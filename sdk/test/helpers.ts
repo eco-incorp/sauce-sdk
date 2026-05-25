@@ -1,0 +1,233 @@
+/**
+ * SDK Test Helpers
+ *
+ * Compilation utilities for testing SauceScript functions against the
+ * @eco/sauce-compiler. Handles ABI import resolution from TypeScript
+ * source files since the published compiler only resolves JSON imports.
+ */
+
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import ts from 'typescript';
+import { keccak256, toBytes, toHex } from 'viem';
+import { compile, type ContractsConfig, type Abi } from '@eco/sauce-compiler';
+
+/**
+ * Strip TypeScript type annotations from SauceScript, returning plain JS.
+ */
+function stripTypes(source: string): string {
+  const result = ts.transpileModule(source, {
+    compilerOptions: {
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.ESNext,
+    },
+  });
+  return result.outputText;
+}
+
+/**
+ * Parsed import: `import { ExportName as LocalName } from "./abis"`
+ */
+interface ParsedImport {
+  exportName: string;
+  localName: string;
+  source: string;
+}
+
+/**
+ * Parse SauceScript import statements.
+ * Extracts `import { Foo as Bar } from "./abis"` patterns.
+ */
+function parseImports(source: string): ParsedImport[] {
+  const imports: ParsedImport[] = [];
+  const importRegex = /import\s*\{([^}]+)\}\s*from\s*["']([^"']+)["']\s*;?/g;
+  let match;
+  while ((match = importRegex.exec(source)) !== null) {
+    const specifiers = match[1];
+    const importSource = match[2];
+    // Parse each specifier: "Foo as Bar" or just "Foo"
+    for (const spec of specifiers.split(',')) {
+      const trimmed = spec.trim();
+      if (!trimmed) continue;
+      const asMatch = trimmed.match(/^(\w+)\s+as\s+(\w+)$/);
+      if (asMatch) {
+        imports.push({ exportName: asMatch[1], localName: asMatch[2], source: importSource });
+      } else {
+        imports.push({ exportName: trimmed, localName: trimmed, source: importSource });
+      }
+    }
+  }
+  return imports;
+}
+
+/**
+ * Strip import lines from SauceScript source.
+ */
+function stripImports(source: string): string {
+  return source.replace(/import\s*\{[^}]+\}\s*from\s*["'][^"']+["']\s*;?\s*\n?/g, '');
+}
+
+/**
+ * Evaluate exported const arrays from a TypeScript source file.
+ * Strips `as const`, type annotations, and `export` to extract plain JS objects.
+ * Uses a safe Function constructor approach (no eval of arbitrary code).
+ */
+function extractExportsFromTs(tsSource: string): Record<string, unknown> {
+  // Strip TypeScript-specific syntax
+  let js = tsSource;
+  // Remove `import type ...` lines
+  js = js.replace(/^\s*import\s+type\s+[^;]*;?\s*$/gm, '');
+  // Remove `satisfies TypeName`
+  js = js.replace(/\s+satisfies\s+[A-Za-z_$][\w$]*(?:<[^>]*>)?/g, '');
+  // Remove `as const`
+  js = js.replace(/\s+as\s+const\b/g, '');
+  // Remove type annotations on declarations: `const x: Type = ...`
+  js = js.replace(
+    /((?:const|let|var)\s+\w+)\s*:\s*(?:readonly\s+)?[A-Za-z_$][\w$.<>|&\[\]\s]*(?:\[\])?\s*(?==)/g,
+    '$1 ',
+  );
+
+  // Extract all `export const NAME = VALUE;` patterns
+  const exports: Record<string, unknown> = {};
+  // Match export const declarations and evaluate them
+  const exportRegex = /export\s+const\s+(\w+)\s*=\s*/g;
+  let match;
+  while ((match = exportRegex.exec(js)) !== null) {
+    const name = match[1];
+    const startIdx = match.index + match[0].length;
+    // Find the balanced end of the value (handle nested brackets)
+    const value = extractBalancedValue(js, startIdx);
+    if (value !== null) {
+      try {
+        // Safe evaluation of pure data literals
+        const fn = new Function(`return (${value})`);
+        exports[name] = fn();
+      } catch {
+        // Skip values that can't be evaluated
+      }
+    }
+  }
+  return exports;
+}
+
+/**
+ * Extract a balanced JS value starting at the given index.
+ * Handles nested arrays/objects with bracket counting.
+ */
+function extractBalancedValue(source: string, startIdx: number): string | null {
+  let depth = 0;
+  let inString: string | null = null;
+  let i = startIdx;
+
+  // Skip leading whitespace
+  while (i < source.length && /\s/.test(source[i])) i++;
+
+  const valueStart = i;
+  const openChar = source[i];
+
+  if (openChar === '[' || openChar === '{') {
+    const closeChar = openChar === '[' ? ']' : '}';
+    depth = 1;
+    i++;
+    while (i < source.length && depth > 0) {
+      const ch = source[i];
+      if (inString) {
+        if (ch === '\\') { i += 2; continue; }
+        if (ch === inString) inString = null;
+      } else {
+        if (ch === '"' || ch === "'" || ch === '`') inString = ch;
+        else if (ch === openChar) depth++;
+        else if (ch === closeChar) depth--;
+      }
+      i++;
+    }
+    if (depth !== 0) return null;
+    return source.slice(valueStart, i);
+  }
+
+  // Simple value — read until semicolon or newline
+  while (i < source.length && source[i] !== ';' && source[i] !== '\n') i++;
+  return source.slice(valueStart, i).trim();
+}
+
+/**
+ * Load ABI exports from a protocol's abis.ts file.
+ */
+function loadProtocolAbis(protocolDir: string): Record<string, unknown> {
+  const abisPath = join(protocolDir, 'abis.ts');
+  const tsSource = readFileSync(abisPath, 'utf-8');
+  return extractExportsFromTs(tsSource);
+}
+
+export interface CompileResult {
+  bytecode: Uint8Array[];
+  warnings: string[];
+}
+
+/**
+ * Compile a SauceScript string, resolving ABI imports from the given protocol directory.
+ *
+ * @param sauceScript - The SauceScript source code (template literal content)
+ * @param protocolDir - Absolute path to the protocol's directory (containing abis.ts)
+ * @returns Compiled bytecode segments and warnings
+ */
+export function compileSauceFunction(sauceScript: string, protocolDir: string): CompileResult {
+  const imports = parseImports(sauceScript);
+  // Strip TS types first (preserves ESM imports), then remove import lines
+  const jsSource = stripTypes(sauceScript);
+  const strippedSource = stripImports(jsSource);
+
+  // Build contracts config from imports
+  const contracts: ContractsConfig = {};
+
+  if (imports.length > 0) {
+    const abiExports = loadProtocolAbis(protocolDir);
+
+    for (const imp of imports) {
+      const abi = abiExports[imp.exportName];
+      if (!abi) {
+        throw new Error(
+          `ABI export "${imp.exportName}" not found in ${protocolDir}/abis.ts. ` +
+          `Available exports: ${Object.keys(abiExports).join(', ')}`
+        );
+      }
+      contracts[imp.localName] = { abi: abi as Abi };
+    }
+  }
+
+  const result = compile(strippedSource, { contracts });
+  return { bytecode: result.bytecode, warnings: result.warnings };
+}
+
+/**
+ * Extract 4-byte function selectors from compiled bytecode segments.
+ * Selectors appear as the first 4 bytes of ABI-encoded CALL data within the bytecode.
+ */
+export function extractSelectors(bytecode: Uint8Array[]): string[] {
+  const selectors: string[] = [];
+  for (const segment of bytecode) {
+    // Look for CALL opcode patterns that contain 4-byte selectors
+    // In Sauce bytecode, selectors are embedded as BYTE_4 (opcode 0x04) followed by 4 bytes
+    for (let i = 0; i < segment.length - 4; i++) {
+      if (segment[i] === 0x04) {
+        // BYTE_4 opcode: next 4 bytes are the selector
+        const sel = toHex(segment.slice(i + 1, i + 5));
+        if (!selectors.includes(sel)) {
+          selectors.push(sel);
+        }
+      }
+    }
+  }
+  return selectors;
+}
+
+/**
+ * Compute the 4-byte function selector from a Solidity function signature.
+ *
+ * @param signature - e.g. "transfer(address,uint256)"
+ * @returns The 4-byte selector as hex string, e.g. "0xa9059cbb"
+ */
+export function computeSelector(signature: string): string {
+  const hash = keccak256(toBytes(signature));
+  return hash.slice(0, 10); // "0x" + 8 hex chars = 4 bytes
+}

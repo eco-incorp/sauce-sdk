@@ -1,0 +1,1580 @@
+[
+  {
+    "name": "Uniswap V2",
+    "website": "https://uniswap.org",
+    "github": "https://github.com/Uniswap/v2-core",
+    "npm": "@uniswap/v2-core, @uniswap/v2-periphery",
+    "category": "AMM (Constant Product)",
+    "tvl_estimate": "$1.5B+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "swapTokensForExactTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "getAmountsOut",
+      "getAmountsIn"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+          "router": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "factory": "0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9",
+          "router": "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "factory": "0x0c3c1c532F1e39EdF36BE9Fe0bE1410313E074Bf",
+          "router": "0x4A7b5Da61326A6379179b40d00F57E5bbDC962c2"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "factory": "0x9e5A52f57b3038F1B8EeE45F28b3C1967e22799C",
+          "router": "0xedf6066a2b290C185783862C7F4776A2C8077AD1"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "factory": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
+          "router": "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "factory": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
+          "router": "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "factory": "0x9e5A52f57b3038F1B8EeE45F28b3C1967e22799C",
+          "router": "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24"
+        }
+      },
+      {
+        "chain": "Blast",
+        "contracts": {
+          "factory": "0x5C346464d33F90bABaf70dB6388507CC889C1070",
+          "router": "0xBB66Eb1c5e875933D44DAe661dbD80e5D9B03035"
+        }
+      },
+      {
+        "chain": "Zora",
+        "contracts": {
+          "factory": "0x0F797dC7efaEA995bB916f268D919d0a1950eE3C",
+          "router": "0xa00F34A632630EFd15223B1968358bA4845bEEC7"
+        }
+      },
+      {
+        "chain": "WorldChain",
+        "contracts": {
+          "factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+          "router": "0x541aB7c31A119441eF3575F6973277DE0eF460bd"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Uniswap V3",
+    "website": "https://uniswap.org",
+    "github": "https://github.com/Uniswap/v3-core",
+    "npm": "@uniswap/v3-core, @uniswap/v3-periphery, @uniswap/v3-sdk",
+    "category": "Concentrated Liquidity AMM",
+    "tvl_estimate": "$4B+",
+    "key_functions": [
+      "exactInputSingle",
+      "exactInput",
+      "exactOutputSingle",
+      "exactOutput",
+      "mint (NonfungiblePositionManager)",
+      "increaseLiquidity",
+      "decreaseLiquidity",
+      "collect"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+          "swapRouter": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+          "swapRouter02": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+          "quoterV2": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+          "nonfungiblePositionManager": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
+          "universalRouter": "0x66a9893cc07d91d95644aedd05d03f95e1dba8af"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+          "swapRouter": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+          "nonfungiblePositionManager": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+          "swapRouter": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+          "nonfungiblePositionManager": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+          "swapRouter": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+          "nonfungiblePositionManager": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "factory": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+          "swapRouter02": "0x2626664c2603336E57B271c5C0b26F421741e481",
+          "nonfungiblePositionManager": "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "factory": "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
+          "swapRouter02": "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "factory": "0x740b1c1de25031C31FF4fC9A62f554A55cdC1baD",
+          "swapRouter02": "0xbb00FF08d01D300023C629E8fFfFcb65A5a578cE"
+        }
+      },
+      {
+        "chain": "Celo",
+        "contracts": {
+          "factory": "0xAfE208a311B21f13EF87E33A90049fC17A7acDEc",
+          "swapRouter02": "0x5615CDAb10dc425a742d643d949a7F474C01abc4"
+        }
+      },
+      {
+        "chain": "Blast",
+        "contracts": {
+          "factory": "0x792edAdE80af5fC680d96a2eD80A44247D2Cf6Fd"
+        }
+      },
+      {
+        "chain": "zkSync",
+        "contracts": {
+          "factory": "0x8FdA5a7a8dCA67BBcDd10F02Fa0649A937215422"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Uniswap V4",
+    "website": "https://uniswap.org",
+    "github": "https://github.com/Uniswap/v4-core",
+    "npm": "@uniswap/v4-core, @uniswap/v4-periphery",
+    "category": "Singleton AMM with Hooks",
+    "tvl_estimate": "$500M+ (launched Jan 2025)",
+    "key_functions": [
+      "swap (via PoolManager)",
+      "modifyLiquidity",
+      "donate",
+      "initialize",
+      "execute (UniversalRouter)"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "poolManager": "0x000000000004444c5dc75cB358380D2e3dE08A90",
+          "universalRouter": "0x66a9893cc07d91d95644aedd05d03f95e1dba8af",
+          "positionManager": "0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "poolManager": "0x360e68faccca8ca495c1b759fd9eee466db9fb32",
+          "universalRouter": "0xa51afafe0263b40edaef0df8781ea9aa03e381a3",
+          "positionManager": "0xd88f38f930b7952f2db2432cb002e7abbf3dd869"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "poolManager": "0x9a13f98cb987694c9f086b1f5eb990eea8264ec3",
+          "universalRouter": "0x851116d9223fabed8e56c0e6b8ad0c31d98b3507",
+          "positionManager": "0x3c3ea4b57a46241e54610e5f022e5c45859a1017"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "poolManager": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+          "universalRouter": "0x6ff5693b99212da76ad316178a184ab56d299b43",
+          "positionManager": "0x7c5f5a4bbd8fd63184577525326123b519429bdc"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "poolManager": "0x67366782805870060151383f4bbff9dab53e5cd6",
+          "universalRouter": "0x1095692a6237d83c6a72f3f5efedb9a670c49223",
+          "positionManager": "0x1ec2ebf4f37e7363fdfe3551602425af0b3ceef9"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "poolManager": "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
+          "universalRouter": "0x1906c1d672b88cd1b9ac7593301ca990f94eae07",
+          "positionManager": "0x7a4a5c919ae2541aed11041a1aeee68f1287f95b"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "poolManager": "0x06380c0e0912312b5150364b9dc4542ba0dbbc85",
+          "universalRouter": "0x94b75331ae8d42c1b61065089b7d48fe14aa73b7",
+          "positionManager": "0xb74b1f14d2754acfcbbe1a221023a5cf50ab8acd"
+        }
+      },
+      {
+        "chain": "Blast",
+        "contracts": {
+          "poolManager": "0x1631559198a9e474033433b2958dabc135ab6446",
+          "universalRouter": "0xeabbcb3e8e415306207ef514f660a3f820025be3",
+          "positionManager": "0x4ad2f4cca2682cbb5b950d660dd458a1d3f1baad"
+        }
+      },
+      {
+        "chain": "Zora",
+        "contracts": {
+          "poolManager": "0x0575338e4c17006ae181b47900a84404247ca30f",
+          "universalRouter": "0x3315ef7ca28db74abadc6c44570efdf06b04b020",
+          "positionManager": "0xf66c7b99e2040f0d9b326b3b7c152e9663543d63"
+        }
+      },
+      {
+        "chain": "WorldChain",
+        "contracts": {
+          "poolManager": "0xb1860d529182ac3bc1f51fa2abd56662b7d13f33",
+          "universalRouter": "0x8ac7bee993bb44dab564ea4bc9ea67bf9eb5e743",
+          "positionManager": "0xc585e0f504613b5fbf874f21af14c65260fb41fa"
+        }
+      },
+      {
+        "chain": "Celo",
+        "contracts": {
+          "poolManager": "0x288dc841A52FCA2707c6947B3A777c5E56cd87BC",
+          "universalRouter": "0xcb695bc5d3aa22cad1e6df07801b061a05a0233a",
+          "positionManager": "0xf7965f3981e4d5bc383bfbcb61501763e9068ca9"
+        }
+      }
+    ]
+  },
+  {
+    "name": "SushiSwap V2",
+    "website": "https://www.sushi.com",
+    "github": "https://github.com/sushiswap/v2-core",
+    "npm": "@sushiswap/core, @sushiswap/sdk",
+    "category": "AMM (Constant Product)",
+    "tvl_estimate": "$300M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "swapTokensForExactTokens",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "factory": "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac",
+          "router": "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "factory": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4",
+          "router": "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "factory": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4",
+          "router": "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "factory": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4",
+          "router": "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "factory": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4",
+          "router": "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+        }
+      },
+      {
+        "chain": "Fantom",
+        "contracts": {
+          "factory": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4",
+          "router": "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "factory": "0xFbc12984689e5f15626Bad03Ad60160Fe98B303C",
+          "router": "0x4C5D5234f232BD2D76B96aA33F5AE4FCF0E4BFAb"
+        }
+      }
+    ]
+  },
+  {
+    "name": "SushiSwap V3",
+    "website": "https://www.sushi.com",
+    "github": "https://github.com/sushiswap/v3-core",
+    "npm": "@sushiswap/v3-core, @sushiswap/v3-periphery",
+    "category": "Concentrated Liquidity AMM",
+    "tvl_estimate": "$150M+",
+    "key_functions": [
+      "exactInputSingle",
+      "exactInput",
+      "exactOutputSingle",
+      "exactOutput",
+      "mint",
+      "collect"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "factory": "0xbACEB8eC6b9355Dfc0269C18bac9d6E2Bdc29C4F",
+          "swapRouter": "0x2E6cd2d30aa43f40aa81619571B2b1bc5C418301"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "factory": "0x1af415a1eba07a4986a52b6f2e7de7003d82231e",
+          "swapRouter": "0x8A21F6768C1f8075791D08546Dadf6daA0bE820c"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "factory": "0x917933899c6a5F8E37F31E050010413dCDB6d52C",
+          "swapRouter": "0x0a6e511Fe663827b9cA7e2D2542b20B37fC217A6"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "factory": "0x9c6522117e2ed1fE5bdb72bb0eD5E3f2bdE7DBe0"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "factory": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Curve Finance",
+    "website": "https://curve.fi",
+    "github": "https://github.com/curvefi",
+    "npm": "N/A (Vyper contracts, no npm package)",
+    "category": "StableSwap AMM / Crypto Pools",
+    "tvl_estimate": "$2B+",
+    "key_functions": [
+      "exchange",
+      "exchange_underlying",
+      "add_liquidity",
+      "remove_liquidity",
+      "remove_liquidity_one_coin",
+      "get_dy",
+      "get_dx"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "routerNG": "0x16C6521Dff6baB339122a0FE25a9116693265353",
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383",
+          "crvToken": "0xD533a949740bb3306d119CC777fa900bA034cd52",
+          "gaugeController": "0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB",
+          "votingEscrow": "0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2",
+          "3pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "routerNG": "0x2191718CD32d02B8E60BAdFFeA33E4B5DD9A0A0D",
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "routerNG": "0x0DCDED3545D565bA3B19E683431381007245d983",
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "routerNG": "0x4f37A9d177470499A2dD084621020b023fcffc1F",
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383"
+        }
+      },
+      {
+        "chain": "Fantom",
+        "contracts": {
+          "addressProvider": "0x0000000022D53366457F9d5E68Ec105046FC4383"
+        }
+      },
+      {
+        "chain": "Fraxtal",
+        "contracts": {
+          "routerNG": "0x9f2Fa7709B30c75047980a0d70A106728f0Ef2db"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Balancer V2",
+    "website": "https://balancer.fi",
+    "github": "https://github.com/balancer/balancer-v2-monorepo",
+    "npm": "@balancer-labs/v2-deployments, @balancer-labs/balancer-js",
+    "category": "Weighted Pool AMM / Composable Stable Pools",
+    "tvl_estimate": "$1B+",
+    "key_functions": [
+      "swap (single)",
+      "batchSwap",
+      "joinPool",
+      "exitPool",
+      "flashLoan",
+      "queryBatchSwap"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "Gnosis",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+        }
+      }
+    ],
+    "notes": "Balancer V2 uses a single Vault contract at the same address across all chains. All pool tokens are held by the Vault."
+  },
+  {
+    "name": "Balancer V3",
+    "website": "https://balancer.fi",
+    "github": "https://github.com/balancer/balancer-deployments",
+    "npm": "@balancer-labs/v3-vault",
+    "category": "Weighted Pool AMM / Hooks (V3 upgrade)",
+    "tvl_estimate": "$200M+ (launched Dec 2024)",
+    "key_functions": [
+      "swap",
+      "swapSingleTokenExactIn",
+      "swapSingleTokenExactOut",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "vault": "0xbA1333333333a1BA1108E8412f11850A5C319bA9",
+          "vaultFactory": "0xAc27df81663d139072E615855eF9aB0Af3FBD281",
+          "vaultExtension": "0x0E8B07657D719B86e06bF0806D6729e3D528C9A9",
+          "vaultExplorer": "0xFc2986feAB34713E659da84F3B1FA32c1da95832"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "vault": "0xbA1333333333a1BA1108E8412f11850A5C319bA9"
+        }
+      },
+      {
+        "chain": "Gnosis",
+        "contracts": {
+          "vault": "0xbA1333333333a1BA1108E8412f11850A5C319bA9"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "vault": "0xbA1333333333a1BA1108E8412f11850A5C319bA9"
+        }
+      }
+    ]
+  },
+  {
+    "name": "PancakeSwap V2",
+    "website": "https://pancakeswap.finance",
+    "github": "https://github.com/pancakeswap",
+    "npm": "@pancakeswap/sdk, @pancakeswap/v2-sdk",
+    "category": "AMM (Constant Product)",
+    "tvl_estimate": "$1.5B+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "swapTokensForExactTokens",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "factory": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
+          "router": "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+        }
+      },
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "factory": "0x1097053Fd2ea711dad45caCcc45EfF7548fCB362",
+          "router": "0xEfF92A263d31888d860bD50809A8D171709b7b1c"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "factory": "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E",
+          "router": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "factory": "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E",
+          "router": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
+        }
+      },
+      {
+        "chain": "Linea",
+        "contracts": {
+          "factory": "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E",
+          "router": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
+        }
+      },
+      {
+        "chain": "zkSync",
+        "contracts": {
+          "factory": "0xd03D8D566183F0086d8D09A84E1e30b58Dd5619d",
+          "router": "0x5aEaF2883FBf30f3D62471154eDa3C0c1b05942d"
+        }
+      },
+      {
+        "chain": "zkEVM",
+        "contracts": {
+          "factory": "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E",
+          "router": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
+        }
+      },
+      {
+        "chain": "opBNB",
+        "contracts": {
+          "factory": "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E",
+          "router": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
+        }
+      }
+    ]
+  },
+  {
+    "name": "PancakeSwap V3",
+    "website": "https://pancakeswap.finance",
+    "github": "https://github.com/pancakeswap/pancake-v3-contracts",
+    "npm": "@pancakeswap/v3-core, @pancakeswap/v3-periphery, @pancakeswap/v3-sdk",
+    "category": "Concentrated Liquidity AMM",
+    "tvl_estimate": "$1B+",
+    "key_functions": [
+      "exactInputSingle",
+      "exactInput",
+      "exactOutputSingle",
+      "exactOutput",
+      "mint",
+      "increaseLiquidity",
+      "decreaseLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      },
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x32226588378236Fd0c7c4053999F88aC0e5cAc77",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      },
+      {
+        "chain": "Linea",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      },
+      {
+        "chain": "zkSync",
+        "contracts": {
+          "factory": "0x1BB72E0CbbEA93c08f535fc7856E0338D7F7a8aB",
+          "smartRouter": "0xf8b59f3c3Ab33200ec80a8A58b2aA5F5D2a8944C",
+          "nonfungiblePositionManager": "0xa815e2eD7f7d5B0c49fda367F249232a1B9D2883"
+        }
+      },
+      {
+        "chain": "zkEVM",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      },
+      {
+        "chain": "opBNB",
+        "contracts": {
+          "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+          "smartRouter": "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86",
+          "nonfungiblePositionManager": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Trader Joe (Liquidity Book)",
+    "website": "https://traderjoexyz.com",
+    "github": "https://github.com/traderjoe-xyz/joe-v2",
+    "npm": "@traderjoe-xyz/joe-v2",
+    "category": "Liquidity Book (Concentrated Liquidity with Bins)",
+    "tvl_estimate": "$150M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "swapTokensForExactTokens",
+      "addLiquidity",
+      "addLiquidityNATIVE",
+      "removeLiquidity",
+      "getSwapOut",
+      "getSwapIn"
+    ],
+    "deployments": [
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "lbFactory_v2.0": "0x6E77932A92582f504FF6c4BdbCef7Da6c198aEEf",
+          "lbRouter_v2.0": "0xE3Ffc583dC176575eEA7FD9dF2A7c65F7E23f4C3",
+          "lbQuoter_v2.0": "0x9dbf1706577636941ab5f443d2aebe251ccd1648",
+          "lbFactory_v2.1": "0x8e42f2F4101563bF679975178e880FD87d3eFd4e",
+          "lbRouter_v2.1": "0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30",
+          "lbQuoter_v2.1": "0xd76019A16606FDa4651f636D9751f500Ed776250",
+          "lbFactory_v2.2": "0xb43120c4745967fa9b93E79C149E66B0f2D6Fe0c",
+          "lbRouter_v2.2": "0x18556DA13313f3532c54711497A8FedAC273220E",
+          "lbQuoter_v2.2": "0x9A550a522BBaDFB69019b0432800Ed17855A51C3",
+          "legacyFactory_v1": "0x9Ad6C38BE94206cA50bb0d90783181662f0Cfa10",
+          "legacyRouter_v1": "0x60aE616a2155Ee3d9A68541Ba4544862310933d4"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "lbFactory_v2.0": "0x1886d09c9ade0c5db822d85d21678db67b6c2982",
+          "lbRouter_v2.0": "0x7BFd7192E76D950832c77BB412aaE841049D8d9B",
+          "lbFactory_v2.1": "0x8e42f2F4101563bF679975178e880FD87d3eFd4e",
+          "lbRouter_v2.1": "0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30",
+          "lbRouter_v2.2": "0x18556da13313f3532c54711497a8fedac273220e"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "lbRouter_v2.1": "0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Camelot",
+    "website": "https://camelot.exchange",
+    "github": "https://github.com/camelotlabs",
+    "npm": "N/A",
+    "category": "AMM V2 + Algebra-based Concentrated Liquidity (V3/V4)",
+    "tvl_estimate": "$100M+",
+    "key_functions": [
+      "swapExactTokensForTokens (V2)",
+      "exactInputSingle (V3/V4)",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "ammV2_factory": "0x6EcCab422D763aC031210895C81787E87B43A652",
+          "ammV2_router": "0xc873fEcbd354f5A56E00E710B90EF4201db2448d",
+          "ammV3_factory": "0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B",
+          "ammV3_swapRouter": "0x1F721E2E82F6676FCE4eA07A5958cF098D339e18",
+          "ammV4_factory": "0xBefC4b405041c5833f53412fF997ed2f697a2f37",
+          "ammV4_swapRouter": "0x4ee15342d6Deb297c3A2aA7CFFd451f788675F53",
+          "grailToken": "0x3d9907F9a368ad0a51Be60f7Da3b97cf940982D8"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Velodrome Finance",
+    "website": "https://velodrome.finance",
+    "github": "https://github.com/velodrome-finance/contracts",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) AMM",
+    "tvl_estimate": "$300M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote (Voter)",
+      "claimRewards"
+    ],
+    "deployments": [
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "router_v1": "0x9c12939390052919aF3155f41Bf4160Fd3666A6f",
+          "router_v2": "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858",
+          "voter_v1": "0x09236cfF45047DBee6B921e00704bed6D6B8Cf7e",
+          "voter_v2": "0x41C914ee0c7E1A5edCD0295623e6dc557B5aBf3C",
+          "poolFactory_v2": "0x8134a2fdc127549480865fb8e5a9e8a8a95a54c5",
+          "veloToken": "0x3c8B650257cFb5f272f799F5e2b4e65093a11a05"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Aerodrome Finance",
+    "website": "https://aerodrome.finance",
+    "github": "https://github.com/aerodrome-finance/contracts",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) AMM",
+    "tvl_estimate": "$1.5B+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote (Voter)",
+      "claimRewards"
+    ],
+    "deployments": [
+      {
+        "chain": "Base",
+        "contracts": {
+          "router": "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",
+          "poolFactory": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
+          "gaugeFactory": "0x35f35cA5B132CaDf2916BaB57639128eAC5bbcb5",
+          "factoryRegistry": "0x5C3F18F06CC09CA1910767A34a20F771039E37C0",
+          "aeroToken": "0x940181a94A35A4569E4529A3CDFb74e38FD98631"
+        }
+      }
+    ]
+  },
+  {
+    "name": "QuickSwap",
+    "website": "https://quickswap.exchange",
+    "github": "https://github.com/QuickSwap",
+    "npm": "quickswap-sdk",
+    "category": "AMM V2 + Algebra-based Concentrated Liquidity (V3)",
+    "tvl_estimate": "$100M+",
+    "key_functions": [
+      "swapExactTokensForTokens (V2)",
+      "exactInputSingle (V3)",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "v2_factory": "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32",
+          "v2_router": "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff",
+          "v3_algebraFactory": "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28",
+          "v3_swapRouter": "0xf5b509bB0909a69B1c207E495f687a596C168e12"
+        }
+      }
+    ]
+  },
+  {
+    "name": "SpookySwap",
+    "website": "https://spooky.fi",
+    "github": "https://github.com/SpookySwap",
+    "npm": "N/A",
+    "category": "AMM (Constant Product) V2 + V3",
+    "tvl_estimate": "$30M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Fantom",
+        "contracts": {
+          "v2_factory": "0xEE4bC42157cf65291Ba2FE839AE127e3Cc76f741",
+          "v2_router": "0xa6AD18C2aC47803E193F75c3677b14BF19B94883",
+          "v3_factory": "0x7928a2c48754501f3a8064765ECaE541daE5c3E6",
+          "legacyRouter": "0xF491e7B69E4244ad4002BC14e878a34207E38c29"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Maverick Protocol",
+    "website": "https://www.mav.xyz",
+    "github": "https://github.com/maverickprotocol",
+    "npm": "N/A",
+    "category": "Directional Liquidity AMM",
+    "tvl_estimate": "$50M+",
+    "key_functions": [
+      "exactInputSingle",
+      "exactInput",
+      "addLiquidity",
+      "removeLiquidity",
+      "multicall"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "v1_router": "0xbBF1EE38152E9D8e3470Dc47947eAa65DcA94913",
+          "v2_router": "0x62e31802c6145A2D5E842EeD8efe01fC224422fA",
+          "v2_factory": "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e",
+          "v2_positionManager": "0x116193c58B40D50687c0433B2aa0cC4AE00bC32c"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "v2_router": "0x5c3b380e5Aeec389d1014Da3Eb372FA2C9e0fc76",
+          "v2_factory": "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e",
+          "v2_positionManager": "0x116193c58B40D50687c0433B2aa0cC4AE00bC32c"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "v2_router": "0x5eDEd0d7E76C563FF081Ca01D9d12D6B404Df527",
+          "v2_factory": "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e",
+          "v2_positionManager": "0x116193c58B40D50687c0433B2aa0cC4AE00bC32c"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "v2_router": "0x374bFCc264678c67a582D067AD91f1951bC6b20f",
+          "v2_factory": "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e",
+          "v2_positionManager": "0x116193c58B40D50687c0433B2aa0cC4AE00bC32c"
+        }
+      },
+      {
+        "chain": "Scroll",
+        "contracts": {
+          "v2_router": "0x15D5ff975c1181FAf938cd33BD0633435bdfA18d",
+          "v2_factory": "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e",
+          "v2_positionManager": "0x116193c58B40D50687c0433B2aa0cC4AE00bC32c"
+        }
+      },
+      {
+        "chain": "zkSync Era",
+        "contracts": {
+          "v2_router": "0x432e6791d35dc6c638f44E949A5c0228e4048244",
+          "v2_factory": "0x7A6902af768a06bdfAb4F076552036bf68D1dc56",
+          "v2_positionManager": "0x4D93c58B348d99969257cec007cFb31B410b21A0"
+        }
+      }
+    ]
+  },
+  {
+    "name": "KyberSwap",
+    "website": "https://kyberswap.com",
+    "github": "https://github.com/KyberNetwork",
+    "npm": "N/A",
+    "category": "Elastic (Concentrated Liquidity) + Classic AMM + Aggregator",
+    "tvl_estimate": "$50M+",
+    "key_functions": [
+      "swapExactInputSingle (Elastic)",
+      "swap (Classic)",
+      "mint",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "elastic_factory": "0xC7a590291e07B9fe9E64b86c58fD8fC764308C4A",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83",
+          "classic_factory": "0x1c758aF0688502e49140230F6b0EBd376d429be5",
+          "classic_router": "0x5649B4DD00780e99Bab7Abb4A3d581Ea1aEB23D0",
+          "metaAggregationRouterV2": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+        }
+      },
+      {
+        "chain": "Polygon",
+        "contracts": {
+          "elastic_factory": "0x5F1dddbf348aC2fbe22a163e30F99F9ECE3DD50a",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83",
+          "classic_factory": "0x1c758aF0688502e49140230F6b0EBd376d429be5",
+          "classic_router": "0x5649B4DD00780e99Bab7Abb4A3d581Ea1aEB23D0",
+          "metaAggregationRouterV2": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "elastic_factory": "0x5F1dddbf348aC2fbe22a163e30F99F9ECE3DD50a",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83",
+          "metaAggregationRouterV2": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+        }
+      },
+      {
+        "chain": "Optimism",
+        "contracts": {
+          "elastic_factory": "0x5F1dddbf348aC2fbe22a163e30F99F9ECE3DD50a",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83",
+          "metaAggregationRouterV2": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "elastic_factory": "0x5F1dddbf348aC2fbe22a163e30F99F9ECE3DD50a",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83",
+          "metaAggregationRouterV2": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+        }
+      },
+      {
+        "chain": "Avalanche",
+        "contracts": {
+          "elastic_factory": "0x5F1dddbf348aC2fbe22a163e30F99F9ECE3DD50a",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83"
+        }
+      },
+      {
+        "chain": "Fantom",
+        "contracts": {
+          "elastic_factory": "0x5F1dddbf348aC2fbe22a163e30F99F9ECE3DD50a",
+          "elastic_router": "0xC1e7dFE73E1598E3910EF4C7845B68A9Ab6F4c83"
+        }
+      }
+    ],
+    "notes": "KyberSwap Elastic contracts are deployed at the same addresses across most chains."
+  },
+  {
+    "name": "DODO",
+    "website": "https://dodoex.io",
+    "github": "https://github.com/DODOEX",
+    "npm": "N/A",
+    "category": "Proactive Market Maker (PMM)",
+    "tvl_estimate": "$100M+",
+    "key_functions": [
+      "dodoSwapV2TokenToToken",
+      "mixSwap",
+      "externalSwap",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "dodoV2Proxy": "0xa356867fDCeA8e71AEaf87805808803806231FDc",
+          "routeProxy2": "0xa2398842F37465f89540430bDC00219fA9E4D28a"
+        }
+      },
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "dodoV2Proxy": "0x8F8Dd7DB1bDA5eD3da8C9dAf3bFA471c12d58486"
+        }
+      },
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "feeRouteProxy": "0xe05dd51e4eB5636F4f0e8e7fbe82ea31a2ecef16"
+        }
+      }
+    ],
+    "notes": "DODO uses a PMM algorithm which is different from constant product AMM. See docs.dodoex.io for full chain-specific addresses."
+  },
+  {
+    "name": "Thena",
+    "website": "https://thena.fi",
+    "github": "https://github.com/ThenafiBNB/THENA-Contracts",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) AMM + Algebra CL",
+    "tvl_estimate": "$80M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote",
+      "claimRewards"
+    ],
+    "deployments": [
+      {
+        "chain": "BNB Chain",
+        "contracts": {
+          "router_v1": "0x20a304a7d126758dfe6b243d0fc515f83bca8431",
+          "router_v2": "0xd4ae6eCA985340Dd434D38F470aCCce4DC78D109",
+          "theToken": "0xF4C8E32EaDEC4BFe97E0F595AdD0f4450a863a11",
+          "veTHE": "0xfBBF371C9B0B994EebFcC977CEf603F7f31c070D"
+        }
+      },
+      {
+        "chain": "opBNB",
+        "contracts": {
+          "notes": "Thena also deployed on opBNB. See docs.thena.fi for addresses."
+        }
+      }
+    ]
+  },
+  {
+    "name": "Ramses Exchange",
+    "website": "https://www.ramses.exchange",
+    "github": "https://github.com/RamsesExchange",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) + Concentrated Liquidity",
+    "tvl_estimate": "$40M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote",
+      "claimRewards"
+    ],
+    "deployments": [
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "router": "0xAAA87963EFeB6f7E0a2711F397663105Acb1805e",
+          "ramToken": "0xAAA6C1E32C55A7Bfa8066A6FAE9b42650F262418"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Chronos",
+    "website": "https://chronos.exchange",
+    "github": "https://github.com/pbnather/Chronos-Contracts",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) AMM",
+    "tvl_estimate": "$10M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote"
+    ],
+    "deployments": [
+      {
+        "chain": "Arbitrum",
+        "contracts": {
+          "router_v2": "0xE708aA9E887980750C040a6A2Cb901c37Aa34f3b",
+          "chrToken": "0x15b2fb8f08E4Ac1Ce019EADAe02eE92AeDF06851"
+        }
+      }
+    ]
+  },
+  {
+    "name": "SyncSwap",
+    "website": "https://syncswap.xyz",
+    "github": "https://github.com/syncswap/core-contracts",
+    "npm": "N/A",
+    "category": "AMM (Classic + Stable pools)",
+    "tvl_estimate": "$50M+",
+    "key_functions": [
+      "swap",
+      "addLiquidity",
+      "addLiquidity2",
+      "removeLiquidity",
+      "removeLiquiditySingle"
+    ],
+    "deployments": [
+      {
+        "chain": "zkSync Era",
+        "contracts": {
+          "router": "0x2da10A1e27bF85cEdD8FFb1AbBe97e53391C0295",
+          "vault": "0x621425a1Ef6abE91058E9712575dcc4258F8d091",
+          "poolMaster": "0xbB05918E9B4bA9Fe2c8384d223f0844867909Ffb",
+          "classicPoolFactory": "0xf2DAd89f2788a8CD54625C60b55cD3d2D0ACa7Cb",
+          "stablePoolFactory": "0x5b9f21d407F35b10CbfDDca17D5D84b129356ea3"
+        }
+      },
+      {
+        "chain": "Scroll",
+        "contracts": {
+          "router": "0x80e38291e06339d10aab483c65695d004dbd5c69"
+        }
+      }
+    ]
+  },
+  {
+    "name": "SpaceFi",
+    "website": "https://www.spacefi.io",
+    "github": "https://github.com/SpaceFinance",
+    "npm": "N/A",
+    "category": "AMM (Constant Product)",
+    "tvl_estimate": "$5M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "zkSync Era",
+        "contracts": {
+          "spaceToken": "0x47260090cE5e83454d5f05A0ABB2C953835F777",
+          "notes": "Router and factory addresses available via SpaceFi docs. Small TVL DEX."
+        }
+      }
+    ]
+  },
+  {
+    "name": "Koi Finance (formerly Mute.io)",
+    "website": "https://koi.finance",
+    "github": "https://github.com/mute-io",
+    "npm": "N/A",
+    "category": "AMM + Concentrated Liquidity (V3)",
+    "tvl_estimate": "$10M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "swapTokensForExactTokens",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "zkSync Era",
+        "contracts": {
+          "factory_v2": "0x40be1cBa6C5B47cDF9da7f963B6F761F4C60627D",
+          "router_v2": "0x8B791913eB07C32779a16750e3868aA8495F5964",
+          "factory_v3": "0x488A92576DA475f7429BC9dec9247045156144D3",
+          "universalRouter": "0x3388530FbaF0C916fA7C0390413DFB178Cb33CBb",
+          "nftPosition": "0xa459EbF3E6A6d5875345f725bA3F107340b67732",
+          "permit2": "0x0000000000225e31D15943971F47aD3022F714Fa",
+          "veKOI": "0x98dB4e3Df6502369dAD7AC99f3aEE5D064721C4C"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Lynex",
+    "website": "https://www.lynex.fi",
+    "github": "https://github.com/lynexfi",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) + Algebra CL",
+    "tvl_estimate": "$30M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote"
+    ],
+    "deployments": [
+      {
+        "chain": "Linea",
+        "contracts": {
+          "router": "0x610D2f07b7EdC67565160F587F37636194C34E74",
+          "factory": "0xBc7695Fd00E3b32D08124b7a4287493aEE99f9ee",
+          "voter_v5": "0x0B2c83B6e39E32f694a86633B4d1Fe69d13b63c5",
+          "lynxToken": "0x1a51b19CE03dbE0Cb44C1528E34a7EDD7771E9Af"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Nile Exchange",
+    "website": "https://www.nile.build",
+    "github": "https://github.com/nile-exchange",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) AMM",
+    "tvl_estimate": "$15M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote"
+    ],
+    "deployments": [
+      {
+        "chain": "Linea",
+        "contracts": {
+          "router": "0xAAA45c8F5ef92a000a121d102F4e89278a711Faa",
+          "factory": "0xAAA32926fcE6bE95ea2c51cB4Fcb60836D320C42",
+          "pairFactory": "0xAAA16c016BF556fcD620328f0759252E29b1AB57",
+          "nileToken": "0xAAAac83751090C6ea42379626435f805DDF54DC8"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Ambient Finance (CrocSwap)",
+    "website": "https://ambient.finance",
+    "github": "https://github.com/CrocSwap",
+    "npm": "N/A",
+    "category": "Singleton DEX (Concentrated + Ambient Liquidity)",
+    "tvl_estimate": "$50M+",
+    "key_functions": [
+      "swap (CrocSwapDex)",
+      "mintRanged",
+      "mintAmbient",
+      "burnRanged",
+      "burnAmbient",
+      "userCmd"
+    ],
+    "deployments": [
+      {
+        "chain": "Ethereum",
+        "contracts": {
+          "crocSwapDex": "0xAaAaAAAaA24eEeb8d57D431224f73832bC34f688",
+          "crocSwapRouter": "0x533E164ded63f4c55E83E1f409BDf2BaC5278035"
+        }
+      },
+      {
+        "chain": "Scroll",
+        "contracts": {
+          "crocSwapDex": "0xaaaaAAAACB71BF2C8CaE522EA5fa455571a74106",
+          "crocSwapRouter": "0xfB5f26851E03449A0403Ca945eBB4201415fd1fc"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Fenix Finance",
+    "website": "https://www.fenixfinance.io",
+    "github": "https://github.com/Satsyxbt/Fenix-dex-v3",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) + Algebra CL",
+    "tvl_estimate": "$15M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote"
+    ],
+    "deployments": [
+      {
+        "chain": "Blast",
+        "contracts": {
+          "pairFactory": "0xa19C51D91891D3DF7C13Ed22a2f89d328A82950f",
+          "router_v2": "0xbD571125856975DBfC2E9b6d1DE496D614D7BAEE"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Thruster",
+    "website": "https://www.thruster.finance",
+    "github": "https://github.com/thruster-protocol",
+    "npm": "N/A",
+    "category": "AMM V2 + Concentrated Liquidity V3 (Uniswap V3 fork)",
+    "tvl_estimate": "$50M+",
+    "key_functions": [
+      "swapExactTokensForTokens (V2)",
+      "exactInputSingle (V3)",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Blast",
+        "contracts": {
+          "v2_router_0.3pct": "0x98994a9A7a2570367554589189dC9772241650f6",
+          "v2_router_1pct": "0x44889b52b71E60De6ed7dE82E2939fcc52fB2B4E",
+          "v3_swapRouter": "0x337827814155ECBf24D20231fCA4444F530c0555",
+          "v3_poolDeployer": "0xa08ae3d3f4dA51C22d3c041E468bdF4C61405AaB",
+          "thrustToken": "0xe36072DD051ce26261Bf50cd966311CAb62C596e"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Ring Protocol",
+    "website": "https://ring.exchange",
+    "github": "https://github.com/ring-exchange",
+    "npm": "N/A",
+    "category": "AMM V2 + V3 (Uniswap fork)",
+    "tvl_estimate": "$10M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "exactInputSingle",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Blast",
+        "contracts": {
+          "swapRouter": "0x7001F706ACB6440d17cBFaD63Fa50a22D51696fF",
+          "universalRouter": "0xC9DD682A06dbf10D91e2adbdAC70f3Adb8a3f201",
+          "v2_factory": "0x24F5Ac9A706De0cF795A8193F6AB3966B14ECfE6",
+          "v3_factory": "0x890509Fab3dD11D4Ff57d8471b5eAC74687E4C75",
+          "permit2": "0x313C2bD7cEEA9b68E81f36FFf053A570C85C6A8B"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Kim Exchange",
+    "website": "https://www.kim.exchange",
+    "github": "https://github.com/kimprotocol",
+    "npm": "N/A",
+    "category": "AMM V2 + Algebra-based V4",
+    "tvl_estimate": "$15M+",
+    "key_functions": [
+      "swapExactTokensForTokens (V2)",
+      "exactInputSingle (V4)",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Mode",
+        "contracts": {
+          "v2_router": "0x5D61c537393cf21893BE619E36fC94cd73C77DD3",
+          "v2_factory": "0xc02155946dd8C89D3D3238A6c8A64D04E2CD4500",
+          "v4_swapRouter": "0xAc48FcF1049668B285f3dC72483DF5Ae2162f7e8"
+        }
+      }
+    ]
+  },
+  {
+    "name": "BaseSwap",
+    "website": "https://baseswap.fi",
+    "github": "https://github.com/baseswapfi",
+    "npm": "N/A",
+    "category": "AMM V2 + V3 (Uniswap fork)",
+    "tvl_estimate": "$15M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "exactInputSingle",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Base",
+        "contracts": {
+          "v2_factory": "0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB",
+          "v2_router": "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86",
+          "v3_factory": "0xb5620F90e803C7F957A9EF351B8DB3C746021BEa",
+          "v3_router": "0x756C6BbDd915202adac7beBB1c6C89ac0886503f"
+        }
+      }
+    ]
+  },
+  {
+    "name": "SwapBased",
+    "website": "https://swapbased.finance",
+    "github": "https://github.com/SwapBased",
+    "npm": "N/A",
+    "category": "AMM V2 + V3 (Uniswap fork)",
+    "tvl_estimate": "$5M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "exactInputSingle",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Base",
+        "contracts": {
+          "v2_factory": "0x04C9f118d21e8B767D2e50C946f0cC9F6C367300",
+          "v2_router": "0xaaa3b1F1bd7BCc97fD1917c18ADE665C5D31F066",
+          "v3_factory": "0xb5620F90e803C7F957A9EF351B8DB3C746021BEa",
+          "v3_router": "0x756C6BbDd915202adac7beBB1c6C89ac0886503f",
+          "masterchefV3": "0xeBA10CDb4C2186800f2704538FbDBBBE7F6D245b"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Equalizer Exchange",
+    "website": "https://equalizer.exchange",
+    "github": "https://github.com/Equalizer-Exchange",
+    "npm": "N/A",
+    "category": "Solidly-fork ve(3,3) AMM",
+    "tvl_estimate": "$10M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity",
+      "vote"
+    ],
+    "deployments": [
+      {
+        "chain": "Fantom",
+        "contracts": {
+          "router": "0x1A05EB736873485655F29a37DEf8a0AA87F5a447",
+          "pairFactory": "0xc6366EFD0AF1D09171fE0EBF32c7943BB310832a",
+          "equalToken": "0x3Fd3A0c85B70754eFc07aC9Ac0cbBDCe664865A6"
+        }
+      },
+      {
+        "chain": "Base",
+        "contracts": {
+          "notes": "Equalizer is also deployed on Base. See equalizer0x.gitbook.io for addresses."
+        }
+      }
+    ]
+  },
+  {
+    "name": "Netswap",
+    "website": "https://netswap.io",
+    "github": "https://github.com/Netswap/exchange-contracts",
+    "npm": "N/A",
+    "category": "AMM (Constant Product, Uniswap V2 fork)",
+    "tvl_estimate": "$5M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Metis",
+        "contracts": {
+          "factory_v1": "0x70f51d68D16e8f9e418441280342BD43AC9Dff9f",
+          "router_v1": "0x1E876cCe41B7b844FDe09E38Fa1cf00f213bFf56",
+          "factory_v2": "0x5A9D3157c6818C0f2A4D8Dd44769BB7f1173B5Da",
+          "router_v2": "0xaCCb24357D4ae5F84b8dDB97adaD1b0217383639"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Hercules Exchange",
+    "website": "https://www.hercules.exchange",
+    "github": "N/A (Camelot fork)",
+    "npm": "N/A",
+    "category": "Algebra-based Concentrated Liquidity (Camelot fork)",
+    "tvl_estimate": "$10M+",
+    "key_functions": [
+      "swapExactTokensForTokens",
+      "exactInputSingle",
+      "addLiquidity",
+      "removeLiquidity"
+    ],
+    "deployments": [
+      {
+        "chain": "Metis",
+        "contracts": {
+          "notes": "Hercules is an authorized Camelot fork on Metis. Visit docs.hercules.exchange for contract addresses."
+        }
+      }
+    ]
+  }
+]

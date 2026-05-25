@@ -1,0 +1,47 @@
+{
+  "name": "@eco/sauce-dev-tools",
+  "version": "0.0.1",
+  "description": "Development tools for the Sauce protocol",
+  "type": "module",
+  "bin": {
+    "sauce-dev-tools": "scripts/init.js"
+  },
+  "files": [
+    "scripts",
+    "src",
+    "sauce",
+    "artifacts",
+    "hardhat.config.cjs",
+    "tsconfig.json",
+    "README.md",
+    "COMPILER.md"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "scripts": {
+    "prepublishOnly": "cp ../compiler/README.md COMPILER.md",
+    "sauce": "npx tsx scripts/run.ts",
+    "recipe": "npx tsx scripts/recipe.ts",
+    "start:local": "./scripts/start-local.sh",
+    "start:fork": "./scripts/start-fork.sh",
+    "stop": "./scripts/stop-local.sh",
+    "sync-price": "npx tsx scripts/sync-price.ts",
+    "test": "npx tsx test/examples.test.ts && npx tsx test/runner.test.ts",
+    "test:e2e": "npx tsx test/e2e.test.ts",
+    "format": "npx prettier --write sauce scripts test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "hardhat": "^2.22.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@eco/sauce-compiler": "workspace:*",
+    "@uniswap/v3-core": "^1.0.1",
+    "dotenv": "^17.3.1",
+    "viem": "^2.45.1"
+  }
+}

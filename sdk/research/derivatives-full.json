@@ -1,0 +1,1071 @@
+[
+  {
+    "name": "GMX",
+    "type": "perpetuals",
+    "website": "https://gmx.io",
+    "github": "https://github.com/gmx-io/gmx-contracts",
+    "github_v2": "https://github.com/gmx-io/gmx-synthetics",
+    "npm": null,
+    "tvl_estimate": "$399M (V2 Perps) + V1 liquidity",
+    "status": "active",
+    "versions": {
+      "v1": {
+        "chains": {
+          "arbitrum": {
+            "chainId": 42161,
+            "contracts": {
+              "Vault": "0x489ee077994B6658eAfA855C308275EAd8097C4A",
+              "Router": "0xaBBc5F99639c9B6bCb58544ddf04EFA6802F4064",
+              "PositionRouter": "0xb87a436B93fFE9D75c5cFA7bAcFff96430b09868",
+              "PositionManager": "0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c",
+              "RewardRouter": "0xA906F338CB21815cBc4Bc87ace9e68c87eF8d8F1",
+              "GMX_Token": "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a",
+              "GLP_Token": "0x4277f8F2c384827B5273592FF7CeBd9f2C1ac258",
+              "StakedGMX": "0xd2D1162512F927a7e282Ef43a362659E4F2a728F"
+            }
+          },
+          "avalanche": {
+            "chainId": 43114,
+            "contracts": {
+              "Vault": "0x9ab2De34A33fB459b538c43f251eB825645e8595",
+              "Router": "0x5F719c2F1095F7B9fc68a68e35B51194f4b6abe8",
+              "PositionRouter": "0xffF6D276Bc37c61A23f06410Dce4A400f66420f8",
+              "GMX_Token": "0x62edc0692BD897D2295872a9FFCac5425011c661",
+              "GLP_Token": "0x01234181085565ed162a948b6a5e88758CD7c7b8",
+              "StakedGMX": "0x4d268a7d4C16ceB5a606c173Bd974984343fea13"
+            }
+          }
+        }
+      },
+      "v2": {
+        "chains": {
+          "arbitrum": {
+            "chainId": 42161,
+            "contracts": {
+              "ExchangeRouter": "0x7C68C7866A64FA2160F78EEaE12217FFbf871fa8",
+              "DataStore": "0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8",
+              "Reader": "0x470fbC46bcC0f16532691Df360A07d8Bf5ee0789",
+              "OrderVault": "0x31eF83a530Fde1B38EE9A18093A333D8Bbbc40D5"
+            }
+          },
+          "avalanche": {
+            "chainId": 43114,
+            "contracts": {
+              "note": "V2 contracts also deployed on Avalanche; check gmx-synthetics deployments folder for exact addresses"
+            }
+          }
+        }
+      }
+    },
+    "key_functions": [
+      "createIncreasePosition",
+      "createDecreasePosition",
+      "createOrder",
+      "cancelOrder",
+      "executeOrder",
+      "createDeposit",
+      "createWithdrawal",
+      "mintAndStakeGlp",
+      "unstakeAndRedeemGlp"
+    ]
+  },
+  {
+    "name": "dYdX",
+    "type": "perpetuals",
+    "website": "https://dydx.exchange",
+    "github": "https://github.com/dydxprotocol",
+    "github_perpetual": "https://github.com/dydxprotocol/perpetual",
+    "github_starkex": "https://github.com/dydxprotocol/starkex-eth",
+    "npm": null,
+    "tvl_estimate": "$1B+ (v3 winding down)",
+    "status": "v3 shutting down (escape-hatch mode), v4 is Cosmos-based (non-EVM)",
+    "versions": {
+      "v3": {
+        "chains": {
+          "ethereum": {
+            "chainId": 1,
+            "contracts": {
+              "L2PerpetualSmartContract": "0xD54f502e184B6B739d7D27A6410a67dc462D69c8",
+              "note": "StarkEx-based L2; deposits/withdrawals via Ethereum"
+            }
+          }
+        }
+      }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "forcedWithdrawalRequest",
+      "forcedTradeRequest"
+    ]
+  },
+  {
+    "name": "Synthetix",
+    "type": "synthetics_and_perpetuals",
+    "website": "https://synthetix.io",
+    "github": "https://github.com/Synthetixio/synthetix",
+    "github_v3": "https://github.com/Synthetixio/synthetix-v3",
+    "npm": "@synthetixio/contracts-interface",
+    "tvl_estimate": "$200M+ (v2) + $58M (v3)",
+    "status": "active",
+    "versions": {
+      "v2": {
+        "chains": {
+          "ethereum": {
+            "chainId": 1,
+            "contracts": {
+              "ProxySNX": "0xC011a73ee8576Fb46F5E1c5751cA3B9Fe0af2a6F",
+              "ProxysUSD": "0x57Ab1ec28D129707052df4dF418D58a2D46d5f51",
+              "SystemSettings": "0x202ae40Bed1c2E0A5e9e7BDb82145E3282E55886"
+            }
+          },
+          "optimism": {
+            "chainId": 10,
+            "contracts": {
+              "ProxySNX": "0x8700dAec35aF8Ff88c16BdF0418774CB3D7599B4",
+              "PerpsV2MarketProxy_example": "0x074b8f19fc91d6b2eb51143e1f186ca0ddb88042",
+              "note": "Each perps market has its own PerpsV2MarketProxy contract"
+            }
+          }
+        }
+      },
+      "v3": {
+        "chains": {
+          "base": {
+            "chainId": 8453,
+            "contracts": {
+              "CoreProxy": "0xffffffaEff0B96Ea8e4f94b2253f31abdD875847",
+              "PerpsMarketProxy": "0x0A2AF931eFFd34b81ebcc57E3d3c9B1E1dE1C9Ce",
+              "SpotMarketProxy": "0x18141523403e2595D31b22604AcB8Fc06a4CaA61",
+              "AccountProxy": "0x63f4Dd0434BEB5baeCD27F3778a909278d8cf5b8",
+              "SNX_Token": "0x22e6966B799c4D5B13BE962E1D117b56327fDA66"
+            }
+          },
+          "optimism": {
+            "chainId": 10,
+            "contracts": {
+              "note": "Synthetix v3 also deployed on Optimism; check docs.synthetix.io for current addresses"
+            }
+          },
+          "ethereum": {
+            "chainId": 1,
+            "contracts": {
+              "note": "Synthetix v3 core deployed on Ethereum mainnet as well"
+            }
+          }
+        }
+      }
+    },
+    "key_functions": [
+      "commitOrder",
+      "settleOrder",
+      "liquidatePosition",
+      "modifyCollateral",
+      "createAccount",
+      "delegateCollateral",
+      "mintUsd",
+      "burnUsd"
+    ]
+  },
+  {
+    "name": "Kwenta",
+    "type": "perpetuals_frontend",
+    "website": "https://kwenta.eth.limo",
+    "github": "https://github.com/Kwenta",
+    "npm": "@kwenta/sdk",
+    "tvl_estimate": "Uses Synthetix liquidity",
+    "status": "acquired by Synthetix (Nov 2024)",
+    "note": "Frontend/SDK for Synthetix Perps; uses Synthetix V3 contracts on Base",
+    "chains": {
+      "base": { "chainId": 8453 },
+      "optimism": { "chainId": 10 }
+    },
+    "key_functions": [
+      "submitOrder",
+      "cancelOrder",
+      "closePosition",
+      "modifyPosition"
+    ]
+  },
+  {
+    "name": "Gains Network (gTrade)",
+    "type": "perpetuals",
+    "website": "https://gains.trade",
+    "github": "https://github.com/GainsNetwork",
+    "npm": null,
+    "tvl_estimate": "$26M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "GNSMultiCollatDiamond": "0xFF162c694eAA571f685030649814282eA457f169",
+          "GNS_Token": "0x18c11FD286C5EC11c3b683Caa813B77f5163A122",
+          "gUSDC": "0xd3443ee1e91aF28e5FB858Fbd0D72A63bA8046e0",
+          "gDAI": "0xd85E038593d7A098614721EaE955EC2022b9b91b",
+          "Treasury": "0xc07EEd650aB255190CA9766162CfB47cFDf72f3a",
+          "Legacy_TradingV6_2": "0x2f67A8d26F370b922B31B199C7946c3Ed53C10c6"
+        }
+      },
+      "polygon": {
+        "chainId": 137,
+        "contracts": {
+          "GNSMultiCollatDiamond": "0x209A9A01980377916851af2cA075C2b170452018",
+          "GNS_Token": "0xE5417Af564e4bFDA1c483642db72007871397896"
+        }
+      },
+      "base": {
+        "chainId": 8453,
+        "contracts": {
+          "note": "Also deployed on Base; check docs.gains.trade for addresses"
+        }
+      }
+    },
+    "key_functions": [
+      "openTrade",
+      "closeTrade",
+      "updateSl",
+      "updateTp",
+      "cancelOpenOrder",
+      "updateOpenOrder",
+      "executeNftOrder",
+      "claimPendingGovFees"
+    ]
+  },
+  {
+    "name": "Vertex Protocol",
+    "type": "perpetuals_spot_money_market",
+    "website": "https://vertexprotocol.com",
+    "github": "https://github.com/vertex-protocol/vertex-contracts",
+    "npm": "@vertex-protocol/client",
+    "tvl_estimate": "$30M+",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "Endpoint": "0x73eab16c88b9f38d3f2661c9e5875ec0eeee2965",
+          "Clearinghouse": "0x773bb71b0108b060b76746422ee810bfec9a963d",
+          "VertexRouter": "0xeAc3A369FBe6C44a137ff6Fb5dE771c1891a201E",
+          "VRTX_Token": "0x95146881b86B3ee99e63705eC87AfE29Fcc044D9"
+        }
+      }
+    },
+    "key_functions": [
+      "submitSlowModeTransaction",
+      "depositCollateral",
+      "withdrawCollateral",
+      "liquidateSubaccount",
+      "mintLp",
+      "burnLp"
+    ]
+  },
+  {
+    "name": "HMX",
+    "type": "perpetuals",
+    "website": "https://hmx.org",
+    "github": "https://github.com/HMXOrg",
+    "npm": null,
+    "tvl_estimate": "$15M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "HMX_Token": "0x83D6C8C06AC276465e4c92E7AC8c23740F435140",
+          "HandlersLimitTrade": "0xeE116128b9aAAdBCd1f7C18608c5114f594Cf5D6",
+          "note": "Cross-margin perpetuals; check hmx.org docs for full contract list"
+        }
+      }
+    },
+    "key_functions": [
+      "createIncreasePosition",
+      "createDecreasePosition",
+      "depositCollateral",
+      "withdrawCollateral",
+      "liquidate"
+    ]
+  },
+  {
+    "name": "MUX Protocol",
+    "type": "perpetuals_aggregator",
+    "website": "https://mux.network",
+    "github": "https://github.com/mux-world/mux-protocol",
+    "npm": null,
+    "tvl_estimate": "$10M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "LiquidityPool_Proxy": "0x3e0199792Ce69DC29A0a36146bFa68bd7C8D6633",
+          "LiquidityPool_Hop1": "0x9588535Df27aEAD7BBf2520892852B220ec36F15",
+          "LiquidityPool_Hop2": "0xad367F665AeEb1D57764BbDcBFAB5Be5327632dA",
+          "OrderBook_Proxy": "0xa19fD5aB6C8DCffa2A295F78a5Bb4aC543AAF5e3",
+          "OrderBook_Impl": "0xFD92e0b7107488b095cA98E50BE128fee2a35879"
+        }
+      },
+      "bsc": {
+        "chainId": 56,
+        "contracts": {
+          "note": "Also deployed on BSC, Avalanche, Fantom, Optimism"
+        }
+      },
+      "avalanche": { "chainId": 43114 },
+      "fantom": { "chainId": 250 },
+      "optimism": { "chainId": 10 }
+    },
+    "key_functions": [
+      "openPosition",
+      "closePosition",
+      "placePositionOrder",
+      "cancelOrder",
+      "liquidate",
+      "addLiquidity",
+      "removeLiquidity"
+    ]
+  },
+  {
+    "name": "Perpetual Protocol",
+    "type": "perpetuals",
+    "website": "https://perp.com",
+    "github": "https://github.com/perpetual-protocol/perp-curie-contract",
+    "npm": "@perp/curie-deployments",
+    "tvl_estimate": "$5M",
+    "status": "active (v2 Curie)",
+    "chains": {
+      "optimism": {
+        "chainId": 10,
+        "contracts": {
+          "ClearingHouse_Proxy": "0x82ac2CE43e33683c58BE4cDc40975E73aA50F459",
+          "note": "Full addresses in @perp/curie-deployments npm package or metadata.perp.exchange/v2/optimism.json"
+        }
+      }
+    },
+    "key_functions": [
+      "openPosition",
+      "closePosition",
+      "addLiquidity",
+      "removeLiquidity",
+      "liquidate",
+      "cancelExcessOrders"
+    ]
+  },
+  {
+    "name": "Pika Protocol",
+    "type": "perpetuals",
+    "website": "https://pikaprotocol.com",
+    "github": "https://github.com/PikaProtocol",
+    "npm": null,
+    "tvl_estimate": "$3M",
+    "status": "active",
+    "chains": {
+      "optimism": {
+        "chainId": 10,
+        "contracts": {
+          "PikaPerpV3": "0xD5A8f233CBdDb40368D55C3320644Fb36e597002",
+          "OrderBook": "0xA0BE4c09a03F5F91c68F18EAc598155812101Be3",
+          "PositionManager": "0x8adD31BC901214A37f3bb676Cb90AD62B24fd9a5",
+          "VaultFeeReward": "0x939c11c596B851447e5220584d37F12854bA02ae",
+          "PIKA_Token": "0x9a601c5bb360811d96a23689066af316a30c3027"
+        }
+      }
+    },
+    "key_functions": [
+      "openPosition",
+      "closePosition",
+      "addMargin",
+      "removeMargin",
+      "liquidatePosition"
+    ]
+  },
+  {
+    "name": "Level Finance",
+    "type": "perpetuals",
+    "website": "https://level.finance",
+    "github": "https://github.com/level-fi",
+    "npm": null,
+    "tvl_estimate": "$8M",
+    "status": "active",
+    "chains": {
+      "bsc": {
+        "chainId": 56,
+        "contracts": {
+          "LiquidityPool": "0xA5aBFB56a78D2BD4689b25B8A77fd49Bb0675874",
+          "OrderManager": "0xf584A17dF21Afd9de84F47842ECEAF6042b1Bb5b",
+          "LevelOracle": "0x347a868537c96650608b0C38a40d65fA8668bb61",
+          "LVL_Token": "0xB64E280e9D1B5DbEc4AcceDb2257A87b400DB149"
+        }
+      },
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "LiquidityPool": "0x32B7bF19cb8b95C27E644183837813d4b595dcc6",
+          "OrderManager": "0x2215298606C9D0274527b13519Ec50c3A7f1c1eF",
+          "LevelOracle": "0x82B585a8F15701BBD671850f0a9F1feE57a8DCB5",
+          "LVL_Token": "0xB64E280e9D1B5DbEc4AcceDb2257A87b400DB149",
+          "Ladder": "0x8d7f3359D3d3d0F37a988B89A5824885ED8C52a4"
+        }
+      }
+    },
+    "key_functions": [
+      "createIncreasePositionOrder",
+      "createDecreasePositionOrder",
+      "cancelOrder",
+      "addLiquidity",
+      "removeLiquidity",
+      "liquidatePosition"
+    ]
+  },
+  {
+    "name": "Vela Exchange",
+    "type": "perpetuals",
+    "website": "https://vela.exchange",
+    "github": "https://github.com/VelaExchange/vela-exchange-contracts",
+    "npm": null,
+    "tvl_estimate": "$5M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "VELA_Token": "0x088cd8f5eF3652623c22D48b1605DCfE860Cd704",
+          "Vault": "0x2c4478Dd91341Cb50521F2Af7174FB3C73A7DbEC",
+          "PositionVault": "0xce12b20F44E8fD27E4cd67eBc5c4F871400f84e7",
+          "OrderVault": "0x1dd07152b883c1d0A8490A35121A2e559dFE0702"
+        }
+      }
+    },
+    "key_functions": [
+      "newPositionOrder",
+      "addOrRemoveCollateral",
+      "cancelPendingOrder",
+      "addTrailingStop",
+      "deposit",
+      "withdraw",
+      "stake",
+      "unstake"
+    ]
+  },
+  {
+    "name": "Cap Finance",
+    "type": "perpetuals",
+    "website": "https://cap.finance",
+    "github": "https://github.com/capfina/protocol-arbitrum",
+    "npm": null,
+    "tvl_estimate": "$2M",
+    "status": "low activity",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "CAP_Token": "0x031d35296154279DC1984dCd93E392b1f946737b",
+          "Treasury": "0x283C41b726634fBD6B72aA22741B202DB7E56aaC"
+        }
+      }
+    },
+    "key_functions": [
+      "submitOrder",
+      "cancelOrder",
+      "deposit",
+      "withdraw"
+    ]
+  },
+  {
+    "name": "ApolloX (APX Finance)",
+    "type": "perpetuals",
+    "website": "https://apollox.finance",
+    "github": "https://github.com/apollox-finance",
+    "npm": null,
+    "tvl_estimate": "$15M",
+    "status": "active",
+    "chains": {
+      "bsc": {
+        "chainId": 56,
+        "contracts": {
+          "APX_Token": "0x78F5d389F5CDCcFc41594aBaB4b0Ed02F31398b3",
+          "Diamond_V2": "0x1b6F2d3844C6ae7D56ceb3C3643b9060ba28FEb0"
+        }
+      },
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "note": "V2 on-chain perps also deployed on Arbitrum"
+        }
+      }
+    },
+    "key_functions": [
+      "openMarketTrade",
+      "closeTrade",
+      "updateTradeTp",
+      "updateTradeSl",
+      "addMargin",
+      "removeMargin"
+    ]
+  },
+  {
+    "name": "Tigris Trade",
+    "type": "perpetuals",
+    "website": "https://tigris.trade",
+    "github": "https://github.com/Tigris-Trade",
+    "npm": null,
+    "tvl_estimate": "$1M",
+    "status": "low activity",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "Trading": "0x0CC23BF1761C85e010D257F02fd638d4E4221579",
+          "Positions": "0xb75bF135a05665855377a689D39203750CbA6C30",
+          "Stable": "0x7E491F53bF807f836E2dd6C4A4FBd193e1913EFd",
+          "GovNFT": "0x303c470c0e0342a1CCDd70b0a17a14b599FF1474",
+          "PairsContract": "0x0e6E91221C46904563fAfDCc814fbF342BE8Ba20",
+          "StableVault": "0xe82fcefbDD034500B5862B4827CAE5c117f6b921",
+          "Referrals": "0x0A869AF0d5162bF70f9c66f10Cba1795221E4F76",
+          "TIG_Token": "0x3a33473d7990a605a88ac72a78ad4efc40a54adb"
+        }
+      },
+      "polygon": {
+        "chainId": 137,
+        "contracts": {
+          "Trading": "0xCde587E333327fBF887548b3eAf111Fb50D38388",
+          "Positions": "0xBB323fE012BFA1728AF14941D09E479612b64281",
+          "Stable": "0x76973Ba2AFF24F87fFE41FDBfD15308dEBB8f7E8",
+          "GovNFT": "0x5DF98AA475D8815df7cd4fC4549B5c150e8505Be",
+          "PairsContract": "0x64c96eE480ab084D01dC682DB0197a68C664D724",
+          "StableVault": "0x3677415Dc23e49B7780ef46976F418F4a9d5031B",
+          "Referrals": "0xfE4AF289b1a3fA6ac8902031eAD94ff4D57D01f8",
+          "TradingLibrary": "0xAC6454D8132171A8A34132Ec31421eF28eAd2F4f",
+          "Forwarder": "0xF63286c8d0E8C52eB1174ADd961AF03915a4f3fe",
+          "Timelock": "0x7Dd07f52eD1475eBD806d1C5B7B74F34f109479B"
+        }
+      }
+    },
+    "key_functions": [
+      "initiateMarketOrder",
+      "initiateLimitOrder",
+      "cancelLimitOrder",
+      "addToPosition",
+      "removeMargin",
+      "addMargin",
+      "closePosition"
+    ]
+  },
+  {
+    "name": "UniDex",
+    "type": "perpetuals_aggregator",
+    "website": "https://unidex.exchange",
+    "github": "https://github.com/UniDex-Finance",
+    "npm": null,
+    "tvl_estimate": "$2M",
+    "status": "active",
+    "note": "Perps aggregator across 14 chains, splits orders across multiple DEXs (GMX, Gains, MUX, Pika, etc.)",
+    "chains": {
+      "arbitrum": { "chainId": 42161 },
+      "optimism": { "chainId": 10 },
+      "fantom": { "chainId": 250 },
+      "bsc": { "chainId": 56 },
+      "polygon": { "chainId": 137 }
+    },
+    "key_functions": [
+      "submitOrder",
+      "cancelOrder",
+      "closePosition"
+    ]
+  },
+  {
+    "name": "Rage Trade",
+    "type": "perpetuals_delta_neutral",
+    "website": "https://rage.trade",
+    "github": "https://github.com/RageTrade",
+    "npm": null,
+    "tvl_estimate": "$3M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "CurveYieldStrategy": "0x1d42783E7eeacae12EbC315D1D2D0E3C6230a068",
+          "TimelockController": "0x39b54de853d9dca48e928a273c3bb5fa0299540a",
+          "VaultPeriphery": "0x4b928aFd7CA775C7f4ECdf2c00B7e608962AbbDc"
+        }
+      }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "openPosition",
+      "closePosition",
+      "rebalance"
+    ]
+  },
+  {
+    "name": "Buffer Finance",
+    "type": "binary_options_perpetuals",
+    "website": "https://buffer.finance",
+    "github": "https://github.com/Buffer-Finance",
+    "npm": null,
+    "tvl_estimate": "$2M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "BFR_Token": "0x1A5B0aaF478bf1FDA7b934c76E7692D722982a6d",
+          "note": "Trading v2.5 with USDC Pool and ARB Pool; see docs.buffer.finance for full contract list"
+        }
+      }
+    },
+    "key_functions": [
+      "initiateTrade",
+      "resolveQueuedTrades",
+      "cancelQueuedTrade",
+      "deposit",
+      "withdraw"
+    ]
+  },
+  {
+    "name": "Y2K Finance",
+    "type": "catastrophe_derivatives",
+    "website": "https://y2k.finance",
+    "github": "https://github.com/Y2K-Finance",
+    "npm": null,
+    "tvl_estimate": "$5M",
+    "status": "active",
+    "note": "Depeg risk derivatives (Earthquake vaults for stablecoin/wrapper catastrophe insurance)",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "Y2K_Token": "0x65c936f008BC34fE819bce9Fa5aFd9dc2d49977f"
+        }
+      }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "triggerDepeg",
+      "triggerEndEpoch",
+      "createNewMarket"
+    ]
+  },
+  {
+    "name": "Opyn (Squeeth)",
+    "type": "options_power_perpetuals",
+    "website": "https://opyn.co",
+    "github": "https://github.com/opynfinance/squeeth-monorepo",
+    "npm": null,
+    "tvl_estimate": "$10M",
+    "status": "active",
+    "chains": {
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "Controller": "0x64187ae08781B09368e6253F9E94951243A493D5",
+          "WPowerPerp_oSQTH": "0xf1B99e3E573A1a9C5E6B2Ce818b617F0E664E86B",
+          "ShortPowerPerp": "0xa653e22A963ff0026292Cc8B67941c0ba7863a38",
+          "Oracle": "0x65D66c76447ccB45dAf1e8044e918fA786A483A1",
+          "ShortHelper": "0x3b4095D5ff0e629972CAAa50bd3004B09a1632C5",
+          "CrabStrategy": "0xf205ad80BB86ac92247638914265887A8BAa437D",
+          "CrabStrategyV2": "0x3B960E47784150F5a63777201ee2B15253D713e8",
+          "BullStrategy": "0xb46Fb07b0c80DBC3F97cae3BFe168AcaD46dF507",
+          "FlashBullStrategy": "0x11A56a3A7A6Eb768A9125798B1eABE9EBD9EcE02"
+        }
+      }
+    },
+    "key_functions": [
+      "mintPowerPerpAmount",
+      "mintWPowerPerpAmount",
+      "burnWPowerPerp",
+      "deposit",
+      "withdraw",
+      "liquidate",
+      "redeemLong",
+      "redeemShort"
+    ]
+  },
+  {
+    "name": "Hegic",
+    "type": "options",
+    "website": "https://hegic.co",
+    "github": "https://github.com/hegic",
+    "npm": null,
+    "tvl_estimate": "$27M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "HEGIC_Token": "0x431402e8b9dE9aa016C743880e04E517074D8cEC",
+          "HegicV8888_Options": "0x5B53D56c5A63EBBe852D9d911B7886A4338953F1"
+        }
+      },
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "note": "Legacy deployment with ~$1.7M TVL"
+        }
+      }
+    },
+    "key_functions": [
+      "createFor",
+      "exercise",
+      "unlock",
+      "provideEthToPool",
+      "provideToPool",
+      "withdrawFromPool"
+    ]
+  },
+  {
+    "name": "Premia (Premia Blue / v3)",
+    "type": "options",
+    "website": "https://premia.blue",
+    "github": "https://github.com/Premian-Labs",
+    "npm": null,
+    "tvl_estimate": "$10M",
+    "status": "active",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "PremiaBlue_Diamond": "0xa079C6B032133b95Cf8b3d273D27eeb6B110a469",
+          "PREMIA_Token": "0x51fC0F6660482Ea73330e414eFd7808811a57Fa2",
+          "FeeCollector": "0x32248ec445d3c72B42F16B040E55bCD5cF5a8712"
+        }
+      },
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "PremiaBlue_Diamond": "0xc22FAe86443aEed038A4ED887bbA8F5035FD12F0"
+        }
+      }
+    },
+    "key_functions": [
+      "fillQuoteOB",
+      "trade",
+      "exercise",
+      "settle",
+      "annihilate",
+      "deposit",
+      "withdraw",
+      "writeFrom"
+    ]
+  },
+  {
+    "name": "Ribbon Finance / Aevo",
+    "type": "options_structured_products",
+    "website": "https://aevo.xyz",
+    "github": "https://github.com/ribbon-finance/ribbon-v2",
+    "npm": null,
+    "tvl_estimate": "$20M (Aevo exchange)",
+    "status": "Ribbon DOV vaults deprecated (exploited Dec 2024); Aevo is a separate L2 exchange",
+    "chains": {
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "ETH_CoveredCall_Vault": "0x0FABaF48Bbf864a3947bdd0Ba9d764791a60467A",
+          "ETH_PutSelling_Vault": "0xCc323557c71C0D1D20a1861Dc69c06C5f3cC9624",
+          "WBTC_CoveredCall_Vault": "0x8b5876f5B0Bf64056A89Aa7e97511644758c3E8c",
+          "stETH_CoveredCall_Vault": "0x53773e034d9784153471813dacaff53dbBB78E8C",
+          "rETH_THETA_Token": "0x25751853Eab4D0eB3652B5eB6ecB102A2789644B"
+        }
+      }
+    },
+    "key_functions": [
+      "depositETH",
+      "deposit",
+      "initiateWithdraw",
+      "completeWithdraw",
+      "rollToNextOption",
+      "commitAndClose"
+    ]
+  },
+  {
+    "name": "Lyra Finance (Derive)",
+    "type": "options",
+    "website": "https://derive.xyz",
+    "github": "https://github.com/lyra-finance",
+    "npm": "@lyrafinance/lyra-js",
+    "tvl_estimate": "$15M",
+    "status": "active (rebranded to Derive, L2-based CLOB)",
+    "chains": {
+      "optimism": {
+        "chainId": 10,
+        "contracts": {
+          "ARB_LiquidityPool": "0xdD0d125475453767e65f1a4dD30B62699FDcc9f5",
+          "LiquidityPool_Old": "0x7af4e1ce484f40d927b9c90fb6905df4376fc3f6",
+          "LYRA_Token": "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+        }
+      },
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "note": "Options on ETH, WBTC, ARB"
+        }
+      }
+    },
+    "key_functions": [
+      "openPosition",
+      "closePosition",
+      "forceClosePosition",
+      "addCollateral",
+      "liquidatePosition",
+      "initiateDeposit",
+      "initiateWithdraw"
+    ]
+  },
+  {
+    "name": "Dopex / Stryke",
+    "type": "options",
+    "website": "https://stryke.xyz",
+    "github": "https://github.com/dopex-io",
+    "npm": null,
+    "tvl_estimate": "$8M",
+    "status": "active (rebranded from Dopex to Stryke)",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "DPX_Token": "0x6C2C06790b3E3E3c38e12Ee22F8183b37a13EE55",
+          "rDPX_Token": "0x32Eb7902D4134bf98A28b963D26de779AF92A212",
+          "StakingRewards_DPX_WETH": "0x1f80c96ca521d7247a818a09b0b15c38e3e58a28",
+          "SSOV_V3_Example": "0x90788b788a649bd037ef7eba06f52497b987e51e",
+          "note": "DPX and rDPX merging into SYK token; CLAMM products active"
+        }
+      }
+    },
+    "key_functions": [
+      "purchase",
+      "settle",
+      "deposit",
+      "withdraw",
+      "exercise",
+      "compound"
+    ]
+  },
+  {
+    "name": "Synthetix (Synthetics)",
+    "type": "synthetics",
+    "note": "Same protocol as above (Synthetix perpetuals entry), listed here for synthetics specifically",
+    "website": "https://synthetix.io",
+    "github": "https://github.com/Synthetixio/synthetix",
+    "tvl_estimate": "See Synthetix entry above",
+    "chains": {
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "ProxySNX": "0xC011a73ee8576Fb46F5E1c5751cA3B9Fe0af2a6F",
+          "ProxysUSD": "0x57Ab1ec28D129707052df4dF418D58a2D46d5f51"
+        }
+      },
+      "optimism": {
+        "chainId": 10,
+        "contracts": {
+          "ProxySNX": "0x8700dAec35aF8Ff88c16BdF0418774CB3D7599B4"
+        }
+      }
+    },
+    "key_functions": [
+      "issueSynths",
+      "burnSynths",
+      "exchange",
+      "stake",
+      "claim"
+    ]
+  },
+  {
+    "name": "UMA Protocol",
+    "type": "synthetics_oracle",
+    "website": "https://uma.xyz",
+    "github": "https://github.com/UMAprotocol/protocol",
+    "npm": "@uma/core",
+    "tvl_estimate": "$50M",
+    "status": "active",
+    "note": "Optimistic Oracle for synthetics, prediction markets, insurance; contract addresses in github.com/UMAprotocol/protocol/blob/master/packages/core/networks/1.json",
+    "chains": {
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "note": "OptimisticOracleV3, VotingV2, Finder, Store, Governor - addresses in networks/1.json in the UMA repo"
+        }
+      },
+      "optimism": { "chainId": 10 },
+      "arbitrum": { "chainId": 42161 },
+      "polygon": { "chainId": 137 },
+      "bsc": { "chainId": 56 }
+    },
+    "key_functions": [
+      "assertTruth",
+      "disputeAssertion",
+      "settleAssertion",
+      "requestPrice",
+      "proposePrice",
+      "disputePrice",
+      "settle"
+    ]
+  },
+  {
+    "name": "Thales",
+    "type": "binary_options_parimutuel",
+    "website": "https://thalesmarket.io",
+    "github": "https://github.com/thales-markets",
+    "npm": null,
+    "tvl_estimate": "$8M",
+    "status": "active",
+    "chains": {
+      "optimism": {
+        "chainId": 10,
+        "contracts": {
+          "ThalesAMM": "0x278B5A44397c9D8E52743fEdec263c4760dc1A1A",
+          "RangedAMM": "0x2d356b114cbCA8DEFf2d8783EAc2a5A5324fE1dF",
+          "SpeedMarketsAMM": "0xE16B8a01490835EC1e76bAbbB3Cadd8921b32001",
+          "SportsAMM": "0x170a5714112daEfF20E798B6e92e25B86Ea603C1",
+          "ParlayAMM": "0x82B3634C0518507D5d817bE6dAb6233ebE4D68D9",
+          "THALES_Token": "0x217D47011b23BB961eB6D93cA9945B7501a5BB11"
+        }
+      },
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "note": "Also deployed on Arbitrum and Base"
+        }
+      },
+      "base": {
+        "chainId": 8453
+      }
+    },
+    "key_functions": [
+      "buyFromAMM",
+      "sellToAMM",
+      "exerciseOptions",
+      "createMarket",
+      "resolveMarket",
+      "buyFromParlayAMM"
+    ]
+  },
+  {
+    "name": "Polynomial Protocol",
+    "type": "structured_products_perpetuals",
+    "website": "https://polynomial.fi",
+    "github": "https://github.com/polynomialfi",
+    "npm": null,
+    "tvl_estimate": "$5M",
+    "status": "active",
+    "note": "DeFi options vaults (DOV) selling options to Lyra AMM; also building own chain",
+    "chains": {
+      "optimism": {
+        "chainId": 10,
+        "contracts": {
+          "note": "Earn vaults deployed on Optimism; uses Synthetix and Lyra under the hood"
+        }
+      }
+    },
+    "key_functions": [
+      "deposit",
+      "initiateWithdrawal",
+      "completeWithdrawal",
+      "rollToNextRound"
+    ]
+  },
+  {
+    "name": "Sommelier",
+    "type": "structured_products",
+    "website": "https://sommelier.finance",
+    "github": "https://github.com/PeggyJV/cellar-contracts",
+    "npm": null,
+    "tvl_estimate": "$30M",
+    "status": "active",
+    "note": "ERC4626 vaults (Cellars) managed by off-chain strategists via Cosmos SDK bridge",
+    "chains": {
+      "ethereum": {
+        "chainId": 1,
+        "contracts": {
+          "RealYieldETH_Cellar_example": "0xea1a6307d9b18f8d1cbf1c3dd6aad8416c06a221",
+          "note": "Multiple Cellar vaults deployed; each has its own ERC4626 contract address"
+        }
+      },
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "note": "Sommelier vaults also live on Arbitrum via Axelar bridge"
+        }
+      }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "totalAssets",
+      "convertToShares",
+      "convertToAssets",
+      "previewDeposit",
+      "previewWithdraw"
+    ]
+  },
+  {
+    "name": "Cega",
+    "type": "exotic_options_structured_products",
+    "website": "https://cega.fi",
+    "github": "https://github.com/cega-fi",
+    "npm": null,
+    "tvl_estimate": "<$1M (sunsetting)",
+    "status": "deprecated (acquired late 2024, sunsetting platform)",
+    "note": "Exotic options (barrier options, fixed coupon notes) on Ethereum and Arbitrum; no longer accepting deposits",
+    "chains": {
+      "ethereum": { "chainId": 1 },
+      "arbitrum": { "chainId": 42161 }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "rolloverVault"
+    ]
+  },
+  {
+    "name": "Thetanuts Finance",
+    "type": "options_structured_products",
+    "website": "https://thetanuts.finance",
+    "github": "https://github.com/thetanuts",
+    "npm": null,
+    "tvl_estimate": "$5M",
+    "status": "active (v3, working on v4)",
+    "note": "Multi-chain options vaults selling covered calls/puts via blind auctions",
+    "chains": {
+      "ethereum": { "chainId": 1 },
+      "arbitrum": { "chainId": 42161 },
+      "bsc": { "chainId": 56 },
+      "avalanche": { "chainId": 43114 },
+      "polygon": { "chainId": 137 }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "initiateWithdraw",
+      "completeWithdraw"
+    ]
+  },
+  {
+    "name": "Jones DAO",
+    "type": "options_yield_vaults",
+    "website": "https://jonesdao.io",
+    "github": "https://github.com/Jones-DAO",
+    "npm": null,
+    "tvl_estimate": "$8M",
+    "status": "active",
+    "note": "Yield vaults with options strategies; Leveraged GLP and USDC vaults",
+    "chains": {
+      "arbitrum": {
+        "chainId": 42161,
+        "contracts": {
+          "JONES_Token": "0x10393c20975cF177a3513071bC110f7962CD67da"
+        }
+      }
+    },
+    "key_functions": [
+      "deposit",
+      "withdraw",
+      "compound",
+      "rebalance",
+      "emergencyWithdraw"
+    ]
+  }
+]

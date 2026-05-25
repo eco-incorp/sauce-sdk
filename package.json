@@ -1,0 +1,17 @@
+{
+  "name": "sauce-tools",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Sauce protocol tooling: compiler, dev-tools, SDK, and actions",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --filter './compiler' --filter './sdk' --filter './actions' build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "format": "pnpm -r --if-present format"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,1127 @@
+[
+  {
+    "name": "Across Protocol",
+    "website": "https://across.to",
+    "github": "https://github.com/across-protocol/contracts",
+    "npm": "@across-protocol/contracts, @across-protocol/app-sdk, @across-protocol/contracts-v2",
+    "type": "optimistic-oracle-based (intent-based)",
+    "tvlEstimate": "$650M+",
+    "status": "active",
+    "description": "Fast cross-chain bridge using UMA optimistic oracle. Intent-based design with relayers providing upfront capital.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "zkSync Era", "Linea",
+      "Mode", "Blast", "Scroll", "Zora", "Lisk", "World Chain", "AlephZero",
+      "Ink", "Soneium", "Unichain", "Lens", "HyperEVM", "Plasma", "Monad", "MegaETH"
+    ],
+    "keyFunctions": ["deposit", "fillV3Relay", "speedUpV3Deposit", "executeRelayerRefundLeaf"],
+    "contracts": {
+      "ethereum": {
+        "HubPool": "0xc186fA914353c44b2E33eBE05f21846F1048bEda",
+        "SpokePool": "0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5"
+      },
+      "arbitrum": {
+        "SpokePool": "0xe35e9842fceaCA96570B734083f4a58e8F7C5f2A"
+      },
+      "optimism": {
+        "SpokePool": "0x6f26Bf09B1C792e3228e5467807a900A503c0281"
+      },
+      "base": {
+        "SpokePool": "0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64"
+      },
+      "polygon": {
+        "SpokePool": "0x9295ee1d8C5b022Be115A2AD3c30C72E34e7F096"
+      },
+      "zkSync": {
+        "SpokePool": "0xE0B015E54d54fc84a6cB9B666099c46adE9335FF"
+      },
+      "linea": {
+        "SpokePool": "0x7E63A5f1a8F0B4d0934B2f2327DAED3F6bb2ee75"
+      },
+      "mode": {
+        "SpokePool": "0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96"
+      },
+      "blast": {
+        "SpokePool": "0x2D509190Ed0172ba588407D4c2df918F955Cc6E1"
+      },
+      "scroll": {
+        "SpokePool": "0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96"
+      },
+      "zora": {
+        "SpokePool": "0x13fDac9F9b4777705db45291bbFF3c972c6d1d97"
+      },
+      "lisk": {
+        "SpokePool": "0x9552a0a6624A23B848060AE5901659CDDa1f83f8"
+      },
+      "worldChain": {
+        "SpokePool": "0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64"
+      },
+      "alephZero": {
+        "SpokePool": "0x13fDac9F9b4777705db45291bbFF3c972c6d1d97"
+      },
+      "ink": {
+        "SpokePool": "0xeF684C38F94F48775959ECf2012D7E864ffb9dd4"
+      },
+      "soneium": {
+        "SpokePool": "0x3baD7AD0728f9917d1Bf08af5782dCbD516cDd96"
+      },
+      "unichain": {
+        "SpokePool": "0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64"
+      },
+      "lens": {
+        "SpokePool": "0xb234cA484866c811d0e6D3318866F583781ED045"
+      },
+      "hyperEVM": {
+        "SpokePool": "0x35E63eA3eb0fb7A3bc543C71FB66412e1F6B0E04"
+      },
+      "plasma": {
+        "SpokePool": "0x50039fAEfebef707cFD94D6d462fE6D10B39207a"
+      },
+      "monad": {
+        "SpokePool": "0xd2ecb3afe598b746F8123CaE365a598DA831A449"
+      },
+      "megaETH": {
+        "SpokePool": "0x3Db06DA8F0a24A525f314eeC954fC5c6a973d40E"
+      }
+    },
+    "supportedTokens": ["ETH", "WETH", "WBTC", "USDC", "USDT", "DAI", "UMA", "ACX", "BAL", "POOL"]
+  },
+  {
+    "name": "Stargate (LayerZero)",
+    "website": "https://stargate.finance",
+    "github": "https://github.com/stargate-protocol/stargate-v2",
+    "npm": "@stargatefinance/stg-definitions-v2",
+    "type": "liquidity-pool (omnichain)",
+    "tvlEstimate": "$510M+",
+    "status": "active",
+    "description": "Omnichain liquidity transport protocol built on LayerZero. Uses unified liquidity pools with delta algorithm for instant guaranteed finality.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Metis", "Linea", "Scroll", "Mantle", "Kava", "Aurora",
+      "Kaia", "Iota", "Taiko", "Sei", "Flare", "Abstract", "Berachain", "Ink"
+    ],
+    "keyFunctions": ["send", "sendCredits", "taxi", "bus", "ride"],
+    "contracts": {
+      "ethereum": {
+        "endpointId": "30101",
+        "StargatePoolNative": "0x77b2043768d28E9C9aB44E1aBfC95944bcE57931",
+        "StargatePoolUSDC": "0xc026395860Db2d07ee33e05fE50ed7bD583189C7",
+        "StargatePoolUSDT": "0x933597a323Eb81cAe705C5bC29985172fd5A3973",
+        "TokenMessaging": "0x6d6620eFa72948C5f68A3C8646d58C00d3f4A980",
+        "RouterV1": "0x8731d54E9D02c286767d56ac03e8037C07e01e98",
+        "RouterETHV1": "0x150f94B44927F078737562f0fcF3C95c01Cc2376"
+      },
+      "arbitrum": {
+        "endpointId": "30110",
+        "StargatePoolNative": "0xA45B5130f36CDcA45667738e2a258AB09f4A5f7F",
+        "StargatePoolUSDC": "0xe8CDF27AcD73a434D661C84887215F7598e7d0d3",
+        "StargatePoolUSDT": "0xcE8CcA271Ebc0533920C83d39F417ED6A0abB7D0",
+        "TokenMessaging": "0x19cFCE47eD54a88614648DC3f19A5980097007dD"
+      },
+      "optimism": {
+        "endpointId": "30111",
+        "StargatePoolNative": "0xe8CDF27AcD73a434D661C84887215F7598e7d0d3",
+        "StargatePoolUSDC": "0xcE8CcA271Ebc0533920C83d39F417ED6A0abB7D0",
+        "StargatePoolUSDT": "0x19cFCE47eD54a88614648DC3f19A5980097007dD",
+        "TokenMessaging": "0xF1fCb4CBd57B67d683972A59B6a7b1e2E8Bf27E6"
+      },
+      "base": {
+        "endpointId": "30184",
+        "StargatePoolNative": "0xdc181Bd607330aeeBEF6ea62e03e5e1Fb4B6F7C7",
+        "StargatePoolUSDC": "0x27a16dc786820B16E5c9028b75B99F6f604b5d26",
+        "TokenMessaging": "0x5634c4a5FEd09819E3c46D86A965Dd9447d86e47"
+      },
+      "polygon": {
+        "endpointId": "30109",
+        "StargatePoolUSDC": "0x9Aa02D4Fae7F58b8E8f34c66E756cC734DAc7fe4",
+        "StargatePoolUSDT": "0xd47b03ee6d86Cf251ee7860FB2ACf9f91B9fD4d7",
+        "TokenMessaging": "0xD1B10944800BaE86E4B21B10b9C316E031FB2eEf"
+      },
+      "avalanche": {
+        "endpointId": "30106",
+        "StargatePoolUSDC": "0x5634c4a5FEd09819E3c46D86A965Dd9447d86e47",
+        "StargatePoolUSDT": "0x12dC9256Acc9895B076f6638D628382881e62CeE",
+        "TokenMessaging": "0x5c830be4Bb154F2E328bD9E3eB5FEE85Db9a3e9c"
+      },
+      "bnbChain": {
+        "endpointId": "30102",
+        "StargatePoolUSDC": "0x962Bd449E630b0d928f308Ce63f1A21F02576057",
+        "StargatePoolUSDT": "0x138EB30f73BC423c6455C53ADB7D5F6A4a50451b",
+        "TokenMessaging": "0x9c2dc7377717603eB92b2655c5f2E7997a4945BD"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "mETH", "METIS"]
+  },
+  {
+    "name": "LayerZero (Messaging)",
+    "website": "https://layerzero.network",
+    "github": "https://github.com/LayerZero-Labs/LayerZero-v2",
+    "npm": "@layerzerolabs/lz-evm-sdk-v2, @layerzerolabs/lz-evm-oapp-v2",
+    "type": "message-passing (omnichain interoperability)",
+    "tvlEstimate": "N/A (messaging protocol, not a bridge)",
+    "status": "active",
+    "description": "Omnichain interoperability protocol enabling cross-chain messaging. V2 uses decoupled verification and execution with configurable DVNs (Decentralized Verifier Networks).",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Gnosis", "Celo", "Moonbeam", "Harmony", "Scroll", "Linea", "Mantle",
+      "Kaia", "Sei", "Taiko", "Blast", "zkSync", "Metis", "Canto", "40+ chains total"
+    ],
+    "keyFunctions": ["send", "lzSend", "lzReceive", "lzCompose", "quote"],
+    "contracts": {
+      "ethereum": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30101"
+      },
+      "arbitrum": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30110"
+      },
+      "optimism": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30111"
+      },
+      "base": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30184"
+      },
+      "polygon": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30109"
+      },
+      "avalanche": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30106"
+      },
+      "bnbChain": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30102"
+      },
+      "scroll": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30214"
+      },
+      "linea": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30183"
+      },
+      "mantle": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30181"
+      },
+      "fantom": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30112"
+      },
+      "canto": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30159"
+      },
+      "harmony": {
+        "EndpointV2": "0x1a44076050125825900e736c501f859c50fE728c",
+        "endpointId": "30116"
+      },
+      "zkSync": {
+        "EndpointV2": "0xd07C30aF3Ff30D96BDc9c6044958230Eb5b32e1D",
+        "endpointId": "30165"
+      }
+    },
+    "note": "EndpointV2 uses the same address 0x1a44076050125825900e736c501f859c50fE728c on most EVM chains via CREATE2. Some newer chains use 0x6F475642a6e85809B1c36Fa62763669b1b48DD5B."
+  },
+  {
+    "name": "Wormhole",
+    "website": "https://wormhole.com",
+    "github": "https://github.com/wormhole-foundation/wormhole",
+    "npm": "@wormhole-foundation/sdk, @wormhole-foundation/sdk-evm",
+    "type": "message-passing + lock-and-mint (guardian-based)",
+    "tvlEstimate": "$3B+ (Portal bridge)",
+    "status": "active",
+    "description": "Cross-chain messaging protocol secured by a set of 19 Guardians. Supports token transfers via Portal (lock-and-mint) and arbitrary message passing.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Celo", "Moonbeam", "Solana", "Terra", "Sui", "Aptos", "35+ chains"
+    ],
+    "keyFunctions": ["publishMessage", "transferTokens", "completeTransfer", "parseAndVerifyVM"],
+    "contracts": {
+      "ethereum": {
+        "CoreBridge": "0x98f3c9e6E3fAce36bAAd05FE09d375Ef1464288B",
+        "TokenBridge": "0x3ee18B2214AFF97000D974cf647E7C347E8fa585"
+      },
+      "arbitrum": {
+        "CoreBridge": "0xa5f208e072434bC67592E4C49C1B991BA79BCA46",
+        "TokenBridge": "0x0b2402144Bb366A632D14B83F244D2e0e21bD39c"
+      },
+      "optimism": {
+        "CoreBridge": "0xEe91C335eab126dF5fDB3797EA9d6aD93aeC9722",
+        "TokenBridge": "0x1D68124e65faFC907325e3EDbF8c4d84499DAa8b"
+      },
+      "base": {
+        "CoreBridge": "0xbebdb6C8ddC678FfA9f8748f85C815C556Dd8ac6",
+        "TokenBridge": "0x8d2de8d2f73F1F4cAB472AC9A881C9b123C79627"
+      },
+      "polygon": {
+        "CoreBridge": "0x7A4B5a56256163F07b2C80A7cA55aBE66c4ec4d7",
+        "TokenBridge": "0x5a58505a96D1dbf8dF91cB21B54419FC36e93fdE"
+      },
+      "avalanche": {
+        "CoreBridge": "0x54a8e5f9c4CbA08F9943965859F6c34eAF03E26c",
+        "TokenBridge": "0x0e082F06FF657D94310cB8cE8B0D9a04541d8052"
+      },
+      "bnbChain": {
+        "CoreBridge": "0x98f3c9e6E3fAce36bAAd05FE09d375Ef1464288B",
+        "TokenBridge": "0xB6F6D86a8f9879A9c87f643768d9efc38c1Da6E7"
+      }
+    },
+    "supportedTokens": ["ETH", "WETH", "USDC", "USDT", "WBTC", "SOL", "AVAX", "MATIC", "BNB", "many more"]
+  },
+  {
+    "name": "Axelar",
+    "website": "https://axelar.network",
+    "github": "https://github.com/axelarnetwork/axelar-cgp-solidity",
+    "npm": "@axelar-network/axelar-gmp-sdk-solidity, @axelar-network/axelarjs-sdk",
+    "type": "message-passing + cross-chain gateway (validator-based)",
+    "tvlEstimate": "$500M+",
+    "status": "active",
+    "description": "Full-stack cross-chain communication protocol with Proof-of-Stake validator set. Supports General Message Passing (GMP) and Interchain Token Service (ITS).",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Moonbeam", "Celo", "Kava", "Filecoin", "Linea", "Scroll", "Mantle",
+      "60+ chains total"
+    ],
+    "keyFunctions": ["callContract", "callContractWithToken", "execute", "executeWithToken", "sendToken", "interchainTransfer"],
+    "contracts": {
+      "ethereum": {
+        "Gateway": "0x4F4495243837681061C4743b74B3eEdf548D56A5",
+        "GasService": "0x2d5d7d31F671F86C782533cc367F14109a082712",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C",
+        "InterchainTokenFactory": "0x83a93500d23Fbc3e82B410aD07A6a9F7A0670D66"
+      },
+      "arbitrum": {
+        "Gateway": "0xe432150cce91c13a887f7D836923d5597adD8E31",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "optimism": {
+        "Gateway": "0xe432150cce91c13a887f7D836923d5597adD8E31",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "polygon": {
+        "Gateway": "0x6f015F16De9fC8791b234eF68D486d2bF203FBA8",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "avalanche": {
+        "Gateway": "0x5029C0EFf6C34351a0CEc334542cDb22c7928f78",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "bnbChain": {
+        "Gateway": "0x304acf330bbE08d1e512eefaa92F6a57871fD895",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "base": {
+        "Gateway": "0xe432150cce91c13a887f7D836923d5597adD8E31",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "moonbeam": {
+        "Gateway": "0x4F4495243837681061C4743b74B3eEdf548D56A5",
+        "InterchainTokenService": "0xB5FB4BE02232B1bBA4dC8f81dc24C26980dE9e3C"
+      },
+      "shared": {
+        "Create3Deployer": "0x6513Aedb4D1593BA12e50644401D976aebDc90d8",
+        "Create2Deployer": "0x98b2920d53612483f91f12ed7754e51b4a77919e"
+      }
+    },
+    "supportedTokens": ["axlUSDC", "axlWETH", "axlWBTC", "USDC", "USDT", "WETH", "many wrapped tokens"]
+  },
+  {
+    "name": "Hyperlane",
+    "website": "https://www.hyperlane.xyz",
+    "github": "https://github.com/hyperlane-xyz/hyperlane-monorepo",
+    "npm": "@hyperlane-xyz/sdk, @hyperlane-xyz/core",
+    "type": "message-passing (permissionless, modular security)",
+    "tvlEstimate": "$100M+",
+    "status": "active",
+    "description": "Permissionless interoperability protocol. Allows anyone to deploy on any chain. Uses modular security via Interchain Security Modules (ISMs).",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Celo", "Gnosis", "Moonbeam", "Scroll", "Linea", "Blast", "zkSync", "Mantle",
+      "150+ chains total"
+    ],
+    "keyFunctions": ["dispatch", "process", "handle", "quoteDispatch"],
+    "contracts": {
+      "ethereum": { "Mailbox": "0xc005dc82818d67AF737725bD4bf75435d065D239" },
+      "arbitrum": { "Mailbox": "0x979Ca5202784112f4738403dBec5D0F3B9daabB9" },
+      "optimism": { "Mailbox": "0xd4C1905BB1D26BC93DAC913e13CaCC278CdCC80D" },
+      "base": { "Mailbox": "0xeA87ae93Fa0019a82A727bfd3eBd1cFCa8f64f1D" },
+      "polygon": { "Mailbox": "0x5d934f4e2f797775e53561bB72aca21ba36B96BB" },
+      "avalanche": { "Mailbox": "0xFf06aFcaABaDDd1fb08371f9ccA15D73D51FeBD6" },
+      "bnbChain": { "Mailbox": "0x2971b9Aec44bE4eb673DF1B88cDB57b96eefe8a4" },
+      "gnosis": { "Mailbox": "0xaD09d78f4c6b9dA2Ae82b1D34107802d380Bb74f" },
+      "celo": { "Mailbox": "0x50da3B3907A08a24fe4999F4Dcf337E8dC7954bb" },
+      "moonbeam": { "Mailbox": "0x094d03E751f49908080EFf000Dd6FD177fd44CC3" },
+      "scroll": { "Mailbox": "0x2f2aFaE1139Ce54feFC03593FeE8AB2aDF4a85A7" },
+      "linea": { "Mailbox": "0x02d16BC51af6BfD153d67CA61754cF912E82C4d9" },
+      "blast": { "Mailbox": "0x3a867fCfFeC2B790970eeBDC9023E75B0a172aa7" },
+      "zkSync": { "Mailbox": "0x6bD0A2214797Bc81e0b006F7B74d6221BcD8cb6E" },
+      "mantle": { "Mailbox": "0x398633D19f4371e1DB5a8EFE90468eB70B1176AA" },
+      "sei": { "Mailbox": "0x2f2aFaE1139Ce54feFC03593FeE8AB2aDF4a85A7" },
+      "fantom": { "Mailbox": "0x3a867fCfFeC2B790970eeBDC9023E75B0a172aa7" },
+      "taiko": { "Mailbox": "0x28EFBCadA00A7ed6772b3666F3898d276e88CAe3" },
+      "fraxtal": { "Mailbox": "0x2f9DB5616fa3fAd1aB06cB2C906830BA63d135e3" },
+      "ink": { "Mailbox": "0x7f50C5776722630a0024fAE05fDe8b47571D7B39" },
+      "berachain": { "Mailbox": "0x7f50C5776722630a0024fAE05fDe8b47571D7B39" },
+      "worldChain": { "Mailbox": "0x2f2aFaE1139Ce54feFC03593FeE8AB2aDF4a85A7" },
+      "mode": { "Mailbox": "0x2f2aFaE1139Ce54feFC03593FeE8AB2aDF4a85A7" }
+    },
+    "supportedTokens": ["Warp Route tokens - any ERC20 can be made interchain"]
+  },
+  {
+    "name": "Chainlink CCIP",
+    "website": "https://chain.link/cross-chain",
+    "github": "https://github.com/smartcontractkit/ccip",
+    "npm": "@chainlink/contracts-ccip",
+    "type": "message-passing + token-transfer (decentralized oracle network)",
+    "tvlEstimate": "$1B+ (growing rapidly)",
+    "status": "active",
+    "description": "Cross-Chain Interoperability Protocol by Chainlink. Uses decentralized oracle networks with ARM (Anti-fraud Risk Management) network for security.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Wemix", "Kroma", "Gnosis", "Celo", "Metis", "Blast", "Mode", "zkSync",
+      "100+ chains supported"
+    ],
+    "keyFunctions": ["ccipSend", "ccipReceive", "getFee", "getRouter"],
+    "contracts": {
+      "ethereum": {
+        "Router": "0x80226fc0Ee2b096224EeAc085Bb9a8cba1146f7D"
+      },
+      "arbitrum": {
+        "Router": "0x141fa059441E0ca23ce184B6A78bafD2A517DdE8"
+      },
+      "optimism": {
+        "Router": "0x3206695CaE29952f4b0c22a169725a865bc8Ce0f"
+      },
+      "base": {
+        "Router": "0x881e3A65B4d4a04dD529061dd0071cf975F58bCD"
+      },
+      "polygon": {
+        "Router": "0x849c5ED5a80F5B408Dd4969b78c2C8fdf0565Bfe"
+      },
+      "avalanche": {
+        "Router": "0xF4c7E640EdA248ef95972845a62bdC74237805dB"
+      },
+      "bnbChain": {
+        "Router": "0x34B03Cb9086d7D758AC55af71584F81A598759FE"
+      }
+    },
+    "supportedTokens": ["CCIP-BnM", "USDC (via CCTP)", "LINK", "WETH", "and more"]
+  },
+  {
+    "name": "Celer cBridge",
+    "website": "https://cbridge.celer.network",
+    "github": "https://github.com/celer-network/cBridge-contracts",
+    "npm": "@celer-network/contracts",
+    "type": "liquidity-pool + lock-and-mint (SGN validator)",
+    "tvlEstimate": "$150M+",
+    "status": "active",
+    "description": "Cross-chain bridge using State Guardian Network (SGN). Supports both pool-based transfers and canonical token bridging via PegBridge.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Gnosis", "Moonbeam", "Metis", "Aurora", "Astar", "40+ chains"
+    ],
+    "keyFunctions": ["send", "relay", "addLiquidity", "removeLiquidity", "mint", "burn"],
+    "contracts": {
+      "ethereum": {
+        "Bridge": "0x5427FEFA711Eff984124bFBB1AB6fbf5E3DA1820",
+        "OriginalTokenVault": "0xB37D31b2A74029B5951a2778F959282E2D518595",
+        "PeggedTokenBridge": "0x16365b45EB269B5B5dACB34B4a15399Ec79b95eB",
+        "TransferAgent": "0x9b274BC73940d92d0Af292Bde759cbFCCE661a0b"
+      },
+      "arbitrum": {
+        "Bridge": "0x1619DE6B6B20eD217a58d00f37B9d47C7663feca"
+      },
+      "polygon": {
+        "Bridge": "0x88DCDC47D2f83a99CF0000FDF667A468bB958a78"
+      },
+      "avalanche": {
+        "Bridge": "0xef3c714c9425a8F3697A9C969Dc1af30ba82e5d4"
+      },
+      "bnbChain": {
+        "Bridge": "0xdd90E5E87A2081Dcf0391920868eBc2FFB81a1aF"
+      },
+      "optimism": {
+        "Bridge": "0x9D39Fc627A6d9d9F8C831c16995b209548cc3401"
+      },
+      "base": {
+        "Bridge": "0x7d43AABC515C356145049227CeE54B608342c0ad"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "WBTC", "DAI", "many ERC-20s"]
+  },
+  {
+    "name": "Celer IM (Inter-chain Messaging)",
+    "website": "https://im.celer.network",
+    "github": "https://github.com/celer-network/sgn-v2-contracts",
+    "npm": "@celer-network/contracts",
+    "type": "message-passing (SGN validator)",
+    "tvlEstimate": "N/A (messaging layer)",
+    "status": "active",
+    "description": "Inter-chain messaging framework built on top of Celer SGN. Allows arbitrary cross-chain message passing and contract calls.",
+    "supportedChains": ["Same as cBridge - 40+ chains"],
+    "keyFunctions": ["sendMessage", "executeMessage", "sendMessageWithTransfer"],
+    "contracts": {
+      "note": "Uses same SGN infrastructure as cBridge. MessageBus contracts deployed on each chain."
+    }
+  },
+  {
+    "name": "Multichain (Anyswap)",
+    "website": "https://multichain.org",
+    "github": "https://github.com/anyswap/multichain-smart-contracts",
+    "npm": "N/A",
+    "type": "lock-and-mint (MPC-based)",
+    "tvlEstimate": "$0 (DEPRECATED/COMPROMISED)",
+    "status": "DEPRECATED_COMPROMISED",
+    "description": "COMPROMISED - July 2023: $125M+ exploit due to compromised private keys. Previously one of the largest bridges. CEO arrested. DO NOT USE.",
+    "supportedChains": ["Was deployed on 90+ chains - now deprecated"],
+    "keyFunctions": ["anySwapOut", "anySwapIn", "anySwapOutUnderlying"],
+    "contracts": {
+      "ethereum": {
+        "RouterV6": "0x6b7a87899490EcE95443e979cA9485CBE7E71522",
+        "RouterV4": "0x765277EebeCA2e31912C9946eAe1021199B39C61",
+        "note": "DO NOT INTERACT - COMPROMISED"
+      }
+    },
+    "securityIncidents": [
+      "July 2023: $125M+ exploit - MPC keys compromised",
+      "January 2022: Router V3 exploit",
+      "July 2021: V3 router signature exploit"
+    ]
+  },
+  {
+    "name": "Hop Protocol",
+    "website": "https://hop.exchange",
+    "github": "https://github.com/hop-protocol/contracts",
+    "npm": "@hop-protocol/sdk, @hop-protocol/core",
+    "type": "liquidity-pool (AMM-based with hTokens)",
+    "tvlEstimate": "$30M+",
+    "status": "active",
+    "description": "Bridge for L2-to-L2 transfers using hTokens and AMMs. Each supported asset has its own bridge and hToken variant.",
+    "supportedChains": ["Ethereum", "Arbitrum", "Optimism", "Polygon", "Gnosis", "Base", "Linea"],
+    "keyFunctions": ["sendToL2", "swapAndSend", "bondWithdrawal", "distribute"],
+    "contracts": {
+      "ethereum": {
+        "L1_ETH_Bridge": "0xb8901acb165ed027e32754e0ffe830802919727f",
+        "L1_USDC_Bridge": "0x3666f603Cc164936C1b87e207F36BEBa4AC5f18a",
+        "L1_USDT_Bridge": "0x3E4a3a4796d16c0Cd582C382691998f7c06420B6",
+        "L1_DAI_Bridge": "0x3d4Cc8A61c7528Fd86C55cfe061a78dCBA48EDd1",
+        "L1_HOP_Bridge": "0x914f986a44AcB623A277d6Bd17368171FCbe4273"
+      },
+      "optimism": {
+        "L2_USDC_Bridge": "0xa81D244A1814468c734E5b4101F7b9c0c577a8fC",
+        "L2_ETH_Bridge": "0x83f6244Bd87662118d96D9a6D44f09dFdA0370AB"
+      },
+      "arbitrum": {
+        "L2_USDC_Bridge": "0x0e0E3d2C5c292161999474247956EF542cABF8dd",
+        "L2_ETH_Bridge": "0x3749C4f034022c39EcaFfaBA182555d4508CaCCC"
+      },
+      "polygon": {
+        "L2_ETH_Bridge": "0xc315239cfb05f1e130e7e28e603cea4c014c57f0"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "DAI", "MATIC", "HOP", "SNX", "sUSD", "rETH"]
+  },
+  {
+    "name": "Synapse Protocol",
+    "website": "https://synapseprotocol.com",
+    "github": "https://github.com/synapsecns/synapse-contracts",
+    "npm": "@synapsecns/sdk-router",
+    "type": "liquidity-pool + lock-and-mint (AMM-based)",
+    "tvlEstimate": "$122M+",
+    "status": "active",
+    "description": "Cross-chain bridge using AMM pools with nUSD/nETH synthetic assets. Also supports CCTP integration for native USDC.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Canto", "Metis", "Aurora", "Harmony", "Moonbeam", "Cronos", "Boba"
+    ],
+    "keyFunctions": ["deposit", "redeem", "depositAndSwap", "redeemAndSwap", "bridge"],
+    "contracts": {
+      "ethereum": {
+        "SynapseBridge": "0x2796317b0fF8538F253012862c06787Adfb8cEB6",
+        "SynapseCCTPRouter": "0x12715a66773BD9C54534a01aBF01d05F6B4Bd35E"
+      },
+      "arbitrum": {
+        "SynapseBridge": "0x6F4e8eba4d337f874AB57478AcC2Cb5BacDc19c9",
+        "SynapseCCTPRouter": "0x12715a66773BD9C54534a01aBF01d05F6B4Bd35E"
+      },
+      "polygon": {
+        "SynapseBridge": "0x8F5BBB2BB8c2Ee94639E55d5F41de9b4839C1280"
+      },
+      "avalanche": {
+        "SynapseBridge": "0xC05e61d0E7a63D27546389B7aD62FdFf5A91aACE"
+      },
+      "bnbChain": {
+        "SynapseBridge": "0xd123f70AE324d34A9E76b67a27bf77593bA8749f"
+      },
+      "optimism": {
+        "SynapseBridge": "0xAf41a65F786339e7911F4acDAD6BD49426F2Dc6b"
+      },
+      "base": {
+        "SynapseBridge": "0xf07d1C752fAb503E47FEF309bf14fbDD3E867089"
+      }
+    },
+    "supportedTokens": ["ETH", "nETH", "USDC", "nUSD", "USDT", "DAI", "WBTC", "SYN", "gOHM"]
+  },
+  {
+    "name": "Connext (now Everclear)",
+    "website": "https://www.connext.network",
+    "github": "https://github.com/connext/monorepo",
+    "npm": "@connext/sdk, @connext/smart-contracts",
+    "type": "intent-based (netting and clearing layer)",
+    "tvlEstimate": "$50M+",
+    "status": "active (rebranded to Everclear)",
+    "description": "Cross-chain liquidity protocol rebranded to Everclear. Uses intent-based architecture with clearing layer for netting cross-chain settlements.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "BNB Chain", "Gnosis",
+      "Linea", "Metis", "Mode", "Blast", "Scroll", "zkSync", "Mantle", "Avalanche",
+      "Taiko", "Zircuit", "Berachain", "Sonic", "Ink", "Unichain", "Ronin", "Apechain"
+    ],
+    "keyFunctions": ["xcall", "execute", "reconcile", "newIntent", "fillIntent"],
+    "contracts": {
+      "hub": {
+        "chainId": 25327,
+        "EverclearHub": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "HubGateway": "0xEFfAB7cCEBF63FbEFB4884964b12259d4374FaAa"
+      },
+      "ethereum": {
+        "EverclearSpoke": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "SpokeGateway": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7"
+      },
+      "arbitrum": {
+        "EverclearSpoke": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "SpokeGateway": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7"
+      },
+      "optimism": {
+        "EverclearSpoke": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "SpokeGateway": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7"
+      },
+      "base": {
+        "EverclearSpoke": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "SpokeGateway": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7"
+      },
+      "polygon": {
+        "EverclearSpoke": "0x7189C59e245135696bFd2906b56607755F84F3fD",
+        "SpokeGateway": "0x26CFF54f11608Cd3060408690803AB4a43f462f2"
+      },
+      "bnbChain": {
+        "EverclearSpoke": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "SpokeGateway": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7"
+      },
+      "linea": {
+        "EverclearSpoke": "0xc24dC29774fD2c1c0c5FA31325Bb9cbC11D8b751",
+        "SpokeGateway": "0xC1E5b7bE6c62948eeAb40523B33e5d0121ccae94"
+      },
+      "blast": {
+        "EverclearSpoke": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7",
+        "SpokeGateway": "0x4e2bbbFb10058E0D248a78fe2F469562f4eDbe66"
+      },
+      "scroll": {
+        "EverclearSpoke": "0xa05A3380889115bf313f1Db9d5f335157Be4D816",
+        "SpokeGateway": "0x9ADA72CCbAfe94248aFaDE6B604D1bEAacc899A7"
+      },
+      "zkSync": {
+        "EverclearSpoke": "0x7F5e085981C93C579c865554B9b723B058AaE4D3",
+        "SpokeGateway": "0xbD82E5503461913a70566E66a454465a46F5C903"
+      },
+      "gnosis": {
+        "EverclearSpoke": "0xe0F010e465f15dcD42098dF9b99F1038c11B3056",
+        "SpokeGateway": "0xeFa6Ac3F931620fD0449eC8c619f2A14A0A78E99"
+      },
+      "mantle": {
+        "EverclearSpoke": "0xe0F010e465f15dcD42098dF9b99F1038c11B3056",
+        "SpokeGateway": "0xeFa6Ac3F931620fD0449eC8c619f2A14A0A78E99"
+      },
+      "avalanche": {
+        "EverclearSpoke": "0x9aA2Ecad5C77dfcB4f34893993f313ec4a370460",
+        "SpokeGateway": "0x7EB63a646721de65eBa79ffe91c55DCE52b73c12"
+      }
+    },
+    "supportedTokens": ["USDC", "USDT", "WETH", "DAI", "NEXT/CLEAR"]
+  },
+  {
+    "name": "deBridge",
+    "website": "https://debridge.finance",
+    "github": "https://github.com/debridge-finance/dln-contracts",
+    "npm": "@debridge-finance/dln-client",
+    "type": "intent-based (DLN - deBridge Liquidity Network)",
+    "tvlEstimate": "$50M+",
+    "status": "active",
+    "description": "Cross-chain trading protocol with 0-TVL architecture. Uses intent-based DLN where takers fill orders on destination chains.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Linea", "Solana", "Sonic"
+    ],
+    "keyFunctions": ["createOrder", "fulfillOrder", "claimUnlock", "cancelOrder"],
+    "contracts": {
+      "allEVMChains": {
+        "DlnSource": "0xeF4fB24aD0916217251F553c0596F8Edc630EB66",
+        "DlnDestination": "0xE7351Fd770A37282b91D153Ee690B63579D6dd7f",
+        "note": "Same addresses deployed across Ethereum(1), BNB(56), Polygon(137), Fantom(250), Arbitrum(42161), Avalanche(43114), Linea(59144), Optimism(10), Base(8453)"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "WBTC", "DAI", "SOL"]
+  },
+  {
+    "name": "Orbiter Finance",
+    "website": "https://www.orbiter.finance",
+    "github": "https://github.com/Orbiter-Finance",
+    "npm": "N/A",
+    "type": "maker-based (EOA transfer with identification codes)",
+    "tvlEstimate": "$30M+",
+    "status": "active",
+    "description": "Cross-rollup bridge using maker model. Transfers are EOA-to-EOA with identification codes appended to amounts. Extremely fast for rollup-to-rollup.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "zkSync Era", "Linea",
+      "Scroll", "StarkNet", "BNB Chain", "Mantle", "Taiko", "Blast", "Mode", "Manta",
+      "19+ chains"
+    ],
+    "keyFunctions": ["transfer (with trailing identification code)", "claim"],
+    "contracts": {
+      "ethereum": {
+        "Bridge1": "0x80C67432656d59144cEFf962E8fAF8926599bCF8",
+        "Bridge2": "0xe4eDb277e41dc89aB076a1F049F4a3EfA700bce8",
+        "Bridge3": "0x3bDB03ad7363152DFBc185Ee23eBC93F0CF93fd1",
+        "Bridge4": "0xACc517ea627CEb71Cf25e002AdAa9761623837b9",
+        "note": "Orbiter uses EOA maker addresses, not traditional bridge contracts"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "DAI"]
+  },
+  {
+    "name": "Rhino.fi (formerly DeversiFi)",
+    "website": "https://rhino.fi",
+    "github": "https://github.com/rhinofi",
+    "npm": "N/A",
+    "type": "liquidity-layer (StarkEx-based)",
+    "tvlEstimate": "$20M+",
+    "status": "active",
+    "description": "Cross-chain liquidity layer for stablecoins. Built on StarkEx L2 with multi-chain bridge infrastructure.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "BNB Chain",
+      "zkSync Era", "Linea", "Scroll"
+    ],
+    "keyFunctions": ["bridge", "swap"],
+    "contracts": {
+      "ethereum": {
+        "Bridge": "0x5d22045DAcEAB03B158031eCB7D9d06Fad24609b",
+        "StarkExContract": "0xaf8ae6955d07776ab690e565ba6fbc79b8de3a5d"
+      },
+      "bnbChain": {
+        "Bridge": "0xb80a582fa430645a043bb4f6135321ee01005fef"
+      }
+    },
+    "supportedTokens": ["USDC", "USDT", "DAI", "ETH", "WBTC"]
+  },
+  {
+    "name": "Socket (Bungee)",
+    "website": "https://www.socket.tech",
+    "github": "https://github.com/SocketDotTech/bungee-contracts-public",
+    "npm": "@socket.tech/socket-v2-sdk",
+    "type": "aggregator (meta-bridge)",
+    "tvlEstimate": "N/A (aggregator)",
+    "status": "active",
+    "description": "Bridge aggregator that routes through multiple bridges (Stargate, Across, Hop, Celer, etc.) to find optimal routes. Uses modular route system.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Gnosis", "Aurora", "15+ chains"
+    ],
+    "keyFunctions": ["bridge (via routes)", "swap"],
+    "contracts": {
+      "multichain": {
+        "SocketGateway": "0x3a23F943181408EAC424116Af7b7790c94Cb97a5",
+        "note": "Same address on Ethereum, Arbitrum, Avalanche, Base, BSC, Optimism, Polygon, Fantom, and more"
+      },
+      "bungee": {
+        "BungeeGateway_Ethereum": "0xe772551F88E2c14aEcC880dF6b7CBd574561bf82",
+        "BungeeGateway_Arbitrum": "0xCdEa28Ee7BD5bf7710B294d9391e1b6A318d809a",
+        "BungeeGateway_Base": "0x84F06fBaCc4b64CA2f72a4B26191DAD97f2b52BA",
+        "BungeeInbox": "0x5e0f8e7337c8955d2124b8e85ca74af884b3e124",
+        "BungeeDepository": "0xa6cd293ba20873b3cbbbf78f156a1d56d8ab9347"
+      },
+      "deployment": {
+        "SocketDeployFactory": "0x71630095e3F08A86aFC73f7b07342192adf39C55"
+      }
+    },
+    "supportedTokens": ["Any token supported by underlying bridges"]
+  },
+  {
+    "name": "LI.FI",
+    "website": "https://li.fi",
+    "github": "https://github.com/lifinance/contracts",
+    "npm": "@lifi/sdk, @lifi/widget",
+    "type": "aggregator (meta-bridge + DEX aggregator)",
+    "tvlEstimate": "N/A (aggregator)",
+    "status": "active",
+    "description": "Cross-chain bridge and DEX aggregator. Uses Diamond proxy pattern to integrate multiple bridges and DEXes in a single contract.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Gnosis", "Moonbeam", "Celo", "zkSync", "Linea", "Scroll", "Mantle",
+      "25+ EVM mainnets, 40+ networks total"
+    ],
+    "keyFunctions": ["swapAndStartBridgeTokensVia*", "startBridgeTokensVia*"],
+    "contracts": {
+      "mostChains": {
+        "LiFiDiamond": "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
+        "note": "Same address on most chains including Ethereum, Arbitrum, Optimism, Base, Polygon, BSC, Avalanche, Fantom, Scroll"
+      },
+      "linea": {
+        "LiFiDiamond": "0xDE1E598b81620773454588B85D6b5D4eEC32573e"
+      }
+    },
+    "supportedTokens": ["Any token supported by underlying bridges and DEXes"]
+  },
+  {
+    "name": "Squid Router",
+    "website": "https://www.squidrouter.com",
+    "github": "https://github.com/0xsquid/squid-sdk",
+    "npm": "@0xsquid/sdk",
+    "type": "cross-chain swap router (built on Axelar GMP)",
+    "tvlEstimate": "N/A (routing layer)",
+    "status": "active",
+    "description": "Cross-chain swap and liquidity routing protocol built on Axelar. Routes through DEXes on source and destination chains with Axelar bridging in between.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Moonbeam", "Celo", "Kava", "Filecoin", "Linea", "Scroll",
+      "60+ chains supported via Axelar"
+    ],
+    "keyFunctions": ["callBridgeCall", "bridgeCall", "fundAndRunMulticall"],
+    "contracts": {
+      "multichain": {
+        "SquidRouter": "0xce16F69375520ab01377ce7B88f5BA8C48F8D666",
+        "note": "Same address deployed across Ethereum, Polygon, Arbitrum, Optimism, Base, Avalanche, BNB Chain, and more via Axelar"
+      }
+    },
+    "supportedTokens": ["Any token available on connected DEXes"]
+  },
+  {
+    "name": "Router Protocol",
+    "website": "https://www.routerprotocol.com",
+    "github": "https://github.com/router-protocol",
+    "npm": "@routerprotocol/evm-gateway-contracts",
+    "type": "message-passing + cross-chain swaps (validator-based)",
+    "tvlEstimate": "$30M+",
+    "status": "active",
+    "description": "Cross-chain infrastructure with Router Chain as hub. Supports CrossTalk for messaging and Nitro for asset transfers.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Fantom", "Scroll", "Linea", "Mantle", "20+ chains"
+    ],
+    "keyFunctions": ["iSend", "iReceive", "iAck", "transferTokens"],
+    "contracts": {
+      "note": "Gateway contracts deployed per chain. See docs.routerprotocol.com/reference/contract-addresses for complete list."
+    }
+  },
+  {
+    "name": "Allbridge",
+    "website": "https://allbridge.io",
+    "github": "https://github.com/allbridge-io",
+    "npm": "@allbridge/bridge-core-sdk",
+    "type": "liquidity-pool + lock-and-mint",
+    "tvlEstimate": "$40M+",
+    "status": "active",
+    "description": "Cross-chain bridge supporting both Classic (lock-and-mint) and Core (liquidity pool) modes. Uses own AMB, Circle CCTP, or Wormhole for messaging.",
+    "supportedChains": [
+      "Ethereum", "Arbitrum", "Optimism", "Base", "Polygon", "Avalanche", "BNB Chain",
+      "Solana", "Tron", "Celo", "Stellar"
+    ],
+    "keyFunctions": ["bridge", "swap", "addLiquidity"],
+    "contracts": {
+      "note": "Contract addresses vary by chain and bridge mode (Classic vs Core). See docs-core.allbridge.io for details."
+    },
+    "supportedTokens": ["USDC", "USDT", "DAI", "BUSD", "ABR"]
+  },
+  {
+    "name": "Poly Network",
+    "website": "https://www.poly.network",
+    "github": "https://github.com/polynetwork",
+    "npm": "N/A",
+    "type": "lock-and-mint (relay chain)",
+    "tvlEstimate": "$0 (COMPROMISED/DEPRECATED)",
+    "status": "DEPRECATED_COMPROMISED",
+    "description": "COMPROMISED - Hacked twice: August 2021 ($611M exploit, funds returned) and July 2023 (private keys compromised, 57 assets on 10 chains affected). DO NOT USE.",
+    "supportedChains": ["Was deployed on Ethereum, BNB, Polygon, Avalanche, Heco, OKX, Metis, and more"],
+    "keyFunctions": ["lock", "unlock"],
+    "contracts": {
+      "ethereum": {
+        "LockProxy": "0x250E76987D838A75310C34BF422EA9F1AC4CC906",
+        "note": "DO NOT INTERACT - COMPROMISED"
+      },
+      "bnbChain": {
+        "LockProxy": "0x2f7ac9436ba4B548f9582af91CA1Ef02cd2F1f03",
+        "note": "DO NOT INTERACT - COMPROMISED"
+      }
+    },
+    "securityIncidents": [
+      "August 2021: $611M exploit (funds returned by hacker)",
+      "July 2023: Private keys compromised, 57 crypto assets on 10 blockchains affected"
+    ]
+  },
+  {
+    "name": "Gnosis Bridge (AMB / Omnibridge)",
+    "website": "https://bridge.gnosischain.com",
+    "github": "https://github.com/omni/tokenbridge-contracts",
+    "npm": "N/A",
+    "type": "lock-and-mint + message-passing (validator-based AMB)",
+    "tvlEstimate": "$100M+",
+    "status": "active",
+    "description": "Native bridge for Gnosis Chain (formerly xDai). Includes xDai Bridge (DAI<->xDAI), Omnibridge (arbitrary ERC-20s), and AMB (Arbitrary Message Bridge).",
+    "supportedChains": ["Ethereum", "Gnosis Chain"],
+    "keyFunctions": ["relayTokens", "requireToPassMessage", "executeAffirmation"],
+    "contracts": {
+      "ethereum": {
+        "AMB": "0x4C36d2919e407f0Cc2Ee3c993ccF8ac26d9CE64e",
+        "xDaiBridge": "0x4aa42145Aa6Ebf72e164C9bBC74fbD3788045016",
+        "Omnibridge": "0x88ad09518695c6c3712AC10a214bE5109a655671"
+      },
+      "gnosisChain": {
+        "AMB": "0x75Df5AF045d91108662D8080fD1FEFAd6aA0bb59",
+        "Omnibridge": "0xf6A78083ca3e2a662D6dd1703c939c8aCE2e268d"
+      }
+    },
+    "supportedTokens": ["DAI/xDAI", "Any ERC-20 via Omnibridge"]
+  },
+  {
+    "name": "Polygon PoS Bridge",
+    "website": "https://portal.polygon.technology/bridge",
+    "github": "https://github.com/maticnetwork/pos-portal",
+    "npm": "@maticnetwork/maticjs, @maticnetwork/maticjs-pos",
+    "type": "lock-and-mint (PoS validator checkpoint)",
+    "tvlEstimate": "$2B+",
+    "status": "active",
+    "description": "Native bridge for Polygon PoS. Uses validator checkpoints for security. Supports ETH, ERC-20, ERC-721, and ERC-1155 tokens.",
+    "supportedChains": ["Ethereum", "Polygon PoS"],
+    "keyFunctions": ["depositEtherFor", "depositFor", "exit", "processExits"],
+    "contracts": {
+      "ethereum": {
+        "RootChainManager": "0xA0c68C638235ee32657e8f720a23ceC1bFc77C77",
+        "ERC20Predicate": "0x40ec5B33f54e0E8A33A975908C5BA1c14e5BbbDf",
+        "EtherPredicate": "0x8484Ef722627bf18ca5Ae6BcF031c23E6e922B30",
+        "RootChain": "0x86E4Dc95c7FBdBf52e33D563BbDB00823894C287"
+      }
+    },
+    "supportedTokens": ["ETH", "MATIC", "USDC", "USDT", "DAI", "WBTC", "AAVE", "LINK", "any ERC-20/721/1155"]
+  },
+  {
+    "name": "Polygon zkEVM Bridge",
+    "website": "https://portal.polygon.technology",
+    "github": "https://github.com/0xPolygonHermez/zkevm-contracts",
+    "npm": "@0xpolygonhermez/zkevm-contracts",
+    "type": "lock-and-mint (ZK-proof verified)",
+    "tvlEstimate": "$50M+",
+    "status": "active",
+    "description": "Native bridge for Polygon zkEVM. Uses zero-knowledge proofs for verification. Supports ETH and ERC-20 tokens.",
+    "supportedChains": ["Ethereum", "Polygon zkEVM"],
+    "keyFunctions": ["bridgeAsset", "bridgeMessage", "claimAsset", "claimMessage"],
+    "contracts": {
+      "ethereum": {
+        "PolygonZkEVMBridge": "0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe"
+      },
+      "polygonZkEVM": {
+        "PolygonZkEVMBridge": "0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "DAI", "WBTC", "MATIC", "any ERC-20"]
+  },
+  {
+    "name": "Arbitrum Bridge (Native)",
+    "website": "https://bridge.arbitrum.io",
+    "github": "https://github.com/OffchainLabs/token-bridge-contracts",
+    "npm": "@arbitrum/sdk",
+    "type": "lock-and-mint (optimistic rollup, 7-day withdrawal)",
+    "tvlEstimate": "$10B+",
+    "status": "active",
+    "description": "Native canonical bridge for Arbitrum One. Uses optimistic fraud proofs with 7-day withdrawal period. Supports ETH and ERC-20 via Gateway Router.",
+    "supportedChains": ["Ethereum", "Arbitrum One", "Arbitrum Nova"],
+    "keyFunctions": ["depositEth", "outboundTransfer", "finalizeInboundTransfer", "createRetryableTicket"],
+    "contracts": {
+      "ethereum": {
+        "L1GatewayRouter": "0x72Ce9c846789fdB6fC1f34aC4AD25Dd9ef7031ef",
+        "L1ERC20Gateway": "0xa3A7B6F88361F48403514059F1F16C8E78d60EeC",
+        "L1CustomGateway": "0xcEe284F754E854890e311e3280b767F80797180d",
+        "L1WethGateway": "0xd92023E9d9911199a6711321D1277285e6d4e2db",
+        "Inbox": "0x4Dbd4fc535Ac27206064B68FfCf827b0A60BAB3f",
+        "SequencerInbox": "0x1c479675ad559DC151F6Ec7ed3FbF8ceE79582B6",
+        "Bridge": "0x8315177aB297bA92A06054cE80a67Ed4DBd7ed3a",
+        "Outbox": "0x0B9857ae2D4A3DBe74ffE1d7DF045bb7F96E4840",
+        "RollupCore": "0x5eF0D09d1E6204141B4d37530808eD19f60FBa35"
+      },
+      "arbitrum": {
+        "L2GatewayRouter": "0x5288c571Fd7aD117beA99bF60FE0846C4E84F933",
+        "L2ERC20Gateway": "0x09e9222E96E7B4AE2a407B98d48e330053351EEe",
+        "ArbSys": "0x0000000000000000000000000000000000000064"
+      }
+    },
+    "supportedTokens": ["ETH", "Any ERC-20 via Gateway Router"]
+  },
+  {
+    "name": "Optimism Bridge (Native)",
+    "website": "https://app.optimism.io/bridge",
+    "github": "https://github.com/ethereum-optimism/optimism",
+    "npm": "@eth-optimism/sdk",
+    "type": "lock-and-mint (optimistic rollup, 7-day withdrawal)",
+    "tvlEstimate": "$8B+",
+    "status": "active",
+    "description": "Native canonical bridge for OP Mainnet. Uses Bedrock architecture with L1StandardBridge and CrossDomainMessenger. 7-day withdrawal period.",
+    "supportedChains": ["Ethereum", "OP Mainnet"],
+    "keyFunctions": ["depositETH", "depositERC20", "bridgeETH", "bridgeERC20", "finalizeWithdrawalTransaction"],
+    "contracts": {
+      "ethereum": {
+        "L1StandardBridge": "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",
+        "L1CrossDomainMessenger": "0x25ace71c97B33Cc4729CF772ae268934F7ab5fA1",
+        "OptimismPortal": "0xbEb5Fc579115071764c7423A4f12eDde41f106Ed",
+        "L2OutputOracle": "0xdfe97868233d1aa22e815a266982f2cf17685a27"
+      },
+      "optimism": {
+        "L2StandardBridge": "0x4200000000000000000000000000000000000010",
+        "L2CrossDomainMessenger": "0x4200000000000000000000000000000000000007",
+        "L2ToL1MessagePasser": "0x4200000000000000000000000000000000000016"
+      }
+    },
+    "supportedTokens": ["ETH", "Any ERC-20 via Standard Bridge"]
+  },
+  {
+    "name": "Base Bridge (Native)",
+    "website": "https://bridge.base.org",
+    "github": "https://github.com/base-org/contracts",
+    "npm": "N/A (uses @eth-optimism/sdk)",
+    "type": "lock-and-mint (OP Stack, 7-day withdrawal)",
+    "tvlEstimate": "$7B+",
+    "status": "active",
+    "description": "Native canonical bridge for Base (Coinbase L2). Built on OP Stack, shares architecture with Optimism bridge.",
+    "supportedChains": ["Ethereum", "Base"],
+    "keyFunctions": ["depositETH", "depositERC20", "bridgeETH", "bridgeERC20"],
+    "contracts": {
+      "ethereum": {
+        "L1StandardBridge": "0x3154Cf16ccdb4C6d922629664174b904d80F2C35",
+        "L1CrossDomainMessenger": "0x866E82a600A1414e583f7F13623F1aC5d58b0Afa",
+        "OptimismPortal": "0x49048044D57e1C92A77f79988d21Fa8fAF36C51B"
+      },
+      "base": {
+        "L2StandardBridge": "0x4200000000000000000000000000000000000010",
+        "L2CrossDomainMessenger": "0x4200000000000000000000000000000000000007"
+      }
+    },
+    "supportedTokens": ["ETH", "Any ERC-20 via Standard Bridge"]
+  },
+  {
+    "name": "zkSync Bridge (Native)",
+    "website": "https://bridge.zksync.io",
+    "github": "https://github.com/matter-labs/era-contracts",
+    "npm": "zksync-ethers",
+    "type": "lock-and-mint (ZK rollup, instant verification)",
+    "tvlEstimate": "$1B+",
+    "status": "active",
+    "description": "Native canonical bridge for zkSync Era. Uses zero-knowledge proofs for verification. Deposits are fast, withdrawals require proof generation.",
+    "supportedChains": ["Ethereum", "zkSync Era"],
+    "keyFunctions": ["deposit", "requestL2Transaction", "finalizeWithdrawal", "l2TransactionBaseCost"],
+    "contracts": {
+      "ethereum": {
+        "DiamondProxy": "0x32400084C286CF3E17e7B677ea9583e60a000324",
+        "L1SharedBridge": "0xD7f9f54194C633F36CCD5F3da84ad4a1c38cB2cB",
+        "Bridgehub": "0x303a465B659cBB0ab36eE643eA362c509EEb5213",
+        "ValidatorTimelock": "0x5D8ba173Dc6C3c90C8f7C04C9288BeF5FDbAd06E"
+      },
+      "zkSync": {
+        "L2SharedBridge": "0x11f943b2c77b743AB90f4A0Ae7d5A4e7FCA3E102"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "DAI", "WBTC", "any ERC-20"]
+  },
+  {
+    "name": "Scroll Bridge (Native)",
+    "website": "https://scroll.io/bridge",
+    "github": "https://github.com/scroll-tech/scroll",
+    "npm": "N/A",
+    "type": "lock-and-mint (ZK rollup)",
+    "tvlEstimate": "$500M+",
+    "status": "active",
+    "description": "Native canonical bridge for Scroll. Uses zkEVM with ZK proofs for verification.",
+    "supportedChains": ["Ethereum", "Scroll"],
+    "keyFunctions": ["sendMessage", "relayMessageWithProof", "depositETH", "depositERC20"],
+    "contracts": {
+      "ethereum": {
+        "L1ScrollMessenger": "0x6774Bcbd5ceCeF1336b5300fb5186a12DDD8b367",
+        "L1GatewayRouter": "0xF8B1378579659D8F7EE5f3C929c2f3E332E41Fd6",
+        "ScrollChain": "0xa13BAF47339d63B743e7Da8741db5456DAc1E556",
+        "L1ETHGateway": "0x7F2b8C31F88B6006c382775eea88297Ec1e3E905",
+        "L1StandardERC20Gateway": "0xD8A791fE2bE73eb6E6cF1eb0cb3F36adC9B3F8f9"
+      },
+      "scroll": {
+        "L2ScrollMessenger": "0x781e90f1c8Fc4611c9b7497C3B47F99Ef6969CbC",
+        "L2GatewayRouter": "0x4C0926FF5252A435FD19e10ED15e5a249Ba19d79"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "DAI", "WBTC", "any ERC-20"]
+  },
+  {
+    "name": "Linea Bridge (Native)",
+    "website": "https://linea.build/hub/bridge",
+    "github": "https://github.com/Consensys/linea-contracts",
+    "npm": "@consensys/linea-sdk",
+    "type": "lock-and-mint (ZK rollup)",
+    "tvlEstimate": "$500M+",
+    "status": "active",
+    "description": "Native canonical bridge for Linea (Consensys zkEVM). Uses zero-knowledge proofs for verification.",
+    "supportedChains": ["Ethereum", "Linea"],
+    "keyFunctions": ["sendMessage", "claimMessage", "bridgeToken"],
+    "contracts": {
+      "ethereum": {
+        "L1MessageService": "0xd19d4B5d358258f05D7B411E21A1460D11B0876F",
+        "TokenBridge": "0x051F1D88f0aF5763fB888eC4378b4D8B29ea3319"
+      },
+      "linea": {
+        "L2MessageService": "0x508Ca82Df566dCD1B0DE8296e70a96332cD644ec"
+      }
+    },
+    "supportedTokens": ["ETH", "USDC", "USDT", "DAI", "WBTC", "any ERC-20"]
+  },
+  {
+    "name": "Mantle Bridge (Native)",
+    "website": "https://app.mantle.xyz/bridge",
+    "github": "https://github.com/mantlenetworkio/mantle",
+    "npm": "@mantleio/sdk",
+    "type": "lock-and-mint (optimistic rollup, OP Stack fork)",
+    "tvlEstimate": "$1B+",
+    "status": "active",
+    "description": "Native canonical bridge for Mantle Network. Forked from OP Stack with modifications for MNT gas token.",
+    "supportedChains": ["Ethereum", "Mantle"],
+    "keyFunctions": ["depositETH", "depositERC20", "bridgeETH", "bridgeERC20"],
+    "contracts": {
+      "ethereum": {
+        "L1StandardBridge": "0x95fC37A27a2f68e3A647CDc081F0A89BB47c3012",
+        "MNTToken": "0x3c3a81e81dc49A522A592e7622A7E711c06bf354"
+      },
+      "mantle": {
+        "L2StandardBridge": "0x4200000000000000000000000000000000000010"
+      }
+    },
+    "supportedTokens": ["ETH", "MNT", "USDC", "USDT", "WBTC", "any ERC-20"]
+  },
+  {
+    "name": "Blast Bridge (Native)",
+    "website": "https://blast.io/bridge",
+    "github": "https://github.com/blast-io/blast",
+    "npm": "N/A",
+    "type": "lock-and-mint (optimistic rollup, yield-bearing)",
+    "tvlEstimate": "$1B+",
+    "status": "active",
+    "description": "Native canonical bridge for Blast L2. Deposits earn native yield via staking ETH (Lido) and lending stablecoins (MakerDAO T-Bills).",
+    "supportedChains": ["Ethereum", "Blast"],
+    "keyFunctions": ["depositETH", "depositERC20", "bridgeETH"],
+    "contracts": {
+      "ethereum": {
+        "L1BlastBridge": "0x3a05E5d33d7Ab3864D53aaEc93c8301C1Fa49115",
+        "L1StandardBridge": "0x697402166Fbf2F22E970df8a6486Ef171dbfc524",
+        "OptimismPortal": "0x0Ec68c5B10F21EFFb74f996F8cD0321e62dbfCF0"
+      },
+      "blast": {
+        "L2StandardBridge": "0x4200000000000000000000000000000000000010"
+      }
+    },
+    "supportedTokens": ["ETH", "USDB", "WETH", "DAI", "USDC", "USDT"]
+  }
+]

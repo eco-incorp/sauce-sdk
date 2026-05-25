@@ -1,0 +1,124 @@
+import { compile } from '../src/index.js';
+import { OPS } from '../src/saucer/index.js';
+
+describe('index', () => {
+  it('compiles array index with literal', () => {
+    const result = compile('function main() { const arr = [1, 2, 3]; const x = arr[0]; }');
+    // ALLOCATE_VALUE, 1 (for x),
+    // ALLOCATE_HEAP, 1 (for arr),
+    // WRITE_HEAP, 0, ARRAY, 3, BYTE_1, 1, 2, 3,
+    // WRITE_VALUE, 0, INDEX, BYTE_1, 0, READ_HEAP, 0
+    expect(result.bytecode[0]).toEqual(
+      new Uint8Array([
+        OPS.ALLOCATE_VALUE,
+        1,
+        OPS.ALLOCATE_HEAP,
+        1,
+        OPS.WRITE_HEAP,
+        0,
+        OPS.ARRAY,
+        3,
+        OPS.BYTE_1,
+        1,
+        2,
+        3,
+        OPS.WRITE_VALUE,
+        0,
+        OPS.INDEX,
+        OPS.BYTE_1,
+        0,
+        OPS.READ_HEAP,
+        0,
+      ]),
+    );
+  });
+
+  it('compiles string index with literal', () => {
+    const result = compile('function main() { const s = "abc"; const c = s[1]; }');
+    // ALLOCATE_VALUE, 1 (for c),
+    // ALLOCATE_HEAP, 1 (for s),
+    // WRITE_HEAP, 0, BYTES, 3, a, b, c,
+    // WRITE_VALUE, 0, INDEX, BYTE_1, 1, READ_HEAP, 0
+    expect(result.bytecode[0]).toEqual(
+      new Uint8Array([
+        OPS.ALLOCATE_VALUE,
+        1,
+        OPS.ALLOCATE_HEAP,
+        1,
+        OPS.WRITE_HEAP,
+        0,
+        OPS.BYTES,
+        3,
+        97,
+        98,
+        99,
+        OPS.WRITE_VALUE,
+        0,
+        OPS.INDEX,
+        OPS.BYTE_1,
+        1,
+        OPS.READ_HEAP,
+        0,
+      ]),
+    );
+  });
+
+  it('compiles length property', () => {
+    const result = compile('function main() { const arr = [1, 2, 3]; const len = arr.length; }');
+    // ALLOCATE_VALUE, 1 (for len),
+    // ALLOCATE_HEAP, 1 (for arr),
+    // WRITE_HEAP, 0, ARRAY, 3, BYTE_1, 1, 2, 3,
+    // WRITE_VALUE, 0, LENGTH, READ_HEAP, 0
+    expect(result.bytecode[0]).toEqual(
+      new Uint8Array([
+        OPS.ALLOCATE_VALUE,
+        1,
+        OPS.ALLOCATE_HEAP,
+        1,
+        OPS.WRITE_HEAP,
+        0,
+        OPS.ARRAY,
+        3,
+        OPS.BYTE_1,
+        1,
+        2,
+        3,
+        OPS.WRITE_VALUE,
+        0,
+        OPS.LENGTH,
+        OPS.READ_HEAP,
+        0,
+      ]),
+    );
+  });
+
+  it('throws for unsupported property access', () => {
+    expect(() => compile('function main() { const obj = [1]; const x = obj.foo; }')).toThrow(
+      "property 'foo' access not supported",
+    );
+  });
+
+  it('compiles array index with variable', () => {
+    const result = compile('function main() { const arr = [1, 2, 3]; let i = 1; const x = arr[i]; }');
+    // Should contain INDEX followed by READ_VALUE (for i) and READ_HEAP (for arr)
+    expect(result.bytecode[0]).toContain(OPS.INDEX);
+    expect(result.bytecode[0]).toContain(OPS.READ_VALUE);
+  });
+
+  it('compiles array index with expression', () => {
+    const result = compile('function main() { const arr = [1, 2, 3]; let i = 0; const x = arr[i + 1]; }');
+    // Should contain INDEX followed by ADD operation
+    expect(result.bytecode[0]).toContain(OPS.INDEX);
+    expect(result.bytecode[0]).toContain(OPS.ADD);
+  });
+
+  it('compiles string length', () => {
+    const result = compile('function main() { const s = "hello"; const len = s.length; }');
+    expect(result.bytecode[0]).toContain(OPS.LENGTH);
+  });
+
+  it('compiles bytes length', () => {
+    const result = compile('function main() { const b = new Uint8Array([1, 2, 3]); const len = b.length; }');
+    expect(result.bytecode[0]).toContain(OPS.LENGTH);
+  });
+});
