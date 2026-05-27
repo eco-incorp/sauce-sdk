@@ -111,7 +111,7 @@ async function startHardhat(): Promise<ChildProcess> {
 }
 
 async function deploySauce(): Promise<Address> {
-  const artifactPath = resolve(REPO_ROOT, 'engine/out/Sauce.sol/Sauce.json');
+  const artifactPath = resolve(REPO_ROOT, 'compiler/node_modules/sauce/engine/out/Sauce.sol/Sauce.json');
   const artifact = JSON.parse(readFileSync(artifactPath, 'utf-8'));
   const bytecode = artifact.bytecode.object as Hex;
   const abi = artifact.abi;

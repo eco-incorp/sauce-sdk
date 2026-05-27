@@ -10,7 +10,7 @@
     "test": "pnpm -r test",
     "format": "pnpm -r --if-present format"
   },
-  "packageManager": "pnpm@9.0.0",
+  "packageManager": "pnpm@10.28.2",
   "engines": {
     "node": ">=22"
   }

@@ -2,7 +2,7 @@ import { cook, deploy } from './utils.js';
 import { resolve } from 'path';
 
 describe('integration: contract calls', () => {
-  const baseDirs = [resolve(process.cwd(), '../engine/out/Logger.sol')];
+  const baseDirs = [resolve(process.cwd(), 'node_modules/sauce/engine/out/Logger.sol')];
   let addr: bigint;
 
   beforeAll(() => {
@@ -83,7 +83,7 @@ describe('integration: contract calls', () => {
 });
 
 describe('integration: abi decode on contract call returns', () => {
-  const baseDirs = [resolve(process.cwd(), '../engine/out/ReturnTest.sol')];
+  const baseDirs = [resolve(process.cwd(), 'node_modules/sauce/engine/out/ReturnTest.sol')];
   let addr: bigint;
 
   beforeAll(() => {

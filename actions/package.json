@@ -20,8 +20,8 @@
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsc -p tsconfig.build.json --watch",
     "typecheck": "tsc --noEmit",
-    "test": "npx tsx --test tests/to-sauce.test.ts tests/to-quote.test.ts tests/megas-swap.unit.test.ts",
-    "test:megas-swap": "npx tsx --test tests/megas-swap.test.ts"
+    "test": "tsx --env-file-if-exists=.env --test --test-concurrency=1 tests/to-sauce.test.ts tests/to-quote.test.ts tests/megas-swap.unit.test.ts",
+    "test:megas-swap": "tsx --env-file-if-exists=.env --test --test-concurrency=1 tests/megas-swap.test.ts"
   },
   "dependencies": {
     "@eco/sauce-compiler": "workspace:*",
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.8.0"
   }
 }

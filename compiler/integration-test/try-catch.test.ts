@@ -1,7 +1,7 @@
 import { cook, deploy } from './utils.js';
 import { resolve } from 'path';
 
-const baseDirs = [resolve(process.cwd(), '../engine/out/MockTarget.sol')];
+const baseDirs = [resolve(process.cwd(), 'node_modules/sauce/engine/out/MockTarget.sol')];
 
 describe('integration: .catch()', () => {
   let addr: bigint;

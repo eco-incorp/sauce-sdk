@@ -67,7 +67,7 @@ export const cookSend = (source: string, options?: CompileOptions): void => {
 };
 
 export const deploy = (contract: string): string => {
-  const engineDir = resolve(process.cwd(), '../engine');
+  const engineDir = resolve(process.cwd(), 'node_modules/sauce/engine');
   const output = execSync(`forge create ${contract} --rpc-url ${RPC} --private-key ${PK} --broadcast`, {
     cwd: engineDir,
     encoding: 'utf8',

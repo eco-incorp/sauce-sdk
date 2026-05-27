@@ -23,7 +23,8 @@
     "format": "prettier --write src test integration-test",
     "format:check": "prettier --check src test integration-test",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "postinstall": "node integration-test/fetch-engine-libs.js"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",
@@ -33,6 +34,7 @@
     "eslint": "^9.39.2",
     "jest": "^30.2.0",
     "prettier": "^3.8.1",
+    "sauce": "git+https://github.com/eco-incorp/sauce.git",
     "ts-jest": "^29.4.6",
     "typescript": "^5.7.0"
   },
