@@ -54,6 +54,11 @@ interface ChainAddresses {
   balancerV2Vault: Address;
   balancerV2WethUsdcPoolId: `0x${string}`;
   curvePool: Address;
+  // USDC → curveTokenOut via curvePool with these coin indices.
+  // 3pool (mainnet): USDC=1, USDT=2. 4pool (base): USDC=0, USDbC=1.
+  curveTokenOut: Address;
+  curveI: number;
+  curveJ: number;
   uniswapV4Router: Address;
   // New AMM swap addresses
   uniswapV2Router: Address;
@@ -61,6 +66,9 @@ interface ChainAddresses {
   balancerV3Router: Address;
   ambientDex: Address;
   dodoProxy: Address;
+  // DODOApprove — the contract that DODO's proxy delegates transferFrom to.
+  // Allowances must be granted here, NOT to dodoProxy itself.
+  dodoApprove: Address;
   dodoPairWethUsdc: Address;
   maverickV2Router: Address;
   carbonController: Address;
@@ -88,6 +96,8 @@ const CHAINS: Record<string, ChainAddresses> = {
     balancerV2Vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
     balancerV2WethUsdcPoolId: '0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f8000200000000000000000019',
     curvePool: '0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7', // 3pool (DAI/USDC/USDT)
+    curveTokenOut: '0xdAC17F958D2ee523a2206206994597C13D831ec7', // USDT
+    curveI: 1, curveJ: 2, // USDC=1, USDT=2 in 3pool
     uniswapV4Router: '0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af',
     // New AMM addresses
     uniswapV2Router: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',
@@ -95,6 +105,7 @@ const CHAINS: Record<string, ChainAddresses> = {
     balancerV3Router: '0xaE563e3F8219521950555f5962419c8919758ea2',
     ambientDex: '0xAaAaAAAaA24eEeb8d57D431224f73832bC34f688',
     dodoProxy: '0xa356867fDCEa8e71AEaF87805808803806231FdC',
+    dodoApprove: '0xCB859eA579b28e02B87A1FDE08d087ab9dbE5149',
     dodoPairWethUsdc: '0x75c23271661d9d143DCb617222BC4BEc783eFf34',
     maverickV2Router: '0xbbF1EE38152E9D8E3470Dc47947eAa65DCA94913',
     carbonController: '0xC537e898CD774e2dCBa3B14Ea6f34C93d5eA45e1',
@@ -120,6 +131,8 @@ const CHAINS: Record<string, ChainAddresses> = {
     balancerV2Vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
     balancerV2WethUsdcPoolId: '0xbbb4966335677ea24f7b86dc19a423412390e1fb00020000000000000000019a',
     curvePool: '0xf6C5F01C7F3148891ad0e19DF78743D31E390D1f', // 4pool (USDC/USDbC/axlUSDC/crvUSD)
+    curveTokenOut: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', // USDbC
+    curveI: 0, curveJ: 1, // USDC=0, USDbC=1 in 4pool
     uniswapV4Router: '0x6ff5693b99212da76ad316178a184ab56d299b43',
     // Most of these are mainnet-only; use zero placeholders for base
     uniswapV2Router: '0x0000000000000000000000000000000000000000',
@@ -127,6 +140,7 @@ const CHAINS: Record<string, ChainAddresses> = {
     balancerV3Router: '0x0000000000000000000000000000000000000000',
     ambientDex: '0x0000000000000000000000000000000000000000',
     dodoProxy: '0x0000000000000000000000000000000000000000',
+    dodoApprove: '0x0000000000000000000000000000000000000000',
     dodoPairWethUsdc: '0x0000000000000000000000000000000000000000',
     maverickV2Router: '0x0000000000000000000000000000000000000000',
     carbonController: '0x0000000000000000000000000000000000000000',
@@ -152,10 +166,11 @@ const { chainId, weth: WETH, usdc: USDC, usdbc: USDbC, dai: DAI, usdt: USDT,
   aaveV3Pool: AAVE_V3_POOL, aaveV3aUSDC: AAVE_V3_aUSDC,
   compoundV3USDC: COMPOUND_V3_USDC, acrossSpokePool: ACROSS_SPOKE_POOL,
   balancerV2Vault: BALANCER_V2_VAULT, balancerV2WethUsdcPoolId: BALANCER_V2_POOL_ID,
-  curvePool: CURVE_POOL, uniswapV4Router: UNISWAP_V4_ROUTER,
+  curvePool: CURVE_POOL, curveTokenOut: CURVE_TOKEN_OUT, curveI: CURVE_I, curveJ: CURVE_J,
+  uniswapV4Router: UNISWAP_V4_ROUTER,
   uniswapV2Router: UNISWAP_V2_ROUTER, curveRouterNG: CURVE_ROUTER_NG,
   balancerV3Router: BALANCER_V3_ROUTER, ambientDex: AMBIENT_DEX,
-  dodoProxy: DODO_PROXY, dodoPairWethUsdc: DODO_PAIR_WETH_USDC,
+  dodoProxy: DODO_PROXY, dodoApprove: DODO_APPROVE, dodoPairWethUsdc: DODO_PAIR_WETH_USDC,
   maverickV2Router: MAVERICK_V2_ROUTER, carbonController: CARBON_CONTROLLER,
   fraxswapRouter: FRAXSWAP_ROUTER, clipperExchange: CLIPPER_EXCHANGE,
   integralDelay: INTEGRAL_DELAY, fluidDexT1WstethEth: FLUID_DEX_T1_WSTETH_ETH,
@@ -1053,7 +1068,7 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
     });
 
     it('curveSwap output → approve: Curve swap output chains into approval', async () => {
-      // Fund Sauce with USDC, then swap USDC → USDbC via Curve 4pool
+      // Fund Sauce with USDC, then swap USDC → curveTokenOut via the chain's curve stable pool
       await fundSauceUSDC('1000000000000000000');
       const usdcBal = await balanceOf(USDC, SAUCE);
       const swapAmount = (usdcBal / 2n).toString();
@@ -1063,14 +1078,14 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
           { type: 'approve', chainId, token: USDC, spender: CURVE_POOL, amount: swapAmount },
           {
             type: 'curveSwap', chainId,
-            pool: CURVE_POOL, tokenIn: USDC, tokenOut: USDbC,
-            i: 0, j: 1, amountIn: swapAmount, amountOutMin: '1',
+            pool: CURVE_POOL, tokenIn: USDC, tokenOut: CURVE_TOKEN_OUT,
+            i: CURVE_I, j: CURVE_J, amountIn: swapAmount, amountOutMin: '1',
             recipient: CALLER, saveOutputAs: 'swapOut',
           },
-          { type: 'approve', chainId, token: USDbC, spender, amountRef: 'swapOut' },
+          { type: 'approve', chainId, token: CURVE_TOKEN_OUT, spender, amountRef: 'swapOut' },
         ]),
       );
-      const a = await allowance(USDbC, SAUCE, spender);
+      const a = await allowance(CURVE_TOKEN_OUT, SAUCE, spender);
       assert.ok(a > 0n, `Allowance should reflect Curve swap output, got ${a}`);
 
       const receipt = await getReceipt(txHash);
@@ -1078,12 +1093,12 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
       const usdcToCurve = findEvents(receipt, transferEventAbi, 'Transfer', { address: USDC, args: { from: SAUCE, to: CURVE_POOL } });
       assert.ok(usdcToCurve.length >= 1, 'Should emit USDC Transfer from Sauce to Curve');
       assert.equal(usdcToCurve[0].args.value, BigInt(swapAmount), 'USDC input to Curve should equal swapAmount');
-      // USDbC transferred from Curve pool to Sauce (swap output)
-      const curveOutput = findEvents(receipt, transferEventAbi, 'Transfer', { address: USDbC, args: { to: SAUCE } });
-      assert.ok(curveOutput.length >= 1, 'Should emit USDbC Transfer to Sauce from Curve');
+      // curveTokenOut transferred from Curve pool to Sauce (swap output)
+      const curveOutput = findEvents(receipt, transferEventAbi, 'Transfer', { address: CURVE_TOKEN_OUT, args: { to: SAUCE } });
+      assert.ok(curveOutput.length >= 1, 'Should emit curveTokenOut Transfer to Sauce from Curve');
       // Approval amount should match Curve output (amountRef chaining)
-      const approvals = findEvents(receipt, approvalEventAbi, 'Approval', { address: USDbC, args: { owner: SAUCE, spender } });
-      assert.equal(approvals.length, 1, 'Should emit one USDbC Approval event');
+      const approvals = findEvents(receipt, approvalEventAbi, 'Approval', { address: CURVE_TOKEN_OUT, args: { owner: SAUCE, spender } });
+      assert.equal(approvals.length, 1, 'Should emit one curveTokenOut Approval event');
       assert.equal(approvals[0].args.value, curveOutput[0].args.value,
         'Approval value should equal Curve swap output (amountRef chaining)');
     });
@@ -1099,14 +1114,14 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
           { type: 'approve', chainId, token: USDC, spender: CURVE_POOL, amount: swapAmount },
           {
             type: 'curveSwap', chainId,
-            pool: CURVE_POOL, tokenIn: USDC, tokenOut: USDbC,
-            i: 0, j: 1, amountIn: swapAmount, amountOutMin: '1',
+            pool: CURVE_POOL, tokenIn: USDC, tokenOut: CURVE_TOKEN_OUT,
+            i: CURVE_I, j: CURVE_J, amountIn: swapAmount, amountOutMin: '1',
             recipient: CALLER, saveOutputAs: 'curveOut',
           },
-          { type: 'approve', chainId, token: USDbC, spender: SWAP_ROUTER, amountRef: 'curveOut' },
+          { type: 'approve', chainId, token: CURVE_TOKEN_OUT, spender: SWAP_ROUTER, amountRef: 'curveOut' },
           {
             type: 'uniswapV3ExactInput', chainId,
-            router: SWAP_ROUTER, tokenIn: USDbC, tokenOut: USDC,
+            router: SWAP_ROUTER, tokenIn: CURVE_TOKEN_OUT, tokenOut: USDC,
             fee: 100, amountOutMin: '1',
             recipient: CALLER, deadline: Math.floor(Date.now() / 1000) + 3600,
             amountRef: 'curveOut',
@@ -1116,23 +1131,23 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
 
       const receipt = await getReceipt(txHash);
 
-      // Curve output: USDbC Transfer from CurvePool → Sauce
-      const curveOutput = findEvents(receipt, transferEventAbi, 'Transfer', { address: USDbC, args: { from: CURVE_POOL, to: SAUCE } });
-      assert.ok(curveOutput.length >= 1, 'Should emit USDbC Transfer from Curve to Sauce');
+      // Curve output: curveTokenOut Transfer from CurvePool → Sauce
+      const curveOutput = findEvents(receipt, transferEventAbi, 'Transfer', { address: CURVE_TOKEN_OUT, args: { from: CURVE_POOL, to: SAUCE } });
+      assert.ok(curveOutput.length >= 1, 'Should emit curveTokenOut Transfer from Curve to Sauce');
       const curveOutAmount = curveOutput[0].args.value;
 
       // Approval should use Curve output via amountRef
-      const approvals = findEvents(receipt, approvalEventAbi, 'Approval', { address: USDbC, args: { owner: SAUCE, spender: SWAP_ROUTER } });
-      assert.ok(approvals.length >= 1, 'Should emit USDbC Approval for swap router');
+      const approvals = findEvents(receipt, approvalEventAbi, 'Approval', { address: CURVE_TOKEN_OUT, args: { owner: SAUCE, spender: SWAP_ROUTER } });
+      assert.ok(approvals.length >= 1, 'Should emit curveTokenOut Approval for swap router');
       assert.equal(approvals[0].args.value, curveOutAmount,
         'Approval amount should equal Curve output (amountRef chaining)');
 
-      // V3 input: USDbC Transfer from Sauce → pool (not router)
-      const v3Input = findEvents(receipt, transferEventAbi, 'Transfer', { address: USDbC, args: { from: SAUCE } })
+      // V3 input: curveTokenOut Transfer from Sauce → pool (not router)
+      const v3Input = findEvents(receipt, transferEventAbi, 'Transfer', { address: CURVE_TOKEN_OUT, args: { from: SAUCE } })
         .filter(e => e.args.to.toLowerCase() !== SWAP_ROUTER.toLowerCase());
-      assert.ok(v3Input.length >= 1, 'Should emit USDbC Transfer from Sauce to V3 pool');
+      assert.ok(v3Input.length >= 1, 'Should emit curveTokenOut Transfer from Sauce to V3 pool');
       assert.equal(v3Input[0].args.value, curveOutAmount,
-        `V3 input (${formatUnits(v3Input[0].args.value, 6)} USDbC) should equal Curve output (${formatUnits(curveOutAmount, 6)} USDbC) (amountRef chaining)`);
+        `V3 input (${formatUnits(v3Input[0].args.value, 6)} curveTokenOut) should equal Curve output (${formatUnits(curveOutAmount, 6)} curveTokenOut) (amountRef chaining)`);
     });
 
     it.skip('balancerV2Swap output → approve: Balancer swap output chains into approval (Balancer V2 vault locked after Nov 2025 exploit)', async () => {
@@ -1217,7 +1232,7 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
     const SEL_TRANSFER     = '0xa9059cbb'; // transfer(address,uint256)
     const SEL_EXECUTE      = '0x24856bc3'; // execute(bytes,bytes[])
     const SEL_APPROVE      = '0x095ea7b3'; // approve(address,uint256)
-    const SEL_EXCHANGE     = '0xddc1f59d'; // exchange(int128,int128,uint256,uint256,address)
+    const SEL_EXCHANGE     = '0x3df02124'; // exchange(int128,int128,uint256,uint256) — 4-arg variant emitted by curveSwap impl
     const SEL_BAL_SWAP     = '0x52bbbe29'; // swap((bytes32,uint8,address,address,uint256,bytes),(address,bool,address,bool),uint256,uint256)
     const SEL_BAL_BATCH    = '0x945bcec9'; // batchSwap(uint8,(bytes32,uint256,uint256,uint256,bytes)[],address[],(address,bool,address,bool),int256[],uint256)
     const SEL_WRAP         = '0xea598cb0'; // wrap(uint256)
@@ -1607,14 +1622,14 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
   });
 
   describe('DODO Swaps', () => {
-    it('dodoSwap: swaps WETH → USDC via DODO V2 Proxy', async () => {
+    it('dodoSwap: swaps WETH → USDC via DODO V1 Proxy', async () => {
       if (!isMainnet) return;
       const amountIn = '100000000000000000'; // 0.1 ETH (use small amount for DODO liquidity)
-      const usdcBefore = await balanceOf(USDC, CALLER);
+      const usdcBefore = await balanceOf(USDC, SAUCE);
       const txHash = cookSend(
         actionsToSauce([
           { type: 'wrapETH', chainId, weth: WETH, amount: amountIn },
-          { type: 'approve', chainId, token: WETH, spender: DODO_PROXY, amount: amountIn },
+          { type: 'approve', chainId, token: WETH, spender: DODO_APPROVE, amount: amountIn },
           {
             type: 'dodoSwap', chainId,
             proxy: DODO_PROXY,
@@ -1623,16 +1638,18 @@ describe('Sauce Action Integration Tests', { timeout: 120_000 }, () => {
             dodoPairs: [DODO_PAIR_WETH_USDC],
             directions: 0, // sellBase at pool 0
             deadline: Math.floor(Date.now() / 1000) + 3600,
+            version: 'v1', // configured pair is a DODO V1 Classical pool
           },
         ]),
         amountIn,
       );
-      const usdcAfter = await balanceOf(USDC, CALLER);
-      assert.ok(usdcAfter > usdcBefore, 'Caller should receive USDC from DODO swap');
+      // DODO proxy has no recipient param — output lands in msg.sender (Sauce).
+      const usdcAfter = await balanceOf(USDC, SAUCE);
+      assert.ok(usdcAfter > usdcBefore, 'Sauce should receive USDC from DODO swap');
 
       const receipt = await getReceipt(txHash);
-      const usdcIn = findEvents(receipt, transferEventAbi, 'Transfer', { address: USDC, args: { to: CALLER } });
-      assert.ok(usdcIn.length >= 1, 'Should emit USDC Transfer to caller');
+      const usdcIn = findEvents(receipt, transferEventAbi, 'Transfer', { address: USDC, args: { to: SAUCE } });
+      assert.ok(usdcIn.length >= 1, 'Should emit USDC Transfer to Sauce');
     });
   });
 

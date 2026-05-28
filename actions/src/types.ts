@@ -196,7 +196,7 @@ export interface AmbientSwapAction extends ActionChainOptions {
   reserveFlags: number;
 }
 
-/** DODO V2 token-to-token swap via DODOProxy */
+/** DODO token-to-token swap via DODOProxy (supports V1 Classical and V2 pools) */
 export interface DODOSwapAction extends ActionChainOptions {
   type: "dodoSwap";
   chainId: number;
@@ -208,6 +208,10 @@ export interface DODOSwapAction extends ActionChainOptions {
   dodoPairs: Address[];
   directions: number;
   deadline: number;
+  // Pool generation: "v2" (default) uses dodoSwapV2TokenToToken; "v1" routes
+  // legacy Classical pairs (e.g. 0x75c23271661d9d143DCb617222BC4BEc783eFf34)
+  // through dodoSwapV1.
+  version?: "v1" | "v2";
 }
 
 /** Maverick V2 exact-input single swap */

@@ -599,6 +599,8 @@ function balancerV2BatchSwap(s: Saucer, action: BalancerV2BatchSwapAction, _amou
 // New AMM swap actions
 // ---------------------------------------------------------------------------
 
+let v2ScratchCounter = 0;
+
 function uniswapV2Swap(s: Saucer, action: UniswapV2SwapAction, amountIn: Saucer, outputChained: boolean): ActionResult {
   const recipient = outputChained ? s.addressSelf() : s.int(BigInt(action.recipient));
   const cd = calldata(
@@ -612,8 +614,24 @@ function uniswapV2Swap(s: Saucer, action: UniswapV2SwapAction, amountIn: Saucer,
       s.int(BigInt(action.deadline)),
     ],
   );
-  const call = s.externalCall(s.int(BigInt(action.router)), s.int(0n), cd, UINT256_OUTPUT);
-  return { call, output: call };
+  const call = s.externalCall(s.int(BigInt(action.router)), s.int(0n), cd);
+  if (!outputChained) return { call, output: call };
+
+  // swapExactTokensForTokens returns `uint256[] memory amounts` — decoding the
+  // first 32 bytes (UINT256_OUTPUT) yields the ABI offset (0x20), not the
+  // output amount. Snapshot Sauce's tokenOut balance pre/post instead.
+  const tokenOut = s.int(BigInt(action.path[action.path.length - 1]));
+  const id = v2ScratchCounter++;
+  const preSlot = `__v2_pre_${id}`;
+  const balOf = () =>
+    s.externalCall(
+      tokenOut,
+      s.int(0n),
+      calldata(s, 'balanceOf(address)', [s.addressSelf()]),
+      UINT256_OUTPUT,
+    );
+  const captureAndSwap = s.store(preSlot, balOf()).join(call);
+  return { call: captureAndSwap, output: s.sub(balOf(), s.read(preSlot)) };
 }
 
 function curveRouterNGSwap(s: Saucer, action: CurveRouterNGSwapAction, amountIn: Saucer, outputChained: boolean): ActionResult {
@@ -690,10 +708,13 @@ function ambientSwap(s: Saucer, action: AmbientSwapAction, amountIn: Saucer): Ac
 }
 
 function dodoSwap(s: Saucer, action: DODOSwapAction, amountIn: Saucer, outputChained: boolean): ActionResult {
-  const recipient = outputChained ? s.addressSelf() : s.msgSender();
+  void outputChained; // DODO proxy sends output to msg.sender; we return the proxy's return value
+  const fn = action.version === 'v1'
+    ? 'dodoSwapV1(address,address,uint256,uint256,address[],uint256,bool,uint256)'
+    : 'dodoSwapV2TokenToToken(address,address,uint256,uint256,address[],uint256,bool,uint256)';
   const cd = calldata(
     s,
-    'dodoSwapV2TokenToToken(address,address,uint256,uint256,address[],uint256,bool,uint256)',
+    fn,
     [
       s.int(BigInt(action.fromToken)),
       s.int(BigInt(action.toToken)),
