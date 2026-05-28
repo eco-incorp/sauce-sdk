@@ -1,4 +1,4 @@
-# sauce-tools
+# sauce-sdk
 
 Sauce protocol tooling, organized as a pnpm workspace.
 

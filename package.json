@@ -1,5 +1,5 @@
 {
-  "name": "sauce-tools",
+  "name": "sauce-sdk",
   "private": true,
   "version": "0.0.0",
   "description": "Sauce protocol tooling: compiler, dev-tools, SDK, and actions",
