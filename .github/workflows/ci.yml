@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `sauce` npm dep resolves to git+https://github.com/eco-incorp/sauce.git
+      # (private). Configure git to use a PAT so `pnpm install` can clone it.
+      # Set ECO_INCORP_TOKEN as a repo secret (a PAT with `repo` read on eco-incorp/sauce).
+      - name: Configure git auth for private deps
+        env:
+          ECO_INCORP_TOKEN: ${{ secrets.ECO_INCORP_TOKEN }}
+        run: |
+          if [ -n "$ECO_INCORP_TOKEN" ]; then
+            git config --global url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build compiler
+        run: pnpm --filter @eco/sauce-compiler build
+
+      - name: Compiler — typecheck
+        run: pnpm --filter @eco/sauce-compiler typecheck
+
+      - name: Compiler — lint
+        run: pnpm --filter @eco/sauce-compiler lint
+
+      - name: Compiler — format check
+        run: pnpm --filter @eco/sauce-compiler format:check
+
+      - name: Compiler — test
+        run: pnpm --filter @eco/sauce-compiler test
+
+      - name: SDK — typecheck
+        run: pnpm --filter @eco/sauce-sdk typecheck
+
+      - name: SDK — build
+        run: pnpm --filter @eco/sauce-sdk build
+
+      - name: SDK — test
+        run: pnpm --filter @eco/sauce-sdk test
+
+      - name: Actions — typecheck
+        run: pnpm --filter @eco/sauce-actions typecheck
+
+      - name: Actions — build
+        run: pnpm --filter @eco/sauce-actions build
+
+      - name: Actions — unit tests
+        run: pnpm --filter @eco/sauce-actions test:unit
+
+      - name: Dev Tools — test
+        run: pnpm --filter @eco/sauce-dev-tools test
