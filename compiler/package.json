@@ -1,6 +1,7 @@
 {
   "name": "@eco-incorp/sauce-compiler",
   "version": "0.0.1",
+  "private": true,
   "type": "module",
   "repository": {
     "type": "git",
