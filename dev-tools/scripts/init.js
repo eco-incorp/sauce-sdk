@@ -74,7 +74,7 @@ const pkg = {
     stop: "./scripts/stop-local.sh",
   },
   dependencies: {
-    "@eco/sauce-compiler": `^${compilerVersion}`,
+    "@eco-incorp/sauce-compiler": `^${compilerVersion}`,
     "@uniswap/v3-core": "^1.0.1",
     viem: "^2.45.1",
   },

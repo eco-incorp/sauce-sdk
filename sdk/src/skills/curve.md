@@ -12,7 +12,7 @@ dex | Chains: Ethereum, Arbitrum, Optimism, Base, Polygon, Avalanche, Fantom, Gn
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/curve";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/curve";
 ```
 
 ## SauceScript Examples

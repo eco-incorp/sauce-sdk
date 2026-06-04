@@ -11,7 +11,7 @@ aggregator | Chains: Ethereum, Arbitrum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/cowswap";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/cowswap";
 ```
 
 ## SauceScript Examples

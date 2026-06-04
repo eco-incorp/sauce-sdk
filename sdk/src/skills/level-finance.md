@@ -11,7 +11,7 @@ perpetuals | Chains: BSC, Arbitrum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/level-finance";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/level-finance";
 ```
 
 ## SauceScript Examples

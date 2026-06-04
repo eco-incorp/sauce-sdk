@@ -10,7 +10,7 @@ dex | Chains: Arbitrum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/ramses";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/ramses";
 ```
 
 ## SauceScript Examples

@@ -12,7 +12,7 @@ payments | Chains: Ethereum, Polygon, Arbitrum, Optimism, Base
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/superfluid";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/superfluid";
 ```
 
 ## SauceScript Examples

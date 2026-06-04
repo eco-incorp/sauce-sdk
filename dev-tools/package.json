@@ -1,5 +1,5 @@
 {
-  "name": "@eco/sauce-dev-tools",
+  "name": "@eco-incorp/sauce-dev-tools",
   "version": "0.0.1",
   "description": "Development tools for the Sauce protocol",
   "type": "module",

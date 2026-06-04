@@ -11,7 +11,7 @@ liquid-staking | Chains: Ethereum, Base
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/cbeth";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/cbeth";
 ```
 
 ## SauceScript Examples

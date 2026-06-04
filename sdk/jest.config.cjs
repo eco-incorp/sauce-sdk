@@ -30,7 +30,7 @@ module.exports = {
     ],
   },
   transformIgnorePatterns: [
-    'node_modules/(?!(@eco/sauce-compiler)/)',
+    'node_modules/(?!(@eco-incorp/sauce-compiler)/)',
   ],
   testMatch: ['**/*.test.ts'],
 };

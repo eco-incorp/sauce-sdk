@@ -1,5 +1,5 @@
 {
-  "name": "@eco/sauce-sdk",
+  "name": "@eco-incorp/sauce-sdk",
   "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",

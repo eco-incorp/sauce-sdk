@@ -1,12 +1,12 @@
 name: Publish
 
-# Publishes every non-private workspace package (@eco/sauce-compiler,
-# @eco/sauce-dev-tools, @eco/sauce-sdk, @eco/sauce-actions) to public npm
+# Publishes every non-private workspace package (@eco-incorp/sauce-compiler,
+# @eco-incorp/sauce-dev-tools, @eco-incorp/sauce-sdk, @eco-incorp/sauce-actions) to public npm
 # at the version derived from a `v*` tag.
 #
 # pnpm publish -r walks the workspace in topological order and rewrites
 # workspace:* deps to the version being published, so downstream packages
-# get a proper @eco/sauce-compiler@X.Y.Z pin instead of `workspace:*`.
+# get a proper @eco-incorp/sauce-compiler@X.Y.Z pin instead of `workspace:*`.
 #
 # Trigger:
 #   git tag v1.2.3 && git push origin v1.2.3
@@ -31,11 +31,12 @@ on:
 
 jobs:
   publish:
-    name: Publish all packages to npm
+    name: Publish all packages to npm and GitHub Packages
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -94,3 +95,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: pnpm -r publish --access public --no-git-checks
+
+      - name: Publish to GitHub Packages
+        # The @eco-incorp scope matches the repo owner, so the auto-provisioned
+        # GITHUB_TOKEN (with `packages: write` above) can publish here directly.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > .npmrc <<EOF
+          @eco-incorp:registry=https://npm.pkg.github.com
+          //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+          EOF
+          pnpm -r publish --registry https://npm.pkg.github.com --no-git-checks
+          rm -f .npmrc

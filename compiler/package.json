@@ -1,5 +1,5 @@
 {
-  "name": "@eco/sauce-compiler",
+  "name": "@eco-incorp/sauce-compiler",
   "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",

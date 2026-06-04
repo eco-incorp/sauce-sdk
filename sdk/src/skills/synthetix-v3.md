@@ -14,7 +14,7 @@ synthetics | Chains: Base
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/synthetix-v3";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/synthetix-v3";
 ```
 
 ## SauceScript Examples

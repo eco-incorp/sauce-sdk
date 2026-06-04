@@ -10,7 +10,7 @@ dex | Chains: Ethereum, BSC
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/dodo";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/dodo";
 ```
 
 ## SauceScript Examples

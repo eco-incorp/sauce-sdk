@@ -1,12 +1,12 @@
-# @eco/sauce-actions
+# @eco-incorp/sauce-actions
 
 Converts high-level routing actions (swaps, bridges, wraps, staking, lending, transfers) into Sauce bytecode for on-chain execution.
 
 ## Usage
 
 ```typescript
-import { actionsToSauce } from '@eco/sauce-actions';
-import type { RoutingAction } from '@eco/sauce-actions';
+import { actionsToSauce } from '@eco-incorp/sauce-actions';
+import type { RoutingAction } from '@eco-incorp/sauce-actions';
 
 const actions: RoutingAction[] = [
   {

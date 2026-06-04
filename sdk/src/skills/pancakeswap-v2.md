@@ -12,7 +12,7 @@ dex | Chains: BSC, Ethereum, Arbitrum, Base, Linea, opBNB
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/pancakeswap-v2";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/pancakeswap-v2";
 ```
 
 ## SauceScript Examples

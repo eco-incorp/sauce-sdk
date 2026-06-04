@@ -14,7 +14,7 @@ infrastructure | Chains: (standard interface, any chain)
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/erc20";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/erc20";
 ```
 
 ## SauceScript Examples

@@ -1,5 +1,5 @@
 {
-  "name": "@eco/sauce-actions",
+  "name": "@eco-incorp/sauce-actions",
   "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",
