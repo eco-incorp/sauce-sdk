@@ -19,9 +19,11 @@ jobs:
         env:
           ECO_INCORP_TOKEN: ${{ secrets.ECO_INCORP_TOKEN }}
         run: |
-          if [ -n "$ECO_INCORP_TOKEN" ]; then
-            git config --global url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
+          if [ -z "${ECO_INCORP_TOKEN:-}" ]; then
+            echo "::error::Missing repo secret ECO_INCORP_TOKEN — required to clone the private eco-incorp/sauce git dep. Add a PAT with read access on eco-incorp/sauce under Settings -> Secrets and variables -> Actions."
+            exit 1
           fi
+          git config --global url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
