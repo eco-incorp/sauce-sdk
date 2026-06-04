@@ -11,7 +11,7 @@ liquid-staking | Chains: Ethereum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/swell";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/swell";
 ```
 
 ## SauceScript Examples

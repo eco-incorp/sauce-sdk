@@ -12,7 +12,7 @@ dex | Chains: Ethereum, Arbitrum, Optimism, Polygon, Base, BSC, Avalanche, Celo
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/uniswap-v3";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/uniswap-v3";
 ```
 
 ## SauceScript Examples

@@ -13,7 +13,7 @@ perpetuals | Chains: Arbitrum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/mux-protocol";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/mux-protocol";
 ```
 
 ## SauceScript Examples

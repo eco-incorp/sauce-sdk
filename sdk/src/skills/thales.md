@@ -12,7 +12,7 @@ options | Chains: Optimism
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/thales";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/thales";
 ```
 
 ## SauceScript Examples

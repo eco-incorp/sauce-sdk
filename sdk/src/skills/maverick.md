@@ -10,7 +10,7 @@ dex | Chains: Ethereum, Arbitrum, Base
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/maverick";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/maverick";
 ```
 
 ## SauceScript Examples

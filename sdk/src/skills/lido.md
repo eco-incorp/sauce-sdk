@@ -12,7 +12,7 @@ liquid-staking | Chains: Ethereum, Arbitrum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/lido";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/lido";
 ```
 
 ## SauceScript Examples

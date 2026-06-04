@@ -12,7 +12,7 @@ dex | Chains: Base
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/aerodrome";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/aerodrome";
 ```
 
 ## SauceScript Examples

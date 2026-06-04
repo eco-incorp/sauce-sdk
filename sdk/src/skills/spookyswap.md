@@ -12,7 +12,7 @@ dex | Chains: Fantom
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/spookyswap";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/spookyswap";
 ```
 
 ## SauceScript Examples

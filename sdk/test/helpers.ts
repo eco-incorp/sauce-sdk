@@ -2,7 +2,7 @@
  * SDK Test Helpers
  *
  * Compilation utilities for testing SauceScript functions against the
- * @eco/sauce-compiler. Handles ABI import resolution from TypeScript
+ * @eco-incorp/sauce-compiler. Handles ABI import resolution from TypeScript
  * source files since the published compiler only resolves JSON imports.
  */
 

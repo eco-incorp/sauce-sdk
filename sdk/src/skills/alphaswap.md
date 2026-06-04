@@ -15,7 +15,7 @@ recipe | Chain: Base
 
 ## SDK Usage
 ```typescript
-import { alphaSwap, prepareAlphaSwap } from "@eco/sauce-sdk/recipes";
+import { alphaSwap, prepareAlphaSwap } from "@eco-incorp/sauce-sdk/recipes";
 ```
 
 ## How It Works

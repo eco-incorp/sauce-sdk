@@ -1,11 +1,11 @@
-# @eco/sauce-sdk
+# @eco-incorp/sauce-sdk
 
 Protocol SDK for Sauce — 127 DeFi protocols across every major EVM chain, with verified contract addresses, ABIs, compilable SauceScript functions, and AI-ready skill files.
 
 ## Install
 
 ```bash
-npm install @eco/sauce-sdk
+npm install @eco-incorp/sauce-sdk
 ```
 
 ## Quick Start
@@ -17,7 +17,7 @@ import {
   getProtocolsByCategory,
   getProtocolsByChain,
   listProtocolSlugs,
-} from "@eco/sauce-sdk";
+} from "@eco-incorp/sauce-sdk";
 
 // Look up a protocol
 const aave = getProtocol("aave-v3");
@@ -43,9 +43,9 @@ const slugs = listProtocolSlugs(); // ["aave-v2", "aave-v3", "across", ...]
 Each protocol is tree-shakeable:
 
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/aave-v3";
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/uniswap-v3";
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/lido";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/aave-v3";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/uniswap-v3";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/lido";
 ```
 
 ### Protocol Module Structure
@@ -68,7 +68,7 @@ import {
   getProtocolIndex,
   getProtocolSkill,
   listSkillSlugs,
-} from "@eco/sauce-sdk/skills";
+} from "@eco-incorp/sauce-sdk/skills";
 
 // Master index — all protocols, categories, operations, chain coverage
 const index = getProtocolIndex();
@@ -92,7 +92,7 @@ Each skill file includes:
 ## Chain Registry
 
 ```typescript
-import { getChain, getAllChainIds, chains } from "@eco/sauce-sdk/chains";
+import { getChain, getAllChainIds, chains } from "@eco-incorp/sauce-sdk/chains";
 
 const base = getChain(8453);
 console.log(base.name);       // "Base"
@@ -126,7 +126,7 @@ const allIds = getAllChainIds(); // [1, 10, 56, 137, 8453, 42161, ...]
 
 ## SauceScript Functions
 
-Every protocol includes compilable SauceScript functions — TypeScript-like DSL that compiles to Sauce bytecode via `@eco/sauce-compiler`.
+Every protocol includes compilable SauceScript functions — TypeScript-like DSL that compiles to Sauce bytecode via `@eco-incorp/sauce-compiler`.
 
 ```typescript
 // Example: Aave V3 supply
@@ -162,7 +162,7 @@ import type {
   SauceParam,
   ChainInfo,
   Address,
-} from "@eco/sauce-sdk";
+} from "@eco-incorp/sauce-sdk";
 ```
 
 ### ProtocolCategory

@@ -10,7 +10,7 @@ dex | Chains: Ethereum, Scroll
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/ambient";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/ambient";
 ```
 
 ## SauceScript Examples

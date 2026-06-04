@@ -1,37 +1,48 @@
 # sauce-sdk
 
-Sauce protocol tooling, organized as a pnpm workspace.
+Tooling for the Sauce protocol, published as a single npm package: `@eco-incorp/sauce-sdk`.
 
-## Packages
+Includes:
 
-| Package | Path | Description |
-| --- | --- | --- |
-| `@eco/sauce-compiler` | [`compiler/`](compiler/) | Compiles JS-like recipes into Sauce bytecode. |
-| `@eco-incorp/sauce-dev-tools` | [`dev-tools/`](dev-tools/) | Local dev environment, hardhat fork, recipe runner, examples. |
-| `@eco/sauce-sdk` | [`sdk/`](sdk/) | TypeScript SDK for building Sauce recipes (protocols, chains, skills). |
-| `@eco/sauce-actions` | [`actions/`](actions/) | High-level action primitives (e.g. AMM swaps) built on the SDK and compiler. |
+- A JS-like recipe **compiler** that emits Sauce bytecode.
+- A TypeScript **SDK** for building recipes against on-chain protocols (Uniswap, Curve, Balancer, …).
+- High-level **action primitives** (AMM swaps, multi-hop, split routing).
+- A local **dev environment** (hardhat fork, recipe runner, examples).
 
-## Getting started
+## Install
+
+```sh
+pnpm add @eco-incorp/sauce-sdk
+# or
+npm install @eco-incorp/sauce-sdk
+```
+
+## Repo layout
+
+Sources are organised as a pnpm workspace for development; everything ships under the single `@eco-incorp/sauce-sdk` name at publish time.
+
+| Path | What's in it |
+| --- | --- |
+| [`compiler/`](compiler/) | Recipe compiler (JS → Sauce bytecode) |
+| [`sdk/`](sdk/) | Protocols, chains, skills, recipes |
+| [`actions/`](actions/) | High-level action primitives |
+| [`dev-tools/`](dev-tools/) | Local fork environment, recipe runner, examples |
+
+## Development
 
 ```sh
 pnpm install
 pnpm build       # build compiler, sdk, actions
 pnpm typecheck   # typecheck all packages
-pnpm test        # run each package's tests
-```
-
-Within each package you can use its native scripts, e.g.:
-
-```sh
-pnpm --filter @eco-incorp/sauce-dev-tools start:local
-pnpm --filter @eco/sauce-compiler test
+pnpm test        # run all tests
 ```
 
 ## Publishing
 
-Tag-driven workflows in [`.github/workflows/`](.github/workflows/):
+Tag-driven via [`.github/workflows/publish.yml`](.github/workflows/publish.yml):
 
-- `compiler-v*` &rarr; publishes `@eco/sauce-compiler`
-- `dev-tools-v*` &rarr; publishes `@eco-incorp/sauce-dev-tools`
+```sh
+git tag v1.2.3 && git push origin v1.2.3
+```
 
-Both publish to the `npm.pkg.github.com` registry.
+The workflow stamps every workspace package with the tag's version and publishes to npmjs.

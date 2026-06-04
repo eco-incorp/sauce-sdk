@@ -12,7 +12,7 @@ payments | Chains: Ethereum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/sablier";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/sablier";
 ```
 
 ## SauceScript Examples

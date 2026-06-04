@@ -20,7 +20,7 @@ The SDK should be the single import a developer needs to interact with any proto
 
 ```
 sdk/
-├── package.json                    # @eco/sauce-sdk, links to ../compiler
+├── package.json                    # @eco-incorp/sauce-sdk, links to ../compiler
 ├── tsconfig.json                   # Strict, ESNext, bundler resolution
 ├── PLAN.md                         # This file
 ├── src/
@@ -195,7 +195,7 @@ Flag and remove any unverified addresses.
 Use agent teams (`/go-team-sdk`) to parallelize the build:
 - 5-6 builder agents, each handling a category of protocols
 - Each agent reads research data, creates protocol modules
-- Quality gate: every Sauce function must compile via `@eco/sauce-compiler`
+- Quality gate: every Sauce function must compile via `@eco-incorp/sauce-compiler`
 - Lead agent synthesizes, deduplicates, creates the index
 
 Estimated scope: ~200 protocol modules, ~600 Sauce functions, ~1000 chain deployments.

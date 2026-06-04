@@ -12,7 +12,7 @@ perpetuals | Chains: Arbitrum, Polygon
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/gains-network";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/gains-network";
 ```
 
 ## SauceScript Examples

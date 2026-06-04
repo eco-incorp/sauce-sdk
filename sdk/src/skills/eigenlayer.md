@@ -12,7 +12,7 @@ restaking | Chains: Ethereum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/eigenlayer";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/eigenlayer";
 ```
 
 ## SauceScript Examples

@@ -10,7 +10,7 @@ options | Chains: Ethereum (deposits)
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/aevo";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/aevo";
 ```
 
 ## SauceScript Examples
