@@ -44,37 +44,37 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build compiler
-        run: pnpm --filter @eco-incorp/sauce-compiler build
+        run: pnpm --filter './compiler' build
 
       - name: Compiler — typecheck
-        run: pnpm --filter @eco-incorp/sauce-compiler typecheck
+        run: pnpm --filter './compiler' typecheck
 
       - name: Compiler — lint
-        run: pnpm --filter @eco-incorp/sauce-compiler lint
+        run: pnpm --filter './compiler' lint
 
       - name: Compiler — format check
-        run: pnpm --filter @eco-incorp/sauce-compiler format:check
+        run: pnpm --filter './compiler' format:check
 
       - name: Compiler — test
-        run: pnpm --filter @eco-incorp/sauce-compiler test
+        run: pnpm --filter './compiler' test
 
       - name: SDK — typecheck
-        run: pnpm --filter @eco-incorp/sauce-sdk typecheck
+        run: pnpm --filter './sdk' typecheck
 
       - name: SDK — build
-        run: pnpm --filter @eco-incorp/sauce-sdk build
+        run: pnpm --filter './sdk' build
 
       - name: SDK — test
-        run: pnpm --filter @eco-incorp/sauce-sdk test
+        run: pnpm --filter './sdk' test
 
       - name: Actions — typecheck
-        run: pnpm --filter @eco-incorp/sauce-actions typecheck
+        run: pnpm --filter './actions' typecheck
 
       - name: Actions — build
-        run: pnpm --filter @eco-incorp/sauce-actions build
+        run: pnpm --filter './actions' build
 
       - name: Actions — unit tests
-        run: pnpm --filter @eco-incorp/sauce-actions test:unit
+        run: pnpm --filter './actions' test:unit
 
       - name: Dev Tools — test
-        run: pnpm --filter @eco-incorp/sauce-dev-tools test
+        run: pnpm --filter './dev-tools' test

@@ -1,6 +1,7 @@
 {
   "name": "@eco-incorp/sauce-dev-tools",
   "version": "0.0.1",
+  "private": true,
   "description": "Development tools for the Sauce protocol",
   "type": "module",
   "repository": {

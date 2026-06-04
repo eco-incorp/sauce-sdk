@@ -1,14 +1,81 @@
 {
-  "name": "sauce-sdk",
-  "private": true,
-  "version": "0.0.0",
-  "description": "Sauce protocol tooling: compiler, dev-tools, SDK, and actions",
+  "name": "@eco-incorp/sauce-sdk",
+  "version": "0.0.1",
+  "description": "Sauce protocol tooling: compiler, SDK, action primitives, and a local dev environment.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eco-incorp/sauce-sdk.git"
+  },
+  "homepage": "https://github.com/eco-incorp/sauce-sdk#readme",
+  "bugs": "https://github.com/eco-incorp/sauce-sdk/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "sdk/dist/index.js",
+  "types": "sdk/dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./sdk/dist/index.d.ts",
+      "default": "./sdk/dist/index.js"
+    },
+    "./compiler": {
+      "types": "./compiler/dist/index.d.ts",
+      "default": "./compiler/dist/index.js"
+    },
+    "./actions": {
+      "types": "./actions/dist/index.d.ts",
+      "default": "./actions/dist/index.js"
+    },
+    "./protocols/*": {
+      "types": "./sdk/dist/protocols/*/index.d.ts",
+      "default": "./sdk/dist/protocols/*/index.js"
+    },
+    "./chains": {
+      "types": "./sdk/dist/chains/index.d.ts",
+      "default": "./sdk/dist/chains/index.js"
+    },
+    "./skills": {
+      "types": "./sdk/dist/skills/loader.d.ts",
+      "default": "./sdk/dist/skills/loader.js"
+    },
+    "./recipes": {
+      "types": "./sdk/dist/recipes/index.d.ts",
+      "default": "./sdk/dist/recipes/index.js"
+    }
+  },
+  "bin": {
+    "sauce-dev-tools": "./dev-tools/scripts/init.js"
+  },
+  "files": [
+    "compiler/dist",
+    "sdk/dist",
+    "sdk/src/skills",
+    "sdk/src/protocols",
+    "sdk/src/recipes",
+    "actions/dist",
+    "dev-tools/scripts",
+    "dev-tools/src",
+    "dev-tools/sauce",
+    "dev-tools/artifacts",
+    "dev-tools/hardhat.config.cjs",
+    "dev-tools/README.md"
+  ],
   "scripts": {
-    "build": "pnpm -r --filter './compiler' --filter './sdk' --filter './actions' build",
+    "build": "pnpm --filter './compiler' build && pnpm -r --filter './sdk' --filter './actions' build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "format": "pnpm -r --if-present format"
+  },
+  "dependencies": {
+    "acorn": "^8.15.0",
+    "dotenv": "^17.3.1",
+    "viem": "^2.45.3"
+  },
+  "devDependencies": {
+    "@uniswap/v3-core": "^1.0.1",
+    "hardhat": "^2.22.0",
+    "typescript": "^5.7.0"
   },
   "packageManager": "pnpm@10.28.2",
   "engines": {
