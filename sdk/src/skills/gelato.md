@@ -11,7 +11,7 @@ infrastructure | Chains: Ethereum, Arbitrum, Optimism, Polygon, BSC, Avalanche, 
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/gelato";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/gelato";
 ```
 
 ## SauceScript Examples

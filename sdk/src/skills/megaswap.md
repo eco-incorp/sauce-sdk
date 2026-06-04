@@ -15,7 +15,7 @@ recipe | Chain: Base
 
 ## SDK Usage
 ```typescript
-import { megaSwap, prepareMegaSwap } from "@eco/sauce-sdk/recipes";
+import { megaSwap, prepareMegaSwap } from "@eco-incorp/sauce-sdk/recipes";
 ```
 
 ## How It Works

@@ -1,7 +1,7 @@
 /**
  * Comprehensive compilation and structure tests for all SDK protocol SauceScript functions.
  *
- * Tests that every protocol's SauceScript compiles through the real @eco/sauce-compiler,
+ * Tests that every protocol's SauceScript compiles through the real @eco-incorp/sauce-compiler,
  * verifies Tier 1 selectors, tests registry functions, and validates module structure.
  */
 

@@ -13,7 +13,7 @@ dex | Chains: Polygon
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/quickswap";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/quickswap";
 ```
 
 ## SauceScript Examples

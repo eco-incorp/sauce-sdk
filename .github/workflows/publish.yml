@@ -1,22 +1,27 @@
 name: Publish
 
-# Publishes every non-private workspace package (@eco/sauce-compiler,
-# @eco/sauce-dev-tools, @eco/sauce-sdk, @eco/sauce-actions) to public npm
+# Publishes every non-private workspace package (@eco-incorp/sauce-compiler,
+# @eco-incorp/sauce-dev-tools, @eco-incorp/sauce-sdk, @eco-incorp/sauce-actions) to public npm
 # at the version derived from a `v*` tag.
 #
 # pnpm publish -r walks the workspace in topological order and rewrites
 # workspace:* deps to the version being published, so downstream packages
-# get a proper @eco/sauce-compiler@X.Y.Z pin instead of `workspace:*`.
+# get a proper @eco-incorp/sauce-compiler@X.Y.Z pin instead of `workspace:*`.
 #
 # Trigger:
 #   git tag v1.2.3 && git push origin v1.2.3
 #   — or manual workflow_dispatch with `version` input.
 #
+# Publishes to BOTH registries:
+#   - npmjs.com                  (auth: NPM_TOKEN)
+#   - npm.pkg.github.com         (auth: GITHUB_TOKEN, scoped to this repo's org)
+#
 # Required repo secrets:
 #   ECO_INCORP_TOKEN   PAT with read on eco-incorp/sauce (for pnpm install
 #                      of the private git dep `sauce`)
 #   NPM_TOKEN          npmjs.com automation token with publish rights on
-#                      the @eco scope
+#                      the @eco-incorp scope
+#   GITHUB_TOKEN       auto-injected by Actions; no setup needed
 
 on:
   workflow_dispatch:
@@ -36,6 +41,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -90,7 +96,16 @@ jobs:
             (cd "$pkg" && npm version "$VERSION" --no-git-tag-version --allow-same-version)
           done
 
-      - name: Publish to npm
+      - name: Publish to npmjs.com
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: pnpm -r publish --access public --no-git-checks
+
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GH Packages auth: line per registry. Add auth for npm.pkg.github.com
+          # without disturbing the npmjs.org line setup-node already wrote.
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
+          pnpm -r publish --access public --no-git-checks --registry https://npm.pkg.github.com

@@ -10,7 +10,7 @@ liquid-staking | Chains: Ethereum
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/mantle-meth";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/mantle-meth";
 ```
 
 ## SauceScript Examples

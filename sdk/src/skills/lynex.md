@@ -10,7 +10,7 @@ dex | Chains: Linea
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/lynex";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/lynex";
 ```
 
 ## SauceScript Examples

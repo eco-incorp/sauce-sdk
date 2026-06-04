@@ -1,8 +1,15 @@
 {
-  "name": "@eco/sauce-dev-tools",
+  "name": "@eco-incorp/sauce-dev-tools",
   "version": "0.0.1",
   "description": "Development tools for the Sauce protocol",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eco-incorp/sauce-sdk.git",
+    "directory": "dev-tools"
+  },
+  "homepage": "https://github.com/eco-incorp/sauce-sdk#readme",
+  "bugs": "https://github.com/eco-incorp/sauce-sdk/issues",
   "bin": {
     "sauce-dev-tools": "scripts/init.js"
   },

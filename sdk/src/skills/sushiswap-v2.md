@@ -12,7 +12,7 @@ dex | Chains: Ethereum, Arbitrum, Polygon, BSC, Avalanche, Fantom, Optimism
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/sushiswap-v2";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/sushiswap-v2";
 ```
 
 ## SauceScript Examples

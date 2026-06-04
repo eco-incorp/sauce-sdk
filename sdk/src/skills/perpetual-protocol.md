@@ -13,7 +13,7 @@ perpetuals | Chains: Optimism
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/perpetual-protocol";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/perpetual-protocol";
 ```
 
 ## SauceScript Examples

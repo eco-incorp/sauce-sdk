@@ -6,10 +6,10 @@ Master reference for all protocols in the Sauce SDK. Use this to find the right 
 
 ```typescript
 // Import specific protocol
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/{slug}";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/{slug}";
 
 // Query the registry
-import { getProtocol, listProtocols, getProtocolsByCategory, getProtocolsByChain } from "@eco/sauce-sdk/protocols";
+import { getProtocol, listProtocols, getProtocolsByCategory, getProtocolsByChain } from "@eco-incorp/sauce-sdk/protocols";
 
 const aave = getProtocol("aave-v3");          // Single protocol by slug
 const dexes = getProtocolsByCategory("dex");   // All DEXes
@@ -221,8 +221,8 @@ Pre-built Sauce recipes that combine off-chain preparation with on-chain SauceSc
 
 ```typescript
 // Recipe imports
-import { alphaSwap, prepareAlphaSwap } from "@eco/sauce-sdk/recipes";
-import { megaSwap, prepareMegaSwap } from "@eco/sauce-sdk/recipes";
+import { alphaSwap, prepareAlphaSwap } from "@eco-incorp/sauce-sdk/recipes";
+import { megaSwap, prepareMegaSwap } from "@eco-incorp/sauce-sdk/recipes";
 ```
 
 ---
@@ -291,6 +291,6 @@ import { megaSwap, prepareMegaSwap } from "@eco/sauce-sdk/recipes";
 ## Per-Protocol Skill Files
 
 Detailed skill files with SauceScript examples, contract addresses, and ABI signatures are at:
-`@eco/sauce-sdk/skills/{slug}.md` (or `sdk/src/skills/{slug}.md` in the repo)
+`@eco-incorp/sauce-sdk/skills/{slug}.md` (or `sdk/src/skills/{slug}.md` in the repo)
 
 Load the specific protocol file when you need full implementation details.

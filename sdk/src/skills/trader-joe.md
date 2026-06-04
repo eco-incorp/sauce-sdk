@@ -10,7 +10,7 @@ dex | Chains: Avalanche, Arbitrum, BSC
 
 ## SDK Usage
 ```typescript
-import { protocolInfo, deployments, sauceFunctions } from "@eco/sauce-sdk/protocols/trader-joe";
+import { protocolInfo, deployments, sauceFunctions } from "@eco-incorp/sauce-sdk/protocols/trader-joe";
 ```
 
 ## SauceScript Examples
