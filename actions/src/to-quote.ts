@@ -1,5 +1,5 @@
 import { keccak256, toBytes, encodeAbiParameters, decodeAbiParameters, getAddress } from 'viem';
-import { Saucer, OPS, type OutputSpec } from '@eco/sauce-compiler';
+import { Saucer, OPS, type OutputSpec } from '../../compiler/dist/index.js';
 
 import type {
   SwapAction,

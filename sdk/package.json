@@ -32,13 +32,15 @@
     "src/protocols",
     "src/recipes"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.config.cjs"
   },
   "dependencies": {
-    "@eco/sauce-compiler": "workspace:*",
     "viem": "^2.45.1"
   },
   "devDependencies": {

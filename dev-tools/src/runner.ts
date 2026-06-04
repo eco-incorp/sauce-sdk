@@ -8,10 +8,8 @@
 import { createPublicClient, createWalletClient, http, parseAbi, Hex, defineChain } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { readFileSync } from 'fs'
-import { createRequire } from 'module'
 
-const require = createRequire(import.meta.url)
-const { compile } = require('@eco/sauce-compiler')
+import { compile } from '../../compiler/dist/index.js'
 
 const sauceAbi = parseAbi([
   'function cook(bytes[] memory calls) public payable returns (bytes memory)'

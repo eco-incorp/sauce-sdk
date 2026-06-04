@@ -10,7 +10,7 @@ import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import ts from "typescript";
-import { compile as _compile } from "@eco/sauce-compiler";
+import { compile as _compile } from "../../../../compiler/dist/index.js";
 
 import { prepareAlphaSwap } from "./prepare.js";
 import { MULTICALL3 } from "../shared/constants.js";
