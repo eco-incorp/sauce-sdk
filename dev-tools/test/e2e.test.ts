@@ -23,11 +23,9 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { readFileSync } from "fs";
 import { execSync, spawn } from "child_process";
-import { createRequire } from "module";
 import ts from "typescript";
 
-const require = createRequire(import.meta.url);
-const { compile } = require("@eco/sauce-compiler");
+import { compile } from "../../compiler/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");

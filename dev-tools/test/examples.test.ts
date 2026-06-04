@@ -6,11 +6,9 @@
 import { join, dirname } from "path";
 import { readdirSync, readFileSync } from "fs";
 import { fileURLToPath } from "url";
-import { createRequire } from "module";
 import ts from "typescript";
 
-const require = createRequire(import.meta.url);
-const { compile } = require("@eco/sauce-compiler");
+import { compile } from "../../compiler/dist/index.js";
 
 /** Strip TypeScript type annotations, returning plain JS */
 function stripTypes(source: string): string {

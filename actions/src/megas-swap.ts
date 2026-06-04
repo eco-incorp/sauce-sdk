@@ -1,4 +1,4 @@
-import { Saucer, CompilerContext } from '@eco/sauce-compiler';
+import { Saucer, CompilerContext } from '../../compiler/dist/index.js';
 import { buildAction } from './to-sauce.js';
 import { actionToQuote, type QuoteOpts } from './to-quote.js';
 import type {
