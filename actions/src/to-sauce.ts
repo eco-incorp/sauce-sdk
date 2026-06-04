@@ -1,4 +1,4 @@
-import { Saucer, CompilerContext, OPS, type OutputSpec } from '@eco/sauce-compiler';
+import { Saucer, CompilerContext, OPS, type OutputSpec } from '../../compiler/dist/index.js';
 import { keccak256, toBytes, encodeAbiParameters } from 'viem';
 
 import type {

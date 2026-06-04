@@ -10,7 +10,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import ts from 'typescript';
 import { keccak256, toBytes, toHex } from 'viem';
-import { compile, type ContractsConfig, type Abi } from '@eco/sauce-compiler';
+import { compile, type ContractsConfig, type Abi } from '../../compiler/dist/index.js';
 
 /**
  * Strip TypeScript type annotations from SauceScript, returning plain JS.
