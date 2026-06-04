@@ -43,6 +43,8 @@ if (!existsSync(resolve(engineDir, 'out/Sauce.sol/Sauce.json'))) {
   try {
     execSync('forge build --skip test --skip script', { cwd: engineDir, stdio: 'inherit' });
   } catch {
-    console.warn('[fetch-engine-libs] forge build failed (foundry not installed?); integration tests that read engine artifacts will fail until you run it manually');
+    console.warn(
+      '[fetch-engine-libs] forge build failed (foundry not installed?); integration tests that read engine artifacts will fail until you run it manually',
+    );
   }
 }
