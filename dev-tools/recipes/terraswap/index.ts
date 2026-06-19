@@ -38,7 +38,7 @@ import type {
 } from "../shared/types";
 
 const require = createRequire(import.meta.url);
-const { compile } = require("sauce-compiler");
+const { compile } = require("@eco-incorp/sauce-compiler");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");

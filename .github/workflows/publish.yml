@@ -50,6 +50,13 @@ jobs:
           fi
           git config --global url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
 
+      # Foundry builds the sauce engine (compiler postinstall `forge build`) so the
+      # `prepack` step can copy engine artifacts into dev-tools/artifacts/ for the tarball.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10.28.2
