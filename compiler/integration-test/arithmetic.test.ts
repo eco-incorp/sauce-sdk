@@ -33,6 +33,14 @@ describe('integration: arithmetic', () => {
     expect(BigInt(cook('function main() { return Math.sqrt(10); }'))).toBe(3n);
   });
 
+  it('mulDiv', () => {
+    expect(BigInt(cook('function main() { return Math.mulDiv(100, 50, 25); }'))).toBe(200n);
+  });
+
+  it('mulDiv full precision (no intermediate overflow)', () => {
+    expect(BigInt(cook('function main() { return Math.mulDiv(2 ** 255, 2, 2 ** 255); }'))).toBe(2n);
+  });
+
   it('nested: (a + b) * c', () => {
     expect(BigInt(cook('function main() { return (3 + 4) * 5; }'))).toBe(35n);
   });

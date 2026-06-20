@@ -18,6 +18,7 @@ export const OPS = {
   MOD: 0x25,
   EXP: 0x26,
   SQRT: 0x27,
+  MUL_DIV: 0x28,
   NEG: 0x29,
   AND: 0x30,
   OR: 0x31,

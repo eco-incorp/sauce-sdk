@@ -111,6 +111,36 @@ describe('arithmetic', () => {
     );
   });
 
+  it('compiles Math.mulDiv', () => {
+    const result = compile('function main(a, b, c) { return Math.mulDiv(a, b, c); }');
+    expect(Array.from(result.bytecode[0])).toContain(OPS.MUL_DIV);
+  });
+
+  it('compiles Math.mulDiv with literals', () => {
+    const result = compile('function main() { const x = Math.mulDiv(100, 50, 25); }');
+    expect(result.bytecode[0]).toEqual(
+      new Uint8Array([
+        OPS.ALLOCATE_VALUE,
+        1,
+        OPS.WRITE_VALUE,
+        0,
+        OPS.MUL_DIV,
+        OPS.BYTE_1,
+        100,
+        OPS.BYTE_1,
+        50,
+        OPS.BYTE_1,
+        25,
+      ]),
+    );
+  });
+
+  it('throws on Math.mulDiv with wrong arity', () => {
+    expect(() => compile('function main(a, b) { return Math.mulDiv(a, b); }')).toThrow(
+      'Math.mulDiv expects 3 argument(s), got 2',
+    );
+  });
+
   it('throws on >>>', () => {
     expect(() => compile('function main() { const x = 1 >>> 2; }')).toThrow('use >> instead of >>>');
   });

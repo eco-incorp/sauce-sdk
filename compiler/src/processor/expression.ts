@@ -11,6 +11,9 @@ import type {
   Statement,
   TaggedTemplateExpression,
   TemplateElement,
+  ObjectExpression,
+  ArrayExpression,
+  Property,
 } from 'acorn';
 import { Saucer, OPS } from '../saucer/index.js';
 import type { AbiParameter, ContractInfo } from '../contracts.js';
@@ -22,6 +25,7 @@ import {
   resolveStaticMethod,
   resolveInstanceMethod,
   getPropertyName,
+  getPropertyKey,
   lookupStructType,
   getFieldIndex,
   inferKindWithContext,
@@ -214,6 +218,55 @@ function resolveInlineChain(expr: CallExpression): InlineChainInfo | undefined {
   };
 }
 
+// Object literals are stored internally with fields in alphabetical order (the
+// canonical order used for `obj.field` reads). But a struct passed to a contract
+// method must be ABI-encoded in the ABI's DECLARATION order. So at the call
+// boundary we re-order an object-literal arg to match the ABI tuple components
+// (recursively, including nested tuples and tuple[]), rather than emitting the
+// internal alphabetical tuple. Non-object args (scalars, arrays, variables) fall
+// through to normal processing.
+function processAbiArg(arg: Expression, param: AbiParameter | undefined, ctx: CompilerContext): Saucer {
+  if (param?.type === 'tuple' && arg.type === 'ObjectExpression') {
+    return orderedStructTuple(arg as ObjectExpression, param.components ?? [], ctx);
+  }
+
+  if (param?.type === 'tuple[]' && arg.type === 'ArrayExpression') {
+    const elementParam: AbiParameter = { type: 'tuple', components: param.components };
+    const elements = (arg as ArrayExpression).elements.map((el) => {
+      if (!el || el.type === 'SpreadElement') throw new Error('sparse/spread arrays are not supported');
+
+      return processAbiArg(el as Expression, elementParam, ctx);
+    });
+
+    return new Saucer(ctx).array(elements);
+  }
+
+  return processExpression(arg, ctx);
+}
+
+function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], ctx: CompilerContext): Saucer {
+  const byName = new Map<string, Expression>();
+  for (const prop of obj.properties) {
+    if (prop.type !== 'Property') throw new Error('spread properties are not supported');
+
+    const p = prop as Property;
+    const key = getPropertyKey(p);
+    byName.set(key, p.shorthand ? ({ type: 'Identifier', name: key } as Expression) : (p.value as Expression));
+  }
+
+  const elements = components.map((component) => {
+    if (!component.name) throw new Error('ABI tuple components must be named to encode an object literal');
+
+    const value = byName.get(component.name);
+
+    if (!value) throw new Error(`missing struct field '${component.name}' in object literal`);
+
+    return processAbiArg(value, component, ctx);
+  });
+
+  return new Saucer(ctx).tuple(elements);
+}
+
 function processContractCall(
   contract: ContractInfo,
   methodName: string,
@@ -237,7 +290,7 @@ function processContractCall(
   const s = new Saucer(ctx);
   const selectorBytes = hexToBytes(method.selector);
 
-  const processedArgs = args.map((arg) => processExpression(arg, ctx));
+  const processedArgs = args.map((arg, i) => processAbiArg(arg, method.inputs[i], ctx));
 
   const calldata =
     processedArgs.length === 0
