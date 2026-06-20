@@ -146,7 +146,7 @@ async function main() {
       "         npm run recipe megaswap WETH USDC 0.01 -- --network base",
     );
     console.error("         npm run recipe terraswap config.json");
-    console.error("\nAvailable recipes: megaswap, alphaswap, gigaswap, terraswap");
+    console.error("\nAvailable recipes: megaswap, alphaswap, gigaswap, ecoswap, terraswap");
     console.error(
       "Available tokens: WETH, USDC, DAI, USDbC (or pass 0x address)",
     );
@@ -370,9 +370,39 @@ async function main() {
     }
     console.log(`  Global price limit: ${result.prepared.globalPriceLimit}`);
     console.log(`  Direction: ${result.prepared.zeroForOne ? "zeroForOne" : "oneForZero"}`);
+  } else if (recipeName === "ecoswap") {
+    const { ecoSwap } = await import("../recipes/ecoswap/index");
+    const result = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      rpcUrl,
+      sauceAddress as Hex,
+      account.address,
+    );
+    bytecodes = result.bytecodes;
+
+    const v3 = result.prepared.pools.filter((p) => !p.isV2);
+    const v2 = result.prepared.pools.filter((p) => p.isV2);
+    console.log(`  V3 pools: ${v3.length}`);
+    for (const p of v3) {
+      console.log(`    [V3] ${p.source} ${p.address.slice(0, 10)}... fee=${p.fee} ts=${p.tickSpacing}`);
+    }
+    console.log(`  V2 pools: ${v2.length}`);
+    for (const p of v2) {
+      console.log(`    [V2] ${p.source} ${p.address.slice(0, 10)}... fee=${p.fee}`);
+    }
+    console.log(`  Multi-hop routes: ${result.prepared.routes.length}`);
+    for (const r of result.prepared.routes) {
+      console.log(`    via ${r.route.intermediateToken.slice(0, 10)}...`);
+    }
+    console.log(`  Brackets: ${result.prepared.brackets.length}`);
+    console.log(
+      `  Off-chain coverage: ${result.prepared.expectedInputCovered >= amountIn ? "full" : "partial"} ` +
+        `(${formatUnits(result.prepared.expectedInputCovered, inDecimals)} of ${formatUnits(amountIn, inDecimals)})`,
+    );
+    console.log(`  Direction: ${result.prepared.zeroForOne ? "zeroForOne" : "oneForZero"}`);
   } else {
     console.error(`Unknown recipe: ${recipeName}`);
-    console.error("Available recipes: megaswap, alphaswap, gigaswap, terraswap");
+    console.error("Available recipes: megaswap, alphaswap, gigaswap, ecoswap, terraswap");
     process.exit(1);
   }
 

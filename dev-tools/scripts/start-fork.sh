@@ -16,6 +16,16 @@ fi
 
 FORK_URL="$1"
 
+# Optional pinned block (2nd arg or $FORK_BLOCK env). Pinning enables Hardhat's
+# persistent on-disk fork cache (~/.cache/hardhat-nodejs/hardhat-network-fork/,
+# keyed by chainId+block) so state is reused across runs, and makes runs
+# deterministic. Without it, Hardhat forks "latest" and caches in memory only.
+FORK_BLOCK="${2:-$FORK_BLOCK}"
+BLOCK_ARG=""
+if [ -n "$FORK_BLOCK" ]; then
+    BLOCK_ARG="--fork-block-number $FORK_BLOCK"
+fi
+
 # Check for Sauce artifact
 if [ ! -f "$REPO_ROOT/artifacts/ISauceRouter.json" ]; then
     echo "Error: artifacts/ISauceRouter.json not found."
@@ -23,7 +33,11 @@ if [ ! -f "$REPO_ROOT/artifacts/ISauceRouter.json" ]; then
     exit 1
 fi
 
-echo -e "${YELLOW}Starting Hardhat (forking $FORK_URL)...${NC}"
+if [ -n "$FORK_BLOCK" ]; then
+    echo -e "${YELLOW}Starting Hardhat (forking $FORK_URL @ block $FORK_BLOCK, persistent cache)...${NC}"
+else
+    echo -e "${YELLOW}Starting Hardhat (forking $FORK_URL @ latest, in-memory cache only)...${NC}"
+fi
 
 # Kill any existing process on port 8545
 if lsof -i :8545 > /dev/null 2>&1; then
@@ -34,7 +48,7 @@ fi
 
 # Start Hardhat node with forking in background
 cd "$REPO_ROOT"
-npx hardhat node --fork "$FORK_URL" > "$REPO_ROOT/.hardhat.log" 2>&1 &
+npx hardhat node --fork "$FORK_URL" $BLOCK_ARG > "$REPO_ROOT/.hardhat.log" 2>&1 &
 HARDHAT_PID=$!
 
 # Wait for hardhat to be ready

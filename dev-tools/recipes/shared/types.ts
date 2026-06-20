@@ -160,3 +160,96 @@ export interface TerraSwapPrepared {
   chains: TerraSwapChainPrepared[];
   globalPriceLimit: bigint;
 }
+
+// ── EcoSwap ──────────────────────────────────────────────────
+//
+// EcoSwap generalises GigaSwap's price-limit idea to AMMs that do NOT support
+// sqrtPriceLimitX96. Instead of relying on the pool to cap its own fill, it
+// reconstructs each pool's liquidity curve off-chain as a set of per-tick
+// "brackets", then on-chain solves the optimal split that equalises the
+// post-fee marginal execution price across every pool (water-filling), doing
+// exactly ONE swap per pool (one per hop for routes).
+//
+// Unification insight: a constant-product (V2) pool is mathematically identical
+// to a single Uniswap-V3 liquidity bracket with L = sqrt(reserveIn * reserveOut).
+// So every direct pool — V3 ticks and V2 alike — is represented as brackets in a
+// common "out/in" sqrt-price space, and the on-chain solver runs ONE formula:
+//   inputForBracket = L * 2^96 * (1/sqrtFar - 1/sqrtNear)   (then grossed-up by fee)
+
+export interface EcoSwapConfig {
+  tokenIn: Hex;
+  tokenOut: Hex;
+  amountIn: bigint;
+}
+
+/** Bracket kinds (must match the on-chain `kind` tag). */
+export enum EcoBracketKind {
+  V3 = 0, // direct concentrated-liquidity bracket (live re-anchor via slot0)
+  V2 = 1, // direct constant-product bracket (live re-anchor via getReserves)
+  Route = 2, // multi-hop route segment (static, off-chain-precomputed capacity)
+}
+
+/**
+ * One liquidity bracket in unified out/in sqrt-price space.
+ *
+ * All sqrt values are Q96 fixed-point in OUT-per-IN orientation (price decreases
+ * as the swap proceeds, so sqrtNear > sqrtFar). The `*Adj` values are fee-adjusted
+ * (multiplied by sqrt(1-fee)) and are the universal sort/threshold coordinate that
+ * makes marginal *execution* prices comparable across pools of different fee tiers.
+ */
+export interface EcoBracket {
+  kind: EcoBracketKind;
+  /** Index into EcoSwapPrepared.pools (V3/V2) or .routes (Route). */
+  refIdx: number;
+  /** Spot out/in sqrtP at the near (entry) edge — higher price. */
+  sqrtNear: bigint;
+  /** Spot out/in sqrtP at the far (exit) edge — lower price. */
+  sqrtFar: bigint;
+  /** Bracket liquidity L (V3). For V2 it is recomputed live on-chain; for routes unused. */
+  liquidity: bigint;
+  /** Pre-computed gross input capacity to traverse the full bracket (tokenIn units). */
+  capacity: bigint;
+  /** Fee-adjusted sqrt at the near edge (sort key, descending). */
+  sqrtAdjNear: bigint;
+  /** Fee-adjusted sqrt at the far edge (threshold coordinate). */
+  sqrtAdjFar: bigint;
+}
+
+/** Direct-pool descriptor (live-readable on-chain). */
+export interface EcoPool {
+  poolType: SwapPoolType;
+  address: Hex;
+  fee: number;
+  tickSpacing: number;
+  hooks: Hex;
+  /** parts-per-million fee (e.g. 3000 = 0.30%). */
+  feePpm: number;
+  /** true => constant-product (read getReserves); false => V3 (read slot0). */
+  isV2: boolean;
+  /** For V2 live reserve orientation: is tokenIn the pool's token0? */
+  inIsToken0: boolean;
+  source: string;
+}
+
+/** Multi-hop route descriptor (two hops through an intermediate base token). */
+export interface EcoRoute {
+  route: DiscoveredMultiHopRoute;
+}
+
+/**
+ * Off-chain preparation result.
+ *
+ * `brackets` is the global ladder, pre-sorted DESCENDING by sqrtAdjNear — the
+ * on-chain solver walks it once to find the common marginal-price cut, then
+ * executes one swap per pool re-anchored to live prices.
+ */
+export interface EcoSwapPrepared {
+  pools: EcoPool[];
+  routes: EcoRoute[];
+  brackets: EcoBracket[];
+  zeroForOne: boolean;
+  /** Real-sqrt-space extreme price limit for the swap calls (direction-dependent). */
+  priceLimit: bigint;
+  /** Sum of off-chain bracket capacities consumed up to amountIn (diagnostic). */
+  expectedInputCovered: bigint;
+}

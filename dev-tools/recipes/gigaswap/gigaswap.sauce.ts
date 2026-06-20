@@ -16,10 +16,10 @@ function main(
   priceLimitedPools: Tuple, noLimitPools: Tuple, multiHopRoutes: Tuple,
   globalPriceLimit: Uint256
 ): Uint256 {
-  const router = ISauceRouter.at(THIS_ADDRESS());
+  const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
 
-  token.transferFrom(caller, THIS_ADDRESS(), amountIn);
+  token.transferFrom(caller, address.self, amountIn);
 
   // Sort tokens for PoolKey
   const token0: Address = tokenIn < tokenOut ? tokenIn : tokenOut;
@@ -37,9 +37,8 @@ function main(
   for (let i = 0; i < priceLimitedPools.length; i = i + 1) {
     const dp: Tuple = priceLimitedPools[i];
 
-    // Read current tokenIn balance — this IS the swap amount
-    const balData: Tuple = ABI_DECODE(token.balanceOf(THIS_ADDRESS()), 1, 32);
-    const currentBal: Uint256 = balData[0];
+    // Read current tokenIn balance — this IS the swap amount (balanceOf auto-decodes).
+    const currentBal: Uint256 = token.balanceOf(address.self);
 
     if (currentBal > 0) {
       router.swap({
@@ -50,8 +49,8 @@ function main(
         tokenOut: tokenOut,
         amountSpecified: currentBal,
         sqrtPriceLimitX96: globalPriceLimit,
-        payer: THIS_ADDRESS(),
-        recipient: THIS_ADDRESS(),
+        payer: address.self,
+        recipient: address.self,
       });
     }
   }
@@ -76,8 +75,8 @@ function main(
         tokenOut: tokenOut,
         amountSpecified: splitAmt,
         sqrtPriceLimitX96: 0,
-        payer: THIS_ADDRESS(),
-        recipient: THIS_ADDRESS(),
+        payer: address.self,
+        recipient: address.self,
       });
     }
   }
@@ -104,13 +103,13 @@ function main(
         tokenOut: inter,
         amountSpecified: splitAmt,
         sqrtPriceLimitX96: 0,
-        payer: THIS_ADDRESS(),
-        recipient: THIS_ADDRESS(),
+        payer: address.self,
+        recipient: address.self,
       });
 
-      const interBal: Tuple = ABI_DECODE(IERC20.at(inter).balanceOf(THIS_ADDRESS()), 1, 32);
-      if (interBal[0] > 0) {
-        IERC20.at(inter).approve(THIS_ADDRESS(), interBal[0]);
+      const interBal: Uint256 = IERC20.at(inter).balanceOf(address.self);
+      if (interBal > 0) {
+        IERC20.at(inter).approve(address.self, interBal);
 
         const out0: Address = inter < tokenOut ? inter : tokenOut;
         const out1: Address = inter < tokenOut ? tokenOut : inter;
@@ -122,10 +121,10 @@ function main(
           poolKey: { currency0: out0, currency1: out1, fee: route[8], tickSpacing: route[9], hooks: route[10] },
           tokenIn: inter,
           tokenOut: tokenOut,
-          amountSpecified: interBal[0],
+          amountSpecified: interBal,
           sqrtPriceLimitX96: 0,
-          payer: THIS_ADDRESS(),
-          recipient: THIS_ADDRESS(),
+          payer: address.self,
+          recipient: address.self,
         });
       }
     }
@@ -142,19 +141,18 @@ function main(
   // Multi-hop routes use hop1 pool's slot0 delta for weighting.
   // ══════════════════════════════════════════════════════════════
 
-  const leftoverData: Tuple = ABI_DECODE(token.balanceOf(THIS_ADDRESS()), 1, 32);
-  const remaining: Uint256 = leftoverData[0];
+  const remaining: Uint256 = token.balanceOf(address.self);
 
   if (remaining > 0) {
-    const SCALE: Uint256 = 1000000000000000000;
+    const SCALE: Uint256 = 10 ** 18;
 
     // Pass 1: sum inverse-delta weights across V3 pools + multi-hop routes
     let totalWeight: Uint256 = 0;
 
     for (let i = 0; i < priceLimitedPools.length; i = i + 1) {
       const dp: Tuple = priceLimitedPools[i];
-      const postData: Tuple = ABI_DECODE(IUniswapV3Pool.at(dp[1]).slot0(), 1, 32);
-      const postPrice: Uint256 = postData[0];
+      // slot0 is multi-return — index inline.
+      const postPrice: Uint256 = IUniswapV3Pool.at(dp[1]).slot0()[0];
       const prePrice: Uint256 = dp[6];
       const delta: Uint256 = prePrice > postPrice ? prePrice - postPrice : postPrice - prePrice;
       if (delta > 0) {
@@ -164,8 +162,7 @@ function main(
 
     for (let j = 0; j < multiHopRoutes.length; j = j + 1) {
       const route: Tuple = multiHopRoutes[j];
-      const postData: Tuple = ABI_DECODE(IUniswapV3Pool.at(route[2]).slot0(), 1, 32);
-      const postPrice: Uint256 = postData[0];
+      const postPrice: Uint256 = IUniswapV3Pool.at(route[2]).slot0()[0];
       const prePrice: Uint256 = route[12];
       const delta: Uint256 = prePrice > postPrice ? prePrice - postPrice : postPrice - prePrice;
       if (delta > 0) {
@@ -180,12 +177,11 @@ function main(
 
       for (let i = 0; i < priceLimitedPools.length; i = i + 1) {
         const dp: Tuple = priceLimitedPools[i];
-        const postData: Tuple = ABI_DECODE(IUniswapV3Pool.at(dp[1]).slot0(), 1, 32);
-        const postPrice: Uint256 = postData[0];
+        const postPrice: Uint256 = IUniswapV3Pool.at(dp[1]).slot0()[0];
         const prePrice: Uint256 = dp[6];
         const delta: Uint256 = prePrice > postPrice ? prePrice - postPrice : postPrice - prePrice;
         const weight: Uint256 = delta > 0 ? SCALE / delta : 0;
-        const amt: Uint256 = MUL_DIV(remaining, weight, totalWeight);
+        const amt: Uint256 = Math.mulDiv(remaining, weight, totalWeight);
         allocated = allocated + amt;
 
         if (amt > 0) {
@@ -197,8 +193,8 @@ function main(
             tokenOut: tokenOut,
             amountSpecified: amt,
             sqrtPriceLimitX96: 0,
-            payer: THIS_ADDRESS(),
-            recipient: THIS_ADDRESS(),
+            payer: address.self,
+            recipient: address.self,
           });
         }
       }
@@ -209,14 +205,13 @@ function main(
         const hop1Pool: Address = route[2];
         const hop2Pool: Address = route[7];
 
-        const postData: Tuple = ABI_DECODE(IUniswapV3Pool.at(hop1Pool).slot0(), 1, 32);
-        const postPrice: Uint256 = postData[0];
+        const postPrice: Uint256 = IUniswapV3Pool.at(hop1Pool).slot0()[0];
         const prePrice: Uint256 = route[12];
         const delta: Uint256 = prePrice > postPrice ? prePrice - postPrice : postPrice - prePrice;
         const weight: Uint256 = delta > 0 ? SCALE / delta : 0;
 
-        const isLast: Uint256 = (priceLimitedPools.length + j + 1 == totalEntries) ? 1 : 0;
-        const amt: Uint256 = isLast == 1 ? remaining - allocated : MUL_DIV(remaining, weight, totalWeight);
+        const isLast: Uint256 = (priceLimitedPools.length + j + 1 === totalEntries) ? 1 : 0;
+        const amt: Uint256 = isLast === 1 ? remaining - allocated : Math.mulDiv(remaining, weight, totalWeight);
         allocated = allocated + amt;
 
         if (amt > 0) {
@@ -231,13 +226,13 @@ function main(
             tokenOut: inter,
             amountSpecified: amt,
             sqrtPriceLimitX96: 0,
-            payer: THIS_ADDRESS(),
-            recipient: THIS_ADDRESS(),
+            payer: address.self,
+            recipient: address.self,
           });
 
-          const interBal: Tuple = ABI_DECODE(IERC20.at(inter).balanceOf(THIS_ADDRESS()), 1, 32);
-          if (interBal[0] > 0) {
-            IERC20.at(inter).approve(THIS_ADDRESS(), interBal[0]);
+          const interBal: Uint256 = IERC20.at(inter).balanceOf(address.self);
+          if (interBal > 0) {
+            IERC20.at(inter).approve(address.self, interBal);
 
             const out0: Address = inter < tokenOut ? inter : tokenOut;
             const out1: Address = inter < tokenOut ? tokenOut : inter;
@@ -248,10 +243,10 @@ function main(
               poolKey: { currency0: out0, currency1: out1, fee: route[8], tickSpacing: route[9], hooks: route[10] },
               tokenIn: inter,
               tokenOut: tokenOut,
-              amountSpecified: interBal[0],
+              amountSpecified: interBal,
               sqrtPriceLimitX96: 0,
-              payer: THIS_ADDRESS(),
-              recipient: THIS_ADDRESS(),
+              payer: address.self,
+              recipient: address.self,
             });
           }
         }
@@ -261,7 +256,7 @@ function main(
 
   // Transfer all output tokens to caller
   const outToken = IERC20.at(tokenOut);
-  const outBal: Tuple = ABI_DECODE(outToken.balanceOf(THIS_ADDRESS()), 1, 32);
-  outToken.transfer(caller, outBal[0]);
-  return outBal[0];
+  const outBal: Uint256 = outToken.balanceOf(address.self);
+  outToken.transfer(caller, outBal);
+  return outBal;
 }
