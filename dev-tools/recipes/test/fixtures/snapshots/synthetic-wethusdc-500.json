@@ -1,0 +1,27 @@
+{
+  "_note": "synthetic; not from a real RPC. Hand-authored WETH/USDC-like V3 pool (fee 500, tickSpacing 10) with a positive staircase liquidity profile straddling the current tick (200). Used to verify the reproduce-pool + prod-mirror test path fully offline. Active liquidity 750e18; baseline below the window 150e18; cumulative net below+at tick 200 = 600e18 = 750e18 - 150e18 (consistent).",
+  "chainId": 8453,
+  "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+  "token0": "0x4200000000000000000000000000000000000006",
+  "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "symbol0": "WETH",
+  "symbol1": "USDC",
+  "decimals0": 18,
+  "decimals1": 18,
+  "fee": 500,
+  "tickSpacing": 10,
+  "sqrtPriceX96": "80024378775772204256025656563",
+  "tick": 200,
+  "liquidity": "750000000000000000000",
+  "ticks": [
+    [50, "250000000000000000000"],
+    [100, "250000000000000000000"],
+    [150, "250000000000000000000"],
+    [200, "-150000000000000000000"],
+    [250, "-250000000000000000000"],
+    [300, "-150000000000000000000"],
+    [350, "-150000000000000000000"],
+    [400, "-50000000000000000000"]
+  ],
+  "windowTickSpacings": 200
+}

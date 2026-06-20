@@ -37,7 +37,8 @@
     "sync-price": "npx tsx scripts/sync-price.ts",
     "sync-artifacts": "node scripts/sync-artifacts.js",
     "test": "npx tsx test/examples.test.ts && npx tsx test/runner.test.ts && npm run test:recipes",
-    "test:recipes": "npx tsx --test recipes/test/compile.test.ts recipes/test/ecoswap.compile.test.ts",
+    "test:recipes": "npx tsx --test recipes/test/compile.test.ts recipes/test/ecoswap.compile.test.ts recipes/test/ecoswap.math.test.ts",
+    "test:recipes:evm": "bash recipes/test/fixtures/build.sh && npx tsx --test recipes/test/*.evm.test.ts",
     "test:e2e": "npx tsx test/e2e.test.ts",
     "format": "npx prettier --write sauce scripts test",
     "typecheck": "tsc --noEmit"

@@ -162,13 +162,35 @@ them with **`pnpm sync-artifacts`**, which copies the `sauce` engine's Foundry b
 build` runs in the compiler `postinstall`). This also runs automatically at **`prepack`** so the
 published package ships them.
 
-### Recipe tests (not wired into `npm test`)
+### Recipe tests
 
-`dev-tools/recipes/test/{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests (plain
-`tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router, fund/approve,
-`prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run manually
-(`BASE_RPC_URL=<url> npx tsx recipes/test/megaswap.test.ts`). dev-tools `npm test` only runs the
-`examples`/`runner` compile tests; sdk recipes have no tests; `terraswap` has no test.
+Three tiers under `dev-tools/recipes/test/`, all using the **node:test** runner (`tsx --test`) except
+the legacy fork tests:
+
+1. **Fast, no-network (`npm run test:recipes`, also part of `npm test`)** — `compile.test.ts` +
+   `ecoswap.compile.test.ts` (compile all 4 drifted recipes + ecoswap to bytecode) and
+   `ecoswap.math.test.ts` (pure-bigint known-answer math: TickMath `getSqrtRatioAtTick`, fee-adjust,
+   V2≡V3-bracket unification, water-fill conservation/interior-cut via the `ecoswap.reference.ts`
+   oracle). No anvil, no RPC.
+2. **Local EVM simulation (`npm run test:recipes:evm`)** — `*.evm.test.ts`. Boots a fresh **anvil (NO
+   fork)**, etches Multicall3, deploys the **real** `@uniswap/v3-core` Factory + the Sauce engine
+   (`Router`→`SauceRouter`), mints our own concentrated liquidity across ticks via a `V3LiquidityHelper`,
+   then runs the compiled recipe through `cook()` and asserts the split + marginal-price equalization,
+   cross-checked against the `ecoswap.reference.ts` oracle. The script first `forge build`s the Solidity
+   fixtures (`recipes/test/fixtures/`: `MintableERC20`, `V3LiquidityHelper`) — **Foundry required**.
+   `ecoswap.prodmirror.evm.test.ts` reproduces a real Base pool's tick geometry locally from a snapshot
+   (synthetic snapshot checked in; capture a real one with
+   `BASE_RPC_URL=<url> npx tsx recipes/test/harness/prod-snapshot.ts`). The harness lives in
+   `recipes/test/harness/`. Why local pools work: the engine `Router` authenticates V3 swap callbacks
+   via transient storage (`expectedPool`), not a hardcoded factory/CREATE2 check, so non-canonical
+   locally-deployed pools are accepted. EcoSwap discovery is config-injectable —
+   `ecoSwap(config, rpcUrl, sauceRouter, caller, poolConfig?)` threads a local `ChainPoolConfig` so the
+   real `discoverPools`→bracket→filter path runs against local pools.
+3. **Fork tests (manual)** — `{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests
+   (plain `tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router,
+   fund/approve, `prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run
+   manually (`BASE_RPC_URL=<url> npx tsx recipes/test/megaswap.test.ts`). `terraswap` has no test; sdk
+   recipes have no tests.
 
 ## Publishing
 
