@@ -53,6 +53,18 @@ contract V3LiquidityHelper {
     ///         Pays owed token amounts into the pool: from the helper's own balance when the
     ///         encoded payer is this contract (batchMint), else pulled from the payer.
     function uniswapV3MintCallback(uint256 amount0Owed, uint256 amount1Owed, bytes calldata data) external {
+        _payMint(amount0Owed, amount1Owed, data);
+    }
+
+    /// @notice PancakeSwap V3 mint callback — same shape as Uniswap's, different selector.
+    ///         Pancake V3 pools call THIS during `mint`, so the helper services both forks
+    ///         identically (the only fork difference at the boundary is the callback name).
+    function pancakeV3MintCallback(uint256 amount0Owed, uint256 amount1Owed, bytes calldata data) external {
+        _payMint(amount0Owed, amount1Owed, data);
+    }
+
+    /// @dev Shared mint-callback payment: self-pay (batchMint) vs pull-from-payer (mint).
+    function _payMint(uint256 amount0Owed, uint256 amount1Owed, bytes calldata data) internal {
         address payer = abi.decode(data, (address));
         address pool = msg.sender; // the pool that invoked the callback
         address t0 = IUniswapV3PoolMinimal(pool).token0();

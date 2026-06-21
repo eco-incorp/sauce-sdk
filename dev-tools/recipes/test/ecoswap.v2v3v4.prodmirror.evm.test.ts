@@ -238,6 +238,10 @@ describe("EcoSwap prod-mirror V2+V3+V4 (one swap across all three reproduced Bas
 
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      // Cross-version split demo: keep all three real pools regardless of the
+      // relative-depth filter (the real V2/V4 are genuinely shallow vs the V3 500
+      // pool; the dedicated all-pools test exercises the filter instead).
+      { minRelBps: 0 },
     );
 
     // Discovery must surface exactly one pool of each version.
@@ -381,6 +385,10 @@ describe("EcoSwap prod-mirror V2+V3+V4 (one swap across all three reproduced Bas
     //    embed a ladder/cut snapshotted from these prices.
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      // Cross-version split demo: keep all three real pools regardless of the
+      // relative-depth filter (the real V2/V4 are genuinely shallow vs the V3 500
+      // pool; the dedicated all-pools test exercises the filter instead).
+      { minRelBps: 0 },
     );
     const ref = ecoSwapReference(prepared, amountIn);
     const v3Idx = prepared.pools.findIndex((p) => p.poolType === SwapPoolType.UniV3);

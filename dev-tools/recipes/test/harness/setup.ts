@@ -80,6 +80,22 @@ export const v3PoolArtifact = loadArtifact(
   join(UNISWAP, "UniswapV3Pool.sol", "UniswapV3Pool.json"),
 );
 
+// PancakeSwap V3: the npm package ships the pool's prebuilt CREATION bytecode (but
+// not the concrete deployer source). Deploying THIS bytecode yields a genuine
+// Pancake pool that calls pancakeV3SwapCallback / pancakeV3MintCallback — exercising
+// the engine's Pancake callback path, not Uniswap's. Our PancakeV3Deployer fixture
+// CREATEs it (stamping local tokens via parameters()) and doubles as a getPool registry.
+const PANCAKE = join(
+  DEV_TOOLS, "node_modules", "@pancakeswap", "v3-core", "artifacts", "contracts",
+);
+export const pancakeDeployerArtifact = loadArtifact(
+  join(FIXTURES, "PancakeV3Deployer.sol", "PancakeV3Deployer.json"),
+);
+/** Genuine PancakeV3Pool creation bytecode (ctor reads immutables from its deployer). */
+export const pancakeV3PoolCreationCode = loadArtifact(
+  join(PANCAKE, "PancakeV3Pool.sol", "PancakeV3Pool.json"),
+).bytecode;
+
 // ── Minimal ABIs for reads ───────────────────────────────────
 export const erc20Abi = parseAbi([
   "function mint(address to, uint256 amount)",
@@ -116,6 +132,11 @@ export const helperAbi = parseAbi([
 export const v2FactoryAbi = parseAbi([
   "function setPair(address tokenA, address tokenB, address pair)",
   "function getPair(address tokenA, address tokenB) view returns (address)",
+]);
+
+export const pancakeDeployerAbi = parseAbi([
+  "function createPool(bytes creationCode, address tokenA, address tokenB, uint24 fee, int24 tickSpacing) returns (address pool)",
+  "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)",
 ]);
 
 export const v2PairAbi = parseAbi([
@@ -405,6 +426,55 @@ export async function getSlot0(
     functionName: "slot0",
   })) as readonly [bigint, number, ...unknown[]];
   return { sqrtPriceX96: r[0], tick: Number(r[1]) };
+}
+
+/** Deploy the local Pancake V3 deployer/factory shim (CREATEs genuine pancake pools). */
+export async function deployPancakeDeployer(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: pancakeDeployerArtifact.abi,
+    bytecode: pancakeDeployerArtifact.bytecode,
+  });
+}
+
+/**
+ * Create + initialise a GENUINE PancakeV3 pool via the deployer shim, then read it
+ * back from the shim's getPool registry. Mirrors createAndInitPool but stamps out
+ * real Pancake pool bytecode (→ pancakeV3SwapCallback). token0/token1 should be
+ * sorted; the shim sorts internally and registers both orderings.
+ */
+export async function createAndInitPancakePool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  deployer: Hex,
+  token0: Hex,
+  token1: Hex,
+  fee: number,
+  tickSpacing: number,
+  sqrtPriceX96: bigint,
+): Promise<Hex> {
+  await writeAndWait(walletClient, publicClient, {
+    address: deployer,
+    abi: pancakeDeployerAbi as Abi,
+    functionName: "createPool",
+    args: [pancakeV3PoolCreationCode, token0, token1, fee, tickSpacing],
+  });
+  const pool = (await publicClient.readContract({
+    address: deployer,
+    abi: pancakeDeployerAbi as Abi,
+    functionName: "getPool",
+    args: [token0, token1, fee],
+  })) as Hex;
+  if (!pool || BigInt(pool) === 0n) throw new Error("pancake createPool returned zero address");
+  await writeAndWait(walletClient, publicClient, {
+    address: pool,
+    abi: v3PoolAbi as Abi,
+    functionName: "initialize",
+    args: [sqrtPriceX96],
+  });
+  return pool;
 }
 
 /** Deploy the V2 registry factory (discovery resolves V2 pools via getPair). */

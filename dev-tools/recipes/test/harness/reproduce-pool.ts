@@ -57,6 +57,7 @@ import type { Account, Hex, PublicClient, WalletClient } from "viem";
 
 import {
   createAndInitPool,
+  createAndInitPancakePool,
   deployToken,
   batchMintPositions,
   getSlot0,
@@ -208,6 +209,62 @@ export async function reproducePool(
     BigInt(snap.sqrtPriceX96),
   );
 
+  return reproduceIntoPool(walletClient, publicClient, pool, token0, token1, snap, helper, fundAmount, minter);
+}
+
+/**
+ * Reproduce `snap` into a GENUINE PancakeSwap V3 pool created via the local
+ * deployer shim (`deployer` is a PancakeV3Deployer address). Same baseline +
+ * disjoint-slab reconstruction as reproducePool — the only difference is the pool
+ * creation path: the resulting pool is real Pancake bytecode, so it calls
+ * pancakeV3SwapCallback at swap time (the engine's Pancake path). `tokens` MUST be
+ * a pre-deployed sorted pair (the all-pools test shares one pair across versions).
+ */
+export async function reproducePancakePool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  deployer: Hex,
+  helper: Hex,
+  snap: ProdPoolSnapshot,
+  fundAmount: bigint,
+  tokens: { token0: Hex; token1: Hex },
+  minter?: Account,
+): Promise<ReproducedPool> {
+  const pool = await createAndInitPancakePool(
+    walletClient,
+    publicClient,
+    deployer,
+    tokens.token0,
+    tokens.token1,
+    snap.fee,
+    snap.tickSpacing,
+    BigInt(snap.sqrtPriceX96),
+  );
+  return reproduceIntoPool(
+    walletClient, publicClient, pool, tokens.token0, tokens.token1, snap, helper, fundAmount, minter,
+  );
+}
+
+/**
+ * Shared reconstruction: given an already-created+initialised V3-style `pool` and
+ * its sorted tokens, derive the baseline + per-segment slabs from `snap` and mint
+ * them in batched txs (helper pays from its own funded balance). Works for both
+ * Uniswap and Pancake pools (identical mint surface; the helper services both
+ * mint-callback selectors).
+ */
+async function reproduceIntoPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  pool: Hex,
+  token0: Hex,
+  token1: Hex,
+  snap: ProdPoolSnapshot,
+  helper: Hex,
+  fundAmount: bigint,
+  minter?: Account,
+): Promise<ReproducedPool> {
+  const ts = snap.tickSpacing;
+  const fee = snap.fee;
   const { segments, baseline, baselineClamped } = deriveSegments(snap);
 
   // Build the full position set, then mint it in a few BATCHED txs (the helper pays

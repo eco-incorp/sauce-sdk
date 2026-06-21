@@ -48,8 +48,16 @@ const Q96 = 1n << 96n;
 const Q192 = 1n << 192n;
 const FEE_DENOM = 1_000_000n; // ppm
 
-/** Pools below this liquidity contribute negligibly; excluded. */
+/** Absolute floor: pools below this liquidity contribute negligibly; excluded. */
 const MIN_LIQUIDITY = 10n ** 13n;
+/**
+ * RELATIVE-depth floor (bps of TOTAL discovered liquidity). For one token pair,
+ * raw active-L at spot is comparable across V2 (≡ a V3 range with L=√k), V3 and
+ * V4, so a pool holding < this fraction of the combined marginal depth would only
+ * ever get a dust slice — not worth a swap's gas. Default 100 bps (1%); override
+ * with ECO_MIN_REL_BPS, or per-call via prepareEcoSwap opts. 0 disables.
+ */
+const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
  * Tick boundaries scanned per V3 pool in the swap direction (fetch window).
  * Fetched generously in one multicall; the ladder is then TRIMMED to the ticks
@@ -475,12 +483,25 @@ function limitFor(tokenA: Hex, tokenB: Hex): bigint {
 
 // ── Main preparation ─────────────────────────────────────────
 
+/** Tuning knobs for off-chain preparation (overridable per call; mainly for tests). */
+export interface EcoSwapPrepareOpts {
+  /**
+   * Drop pools whose liquidity is below this many bps of TOTAL discovered
+   * liquidity (default DEFAULT_MIN_REL_BPS = ECO_MIN_REL_BPS env or 100 = 1%).
+   * Set 0 to keep every pool above the absolute floor (used by cross-version
+   * split tests that intentionally mix shallow-but-distinct AMM versions).
+   */
+  minRelBps?: number;
+}
+
 export async function prepareEcoSwap(
   config: EcoSwapConfig,
   client: PublicClient,
   sauceRouterAddress: Hex,
   poolConfig: ChainPoolConfig = BASE_CHAIN_POOL_CONFIG,
+  opts: EcoSwapPrepareOpts = {},
 ): Promise<EcoSwapPrepared> {
+  const minRelBps = opts.minRelBps ?? DEFAULT_MIN_REL_BPS;
   const { tokenIn, tokenOut, amountIn } = config;
   const inLower = tokenIn.toLowerCase();
   const outLower = tokenOut.toLowerCase();
@@ -489,12 +510,37 @@ export async function prepareEcoSwap(
 
   // ── Discover direct pools ──
   const allDirect = await discoverPools(tokenIn, tokenOut, client, poolConfig);
-  const deep = allDirect.filter((p) => p.liquidity >= MIN_LIQUIDITY);
+
+  // Absolute floor + usable-type gate (V3/V4 concentrated, V2 constant-product).
+  const candidates = allDirect.filter(
+    (p) => p.liquidity >= MIN_LIQUIDITY && (isV3Candidate(p) || isV4Candidate(p) || isUsableV2(p)),
+  );
+
+  // RELATIVE-depth gate: drop pools below minRelBps of the COMBINED liquidity so
+  // we swap against deep pools and don't waste gas on shallow ones (dust slices).
+  const totalLiquidity = candidates.reduce((s, p) => s + p.liquidity, 0n);
+  const relFloor = minRelBps > 0 ? (totalLiquidity * BigInt(minRelBps)) / 10_000n : 0n;
+  const deepEnough = candidates.filter((p) => p.liquidity >= relFloor);
+  const droppedShallow = candidates.filter((p) => p.liquidity < relFloor);
+
   // Keep the deepest pools only — bounds on-chain loop size and calldata.
-  const usableDirect = deep
-    .filter((p) => isV3Candidate(p) || isV4Candidate(p) || isUsableV2(p))
+  const usableDirect = deepEnough
+    .slice()
     .sort((a, b) => (a.liquidity < b.liquidity ? 1 : a.liquidity > b.liquidity ? -1 : 0))
     .slice(0, MAX_DIRECT_POOLS);
+
+  // No silent caps: surface what relative-depth dropped and any top-N truncation.
+  if (droppedShallow.length > 0) {
+    console.log(
+      `  EcoSwap dropped ${droppedShallow.length} shallow pool(s) (< ${minRelBps}bps of Σliquidity): ` +
+        droppedShallow.map((p) => `${p.source}/${p.fee}(L=${p.liquidity})`).join(", "),
+    );
+  }
+  if (deepEnough.length > MAX_DIRECT_POOLS) {
+    console.log(
+      `  EcoSwap capped to deepest ${MAX_DIRECT_POOLS} of ${deepEnough.length} pools (ECO_MAX_POOLS)`,
+    );
+  }
   const v3Raw = usableDirect.filter(isV3Candidate);
   const v4Raw = usableDirect.filter(isV4Candidate);
   // Constant-product (Uniswap-V2-style) pools execute via the unified

@@ -15,7 +15,7 @@ import { fileURLToPath } from "url";
 import { readFileSync } from "fs";
 import ts from "typescript";
 
-import { prepareEcoSwap } from "./prepare";
+import { prepareEcoSwap, type EcoSwapPrepareOpts } from "./prepare";
 import { MULTICALL3, BASE_CHAIN_POOL_CONFIG, type ChainPoolConfig } from "../shared/constants";
 import type { EcoSwapConfig, EcoSwapPrepared, EcoPool, EcoRoute, EcoBracket } from "../shared/types";
 
@@ -111,6 +111,7 @@ export async function ecoSwap(
   sauceRouterAddress: Hex,
   caller: Hex,
   poolConfig?: ChainPoolConfig,
+  opts?: EcoSwapPrepareOpts,
 ): Promise<EcoSwapOutput> {
   const tempClient = createPublicClient({ transport: http(rpcUrl) });
   const chainId = await tempClient.getChainId();
@@ -128,6 +129,7 @@ export async function ecoSwap(
     client,
     sauceRouterAddress,
     poolConfig ?? BASE_CHAIN_POOL_CONFIG,
+    opts ?? {},
   );
 
   const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");

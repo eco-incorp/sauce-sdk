@@ -194,7 +194,18 @@ the legacy fork tests:
    deepest/cheapest V3 0.05% pool is pushed below the V2/V4 0.30% tiers, asserting a tokenIn slice lands
    in every version's pool (also heavy, ~10 min — inherits the V3 reconstruction) and that post-fee
    marginals **equalize** at the cut (spot prices differ by fee, fee-adjusted marginals agree to ~5 ppm).
-   Recapture any with `BASE_RPC_URL=<url> npx tsx recipes/test/harness/<x>-snapshot.ts`.
+   `ecoswap.allpools.prodmirror.evm.test.ts` is the **discover→filter→split** one: it reproduces the
+   FULL real Base WETH/USDC universe on ONE anvil — Uniswap V3 ×4 tiers + **PancakeSwap V3 ×4 tiers**
+   (GENUINE pancake pool bytecode that calls `pancakeV3SwapCallback`; deployed from the npm package's
+   prebuilt creation code via the `PancakeV3Deployer` fixture, since pancake ships no factory/deployer
+   source) + V2 + V4 — then asserts (a) `discoverPools` surfaces all 10 across both forks/every tier
+   (per-factory `feeTiers` catch Pancake's 2500), (b) the **relative-liquidity filter** (1% of total Σ
+   liquidity) keeps only the deep pools (Uni 500+3000, Pancake 100+500) and drops the thin V2/V4 +
+   shallow tiers, and (c) ONE EcoSwap splits across BOTH forks (exercising uniswap+pancake callbacks)
+   with marginals equalized; plus a drift case on a Pancake survivor. The 4 survivors are fully
+   reconstructed (real tick profiles); droppees are light-minted at real price + real active L.
+   Recapture any with `BASE_RPC_URL=<url> npx tsx recipes/test/harness/<x>-snapshot.ts` (V3/Pancake
+   take an optional source-tag arg → `base-WETHUSDC-pancake<fee>.json`).
    Every prod-mirror test ALSO has a **drift / runtime re-anchoring** case: snapshot the reconstructed
    pools, `prepare()`+compile, move a pool's price with a REAL swap (`harness/drift.ts` cooks the one-swap
    `harness/drift.sauce.ts` through the engine), then `cook()` the pre-drift bytecodes — so Phase B's
@@ -208,7 +219,10 @@ the legacy fork tests:
    V4 callbacks via the in-flight PoolManager — so non-canonical locally-deployed/etched pools are
    accepted. EcoSwap discovery is config-injectable — `ecoSwap(config, rpcUrl, sauceRouter, caller,
    poolConfig?)` threads a local `ChainPoolConfig` so the real `discoverPools`→bracket→filter path runs
-   against local pools.
+   against local pools. Discovery now queries each factory across **its own** `FactoryConfig.feeTiers`
+   (forks differ — Pancake V3 uses 2500, not Uniswap's 3000), and prepare applies a **relative-depth
+   filter** (drop pools < `ECO_MIN_REL_BPS`/1e4 of total liquidity, default 1%; per-call `{minRelBps}`
+   opt, 0 disables) on top of the absolute `MIN_LIQUIDITY` floor — so it swaps deep pools, not dust.
 3. **Fork tests (manual)** — `{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests
    (plain `tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router,
    fund/approve, `prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run

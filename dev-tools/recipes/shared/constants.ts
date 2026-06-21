@@ -77,6 +77,13 @@ export interface FactoryConfig {
   label: string;
   /** Uniswap V4 only: the StateView lens used to read pool state by poolId. */
   stateView?: Hex;
+  /**
+   * Per-factory fee tiers (ppm). Overrides the chain's global `feeTiers` for THIS
+   * factory only — needed because forks don't share tiers: PancakeSwap V3 uses
+   * 2500 (0.25%) where Uniswap V3 uses 3000 (0.30%). When omitted, discovery falls
+   * back to the chain-level `feeTiers`.
+   */
+  feeTiers?: number[];
 }
 
 export interface ChainPoolConfig {
@@ -89,6 +96,13 @@ export interface ChainPoolConfig {
 export function hasPriceLimit(poolType: SwapPoolType): boolean {
   return poolType === SwapPoolType.UniV3 || poolType === SwapPoolType.UniV4;
 }
+
+/**
+ * PancakeSwap V3 fee tiers (ppm). Pancake's medium tier is 2500 (0.25%), NOT the
+ * 3000 (0.30%) Uniswap uses — so a single global `feeTiers` list misses Pancake's
+ * canonical pool. Attached per-factory via `FactoryConfig.feeTiers`.
+ */
+export const PANCAKE_V3_FEE_TIERS = [100, 500, 2500, 10000] as const;
 
 // ── Uniswap V4 (Base) ────────────────────────────────────────
 // Declared above the chain configs so BASE_CHAIN_POOL_CONFIG can reference them.
@@ -103,7 +117,7 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
   factories: [
     // V3 concentrated liquidity (has price limit)
     { address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
-    { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3" },
+    { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
     { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Aerodrome CL" },
     { address: "0x71524B4f93c58fcbF659783284E38825f0622859" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
     { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
@@ -134,7 +148,7 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // V3 concentrated liquidity (has price limit)
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
       { address: "0xbACEB8eC6b9355Dfc0269C18bac9d6E2Bdc29C4F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
-      { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3" },
+      { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
       // V2 constant-product (no price limit)
       { address: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Uniswap V2" },
@@ -163,7 +177,7 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     factories: [
       // V3 concentrated liquidity (has price limit)
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
-      { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3" },
+      { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       { address: "0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
       { address: "0x07E60782535752be279929e2DFfDd136Db2e6b45" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Ramses V3 CL" },

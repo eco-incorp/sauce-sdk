@@ -44,6 +44,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@pancakeswap/v3-core": "^1.0.2",
     "@types/node": "^22.0.0",
     "hardhat": "^2.22.0",
     "tsx": "^4.7.0",

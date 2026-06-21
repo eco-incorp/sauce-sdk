@@ -52,6 +52,11 @@ const SNAPSHOT_DIR = join(__dirname, "..", "fixtures", "snapshots");
 export interface ProdPoolSnapshot {
   /** Optional free-text note (the synthetic fixture flags itself here). */
   _note?: string;
+  /**
+   * Optional source/fork tag (e.g. "pancake") — distinguishes same-pair-same-fee
+   * pools from different forks so their fixture filenames don't collide.
+   */
+  sourceTag?: string;
   /** Chain id the snapshot was captured on (8453 = Base). */
   chainId: number;
   /** Pool address (checksummed). */
@@ -238,6 +243,9 @@ async function main(): Promise<void> {
 
   const client = await makeClient(rpcUrl);
   const arg = process.argv[2];
+  // Optional source tag (argv[3]) — folded into the filename so a fork's pool
+  // (e.g. PancakeSwap) doesn't overwrite Uniswap's at the same fee tier.
+  const tag = (process.argv[3] ?? "").replace(/[^a-zA-Z0-9]/g, "");
 
   let pool: Hex;
   if (arg && /^0x[0-9a-fA-F]{40}$/.test(arg)) {
@@ -261,9 +269,16 @@ async function main(): Promise<void> {
   }
 
   const snap = await captureSnapshot(client, pool);
+  if (tag) snap.sourceTag = tag;
 
   mkdirSync(SNAPSHOT_DIR, { recursive: true });
-  const file = join(SNAPSHOT_DIR, `${chainName(snap.chainId)}-${snap.symbol0}${snap.symbol1}-${snap.fee}.json`);
+  // Untagged: base-WETHUSDC-<fee>.json (Uniswap convention, unchanged).
+  // Tagged:   base-WETHUSDC-<tag><fee>.json (e.g. -pancake500) — never ends with
+  // "-<fee>.json", so it can't collide with the Uniswap tier matcher.
+  const file = join(
+    SNAPSHOT_DIR,
+    `${chainName(snap.chainId)}-${snap.symbol0}${snap.symbol1}-${tag}${snap.fee}.json`,
+  );
   writeFileSync(file, JSON.stringify(snap, null, 2) + "\n");
 
   console.log(

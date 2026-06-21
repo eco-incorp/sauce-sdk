@@ -141,8 +141,11 @@ async function discoverV3Pools(
   factories: FactoryConfig[],
   feeTiers: number[],
 ): Promise<PoolInfo[]> {
+  // Each factory is queried across ITS OWN fee tiers (FactoryConfig.feeTiers),
+  // falling back to the chain-level list. Lets forks with different tiers — e.g.
+  // PancakeSwap V3's 2500 vs Uniswap's 3000 — both be discovered in one pass.
   const getPoolCalls = factories.flatMap((f) =>
-    feeTiers.map((fee) => ({
+    (f.feeTiers ?? feeTiers).map((fee) => ({
       address: f.address,
       abi: v3FactoryAbi,
       functionName: "getPool" as const,
@@ -877,7 +880,7 @@ async function discoverV4Pools(
   const candidates: Candidate[] = [];
   for (const f of factories) {
     if (!f.stateView) continue;
-    for (const fee of feeTiers) {
+    for (const fee of f.feeTiers ?? feeTiers) {
       const tickSpacing = feeToTickSpacing(fee);
       const poolId = computeV4PoolId(currency0, currency1, fee, tickSpacing, ZERO_HOOKS);
       candidates.push({ factory: f, fee, tickSpacing, poolId });

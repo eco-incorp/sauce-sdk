@@ -26,12 +26,21 @@ they sort into one global ladder regardless of AMM type or fee tier.
 ## How it works
 
 **Off-chain (`prepare.ts`)**
-1. Discover pools (`shared/pool-discovery`) + multi-hop routes through base tokens.
-2. For each V3 pool: scan a window of ticks in **one Multicall3 round-trip**, reconstruct per-bracket
+1. Discover pools (`shared/pool-discovery`) + multi-hop routes through base tokens. Discovery queries
+   **every configured fork** — Uniswap V3, **PancakeSwap V3**, etc. — each across **its own** fee tiers
+   (`FactoryConfig.feeTiers`), because forks don't share tiers: Pancake's medium tier is **2500**
+   (0.25%) where Uniswap's is 3000 — a single global list would silently miss Pancake's pool.
+2. **Filter to deep pools.** Apply an absolute floor (`MIN_LIQUIDITY`) **and** a relative-depth gate:
+   drop any pool below **1% of the total discovered liquidity** (`ECO_MIN_REL_BPS`, default 100 bps; 0
+   disables). For one token pair, raw active-`L` at spot is comparable across V2 (`≡` a V3 range with
+   `L=√k`), V3 and V4, so this is a sound marginal-depth gate — a pool holding a sliver of the combined
+   depth would only ever get a dust slice, not worth a swap's gas. Dropped pools are logged (no silent
+   caps). Then keep the deepest `ECO_MAX_POOLS`.
+3. For each V3 pool: scan a window of ticks in **one Multicall3 round-trip**, reconstruct per-bracket
    `L` from `liquidity()` + `liquidityNet`. **V4** is identical geometry read through the StateView
    lens by `poolId` (`getSlot0`/`getTickLiquidity`). For each V2 pool: one wide bracket discretised
    into geometric steps. For each route: sample input sizes, quote both hops, derive route segments.
-3. Fee-adjust each bracket's sqrt boundaries, compute its gross input capacity, and **sort the whole
+4. Fee-adjust each bracket's sqrt boundaries, compute its gross input capacity, and **sort the whole
    ladder descending** by fee-adjusted marginal price.
 
 **On-chain (`ecoswap.sauce.ts`)**
@@ -74,6 +83,7 @@ checked-in snapshot — on a fresh local anvil, then runs EcoSwap through it. No
 | V2 | `ecoswap.v2.prodmirror.evm.test.ts` | etched canonical pair funded to captured reserves; asserts output == exact constant-product | `… recipes/test/harness/v2-snapshot.ts` |
 | V4 | `ecoswap.v4.prodmirror.evm.test.ts` | etched real PoolManager+StateView; pool re-minted to captured tick profile | `… recipes/test/harness/v4-snapshot.ts` |
 | **V2+V3+V4** | `ecoswap.v2v3v4.prodmirror.evm.test.ts` | all three above reproduced onto ONE anvil sharing ONE token pair; one EcoSwap whose water-fill splits across every version at once | (reuses the three snapshots) |
+| **All pools** | `ecoswap.allpools.prodmirror.evm.test.ts` | Uniswap V3 ×4 tiers + **PancakeSwap V3 ×4 tiers** (genuine pancake bytecode → `pancakeV3SwapCallback`) + V2 + V4 on ONE anvil; asserts discovery breadth + the relative-depth filter + a cross-fork split | Uni: `prod-snapshot.ts <pool>`; Pancake: `prod-snapshot.ts <pool> pancake` |
 
 The V3 reproduction mints one position per initialised boundary, so it is a **heavy** test (~10 min) —
 the V2/V4 ones are fast (seconds). The combined V2+V3+V4 test inherits the V3 cost (also ~10 min): it
@@ -84,6 +94,23 @@ plus an exact constant-product output on the V2 leg. It also asserts the **margi
 invariant: after the swap the pools sit at *different* spot prices (offset by their fee tiers) whose
 fee-adjusted marginals all converge on the solver's cut (to ~5 ppm). All are part of
 `npm run test:recipes:evm`.
+
+### All-pools test (discover → filter → split across forks)
+
+`ecoswap.allpools.prodmirror.evm.test.ts` is the "give it everything, then filter" test. It reproduces
+the FULL real Base WETH/USDC universe on ONE anvil sharing ONE token pair: Uniswap V3 at all four tiers,
+**PancakeSwap V3 at all four tiers** (deployed from the npm package's prebuilt pool creation bytecode via
+the `PancakeV3Deployer` fixture — genuine pancake pools that call `pancakeV3SwapCallback`, since pancake
+ships no factory/deployer source), the V2 pair and the V4 singleton. It asserts the improved prepare
+phase end to end: (1) `discoverPools` surfaces **all ten** pools across both forks and every tier
+(per-factory fee tiers catch Pancake's 2500, which a single global list misses); (2) the relative-depth
+filter (1% of total liquidity) keeps only the genuinely-deep pools — on the real snapshots that is
+Uniswap 0.05% + 0.30% and **both** deep Pancake pools (0.01% + 0.05%), dropping the thin V2/V4 pools and
+shallow tiers; (3) ONE EcoSwap splits across **both forks** in a single `cook()` (exercising
+`uniswapV3SwapCallback` AND `pancakeV3SwapCallback`) with post-fee marginals equalized; and (4) a drift
+case re-anchors a Pancake survivor at runtime. The four survivors are fully reconstructed (real tick
+profiles); the dropped pools are light-minted at their real price + active liquidity (so discovery sees
+them and the filter drops them).
 
 ### Runtime re-anchoring (drift) cases
 
@@ -121,15 +148,25 @@ which only runs the fork-free compile suite.)
 - **V4** — the **real Base PoolManager + StateView runtime etched** at their canonical addresses (so
   StateView's baked-in `poolManager` immutable resolves), a pool initialised + funded through the real
   singleton, then swapped via `swap(SwapParams)` (`poolType=UniV4`). Solo V4 and a V3+V4 split verified.
+- **PancakeSwap V3** — a **genuine pancake pool** (the npm package's prebuilt `PancakeV3Pool` bytecode,
+  deployed locally via the `PancakeV3Deployer` fixture) swaps through the engine's `pancakeV3SwapCallback`
+  path. The all-pools test discovers all four Pancake tiers (incl. 2500) and splits across Uniswap +
+  Pancake in one EcoSwap, with the relative-depth filter dropping the shallow pools.
 
 Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-hop routes
 (`BASE_RPC_URL=<url> npx tsx recipes/test/ecoswap.test.ts`).
 
 ## Supported sources & compromises
 
-- **Sources:** Uniswap **V2** (constant-product), **V3** (concentrated), and **V4** (singleton). Other
-  AMM families (Curve, Balancer, DODO, TraderJoe LB, Maverick, WOOFi) and Algebra/Solidly-stable
-  exotics are excluded in prepare for now (bespoke curve math) — they come later.
+- **Sources:** Uniswap **V2** (constant-product), **V3** (concentrated), and **V4** (singleton), plus any
+  V3-style **fork** (e.g. **PancakeSwap V3**) registered as a `V3Standard`/`V2Standard` factory — each
+  queried across its own `FactoryConfig.feeTiers`. Other AMM families (Curve, Balancer, DODO, TraderJoe
+  LB, Maverick, WOOFi) and Algebra/Solidly-stable exotics are excluded in prepare for now (bespoke curve
+  math) — they come later.
+- **Relative-depth filter:** beyond the absolute `MIN_LIQUIDITY` floor, pools below `ECO_MIN_REL_BPS`
+  (default 1%) of the **total** discovered liquidity are dropped so gas isn't wasted on dust pools.
+  Sound because, for one pair, raw active-`L` at spot is comparable across V2/V3/V4. Per-call
+  `{ minRelBps }` overrides it (0 disables — used by the cross-version split test).
 - **Per-source execution path.** V3/V4 concentrated pools are swapped via the router's flat legacy
   `swapV3(pool, tokenIn, tokenOut, amountSpecified, limit, payer, recipient)` (**positive**
   `amountSpecified` = exact input). Constant-product V2 pools go through the unified
@@ -146,7 +183,9 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   prices haven't moved since prepare.
 - **Tick window** is bounded (`V3_TICK_STEPS`, fetched in one multicall) then trimmed to crossed
   ticks + `SAFETY_TICKS`; trades larger than the window clamp and refund unspent input.
-- **Env knobs:** `ECO_MAX_POOLS` (default 12), `ECO_MAX_ROUTES` (default 2) bound the on-chain loop.
+- **Env knobs:** `ECO_MAX_POOLS` (default 12), `ECO_MAX_ROUTES` (default 2) bound the on-chain loop;
+  `ECO_MIN_REL_BPS` (default 100 = 1% of total liquidity) sets the relative-depth filter (0 disables).
+  `prepareEcoSwap` / `ecoSwap` also take a `{ minRelBps }` opt that overrides the env per call.
 
 ### SauceScript / compiler notes (hard-won)
 

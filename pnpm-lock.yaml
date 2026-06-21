@@ -76,7 +76,7 @@ importers:
         version: 3.8.3
       sauce:
         specifier: git+https://github.com/eco-incorp/sauce.git
-        version: git+https://github.com/eco-incorp/sauce.git#5f09e005cb9d3c2f6518aa69f5a596776f392766
+        version: git+https://git@github.com:eco-incorp/sauce.git#36e6742e09d747894c1e73c4fe70d378b0c3d58d
       ts-jest:
         specifier: ^29.4.6
         version: 29.4.11(@babel/core@7.29.7)(@jest/transform@30.4.1)(@jest/types@30.4.1)(babel-jest@30.4.1(@babel/core@7.29.7))(jest-util@30.4.1)(jest@30.4.2(@types/node@25.9.1))(typescript@5.9.3)
@@ -99,6 +99,9 @@ importers:
         specifier: ^2.45.1
         version: 2.51.0(typescript@5.9.3)
     devDependencies:
+      '@pancakeswap/v3-core':
+        specifier: ^1.0.2
+        version: 1.0.2
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.19
@@ -872,6 +875,10 @@ packages:
   '@nomicfoundation/solidity-analyzer@0.1.2':
     resolution: {integrity: sha512-q4n32/FNKIhQ3zQGGw5CvPF6GTvDCpYwIf7bEY/dZTZbgfDsHyjJwURxUJf3VQuuJj+fDIFl4+KkBVbw4Ef6jA==}
     engines: {node: '>= 12'}
+
+  '@pancakeswap/v3-core@1.0.2':
+    resolution: {integrity: sha512-9aZU8I1J6SbZOSW7NcNxuyaAC17tGkOaZJM9aJgvl6MMUOExpq0i0EC/jc3HxWbpC8sbZL+8eG544NEJs8CS+w==}
+    engines: {node: '>=10'}
 
   '@pkgjs/parseargs@0.11.0':
     resolution: {integrity: sha512-+1VkjdD0QBLPodGrJUeqarH8VAIvQODIbwh9XpP5Syisf7YoQgsJKPNFoqqLQlu+VQ/tVSshMR6loPMn8U+dPg==}
@@ -2594,8 +2601,8 @@ packages:
   safer-buffer@2.1.2:
     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
 
-  sauce@git+https://github.com/eco-incorp/sauce.git#5f09e005cb9d3c2f6518aa69f5a596776f392766:
-    resolution: {commit: 5f09e005cb9d3c2f6518aa69f5a596776f392766, repo: https://github.com/eco-incorp/sauce.git, type: git}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#36e6742e09d747894c1e73c4fe70d378b0c3d58d:
+    resolution: {commit: 36e6742e09d747894c1e73c4fe70d378b0c3d58d, repo: git@github.com:eco-incorp/sauce.git, type: git}
     version: 0.0.0
 
   semver@5.7.2:
@@ -3914,6 +3921,8 @@ snapshots:
       '@nomicfoundation/solidity-analyzer-linux-x64-gnu': 0.1.2
       '@nomicfoundation/solidity-analyzer-linux-x64-musl': 0.1.2
       '@nomicfoundation/solidity-analyzer-win32-x64-msvc': 0.1.2
+
+  '@pancakeswap/v3-core@1.0.2': {}
 
   '@pkgjs/parseargs@0.11.0':
     optional: true
@@ -6095,7 +6104,7 @@ snapshots:
 
   safer-buffer@2.1.2: {}
 
-  sauce@git+https://github.com/eco-incorp/sauce.git#5f09e005cb9d3c2f6518aa69f5a596776f392766: {}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#36e6742e09d747894c1e73c4fe70d378b0c3d58d: {}
 
   semver@5.7.2: {}
 
