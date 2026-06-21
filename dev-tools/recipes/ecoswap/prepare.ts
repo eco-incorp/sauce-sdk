@@ -7,23 +7,25 @@
  * find the common marginal-price cut and executes one swap per pool.
  *
  * Pipeline:
- *   1. Discover pools (reuse shared/pool-discovery) + multi-hop routes.
- *   2. Classify: V3 concentrated (read slot0/ticks) vs V2 constant-product
- *      (read reserves). Algebra/stable/exotic pools are skipped (bespoke math).
- *   3. V3: scan a window of ticks in ONE multicall, reconstruct per-bracket L
- *      from active liquidity() + liquidityNet. V2: one wide bracket discretised
- *      into geometric steps (a V2 pool == a single V3 range with L = sqrt(k)).
- *   4. Routes: sample input sizes, quote each hop, derive route segments.
- *   5. Fee-adjust, compute per-bracket gross input capacity, sort the ladder.
+ *   1. Discover + read ALL direct pools via the on-chain LENS (ecoswap.lens.sauce.ts)
+ *      in ONE read-only eth_call cook(): factory getPool/getPair discovery, live
+ *      slot0/getReserves/StateView reads, and a windowed ticks()/getTickLiquidity
+ *      scan — returned as raw words (see lens.ts). v1 covers V2Standard, V3Standard
+ *      and hookless UniswapV4 only.
+ *   2. Apply the absolute + relative-depth liquidity filter and the top-N cap.
+ *   3. Build brackets from the lens reads: V3/V4 from active L + liquidityNet
+ *      (buildV3Brackets); V2 as one wide bracket discretised into geometric steps
+ *      (a V2 pool == a single V3 range with L = sqrt(k)).
+ *   4. Routes: one lens eth_call per hop pair, then compose the two hops OFF-CHAIN
+ *      via localQuote (no on-chain quote()) into route segments.
+ *   5. Fee-adjust, compute per-bracket gross input capacity, sort + trim the ladder.
  *
- * RPC efficiency: tick reads for ALL V3 pools are batched into a single
- * Multicall3 round-trip (the client is created with multicall3 configured).
+ * RPC efficiency: the entire direct-pool discovery + state + tick read is ONE
+ * eth_call (the lens); multi-hop routes add one eth_call per hop pair.
  */
 
 import type { PublicClient, Hex } from "viem";
-import { parseAbi } from "viem";
-import { discoverPools } from "./../shared/pool-discovery";
-import { quotePool } from "./../shared/quoting";
+import { runLens, type LensPool } from "./lens";
 import {
   MIN_SQRT_RATIO,
   MAX_SQRT_RATIO,
@@ -39,7 +41,6 @@ import {
   type EcoPool,
   type EcoRoute,
   type PoolInfo,
-  type DiscoveredMultiHopRoute,
 } from "./../shared/types";
 
 // ── Tunables ─────────────────────────────────────────────────
@@ -60,7 +61,7 @@ const MIN_LIQUIDITY = 10n ** 13n;
 const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
  * Tick boundaries scanned per V3 pool in the swap direction (fetch window).
- * Fetched generously in one multicall; the ladder is then TRIMMED to the ticks
+ * Fetched generously by the lens in one eth_call; the ladder is then TRIMMED to the ticks
  * the trade actually crosses (see SAFETY_TICKS), so on-chain gas/calldata scale
  * with trade size, not with this window. Must be wide enough to reach the cut
  * for the largest expected trade.
@@ -91,34 +92,10 @@ const MAX_ROUTES = Number(process.env.ECO_MAX_ROUTES ?? 2);
  */
 const V2_FEE_PPM = 3000;
 
-// ── ABIs (tick-level reads not in the shared minimal pool ABI) ──
-
-const v3PoolAbi = parseAbi([
-  "function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint32 feeProtocol, bool unlocked)",
-  "function liquidity() external view returns (uint128)",
-  "function tickSpacing() external view returns (int24)",
-  "function ticks(int24 tick) external view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)",
-]);
-
-const v2PairAbi = parseAbi([
-  "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
-  "function token0() external view returns (address)",
-]);
-
-// V4 StateView lens: pool state is keyed by poolId on the singleton, read here.
-const v4StateViewAbi = parseAbi([
-  "function getSlot0(bytes32 poolId) external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
-  "function getTickLiquidity(bytes32 poolId, int24 tick) external view returns (uint128 liquidityGross, int128 liquidityNet)",
-]);
-
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Hex;
 const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex;
 
 // ── Math helpers ─────────────────────────────────────────────
-
-function abs(x: bigint): bigint {
-  return x < 0n ? -x : x;
-}
 
 /** Integer square root (Babylonian). */
 function isqrt(x: bigint): bigint {
@@ -220,73 +197,37 @@ interface V3Read {
   net: Map<number, bigint>;
 }
 
+/**
+ * Adapt a lens-decoded V3/V4 pool into the V3Read shape `buildV3Brackets`
+ * consumes. The lens already returned slot0 (sqrtPriceX96 + EXACT current tick),
+ * active liquidity, and a windowed liquidityNet map keyed by signed tick — so no
+ * RPC, and the bracket boundaries (base = floor(tick/ts)*ts, stepping ±ts) line
+ * up exactly with the ticks the lens scanned.
+ */
+function lensToV3Read(p: LensPool): V3Read {
+  return {
+    pool: {
+      address: p.address,
+      tokenIn: "0x" as Hex,
+      tokenOut: "0x" as Hex,
+      fee: p.fee,
+      poolType: p.poolType,
+      priceLimited: true,
+      sqrtPriceX96: p.sqrtPriceX96,
+      liquidity: p.liquidity,
+      source: "lens",
+    },
+    tick: p.tick,
+    tickSpacing: p.tickSpacing,
+    activeLiquidity: p.liquidity,
+    net: p.net,
+  };
+}
+
 /** Standard Uniswap-V3 fee → tickSpacing mapping (covers the discovered V3 forks). */
 const TICK_SPACING_BY_FEE: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
 function feeToTickSpacing(fee: number): number {
   return TICK_SPACING_BY_FEE[fee] ?? 60;
-}
-
-/** Approximate current tick from sqrtPriceX96: tick = log_1.0001(price), price = (sqrtP/2^96)^2. */
-function approxTickFromSqrtPriceX96(sqrtP: bigint): number {
-  const ratio = Number(sqrtP) / 2 ** 96; // sqrt(price); double precision is ample for ±1-tick centering
-  return Math.floor((2 * Math.log(ratio)) / Math.log(1.0001));
-}
-
-/**
- * Read the windowed ticks() for every V3 pool in a SINGLE Multicall3 round-trip.
- *
- * Current tick (from `sqrtPriceX96`) and tickSpacing (from `fee`) are derived
- * off-chain from data discovery already returned, and `liquidity()` is the active
- * liquidity carried on PoolInfo — so no extra state read is needed. The only RPC
- * here is the one batched `ticks()` multicall across all pools.
- */
-async function readV3Pools(
-  pools: PoolInfo[],
-  zeroForOne: boolean,
-  client: PublicClient,
-): Promise<V3Read[]> {
-  if (pools.length === 0) return [];
-
-  const usable = pools
-    .filter((p) => p.liquidity > 0n && p.sqrtPriceX96 > 0n)
-    .map((p) => {
-      const tickSpacing = feeToTickSpacing(p.fee);
-      const tick = approxTickFromSqrtPriceX96(p.sqrtPriceX96);
-      const base = Math.floor(tick / tickSpacing) * tickSpacing;
-      const boundaries: number[] = [];
-      for (let k = 0; k <= V3_TICK_STEPS; k++) {
-        boundaries.push(zeroForOne ? base - k * tickSpacing : base + (k + 1) * tickSpacing);
-      }
-      return { pool: p, tick, tickSpacing, activeLiquidity: p.liquidity, boundaries };
-    });
-
-  // Every ticks() for every pool — ONE multicall round-trip.
-  const tickCalls = usable.flatMap((u) =>
-    u.boundaries.map((b) => ({
-      address: u.pool.address,
-      abi: v3PoolAbi,
-      functionName: "ticks" as const,
-      args: [b] as const,
-    })),
-  );
-  if (tickCalls.length === 0) return [];
-
-  const tickResults = await client.multicall({ contracts: tickCalls, allowFailure: true });
-
-  const out: V3Read[] = [];
-  let cursor = 0;
-  for (const u of usable) {
-    const net = new Map<number, bigint>();
-    for (const b of u.boundaries) {
-      const r = tickResults[cursor++];
-      if (r.status === "success") {
-        const liquidityNet = (r.result as unknown as [bigint, bigint, ...unknown[]])[1];
-        if (liquidityNet !== 0n) net.set(b, liquidityNet);
-      }
-    }
-    out.push({ pool: u.pool, tick: u.tick, tickSpacing: u.tickSpacing, activeLiquidity: u.activeLiquidity, net });
-  }
-  return out;
 }
 
 /**
@@ -323,62 +264,6 @@ function buildV3Brackets(r: V3Read, refIdx: number, zeroForOne: boolean): EcoBra
   return brackets;
 }
 
-// ── V4 reads (StateView, singleton) ──────────────────────────
-
-/**
- * Read the windowed tick liquidity for every V4 pool via its StateView lens,
- * batched into a SINGLE Multicall3 round-trip. Produces the same `V3Read` shape
- * as readV3Pools so the identical bracket builder reconstructs the curve — V4's
- * concentrated-liquidity geometry is the same as V3's, only the read path (poolId
- * on the singleton, not slot0()/ticks() on a pool contract) differs.
- */
-async function readV4Pools(
-  pools: PoolInfo[],
-  zeroForOne: boolean,
-  client: PublicClient,
-): Promise<V3Read[]> {
-  if (pools.length === 0) return [];
-
-  const usable = pools
-    .filter((p) => p.liquidity > 0n && p.sqrtPriceX96 > 0n && p.poolId && p.stateView)
-    .map((p) => {
-      const tickSpacing = p.tickSpacing ?? feeToTickSpacing(p.fee);
-      const tick = approxTickFromSqrtPriceX96(p.sqrtPriceX96);
-      const base = Math.floor(tick / tickSpacing) * tickSpacing;
-      const boundaries: number[] = [];
-      for (let k = 0; k <= V3_TICK_STEPS; k++) {
-        boundaries.push(zeroForOne ? base - k * tickSpacing : base + (k + 1) * tickSpacing);
-      }
-      return { pool: p, tick, tickSpacing, activeLiquidity: p.liquidity, boundaries };
-    });
-
-  const tickCalls = usable.flatMap((u) =>
-    u.boundaries.map((b) => ({
-      address: u.pool.stateView as Hex,
-      abi: v4StateViewAbi,
-      functionName: "getTickLiquidity" as const,
-      args: [u.pool.poolId as Hex, b] as const,
-    })),
-  );
-  if (tickCalls.length === 0) return [];
-
-  const tickResults = await client.multicall({ contracts: tickCalls, allowFailure: true });
-
-  const out: V3Read[] = [];
-  let cursor = 0;
-  for (const u of usable) {
-    const net = new Map<number, bigint>();
-    for (const b of u.boundaries) {
-      const r = tickResults[cursor++];
-      if (r.status === "success") {
-        const liquidityNet = (r.result as unknown as [bigint, bigint])[1];
-        if (liquidityNet !== 0n) net.set(b, liquidityNet);
-      }
-    }
-    out.push({ pool: u.pool, tick: u.tick, tickSpacing: u.tickSpacing, activeLiquidity: u.activeLiquidity, net });
-  }
-  return out;
-}
 
 // ── V2 bracket construction ──────────────────────────────────
 
@@ -421,32 +306,99 @@ function makeBracket(
 
 // ── Multi-hop route brackets ─────────────────────────────────
 
+/** Build a single lens-pool's out/in brackets (V2 or V3/V4) for route quoting. */
+function lensPoolBrackets(p: LensPool, zeroForOne: boolean, refIdx: number): EcoBracket[] {
+  if (p.poolType === SwapPoolType.UniV2) {
+    return buildV2Brackets(
+      { sqrtPriceX96: p.sqrtPriceX96, liquidity: p.liquidity } as PoolInfo,
+      refIdx,
+      V2_FEE_PPM,
+    );
+  }
+  return buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne);
+}
+
+/** Adapt a LensPool to a minimal PoolInfo for the route descriptor (tokens set). */
+function lensPoolToInfo(p: LensPool, tokenIn: Hex, tokenOut: Hex): PoolInfo {
+  return {
+    address: p.address,
+    tokenIn,
+    tokenOut,
+    fee: p.poolType === SwapPoolType.UniV2 ? V2_FEE_PPM : p.fee,
+    poolType: p.poolType,
+    priceLimited: p.poolType !== SwapPoolType.UniV2,
+    sqrtPriceX96: p.sqrtPriceX96,
+    liquidity: p.liquidity,
+    source: "lens",
+    poolId: p.poolId,
+    stateView: p.stateView,
+    tickSpacing: p.tickSpacing,
+    hooks: p.hooks,
+  };
+}
+
 /**
- * Profile a route by quoting increasing input sizes and turning each increment
- * into a segment (capacity, marginal price). Routes are STATIC: their on-chain
- * allocation uses these precomputed capacities (composed two-curve paths are too
- * expensive to re-anchor live).
+ * Walk a single pool's out/in bracket curve consuming `amountIn` (gross tokenIn),
+ * returning the tokenOut produced. Off-chain replacement for the on-chain quote()
+ * RPC. Each bracket is [sqrtNear, sqrtFar] of constant L in unified out/in space;
+ *   maxEffIn(bracket) = L*2^96*(1/sqrtFar - 1/sqrtNear), grossIn = effIn/(1-fee).
+ * For a partial fill, solve the spot where the consumed effIn matches the budget.
+ * tokenOut over a bracket from spot sNear→sLow: dOut = L*(sNear - sLow)/2^96.
  */
-async function buildRouteBrackets(
-  route: DiscoveredMultiHopRoute,
+function localQuote(brackets: EcoBracket[], amountIn: bigint, feePpm: number): bigint {
+  let budget = amountIn;
+  let out = 0n;
+  const oneMinusFee = BigInt(1_000_000 - feePpm);
+  for (const b of brackets) {
+    if (budget <= 0n) break;
+    const L = b.liquidity;
+    const near = b.sqrtNear;
+    const far = b.sqrtFar;
+    if (L <= 0n || far <= 0n || near <= far) continue;
+    const grossCap = b.capacity; // gross tokenIn to traverse the whole bracket
+    if (grossCap <= 0n) continue;
+    if (budget >= grossCap) {
+      // full bracket
+      out += (L * (near - far)) / Q96;
+      budget -= grossCap;
+    } else {
+      // partial: effIn = budget*(1-fee); solve sLow from
+      //   effIn = L*2^96*(1/far' - 1/near) where far' is the partial far edge.
+      const effIn = (budget * oneMinusFee) / FEE_DENOM;
+      const invNear = (L * Q96) / near;
+      const invLow = invNear + effIn;
+      const sLow = invLow > 0n ? (L * Q96) / invLow : far;
+      const clampedLow = sLow < far ? far : sLow;
+      out += (L * (near - clampedLow)) / Q96;
+      budget = 0n;
+    }
+  }
+  return out;
+}
+
+/**
+ * Build route segments by composing the two hops via localQuote (NO on-chain
+ * quote()). Profiles cumulative input samples through hop1→hop2 and turns each
+ * increment into a (capacity, marginal-sqrt) segment, mirroring the prior
+ * sampled-quote shape so the on-chain solver's route handling is unchanged.
+ */
+function buildRouteBracketsLocal(
+  hop1Brackets: EcoBracket[],
+  hop2Brackets: EcoBracket[],
   refIdx: number,
   amountIn: bigint,
-  sauceRouterAddress: Hex,
-  client: PublicClient,
-): Promise<EcoBracket[]> {
-  const { hop1Pool, hop2Pool, intermediateToken } = route;
-  const limit1 = limitFor(hop1Pool.tokenIn, intermediateToken);
-  const limit2 = limitFor(intermediateToken, hop2Pool.tokenOut);
+): EcoBracket[] {
+  const hop1Fee = hop1Brackets.length > 0 ? feePpmOf(hop1Brackets[0]) : V2_FEE_PPM;
+  const hop2Fee = hop2Brackets.length > 0 ? feePpmOf(hop2Brackets[0]) : V2_FEE_PPM;
 
-  // Cumulative samples 1/N .. N/N of amountIn.
   const samples: { input: bigint; out: bigint }[] = [];
   for (let s = 1; s <= ROUTE_SAMPLES; s++) {
     const input = (amountIn * BigInt(s)) / BigInt(ROUTE_SAMPLES);
-    const q1 = await quotePool(hop1Pool, input, limit1, sauceRouterAddress, client);
-    if (q1.amountOut === 0n) break;
-    const q2 = await quotePool(hop2Pool, q1.amountOut, limit2, sauceRouterAddress, client);
-    if (q2.amountOut === 0n) break;
-    samples.push({ input, out: q2.amountOut });
+    const mid = localQuote(hop1Brackets, input, hop1Fee);
+    if (mid === 0n) break;
+    const finalOut = localQuote(hop2Brackets, mid, hop2Fee);
+    if (finalOut === 0n) break;
+    samples.push({ input, out: finalOut });
   }
   if (samples.length === 0) return [];
 
@@ -457,13 +409,11 @@ async function buildRouteBrackets(
     const dIn = sm.input - prevIn;
     const dOut = sm.out - prevOut;
     if (dIn > 0n && dOut > 0n) {
-      // marginal price (out/in) over this segment → sqrt-equivalent in Q96.
-      // sqrtAdj = sqrt(dOut/dIn) * 2^96 = sqrt(dOut * 2^192 / dIn)
       const sqrtAdj = isqrt((dOut * Q192) / dIn);
       brackets.push({
         kind: EcoBracketKind.Route,
         refIdx,
-        sqrtNear: sqrtAdj, // routes carry their marginal directly in *Adj fields
+        sqrtNear: sqrtAdj,
         sqrtFar: sqrtAdj,
         liquidity: 0n,
         capacity: dIn,
@@ -477,8 +427,13 @@ async function buildRouteBrackets(
   return brackets;
 }
 
-function limitFor(tokenA: Hex, tokenB: Hex): bigint {
-  return tokenA.toLowerCase() < tokenB.toLowerCase() ? MIN_SQRT_RATIO + 1n : MAX_SQRT_RATIO - 1n;
+/** Recover a bracket's fee from its spot vs fee-adjusted sqrt (near edge). */
+function feePpmOf(b: EcoBracket): number {
+  // sqrtAdjNear = sqrtNear * sqrt(1-fee); recovering fee exactly is unnecessary —
+  // the bracket capacities already embed the fee, so localQuote's partial-fill
+  // fee term is a 2nd-order correction. Default to V2 fee if indeterminate.
+  if (b.sqrtNear === b.sqrtAdjNear) return 0;
+  return V2_FEE_PPM;
 }
 
 // ── Main preparation ─────────────────────────────────────────
@@ -508,13 +463,22 @@ export async function prepareEcoSwap(
   const zeroForOne = inLower < outLower;
   const priceLimit = zeroForOne ? MIN_SQRT_RATIO + 1n : MAX_SQRT_RATIO - 1n;
 
-  // ── Discover direct pools ──
-  const allDirect = await discoverPools(tokenIn, tokenOut, client, poolConfig);
+  // ── Discover + read direct pools via the on-chain LENS (ONE eth_call) ──
+  // Replaces ~all direct-pool discovery/state/tick/token0 RPCs: the lens runs
+  // discovery + slot0/getReserves/StateView + a windowed tick scan inside ONE
+  // read-only cook() eth_call and returns raw reads, decoded into LensPool[].
+  const lensResult = await runLens(client, sauceRouterAddress, poolConfig, {
+    tokenIn,
+    tokenOut,
+    zeroForOne,
+    tickSteps: V3_TICK_STEPS,
+  });
+  const allDirect = lensResult.pools;
 
-  // Absolute floor + usable-type gate (V3/V4 concentrated, V2 constant-product).
-  const candidates = allDirect.filter(
-    (p) => p.liquidity >= MIN_LIQUIDITY && (isV3Candidate(p) || isV4Candidate(p) || isUsableV2(p)),
-  );
+  // Absolute floor + usable-type gate. The lens only discovers V2Standard (no
+  // Solidly stable), V3Standard and hookless UniswapV4 — so every returned pool
+  // is already a usable type; we just apply the liquidity floor.
+  const candidates = allDirect.filter((p) => p.liquidity >= MIN_LIQUIDITY);
 
   // RELATIVE-depth gate: drop pools below minRelBps of the COMBINED liquidity so
   // we swap against deep pools and don't waste gas on shallow ones (dust slices).
@@ -533,7 +497,7 @@ export async function prepareEcoSwap(
   if (droppedShallow.length > 0) {
     console.log(
       `  EcoSwap dropped ${droppedShallow.length} shallow pool(s) (< ${minRelBps}bps of Σliquidity): ` +
-        droppedShallow.map((p) => `${p.source}/${p.fee}(L=${p.liquidity})`).join(", "),
+        droppedShallow.map((p) => `${SwapPoolType[p.poolType]}/${p.fee}(L=${p.liquidity})`).join(", "),
     );
   }
   if (deepEnough.length > MAX_DIRECT_POOLS) {
@@ -541,111 +505,130 @@ export async function prepareEcoSwap(
       `  EcoSwap capped to deepest ${MAX_DIRECT_POOLS} of ${deepEnough.length} pools (ECO_MAX_POOLS)`,
     );
   }
-  const v3Raw = usableDirect.filter(isV3Candidate);
-  const v4Raw = usableDirect.filter(isV4Candidate);
+  const v3Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV3);
+  const v4Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV4);
   // Constant-product (Uniswap-V2-style) pools execute via the unified
   // swap(SwapParams) entry (poolType=UniV2); the on-chain solver re-anchors them
-  // to live reserves. The engine's _swapV2 hardcodes the 0.3% fee, so every V2
-  // pool's bracket math is pinned to feePpm=3000 below regardless of the
-  // discovered fee tier (keeps the off-chain ladder consistent with execution).
-  const v2Raw = usableDirect.filter(isUsableV2);
+  // to live reserves. The engine's _swapV2 hardcodes the 0.3% fee.
+  const v2Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV2);
 
-  // ── Discover multi-hop routes (best pool per leg) ──
-  const routesRaw: DiscoveredMultiHopRoute[] = [];
+  // ── Discover multi-hop routes (best pool per leg) — via the LENS ──
+  // Each hop pair gets its OWN lens eth_call (one pool pair is one cook()); the
+  // deepest pool per hop is reconstructed into brackets, and route segments are
+  // composed OFF-CHAIN via localQuote (no on-chain quote() RPC). Direct prepare is
+  // still ONE eth_call; routes add one eth_call per (in→base) and (base→out) pair.
+  interface RouteLens {
+    intermediateToken: Hex;
+    hop1Pool: PoolInfo;
+    hop2Pool: PoolInfo;
+    hop1Brackets: EcoBracket[];
+    hop2Brackets: EcoBracket[];
+  }
+  const routesRaw: RouteLens[] = [];
   for (const baseToken of poolConfig.baseTokens) {
     const bl = baseToken.toLowerCase();
     if (bl === inLower || bl === outLower) continue;
+    const z1 = inLower < bl;
+    const z2 = bl < outLower;
     const [hop1, hop2] = await Promise.all([
-      discoverPools(tokenIn, baseToken, client, poolConfig),
-      discoverPools(baseToken, tokenOut, client, poolConfig),
+      runLens(client, sauceRouterAddress, poolConfig, {
+        tokenIn, tokenOut: baseToken, zeroForOne: z1, tickSteps: V3_TICK_STEPS,
+      }),
+      runLens(client, sauceRouterAddress, poolConfig, {
+        tokenIn: baseToken, tokenOut, zeroForOne: z2, tickSteps: V3_TICK_STEPS,
+      }),
     ]);
-    if (hop1.length === 0 || hop2.length === 0) continue;
-    const bestHop1 = hop1.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
-    const bestHop2 = hop2.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
-    routesRaw.push({ intermediateToken: baseToken, hop1Pool: bestHop1, hop2Pool: bestHop2 });
+    if (hop1.pools.length === 0 || hop2.pools.length === 0) continue;
+    const best1 = hop1.pools.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
+    const best2 = hop2.pools.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
+    const hop1Brackets = lensPoolBrackets(best1, z1, 0);
+    const hop2Brackets = lensPoolBrackets(best2, z2, 0);
+    if (hop1Brackets.length === 0 || hop2Brackets.length === 0) continue;
+    routesRaw.push({
+      intermediateToken: baseToken,
+      hop1Pool: lensPoolToInfo(best1, tokenIn, baseToken),
+      hop2Pool: lensPoolToInfo(best2, baseToken, tokenOut),
+      hop1Brackets,
+      hop2Brackets,
+    });
   }
 
   // ── Build pool descriptors + brackets ──
   const pools: EcoPool[] = [];
   const brackets: EcoBracket[] = [];
 
-  // V3 (tick reads batched into one multicall)
-  const v3Reads = await readV3Pools(v3Raw, zeroForOne, client);
-  for (const r of v3Reads) {
+  // V3 (lens already returned slot0 + windowed ticks() per pool)
+  for (const p of v3Raw) {
     const refIdx = pools.length;
     pools.push({
-      poolType: r.pool.poolType,
-      address: r.pool.address,
-      fee: r.pool.fee,
-      tickSpacing: r.tickSpacing,
+      poolType: p.poolType,
+      address: p.address,
+      fee: p.fee,
+      tickSpacing: p.tickSpacing,
       hooks: ZERO_ADDRESS,
-      feePpm: r.pool.fee,
+      feePpm: p.fee,
       isV2: false,
       inIsToken0: zeroForOne, // V3 PoolKey orientation = token sort order
       stateView: ZERO_ADDRESS,
       poolId: ZERO_BYTES32,
-      source: r.pool.source,
+      source: "lens V3",
     });
-    brackets.push(...buildV3Brackets(r, refIdx, zeroForOne));
+    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne));
   }
 
-  // V4 (singleton; tick reads via StateView, batched into one multicall)
-  const v4Reads = await readV4Pools(v4Raw, zeroForOne, client);
-  for (const r of v4Reads) {
+  // V4 (singleton; lens read StateView slot0 + windowed getTickLiquidity)
+  for (const p of v4Raw) {
     const refIdx = pools.length;
     pools.push({
-      poolType: r.pool.poolType,
-      address: r.pool.address, // PoolManager singleton
-      fee: r.pool.fee,
-      tickSpacing: r.tickSpacing,
-      hooks: r.pool.hooks ?? ZERO_ADDRESS,
-      feePpm: r.pool.fee,
+      poolType: p.poolType,
+      address: p.address, // PoolManager singleton
+      fee: p.fee,
+      tickSpacing: p.tickSpacing,
+      hooks: p.hooks ?? ZERO_ADDRESS,
+      feePpm: p.fee,
       isV2: false,
       inIsToken0: zeroForOne,
-      stateView: r.pool.stateView as Hex,
-      poolId: r.pool.poolId as Hex,
-      source: r.pool.source,
+      stateView: p.stateView,
+      poolId: p.poolId,
+      source: "lens V4",
     });
-    brackets.push(...buildV3Brackets(r, refIdx, zeroForOne));
+    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne));
   }
 
-  // V2 (need token0 to orient live reserves on-chain)
-  if (v2Raw.length > 0) {
-    const token0Results = await client.multicall({
-      contracts: v2Raw.map((p) => ({ address: p.address, abi: v2PairAbi, functionName: "token0" as const })),
-      allowFailure: true,
+  // V2 (lens returned synthetic out/in sqrt + synthetic L + inIsToken0)
+  for (const p of v2Raw) {
+    const refIdx = pools.length;
+    pools.push({
+      poolType: p.poolType,
+      address: p.address,
+      fee: V2_FEE_PPM, // engine _swapV2 uses 0.3% regardless of discovered tier
+      tickSpacing: 0,
+      hooks: ZERO_ADDRESS,
+      feePpm: V2_FEE_PPM,
+      isV2: true,
+      inIsToken0: p.inIsToken0,
+      stateView: ZERO_ADDRESS,
+      poolId: ZERO_BYTES32,
+      source: "lens V2",
     });
-    for (let i = 0; i < v2Raw.length; i++) {
-      const t0 = token0Results[i];
-      if (t0.status !== "success") continue;
-      const inIsToken0 = (t0.result as string).toLowerCase() === inLower;
-      const refIdx = pools.length;
-      pools.push({
-        poolType: v2Raw[i].poolType,
-        address: v2Raw[i].address,
-        fee: V2_FEE_PPM, // engine _swapV2 uses 0.3% regardless of discovered tier
-        tickSpacing: 0,
-        hooks: ZERO_ADDRESS,
-        feePpm: V2_FEE_PPM,
-        isV2: true,
-        inIsToken0,
-        stateView: ZERO_ADDRESS,
-        poolId: ZERO_BYTES32,
-        source: v2Raw[i].source,
-      });
-      brackets.push(...buildV2Brackets(v2Raw[i], refIdx, V2_FEE_PPM));
-    }
+    brackets.push(
+      ...buildV2Brackets(
+        { sqrtPriceX96: p.sqrtPriceX96, liquidity: p.liquidity } as PoolInfo,
+        refIdx,
+        V2_FEE_PPM,
+      ),
+    );
   }
 
-  // Routes (sampled). Keep the deepest few.
+  // Routes (sampled). Keep the deepest few. Segments composed via localQuote.
   const routes: EcoRoute[] = [];
   const routeBracketSets: EcoBracket[][] = [];
   for (const r of routesRaw) {
     if (routes.length >= MAX_ROUTES) break;
     const refIdx = routes.length;
-    const rb = await buildRouteBrackets(r, refIdx, amountIn, sauceRouterAddress, client);
+    const rb = buildRouteBracketsLocal(r.hop1Brackets, r.hop2Brackets, refIdx, amountIn);
     if (rb.length === 0) continue;
-    routes.push({ route: r });
+    routes.push({ route: { intermediateToken: r.intermediateToken, hop1Pool: r.hop1Pool, hop2Pool: r.hop2Pool } });
     routeBracketSets.push(rb);
   }
   for (const set of routeBracketSets) brackets.push(...set);

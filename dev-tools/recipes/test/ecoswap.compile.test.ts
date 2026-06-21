@@ -123,3 +123,46 @@ describe("ecoswap.sauce.ts", () => {
     for (const seg of segments) assert.ok(seg.length > 0, "segment should not be empty");
   });
 });
+
+// ── The on-chain PREPARE LENS (read-only discovery+state+ticks) ───────────────
+describe("ecoswap.lens.sauce.ts", () => {
+  // Compile the lens with the SAME arg shape lens.ts passes (factory/feeTier/spec
+  // tuples + precomputed poolIds). Deterministically guards the byte-blob
+  // accumulation + inlined signed-tick walk without anvil.
+  const TOKEN_IN = WETH;
+  const TOKEN_OUT = USDC;
+  const FACTORY = BigInt("0x33128a8fC17869897dcE68Ed026d694621f6FDfD");
+  const V2_FACTORY = BigInt("0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6");
+  const POOL_MANAGER = BigInt("0x498581fF718922c3f8e6A244956aF099B2652b2b");
+  const STATE_VIEW = BigInt("0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71");
+  const POOL_ID = BigInt("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+  function compileLens(zeroForOne: bigint) {
+    const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
+    const result: any = compile(stripTypes(source), {
+      baseDirs: [REPO_ROOT, RECIPE_DIR],
+      args: [
+        TOKEN_IN, TOKEN_OUT, zeroForOne, 96n,
+        [[FACTORY]],            // v3Factories
+        [[500n], [3000n]],      // v3FeeTiers
+        [[V2_FACTORY]],         // v2Factories
+        [[POOL_MANAGER, STATE_VIEW]], // v4Factories
+        [[3000n, 60n]],         // v4Specs
+        [[POOL_ID]],            // v4PoolIds (1 factory × 1 spec)
+      ],
+    });
+    return result.bytecode ?? result.bytecodes;
+  }
+
+  it("compiles the lens for zeroForOne (price-down tick walk)", () => {
+    const segments: Uint8Array[] = compileLens(1n);
+    assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
+    for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
+  });
+
+  it("compiles the lens for oneForZero (price-up tick walk)", () => {
+    const segments: Uint8Array[] = compileLens(0n);
+    assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
+    for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
+  });
+});
