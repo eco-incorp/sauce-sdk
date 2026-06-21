@@ -195,6 +195,12 @@ interface V3Read {
   activeLiquidity: bigint;
   /** liquidityNet keyed by tick index, for the scanned window. */
   net: Map<number, bigint>;
+  /**
+   * Forward tick boundaries the LAZY lens actually walked. buildV3Brackets STOPS
+   * here so it never fabricates phantom brackets past the lens's scanned data
+   * (which would assume L unchanged where the lens never read). 0 → no brackets.
+   */
+  scannedForward: number;
 }
 
 /**
@@ -221,6 +227,7 @@ function lensToV3Read(p: LensPool): V3Read {
     tickSpacing: p.tickSpacing,
     activeLiquidity: p.liquidity,
     net: p.net,
+    scannedForward: p.scannedForward,
   };
 }
 
@@ -248,7 +255,9 @@ function buildV3Brackets(r: V3Read, refIdx: number, zeroForOne: boolean): EcoBra
   let b = zeroForOne ? base : base + r.tickSpacing; // first boundary tick in swap dir
   const step = zeroForOne ? -r.tickSpacing : r.tickSpacing;
 
-  for (let k = 0; k < V3_TICK_STEPS; k++) {
+  // STOP at the lazy lens's scanned forward boundary — never walk past the data
+  // it actually read (that would fabricate phantom brackets assuming L unchanged).
+  for (let k = 0; k < r.scannedForward; k++) {
     const farReal = getSqrtRatioAtTick(b);
     const near = toOutIn(nearReal, zeroForOne);
     const far = toOutIn(farReal, zeroForOne);
@@ -471,7 +480,11 @@ export async function prepareEcoSwap(
     tokenIn,
     tokenOut,
     zeroForOne,
-    tickSteps: V3_TICK_STEPS,
+    amountIn,
+    driftTicks: SAFETY_TICKS,
+    minLiquidity: MIN_LIQUIDITY,
+    minRelBps,
+    maxTicks: V3_TICK_STEPS,
   });
   const allDirect = lensResult.pools;
 
@@ -532,10 +545,12 @@ export async function prepareEcoSwap(
     const z2 = bl < outLower;
     const [hop1, hop2] = await Promise.all([
       runLens(client, sauceRouterAddress, poolConfig, {
-        tokenIn, tokenOut: baseToken, zeroForOne: z1, tickSteps: V3_TICK_STEPS,
+        tokenIn, tokenOut: baseToken, zeroForOne: z1,
+        amountIn, driftTicks: SAFETY_TICKS, minLiquidity: MIN_LIQUIDITY, minRelBps, maxTicks: V3_TICK_STEPS,
       }),
       runLens(client, sauceRouterAddress, poolConfig, {
-        tokenIn: baseToken, tokenOut, zeroForOne: z2, tickSteps: V3_TICK_STEPS,
+        tokenIn: baseToken, tokenOut, zeroForOne: z2,
+        amountIn, driftTicks: SAFETY_TICKS, minLiquidity: MIN_LIQUIDITY, minRelBps, maxTicks: V3_TICK_STEPS,
       }),
     ]);
     if (hop1.pools.length === 0 || hop2.pools.length === 0) continue;

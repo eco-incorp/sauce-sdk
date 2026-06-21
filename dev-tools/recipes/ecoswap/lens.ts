@@ -11,10 +11,18 @@
  *
  * Return shape (must mirror ecoswap.lens.sauce.ts EXACTLY):
  *   abi.encode(poolBlob: bytes, tickBlob: bytes)
- *   poolBlob = 11 words/pool: [type,addr,fee,tickSpacing,hooks,sqrtP,liq,tickRaw,inIsToken0,stateView,poolId]
+ *   poolBlob = 12 words/pool: [type,addr,fee,tickSpacing,hooks,sqrtP,liq,tickRaw,inIsToken0,stateView,poolId,scannedForward]
  *   tickBlob = 3 words/row:   [poolIdx, tickIndexRaw, liquidityNetRaw]
  * Signed words (tickRaw int24, tickIndexRaw int24, liquidityNetRaw int128) are
  * ZERO-extended on return; reinterpreted here via BigInt.asIntN.
+ *
+ * v2 (LAZY): the lens reads ONLY the ticks the trade can cross, not a fixed 96
+ * window. Each survivor's poolBlob carries `scannedForward` — the number of
+ * forward tick boundaries the lens actually walked (= the bracket count
+ * buildV3Brackets must STOP at, so off-chain never fabricates phantom brackets
+ * past the lens's data). Reverse-drift tick rows are also emitted (for runtime
+ * drift); they populate the net map but sit ABOVE the forward walk so the forward
+ * bracket build never consumes them.
  */
 
 import { createRequire } from "module";
@@ -45,7 +53,7 @@ const { compile } = require("@eco-incorp/sauce-compiler");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 
-const POOL_STRIDE = 11;
+const POOL_STRIDE = 12;
 const TICK_STRIDE = 3;
 const ZERO_HOOKS = "0x0000000000000000000000000000000000000000" as Hex;
 
@@ -94,6 +102,56 @@ function feeToTickSpacing(fee: number): number {
   return TICK_SPACING_BY_FEE[fee] ?? 60;
 }
 
+/**
+ * Per-tickSpacing multiplicative step ratio used by the lens's lazy walk:
+ *   stepRatio = floor( sqrt(1.0001^tickSpacing) * 2^96 ).
+ * The lens steps √price UP via mulDiv(√,stepRatio,2^96) and DOWN via
+ * mulDiv(√,2^96,stepRatio). Only the lens's internal capacity accounting uses
+ * this (to decide HOW MANY ticks to scan); the emitted data is (tickIndex,net),
+ * and prepare.ts recomputes exact sqrts via getSqrtRatioAtTick — so the
+ * multiplicative drift here only affects the scanned COUNT (covered by drift +
+ * the floor upper bound), never the bracket prices.
+ *
+ * sqrt(1.0001^ts) = 1.0001^(ts/2) = getSqrtRatioAtTick(ts) (which is exactly the
+ * Q96 sqrt price at tick=ts). Reuse the exact TickMath there for fidelity.
+ */
+function stepRatioForSpacing(tickSpacing: number): bigint {
+  return getSqrtRatioAtTickLocal(tickSpacing);
+}
+
+/** Exact Uniswap V3 TickMath.getSqrtRatioAtTick (Q96). Local copy for stepRatio. */
+function getSqrtRatioAtTickLocal(tick: number): bigint {
+  const absTick = BigInt(tick < 0 ? -tick : tick);
+  let ratio =
+    (absTick & 0x1n) !== 0n
+      ? 0xfffcb933bd6fad37aa2d162d1a594001n
+      : 0x100000000000000000000000000000000n;
+  const mul = (m: bigint) => {
+    ratio = (ratio * m) >> 128n;
+  };
+  if (absTick & 0x2n) mul(0xfff97272373d413259a46990580e213an);
+  if (absTick & 0x4n) mul(0xfff2e50f5f656932ef12357cf3c7fdccn);
+  if (absTick & 0x8n) mul(0xffe5caca7e10e4e61c3624eaa0941cd0n);
+  if (absTick & 0x10n) mul(0xffcb9843d60f6159c9db58835c926644n);
+  if (absTick & 0x20n) mul(0xff973b41fa98c081472e6896dfb254c0n);
+  if (absTick & 0x40n) mul(0xff2ea16466c96a3843ec78b326b52861n);
+  if (absTick & 0x80n) mul(0xfe5dee046a99a2a811c461f1969c3053n);
+  if (absTick & 0x100n) mul(0xfcbe86c7900a88aedcffc83b479aa3a4n);
+  if (absTick & 0x200n) mul(0xf987a7253ac413176f2b074cf7815e54n);
+  if (absTick & 0x400n) mul(0xf3392b0822b70005940c7a398e4b70f3n);
+  if (absTick & 0x800n) mul(0xe7159475a2c29b7443b29c7fa6e889d9n);
+  if (absTick & 0x1000n) mul(0xd097f3bdfd2022b8845ad8f792aa5825n);
+  if (absTick & 0x2000n) mul(0xa9f746462d870fdf8a65dc1f90e061e5n);
+  if (absTick & 0x4000n) mul(0x70d869a156d2a1b890bb3df62baf32f7n);
+  if (absTick & 0x8000n) mul(0x31be135f97d08fd981231505542fcfa6n);
+  if (absTick & 0x10000n) mul(0x9aa508b5b7a84e1c677de54f3e99bc9n);
+  if (absTick & 0x20000n) mul(0x5d6af8dedb81196699c329225ee604n);
+  if (absTick & 0x40000n) mul(0x2216e584f5fa1ea926041bedfe98n);
+  if (absTick & 0x80000n) mul(0x48a170391f7dc42444e8fa2n);
+  if (tick > 0) ratio = ((1n << 256n) - 1n) / ratio;
+  return (ratio >> 32n) + (ratio % (1n << 32n) === 0n ? 0n : 1n);
+}
+
 /** One discovered direct pool, decoded from the lens poolBlob. */
 export interface LensPool {
   poolType: SwapPoolType;
@@ -112,6 +170,18 @@ export interface LensPool {
   poolId: Hex;
   /** liquidityNet keyed by tick boundary (signed), for the scanned window. V3/V4 only. */
   net: Map<number, bigint>;
+  /**
+   * Number of FORWARD tick boundaries the lens actually walked (lazy). The off-
+   * chain bracket build must STOP at this — never walk past the lens's data.
+   * 0 for V2 and for dust pools the lens chose not to scan.
+   */
+  scannedForward: number;
+  /**
+   * EVERY tick index the lens emitted a row for (forward walk + reverse drift),
+   * including uninitialized (net 0) ticks the `net` map omits. Lets callers see
+   * the full scanned span (e.g. that reads straddle spot for drift coverage).
+   */
+  scannedTickIndices: number[];
 }
 
 /** Decoded lens output: every direct pool with live state + tick window. */
@@ -123,8 +193,16 @@ export interface LensCallParams {
   tokenIn: Hex;
   tokenOut: Hex;
   zeroForOne: boolean;
-  /** V3_TICK_STEPS — window size per pool (matches prepare.ts). */
-  tickSteps: number;
+  /** Gross tokenIn — sizes the lazy walk (the trade can't cross past what this buys). */
+  amountIn: bigint;
+  /** Extra tick boundaries scanned past the stop, on EACH side (default 2). */
+  driftTicks?: number;
+  /** Absolute liquidity floor (mirrors prepare.ts MIN_LIQUIDITY). */
+  minLiquidity?: bigint;
+  /** Relative-depth floor in bps of Σliquidity (mirrors prepare.ts; 0 disables). */
+  minRelBps?: number;
+  /** Hard cap on forward tick reads per pool (mirrors prepare.ts V3_TICK_STEPS=96). */
+  maxTicks?: number;
 }
 
 /**
@@ -140,7 +218,11 @@ export async function runLens(
   poolConfig: ChainPoolConfig,
   params: LensCallParams,
 ): Promise<LensResult> {
-  const { tokenIn, tokenOut, zeroForOne, tickSteps } = params;
+  const { tokenIn, tokenOut, zeroForOne, amountIn } = params;
+  const driftTicks = params.driftTicks ?? 2;
+  const minLiquidity = params.minLiquidity ?? 0n;
+  const minRelBps = params.minRelBps ?? 0;
+  const maxTicks = params.maxTicks ?? 96;
 
   // Group factories the same way discoverPools does, but only the three families
   // the lens understands (V2/V3/V4). Others are not collapsed in v1.
@@ -169,7 +251,10 @@ export async function runLens(
   const v4SpecSet = new Set<number>();
   for (const f of v4Factories) for (const fee of f.feeTiers ?? poolConfig.feeTiers) v4SpecSet.add(fee);
   const v4Fees = [...v4SpecSet];
-  const v4Specs = v4Fees.map((fee) => ({ fee, tickSpacing: feeToTickSpacing(fee) }));
+  const v4Specs = v4Fees.map((fee) => {
+    const tickSpacing = feeToTickSpacing(fee);
+    return { fee, tickSpacing, stepRatio: stepRatioForSpacing(tickSpacing) };
+  });
   // poolIds row-major over (factory, spec): index = qi*specs.length + si.
   const v4PoolIds: Hex[] = [];
   for (let qi = 0; qi < v4Factories.length; qi++) {
@@ -187,12 +272,16 @@ export async function runLens(
       BigInt(tokenIn),
       BigInt(tokenOut),
       zeroForOne ? 1n : 0n,
-      BigInt(tickSteps),
+      amountIn,
+      BigInt(driftTicks),
+      minLiquidity,
+      BigInt(minRelBps),
+      BigInt(maxTicks),
       v3Factories.map((f) => [BigInt(f.address)]),
-      v3FeeTiers.map((fee) => [BigInt(fee)]),
+      v3FeeTiers.map((fee) => [BigInt(fee), stepRatioForSpacing(feeToTickSpacing(fee))]),
       v2Factories.map((f) => [BigInt(f.address)]),
       v4Factories.map((f) => [BigInt(f.address), BigInt(f.stateView as Hex)]),
-      v4Specs.map((s) => [BigInt(s.fee), BigInt(s.tickSpacing)]),
+      v4Specs.map((s) => [BigInt(s.fee), BigInt(s.tickSpacing), s.stepRatio]),
       v4PoolIds.map((id) => [BigInt(id)]),
     ],
   });
@@ -243,6 +332,8 @@ export function decodeLens(poolBlob: Hex, tickBlob: Hex): LensResult {
       stateView: ("0x" + stateViewWord.toString(16).padStart(40, "0")) as Hex,
       poolId: ("0x" + poolIdWord.toString(16).padStart(64, "0")) as Hex,
       net: new Map<number, bigint>(),
+      scannedForward: Number(pw[o + 11]),
+      scannedTickIndices: [],
     });
   }
 
@@ -253,6 +344,7 @@ export function decodeLens(poolBlob: Hex, tickBlob: Hex): LensResult {
     if (poolIdx < 0 || poolIdx >= pools.length) continue;
     const tickIdx = Number(BigInt.asIntN(24, tw[o + 1]));
     const net = BigInt.asIntN(128, tw[o + 2]);
+    pools[poolIdx].scannedTickIndices.push(tickIdx);
     if (net !== 0n) pools[poolIdx].net.set(tickIdx, net);
   }
 

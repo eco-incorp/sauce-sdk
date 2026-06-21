@@ -137,18 +137,26 @@ describe("ecoswap.lens.sauce.ts", () => {
   const STATE_VIEW = BigInt("0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71");
   const POOL_ID = BigInt("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
 
+  // Arbitrary stepRatio placeholders (compile only inspects shape, not value).
+  const STEP_10 = 79232123823359799118286999567n; // sqrt(1.0001^10)*2^96 (fee 500)
+  const STEP_60 = 79426470787362580746886972461n; // sqrt(1.0001^60)*2^96 (fee 3000)
+
   function compileLens(zeroForOne: bigint) {
     const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
     const result: any = compile(stripTypes(source), {
       baseDirs: [REPO_ROOT, RECIPE_DIR],
+      // SAME 14-arg lazy shape lens.ts passes:
+      //   tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minLiquidity,minRelBps,maxTicks,
+      //   v3Factories,v3FeeTiers[fee,stepRatio],v2Factories,v4Factories,v4Specs[fee,ts,stepRatio],v4PoolIds
       args: [
-        TOKEN_IN, TOKEN_OUT, zeroForOne, 96n,
-        [[FACTORY]],            // v3Factories
-        [[500n], [3000n]],      // v3FeeTiers
-        [[V2_FACTORY]],         // v2Factories
-        [[POOL_MANAGER, STATE_VIEW]], // v4Factories
-        [[3000n, 60n]],         // v4Specs
-        [[POOL_ID]],            // v4PoolIds (1 factory × 1 spec)
+        TOKEN_IN, TOKEN_OUT, zeroForOne,
+        1000n, 2n, 10n ** 13n, 100n, 96n,
+        [[FACTORY]],                       // v3Factories
+        [[500n, STEP_10], [3000n, STEP_60]], // v3FeeTiers [fee, stepRatio]
+        [[V2_FACTORY]],                    // v2Factories
+        [[POOL_MANAGER, STATE_VIEW]],      // v4Factories
+        [[3000n, 60n, STEP_60]],           // v4Specs [fee, tickSpacing, stepRatio]
+        [[POOL_ID]],                       // v4PoolIds (1 factory × 1 spec)
       ],
     });
     return result.bytecode ?? result.bytecodes;
