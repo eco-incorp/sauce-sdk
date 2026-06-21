@@ -36,10 +36,10 @@ const USDC = BigInt("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const CALLER = BigInt("0x1111111111111111111111111111111111111111");
 const PRICE_LIMIT = 4295128740n; // MIN_SQRT_RATIO + 1
 
-// [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0]
+// [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
 const pools: bigint[][] = [
-  [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n],
-  [1n, BigInt("0xbbbb000000000000000000000000000000000002"), 3000n, 60n, 0n, 3000n, 0n, 1n],
+  [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n],
+  [1n, BigInt("0xbbbb000000000000000000000000000000000002"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n],
 ];
 const routes: bigint[][] = [];
 
@@ -65,6 +65,60 @@ describe("ecoswap.sauce.ts", () => {
     });
     const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;
 
+    assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 bytecode segment");
+    for (const seg of segments) assert.ok(seg.length > 0, "segment should not be empty");
+  });
+
+  // The V2 branch executes via the unified swap(SwapParams) with a nested PoolKey
+  // struct. Compiling the function already lowers BOTH branches, so a V2 pool in
+  // the fixture additionally guards the V2 arg-tuple (isV2=1) + struct encoding.
+  it("compiles with a V2 + V3 mix (unified swap nested-struct branch)", () => {
+    const source = readFileSync(join(RECIPE_DIR, "ecoswap.sauce.ts"), "utf-8");
+    // [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
+    const mixedPools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n],
+      [0n, BigInt("0xcccc000000000000000000000000000000000003"), 3000n, 0n, 0n, 3000n, 1n, 1n, 0n, 0n],
+    ];
+    // V2 brackets carry kind=1 (EcoBracketKind.V2).
+    const v2Brkt = (refIdx: bigint, near: bigint, far: bigint, L: bigint): bigint[] => {
+      const cap = (L * Q96) / far - (L * Q96) / near;
+      return [1n, refIdx, near, far, L, cap > 0n ? cap : 1n, near, far];
+    };
+    const mixedBrackets: bigint[][] = [
+      brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
+      v2Brkt(1n, sqrtNear, (sqrtNear * 99n) / 100n, 5n * 10n ** 17n),
+      v2Brkt(1n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 5n * 10n ** 17n),
+    ];
+    const result: any = compile(stripTypes(source), {
+      baseDirs: [REPO_ROOT, RECIPE_DIR],
+      args: [WETH, USDC, 10n ** 18n, CALLER, 1n, PRICE_LIMIT, mixedPools, routes, mixedBrackets],
+    });
+    const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;
+    assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 bytecode segment");
+    for (const seg of segments) assert.ok(seg.length > 0, "segment should not be empty");
+  });
+
+  // The V4 branch reads live price from StateView (dp[8]=stateView, dp[9]=poolId)
+  // and executes via unified swap(SwapParams) poolType=2 with the full PoolKey.
+  it("compiles with a V4 pool (StateView read + unified swap poolType=2)", () => {
+    const source = readFileSync(join(RECIPE_DIR, "ecoswap.sauce.ts"), "utf-8");
+    const STATE_VIEW = BigInt("0xA3c0c9b65baD0189c5c041BF29d8f6DCF1c8e3e1");
+    const POOL_ID = BigInt("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+    const POOL_MANAGER = BigInt("0x498581fF718922c3f8e6A244956aF099B2652b2b");
+    // poolType=2 (V4), tickSpacing=60, stateView + poolId populated.
+    const v4Pools: bigint[][] = [
+      [2n, POOL_MANAGER, 3000n, 60n, 0n, 3000n, 0n, 1n, STATE_VIEW, POOL_ID],
+    ];
+    // V4 brackets carry kind=0 (concentrated, same geometry as V3).
+    const v4Brackets: bigint[][] = [
+      brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
+      brkt(0n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 10n ** 18n),
+    ];
+    const result: any = compile(stripTypes(source), {
+      baseDirs: [REPO_ROOT, RECIPE_DIR],
+      args: [WETH, USDC, 10n ** 18n, CALLER, 1n, PRICE_LIMIT, v4Pools, routes, v4Brackets],
+    });
+    const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;
     assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 bytecode segment");
     for (const seg of segments) assert.ok(seg.length > 0, "segment should not be empty");
   });

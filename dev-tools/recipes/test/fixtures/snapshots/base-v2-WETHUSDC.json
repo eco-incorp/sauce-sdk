@@ -1,0 +1,13 @@
+{
+  "chainId": 8453,
+  "pair": "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C",
+  "token0": "0x4200000000000000000000000000000000000006",
+  "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "symbol0": "WETH",
+  "symbol1": "USDC",
+  "decimals0": 18,
+  "decimals1": 6,
+  "reserve0": "327776444724312168662",
+  "reserve1": "570695702423",
+  "source": "Uniswap V2"
+}

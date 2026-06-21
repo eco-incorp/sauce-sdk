@@ -110,7 +110,17 @@ const BASE_UNIV3_FACTORY = BASE_CHAIN_POOL_CONFIG.factories.find(
   (f) => f.factoryType === FactoryType.V3Standard && f.poolType === SwapPoolType.UniV3,
 )!.address;
 
-/** How many tickSpacings to scan each direction around the live tick. */
+/**
+ * How many tickSpacings to scan each direction around the live tick.
+ *
+ * Must be WIDE enough that the window edges land where the cumulative liquidityNet
+ * has returned to ~baseline — otherwise reproduce-pool's prefix-sum reconstruction
+ * can't match interior boundaries whose paired open/close falls outside the window
+ * (a narrow ±50 window leaves ~14 such mismatches on the WETH/USDC pool; ±200 is
+ * faithful with 0). The cost is one mint tx per initialised boundary, so the
+ * prod-mirror V3 reproduction is a HEAVY test (~10 min for this pool) — run it in a
+ * dedicated lane, not the fast path.
+ */
 const WINDOW_TICKSPACINGS = 200;
 
 async function makeClient(rpcUrl: string): Promise<PublicClient> {

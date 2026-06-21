@@ -177,15 +177,38 @@ the legacy fork tests:
    (`Router`→`SauceRouter`), mints our own concentrated liquidity across ticks via a `V3LiquidityHelper`,
    then runs the compiled recipe through `cook()` and asserts the split + marginal-price equalization,
    cross-checked against the `ecoswap.reference.ts` oracle. The script first `forge build`s the Solidity
-   fixtures (`recipes/test/fixtures/`: `MintableERC20`, `V3LiquidityHelper`) — **Foundry required**.
-   `ecoswap.prodmirror.evm.test.ts` reproduces a real Base pool's tick geometry locally from a snapshot
-   (synthetic snapshot checked in; capture a real one with
-   `BASE_RPC_URL=<url> npx tsx recipes/test/harness/prod-snapshot.ts`). The harness lives in
-   `recipes/test/harness/`. Why local pools work: the engine `Router` authenticates V3 swap callbacks
-   via transient storage (`expectedPool`), not a hardcoded factory/CREATE2 check, so non-canonical
-   locally-deployed pools are accepted. EcoSwap discovery is config-injectable —
-   `ecoSwap(config, rpcUrl, sauceRouter, caller, poolConfig?)` threads a local `ChainPoolConfig` so the
-   real `discoverPools`→bracket→filter path runs against local pools.
+   fixtures (`recipes/test/fixtures/`: `MintableERC20`, `V3LiquidityHelper`, `V2Pair`/`V2Factory`,
+   `V4LiquidityHelper`) — **Foundry required**. EcoSwap executes **V2, V3 and V4**: V3 via flat
+   `swapV3`; V2/V4 via the unified `swap(SwapParams)` (nested `PoolKey`, negative `amountSpecified`).
+   `ecoswap.evm.test.ts` covers V3 splits, a V2+V3 mix (canonical pair runtime **etched** + funded),
+   solo V4 and a V3+V4 split (**real Base PoolManager + StateView runtime etched at their canonical
+   addresses** — StateView bakes the PoolManager address as an immutable, so both must sit at the real
+   addresses; runtime captured by `recipes/test/harness/v4-bytecode-snapshot.ts`, checked in at
+   `fixtures/snapshots/v4-bytecode.json`).
+   **Prod-mirror tests** replay REAL Base pool state from checked-in snapshots: `*.prodmirror.evm.test.ts`
+   for V3 (`prod-snapshot.ts`, heavy ~10 min — one mint per boundary), V2 (`v2-snapshot.ts`, asserts
+   output == exact constant-product) and V4 (`v4-snapshot.ts`, re-mints the tick profile into the etched
+   PoolManager). `ecoswap.v2v3v4.prodmirror.evm.test.ts` is the **cross-version** one: it reproduces all
+   three real Base WETH/USDC pools onto ONE anvil sharing ONE local token pair (decimals don't affect
+   fidelity — `reproducePool` takes an optional pre-deployed pair) and runs a SINGLE EcoSwap, sized so the
+   deepest/cheapest V3 0.05% pool is pushed below the V2/V4 0.30% tiers, asserting a tokenIn slice lands
+   in every version's pool (also heavy, ~10 min — inherits the V3 reconstruction) and that post-fee
+   marginals **equalize** at the cut (spot prices differ by fee, fee-adjusted marginals agree to ~5 ppm).
+   Recapture any with `BASE_RPC_URL=<url> npx tsx recipes/test/harness/<x>-snapshot.ts`.
+   Every prod-mirror test ALSO has a **drift / runtime re-anchoring** case: snapshot the reconstructed
+   pools, `prepare()`+compile, move a pool's price with a REAL swap (`harness/drift.ts` cooks the one-swap
+   `harness/drift.sauce.ts` through the engine), then `cook()` the pre-drift bytecodes — so Phase B's
+   live-price read (slot0 / StateView / getReserves) runs against genuine drift. It asserts the recipe
+   filled only the remaining gap to the cut (`drift + recipe ≈ baseline`; gross input → cut is path-additive)
+   and still re-anchored to the cut — in the combined test the drifted pool's share shrinks while untouched
+   pools keep theirs, i.e. the split adapts at runtime. Drift cases revert to a clean snapshot via viem's
+   `testClient` (anvil `evm_snapshot`/`evm_revert`) so they prepare against the same pools as the no-drift run.
+   The harness lives in `recipes/test/harness/`. Why local pools work: the engine `Router` authenticates
+   V3 swap callbacks via transient storage (`expectedPool`), not a hardcoded factory/CREATE2 check, and
+   V4 callbacks via the in-flight PoolManager — so non-canonical locally-deployed/etched pools are
+   accepted. EcoSwap discovery is config-injectable — `ecoSwap(config, rpcUrl, sauceRouter, caller,
+   poolConfig?)` threads a local `ChainPoolConfig` so the real `discoverPools`→bracket→filter path runs
+   against local pools.
 3. **Fork tests (manual)** — `{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests
    (plain `tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router,
    fund/approve, `prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run

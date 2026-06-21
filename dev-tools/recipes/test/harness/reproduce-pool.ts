@@ -58,9 +58,7 @@ import type { Account, Hex, PublicClient, WalletClient } from "viem";
 import {
   createAndInitPool,
   deployToken,
-  mint,
-  approve,
-  mintPosition,
+  batchMintPositions,
   getSlot0,
   getLiquidity,
   getTickLiquidityNet,
@@ -84,14 +82,14 @@ export interface ReproducedPool {
   baselineClamped: boolean;
 }
 
-interface Segment {
+export interface Segment {
   lo: number;
   hi: number;
   level: bigint;
 }
 
 /** Parse the snapshot's `ticks` into ascending {tick, net} with bigint nets. */
-function parseBoundaries(snap: ProdPoolSnapshot): { tick: number; net: bigint }[] {
+export function parseBoundaries(snap: ProdPoolSnapshot): { tick: number; net: bigint }[] {
   return snap.ticks
     .map(([t, net]) => ({ tick: t, net: BigInt(net) }))
     .sort((a, b) => a.tick - b.tick);
@@ -102,7 +100,7 @@ function parseBoundaries(snap: ProdPoolSnapshot): { tick: number; net: bigint }[
  * Returns the segments (adjacent boundary pairs), the chosen baseline (clamped
  * ≥ 0), and whether clamping occurred.
  */
-function deriveSegments(snap: ProdPoolSnapshot): {
+export function deriveSegments(snap: ProdPoolSnapshot): {
   segments: Segment[];
   baseline: bigint;
   baselineClamped: boolean;
@@ -151,6 +149,11 @@ function deriveSegments(snap: ProdPoolSnapshot): {
  * own account). If the snapshot's fee tier isn't enabled on the factory by
  * default (only 500/3000/10000 are), it is enabled first as the factory owner
  * (the deployer == walletClient.account).
+ *
+ * `tokens` lets a caller supply a PRE-DEPLOYED, already-sorted (token0 < token1)
+ * pair instead of deploying fresh ones — used by the combined V2+V3+V4 prod-mirror
+ * test so all three reproduced pools share ONE token pair (decimals are irrelevant
+ * to fidelity: V3 math is over sqrtPrice + L, which we install from the snapshot).
  */
 export async function reproducePool(
   walletClient: WalletClient,
@@ -160,14 +163,23 @@ export async function reproducePool(
   snap: ProdPoolSnapshot,
   fundAmount: bigint,
   minter?: Account,
+  tokens?: { token0: Hex; token1: Hex },
 ): Promise<ReproducedPool> {
   const ts = snap.tickSpacing;
   const fee = snap.fee;
 
-  // Deploy two local tokens; order them so token0 < token1 (matches snapshot).
-  const a = await deployToken(walletClient, publicClient, snap.symbol0, snap.symbol0, snap.decimals0);
-  const b = await deployToken(walletClient, publicClient, snap.symbol1, snap.symbol1, snap.decimals1);
-  const [token0, token1] = BigInt(a) < BigInt(b) ? [a, b] : [b, a];
+  // Use the supplied sorted pair, or deploy two local tokens ordered so
+  // token0 < token1 (matching the snapshot's canonical orientation).
+  let token0: Hex;
+  let token1: Hex;
+  if (tokens) {
+    token0 = tokens.token0;
+    token1 = tokens.token1;
+  } else {
+    const a = await deployToken(walletClient, publicClient, snap.symbol0, snap.symbol0, snap.decimals0);
+    const b = await deployToken(walletClient, publicClient, snap.symbol1, snap.symbol1, snap.decimals1);
+    [token0, token1] = BigInt(a) < BigInt(b) ? [a, b] : [b, a];
+  }
 
   // Enable the fee tier if the factory doesn't already have a tickSpacing for it.
   const existingTs = (await publicClient.readContract({
@@ -198,13 +210,9 @@ export async function reproducePool(
 
   const { segments, baseline, baselineClamped } = deriveSegments(snap);
 
-  // Fund + approve the minter for both tokens (helper pulls via transferFrom).
-  const who = (minter?.address ?? walletClient.account?.address) as Hex;
-  await mint(walletClient, publicClient, token0, who, fundAmount);
-  await mint(walletClient, publicClient, token1, who, fundAmount);
-  await approve(walletClient, publicClient, token0, helper, fundAmount, minter);
-  await approve(walletClient, publicClient, token1, helper, fundAmount, minter);
-
+  // Build the full position set, then mint it in a few BATCHED txs (the helper pays
+  // from its own funded balance). One tx per position would be ~N round-trips — for
+  // a real pool's hundreds of boundaries that is the ~10-min reconstruction cost.
   const positions: [number, number, bigint][] = [];
 
   // Baseline slab: one wide position spanning the window, placed one tickSpacing
@@ -214,21 +222,20 @@ export async function reproducePool(
   const bnds = parseBoundaries(snap);
   const lo0 = bnds[0].tick - ts;
   const hiN = bnds[bnds.length - 1].tick + ts;
-  if (baseline > 0n) {
-    await mintPosition(walletClient, publicClient, helper, pool, who, lo0, hiN, baseline, minter);
-    positions.push([lo0, hiN, baseline]);
-  }
+  if (baseline > 0n) positions.push([lo0, hiN, baseline]);
 
   // Per-segment incremental slabs. The disjoint-adjacent slab for [lo,hi] carries
   // (level − baseline) = prefix[j], i.e. only the part ABOVE the baseline slab,
   // so that the summed on-chain active level on the segment equals level(j).
   for (const seg of segments) {
     const incr = seg.level - baseline;
-    if (incr > 0n) {
-      await mintPosition(walletClient, publicClient, helper, pool, who, seg.lo, seg.hi, incr, minter);
-      positions.push([seg.lo, seg.hi, incr]);
-    }
+    if (incr > 0n) positions.push([seg.lo, seg.hi, incr]);
   }
+
+  const who = (minter?.address ?? walletClient.account?.address) as Hex;
+  await batchMintPositions(
+    walletClient, publicClient, helper, pool, who, token0, token1, fundAmount, positions, 100, minter,
+  );
 
   return { pool, token0, token1, fee, tickSpacing: ts, positions, baseline, baselineClamped };
 }

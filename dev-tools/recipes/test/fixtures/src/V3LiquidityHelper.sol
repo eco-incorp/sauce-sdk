@@ -16,10 +16,15 @@ interface IERC20Minimal {
 
 /// @notice Test-only helper that mints real Uniswap V3 liquidity directly against a pool's
 ///         `mint()` and services its `uniswapV3MintCallback`. No v3-periphery required.
-/// @dev    The `payer` (the address that initiated `mint`) MUST approve this helper for both
-///         pool tokens beforehand — the callback pulls owed amounts via `transferFrom(payer, pool)`.
+/// @dev    Two funding modes, distinguished by the payer encoded in the callback data:
+///         - `mint`      → payer = msg.sender; callback pulls via `transferFrom(payer, pool)`,
+///                         so the payer MUST approve this helper for both tokens beforehand.
+///         - `batchMint` → payer = address(this); callback pays from the helper's OWN balance
+///                         via `transfer`, so the helper MUST be funded with both tokens first.
+///           batchMint collapses N position mints into ONE transaction (used to reproduce a
+///           real pool's tick profile — hundreds of positions — without one tx per boundary).
 contract V3LiquidityHelper {
-    /// @notice Mint a liquidity position. Encodes `msg.sender` as the payer in the callback data.
+    /// @notice Mint a single liquidity position. Encodes `msg.sender` as the payer.
     function mint(address pool, address recipient, int24 tickLower, int24 tickUpper, uint128 amount)
         external
         returns (uint256 amount0, uint256 amount1)
@@ -27,16 +32,37 @@ contract V3LiquidityHelper {
         return IUniswapV3PoolMinimal(pool).mint(recipient, tickLower, tickUpper, amount, abi.encode(msg.sender));
     }
 
+    /// @notice Mint MANY positions in one tx, paid from this helper's own token balance.
+    ///         The helper must hold enough token0/token1 to cover all owed amounts. Arrays
+    ///         are parallel: position i = (tickLowers[i], tickUppers[i], amounts[i]).
+    function batchMint(
+        address pool,
+        address recipient,
+        int24[] calldata tickLowers,
+        int24[] calldata tickUppers,
+        uint128[] calldata amounts
+    ) external {
+        bytes memory selfPay = abi.encode(address(this));
+        for (uint256 i = 0; i < amounts.length; i++) {
+            if (amounts[i] == 0) continue;
+            IUniswapV3PoolMinimal(pool).mint(recipient, tickLowers[i], tickUppers[i], amounts[i], selfPay);
+        }
+    }
+
     /// @notice Uniswap V3 mint callback. Called by the pool (msg.sender) during `mint`.
-    ///         Pulls owed token amounts from the encoded payer into the pool.
+    ///         Pays owed token amounts into the pool: from the helper's own balance when the
+    ///         encoded payer is this contract (batchMint), else pulled from the payer.
     function uniswapV3MintCallback(uint256 amount0Owed, uint256 amount1Owed, bytes calldata data) external {
         address payer = abi.decode(data, (address));
         address pool = msg.sender; // the pool that invoked the callback
-        if (amount0Owed > 0) {
-            IERC20Minimal(IUniswapV3PoolMinimal(pool).token0()).transferFrom(payer, pool, amount0Owed);
-        }
-        if (amount1Owed > 0) {
-            IERC20Minimal(IUniswapV3PoolMinimal(pool).token1()).transferFrom(payer, pool, amount1Owed);
+        address t0 = IUniswapV3PoolMinimal(pool).token0();
+        address t1 = IUniswapV3PoolMinimal(pool).token1();
+        if (payer == address(this)) {
+            if (amount0Owed > 0) IERC20Minimal(t0).transfer(pool, amount0Owed);
+            if (amount1Owed > 0) IERC20Minimal(t1).transfer(pool, amount1Owed);
+        } else {
+            if (amount0Owed > 0) IERC20Minimal(t0).transferFrom(payer, pool, amount0Owed);
+            if (amount1Owed > 0) IERC20Minimal(t1).transferFrom(payer, pool, amount1Owed);
         }
     }
 }

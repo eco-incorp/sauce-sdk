@@ -39,3 +39,13 @@ export function loadArtifact(path: string): LoadedArtifact {
   };
   return { abi: json.abi, bytecode: normalizeBytecode(json.bytecode) };
 }
+
+/**
+ * Load an artifact's RUNTIME (deployed) bytecode for etching via setCode. Forge
+ * emits this as `deployedBytecode.object`; this is what runs at an address (no
+ * constructor), so it is what `testClient.setCode` expects.
+ */
+export function loadDeployedBytecode(path: string): Hex {
+  const json = JSON.parse(readFileSync(path, "utf-8")) as { deployedBytecode: unknown };
+  return normalizeBytecode(json.deployedBytecode);
+}

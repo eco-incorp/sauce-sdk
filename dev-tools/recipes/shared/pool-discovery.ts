@@ -11,7 +11,7 @@
  */
 
 import type { PublicClient, Hex } from "viem";
-import { parseAbi } from "viem";
+import { parseAbi, keccak256, encodeAbiParameters } from "viem";
 import {
   BASE_CHAIN_POOL_CONFIG,
   SwapPoolType,
@@ -55,6 +55,33 @@ const v2PairAbi = parseAbi([
   "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
   "function token0() external view returns (address)",
 ]);
+
+const v4StateViewAbi = parseAbi([
+  "function getSlot0(bytes32 poolId) external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "function getLiquidity(bytes32 poolId) external view returns (uint128 liquidity)",
+]);
+
+/** Standard Uniswap fee → tickSpacing map (covers V3 + V4 standard tiers). */
+const TICK_SPACING_BY_FEE: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+function feeToTickSpacing(fee: number): number {
+  return TICK_SPACING_BY_FEE[fee] ?? 60;
+}
+
+/** V4 poolId = keccak256(abi.encode(PoolKey{currency0,currency1,fee,tickSpacing,hooks})). */
+function computeV4PoolId(
+  currency0: Hex,
+  currency1: Hex,
+  fee: number,
+  tickSpacing: number,
+  hooks: Hex,
+): Hex {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+      [currency0, currency1, fee, tickSpacing, hooks],
+    ),
+  );
+}
 
 // ── New protocol ABIs ────────────────────────────────────────
 
@@ -820,6 +847,95 @@ function sqrt(x: bigint): bigint {
   return z;
 }
 
+// ── Uniswap V4 discovery ────────────────────────────────────
+
+const ZERO_HOOKS = "0x0000000000000000000000000000000000000000" as Hex;
+
+/**
+ * Discover Uniswap V4 pools for the pair across the configured fee tiers.
+ *
+ * V4 is a singleton: there is no per-pool contract. Each (currency0, currency1,
+ * fee, tickSpacing, hooks) combination has a `poolId = keccak256(abi.encode(key))`;
+ * state is read from the StateView lens. We probe hookless pools at each standard
+ * fee tier (one batched multicall of getSlot0 + getLiquidity) and keep the ones
+ * that are initialised (sqrtPriceX96 > 0) and carry liquidity.
+ */
+async function discoverV4Pools(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+  feeTiers: number[],
+): Promise<PoolInfo[]> {
+  if (factories.length === 0) return [];
+
+  // V4 canonical ordering: currency0 < currency1 by address. Hookless pools only.
+  const [currency0, currency1] =
+    BigInt(tokenIn) < BigInt(tokenOut) ? [tokenIn, tokenOut] : [tokenOut, tokenIn];
+
+  type Candidate = { factory: FactoryConfig; fee: number; tickSpacing: number; poolId: Hex };
+  const candidates: Candidate[] = [];
+  for (const f of factories) {
+    if (!f.stateView) continue;
+    for (const fee of feeTiers) {
+      const tickSpacing = feeToTickSpacing(fee);
+      const poolId = computeV4PoolId(currency0, currency1, fee, tickSpacing, ZERO_HOOKS);
+      candidates.push({ factory: f, fee, tickSpacing, poolId });
+    }
+  }
+  if (candidates.length === 0) return [];
+
+  const [slot0Results, liqResults] = await Promise.all([
+    client.multicall({
+      contracts: candidates.map((c) => ({
+        address: c.factory.stateView as Hex,
+        abi: v4StateViewAbi,
+        functionName: "getSlot0" as const,
+        args: [c.poolId] as const,
+      })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: candidates.map((c) => ({
+        address: c.factory.stateView as Hex,
+        abi: v4StateViewAbi,
+        functionName: "getLiquidity" as const,
+        args: [c.poolId] as const,
+      })),
+      allowFailure: true,
+    }),
+  ]);
+
+  const pools: PoolInfo[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const s = slot0Results[i];
+    const l = liqResults[i];
+    if (s.status !== "success" || l.status !== "success") continue;
+    const sqrtPriceX96 = (s.result as readonly [bigint, number, number, number])[0];
+    const liquidity = l.result as bigint;
+    if (sqrtPriceX96 === 0n || liquidity === 0n) continue;
+    pools.push({
+      address: c.factory.address, // PoolManager singleton
+      tokenIn,
+      tokenOut,
+      fee: c.fee,
+      poolType: c.factory.poolType, // UniV4
+      priceLimited: true,
+      sqrtPriceX96,
+      liquidity,
+      source: c.factory.label,
+      poolId: c.poolId,
+      stateView: c.factory.stateView,
+      currency0,
+      currency1,
+      tickSpacing: c.tickSpacing,
+      hooks: ZERO_HOOKS,
+    });
+  }
+  return pools;
+}
+
 // ── Unified discovery ───────────────────────────────────────
 
 /**
@@ -837,6 +953,7 @@ export async function discoverPools(
 
   // Group factories by type
   const v3Factories = factories.filter((f) => f.factoryType === FactoryType.V3Standard);
+  const v4Factories = factories.filter((f) => f.factoryType === FactoryType.UniswapV4);
   const algebraFactories = factories.filter((f) => f.factoryType === FactoryType.AlgebraV3);
   const v2Factories = factories.filter((f) => f.factoryType === FactoryType.V2Standard);
   const solidlyV2Factories = factories.filter((f) => f.factoryType === FactoryType.SolidlyV2);
@@ -848,10 +965,11 @@ export async function discoverPools(
   const woofiConfigs = factories.filter((f) => f.factoryType === FactoryType.WOOFi);
 
   // Discover all in parallel
-  const [v3Pools, algebraPools, v2Pools, solidlyV2Pools,
+  const [v3Pools, v4Pools, algebraPools, v2Pools, solidlyV2Pools,
          curvePools, balancerPools, dodoPools, traderJoePools,
          maverickPools, woofiPools] = await Promise.all([
     discoverV3Pools(tokenIn, tokenOut, client, v3Factories, feeTiers),
+    discoverV4Pools(tokenIn, tokenOut, client, v4Factories, feeTiers),
     discoverAlgebraPools(tokenIn, tokenOut, client, algebraFactories),
     discoverV2Pools(tokenIn, tokenOut, client, v2Factories),
     discoverSolidlyV2Pools(tokenIn, tokenOut, client, solidlyV2Factories),
@@ -864,7 +982,7 @@ export async function discoverPools(
   ]);
 
   return [
-    ...v3Pools, ...algebraPools, ...v2Pools, ...solidlyV2Pools,
+    ...v3Pools, ...v4Pools, ...algebraPools, ...v2Pools, ...solidlyV2Pools,
     ...curvePools, ...balancerPools, ...dodoPools, ...traderJoePools,
     ...maverickPools, ...woofiPools,
   ];

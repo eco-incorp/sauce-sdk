@@ -25,9 +25,14 @@ import {
   type Account,
 } from "viem";
 
-import { loadArtifact } from "./artifacts";
+import { loadArtifact, loadDeployedBytecode } from "./artifacts";
 import { deployContract, writeAndWait } from "./deploy";
-import { MULTICALL3 } from "../../shared/constants";
+import {
+  MULTICALL3,
+  UNISWAP_V4_POOL_MANAGER,
+  UNISWAP_V4_STATE_VIEW,
+} from "../../shared/constants";
+import { keccak256, encodeAbiParameters } from "viem";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEV_TOOLS = join(__dirname, "..", "..", "..");
@@ -51,6 +56,23 @@ export const erc20Artifact = loadArtifact(
 export const helperArtifact = loadArtifact(
   join(FIXTURES, "V3LiquidityHelper.sol", "V3LiquidityHelper.json"),
 );
+export const v2FactoryArtifact = loadArtifact(
+  join(FIXTURES, "V2Factory.sol", "V2Factory.json"),
+);
+/** Runtime bytecode of the V2 pair — etched at a chosen address (no constructor). */
+export const v2PairRuntime = loadDeployedBytecode(
+  join(FIXTURES, "V2Pair.sol", "V2Pair.json"),
+);
+export const v4HelperArtifact = loadArtifact(
+  join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
+);
+/** Captured Base mainnet runtime for the V4 PoolManager + StateView singletons. */
+const V4_BYTECODE = JSON.parse(
+  readFileSync(join(__dirname, "..", "fixtures", "snapshots", "v4-bytecode.json"), "utf-8"),
+) as {
+  poolManager: { address: Hex; runtime: Hex };
+  stateView: { address: Hex; runtime: Hex };
+};
 export const v3FactoryArtifact = loadArtifact(
   join(UNISWAP, "UniswapV3Factory.sol", "UniswapV3Factory.json"),
 );
@@ -88,7 +110,50 @@ export const v3PoolAbi = parseAbi([
 
 export const helperAbi = parseAbi([
   "function mint(address pool, address recipient, int24 tickLower, int24 tickUpper, uint128 amount) returns (uint256 amount0, uint256 amount1)",
+  "function batchMint(address pool, address recipient, int24[] tickLowers, int24[] tickUppers, uint128[] amounts)",
 ]);
+
+export const v2FactoryAbi = parseAbi([
+  "function setPair(address tokenA, address tokenB, address pair)",
+  "function getPair(address tokenA, address tokenB) view returns (address)",
+]);
+
+export const v2PairAbi = parseAbi([
+  "function initialize(address t0, address t1)",
+  "function sync()",
+  "function token0() view returns (address)",
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
+]);
+
+export const v4HelperAbi = parseAbi([
+  "struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }",
+  "function initialize(PoolKey key, uint160 sqrtPriceX96) returns (int24)",
+  "function addLiquidity(PoolKey key, int24 tickLower, int24 tickUpper, uint128 liquidity)",
+  "function batchAddLiquidity(PoolKey key, int24[] tickLowers, int24[] tickUppers, uint128[] liquidities)",
+]);
+
+export const v4StateViewAbi = parseAbi([
+  "function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "function getLiquidity(bytes32 poolId) view returns (uint128)",
+]);
+
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000" as Hex;
+
+/** V4 poolId = keccak256(abi.encode(PoolKey)). Mirrors discovery's computeV4PoolId. */
+export function computeV4PoolId(
+  currency0: Hex,
+  currency1: Hex,
+  fee: number,
+  tickSpacing: number,
+  hooks: Hex = ZERO_ADDR,
+): Hex {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+      [currency0, currency1, fee, tickSpacing, hooks],
+    ),
+  );
+}
 
 // 2^96 — sqrtPriceX96 for a 1:1 price (tick 0).
 export const SQRT_PRICE_1_1 = 79228162514264337593543950336n;
@@ -286,6 +351,50 @@ export async function mintPosition(
   });
 }
 
+/**
+ * Mint MANY positions in a handful of transactions via the helper's `batchMint`
+ * (which pays from its OWN balance), instead of one tx per position. Funds the
+ * helper with `fundAmount` of each token, then submits the positions in gas-sized
+ * chunks. This collapses a prod-pool reconstruction (hundreds of boundaries) from
+ * ~N sequential mint txs to ~N/chunkSize — turning a ~10-min reconstruction into
+ * seconds. `positions` are [tickLower, tickUpper, liquidity]; zero-liquidity
+ * entries are skipped on-chain.
+ */
+export async function batchMintPositions(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  helper: Hex,
+  pool: Hex,
+  recipient: Hex,
+  token0: Hex,
+  token1: Hex,
+  fundAmount: bigint,
+  positions: [number, number, bigint][],
+  chunkSize = 100,
+  minter?: Account,
+): Promise<void> {
+  // batchMint pays owed amounts from the helper's own balance — fund it directly.
+  await mint(walletClient, publicClient, token0, helper, fundAmount);
+  await mint(walletClient, publicClient, token1, helper, fundAmount);
+
+  for (let i = 0; i < positions.length; i += chunkSize) {
+    const chunk = positions.slice(i, i + chunkSize);
+    await writeAndWait(walletClient, publicClient, {
+      address: helper,
+      abi: helperAbi as Abi,
+      functionName: "batchMint",
+      args: [
+        pool,
+        recipient,
+        chunk.map((p) => p[0]),
+        chunk.map((p) => p[1]),
+        chunk.map((p) => p[2]),
+      ],
+      account: minter,
+    });
+  }
+}
+
 export async function getSlot0(
   publicClient: PublicClient,
   pool: Hex,
@@ -296,6 +405,166 @@ export async function getSlot0(
     functionName: "slot0",
   })) as readonly [bigint, number, ...unknown[]];
   return { sqrtPriceX96: r[0], tick: Number(r[1]) };
+}
+
+/** Deploy the V2 registry factory (discovery resolves V2 pools via getPair). */
+export async function deployV2Factory(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: v2FactoryArtifact.abi,
+    bytecode: v2FactoryArtifact.bytecode,
+  });
+}
+
+/**
+ * Stand up a constant-product V2 pool by ETCHING the V2Pair runtime bytecode at
+ * `pairAddr`, then initialise it, register it on the factory, fund it with both
+ * reserves, and `sync()`. No deploy — the real pair bytecode is etched, exactly
+ * the mechanism the V4 PoolManager fixture reuses.
+ *
+ * `minter` (defaults to wallet account) must hold both tokens; reserves are
+ * transferred straight to the pair and snapshotted via sync().
+ */
+export async function setupEtchedV2Pool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+  factory: Hex,
+  pairAddr: Hex,
+  token0: Hex,
+  token1: Hex,
+  reserve0: bigint,
+  reserve1: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  await testClient.setCode({ address: pairAddr, bytecode: v2PairRuntime });
+  const code = await publicClient.getCode({ address: pairAddr });
+  if (!code || code === "0x") throw new Error("failed to etch V2Pair runtime");
+
+  await writeAndWait(walletClient, publicClient, {
+    address: pairAddr,
+    abi: v2PairAbi as Abi,
+    functionName: "initialize",
+    args: [token0, token1],
+    account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: factory,
+    abi: v2FactoryAbi as Abi,
+    functionName: "setPair",
+    args: [token0, token1, pairAddr],
+    account: minter,
+  });
+  // Fund reserves directly from the minter, then snapshot them.
+  await writeAndWait(walletClient, publicClient, {
+    address: token0, abi: erc20Abi as Abi, functionName: "transfer", args: [pairAddr, reserve0], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pairAddr, reserve1], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: pairAddr, abi: v2PairAbi as Abi, functionName: "sync", args: [], account: minter,
+  });
+  return pairAddr;
+}
+
+// ── Uniswap V4 (etched singletons) ───────────────────────────
+
+export interface V4Singletons {
+  poolManager: Hex;
+  stateView: Hex;
+}
+
+/**
+ * Etch the REAL Uniswap V4 PoolManager + StateView runtime (captured from Base)
+ * at their CANONICAL addresses. StateView bakes the PoolManager address in as an
+ * immutable, so both must sit at the real addresses for its extsload reads to
+ * resolve to the etched manager.
+ */
+export async function etchV4Singletons(
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+): Promise<V4Singletons> {
+  await testClient.setCode({ address: V4_BYTECODE.poolManager.address, bytecode: V4_BYTECODE.poolManager.runtime });
+  await testClient.setCode({ address: V4_BYTECODE.stateView.address, bytecode: V4_BYTECODE.stateView.runtime });
+  const pmCode = await publicClient.getCode({ address: V4_BYTECODE.poolManager.address });
+  const svCode = await publicClient.getCode({ address: V4_BYTECODE.stateView.address });
+  if (!pmCode || pmCode === "0x" || !svCode || svCode === "0x") {
+    throw new Error("failed to etch V4 singletons");
+  }
+  if (V4_BYTECODE.poolManager.address.toLowerCase() !== UNISWAP_V4_POOL_MANAGER.toLowerCase()) {
+    throw new Error("snapshot PoolManager address drifted from constants");
+  }
+  return { poolManager: UNISWAP_V4_POOL_MANAGER, stateView: UNISWAP_V4_STATE_VIEW };
+}
+
+/** Deploy the V4 liquidity helper bound to the (etched) PoolManager. */
+export async function deployV4Helper(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  manager: Hex,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: v4HelperArtifact.abi,
+    bytecode: v4HelperArtifact.bytecode,
+    args: [manager],
+  });
+}
+
+/**
+ * Initialise a V4 pool on the etched PoolManager and add a liquidity position via
+ * the helper (which is funded with both tokens to pay the pool on settle).
+ * Returns the poolId. token0/token1 must be sorted (currency0 < currency1).
+ */
+export async function setupV4Pool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  helper: Hex,
+  token0: Hex,
+  token1: Hex,
+  fee: number,
+  tickSpacing: number,
+  sqrtPriceX96: bigint,
+  tickLower: number,
+  tickUpper: number,
+  liquidity: bigint,
+  fundAmount: bigint,
+): Promise<Hex> {
+  const key = { currency0: token0, currency1: token1, fee, tickSpacing, hooks: ZERO_ADDR };
+  await writeAndWait(walletClient, publicClient, {
+    address: helper, abi: v4HelperAbi as Abi, functionName: "initialize", args: [key, sqrtPriceX96],
+  });
+  // Fund the helper so it can pay the pool when settling the liquidity add.
+  await mint(walletClient, publicClient, token0, helper, fundAmount);
+  await mint(walletClient, publicClient, token1, helper, fundAmount);
+  await writeAndWait(walletClient, publicClient, {
+    address: helper, abi: v4HelperAbi as Abi, functionName: "addLiquidity",
+    args: [key, tickLower, tickUpper, liquidity],
+  });
+  return computeV4PoolId(token0, token1, fee, tickSpacing);
+}
+
+export async function getV4Slot0(
+  publicClient: PublicClient,
+  stateView: Hex,
+  poolId: Hex,
+): Promise<{ sqrtPriceX96: bigint; tick: number }> {
+  const r = (await publicClient.readContract({
+    address: stateView, abi: v4StateViewAbi as Abi, functionName: "getSlot0", args: [poolId],
+  })) as readonly [bigint, number, number, number];
+  return { sqrtPriceX96: r[0], tick: Number(r[1]) };
+}
+
+export async function getV4Liquidity(
+  publicClient: PublicClient,
+  stateView: Hex,
+  poolId: Hex,
+): Promise<bigint> {
+  return publicClient.readContract({
+    address: stateView, abi: v4StateViewAbi as Abi, functionName: "getLiquidity", args: [poolId],
+  }) as Promise<bigint>;
 }
 
 export async function getLiquidity(publicClient: PublicClient, pool: Hex): Promise<bigint> {

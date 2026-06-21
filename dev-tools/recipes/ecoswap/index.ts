@@ -43,7 +43,7 @@ export interface EcoSwapOutput {
 
 // ── Compile-arg tuple builders (all values are bigint scalars) ──
 
-/** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0] */
+/** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId] */
 function buildPoolTuple(p: EcoPool): bigint[] {
   return [
     BigInt(p.poolType),
@@ -54,6 +54,8 @@ function buildPoolTuple(p: EcoPool): bigint[] {
     BigInt(p.feePpm),
     p.isV2 ? 1n : 0n,
     p.inIsToken0 ? 1n : 0n,
+    BigInt(p.stateView), // V4 StateView lens (0 for V2/V3)
+    BigInt(p.poolId), // V4 poolId (0 for V2/V3)
   ];
 }
 

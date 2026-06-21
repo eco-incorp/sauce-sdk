@@ -8,6 +8,7 @@ import type { SwapPoolType, ChainPoolConfig } from "./constants";
 // ── Pool discovery ───────────────────────────────────────────
 
 export interface PoolInfo {
+  /** Pool address — or, for Uniswap V4, the PoolManager singleton address. */
   address: Hex;
   tokenIn: Hex;
   tokenOut: Hex;
@@ -21,6 +22,19 @@ export interface PoolInfo {
   liquidity: bigint;
   /** Human-readable source label (e.g. "Uniswap V3", "Aerodrome V2") */
   source: string;
+  // ── Uniswap V4 only (singleton, keyed by poolId) ──
+  /** V4 poolId = keccak256(abi.encode(PoolKey)). */
+  poolId?: Hex;
+  /** V4 StateView lens for reading pool state by poolId. */
+  stateView?: Hex;
+  /** V4 PoolKey currency0 (sorted token, lower address). */
+  currency0?: Hex;
+  /** V4 PoolKey currency1 (sorted token, higher address). */
+  currency1?: Hex;
+  /** V4 tickSpacing (also derived for V3 downstream). */
+  tickSpacing?: number;
+  /** V4 hooks address (address(0) for hookless pools). */
+  hooks?: Hex;
 }
 
 // ── Quoting ──────────────────────────────────────────────────
@@ -218,16 +232,21 @@ export interface EcoBracket {
 /** Direct-pool descriptor (live-readable on-chain). */
 export interface EcoPool {
   poolType: SwapPoolType;
+  /** Pool address (V2/V3) — or the PoolManager singleton address (V4). */
   address: Hex;
   fee: number;
   tickSpacing: number;
   hooks: Hex;
   /** parts-per-million fee (e.g. 3000 = 0.30%). */
   feePpm: number;
-  /** true => constant-product (read getReserves); false => V3 (read slot0). */
+  /** true => constant-product (read getReserves); false => V3/V4 (read slot0). */
   isV2: boolean;
   /** For V2 live reserve orientation: is tokenIn the pool's token0? */
   inIsToken0: boolean;
+  /** V4 only: StateView lens address (0x0 for V2/V3). */
+  stateView: Hex;
+  /** V4 only: poolId = keccak256(abi.encode(PoolKey)) (0x0 for V2/V3). */
+  poolId: Hex;
   source: string;
 }
 

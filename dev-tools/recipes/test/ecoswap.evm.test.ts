@@ -42,6 +42,13 @@ import {
   getLiquidity,
   getSlot0,
   getTickLiquidityNet,
+  deployV2Factory,
+  setupEtchedV2Pool,
+  etchV4Singletons,
+  deployV4Helper,
+  setupV4Pool,
+  getV4Slot0,
+  getV4Liquidity,
   SQRT_PRICE_1_1,
   type DeployedStack,
 } from "./harness/setup";
@@ -421,5 +428,300 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     assert.ok(spent > 0n && spent < amountIn, "should spend some but not all (liquidity-capped)");
 
     console.log(`  [P3b] oversized: spent ${spent} of ${amountIn}, received ${received}, refunded ${amountIn - spent}`);
+  });
+});
+
+// ── Phase 4: mixed V2 + V3 split (etched constant-product pair) ───────
+describe("EcoSwap V2 + V3 mixed split (etched V2 pair)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let tokenIn: Hex; // token0 (zeroForOne)
+  let tokenOut: Hex; // token1
+  let v3Pool: Hex;
+  let v2Pair: Hex;
+  let poolConfig: ChainPoolConfig;
+
+  // Deterministic, unused address to etch the V2 pair at (all-lowercase, well
+  // above the precompile range, never where anvil CREATE-deploys).
+  const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec05a2a2" as Hex;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const v2Factory = await deployV2Factory(c.walletClient, c.publicClient);
+    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+    tokenIn = tk.token0;
+    tokenOut = tk.token1;
+
+    const minter = c.account0;
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("50000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, minter, parseEther("50000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, HUGE);
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, HUGE);
+
+    // One V3 pool (fee 3000) at 1:1 with a wide deep position.
+    v3Pool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, 3000, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, v3Pool, minter, -12000, 12000, parseEther("300000"),
+    );
+
+    // One ETCHED V2 pair at 1:1 (equal reserves) with comparable depth — both
+    // venues start at the same fee-adjusted marginal price, so the water-fill
+    // must split across the V3 pool AND the V2 pair.
+    v2Pair = await setupEtchedV2Pool(
+      c.walletClient, c.publicClient, c.testClient, v2Factory, V2_PAIR_ADDR,
+      tokenIn, tokenOut, parseEther("300000"), parseEther("300000"), minter,
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: v2Factory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Local UniV2" },
+      ],
+      feeTiers: [3000],
+      baseTokens: [tokenIn, tokenOut],
+    };
+  });
+
+  after(() => {
+    anvil?.stop();
+  });
+
+  it("Phase 4 — splits across an etched V2 pair and a V3 pool", async () => {
+    const amountIn = parseEther("2000");
+    const caller = c.account0;
+
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3Pool);
+    const v2InBefore = await balanceOf(c.publicClient, tokenIn, v2Pair);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+    );
+
+    // Discovery should surface BOTH a V3 and the etched V2 pool.
+    const v2Count = prepared.pools.filter((p) => p.isV2).length;
+    const v3Count = prepared.pools.filter((p) => !p.isV2).length;
+    assert.equal(v2Count, 1, "should discover the etched V2 pair");
+    assert.equal(v3Count, 1, "should discover the V3 pool");
+
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    assert.equal(receipt.status, "success", "mixed V2+V3 cook() must succeed");
+
+    const v3InAfter = await balanceOf(c.publicClient, tokenIn, v3Pool);
+    const v2InAfter = await balanceOf(c.publicClient, tokenIn, v2Pair);
+    const v3Delta = v3InAfter - v3InBefore;
+    const v2Delta = v2InAfter - v2InBefore;
+
+    assert.ok(v3Delta > 0n, "V3 pool should receive input");
+    assert.ok(v2Delta > 0n, "etched V2 pair should receive input (V2 execution path)");
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.ok(received > 0n, "caller received tokenOut");
+    const leftover = amountIn - spent;
+    assert.ok(leftover * 100n <= amountIn, `should spend ~all amountIn (leftover ${leftover})`);
+    // V2 + V3 reserve deltas account for ~all input spent (one swap per venue).
+    assert.equal(v2Delta + v3Delta, spent, "per-venue tokenIn deltas must sum to spent input");
+
+    console.log(
+      `  [P4] mixed split: spent=${spent} received=${received} leftover=${leftover}\n` +
+        `       V3 in=${v3Delta}  V2(etched) in=${v2Delta}`,
+    );
+  });
+});
+
+// ── Phase 5: Uniswap V4 via etched PoolManager singleton ──────
+describe("EcoSwap V4 (etched PoolManager + StateView)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let tokenIn: Hex; // token0 (zeroForOne)
+  let tokenOut: Hex; // token1
+  let poolManager: Hex;
+  let stateView: Hex;
+  let poolId: Hex;
+  let poolConfig: ChainPoolConfig;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+
+    // Etch the REAL V4 singletons (PoolManager + StateView) at canonical addresses.
+    const v4 = await etchV4Singletons(c.publicClient, c.testClient);
+    poolManager = v4.poolManager;
+    stateView = v4.stateView;
+    const helper = await deployV4Helper(c.walletClient, c.publicClient, poolManager);
+
+    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+    tokenIn = tk.token0;
+    tokenOut = tk.token1;
+
+    // Caller funds.
+    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("50000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
+
+    // Initialise a V4 pool at 1:1 (fee 3000, tickSpacing 60) + a wide position.
+    poolId = await setupV4Pool(
+      c.walletClient, c.publicClient, helper, tokenIn, tokenOut,
+      3000, 60, SQRT_PRICE_1_1, -12000, 12000, parseEther("100000"), parseEther("50000000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: poolManager, stateView, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Local UniV4" },
+      ],
+      feeTiers: [3000],
+      baseTokens: [tokenIn, tokenOut],
+    };
+  });
+
+  after(() => {
+    anvil?.stop();
+  });
+
+  it("Phase 5 — V4 swap lands through the singleton and moves the pool price", async () => {
+    // Sanity: the pool is live with liquidity at 1:1.
+    const liq = await getV4Liquidity(c.publicClient, stateView, poolId);
+    assert.ok(liq > 0n, "V4 pool should have liquidity");
+    const before = await getV4Slot0(c.publicClient, stateView, poolId);
+    assert.equal(before.sqrtPriceX96, SQRT_PRICE_1_1, "V4 pool initialised at 1:1");
+
+    const amountIn = parseEther("1000");
+    const caller = c.account0;
+    const pmInBefore = await balanceOf(c.publicClient, tokenIn, poolManager);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+    );
+    const v4Count = prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
+    assert.equal(v4Count, 1, "should discover the V4 pool");
+    assert.ok(prepared.pools[0].poolId === poolId, "prepared poolId matches");
+
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    assert.equal(receipt.status, "success", "V4 cook() must succeed");
+
+    const pmInAfter = await balanceOf(c.publicClient, tokenIn, poolManager);
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    const after = await getV4Slot0(c.publicClient, stateView, poolId);
+
+    assert.ok(pmInAfter - pmInBefore > 0n, "PoolManager tokenIn balance should grow by the V4 input");
+    assert.ok(received > 0n, "caller received tokenOut");
+    const leftover = amountIn - spent;
+    assert.ok(leftover * 100n <= amountIn, `should spend ~all amountIn (leftover ${leftover})`);
+    assert.ok(after.sqrtPriceX96 < before.sqrtPriceX96, "zeroForOne swap should lower the V4 price");
+
+    console.log(
+      `  [P5] V4 solo: spent=${spent} received=${received} leftover=${leftover}\n` +
+        `       PoolManager tokenIn delta=${pmInAfter - pmInBefore} sqrtP ${before.sqrtPriceX96} -> ${after.sqrtPriceX96}`,
+    );
+  });
+});
+
+// ── Phase 6: mixed V3 + V4 split across protocol versions ─────
+describe("EcoSwap V3 + V4 mixed split", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let tokenIn: Hex;
+  let tokenOut: Hex;
+  let v3Pool: Hex;
+  let poolManager: Hex;
+  let stateView: Hex;
+  let v4PoolId: Hex;
+  let poolConfig: ChainPoolConfig;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const v4 = await etchV4Singletons(c.publicClient, c.testClient);
+    poolManager = v4.poolManager;
+    stateView = v4.stateView;
+    const v4Helper = await deployV4Helper(c.walletClient, c.publicClient, poolManager);
+
+    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+    tokenIn = tk.token0;
+    tokenOut = tk.token1;
+
+    const minter = c.account0;
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("50000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, minter, parseEther("50000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, HUGE);
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, HUGE);
+
+    // V3 pool (fee 500) + V4 pool (fee 3000), both at 1:1 with deep liquidity.
+    v3Pool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, 500, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, v3Pool, minter, -12000, 12000, parseEther("300000"),
+    );
+    v4PoolId = await setupV4Pool(
+      c.walletClient, c.publicClient, v4Helper, tokenIn, tokenOut,
+      3000, 60, SQRT_PRICE_1_1, -12000, 12000, parseEther("300000"), parseEther("50000000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: poolManager, stateView, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Local UniV4" },
+      ],
+      feeTiers: [500, 3000],
+      baseTokens: [tokenIn, tokenOut],
+    };
+  });
+
+  after(() => {
+    anvil?.stop();
+  });
+
+  it("Phase 6 — splits across a V3 pool and a V4 pool", async () => {
+    const amountIn = parseEther("2000");
+    const caller = c.account0;
+
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3Pool);
+    const pmInBefore = await balanceOf(c.publicClient, tokenIn, poolManager);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+    );
+    assert.equal(prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV3).length, 1, "1 V3 pool");
+    assert.equal(prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV4).length, 1, "1 V4 pool");
+
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    assert.equal(receipt.status, "success", "mixed V3+V4 cook() must succeed");
+
+    const v3Delta = (await balanceOf(c.publicClient, tokenIn, v3Pool)) - v3InBefore;
+    const v4Delta = (await balanceOf(c.publicClient, tokenIn, poolManager)) - pmInBefore;
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+
+    assert.ok(v3Delta > 0n, "V3 pool should receive input");
+    assert.ok(v4Delta > 0n, "V4 pool should receive input");
+    assert.ok(received > 0n, "caller received tokenOut");
+    assert.equal(v3Delta + v4Delta, spent, "per-venue tokenIn deltas must sum to spent input");
+
+    console.log(
+      `  [P6] V3+V4 split: spent=${spent} received=${received}\n` +
+        `       V3 in=${v3Delta}  V4 in=${v4Delta}  (poolId ${v4PoolId.slice(0, 10)}…)`,
+    );
   });
 });

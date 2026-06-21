@@ -49,6 +49,8 @@ import type { ProdPoolSnapshot } from "./harness/prod-snapshot";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
+import { driftPoolPrice } from "./harness/drift";
+import { FEE_DENOM, isqrt } from "./ecoswap.math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT_DIR = join(__dirname, "fixtures", "snapshots");
@@ -82,6 +84,7 @@ describe("EcoSwap prod-mirror (reproduced V3 tick state)", () => {
   let synthetic: boolean;
   let repro: ReproducedPool;
   let diff: ReproductionDiff;
+  let cleanSnapshot: Hex; // pristine reconstructed state (for the drift case)
 
   before(async () => {
     const loaded = loadSnapshot();
@@ -106,6 +109,8 @@ describe("EcoSwap prod-mirror (reproduced V3 tick state)", () => {
       snap,
       HUGE,
     );
+
+    cleanSnapshot = await c.testClient.snapshot();
   });
 
   after(() => {
@@ -240,6 +245,73 @@ describe("EcoSwap prod-mirror (reproduced V3 tick state)", () => {
       `  [prod-mirror] swap landed: spent=${spent} received=${received}` +
         ` tick ${tickBefore}->${tickAfter} (crossed ticks)` +
         ` oracle perPool[0]=${refIn} (${synthetic ? "synthetic" : "real"} snapshot)`,
+    );
+  });
+
+  it("re-anchors to the live slot0 price when the pool drifts after prepare", async () => {
+    await c.testClient.revert({ id: cleanSnapshot });
+
+    const tokenIn = repro.token0;
+    const tokenOut = repro.token1;
+    const caller = c.account0;
+    const amountIn = parseEther("100");
+    const poolConfig: ChainPoolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3 (prod-mirror)" },
+      ],
+      feeTiers: [snap.fee],
+      baseTokens: [tokenIn, tokenOut],
+    };
+
+    // PREPARE against the clean (pre-drift) tick state.
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+    );
+    const ref = ecoSwapReference(prepared, amountIn);
+    const refV3 = ref.perPoolInput[0] ?? 0n;
+    assert.ok(refV3 > 0n, "baseline allocates to the V3 pool");
+
+    // DRIFT: push the V3 price down with a real swap of ~1/3 the baseline fill.
+    const driftAmount = refV3 / 3n;
+    await driftPoolPrice(c, stack.sauceRouter, prepared.pools[0], tokenIn, tokenOut, true, driftAmount, caller);
+    const { sqrtPriceX96: driftedSqrt, tick: driftedTick } = await getSlot0(c.publicClient, repro.pool);
+
+    // EXECUTE the pre-drift bytecodes — Phase B must read the NEW slot0 price.
+    await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn);
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    const poolInBefore = await balanceOf(c.publicClient, tokenIn, repro.pool);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    assert.equal(receipt.status, "success", "cook() must succeed against drifted slot0");
+
+    const v3InDelta = (await balanceOf(c.publicClient, tokenIn, repro.pool)) - poolInBefore;
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const { sqrtPriceX96: afterSqrt, tick: afterTick } = await getSlot0(c.publicClient, repro.pool);
+
+    const within = (a: bigint, b: bigint, tol: number) => {
+      const hi = a > b ? a : b;
+      const lo = a > b ? b : a;
+      return hi === 0n ? true : Number(hi - lo) / Number(hi) < tol;
+    };
+
+    // Re-anchoring: the recipe filled only the REMAINING gap to the cut from the
+    // drifted live price (drift + recipe ≈ baseline V3 fill).
+    assert.ok(v3InDelta > 0n, "pool still participates");
+    assert.ok(v3InDelta < refV3, `V3 fill adapts DOWN vs baseline (got ${v3InDelta}, baseline ${refV3})`);
+    assert.ok(within(driftAmount + v3InDelta, refV3, 0.03), `drift(${driftAmount}) + recipe(${v3InDelta}) ≈ baseline (${refV3})`);
+    assert.equal(v3InDelta, spent, "single pool → spent == its fill");
+    assert.ok(spent <= amountIn, "never overspends");
+    assert.ok(driftedSqrt < BigInt(snap.sqrtPriceX96), "drift moved the live price below the prepared price");
+
+    // Despite the drift, the pool ends at the same fee-adjusted cut.
+    const feeAdj = (afterSqrt * isqrt((FEE_DENOM - BigInt(snap.fee)) * FEE_DENOM)) / FEE_DENOM;
+    const rel = ref.cutSqrtAdj === 0n ? 0 : Number(feeAdj > ref.cutSqrtAdj ? feeAdj - ref.cutSqrtAdj : ref.cutSqrtAdj - feeAdj) / Number(ref.cutSqrtAdj);
+    assert.ok(rel < 0.01, `V3 re-anchored to the cut (feeAdj ${feeAdj} vs cut ${ref.cutSqrtAdj}, rel ${rel})`);
+
+    console.log(
+      `  [prod-mirror] RUNTIME re-anchoring: drift ${driftAmount} + recipe ${v3InDelta} ≈ baseline ${refV3}; ` +
+        `spent=${spent} tick ${driftedTick}->${afterTick} feeAdj=${feeAdj} cut=${ref.cutSqrtAdj} (rel ${rel})`,
     );
   });
 });

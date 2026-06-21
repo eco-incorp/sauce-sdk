@@ -1,6 +1,7 @@
 import { ISauceRouter } from "./artifacts/ISauceRouter.json";
 import { IERC20 } from "./artifacts/IERC20.json";
 import { IUniswapV3Pool } from "./artifacts/IUniswapV3Pool.json";
+import { IStateView } from "./artifacts/IStateView.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 
 // EcoSwap on-chain solver.
@@ -88,6 +89,7 @@ function main(
       const dp: Tuple = pools[p];
       const feePpm: Uint256 = dp[5];
       const isV2: Uint256 = dp[6];
+      const pType: Uint256 = dp[0];
 
       // Live current out/in sqrt price + (for V2) live liquidity.
       let curSqrt: Uint256 = 0;
@@ -103,8 +105,15 @@ function main(
         liveL = Math.sqrt(reserveIn * reserveOut);
         curSqrt = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
       } else {
-        const sqrtReal: Uint256 = IUniswapV3Pool.at(dp[1]).slot0()[0];
-        curSqrt = zeroForOne === 1 ? sqrtReal : Q192 / sqrtReal;
+        if (pType === 2) {
+          // V4: live price from the StateView lens keyed by poolId
+          // (dp[8]=stateView, dp[9]=poolId). slot0() is multi-return → index inline.
+          const sqrtRealV4: Uint256 = IStateView.at(dp[8]).getSlot0(dp[9])[0];
+          curSqrt = zeroForOne === 1 ? sqrtRealV4 : Q192 / sqrtRealV4;
+        } else {
+          const sqrtReal: Uint256 = IUniswapV3Pool.at(dp[1]).slot0()[0];
+          curSqrt = zeroForOne === 1 ? sqrtReal : Q192 / sqrtReal;
+        }
       }
 
       // Per-pool target spot price where its marginal === cut: target = cut / sqrt(1-fee).
@@ -135,10 +144,51 @@ function main(
       }
 
       if (poolInput > 0) {
-        // Flat legacy swapV3 (the struct swap() self-call mis-encodes its nested
-        // PoolKey). Positive amountSpecified = exact input. Router holds the tokens
-        // (payer = self), output accrues to self and is forwarded at the end.
-        router.swapV3(dp[1], tokenIn, tokenOut, poolInput, priceLimit, address.self, address.self);
+        if (isV2 === 1) {
+          // Constant-product pool: unified swap(SwapParams), poolType=UniV2=0.
+          // amountSpecified is NEGATIVE for exact-input on this path (Math.neg —
+          // SUB is checked). poolKey is ignored by _swapV2 but must be ABI-shaped;
+          // currency0/currency1 follow token sort order. payer=self (router holds
+          // the tokens), recipient=self (output forwarded at the end).
+          const c0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
+          const c1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
+          router.swap({
+            poolType: 0,
+            pool: dp[1],
+            poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            amountSpecified: Math.neg(poolInput),
+            sqrtPriceLimitX96: 0,
+            payer: address.self,
+            recipient: address.self,
+          });
+        } else {
+          if (pType === 2) {
+            // V4 singleton: unified swap(SwapParams), poolType=UniV4=2. pool = the
+            // PoolManager (dp[1]); the full PoolKey (currency0/currency1 sorted, fee,
+            // tickSpacing, hooks) drives dispatch. amountSpecified NEGATIVE = exact
+            // input. payer=self, recipient=self; limit 0 → router picks the extreme.
+            const k0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
+            const k1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
+            router.swap({
+              poolType: 2,
+              pool: dp[1],
+              poolKey: { currency0: k0, currency1: k1, fee: dp[2], tickSpacing: dp[3], hooks: dp[4] },
+              tokenIn: tokenIn,
+              tokenOut: tokenOut,
+              amountSpecified: Math.neg(poolInput),
+              sqrtPriceLimitX96: 0,
+              payer: address.self,
+              recipient: address.self,
+            });
+          } else {
+            // V3 direct pool: flat legacy swapV3. Positive amountSpecified = exact
+            // input. Router holds the tokens (payer = self); output accrues to self
+            // and is forwarded at the end.
+            router.swapV3(dp[1], tokenIn, tokenOut, poolInput, priceLimit, address.self, address.self);
+          }
+        }
         budget = budget - poolInput;
       }
     }

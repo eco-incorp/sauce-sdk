@@ -9,7 +9,7 @@
  * Pipeline:
  *   1. Discover pools (reuse shared/pool-discovery) + multi-hop routes.
  *   2. Classify: V3 concentrated (read slot0/ticks) vs V2 constant-product
- *      (read reserves). Algebra/stable/exotic pools are skipped in v1.
+ *      (read reserves). Algebra/stable/exotic pools are skipped (bespoke math).
  *   3. V3: scan a window of ticks in ONE multicall, reconstruct per-bracket L
  *      from active liquidity() + liquidityNet. V2: one wide bracket discretised
  *      into geometric steps (a V2 pool == a single V3 range with L = sqrt(k)).
@@ -76,6 +76,12 @@ const V2_SQRT_STEP_BPS = 25n; // 0.25% of sqrt → ~0.5% price per bracket
 const ROUTE_SAMPLES = 6;
 /** Keep at most this many routes (bytecode/gas bound). */
 const MAX_ROUTES = Number(process.env.ECO_MAX_ROUTES ?? 2);
+/**
+ * Engine `_swapV2` hardcodes the constant-product fee at 0.3% (997/1000) for
+ * EVERY V2 pool, ignoring the discovered fee tier. So all V2 brackets are pinned
+ * to this fee so the off-chain capacity/marginal ladder matches what executes.
+ */
+const V2_FEE_PPM = 3000;
 
 // ── ABIs (tick-level reads not in the shared minimal pool ABI) ──
 
@@ -90,6 +96,15 @@ const v2PairAbi = parseAbi([
   "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
   "function token0() external view returns (address)",
 ]);
+
+// V4 StateView lens: pool state is keyed by poolId on the singleton, read here.
+const v4StateViewAbi = parseAbi([
+  "function getSlot0(bytes32 poolId) external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "function getTickLiquidity(bytes32 poolId, int24 tick) external view returns (uint128 liquidityGross, int128 liquidityNet)",
+]);
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Hex;
+const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex;
 
 // ── Math helpers ─────────────────────────────────────────────
 
@@ -178,7 +193,12 @@ function isUsableV2(p: PoolInfo): boolean {
 }
 
 function isV3Candidate(p: PoolInfo): boolean {
-  return p.poolType === SwapPoolType.UniV3 || p.poolType === SwapPoolType.UniV4;
+  return p.poolType === SwapPoolType.UniV3;
+}
+
+function isV4Candidate(p: PoolInfo): boolean {
+  // Only hookless V4 pools with a StateView lens + poolId are reconstructable here.
+  return p.poolType === SwapPoolType.UniV4 && !!p.poolId && !!p.stateView;
 }
 
 // ── V3 bracket construction ──────────────────────────────────
@@ -295,12 +315,68 @@ function buildV3Brackets(r: V3Read, refIdx: number, zeroForOne: boolean): EcoBra
   return brackets;
 }
 
+// ── V4 reads (StateView, singleton) ──────────────────────────
+
+/**
+ * Read the windowed tick liquidity for every V4 pool via its StateView lens,
+ * batched into a SINGLE Multicall3 round-trip. Produces the same `V3Read` shape
+ * as readV3Pools so the identical bracket builder reconstructs the curve — V4's
+ * concentrated-liquidity geometry is the same as V3's, only the read path (poolId
+ * on the singleton, not slot0()/ticks() on a pool contract) differs.
+ */
+async function readV4Pools(
+  pools: PoolInfo[],
+  zeroForOne: boolean,
+  client: PublicClient,
+): Promise<V3Read[]> {
+  if (pools.length === 0) return [];
+
+  const usable = pools
+    .filter((p) => p.liquidity > 0n && p.sqrtPriceX96 > 0n && p.poolId && p.stateView)
+    .map((p) => {
+      const tickSpacing = p.tickSpacing ?? feeToTickSpacing(p.fee);
+      const tick = approxTickFromSqrtPriceX96(p.sqrtPriceX96);
+      const base = Math.floor(tick / tickSpacing) * tickSpacing;
+      const boundaries: number[] = [];
+      for (let k = 0; k <= V3_TICK_STEPS; k++) {
+        boundaries.push(zeroForOne ? base - k * tickSpacing : base + (k + 1) * tickSpacing);
+      }
+      return { pool: p, tick, tickSpacing, activeLiquidity: p.liquidity, boundaries };
+    });
+
+  const tickCalls = usable.flatMap((u) =>
+    u.boundaries.map((b) => ({
+      address: u.pool.stateView as Hex,
+      abi: v4StateViewAbi,
+      functionName: "getTickLiquidity" as const,
+      args: [u.pool.poolId as Hex, b] as const,
+    })),
+  );
+  if (tickCalls.length === 0) return [];
+
+  const tickResults = await client.multicall({ contracts: tickCalls, allowFailure: true });
+
+  const out: V3Read[] = [];
+  let cursor = 0;
+  for (const u of usable) {
+    const net = new Map<number, bigint>();
+    for (const b of u.boundaries) {
+      const r = tickResults[cursor++];
+      if (r.status === "success") {
+        const liquidityNet = (r.result as unknown as [bigint, bigint])[1];
+        if (liquidityNet !== 0n) net.set(b, liquidityNet);
+      }
+    }
+    out.push({ pool: u.pool, tick: u.tick, tickSpacing: u.tickSpacing, activeLiquidity: u.activeLiquidity, net });
+  }
+  return out;
+}
+
 // ── V2 bracket construction ──────────────────────────────────
 
 /** Build discretised out/in brackets for one constant-product pool. */
-function buildV2Brackets(pool: PoolInfo, refIdx: number): EcoBracket[] {
+function buildV2Brackets(pool: PoolInfo, refIdx: number, feePpm: number): EcoBracket[] {
   const brackets: EcoBracket[] = [];
-  const feePpm = pool.fee;
   const L = pool.liquidity; // synthetic sqrt(k); recomputed live on-chain
   let near = pool.sqrtPriceX96; // already out/in for V2
 
@@ -416,15 +492,17 @@ export async function prepareEcoSwap(
   const deep = allDirect.filter((p) => p.liquidity >= MIN_LIQUIDITY);
   // Keep the deepest pools only — bounds on-chain loop size and calldata.
   const usableDirect = deep
-    .filter((p) => isV3Candidate(p) || isUsableV2(p))
+    .filter((p) => isV3Candidate(p) || isV4Candidate(p) || isUsableV2(p))
     .sort((a, b) => (a.liquidity < b.liquidity ? 1 : a.liquidity > b.liquidity ? -1 : 0))
     .slice(0, MAX_DIRECT_POOLS);
   const v3Raw = usableDirect.filter(isV3Candidate);
-  // v1 executes V3/V4 only (flat swapV3/swapV4). The unified struct swap() — the
-  // sole on-chain path for V2/constant-product pools — currently hits a compiler
-  // nested-struct ABI-encoding bug, so V2 pools are discovered but not executed.
-  const v2Raw: PoolInfo[] = [];
-  void isUsableV2;
+  const v4Raw = usableDirect.filter(isV4Candidate);
+  // Constant-product (Uniswap-V2-style) pools execute via the unified
+  // swap(SwapParams) entry (poolType=UniV2); the on-chain solver re-anchors them
+  // to live reserves. The engine's _swapV2 hardcodes the 0.3% fee, so every V2
+  // pool's bracket math is pinned to feePpm=3000 below regardless of the
+  // discovered fee tier (keeps the off-chain ladder consistent with execution).
+  const v2Raw = usableDirect.filter(isUsableV2);
 
   // ── Discover multi-hop routes (best pool per leg) ──
   const routesRaw: DiscoveredMultiHopRoute[] = [];
@@ -454,10 +532,32 @@ export async function prepareEcoSwap(
       address: r.pool.address,
       fee: r.pool.fee,
       tickSpacing: r.tickSpacing,
-      hooks: "0x0000000000000000000000000000000000000000",
+      hooks: ZERO_ADDRESS,
       feePpm: r.pool.fee,
       isV2: false,
       inIsToken0: zeroForOne, // V3 PoolKey orientation = token sort order
+      stateView: ZERO_ADDRESS,
+      poolId: ZERO_BYTES32,
+      source: r.pool.source,
+    });
+    brackets.push(...buildV3Brackets(r, refIdx, zeroForOne));
+  }
+
+  // V4 (singleton; tick reads via StateView, batched into one multicall)
+  const v4Reads = await readV4Pools(v4Raw, zeroForOne, client);
+  for (const r of v4Reads) {
+    const refIdx = pools.length;
+    pools.push({
+      poolType: r.pool.poolType,
+      address: r.pool.address, // PoolManager singleton
+      fee: r.pool.fee,
+      tickSpacing: r.tickSpacing,
+      hooks: r.pool.hooks ?? ZERO_ADDRESS,
+      feePpm: r.pool.fee,
+      isV2: false,
+      inIsToken0: zeroForOne,
+      stateView: r.pool.stateView as Hex,
+      poolId: r.pool.poolId as Hex,
       source: r.pool.source,
     });
     brackets.push(...buildV3Brackets(r, refIdx, zeroForOne));
@@ -477,15 +577,17 @@ export async function prepareEcoSwap(
       pools.push({
         poolType: v2Raw[i].poolType,
         address: v2Raw[i].address,
-        fee: v2Raw[i].fee,
+        fee: V2_FEE_PPM, // engine _swapV2 uses 0.3% regardless of discovered tier
         tickSpacing: 0,
-        hooks: "0x0000000000000000000000000000000000000000",
-        feePpm: v2Raw[i].fee,
+        hooks: ZERO_ADDRESS,
+        feePpm: V2_FEE_PPM,
         isV2: true,
         inIsToken0,
+        stateView: ZERO_ADDRESS,
+        poolId: ZERO_BYTES32,
         source: v2Raw[i].source,
       });
-      brackets.push(...buildV2Brackets(v2Raw[i], refIdx));
+      brackets.push(...buildV2Brackets(v2Raw[i], refIdx, V2_FEE_PPM));
     }
   }
 
@@ -546,9 +648,11 @@ export async function prepareEcoSwap(
   const trimmed =
     kept.length >= MIN_BRACKETS ? kept : brackets.slice(0, Math.min(brackets.length, MIN_BRACKETS));
 
+  const nV4 = pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
+  const nV3 = pools.filter((p) => p.poolType === SwapPoolType.UniV3).length;
+  const nV2 = pools.filter((p) => p.isV2).length;
   console.log(
-    `  EcoSwap prepared: ${pools.filter((p) => !p.isV2).length} V3, ` +
-      `${pools.filter((p) => p.isV2).length} V2, ${routes.length} routes, ` +
+    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2, ${routes.length} routes, ` +
       `${trimmed.length}/${brackets.length} brackets kept (crossed+${SAFETY_TICKS}), ` +
       `coverage=${covered >= amountIn ? "full" : "partial"}`,
   );

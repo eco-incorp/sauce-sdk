@@ -67,7 +67,9 @@ export async function startAnvil(opts: { timeoutMs?: number } = {}): Promise<Anv
     const rpcUrl = `http://127.0.0.1:${port}`;
     const child: ChildProcess = spawn(
       "anvil",
-      ["--port", String(port), "--silent"],
+      // Raise the block gas limit so batched mints (many V3 positions per tx, used
+      // by the prod-mirror reconstruction) fit in a single block.
+      ["--port", String(port), "--silent", "--gas-limit", "200000000"],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
 

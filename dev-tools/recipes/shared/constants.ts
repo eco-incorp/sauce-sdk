@@ -42,6 +42,8 @@ export enum SwapPoolType {
 export enum FactoryType {
   /** Uniswap V3 style: getPool(tokenA, tokenB, fee) across fee tiers, slot0() for state */
   V3Standard = "v3",
+  /** Uniswap V4 singleton: poolId = keccak256(PoolKey), StateView.getSlot0(poolId) for state */
+  UniswapV4 = "v4",
   /** Algebra style (Camelot, QuickSwap): poolByPair(tokenA, tokenB), globalState() for state */
   AlgebraV3 = "algebra",
   /** Uniswap V2 style: getPair(tokenA, tokenB), getReserves() for state */
@@ -65,6 +67,7 @@ export enum FactoryType {
 // ── Per-chain pool discovery config ──────────────────────────
 
 export interface FactoryConfig {
+  /** Factory address — or, for Uniswap V4, the PoolManager singleton address. */
   address: Hex;
   /** How the SauceRouter dispatches the swap (V2/V3/V4) */
   poolType: SwapPoolType;
@@ -72,6 +75,8 @@ export interface FactoryConfig {
   factoryType: FactoryType;
   /** Human-readable label for logging */
   label: string;
+  /** Uniswap V4 only: the StateView lens used to read pool state by poolId. */
+  stateView?: Hex;
 }
 
 export interface ChainPoolConfig {
@@ -85,6 +90,12 @@ export function hasPriceLimit(poolType: SwapPoolType): boolean {
   return poolType === SwapPoolType.UniV3 || poolType === SwapPoolType.UniV4;
 }
 
+// ── Uniswap V4 (Base) ────────────────────────────────────────
+// Declared above the chain configs so BASE_CHAIN_POOL_CONFIG can reference them.
+
+export const UNISWAP_V4_POOL_MANAGER = "0x498581fF718922c3f8e6A244956aF099B2652b2b" as Hex;
+export const UNISWAP_V4_STATE_VIEW = "0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71" as Hex;
+
 // ── Chain configs ────────────────────────────────────────────
 
 /** Base chain pool config (default for single-chain recipes) */
@@ -96,6 +107,8 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Aerodrome CL" },
     { address: "0x71524B4f93c58fcbF659783284E38825f0622859" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
     { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+    // V4 singleton (PoolManager + StateView lens)
+    { address: UNISWAP_V4_POOL_MANAGER, stateView: UNISWAP_V4_STATE_VIEW, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4" },
     // V2 constant-product (no price limit)
     { address: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Uniswap V2" },
     { address: "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2" },
@@ -242,11 +255,6 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     feeTiers: [100, 500, 3000, 10000],
   },
 };
-
-// ── V4 ───────────────────────────────────────────────────────
-
-export const UNISWAP_V4_POOL_MANAGER = "0x498581fF718922c3f8e6A244956aF099B2652b2b" as Hex;
-export const UNISWAP_V4_STATE_VIEW = "0xA3c0c9b65baD0189c5c041BF29d8f6DCF1c8e3e1" as Hex;
 
 // ── Infrastructure ───────────────────────────────────────────
 

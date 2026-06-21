@@ -20,6 +20,10 @@ const ARTIFACTS_DIR = resolve(DEV_TOOLS_DIR, "artifacts");
 // deploy/fork-test flow (Router + SauceRouter, which carry deploy bytecode) read.
 const ARTIFACTS = ["IERC20", "ISauceRouter", "IUniswapV3Pool", "Router", "SauceRouter"];
 
+// Artifacts whose Foundry source file name differs from the contract name
+// (name -> containing `<file>.sol` dir). IStateView lives in IUniswapV4.sol.
+const EXTRA_ARTIFACTS = { IStateView: "IUniswapV4.sol" };
+
 // engine/out is reachable via the stable-named `sauce` symlink in compiler's (or the
 // hoisted root) node_modules — avoids hardcoding the SHA-pinned pnpm store path.
 const OUT_CANDIDATES = [
@@ -47,6 +51,14 @@ for (const name of ARTIFACTS) {
     missing.push(name);
   }
 }
+for (const [name, srcDir] of Object.entries(EXTRA_ARTIFACTS)) {
+  const src = resolve(engineOut, srcDir, `${name}.json`);
+  if (existsSync(src)) {
+    copyFileSync(src, resolve(ARTIFACTS_DIR, `${name}.json`));
+  } else {
+    missing.push(name);
+  }
+}
 
 if (missing.length) {
   console.error(
@@ -55,4 +67,5 @@ if (missing.length) {
   process.exit(1);
 }
 
-console.log(`[sync-artifacts] copied ${ARTIFACTS.length} artifacts -> dev-tools/artifacts/`);
+const total = ARTIFACTS.length + Object.keys(EXTRA_ARTIFACTS).length;
+console.log(`[sync-artifacts] copied ${total} artifacts -> dev-tools/artifacts/`);
