@@ -56,12 +56,13 @@ import { IStateViewFull } from "./IStateViewFull.json";
 // ── Return shape (off-chain abi.decode against this EXACTLY) ──────────────────
 //   abi.encode(poolBlob: bytes, tickBlob: bytes)
 //
-//   poolBlob = concatenated 32-byte words, POOL_STRIDE = 12 words per pool:
+//   poolBlob = concatenated 32-byte words, POOL_STRIDE = 13 words per pool:
 //     [0] poolType (0=V2,1=V3,2=V4)  [1] address  [2] fee  [3] tickSpacing
 //     [4] hooks(0)  [5] sqrtPriceX96 (synthetic out/in for V2)
 //     [6] liquidity (synthetic √(rIn·rOut) for V2)  [7] tickRaw (int24 ZERO-EXT)
 //     [8] inIsToken0 (V2 only)  [9] stateView (V4)  [10] poolId (V4)
 //     [11] scannedForward (forward tick boundaries walked; 0 for V2/dust)
+//     [12] scannedReverse (reverse-drift tick boundaries walked; 0 for V2/dust)
 //
 //   tickBlob = concatenated 32-byte words, TICK_STRIDE = 3 words per tick row:
 //     [0] poolIdx  [1] tickIndexRaw (int24 ZERO-EXT)  [2] liquidityNetRaw (int128 ZERO-EXT)
@@ -325,11 +326,13 @@ function main(
             if (zeroForOne === 1) {
               revShift3 = baseRev3 + ts3;
             }
+            let scanRev3: Uint256 = 0; // reverse boundaries walked (= count emitted)
             if (isSurv === 1) {
               for (let rd3 = 0; rd3 < driftTicks; rd3 = rd3 + 1) {
                 const ra3: Uint256 = tickArg(revShift3, OFFSET);
                 const rn3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).ticks(ra3)[1];
                 tickBlob = tickBlob.concat(abi.encode(idx3, ra3, rn3));
+                scanRev3 = scanRev3 + 1;
                 if (zeroForOne === 1) {
                   revShift3 = revShift3 + ts3; // further up
                 } else {
@@ -416,7 +419,7 @@ function main(
             }
 
             poolBlob = poolBlob.concat(
-              abi.encode(1, poolAddr3, fee3, ts3, 0, sqrt3, liq3, tick3, 0, 0, 0, scanned3)
+              abi.encode(1, poolAddr3, fee3, ts3, 0, sqrt3, liq3, tick3, 0, 0, 0, scanned3, scanRev3)
             );
             poolCount = poolCount + 1;
           }
@@ -442,7 +445,7 @@ function main(
           const synthL: Uint256 = Math.sqrt(reserveIn * reserveOut);
           const synthSqrt: Uint256 = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
           poolBlob = poolBlob.concat(
-            abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0)
+            abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
           );
           poolCount = poolCount + 1;
         }
@@ -475,11 +478,13 @@ function main(
           if (zeroForOne === 1) {
             revShift4 = baseRev4 + v4ts3;
           }
+          let scanRev4: Uint256 = 0; // reverse boundaries walked (= count emitted)
           if (isSurv4 === 1) {
             for (let rd4 = 0; rd4 < driftTicks; rd4 = rd4 + 1) {
               const ra4: Uint256 = tickArg(revShift4, OFFSET);
               const rn4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, ra4)[1];
               tickBlob = tickBlob.concat(abi.encode(idx43, ra4, rn4));
+              scanRev4 = scanRev4 + 1;
               if (zeroForOne === 1) {
                 revShift4 = revShift4 + v4ts3;
               } else {
@@ -564,7 +569,7 @@ function main(
           }
 
           poolBlob = poolBlob.concat(
-            abi.encode(2, poolManager3, v4fee3, v4ts3, 0, sqrtP43, liq43, tick43, 0, stateView3, poolId3, scanned4)
+            abi.encode(2, poolManager3, v4fee3, v4ts3, 0, sqrtP43, liq43, tick43, 0, stateView3, poolId3, scanned4, scanRev4)
           );
           poolCount = poolCount + 1;
         }

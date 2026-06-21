@@ -102,11 +102,15 @@ export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): E
       // local test, live == prepared first-bracket of this pool (see header).
       let curSqrt = 0n;
       let liveL = 0n;
-      // Find this pool's first (ladder-earliest, highest-price) direct bracket.
+      // The pool's first (ladder-earliest, highest-price) direct bracket WITH
+      // capacity > 0 is its spot bracket (near edge == the live price it was
+      // anchored to). Reverse-drift brackets carry capacity 0 and sort ABOVE it
+      // (above spot), so they must be skipped here — in the no-drift model the
+      // live price is the spot, not the reverse extent.
       let firstBracket: (typeof brackets)[number] | undefined;
       for (let bi = 0; bi < brackets.length; bi++) {
         const b = brackets[bi];
-        if (b.kind !== EcoBracketKind.Route && b.refIdx === p) {
+        if (b.kind !== EcoBracketKind.Route && b.refIdx === p && b.capacity > 0n) {
           firstBracket = b;
           break;
         }

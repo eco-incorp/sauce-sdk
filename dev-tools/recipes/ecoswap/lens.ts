@@ -11,18 +11,19 @@
  *
  * Return shape (must mirror ecoswap.lens.sauce.ts EXACTLY):
  *   abi.encode(poolBlob: bytes, tickBlob: bytes)
- *   poolBlob = 12 words/pool: [type,addr,fee,tickSpacing,hooks,sqrtP,liq,tickRaw,inIsToken0,stateView,poolId,scannedForward]
+ *   poolBlob = 13 words/pool: [type,addr,fee,tickSpacing,hooks,sqrtP,liq,tickRaw,inIsToken0,stateView,poolId,scannedForward,scannedReverse]
  *   tickBlob = 3 words/row:   [poolIdx, tickIndexRaw, liquidityNetRaw]
  * Signed words (tickRaw int24, tickIndexRaw int24, liquidityNetRaw int128) are
  * ZERO-extended on return; reinterpreted here via BigInt.asIntN.
  *
  * v2 (LAZY): the lens reads ONLY the ticks the trade can cross, not a fixed 96
- * window. Each survivor's poolBlob carries `scannedForward` — the number of
- * forward tick boundaries the lens actually walked (= the bracket count
- * buildV3Brackets must STOP at, so off-chain never fabricates phantom brackets
- * past the lens's data). Reverse-drift tick rows are also emitted (for runtime
- * drift); they populate the net map but sit ABOVE the forward walk so the forward
- * bracket build never consumes them.
+ * window. Each survivor's poolBlob carries `scannedForward` AND `scannedReverse`
+ * — the number of tick boundaries the lens actually walked in the swap direction
+ * and on the opposite (drift) side of spot. buildV3Brackets walks EXACTLY these
+ * counts (never past the lens's data, so it never fabricates phantom brackets):
+ * `scannedForward` forward brackets (the swap path) plus `scannedReverse` reverse
+ * brackets ABOVE spot (capacity-0; consumed only by Phase B when the live price
+ * has drifted against the swap between prepare and execution).
  */
 
 import { createRequire } from "module";
@@ -53,7 +54,7 @@ const { compile } = require("@eco-incorp/sauce-compiler");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 
-const POOL_STRIDE = 12;
+const POOL_STRIDE = 13;
 const TICK_STRIDE = 3;
 const ZERO_HOOKS = "0x0000000000000000000000000000000000000000" as Hex;
 
@@ -176,6 +177,13 @@ export interface LensPool {
    * 0 for V2 and for dust pools the lens chose not to scan.
    */
   scannedForward: number;
+  /**
+   * Number of REVERSE-drift tick boundaries the lens walked on the OPPOSITE side
+   * of spot (= driftTicks for survivors, 0 for V2/dust). buildV3Brackets walks
+   * exactly this many reverse boundaries to extend the curve above spot for
+   * runtime price drift against the swap — never past the lens's data.
+   */
+  scannedReverse: number;
   /**
    * EVERY tick index the lens emitted a row for (forward walk + reverse drift),
    * including uninitialized (net 0) ticks the `net` map omits. Lets callers see
@@ -333,6 +341,7 @@ export function decodeLens(poolBlob: Hex, tickBlob: Hex): LensResult {
       poolId: ("0x" + poolIdWord.toString(16).padStart(64, "0")) as Hex,
       net: new Map<number, bigint>(),
       scannedForward: Number(pw[o + 11]),
+      scannedReverse: Number(pw[o + 12]),
       scannedTickIndices: [],
     });
   }

@@ -201,6 +201,12 @@ interface V3Read {
    * (which would assume L unchanged where the lens never read). 0 → no brackets.
    */
   scannedForward: number;
+  /**
+   * Reverse-drift tick boundaries the lens walked on the OPPOSITE side of spot.
+   * buildV3Brackets emits this many capacity-0 brackets ABOVE spot so Phase B can
+   * re-anchor if the live price has drifted against the swap. 0 → none.
+   */
+  scannedReverse: number;
 }
 
 /**
@@ -228,6 +234,7 @@ function lensToV3Read(p: LensPool): V3Read {
     activeLiquidity: p.liquidity,
     net: p.net,
     scannedForward: p.scannedForward,
+    scannedReverse: p.scannedReverse,
   };
 }
 
@@ -240,23 +247,62 @@ function feeToTickSpacing(fee: number): number {
 /**
  * Build out/in brackets for one V3 pool from its tick window.
  *
- * Walks boundaries in the swap direction. The first bracket's near edge is the
- * LIVE current price; each subsequent edge is an initialized-tick boundary.
- * Crossing a boundary updates active liquidity by ±liquidityNet (− when the
- * price moves down for zeroForOne, + when it moves up for oneForZero).
+ * FORWARD (swap direction): the first bracket's near edge is the LIVE current
+ * price; each subsequent edge is an initialized-tick boundary. Crossing a
+ * boundary updates active liquidity by ±liquidityNet (− when the price moves down
+ * for zeroForOne, + when it moves up for oneForZero).
+ *
+ * REVERSE (opposite of the swap, ABOVE spot): if the pool's live price has
+ * drifted AGAINST the swap between prepare and execution, Phase B integrates from
+ * the live (drifted-up) price down to the cut — a span that begins ABOVE the
+ * prepare-time spot. These reverse brackets supply the liquidity for that region.
+ * They carry capacity = 0 so the water-fill cut (Phase A, on-chain AND the
+ * off-chain trim) IGNORES them; only Phase B's geometric re-anchoring consumes
+ * them. Reverse L accumulation is the MIRROR of forward: zeroForOne reverse = price
+ * UP (cross base+ts.., L += net); oneForZero reverse = price DOWN (cross base..,
+ * L -= net). Walks exactly scannedReverse boundaries — never past the lens's data
+ * (scannedReverse is incremented per-emit in the lens, so this bound can't fabricate
+ * brackets the lens never read; load-bearing — keep in sync if the lens reverse loop
+ * changes). NOTE: reverse drift only helps pools the trade already crosses (the trim
+ * drops non-crossed pools entirely), same as the forward direction.
  */
 function buildV3Brackets(r: V3Read, refIdx: number, zeroForOne: boolean): EcoBracket[] {
   const brackets: EcoBracket[] = [];
   const feePpm = r.pool.fee;
-  const base = Math.floor(r.tick / r.tickSpacing) * r.tickSpacing;
+  const ts = r.tickSpacing;
+  const base = Math.floor(r.tick / ts) * ts;
+  const spotReal = r.pool.sqrtPriceX96;
 
-  let L = r.activeLiquidity;
-  let nearReal = r.pool.sqrtPriceX96; // real sqrt at the near edge (starts live)
-  let b = zeroForOne ? base : base + r.tickSpacing; // first boundary tick in swap dir
-  const step = zeroForOne ? -r.tickSpacing : r.tickSpacing;
+  // ── Reverse-side brackets (above spot; capacity 0, drift-only) ──
+  let Lr = r.activeLiquidity; // active L applies across the spot bucket [base, base+ts]
+  let innerReal = spotReal; // far (lower-out/in) edge of the current reverse bracket
+  let rb = zeroForOne ? base + ts : base; // first reverse boundary
+  const rstep = zeroForOne ? ts : -ts;
+  for (let k = 0; k < r.scannedReverse; k++) {
+    const outerReal = getSqrtRatioAtTick(rb); // farther-from-spot edge
+    const a = toOutIn(innerReal, zeroForOne);
+    const c = toOutIn(outerReal, zeroForOne);
+    const near = a > c ? a : c;
+    const far = a > c ? c : a;
+    if (Lr > 0n && far > 0n && near > far) {
+      const rev = makeBracket(EcoBracketKind.V3, refIdx, near, far, Lr, feePpm);
+      rev.capacity = 0n; // excluded from the water-fill cut; used only by Phase B re-anchoring
+      brackets.push(rev);
+    }
+    const net = r.net.get(rb) ?? 0n;
+    Lr = zeroForOne ? Lr + net : Lr - net; // reverse crossing is the mirror of forward
+    if (Lr < 0n) Lr = 0n;
+    innerReal = outerReal;
+    rb += rstep;
+  }
 
+  // ── Forward brackets (swap direction) ──
   // STOP at the lazy lens's scanned forward boundary — never walk past the data
   // it actually read (that would fabricate phantom brackets assuming L unchanged).
+  let L = r.activeLiquidity;
+  let nearReal = spotReal; // real sqrt at the near edge (starts live)
+  let b = zeroForOne ? base : base + ts; // first boundary tick in swap dir
+  const step = zeroForOne ? -ts : ts;
   for (let k = 0; k < r.scannedForward; k++) {
     const farReal = getSqrtRatioAtTick(b);
     const near = toOutIn(nearReal, zeroForOne);
@@ -396,10 +442,9 @@ function buildRouteBracketsLocal(
   hop2Brackets: EcoBracket[],
   refIdx: number,
   amountIn: bigint,
+  hop1Fee: number,
+  hop2Fee: number,
 ): EcoBracket[] {
-  const hop1Fee = hop1Brackets.length > 0 ? feePpmOf(hop1Brackets[0]) : V2_FEE_PPM;
-  const hop2Fee = hop2Brackets.length > 0 ? feePpmOf(hop2Brackets[0]) : V2_FEE_PPM;
-
   const samples: { input: bigint; out: bigint }[] = [];
   for (let s = 1; s <= ROUTE_SAMPLES; s++) {
     const input = (amountIn * BigInt(s)) / BigInt(ROUTE_SAMPLES);
@@ -434,15 +479,6 @@ function buildRouteBracketsLocal(
     prevOut = sm.out;
   }
   return brackets;
-}
-
-/** Recover a bracket's fee from its spot vs fee-adjusted sqrt (near edge). */
-function feePpmOf(b: EcoBracket): number {
-  // sqrtAdjNear = sqrtNear * sqrt(1-fee); recovering fee exactly is unnecessary —
-  // the bracket capacities already embed the fee, so localQuote's partial-fill
-  // fee term is a 2nd-order correction. Default to V2 fee if indeterminate.
-  if (b.sqrtNear === b.sqrtAdjNear) return 0;
-  return V2_FEE_PPM;
 }
 
 // ── Main preparation ─────────────────────────────────────────
@@ -553,9 +589,15 @@ export async function prepareEcoSwap(
         amountIn, driftTicks: SAFETY_TICKS, minLiquidity: MIN_LIQUIDITY, minRelBps, maxTicks: V3_TICK_STEPS,
       }),
     ]);
-    if (hop1.pools.length === 0 || hop2.pools.length === 0) continue;
-    const best1 = hop1.pools.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
-    const best2 = hop2.pools.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
+    // The on-chain route handler executes BOTH hops via flat swapV3, so only V3
+    // pools are valid route legs. (V2/V4 route hops would need per-hop type
+    // dispatch + a richer route tuple on-chain — a documented follow-up.) Pick the
+    // deepest V3 pool per hop; skip the route if either hop has no V3 pool.
+    const v3Hop1 = hop1.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
+    const v3Hop2 = hop2.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
+    if (v3Hop1.length === 0 || v3Hop2.length === 0) continue;
+    const best1 = v3Hop1.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
+    const best2 = v3Hop2.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
     const hop1Brackets = lensPoolBrackets(best1, z1, 0);
     const hop2Brackets = lensPoolBrackets(best2, z2, 0);
     if (hop1Brackets.length === 0 || hop2Brackets.length === 0) continue;
@@ -641,7 +683,14 @@ export async function prepareEcoSwap(
   for (const r of routesRaw) {
     if (routes.length >= MAX_ROUTES) break;
     const refIdx = routes.length;
-    const rb = buildRouteBracketsLocal(r.hop1Brackets, r.hop2Brackets, refIdx, amountIn);
+    const rb = buildRouteBracketsLocal(
+      r.hop1Brackets,
+      r.hop2Brackets,
+      refIdx,
+      amountIn,
+      r.hop1Pool.fee,
+      r.hop2Pool.fee,
+    );
     if (rb.length === 0) continue;
     routes.push({ route: { intermediateToken: r.intermediateToken, hop1Pool: r.hop1Pool, hop2Pool: r.hop2Pool } });
     routeBracketSets.push(rb);
