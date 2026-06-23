@@ -53,6 +53,241 @@ they sort into one global ladder regardless of AMM type or fee tier.
 
 Equal marginal price at the cut ⇒ synchronized minimal slippage across all venues.
 
+## Data format & algorithms (deep dive)
+
+This section walks the full path — bracket **formation → filtering → handoff into runtime →
+execution** — with the exact data structures at each boundary.
+
+### The one idea everything rests on
+
+Every pool (Uniswap V3 ticks, a V4 singleton, **and** a constant-product V2 pool) is represented as
+**brackets in a common "out/in" √-price space**:
+
+```
+  A constant-product (V2) pool  ≡  ONE Uniswap-V3 liquidity range
+                                    with  L = √(reserveIn · reserveOut) = √k
+
+  So the whole solver runs ONE formula for every pool, every version:
+     effIn   = L · 2^96 · (1/√far − 1/√near)        (token-in to walk a bracket)
+     grossIn = effIn / (1 − fee)
+     dOut    = L · (√near − √far) / 2^96            (token-out produced)
+```
+
+All √ values are `Q96`, oriented **out-per-in** so price *falls* as the swap proceeds → `√near > √far`.
+(`zeroForOne`: real √ is already out/in. `oneForZero`: invert via `Q192/√real`.)
+
+### Pipeline at a glance
+
+```
+ off-chain (prepare.ts)                              on-chain (ecoswap.sauce.ts, via cook())
+ ┌──────────────────────────────────────────┐        ┌──────────────────────────────┐
+ │ 1 LENS eth_call — discover + read pools   │        │ Phase A  water-fill → cut    │
+ │ 2 filter (abs / rel-depth / top-N)        │  args  │ Phase B  re-anchor to live   │
+ │ 3 build brackets (V3/V4 · V2 · route)     │ ─────▶ │          1 swap per pool     │
+ │ 4 fee-adjust + capacity                   │bytecode│ refund leftover, send out    │
+ │ 5 sort DESC by sqrtAdjNear + trim         │        │                              │
+ └──────────────────────────────────────────┘        └──────────────────────────────┘
+```
+
+### 1 · Bracket formation
+
+The atomic unit is the `EcoBracket` (`shared/types.ts`), flattened on-chain to `brackets[b][i]`:
+
+```
+ EcoBracket                          on-chain tuple index  →  brackets[b][i]
+ ┌───────────────┬──────────────────────────────────────────────┬─────┐
+ │ kind          │ 0=V3 direct · 1=V2 direct · 2=Route           │ [0] │
+ │ refIdx        │ index into pools[] (V3/V2) or routes[] (Route) │ [1] │
+ │ sqrtNear      │ spot out/in √P at near (entry) edge — HIGHER   │ [2] │
+ │ sqrtFar       │ spot out/in √P at far  (exit)  edge — LOWER    │ [3] │
+ │ liquidity  L  │ bracket L (V3); recomputed live for V2         │ [4] │
+ │ capacity      │ gross tokenIn to traverse the whole bracket    │ [5] │ ◀─ Phase A
+ │ sqrtAdjNear   │ fee-adjusted near = √near·√(1−fee)  ── SORT KEY │ [6] │ ◀─ ladder sort
+ │ sqrtAdjFar    │ fee-adjusted far  = √far ·√(1−fee)             │ [7] │ ◀─ threshold
+ └───────────────┴──────────────────────────────────────────────┴─────┘
+```
+
+**Why fee-adjust (`·√(1−fee)`)?** It converts a pool's *spot* price into its post-fee *marginal
+execution* price — what makes a 0.05% pool and a 0.30% pool directly comparable on one axis. That's the
+universal sort/threshold coordinate.
+
+**V3/V4 → brackets (`buildV3Brackets`).** Walk the lens's tick window outward from the live tick; at
+each initialised boundary active `L` steps by `±liquidityNet`; each constant-`L` span is one bracket.
+
+```
+ out/in √price                       (zeroForOne example: swap pushes price DOWN)
+   ▲
+   │   ┌── REVERSE side (ABOVE spot) ─────────────────────────────────┐
+   │   │  capacity FORCED to 0 — invisible to the water-fill cut,      │
+   │   │  consumed ONLY by Phase B if live price drifted UP vs prepare │
+   │   │   ╎          ╎          ╎      L accrues as MIRROR of forward │
+   │   │  [rev2]    [rev1]    [rev0]    zeroForOne rev: L += net       │
+   ●───┼───────────── SPOT (live tick at prepare) ──────────────────── ●  base = ⌊tick/ts⌋·ts
+   │   │  [fwd0]    [fwd1]    [fwd2] ...                                │
+   │   │   ╎          ╎          ╎      forward: L −= net (0→1)         │
+   │   │  near=spot  bndry      bndry                                  │
+   │   └── FORWARD side (swap direction) ──────────────────────────────┘
+   ▼      walk EXACTLY scannedForward / scannedReverse boundaries — never past lens data
+          (else you'd fabricate phantom brackets where L is unknown)
+```
+
+- **Forward** brackets are the swap path: `L = zeroForOne ? L−net : L+net` per crossing.
+- **Reverse** brackets sit above spot with `capacity = 0n`. They exist only so Phase B can re-anchor a
+  pool whose live price moved *against* the swap between `prepare()` and execution. `L` accrues by the
+  *mirror* rule (`zeroForOne` reverse = price up = `L += net`). The walk is bounded by `scannedReverse`.
+- Both loops stop at the lens's `scannedForward`/`scannedReverse` counts so brackets never assume
+  liquidity the lens didn't read.
+
+**V2 → brackets (`buildV2Brackets`).** One wide constant-product range, discretised into
+`V2_BRACKETS` (16) geometric steps (~0.5% price each) so it slots into the same ladder. `L = √k` is
+carried but **recomputed live on-chain** from `getReserves`.
+
+```
+ √near ──┐ step −0.25% of √ per bracket
+         ├─[v2_0]─┐
+         │        ├─[v2_1]─┐
+         │        │        ├─[v2_2]─ ... ×16     all share refIdx → same pool
+```
+
+**Route (2-hop) → segments (`buildRouteBracketsLocal`).** No on-chain `quote()`: each hop's bracket
+curve is walked off-chain by `localQuote` at `ROUTE_SAMPLES` (6) cumulative input samples; each
+`(Δin, Δout)` increment becomes a flat segment with `capacity = Δin` and `sqrtAdj = √(Δout·Q192/Δin)`.
+Each hop's **real fee** is threaded in (no `feePpm` heuristic).
+
+```
+ input samples:  s/6 · amountIn  for s=1..6
+   hop1Brackets ──localQuote(in, hop1Fee)──▶ mid ──localQuote(mid, hop2Fee)──▶ out
+                         │
+   segment_s = { capacity: Δin,  sqrtAdjNear = sqrtAdjFar = √(Δout·2^192/Δin) }
+```
+
+### 2 · Filtering
+
+Three gates (`prepareEcoSwap`), then a trim:
+
+```
+ all discovered pools (from lens)
+        │
+        ▼  ① ABSOLUTE floor       p.liquidity ≥ MIN_LIQUIDITY (1e13)
+        │
+        ▼  ② RELATIVE-depth floor p.liquidity ≥ minRelBps/1e4 · Σliquidity
+        │                         (default 100 bps = 1% of combined depth;
+        │                          drops dust pools not worth a swap's gas)
+        ▼  ③ TOP-N cap            keep deepest MAX_DIRECT_POOLS (12) by L
+        │
+        ▼  build brackets, fee-adjust, SORT ladder DESC by sqrtAdjNear
+        │
+        ▼  ④ OFF-CHAIN WATER-FILL PRE-RUN → trim
+```
+
+The trim (④) bounds on-chain calldata/gas to the trade *size*, not the fetch window:
+
+```
+ sorted ladder (DESC sqrtAdjNear):  [b0][b1][b2][b3][b4][b5][b6][b7][b8]...
+                                      └──── Σcapacity ────┘
+ walk summing capacity until ≥ amountIn ───────────────▶ cutIdx ─┐
+                                                                 │
+ KEEP:  every bracket ≤ cutIdx                    ◀── the crossed region
+      + SAFETY_TICKS (2) extra per crossed pool   ◀── drift headroom
+      ✗ drop brackets of pools the trade never reaches
+      (floor at MIN_BRACKETS=8 so tiny trades still split)
+```
+
+`capacity=0` reverse brackets sort to the *top* and are kept (above the cut), but add `0` to the
+running sum — so the cut index is byte-identical to a world without them.
+
+### 3 · Passing into runtime
+
+`EcoSwapPrepared` is flattened into **bigint-scalar tuples** and handed to the compiler as `args` (the
+`.sauce.ts` is static — data rides in as args, not string interpolation):
+
+```
+ prepare.ts ─▶ index.ts buildPoolTuple / buildRouteTuple / buildBracketTuple ─▶ compile(args)
+
+ args = [ tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit,
+          pools[]    each: [poolType,addr,fee,tickSpacing,hooks,feePpm,isV2,inIsToken0,stateView,poolId]
+          routes[]   each: [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks]
+          brackets[] each: [kind,refIdx,sqrtNear,sqrtFar,liquidity,capacity,sqrtAdjNear,sqrtAdjFar] ]
+                                                          │
+                                              compile() ──▼──  Hex[] bytecodes  ──▶  cook()
+```
+
+The data *into* `prepare` comes from the **lens** — one read-only `cook()` eth_call returning two raw
+byte blobs (the VM can't build runtime arrays, so it `concat`-accumulates fixed-stride words,
+sign-recovered off-chain via `BigInt.asIntN`):
+
+```
+ abi.encode(poolBlob: bytes, tickBlob: bytes)
+
+ poolBlob — 13 words / pool:
+ ┌────┬──────┬─────┬───────────┬───────┬──────┬─────┬────────┬──────────┬──────────┬──────┬───────────┬───────────┐
+ │type│ addr │ fee │tickSpacing│ hooks │sqrtP │ liq │tickRaw │inIsToken0│stateView │poolId│scanForward│scanReverse│
+ │ [0]│ [1]  │ [2] │   [3]     │  [4]  │ [5]  │ [6] │  [7]   │   [8]    │   [9]    │ [10] │   [11]    │   [12]    │
+ └────┴──────┴─────┴───────────┴───────┴──────┴─────┴────────┴──────────┴──────────┴──────┴───────────┴───────────┘
+                                                signed int24 ◀┘                          lazy-walk counts ◀┘
+
+ tickBlob — 3 words / row:  [ poolIdx | tickIndexRaw (int24) | liquidityNetRaw (int128) ]
+```
+
+### 4 · Executing on-chain (`ecoswap.sauce.ts`)
+
+Two passes. The solver needed **zero change** for reverse-drift — the `capacity=0` invariant carries it.
+
+**Phase A — water-fill to the common cut.**
+
+```
+ √adj price                  pour amountIn left-to-right along the sorted ladder
+   ▲
+   │ ███                                                  ladder is sorted so the BEST
+   │ ███ ██                                               marginal price is first
+   │ ███ ██ ███                                           (greedy = optimal here)
+   │ ███ ██ ███ ██ ▒▒  ← partial bracket: solve exact cut
+ ──┼─███─██─███─██─▒▒──────────────  cutSqrtAdj  ◀═══ common post-fee marginal price
+   │ ███ ██ ███ ██ ▒▒ ░░ ░░ ░░          (every pool equalizes its marginal here)
+   │ └── cum += capacity until cum ≥ amountIn ──┘
+   ▼   (cap=0 reverse brackets add 0 → invisible to this sum)
+```
+
+**Phase B — re-anchor to LIVE price, one swap per pool.** Read the live price
+(`slot0`/`StateView`/`getReserves`), convert the cut into that pool's spot target
+(`targetSpot = cut / √(1−fee)`), integrate input from live price *down* to the target:
+
+```
+   pool's live curve                 hi = min(curSqrt, near)     lo = max(targetSpot, far)
+   ▲
+   │  curSqrt ●        ← live price (may differ from prepare-time spot)
+   │          ┃▓▓▓▓▓   integrate each bracket:
+   │          ┃▓▓▓▓▓     effIn += L·2^96·(1/lo − 1/hi)
+   │          ┃▓▓▓▓▓   poolInput = Σ effIn / (1−fee)
+ ──┼──────────┸──────  targetSpot  (== cutSqrtAdj un-adjusted for this pool's fee)
+   │            ░░░░░   below the cut → not filled
+   ▼
+   ONE swap:  V3 → flat swapV3 (positive amountSpecified)
+              V2 → unified swap(SwapParams) poolType=0, L from live reserves, neg amount
+              V4 → unified swap(SwapParams) poolType=2, PoolKey + poolId, neg amount
+   routes: sum static segment capacities above the cut → swapV3 hop1 → swapV3 hop2
+```
+
+Drift handled by clamping `hi`:
+
+```
+   price drifted WITH the swap   →  curSqrt < spot  →  hi clamps to curSqrt
+                                     (pool already partway; fill only the gap to the cut)
+
+   price drifted AGAINST swap    →  curSqrt > spot  →  hi = a REVERSE bracket's near
+                                     (cap=0 brackets supply L above spot; pool still
+                                      re-anchors to the cut — no under-fill)
+```
+
+Finally: refund any unspent `tokenIn`, forward all `tokenOut` to the caller.
+
+**Why greedy = optimal, and why one swap per pool.** Because the ladder is sorted by fee-adjusted
+*marginal* price, pouring input into the best marginal first and stopping at a common level *is* the
+convex optimum (marginal-price equalisation = no beneficial reallocation remains). And since each
+pool's contribution is one contiguous integral from its live price down to the shared target, it
+collapses to a **single swap per pool** — no per-pool price limit needed, which is exactly what lets it
+serve V2/Solidly pools that don't support `sqrtPriceLimitX96`.
+
 ## Usage
 
 ```sh

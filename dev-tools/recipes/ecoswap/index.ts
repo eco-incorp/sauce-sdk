@@ -132,7 +132,12 @@ export async function ecoSwap(
     opts ?? {},
   );
 
-  const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");
+  // Solver selection: the default two-pass solver, or the single-pass (live-cut)
+  // variant via ECO_SOLVER=singlepass. Both consume the SAME prepared data; the
+  // single-pass folds Phase A+B into one sweep with unrolled per-pool registers.
+  const solverFile =
+    process.env.ECO_SOLVER === "singlepass" ? "ecoswap.singlepass.sauce.ts" : "ecoswap.sauce.ts";
+  const source = readFileSync(join(__dirname, solverFile), "utf-8");
   const jsSource = stripTypes(source);
 
   const result = compile(jsSource, {

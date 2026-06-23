@@ -40,6 +40,10 @@ function sqrtScale(feePpm: bigint): bigint {
 }
 
 export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): EcoSwapReferenceResult {
+  // ECO_SOLVER=singlepass selects the single-pass (live-cut) solver; mirror it.
+  if (process.env.ECO_SOLVER === "singlepass") {
+    return singlePassReference(prepared, amountIn);
+  }
   const { pools, routes, brackets } = prepared;
 
   // ── Phase A: find the common marginal-price cut ──────────────
@@ -182,5 +186,98 @@ export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): E
   const totalInput =
     perPoolInput.reduce((a, b) => a + b, 0n) + perRouteInput.reduce((a, b) => a + b, 0n);
 
+  return { cutSqrtAdj, perPoolInput, perRouteInput, totalInput };
+}
+
+/**
+ * SINGLE-PASS (live-cut) reference — mirrors ecoswap.singlepass.sauce.ts EXACTLY.
+ *
+ * One sweep over the pre-sorted ladder, accumulating each bracket's LIVE gross
+ * capacity into its pool/route register until cum reaches amountIn; the crossing
+ * entry's pool/route takes the remaining `need`. No explicit cut: it is implicit
+ * where cum hits amountIn, and exact-input swaps realise the geometry. Live price
+ * is read once per pool (here, in the deterministic local test, live == the pool's
+ * first capacity>0 bracket's near = spot). Reverse brackets (capacity 0, sorted
+ * above spot) contribute nothing because hi=min(spot,near)=spot < far there.
+ *
+ * vs the two-pass: spends amountIn EXACTLY when liquidity allows (the two-pass
+ * undershoots via per-pool re-derivation), and allocates by bracket granularity
+ * (sub-tick on fine V3, larger on coarse V2) — both are valid water-fills with
+ * equalised post-fee marginals; output differs only at the flat optimum (<0.1% on
+ * fine ticks).
+ */
+function singlePassReference(prepared: EcoSwapPrepared, amountIn: bigint): EcoSwapReferenceResult {
+  const { pools, routes, brackets } = prepared;
+  const perPoolInput: bigint[] = new Array(pools.length).fill(0n);
+  const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
+  const curCache: ({ curSqrt: bigint; liveL: bigint } | undefined)[] = new Array(pools.length).fill(
+    undefined,
+  );
+
+  // Live price for a pool = its first capacity>0 (spot) bracket's near; V2 live L
+  // = that bracket's liquidity. Matches the on-chain slot0/getReserves read.
+  const spotBracketFor = (p: number) => {
+    for (let bi = 0; bi < brackets.length; bi++) {
+      const b = brackets[bi];
+      if (b.kind !== EcoBracketKind.Route && b.refIdx === p && b.capacity > 0n) return b;
+    }
+    return undefined;
+  };
+
+  let cum = 0n;
+  let found = false;
+  let cutSqrtAdj = 0n; // implicit; recorded for diagnostics only
+
+  for (let bi = 0; bi < brackets.length; bi++) {
+    if (found) break;
+    const b = brackets[bi];
+
+    if (b.kind === EcoBracketKind.Route) {
+      let take = b.capacity;
+      if (cum + b.capacity >= amountIn) {
+        take = amountIn - cum;
+        found = true;
+        cutSqrtAdj = b.sqrtAdjNear;
+      }
+      perRouteInput[b.refIdx] = perRouteInput[b.refIdx] + take;
+      cum = cum + take;
+    } else {
+      const p = b.refIdx;
+      const dp = pools[p];
+      const feePpm = BigInt(dp.feePpm);
+      const isV2 = dp.isV2;
+
+      if (curCache[p] === undefined) {
+        const sb = spotBracketFor(p);
+        curCache[p] = {
+          curSqrt: sb ? sb.sqrtNear : 0n,
+          liveL: sb && isV2 ? sb.liquidity : 0n,
+        };
+      }
+      const cur = curCache[p]!.curSqrt;
+      const Lliv = curCache[p]!.liveL;
+
+      const Lb = isV2 ? Lliv : b.liquidity;
+      const hi = cur < b.sqrtNear ? cur : b.sqrtNear;
+      const far = b.sqrtFar;
+      if (hi > far && Lb > 0n && far > 0n) {
+        const effIn = mulDiv(Lb, Q96, far) - mulDiv(Lb, Q96, hi);
+        if (effIn > 0n) {
+          const capGross = mulDiv(effIn, FEE_DENOM, FEE_DENOM - feePpm);
+          let take = capGross;
+          if (cum + capGross >= amountIn) {
+            take = amountIn - cum;
+            found = true;
+            cutSqrtAdj = b.sqrtAdjFar;
+          }
+          perPoolInput[p] = perPoolInput[p] + take;
+          cum = cum + take;
+        }
+      }
+    }
+  }
+
+  const totalInput =
+    perPoolInput.reduce((a, b) => a + b, 0n) + perRouteInput.reduce((a, b) => a + b, 0n);
   return { cutSqrtAdj, perPoolInput, perRouteInput, totalInput };
 }
