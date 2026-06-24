@@ -12,6 +12,7 @@ import type {
   MemberExpression,
 } from 'acorn';
 import type { SaucerLike } from '../saucer/index.js';
+import { isImmutablePackedArray } from '../saucer/index.js';
 import type { CompilerContext } from '../context.js';
 import { processExpression, processStatement } from './index.js';
 import { applyBinaryOp } from './expression.js';
@@ -117,6 +118,12 @@ export function storeExpression(name: string, expr: Expression, ctx: CompilerCon
         inferElementTypeWithContext(expr, ctx),
         inferStructTypeWithContext(expr, ctx),
       );
+      // Track whether the variable now holds an immutable packed array literal, so
+      // a later `name[i] = x` can be rejected before it reverts on the engine.
+      const variable = ctx.getVar(name);
+
+      if (variable) variable.immutablePacked = isImmutablePackedArray(value._bytes);
+
       ctx.consumePendingContractBinding(name);
 
       return result;
@@ -217,26 +224,73 @@ function processMemberAssignment(
   }
 
   const name = (member.object as { name: string }).name;
+  const target = ctx.getVar(name);
 
-  if (!ctx.getVar(name)) throw new Error(`undefined variable: ${name}`);
+  if (!target) throw new Error(`undefined variable: ${name}`);
 
-  // Compute the array-read and index fragments ONCE; reuse them (immutable
-  // builder nodes) for both the compound INDEX read and the SET_INDEX write,
-  // so the index/array expression is never transpiled twice.
+  // A static packed array literal is immutable — the engine reverts SET_INDEX on
+  // it. Reject element assignment at compile time and point at the mutable path.
+  if (target.immutablePacked) {
+    throw new Error(
+      `cannot assign to an element of '${name}': array literals are immutable (packed); ` +
+        `create a mutable array with new Array(n) instead`,
+    );
+  }
+
+  // Simple assignment: the index feeds only the SET_INDEX write, so there is no
+  // reuse hazard — compute it once and store.
+  if (expr.operator === '=') {
+    const index = resolveMemberIndex(member, ctx);
+
+    return saucer.store(
+      name,
+      ctx.newSaucer().setIndex(ctx.newSaucer().read(name), index, processExpression(expr.right, ctx)),
+    );
+  }
+
+  // Compound assignment (`+=`, `-=`, …): the index feeds BOTH the INDEX read and
+  // the SET_INDEX write. A builder node emits its bytecode wherever it is reused,
+  // so a side-effecting computed index (`arr[f()] += 1`) would execute twice.
+  // Hoist a non-pure computed index into a scratch local so it runs exactly once.
+  const op = expr.operator.slice(0, -1);
+
+  if (member.computed && !isPureIndex(member.property as Expression)) {
+    const tmp = ctx.freshTemp();
+    const withIndex = saucer.store(tmp, processExpression(member.property as Expression, ctx));
+    const current = ctx.newSaucer().index(ctx.newSaucer().read(name), ctx.newSaucer().read(tmp));
+    const value = applyBinaryOp(ctx.newSaucer(), op, current, processExpression(expr.right, ctx));
+
+    return withIndex.store(
+      name,
+      ctx.newSaucer().setIndex(ctx.newSaucer().read(name), ctx.newSaucer().read(tmp), value),
+    );
+  }
+
+  // Pure computed index (identifier / literal / arithmetic) or struct field: the
+  // index is side-effect-free and idempotent, so reusing the node is safe and
+  // keeps the common-case bytecode minimal.
   const readArr = ctx.newSaucer().read(name);
   const index = resolveMemberIndex(member, ctx);
-
-  const value =
-    expr.operator === '='
-      ? processExpression(expr.right, ctx)
-      : applyBinaryOp(
-          ctx.newSaucer(),
-          expr.operator.slice(0, -1),
-          ctx.newSaucer().index(readArr, index),
-          processExpression(expr.right, ctx),
-        );
+  const current = ctx.newSaucer().index(readArr, index);
+  const value = applyBinaryOp(ctx.newSaucer(), op, current, processExpression(expr.right, ctx));
 
   return saucer.store(name, ctx.newSaucer().setIndex(readArr, index, value));
+}
+
+// Whether an index expression is safe to emit more than once: no observable side
+// effects and idempotent. Conservative — only literals, variable reads and pure
+// arithmetic of those qualify; calls, `new`, member reads and anything unknown
+// fall through to false and get hoisted into a temp.
+function isPureIndex(node: Expression): boolean {
+  switch (node.type) {
+    case 'Literal':
+    case 'Identifier':
+      return true;
+    case 'BinaryExpression':
+      return isPureIndex(node.left as Expression) && isPureIndex(node.right as Expression);
+    default:
+      return false;
+  }
 }
 
 // The index for a member assignment: computed `arr[i]` → the property expression;

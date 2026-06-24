@@ -15,10 +15,11 @@
  * published `sauce` dep ships a trimmed engine-v12, so by default this skips;
  * point SAUCE_ENGINE_V12 at a full checkout (e.g. ../sauce/engine-v12) to run.
  *
- * Array-mutation programs (arr[i] = x / SET_INDEX / new Array(n)) now compile
- * locally (byte-exact coverage in saucer-v12.test.ts / transpiler-v12.test.ts).
- * An execution vector for them can be added here once the engine harness
- * (V12ExecParity.t.sol) declares the matching expected result.
+ * Array-mutation programs (arr[i] = x / SET_INDEX / new Array(n)) execute here too:
+ * the harness is generic (decodes each vector's scalar result), so a builder vector
+ * (newArray + setIndex + index) and transpiler vectors (new Array, literal set, get,
+ * compound +=) run on the real runtime and prove the descriptor round-trips through
+ * a heap-slot store/read — not just that the bytes are well-formed.
  */
 import { execSync } from 'child_process';
 import { existsSync, writeFileSync } from 'fs';
@@ -187,6 +188,20 @@ const builderVectors: {
     expected: 30,
     kind: 'uint',
   },
+  {
+    // a = new Array(3); a[1] = 77; return a[1] — exercises NEW_ARRAY + SET_INDEX
+    // (in-place mutate, descriptor written back to the heap slot) + INDEX read.
+    name: 'newarray_setindex',
+    make: (c) =>
+      S(c)
+        .store('a', S(c).newArray(U(c, 3)))
+        .store('a', S(c).setIndex(S(c).read('a'), U(c, 1), U(c, 77)))
+        .store('r', S(c).index(S(c).read('a'), U(c, 1)))
+        .read('r')
+        .build(),
+    expected: 77,
+    kind: 'uint',
+  },
 ];
 
 // Programs produced by the transpiler — the path with no Solidity twin.
@@ -242,6 +257,37 @@ const transpilerVectors: { name: string; src: string; expected: number; kind: 'u
     expected: 10,
     kind: 'uint',
   },
+  // ── array mutation (NEW_ARRAY / SET_INDEX) — targets must be mutable (TUPLE) ──
+  {
+    name: 'new_array_zero_init',
+    src: 'function main(){ let a = new Array(3); return a[1] }',
+    expected: 0, // NEW_ARRAY zero-initializes every slot
+    kind: 'uint',
+  },
+  {
+    name: 'array_set_get',
+    src: 'function main(){ let a = new Array(3); a[1] = 99; return a[1] }',
+    expected: 99, // simple SET_INDEX into a freshly-allocated array, read back
+    kind: 'uint',
+  },
+  {
+    name: 'new_array_set_get',
+    src: 'function main(){ let a = new Array(3); a[2] = 42; return a[2] }',
+    expected: 42, // SET_INDEX at a different slot
+    kind: 'uint',
+  },
+  {
+    name: 'array_compound_assign',
+    src: 'function main(){ let a = new Array(3); a[0] = 4; a[0] += 10; return a[0] }',
+    expected: 14, // compound: INDEX read + ADD + SET_INDEX write
+    kind: 'uint',
+  },
+  {
+    name: 'object_field_set',
+    src: 'function main(){ let p = { x: 5, y: 9 }; p.x = 42; return p.x }',
+    expected: 42, // object literal is a TUPLE (mutable) → SET_INDEX by field index
+    kind: 'uint',
+  },
 ];
 
 function buildVectors(): Vector[] {
@@ -286,7 +332,9 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(names.has('nested_call')).toBe(true); // multi-helper offset accumulation
     expect(names.has('revert_explicit')).toBe(true); // revert path
     expect(names.has('for_sum')).toBe(true); // loop back-jump arithmetic
-    expect(vectors.length).toBeGreaterThanOrEqual(21);
+    expect(names.has('newarray_setindex')).toBe(true); // builder array mutation
+    expect(names.has('array_compound_assign')).toBe(true); // transpiler array mutation
+    expect(vectors.length).toBeGreaterThanOrEqual(25);
   });
 
   it('all vectors execute on the Huff runtime with expected results', () => {
@@ -295,6 +343,9 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(forgeOutput).toMatch(/Suite result: ok\./);
     expect(forgeOutput).toMatch(/ok add /);
     expect(forgeOutput).toMatch(/ok\(revert\) revert_explicit/);
+    expect(forgeOutput).toMatch(/ok newarray_setindex 77/); // builder array mutation
+    expect(forgeOutput).toMatch(/ok array_compound_assign 14/); // transpiler compound +=
+    expect(forgeOutput).toMatch(/ok object_field_set 42/); // object-literal (TUPLE) field set
     expect(forgeOutput).not.toMatch(/\[FAIL/);
   });
 });

@@ -30,6 +30,13 @@ export interface Variable {
   structType?: StructType; // For structs: the field names
   /** v12: a function parameter (lives on the EVM stack, not a memory slot). */
   isParam?: boolean;
+  /**
+   * Holds a static packed array literal (`[1, 2, 3]`) — element-width-packed and
+   * IMMUTABLE in the engine, which reverts SET_INDEX on it. Element assignment
+   * (`arr[i] = x`) requires a mutable collection (`new Array(n)` / object literal,
+   * both TUPLE), so the lowering rejects assignment to a flagged variable.
+   */
+  immutablePacked?: boolean;
 }
 
 export interface Scope {
@@ -59,6 +66,7 @@ export class CompilerContext {
   private loopDepth = 0;
   private nextValueSlot = 0;
   private nextHeapSlot = 0;
+  private nextTempId = 0;
 
   /** Module-level state, shared across a v12 module's per-function contexts. */
   private readonly module: SharedModule;
@@ -219,6 +227,19 @@ export class CompilerContext {
     scope.variables.set(name, variable);
 
     return variable;
+  }
+
+  /**
+   * Allocate a uniquely-named scratch local (a memory slot, never a stack param).
+   * The `#` prefix can never collide with a parsed SauceScript identifier, so the
+   * lowering can stash an intermediate value (e.g. a compound-assignment index that
+   * must be evaluated exactly once) without shadowing a user variable.
+   */
+  freshTemp(kind: VariableKind = 'scalar'): string {
+    const name = `#tmp${this.nextTempId++}`;
+    this.setVar(name, kind);
+
+    return name;
   }
 
   getVar(name: string): Variable | undefined {

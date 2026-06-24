@@ -76,3 +76,19 @@ export const encodeSetIndex = (value: Saucer, index: Saucer, array: Saucer): Uin
 
 // `new Array(n)` → zero-initialized TUPLE of n slots. v1 prefix: [NEW_ARRAY][count].
 export const encodeNewArray = (count: Saucer): Uint8Array => new Uint8Array([OPS.NEW_ARRAY, ...count._bytes]);
+
+// Whether a value's encoded bytes are a STATIC PACKED array literal — element-
+// width-packed (element-type byte 0x01..0x20) and therefore immutable: the engine
+// reverts SET_INDEX on it (only TUPLE and dynamic arrays, element-type byte > 0x20,
+// are in-place mutable). Mirrors the engine's `do_set_idx_array` subtype check so
+// the compiler rejects exactly the targets the runtime would reject — no false
+// positives. TUPLE / NEW_ARRAY / dynamic-element arrays / scalars all return false.
+export const isImmutablePackedArray = (bytes: Uint8Array): boolean => {
+  const op = bytes[0];
+
+  if (op !== OPS.ARRAY && op !== OPS.ARRAY_2) return false;
+
+  const elementType = bytes[op === OPS.ARRAY ? 2 : 3];
+
+  return elementType >= 0x01 && elementType <= 0x20;
+};

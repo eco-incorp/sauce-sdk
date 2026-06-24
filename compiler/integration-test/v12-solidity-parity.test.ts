@@ -14,12 +14,10 @@
  * The published `sauce` dep ships a trimmed engine-v12, so by default this skips;
  * point SAUCE_ENGINE_V12 at a full checkout (e.g. ../sauce/engine-v12) to run.
  *
- * SET_INDEX (arr[i] = x / obj.field = x) and NEW_ARRAY (new Array(n)) now HAVE a
- * local compiler surface (byte-exact coverage lives in saucer-v12.test.ts /
- * transpiler-v12.test.ts). They are still not asserted here because the matching
- * `VEC setIndex` / `VEC newArray` lines must first be emitted by the engine repo's
- * `V12SaucerVectors.s.sol`; add them there and they can be wired in alongside.
- * Other Solidity builder conveniences (ARRAY_FROM_UINTS) remain out of scope.
+ * SET_INDEX (arr[i] = x / obj.field = x) and NEW_ARRAY (new Array(n)) ARE asserted
+ * here (the `setIndex` / `newArray` scenarios) against the matching `VEC` lines the
+ * engine repo's `V12SaucerVectors.s.sol` emits. Other Solidity builder conveniences
+ * (ARRAY_FROM_UINTS) remain out of scope — no local compiler surface.
  */
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';
@@ -196,6 +194,11 @@ const scenarios: Record<string, (c: CompilerContext) => Uint8Array> = {
 
   index: (c) => S(c).index(S(c).array([U(c, 0x10), U(c, 0x20), U(c, 0x30)]), U(c, 1))._bytes,
   tuple: (c) => S(c).tuple([B(c, '1234'), B(c, '5678')])._bytes,
+
+  // In-place mutation: must match V12SaucerVectors.s.sol — SET_INDEX(TUPLE(42,100), 1, 999)
+  // and NEW_ARRAY(5). setIndex(array, index, value); v12 emits [value][index][array][SET_INDEX].
+  setIndex: (c) => S(c).setIndex(S(c).tuple([U(c, 42), U(c, 100)]), U(c, 1), U(c, 999))._bytes,
+  newArray: (c) => S(c).newArray(U(c, 5))._bytes,
 
   abiEncode: (c) => S(c).abiEncode(S(c).tuple([B(c, '1234'), B(c, '5678')]))._bytes,
   abiDecode: (c) => S(c).abiDecode(2, B(c, '1234'), [0x20, 0x20])._bytes,

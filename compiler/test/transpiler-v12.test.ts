@@ -15,7 +15,7 @@
  * captured hex (the cross-function assembly is validated end-to-end by the engine
  * execution + Solidity-parity integration suites).
  */
-import { compile, V12Saucer, OPS_V12 } from '../src/index.js';
+import { compile, V12Saucer, OPS, OPS_V12 } from '../src/index.js';
 import { CompilerContext } from '../src/context.js';
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
@@ -308,9 +308,12 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
   });
 
   describe('Array mutation (SET_INDEX / NEW_ARRAY)', () => {
-    // Captured v12 (postfix) bytecode — the full program assembly (slot
-    // allocation, store, return MSTORE) is validated end-to-end by the engine
-    // integration suites; here we pin the lowering to SET_INDEX/NEW_ARRAY chains.
+    // Captured v12 (postfix) bytecode — the full program assembly (slot allocation,
+    // store, return MSTORE) is validated end-to-end by the engine integration
+    // suites; here we pin the lowering to SET_INDEX/NEW_ARRAY chains. Element
+    // assignment targets a MUTABLE collection (new Array → TUPLE, or an object
+    // literal → TUPLE); static packed array literals are immutable (see the guard
+    // test below) so they are not valid targets.
     const arrayCases: { name: string; src: string; hex: string }[] = [
       {
         name: 'new Array(n) → [count][NEW_ARRAY]',
@@ -318,19 +321,19 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
         hex: '01039cc3009800',
       },
       {
-        name: 'arr[i] = x → SET_INDEX, postfix [value][index][array]',
-        src: 'function main(){ let a = [1, 2, 3]; a[0] = 9; return a }',
-        hex: '920301010203c3000109010098009bc3009800',
+        name: 'arr[i] = x on new Array → SET_INDEX, postfix [value][index][array]',
+        src: 'function main(){ let a = new Array(3); a[1] = 9; return a }',
+        hex: '01039cc3000109010198009bc3009800',
       },
       {
-        name: 'obj.field = x → SET_INDEX with field-index UINT',
+        name: 'obj.field = x → SET_INDEX with field-index UINT (object literal is a TUPLE)',
         src: 'function main(){ let p = { x: 1, y: 2 }; p.x = 9; return p }',
         hex: '010201019402c3000109010098009bc3009800',
       },
       {
-        name: 'compound arr[i] += y → INDEX read + SET_INDEX write',
-        src: 'function main(){ let a = [1, 2, 3]; let i = 1; a[i] += 5; return a }',
-        hex: '920301010203c3000101c1005000980097010521500098009bc3009800',
+        name: 'compound arr[i] += y on new Array → INDEX read + SET_INDEX write',
+        src: 'function main(){ let a = new Array(3); let i = 1; a[i] += 5; return a }',
+        hex: '01039cc3000101c1005000980097010521500098009bc3009800',
       },
     ];
 
@@ -339,6 +342,25 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
         expect(compileV12(c.src)).toBe(c.hex);
       });
     }
+
+    it('compound with a side-effecting index evaluates it exactly once', () => {
+      // `a[f()] += 5`: the index feeds both the INDEX read and the SET_INDEX write.
+      // A non-pure index is hoisted into a scratch local, so f() (CALL_FUNCTION) is
+      // emitted ONCE — not duplicated into both subtrees. f()'s own body has no call.
+      const bc = compile('function f(){ return 1 } function main(){ let a = new Array(3); a[f()] += 5; return a[0] }', {
+        target: 'v12',
+      }).bytecode[0];
+      const calls = bc.filter((b) => b === OPS.CALL_FUNCTION).length;
+      expect(calls).toBe(1);
+    });
+
+    it('rejects element assignment to an immutable packed array literal', () => {
+      // `[1, 2, 3]` packs to a static array the engine reverts SET_INDEX on; reject
+      // it at compile time and point at the mutable `new Array(n)` path.
+      expect(() => compileV12('function main(){ let a = [1, 2, 3]; a[0] = 9; return a }')).toThrow(
+        /array literals are immutable/,
+      );
+    });
   });
 
   describe('Documented v12 boundaries', () => {

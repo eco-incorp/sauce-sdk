@@ -4,5 +4,5 @@ export type { SaucerLike, SaucerIfLike, SaucerThenLike, SaucerLoopLike, OutputSp
 export { OPS } from './ops.js';
 export { OPS_V12 } from './ops-v12.js';
 export { encodeBytes, encodeString } from './bytes.js';
-export { encodeArray, encodeIndex } from './array.js';
+export { encodeArray, encodeIndex, isImmutablePackedArray } from './array.js';
 export { encodeTuple } from './tuple.js';

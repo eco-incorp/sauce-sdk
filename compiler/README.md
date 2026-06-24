@@ -256,6 +256,26 @@ const combined = arr.concat([40, 50]); // concatenate
 const part = arr.slice(1, 3); // slice [start, end)
 ```
 
+#### Element assignment & mutable arrays
+
+`arr[i] = x` and `obj.field = x` mutate a collection in place, and `new Array(n)`
+allocates a zero-initialized, mutable array of `n` slots:
+
+```javascript
+const a = new Array(3); // [0, 0, 0] — mutable
+a[0] = 9; // element assignment
+a[1] += 5; // compound assignment
+
+const p = { x: 1, y: 2 };
+p.x = 9; // object-literal field assignment (objects are mutable)
+```
+
+Mutation requires a **mutable collection** — one created with `new Array(n)` or an
+object literal `{ ... }`. **Array literals (`[1, 2, 3]`) are immutable**: they are
+packed by element width, and the engine reverts on element assignment. Assigning to
+an element of an array literal is rejected at compile time — use `new Array(n)` and
+fill it instead.
+
 ### Strings
 
 ```javascript
