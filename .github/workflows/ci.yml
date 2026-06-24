@@ -85,5 +85,11 @@ jobs:
       - name: Actions — unit tests
         run: pnpm --filter './actions' test:unit
 
+      - name: Dev Tools — sync engine artifacts
+        # The recipe compile tests import contract ABIs from dev-tools/artifacts/
+        # (gitignored build output). sync-artifacts copies them from the sauce engine's
+        # forge-build output, produced by the compiler postinstall during `pnpm install`.
+        run: pnpm --filter './dev-tools' sync-artifacts
+
       - name: Dev Tools — test
         run: pnpm --filter './dev-tools' test
