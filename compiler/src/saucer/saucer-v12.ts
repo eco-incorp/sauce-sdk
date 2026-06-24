@@ -345,6 +345,38 @@ export class V12Saucer implements SaucerLike {
     return this.unary(OPS.LENGTH, arr, false);
   }
 
+  setIndex(arrL: SaucerLike, idxL: SaucerLike, valueL: SaucerLike): V12Saucer {
+    // v12: [value][index][array][SET_INDEX] — value deepest, array on top.
+    // Returns the (same) array descriptor; isDynamic=false matches the engine $$
+    // reference (the idempotent smart-MSTORE passes the descriptor through unchanged).
+    const value = valueL as V12Saucer;
+    const idx = idxL as V12Saucer;
+    const arr = arrL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    const valueOff = this._bytes.length;
+    V12Saucer.merge(calls, refs, value, valueOff, this.stackEffect);
+    const idxOff = valueOff + value._bytes.length;
+    V12Saucer.merge(calls, refs, idx, idxOff, this.stackEffect + value.stackEffect);
+    const arrOff = idxOff + idx._bytes.length;
+    V12Saucer.merge(calls, refs, arr, arrOff, this.stackEffect + value.stackEffect + idx.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, value._bytes, idx._bytes, arr._bytes, [OPS.SET_INDEX]),
+      this.stackEffect + value.stackEffect + idx.stackEffect + arr.stackEffect - 2,
+      false,
+      calls,
+      refs,
+    );
+  }
+
+  newArray(count: SaucerLike): V12Saucer {
+    // v12: [count][NEW_ARRAY] — consumes count, pushes a fresh TUPLE descriptor.
+    // isDynamic=true (matches TUPLE).
+    return this.unary(OPS.NEW_ARRAY, count, true);
+  }
+
   /** Wrap a scalar operand as a heap descriptor for ops that consume dynamic data. */
   private static wrapDescriptor(op: V12Saucer): { bytes: Uint8Array; extra: number } {
     return op.isDynamic ? { bytes: op._bytes, extra: 0 } : { bytes: concat(op._bytes, [OPS_V12.MSTORE]), extra: 1 };

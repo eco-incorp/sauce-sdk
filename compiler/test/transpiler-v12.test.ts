@@ -307,6 +307,40 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
     }
   });
 
+  describe('Array mutation (SET_INDEX / NEW_ARRAY)', () => {
+    // Captured v12 (postfix) bytecode — the full program assembly (slot
+    // allocation, store, return MSTORE) is validated end-to-end by the engine
+    // integration suites; here we pin the lowering to SET_INDEX/NEW_ARRAY chains.
+    const arrayCases: { name: string; src: string; hex: string }[] = [
+      {
+        name: 'new Array(n) → [count][NEW_ARRAY]',
+        src: 'function main(){ let a = new Array(3); return a }',
+        hex: '01039cc3009800',
+      },
+      {
+        name: 'arr[i] = x → SET_INDEX, postfix [value][index][array]',
+        src: 'function main(){ let a = [1, 2, 3]; a[0] = 9; return a }',
+        hex: '920301010203c3000109010098009bc3009800',
+      },
+      {
+        name: 'obj.field = x → SET_INDEX with field-index UINT',
+        src: 'function main(){ let p = { x: 1, y: 2 }; p.x = 9; return p }',
+        hex: '010201019402c3000109010098009bc3009800',
+      },
+      {
+        name: 'compound arr[i] += y → INDEX read + SET_INDEX write',
+        src: 'function main(){ let a = [1, 2, 3]; let i = 1; a[i] += 5; return a }',
+        hex: '920301010203c3000101c1005000980097010521500098009bc3009800',
+      },
+    ];
+
+    for (const c of arrayCases) {
+      it(c.name, () => {
+        expect(compileV12(c.src)).toBe(c.hex);
+      });
+    }
+  });
+
   describe('Documented v12 boundaries', () => {
     it('break is not supported in v12', () => {
       expect(() => compileV12('function main(){ while (1) { break } }')).toThrow(/break.*v12/);

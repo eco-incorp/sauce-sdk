@@ -171,6 +171,58 @@ describe('V12Saucer — tuple/array reverse + index', () => {
     // idx (0) is emitted before the array bytes
     expect(Array.from(r._bytes.slice(0, 2))).toEqual([OPS.BYTE_1, 0]);
   });
+
+  it('index result is a scalar (isDynamic=false)', () => {
+    const s = S();
+    expect(s.index(s.tuple([s.int(7n)]), s.int(0n)).isDynamic).toBe(false);
+  });
+});
+
+describe('V12Saucer — SET_INDEX / NEW_ARRAY (postfix)', () => {
+  it('setIndex emits [value][index][array][SET_INDEX] (value deepest, array on top)', () => {
+    const s = S();
+    // signature setIndex(array, index, value): array=7, index=1, value=9.
+    const r = s.setIndex(s.int(7n), s.int(1n), s.int(9n));
+    expect(Array.from(r._bytes)).toEqual([
+      OPS.BYTE_1,
+      9, // value (deepest)
+      OPS.BYTE_1,
+      1, // index
+      OPS.BYTE_1,
+      7, // array (on top)
+      OPS.SET_INDEX,
+    ]);
+  });
+
+  it('setIndex returns a non-dynamic descriptor and net stackEffect +1', () => {
+    const s = S();
+    const r = s.setIndex(s.int(7n), s.int(1n), s.int(9n));
+    expect(r.isDynamic).toBe(false);
+    // 3 operands pushed (+3), SET_INDEX leaves 1 → net +1.
+    expect(r.stackEffect).toBe(1);
+  });
+
+  it('newArray emits [count][NEW_ARRAY] and is dynamic', () => {
+    const s = S();
+    const r = s.newArray(s.int(3n));
+    expect(Array.from(r._bytes)).toEqual([OPS.BYTE_1, 3, OPS.NEW_ARRAY]);
+    expect(r.isDynamic).toBe(true);
+    // operand pushes count (+1); NEW_ARRAY consumes it and pushes the descriptor
+    // (net 0 on top of the operand) → overall +1, like a unary op.
+    expect(r.stackEffect).toBe(1);
+  });
+
+  it('setIndex propagates REF sentinels at advancing positions/depths', () => {
+    const c = paramCtx('arr', 'i', 'v');
+    const s = new V12Saucer(c);
+    // value=v (deepest), index=i, array=arr (top)
+    const r = s.setIndex(s.read('arr'), s.read('i'), s.read('v'));
+    expect(r.refPositions).toHaveLength(3);
+    // emitted order: value(v) @0 depth0, index(i) @1 depth1, array(arr) @2 depth2
+    expect(r.refPositions[0]).toMatchObject({ position: 0, depth: 0 });
+    expect(r.refPositions[1]).toMatchObject({ position: 1, depth: 1 });
+    expect(r.refPositions[2]).toMatchObject({ position: 2, depth: 2 });
+  });
 });
 
 describe('V12Saucer — local slot variables (postfix)', () => {

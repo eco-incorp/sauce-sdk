@@ -675,6 +675,12 @@ export const processNewExpression = (expr: NewExpression, ctx: CompilerContext, 
 
   const name = (expr.callee as { name: string }).name;
 
+  if (name === 'Array') {
+    if (expr.arguments.length !== 1) throw new Error('new Array expects exactly 1 argument (length)');
+
+    return saucer.newArray(processExpression(expr.arguments[0] as Expression, ctx));
+  }
+
   if (name !== 'Uint8Array') throw new Error(`not implemented: new ${name}`);
 
   return processUint8Array(expr, saucer);

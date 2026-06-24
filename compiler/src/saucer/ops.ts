@@ -69,6 +69,8 @@ export const OPS = {
   SLICE: 0x95,
   CONCAT: 0x96,
   INDEX: 0x97,
+  SET_INDEX: 0x9b,
+  NEW_ARRAY: 0x9c,
 
   BYTE_1: 0x01,
   BYTE_2: 0x02,

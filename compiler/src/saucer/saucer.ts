@@ -2,7 +2,7 @@ import { OPS } from './ops.js';
 import { encodeInt } from './integer.js';
 import { encodeReadByKind, encodeStoreByKind } from './memory.js';
 import { encodeBytes, encodeString } from './bytes.js';
-import { encodeArray, encodeIndex } from './array.js';
+import { encodeArray, encodeIndex, encodeSetIndex, encodeNewArray } from './array.js';
 import { encodeTuple } from './tuple.js';
 import type { CompilerContext, VariableKind, ElementType, StructType } from '../context.js';
 import type { SaucerLike, SaucerIfLike, SaucerThenLike, SaucerLoopLike, OutputSpec } from './saucer-like.js';
@@ -233,6 +233,14 @@ export class Saucer implements SaucerLike {
 
   index(arr: Saucer, idx: Saucer): Saucer {
     return this.with(encodeIndex(idx, arr));
+  }
+
+  setIndex(arr: Saucer, idx: Saucer, value: Saucer): Saucer {
+    return this.with(encodeSetIndex(value, idx, arr));
+  }
+
+  newArray(count: Saucer): Saucer {
+    return this.with(encodeNewArray(count));
   }
 
   length(arr: Saucer): Saucer {
