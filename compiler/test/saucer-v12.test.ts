@@ -35,7 +35,26 @@ describe('V12Saucer — postfix emission', () => {
 });
 
 describe('V12Saucer — operand swapping (non-commutative)', () => {
-  const swapped: [keyof V12Saucer, number][] = [
+  // Methods that take two operands and return a builder — typed so the table-driven
+  // call below needs no `as any` (every entry has the same (l, r) => V12Saucer shape).
+  type BinaryMethod =
+    | 'add'
+    | 'sub'
+    | 'mul'
+    | 'div'
+    | 'mod'
+    | 'exp'
+    | 'eq'
+    | 'neq'
+    | 'gt'
+    | 'lt'
+    | 'gte'
+    | 'lte'
+    | 'and'
+    | 'or'
+    | 'bitAnd';
+
+  const swapped: [BinaryMethod, number][] = [
     ['sub', OPS.SUB],
     ['div', OPS.DIV],
     ['mod', OPS.MOD],
@@ -49,14 +68,13 @@ describe('V12Saucer — operand swapping (non-commutative)', () => {
   for (const [method, op] of swapped) {
     it(`${method} swaps operands → [b][a][OP]`, () => {
       const s = S();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const r = (s as any)[method](s.int(5n), s.int(3n));
+      const r = s[method](s.int(5n), s.int(3n));
       // 5 = 0105, 3 = 0103; swapped → [3][5][OP]
       expect(hex(r._bytes)).toBe('01030105' + op.toString(16).padStart(2, '0'));
     });
   }
 
-  const commutative: [keyof V12Saucer, number][] = [
+  const commutative: [BinaryMethod, number][] = [
     ['add', OPS.ADD],
     ['mul', OPS.MUL],
     ['eq', OPS.BOOL_EQ],
@@ -69,8 +87,7 @@ describe('V12Saucer — operand swapping (non-commutative)', () => {
   for (const [method, op] of commutative) {
     it(`${method} keeps operand order → [a][b][OP]`, () => {
       const s = S();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const r = (s as any)[method](s.int(5n), s.int(3n));
+      const r = s[method](s.int(5n), s.int(3n));
       expect(hex(r._bytes)).toBe('01050103' + op.toString(16).padStart(2, '0'));
     });
   }
@@ -324,5 +341,82 @@ describe('V12Saucer — signed/extended ops (v12-only)', () => {
     expect(s.cast(s.bytes(new Uint8Array([1])))._bytes.at(-1)).toBe(OPS.CAST);
     expect(s.addMod(s.int(1n), s.int(2n), s.int(3n))._bytes.at(-1)).toBe(OPS.ADD_MOD);
     expect(s.mulMod(s.int(1n), s.int(2n), s.int(3n))._bytes.at(-1)).toBe(OPS.MUL_MOD);
+  });
+});
+
+describe('V12Saucer — control-flow widening (large bodies)', () => {
+  // Force a body past the 1-byte (255) / 2-byte (65535) skip boundaries — the one
+  // place v12 control-flow encoding is non-trivial — by stubbing `_bytes` directly
+  // (mirrors the v1 saucer.test.ts approach).
+  const big = (n: number): V12Saucer => {
+    const s = S();
+    (s as { _bytes: Uint8Array })._bytes = new Uint8Array(n);
+
+    return s;
+  };
+
+  it('uses IF_2 (2-byte skip) for a then-body larger than 255 bytes', () => {
+    const r = S().if(S().int(1n)).then(big(300)) as V12Saucer;
+    // [BYTE_1,1] then IF_2 with a 2-byte skip == then-body length (300).
+    expect(r._bytes[2]).toBe(OPS.IF_2);
+    expect((r._bytes[3] << 8) | r._bytes[4]).toBe(300);
+  });
+
+  it('uses JUMP_2 for an else-body larger than 255 bytes', () => {
+    const r = S().if(S().int(1n)).then(big(10)).else(big(300)) as V12Saucer;
+    expect(Array.from(r._bytes)).toContain(OPS.JUMP_2);
+  });
+
+  it('uses JUMP_BACK_2 (and IF_2) for a loop body larger than 253 bytes', () => {
+    const r = S().while(S().int(1n)).loop(big(300)) as V12Saucer;
+    expect(Array.from(r._bytes)).toContain(OPS.JUMP_BACK_2);
+    expect(Array.from(r._bytes)).toContain(OPS.IF_2);
+  });
+
+  it('throws when a then-body exceeds 65535 bytes', () => {
+    expect(() => S().if(S().int(1n)).then(big(65536))).toThrow(/body too large: 65536/);
+  });
+
+  it('throws when an else-body exceeds 65535 bytes', () => {
+    expect(() => S().if(S().int(1n)).then(big(10)).else(big(65536))).toThrow(/body too large: 65536/);
+  });
+
+  it('throws when a loop body exceeds 65535 bytes', () => {
+    expect(() => S().while(S().int(1n)).loop(big(65536))).toThrow(/loop body too large: 65536/);
+  });
+});
+
+describe('V12Saucer — catch / eval / external-call decode', () => {
+  it('catch wraps a handler: [body][CATCH][len][handler]', () => {
+    const body = S().int(7n); // [BYTE_1,7]
+    const r = body.catch(S().int(9n)); // handler [BYTE_1,9], length 2
+    expect(Array.from(r._bytes)).toEqual([OPS.BYTE_1, 7, OPS.CATCH, 2, OPS.BYTE_1, 9]);
+  });
+
+  it('catch throws when the handler exceeds 255 bytes', () => {
+    const handler = S();
+    (handler as { _bytes: Uint8Array })._bytes = new Uint8Array(256);
+    expect(() => S().int(1n).catch(handler)).toThrow(/handler too large/);
+  });
+
+  it('eval emits the EVAL opcode and is dynamic', () => {
+    const r = S().eval(S().bytes(new Uint8Array([1])));
+    expect(r._bytes.at(-1)).toBe(OPS.EVAL);
+    expect(r.isDynamic).toBe(true);
+  });
+
+  it('single-output external call decodes via ABI_DECODE then INDEX 0', () => {
+    const r = S().staticCall(S().int(0xabcdn), S().bytes(new Uint8Array([1])), { count: 1, typeSpecs: [0] });
+    const bytes = Array.from(r._bytes);
+    expect(bytes).toContain(OPS.ABI_DECODE);
+    expect(bytes.at(-1)).toBe(OPS.INDEX); // single output → element 0 of the decoded tuple
+  });
+
+  it('multi-output external call decodes to the whole tuple (no trailing INDEX)', () => {
+    const r = S().staticCall(S().int(0xabcdn), S().bytes(new Uint8Array([1])), { count: 2, typeSpecs: [0, 0] });
+    const bytes = Array.from(r._bytes);
+    expect(bytes).toContain(OPS.ABI_DECODE);
+    expect(bytes.at(-1)).not.toBe(OPS.INDEX);
+    expect(r.isDynamic).toBe(true);
   });
 });

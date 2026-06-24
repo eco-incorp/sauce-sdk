@@ -142,6 +142,13 @@ export interface SaucerLike {
   log(data: SaucerLike, topics: SaucerLike[]): SaucerLike;
   eval(bytecode: SaucerLike): SaucerLike;
 
+  /**
+   * Discard this expression's result when it is used as a bare statement. No-op on
+   * the v1 tree interpreter (it discards intermediates implicitly); on v12 it pops
+   * any value the expression leaves on the stack so it does not leak.
+   */
+  dropIfUnused(): SaucerLike;
+
   build(): Uint8Array;
 }
 

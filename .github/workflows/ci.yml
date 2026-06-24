@@ -32,7 +32,6 @@ jobs:
           git config --global --add url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global --add url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "git@github.com:"
           git config --global --add url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
-          git config --global --list | grep insteadof
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1

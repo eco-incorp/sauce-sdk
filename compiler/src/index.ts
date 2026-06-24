@@ -11,7 +11,8 @@ import { OPS } from './saucer/ops.js';
 import { OPS_V12 } from './saucer/ops-v12.js';
 import { encodeInt } from './saucer/integer.js';
 import { encodeBytes } from './saucer/bytes.js';
-import type { V12Saucer, RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
+import { concatBytes } from './saucer/saucer-v12.js';
+import type { RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
 import type { ContractsConfig } from './contracts.js';
 
 export { Saucer } from './saucer/saucer.js';
@@ -111,22 +112,14 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
 // to each helper's absolute byte offset; parameter-read SDUP sentinels (recorded
 // as refPositions) are patched to a concrete SDUPn from the tracked stack depth.
 
-function concatBytes(parts: (Uint8Array | number[])[]): Uint8Array {
-  const arrays = parts.map((p) => (p instanceof Uint8Array ? p : new Uint8Array(p)));
-  const total = arrays.reduce((n, a) => n + a.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const a of arrays) {
-    out.set(a, off);
-    off += a.length;
-  }
-
-  return out;
-}
-
 function patchCalls(bc: Uint8Array, calls: CallPlaceholder[], funcOffsets: number[], posShift = 0): void {
   for (const { pos, funcIndex } of calls) {
-    if (funcIndex >= funcOffsets.length) continue;
+    // funcOffsets only covers helpers (main is registered last and has no body
+    // offset). An index past the end is a call to main — unsupported, and leaving
+    // the sentinel unpatched would emit corrupt bytecode, so fail loudly.
+    if (funcIndex >= funcOffsets.length) {
+      throw new Error(`cannot resolve CALL_FUNCTION target (index ${funcIndex}); calling main() is not supported`);
+    }
 
     const offset = funcOffsets[funcIndex];
     bc[pos + posShift] = (offset >> 8) & 0xff;
@@ -147,7 +140,7 @@ function assembleV12(ctx: CompilerContext): Uint8Array {
   if (!mainMeta) throw new Error('missing main() function');
 
   const helpers = meta.filter((m) => !m.isMain); // function-index order (0..n-1)
-  const main = mainMeta.saucer as V12Saucer;
+  const main = mainMeta.saucer;
   const mainBc = main.build();
 
   // Main params are pre-pushed by the runtime, so no frame-pointer offset.
@@ -156,13 +149,16 @@ function assembleV12(ctx: CompilerContext): Uint8Array {
   };
 
   if (helpers.length === 0) {
+    // No helper bodies to jump to: any CALL_FUNCTION here is a main() self-call,
+    // which patchCalls rejects (empty offset table) rather than emit corrupt bytes.
+    patchCalls(mainBc, main.callPositions, []);
     patchMainRefs(mainBc, main.refPositions);
 
     return mainBc;
   }
 
   const built = helpers.map((h) => {
-    const saucer = h.saucer as V12Saucer;
+    const saucer = h.saucer;
     const bc = saucer.buildFunctionBody();
 
     return { meta: h, saucer, bc, prefixLen: bc.length - saucer._bytes.length };

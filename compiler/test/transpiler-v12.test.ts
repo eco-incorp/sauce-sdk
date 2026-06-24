@@ -363,6 +363,27 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
     });
   });
 
+  describe('Statement-context stack hygiene', () => {
+    it('drops a bare value-returning call result, but not when it is consumed', () => {
+      // `noise(1);` as a statement returns a value that v12 must SDROP, or it leaks
+      // on the stack. `noise` SETs no params, so the only SDROP source is the drop —
+      // present when the result is discarded, absent when bound to a local.
+      const dropped = compile('function noise(x){ return x } function main(){ noise(1); return 0 }', {
+        target: 'v12',
+      }).bytecode[0];
+      const used = compile('function noise(x){ return x } function main(){ let y = noise(1); return y }', {
+        target: 'v12',
+      }).bytecode[0];
+
+      expect(Array.from(dropped)).toContain(OPS_V12.SDROP);
+      expect(Array.from(used)).not.toContain(OPS_V12.SDROP);
+    });
+
+    it('throws when main() is called (recursion into the entrypoint is unsupported)', () => {
+      expect(() => compileV12('function main(){ return main() }')).toThrow(/main\(\) is not supported/);
+    });
+  });
+
   describe('Documented v12 boundaries', () => {
     it('break is not supported in v12', () => {
       expect(() => compileV12('function main(){ while (1) { break } }')).toThrow(/break.*v12/);

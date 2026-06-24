@@ -555,7 +555,9 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
       if (args[0].type === 'Literal' && typeof (args[0] as Literal).value === 'string') {
         const code = (args[0] as Literal).value as string;
         const source = /function\s+main\s*\(/.test(code) ? code : `function main() { ${code} }`;
-        const { bytecode } = compile(source);
+        // Compile the nested program for the SAME target as the enclosing one, so
+        // the EVAL'd bytecode matches the engine it will run on (v1 vs v12).
+        const { bytecode } = compile(source, { target: s.ctx.target });
 
         return s.eval(s.ctx.newSaucer().bytes(bytecode[0]));
       }

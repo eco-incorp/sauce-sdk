@@ -288,6 +288,15 @@ const transpilerVectors: { name: string; src: string; expected: number; kind: 'u
     expected: 42, // object literal is a TUPLE (mutable) → SET_INDEX by field index
     kind: 'uint',
   },
+  {
+    // A bare value-returning call must be SDROP'd or it leaks on the stack and
+    // corrupts the fixed-position return — so a missing drop would make this return
+    // 42 (or revert) instead of 7.
+    name: 'unused_call_dropped',
+    src: 'function noise(x){ return x + 1 } function main(){ noise(41); return 7 }',
+    expected: 7,
+    kind: 'uint',
+  },
 ];
 
 function buildVectors(): Vector[] {
@@ -346,6 +355,7 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(forgeOutput).toMatch(/ok newarray_setindex 77/); // builder array mutation
     expect(forgeOutput).toMatch(/ok array_compound_assign 14/); // transpiler compound +=
     expect(forgeOutput).toMatch(/ok object_field_set 42/); // object-literal (TUPLE) field set
+    expect(forgeOutput).toMatch(/ok unused_call_dropped 7/); // bare call result SDROP'd, stack balanced
     expect(forgeOutput).not.toMatch(/\[FAIL/);
   });
 });

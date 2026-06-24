@@ -127,7 +127,18 @@ describe('array mutation (v1)', () => {
   it('compiles new Array(n) → NEW_ARRAY', () => {
     const result = compile('function main() { let a = new Array(3); return a; }');
     expect(result.bytecode[0]).toContain(OPS.NEW_ARRAY);
-    expect(Buffer.from(result.bytecode[0]).toString('hex')).toBe('c001c1009c0103500000');
+    expect(Array.from(result.bytecode[0])).toEqual([
+      OPS.ALLOCATE_VALUE,
+      1, // one value slot for `a`
+      OPS.WRITE_VALUE,
+      0,
+      OPS.NEW_ARRAY,
+      OPS.BYTE_1,
+      3, // a = new Array(3)
+      OPS.READ_VALUE,
+      0, // return a
+      OPS.STOP,
+    ]);
   });
 
   it('throws when new Array has wrong arity', () => {
@@ -139,13 +150,56 @@ describe('array mutation (v1)', () => {
   it('compiles arr[i] = x on a new Array → SET_INDEX, prefix [value][index][array]', () => {
     const result = compile('function main() { let a = new Array(3); a[0] = 9; return a; }');
     expect(result.bytecode[0]).toContain(OPS.SET_INDEX);
-    expect(Buffer.from(result.bytecode[0]).toString('hex')).toBe('c001c1009c0103c1009b010901005000500000');
+    expect(Array.from(result.bytecode[0])).toEqual([
+      OPS.ALLOCATE_VALUE,
+      1,
+      OPS.WRITE_VALUE,
+      0,
+      OPS.NEW_ARRAY,
+      OPS.BYTE_1,
+      3, // a = new Array(3)
+      OPS.WRITE_VALUE,
+      0, // a =
+      OPS.SET_INDEX,
+      OPS.BYTE_1,
+      9,
+      OPS.BYTE_1,
+      0,
+      OPS.READ_VALUE,
+      0, //   setIndex(value 9, index 0, array a)
+      OPS.READ_VALUE,
+      0, // return a
+      OPS.STOP,
+    ]);
   });
 
   it('compiles obj.field = x → SET_INDEX with field index (object literal is a TUPLE)', () => {
     const result = compile('function main() { let p = { x: 1, y: 2 }; p.x = 9; return p; }');
     expect(result.bytecode[0]).toContain(OPS.SET_INDEX);
-    expect(Buffer.from(result.bytecode[0]).toString('hex')).toBe('c201c300940201010102c3009b010901009800980000');
+    expect(Array.from(result.bytecode[0])).toEqual([
+      OPS.ALLOCATE_HEAP,
+      1, // a TUPLE lives on the heap
+      OPS.WRITE_HEAP,
+      0,
+      OPS.TUPLE,
+      2,
+      OPS.BYTE_1,
+      1,
+      OPS.BYTE_1,
+      2, // p = { x: 1, y: 2 }
+      OPS.WRITE_HEAP,
+      0, // p =
+      OPS.SET_INDEX,
+      OPS.BYTE_1,
+      9,
+      OPS.BYTE_1,
+      0,
+      OPS.READ_HEAP,
+      0, //   setIndex(value 9, field 0 = x, array p)
+      OPS.READ_HEAP,
+      0, // return p
+      OPS.STOP,
+    ]);
   });
 
   it('compiles compound arr[i] += y on a new Array → INDEX read then SET_INDEX write', () => {
@@ -161,6 +215,22 @@ describe('array mutation (v1)', () => {
     expect(() => compile('function main() { let a = [1, 2, 3]; a[0] = 9; return a; }')).toThrow(
       /array literals are immutable/,
     );
+  });
+
+  it('clears the immutable-packed flag when a packed-literal var is reassigned (ternary)', () => {
+    // `a` starts as an immutable packed literal, then is reassigned via a ternary to
+    // a mutable new Array. The stale flag must clear so `a[0] = …` is allowed again.
+    expect(() =>
+      compile('function main(c) { let a = [1, 2, 3]; a = c ? new Array(3) : new Array(3); a[0] = 9; return a; }'),
+    ).not.toThrow();
+  });
+
+  it('keeps rejecting when a ternary branch still yields a packed literal', () => {
+    // If EITHER branch is a packed literal the variable may hold one at runtime, so
+    // element assignment stays rejected (conservative — matches the engine).
+    expect(() =>
+      compile('function main(c) { let a = new Array(3); a = c ? [1, 2, 3] : new Array(3); a[0] = 9; return a; }'),
+    ).toThrow(/array literals are immutable/);
   });
 
   it('evaluates a side-effecting compound index exactly once', () => {

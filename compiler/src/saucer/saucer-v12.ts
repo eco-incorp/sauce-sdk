@@ -67,7 +67,8 @@ const SWAPPED_OPS = new Set<number>([
   OPS.BOOL_SLTE,
 ]);
 
-const concat = (...parts: (Uint8Array | number[])[]): Uint8Array => {
+/** Flatten byte chunks (Uint8Arrays or number[]) into one Uint8Array. */
+export const concatBytes = (parts: (Uint8Array | number[])[]): Uint8Array => {
   const arrays = parts.map((p) => (p instanceof Uint8Array ? p : new Uint8Array(p)));
   const total = arrays.reduce((n, a) => n + a.length, 0);
   const out = new Uint8Array(total);
@@ -79,6 +80,25 @@ const concat = (...parts: (Uint8Array | number[])[]): Uint8Array => {
 
   return out;
 };
+
+// Variadic convenience wrapper used throughout the postfix builder.
+const concat = (...parts: (Uint8Array | number[])[]): Uint8Array => concatBytes(parts);
+
+// Shift a child's sentinels into the parent's frame and collect them: byte
+// positions move by `posOffset` (the preceding bytes) and REF depths by
+// `depthOffset` (the preceding stackEffect). The single source of truth for both
+// V12Saucer and its control-flow helper classes.
+function mergeSentinels(
+  calls: CallPlaceholder[],
+  refs: RefPlaceholder[],
+  src: V12Saucer,
+  posOffset: number,
+  depthOffset: number,
+): void {
+  for (const c of src.callPositions) calls.push({ pos: c.pos + posOffset, funcIndex: c.funcIndex });
+  for (const r of src.refPositions)
+    refs.push({ position: r.position + posOffset, paramIndex: r.paramIndex, depth: r.depth + depthOffset });
+}
 
 const MAX_BYTE_1 = 0xff;
 const MAX_BYTE_2 = 0xffff;
@@ -93,17 +113,42 @@ export class V12Saucer implements SaucerLike {
     readonly refPositions: RefPlaceholder[] = [],
   ) {}
 
-  // ── sentinel propagation ──
-  private static merge(
-    calls: CallPlaceholder[],
-    refs: RefPlaceholder[],
-    src: V12Saucer,
-    posOffset: number,
-    depthOffset: number,
-  ): void {
-    for (const c of src.callPositions) calls.push({ pos: c.pos + posOffset, funcIndex: c.funcIndex });
-    for (const r of src.refPositions)
-      refs.push({ position: r.position + posOffset, paramIndex: r.paramIndex, depth: r.depth + depthOffset });
+  /**
+   * Append a run of operands, threading the running byte/stack offsets through
+   * `mergeSentinels` once. Operands are emitted forward by default, or reversed
+   * (ARRAY/TUPLE/CONCAT want elements in reverse); `wrap` MSTORE-wraps each scalar
+   * into a heap descriptor (for CONCAT). The single accumulator behind `nary`,
+   * `concat`, `callFunction` and `log`. Returns the parts plus the final offsets so
+   * callers can append their own header (and a CALL_FUNCTION sentinel).
+   */
+  private appendOperands(
+    operands: SaucerLike[],
+    opts: { reverse?: boolean; wrap?: boolean } = {},
+  ): {
+    parts: Uint8Array[];
+    calls: CallPlaceholder[];
+    refs: RefPlaceholder[];
+    posOff: number;
+    effectSum: number;
+  } {
+    const parts: Uint8Array[] = [this._bytes];
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    let posOff = this._bytes.length;
+    let depthOff = this.stackEffect;
+    let effectSum = 0;
+    const ordered = opts.reverse ? [...operands].reverse() : operands;
+    for (const operandL of ordered) {
+      const operand = operandL as V12Saucer;
+      const bytes = opts.wrap ? V12Saucer.wrapDescriptor(operand) : operand._bytes;
+      mergeSentinels(calls, refs, operand, posOff, depthOff);
+      parts.push(bytes);
+      posOff += bytes.length;
+      depthOff += operand.stackEffect;
+      effectSum += operand.stackEffect;
+    }
+
+    return { parts, calls, refs, posOff, effectSum };
   }
 
   /** Append literal bytes (a constant/context op) to this builder. */
@@ -127,7 +172,7 @@ export class V12Saucer implements SaucerLike {
 
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, o, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, o, this._bytes.length, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -148,8 +193,8 @@ export class V12Saucer implements SaucerLike {
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
     const firstOff = this._bytes.length;
-    V12Saucer.merge(calls, refs, first, firstOff, this.stackEffect);
-    V12Saucer.merge(calls, refs, second, firstOff + first._bytes.length, this.stackEffect + first.stackEffect);
+    mergeSentinels(calls, refs, first, firstOff, this.stackEffect);
+    mergeSentinels(calls, refs, second, firstOff + first._bytes.length, this.stackEffect + first.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -165,7 +210,7 @@ export class V12Saucer implements SaucerLike {
     const operand = operandL as V12Saucer;
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, operand, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, operand, this._bytes.length, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -184,11 +229,11 @@ export class V12Saucer implements SaucerLike {
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
     const aOff = this._bytes.length;
-    V12Saucer.merge(calls, refs, a, aOff, this.stackEffect);
+    mergeSentinels(calls, refs, a, aOff, this.stackEffect);
     const bOff = aOff + a._bytes.length;
-    V12Saucer.merge(calls, refs, b, bOff, this.stackEffect + a.stackEffect);
+    mergeSentinels(calls, refs, b, bOff, this.stackEffect + a.stackEffect);
     const cOff = bOff + b._bytes.length;
-    V12Saucer.merge(calls, refs, c, cOff, this.stackEffect + a.stackEffect + b.stackEffect);
+    mergeSentinels(calls, refs, c, cOff, this.stackEffect + a.stackEffect + b.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -202,18 +247,7 @@ export class V12Saucer implements SaucerLike {
 
   /** Append a sequence of operands (reverse order) followed by a header. */
   private nary(operands: SaucerLike[], header: number[], stackEffect: number, isDynamic: boolean): V12Saucer {
-    const parts: Uint8Array[] = [this._bytes];
-    const calls = [...this.callPositions];
-    const refs = [...this.refPositions];
-    let posOff = this._bytes.length;
-    let depthOff = this.stackEffect;
-    for (let i = operands.length - 1; i >= 0; i--) {
-      const el = operands[i] as V12Saucer;
-      V12Saucer.merge(calls, refs, el, posOff, depthOff);
-      parts.push(el._bytes);
-      posOff += el._bytes.length;
-      depthOff += el.stackEffect;
-    }
+    const { parts, calls, refs } = this.appendOperands(operands, { reverse: true });
     parts.push(new Uint8Array(header));
 
     return new V12Saucer(this.ctx, concat(...parts), stackEffect, isDynamic, calls, refs);
@@ -328,8 +362,8 @@ export class V12Saucer implements SaucerLike {
     const a = arr as V12Saucer;
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, i, this._bytes.length, this.stackEffect);
-    V12Saucer.merge(calls, refs, a, this._bytes.length + i._bytes.length, this.stackEffect + i.stackEffect);
+    mergeSentinels(calls, refs, i, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, a, this._bytes.length + i._bytes.length, this.stackEffect + i.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -355,11 +389,11 @@ export class V12Saucer implements SaucerLike {
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
     const valueOff = this._bytes.length;
-    V12Saucer.merge(calls, refs, value, valueOff, this.stackEffect);
+    mergeSentinels(calls, refs, value, valueOff, this.stackEffect);
     const idxOff = valueOff + value._bytes.length;
-    V12Saucer.merge(calls, refs, idx, idxOff, this.stackEffect + value.stackEffect);
+    mergeSentinels(calls, refs, idx, idxOff, this.stackEffect + value.stackEffect);
     const arrOff = idxOff + idx._bytes.length;
-    V12Saucer.merge(calls, refs, arr, arrOff, this.stackEffect + value.stackEffect + idx.stackEffect);
+    mergeSentinels(calls, refs, arr, arrOff, this.stackEffect + value.stackEffect + idx.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -377,28 +411,17 @@ export class V12Saucer implements SaucerLike {
     return this.unary(OPS.NEW_ARRAY, count, true);
   }
 
-  /** Wrap a scalar operand as a heap descriptor for ops that consume dynamic data. */
-  private static wrapDescriptor(op: V12Saucer): { bytes: Uint8Array; extra: number } {
-    return op.isDynamic ? { bytes: op._bytes, extra: 0 } : { bytes: concat(op._bytes, [OPS_V12.MSTORE]), extra: 1 };
+  /** Wrap a scalar operand as a heap descriptor (append MSTORE) for ops that consume dynamic data. */
+  private static wrapDescriptor(op: V12Saucer): Uint8Array {
+    return op.isDynamic ? op._bytes : concat(op._bytes, [OPS_V12.MSTORE]);
   }
 
   concat(operands: SaucerLike[]): V12Saucer {
     if (operands.length === 0 || operands.length > MAX_BYTE_1)
       throw new Error(`concat requires 1-255 operands, got ${operands.length}`);
 
-    const parts: Uint8Array[] = [this._bytes];
-    const calls = [...this.callPositions];
-    const refs = [...this.refPositions];
-    let posOff = this._bytes.length;
-    let depthOff = this.stackEffect;
-    for (let i = operands.length - 1; i >= 0; i--) {
-      const el = operands[i] as V12Saucer;
-      const wrapped = V12Saucer.wrapDescriptor(el);
-      V12Saucer.merge(calls, refs, el, posOff, depthOff);
-      parts.push(wrapped.bytes);
-      posOff += wrapped.bytes.length;
-      depthOff += el.stackEffect;
-    }
+    // Reverse order, each scalar MSTORE-wrapped into a heap descriptor.
+    const { parts, calls, refs } = this.appendOperands(operands, { reverse: true, wrap: true });
     parts.push(new Uint8Array([OPS.CONCAT, operands.length]));
 
     return new V12Saucer(this.ctx, concat(...parts), this.naryEffect(operands), true, calls, refs);
@@ -415,11 +438,11 @@ export class V12Saucer implements SaucerLike {
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
     const dataOff = this._bytes.length;
-    V12Saucer.merge(calls, refs, data, dataOff, this.stackEffect);
+    mergeSentinels(calls, refs, data, dataOff, this.stackEffect);
     const offsetOff = dataOff + data._bytes.length + 1; // +1 for MSTORE
-    V12Saucer.merge(calls, refs, offset, offsetOff, this.stackEffect + data.stackEffect);
+    mergeSentinels(calls, refs, offset, offsetOff, this.stackEffect + data.stackEffect);
     const lengthOff = offsetOff + offset._bytes.length;
-    V12Saucer.merge(calls, refs, length, lengthOff, this.stackEffect + data.stackEffect + offset.stackEffect);
+    mergeSentinels(calls, refs, length, lengthOff, this.stackEffect + data.stackEffect + offset.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -439,7 +462,7 @@ export class V12Saucer implements SaucerLike {
     const data = dataL as V12Saucer;
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, data, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, data, this._bytes.length, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -475,7 +498,7 @@ export class V12Saucer implements SaucerLike {
 
       const calls = [...this.callPositions];
       const refs = [...this.refPositions];
-      V12Saucer.merge(calls, refs, value, this._bytes.length, this.stackEffect);
+      mergeSentinels(calls, refs, value, this._bytes.length, this.stackEffect);
 
       return new V12Saucer(
         this.ctx,
@@ -493,7 +516,7 @@ export class V12Saucer implements SaucerLike {
     const op = variable.kind === 'scalar' ? OPS.WRITE_VALUE : OPS.WRITE_HEAP;
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, value, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, value, this._bytes.length, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -605,7 +628,7 @@ export class V12Saucer implements SaucerLike {
 
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, data, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, data, this._bytes.length, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -641,14 +664,8 @@ export class V12Saucer implements SaucerLike {
     const second = secondL as V12Saucer;
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, first, this._bytes.length, this.stackEffect);
-    V12Saucer.merge(
-      calls,
-      refs,
-      second,
-      this._bytes.length + first._bytes.length,
-      this.stackEffect + first.stackEffect,
-    );
+    mergeSentinels(calls, refs, first, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, second, this._bytes.length + first._bytes.length, this.stackEffect + first.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -759,25 +776,21 @@ export class V12Saucer implements SaucerLike {
     if (args.length > MAX_BYTE_1) throw new Error(`too many params (max 255), got ${args.length}`);
 
     const index = this.ctx.getFunc(functionName);
-    const parts: Uint8Array[] = [this._bytes];
-    const calls = [...this.callPositions];
-    const refs = [...this.refPositions];
-    let posOff = this._bytes.length;
-    let depthOff = this.stackEffect;
-    for (const argL of args) {
-      const arg = argL as V12Saucer;
-      V12Saucer.merge(calls, refs, arg, posOff, depthOff);
-      parts.push(arg._bytes);
-      posOff += arg._bytes.length;
-      depthOff += arg.stackEffect;
-    }
+    // Args forward, then the CALL_FUNCTION header + a sentinel at the 2-byte index.
+    const { parts, calls, refs, posOff, effectSum } = this.appendOperands(args);
     const sentinel = (0xff00 | index) & 0xffff;
     const callPos = posOff + 1; // position of the 2-byte sentinel
     parts.push(new Uint8Array([OPS.CALL_FUNCTION, (sentinel >> 8) & 0xff, sentinel & 0xff, args.length]));
     calls.push({ pos: callPos, funcIndex: index });
-    const sum = args.reduce((n, a) => n + (a as V12Saucer).stackEffect, 0);
 
-    return new V12Saucer(this.ctx, concat(...parts), this.stackEffect + sum - args.length + 1, false, calls, refs);
+    return new V12Saucer(
+      this.ctx,
+      concat(...parts),
+      this.stackEffect + effectSum - args.length + 1,
+      false,
+      calls,
+      refs,
+    );
   }
 
   externalCall(target: SaucerLike, value: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
@@ -815,7 +828,7 @@ export class V12Saucer implements SaucerLike {
 
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, handler, this._bytes.length + 2, this.stackEffect);
+    mergeSentinels(calls, refs, handler, this._bytes.length + 2, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -838,7 +851,7 @@ export class V12Saucer implements SaucerLike {
     const data = dataL as V12Saucer;
     const calls = [...this.callPositions];
     const refs = [...this.refPositions];
-    V12Saucer.merge(calls, refs, data, this._bytes.length, this.stackEffect);
+    mergeSentinels(calls, refs, data, this._bytes.length, this.stackEffect);
 
     return new V12Saucer(
       this.ctx,
@@ -853,31 +866,30 @@ export class V12Saucer implements SaucerLike {
   log(dataL: SaucerLike, topics: SaucerLike[]): V12Saucer {
     if (topics.length > 4) throw new Error(`log supports 0-4 topics, got ${topics.length}`);
 
-    const data = dataL as V12Saucer;
-    const parts: Uint8Array[] = [this._bytes, data._bytes];
-    const calls = [...this.callPositions];
-    const refs = [...this.refPositions];
-    let posOff = this._bytes.length;
-    let depthOff = this.stackEffect;
-    V12Saucer.merge(calls, refs, data, posOff, depthOff);
-    posOff += data._bytes.length;
-    depthOff += data.stackEffect;
-    let sum = data.stackEffect;
-    for (const topicL of topics) {
-      const topic = topicL as V12Saucer;
-      V12Saucer.merge(calls, refs, topic, posOff, depthOff);
-      parts.push(topic._bytes);
-      posOff += topic._bytes.length;
-      depthOff += topic.stackEffect;
-      sum += topic.stackEffect;
-    }
+    // Data then topics, forward; LOG consumes them all (net -1: descriptor + topics
+    // in, nothing out).
+    const { parts, calls, refs, effectSum } = this.appendOperands([dataL, ...topics]);
     parts.push(new Uint8Array([OPS.LOG, topics.length]));
 
-    return new V12Saucer(this.ctx, concat(...parts), this.stackEffect + sum - topics.length - 1, false, calls, refs);
+    return new V12Saucer(
+      this.ctx,
+      concat(...parts),
+      this.stackEffect + effectSum - topics.length - 1,
+      false,
+      calls,
+      refs,
+    );
   }
 
   eval(bytecode: SaucerLike): V12Saucer {
     return this.unary(OPS.EVAL, bytecode, true);
+  }
+
+  // A bare expression statement discards its result; pop whatever it left on the
+  // stack so it does not leak (side-effect-only ops like log net zero and are
+  // untouched). The v1 counterpart is a no-op.
+  dropIfUnused(): V12Saucer {
+    return this.stackEffect > 0 ? this.sdrop().dropIfUnused() : this;
   }
 
   // ── raw stack ops (v12-only) ──
@@ -937,7 +949,7 @@ class V12If implements SaucerIfLike {
       // IF_2 with a 2-byte skip.
       if (thenLen > MAX_BYTE_2) throw new Error(`body too large: ${thenLen} bytes exceeds ${MAX_BYTE_2}`);
 
-      mergeInto(calls, refs, cond, parent._bytes.length, parent.stackEffect);
+      mergeSentinels(calls, refs, cond, parent._bytes.length, parent.stackEffect);
       const ifOpOffset = parent._bytes.length + cond._bytes.length;
       const bytes = concat(
         parent._bytes,
@@ -945,15 +957,15 @@ class V12If implements SaucerIfLike {
         [OPS.IF_2, (thenLen >> 8) & 0xff, thenLen & 0xff],
         thenBody._bytes,
       );
-      mergeInto(calls, refs, thenBody, ifOpOffset + 3, parent.stackEffect + cond.stackEffect - 1);
+      mergeSentinels(calls, refs, thenBody, ifOpOffset + 3, parent.stackEffect + cond.stackEffect - 1);
 
       return new V12Then(parent.ctx, bytes, stackEffect, thenBody.isDynamic, calls, refs, ifOpOffset, true);
     }
 
-    mergeInto(calls, refs, cond, parent._bytes.length, parent.stackEffect);
+    mergeSentinels(calls, refs, cond, parent._bytes.length, parent.stackEffect);
     const ifOpOffset = parent._bytes.length + cond._bytes.length;
     const bytes = concat(parent._bytes, cond._bytes, [OPS.IF, thenLen], thenBody._bytes);
-    mergeInto(calls, refs, thenBody, ifOpOffset + 2, parent.stackEffect + cond.stackEffect - 1);
+    mergeSentinels(calls, refs, thenBody, ifOpOffset + 2, parent.stackEffect + cond.stackEffect - 1);
 
     return new V12Then(parent.ctx, bytes, stackEffect, thenBody.isDynamic, calls, refs, ifOpOffset, false);
   }
@@ -1000,7 +1012,7 @@ class V12Then extends V12Saucer implements SaucerThenLike {
       bytes[skipOffset] = next & 0xff;
     }
 
-    mergeInto(calls, refs, elseBody, this._bytes.length + jumpHeader.length, this.stackEffect);
+    mergeSentinels(calls, refs, elseBody, this._bytes.length + jumpHeader.length, this.stackEffect);
 
     return new V12Saucer(this.ctx, bytes, this.stackEffect + elseBody.stackEffect, elseBody.isDynamic, calls, refs);
   }
@@ -1029,9 +1041,9 @@ class V12Loop implements SaucerLoopLike {
     const jumpHeader = incrLen > MAX_BYTE_1 ? [OPS.JUMP_2, (incrLen >> 8) & 0xff, incrLen & 0xff] : [OPS.JUMP, incrLen];
 
     let posOff = parent._bytes.length + jumpHeader.length;
-    mergeInto(calls, refs, update, posOff, parent.stackEffect);
+    mergeSentinels(calls, refs, update, posOff, parent.stackEffect);
     posOff += update._bytes.length;
-    mergeInto(calls, refs, condition, posOff, parent.stackEffect);
+    mergeSentinels(calls, refs, condition, posOff, parent.stackEffect);
     posOff += condition._bytes.length;
 
     const head = concat(parent._bytes, jumpHeader, update._bytes, condition._bytes, [OPS.IF, 0]);
@@ -1078,21 +1090,8 @@ class V12Loop implements SaucerLoopLike {
       backHeader = [OPS.JUMP_BACK, backCount];
     }
 
-    mergeInto(calls, refs, body, prefix.length, parent.stackEffect);
+    mergeSentinels(calls, refs, body, prefix.length, parent.stackEffect);
 
     return new V12Saucer(ctx, concat(prefix, body._bytes, backHeader), parent.stackEffect, false, calls, refs);
   }
-}
-
-// Standalone merge for the helper classes (mirrors V12Saucer.merge).
-function mergeInto(
-  calls: CallPlaceholder[],
-  refs: RefPlaceholder[],
-  src: V12Saucer,
-  posOffset: number,
-  depthOffset: number,
-): void {
-  for (const c of src.callPositions) calls.push({ pos: c.pos + posOffset, funcIndex: c.funcIndex });
-  for (const r of src.refPositions)
-    refs.push({ position: r.position + posOffset, paramIndex: r.paramIndex, depth: r.depth + depthOffset });
 }

@@ -531,6 +531,12 @@ export class Saucer implements SaucerLike {
     return this.with([OPS.EVAL, ...bytecode._bytes]);
   }
 
+  // The prefix-tree interpreter discards a statement's result implicitly, so there
+  // is nothing to drop (see V12Saucer for the stack-based counterpart).
+  dropIfUnused(): Saucer {
+    return this;
+  }
+
   build(): Uint8Array {
     const valueSlots = this.ctx.valueSlotCount;
     const heapSlots = this.ctx.heapSlotCount;

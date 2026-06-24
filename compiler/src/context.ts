@@ -78,7 +78,6 @@ export class CompilerContext {
   // the per-function stack layout so reads/writes resolve to SDUP/SSWAP positions.
   private stackDepth = 0;
   private stackVars: Map<string, number> = new Map();
-  private stackOrder: string[] = [];
 
   /** Type info for main() function parameters, inferred from args option */
   mainArgTypes?: { kind: VariableKind; elementType?: ElementType }[];
@@ -138,15 +137,6 @@ export class CompilerContext {
     this.stackDepth++;
 
     if (name) this.stackVars.set(name, this.stackDepth);
-
-    this.stackOrder.push(name);
-  }
-
-  popStack(): void {
-    if (this.stackDepth > 0) {
-      this.stackDepth--;
-      this.stackOrder.pop();
-    }
   }
 
   /** Absolute 1-indexed stack position of a tracked variable (0 = not found). */

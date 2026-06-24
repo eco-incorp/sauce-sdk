@@ -138,9 +138,19 @@ function processTernaryStore(
   saucer: SaucerLike,
 ): SaucerLike {
   const condition = processExpression(expr.test, ctx);
-  const s = ctx.newSaucer();
-  const thenStore = s.store(name, processExpression(expr.consequent, ctx));
-  const elseStore = ctx.newSaucer().store(name, processExpression(expr.alternate, ctx));
+  const consequent = processExpression(expr.consequent, ctx);
+  const alternate = processExpression(expr.alternate, ctx);
+  const thenStore = ctx.newSaucer().store(name, consequent);
+  const elseStore = ctx.newSaucer().store(name, alternate);
+
+  // Recompute (don't leave stale): the variable is immutable-packed only if a
+  // branch actually stores a packed array literal — clear it otherwise so a later
+  // `name[i] = x` isn't wrongly rejected.
+  const variable = ctx.getVar(name);
+
+  if (variable) {
+    variable.immutablePacked = isImmutablePackedArray(consequent._bytes) || isImmutablePackedArray(alternate._bytes);
+  }
 
   return saucer.if(condition).then(thenStore).else(elseStore);
 }
@@ -160,8 +170,15 @@ function processUpdateStore(
   const incremented = expr.operator === '++' ? s.add(s.read(target), s.int(1n)) : s.sub(s.read(target), s.int(1n));
   const assign = (saucer: SaucerLike) => saucer.store(name, ctx.newSaucer().read(target));
   const update = (saucer: SaucerLike) => saucer.store(target, incremented);
+  const result = expr.prefix ? assign(update(saucer)) : update(assign(saucer));
 
-  return expr.prefix ? assign(update(saucer)) : update(assign(saucer));
+  // An increment result is always a scalar, never a packed literal — clear any
+  // stale flag from a prior array-literal assignment to `name`.
+  const variable = ctx.getVar(name);
+
+  if (variable) variable.immutablePacked = false;
+
+  return result;
 }
 
 export function processMutation(expr: Expression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
@@ -171,8 +188,10 @@ export function processMutation(expr: Expression, ctx: CompilerContext, saucer: 
     case 'AssignmentExpression':
       return processAssignmentMutation(expr as AssignmentExpression, ctx, saucer);
     case 'CallExpression': {
-      // Side-effect function calls (e.g., emit) can be used as statements
-      return saucer.join(processExpression(expr, ctx));
+      // Side-effect function calls (e.g. emit) can be used as statements. The
+      // result is discarded, so drop it — on v12 a value-returning call would
+      // otherwise leak onto the stack (dropIfUnused is a no-op on v1).
+      return saucer.join(processExpression(expr, ctx).dropIfUnused());
     }
     default:
       throw new Error(`not implemented: ${expr.type} as statement`);
