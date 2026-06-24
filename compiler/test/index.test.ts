@@ -122,3 +122,36 @@ describe('index', () => {
     expect(result.bytecode[0]).toContain(OPS.LENGTH);
   });
 });
+
+describe('array mutation (v1)', () => {
+  it('compiles new Array(n) → NEW_ARRAY', () => {
+    const result = compile('function main() { let a = new Array(3); return a; }');
+    expect(result.bytecode[0]).toContain(OPS.NEW_ARRAY);
+    expect(Buffer.from(result.bytecode[0]).toString('hex')).toBe('c001c1009c0103500000');
+  });
+
+  it('throws when new Array has wrong arity', () => {
+    expect(() => compile('function main() { let a = new Array(1, 2); return a; }')).toThrow(
+      'new Array expects exactly 1 argument',
+    );
+  });
+
+  it('compiles arr[i] = x → SET_INDEX, prefix [value][index][array]', () => {
+    const result = compile('function main() { let a = [1, 2, 3]; a[0] = 9; return a; }');
+    expect(result.bytecode[0]).toContain(OPS.SET_INDEX);
+    expect(Buffer.from(result.bytecode[0]).toString('hex')).toBe('c201c300920301010203c3009b010901009800980000');
+  });
+
+  it('compiles obj.field = x → SET_INDEX with field index', () => {
+    const result = compile('function main() { let p = { x: 1, y: 2 }; p.x = 9; return p; }');
+    expect(result.bytecode[0]).toContain(OPS.SET_INDEX);
+    expect(Buffer.from(result.bytecode[0]).toString('hex')).toBe('c201c300940201010102c3009b010901009800980000');
+  });
+
+  it('compiles compound arr[i] += y → INDEX read then SET_INDEX write', () => {
+    const result = compile('function main() { let a = [1, 2, 3]; let i = 1; a[i] += 5; return a; }');
+    expect(result.bytecode[0]).toContain(OPS.SET_INDEX);
+    expect(result.bytecode[0]).toContain(OPS.INDEX);
+    expect(result.bytecode[0]).toContain(OPS.ADD);
+  });
+});

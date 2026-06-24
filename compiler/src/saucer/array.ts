@@ -68,3 +68,11 @@ export const encodeArray = (elements: Saucer[]): Uint8Array => {
 
 export const encodeIndex = (index: Saucer, array: Saucer): Uint8Array =>
   new Uint8Array([OPS.INDEX, ...index._bytes, ...array._bytes]);
+
+// In-place element assignment `arr[i] = value`. v1 prefix order:
+// [SET_INDEX][value][index][array] — value first, array last.
+export const encodeSetIndex = (value: Saucer, index: Saucer, array: Saucer): Uint8Array =>
+  new Uint8Array([OPS.SET_INDEX, ...value._bytes, ...index._bytes, ...array._bytes]);
+
+// `new Array(n)` → zero-initialized TUPLE of n slots. v1 prefix: [NEW_ARRAY][count].
+export const encodeNewArray = (count: Saucer): Uint8Array => new Uint8Array([OPS.NEW_ARRAY, ...count._bytes]);

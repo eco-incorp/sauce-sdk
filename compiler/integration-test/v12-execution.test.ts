@@ -15,8 +15,10 @@
  * published `sauce` dep ships a trimmed engine-v12, so by default this skips;
  * point SAUCE_ENGINE_V12 at a full checkout (e.g. ../sauce/engine-v12) to run.
  *
- * Array-mutation programs (arr[i] = x / SET_INDEX / new Array(n)) are omitted —
- * the local compiler has no surface for element assignment.
+ * Array-mutation programs (arr[i] = x / SET_INDEX / new Array(n)) now compile
+ * locally (byte-exact coverage in saucer-v12.test.ts / transpiler-v12.test.ts).
+ * An execution vector for them can be added here once the engine harness
+ * (V12ExecParity.t.sol) declares the matching expected result.
  */
 import { execSync } from 'child_process';
 import { existsSync, writeFileSync } from 'fs';

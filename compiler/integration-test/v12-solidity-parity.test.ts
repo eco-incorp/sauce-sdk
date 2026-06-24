@@ -14,9 +14,12 @@
  * The published `sauce` dep ships a trimmed engine-v12, so by default this skips;
  * point SAUCE_ENGINE_V12 at a full checkout (e.g. ../sauce/engine-v12) to run.
  *
- * Array-family / setIndex / newArray scenarios are intentionally not covered:
- * those are Solidity builder conveniences (ARRAY_FROM_UINTS, in-place mutation,
- * pre-sized arrays) with no surface in the local compiler.
+ * SET_INDEX (arr[i] = x / obj.field = x) and NEW_ARRAY (new Array(n)) now HAVE a
+ * local compiler surface (byte-exact coverage lives in saucer-v12.test.ts /
+ * transpiler-v12.test.ts). They are still not asserted here because the matching
+ * `VEC setIndex` / `VEC newArray` lines must first be emitted by the engine repo's
+ * `V12SaucerVectors.s.sol`; add them there and they can be wired in alongside.
+ * Other Solidity builder conveniences (ARRAY_FROM_UINTS) remain out of scope.
  */
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';

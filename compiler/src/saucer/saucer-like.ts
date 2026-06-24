@@ -54,6 +54,8 @@ export interface SaucerLike {
   array(elements: SaucerLike[]): SaucerLike;
   tuple(elements: SaucerLike[]): SaucerLike;
   index(arr: SaucerLike, idx: SaucerLike): SaucerLike;
+  setIndex(arr: SaucerLike, idx: SaucerLike, value: SaucerLike): SaucerLike;
+  newArray(count: SaucerLike): SaucerLike;
   length(arr: SaucerLike): SaucerLike;
   concat(operands: SaucerLike[]): SaucerLike;
   slice(data: SaucerLike, offset: SaucerLike, length: SaucerLike): SaucerLike;

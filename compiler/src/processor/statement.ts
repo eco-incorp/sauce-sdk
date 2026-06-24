@@ -9,12 +9,20 @@ import type {
   WhileStatement,
   UpdateExpression,
   AssignmentExpression,
+  MemberExpression,
 } from 'acorn';
 import type { SaucerLike } from '../saucer/index.js';
 import type { CompilerContext } from '../context.js';
 import { processExpression, processStatement } from './index.js';
 import { applyBinaryOp } from './expression.js';
-import { inferKindWithContext, inferElementTypeWithContext, inferStructTypeWithContext } from './inference.js';
+import {
+  inferKindWithContext,
+  inferElementTypeWithContext,
+  inferStructTypeWithContext,
+  getPropertyName,
+  lookupStructType,
+  getFieldIndex,
+} from './inference.js';
 
 export function processVariableDeclaration(
   decl: VariableDeclaration,
@@ -177,6 +185,10 @@ function processUpdateMutation(expr: UpdateExpression, ctx: CompilerContext, sau
 }
 
 function processAssignmentMutation(expr: AssignmentExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
+  if (expr.left.type === 'MemberExpression') {
+    return processMemberAssignment(expr.left as MemberExpression, expr, ctx, saucer);
+  }
+
   if (expr.left.type !== 'Identifier') {
     throw new Error(`not implemented: assignment to ${expr.left.type}`);
   }
@@ -189,4 +201,56 @@ function processAssignmentMutation(expr: AssignmentExpression, ctx: CompilerCont
   const value = applyBinaryOp(s, expr.operator.slice(0, -1), s.read(name), processExpression(expr.right, ctx));
 
   return saucer.store(name, value);
+}
+
+// Element/field assignment: `arr[i] = x`, `obj.field = x` and their compound forms.
+// Lowers to STORE(name, SET_INDEX(readArr, index, value)) (the saucer's read/store
+// pick slot-memory vs stack-param access per target).
+function processMemberAssignment(
+  member: MemberExpression,
+  expr: AssignmentExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike {
+  if (member.object.type !== 'Identifier') {
+    throw new Error(`not implemented: assignment to ${member.object.type} member`);
+  }
+
+  const name = (member.object as { name: string }).name;
+
+  if (!ctx.getVar(name)) throw new Error(`undefined variable: ${name}`);
+
+  // Compute the array-read and index fragments ONCE; reuse them (immutable
+  // builder nodes) for both the compound INDEX read and the SET_INDEX write,
+  // so the index/array expression is never transpiled twice.
+  const readArr = ctx.newSaucer().read(name);
+  const index = resolveMemberIndex(member, ctx);
+
+  const value =
+    expr.operator === '='
+      ? processExpression(expr.right, ctx)
+      : applyBinaryOp(
+          ctx.newSaucer(),
+          expr.operator.slice(0, -1),
+          ctx.newSaucer().index(readArr, index),
+          processExpression(expr.right, ctx),
+        );
+
+  return saucer.store(name, ctx.newSaucer().setIndex(readArr, index, value));
+}
+
+// The index for a member assignment: computed `arr[i]` → the property expression;
+// field `obj.field` → the field's slot looked up from the object's known shape.
+function resolveMemberIndex(member: MemberExpression, ctx: CompilerContext): SaucerLike {
+  if (member.computed) return processExpression(member.property as Expression, ctx);
+
+  const field = getPropertyName(member);
+
+  if (!field) throw new Error('unsupported member assignment target');
+
+  const structType = lookupStructType(member, ctx);
+
+  if (!structType) throw new Error(`property '${field}' assignment not supported, use array indexing arr[i]`);
+
+  return ctx.newSaucer().int(BigInt(getFieldIndex(structType, field)));
 }
