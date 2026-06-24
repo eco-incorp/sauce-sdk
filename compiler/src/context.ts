@@ -3,6 +3,11 @@ import * as path from 'path';
 import type { Abi, ContractInfo, ContractsConfig } from './contracts.js';
 import { parseAbiMethods } from './contracts.js';
 import { RESERVED_NAMES } from './globals.js';
+import { Saucer } from './saucer/saucer.js';
+import { V12Saucer } from './saucer/saucer-v12.js';
+import type { SaucerLike } from './saucer/saucer-like.js';
+
+export type CompileTarget = 'v1' | 'v12';
 
 export type VariableKind = 'scalar' | 'dynamic';
 
@@ -23,6 +28,8 @@ export interface Variable {
   kind: VariableKind;
   elementType?: ElementType; // For arrays: the full element type chain
   structType?: StructType; // For structs: the field names
+  /** v12: a function parameter (lives on the EVM stack, not a memory slot). */
+  isParam?: boolean;
 }
 
 export interface Scope {
@@ -30,29 +37,122 @@ export interface Scope {
   parent?: Scope;
 }
 
+/** v12: per-function build artifacts collected during processing, assembled by compile(). */
+export interface FunctionMeta {
+  name: string;
+  isMain: boolean;
+  paramCount: number;
+  saucer: V12Saucer;
+}
+
+/** State shared across a v12 module's per-function child contexts. */
+interface SharedModule {
+  functions: string[];
+  contracts: Map<string, ContractInfo>;
+  funcMeta: FunctionMeta[];
+}
+
 export class CompilerContext {
   readonly warnings: string[] = [];
+  readonly target: CompileTarget;
   private scopes: Scope[] = [];
   private loopDepth = 0;
-  public functions: string[] = [];
   private nextValueSlot = 0;
   private nextHeapSlot = 0;
 
-  private contracts: Map<string, ContractInfo> = new Map();
+  /** Module-level state, shared across a v12 module's per-function contexts. */
+  private readonly module: SharedModule;
   private baseDirs: string[];
   private pendingContractBinding?: { contractName: string; callTypeOverride?: 'static' | 'delegate' };
   private boundContracts: Map<string, { contract: ContractInfo; callTypeOverride?: 'static' | 'delegate' }> = new Map();
 
+  // v12: function parameters live on the EVM stack (not memory slots). This tracks
+  // the per-function stack layout so reads/writes resolve to SDUP/SSWAP positions.
+  private stackDepth = 0;
+  private stackVars: Map<string, number> = new Map();
+  private stackOrder: string[] = [];
+
   /** Type info for main() function parameters, inferred from args option */
   mainArgTypes?: { kind: VariableKind; elementType?: ElementType }[];
 
-  constructor(baseDirs: string[] = [], contracts: ContractsConfig = {}) {
+  constructor(
+    baseDirs: string[] = [],
+    contracts: ContractsConfig = {},
+    target: CompileTarget = 'v1',
+    shared?: SharedModule,
+  ) {
     this.scopes.push({ variables: new Map() });
     this.baseDirs = baseDirs;
+    this.target = target;
+    this.module = shared ?? { functions: [], contracts: new Map(), funcMeta: [] };
 
     for (const [name, config] of Object.entries(contracts)) {
       this.registerContract(name, config.abi);
     }
+  }
+
+  get isV12(): boolean {
+    return this.target === 'v12';
+  }
+
+  /** The function index table (shared across a v12 module's contexts). */
+  get functions(): string[] {
+    return this.module.functions;
+  }
+
+  /** v12: per-function build artifacts collected during processing. */
+  get funcMeta(): FunctionMeta[] {
+    return this.module.funcMeta;
+  }
+
+  /** Target-aware builder factory — the seam that keeps the processor agnostic. */
+  newSaucer(): SaucerLike {
+    return this.target === 'v12' ? new V12Saucer(this) : new Saucer(this);
+  }
+
+  /**
+   * v12: a child context for compiling one function body — fresh slots, scopes
+   * and stack tracker, but a SHARED module (function index table, contracts,
+   * collected metadata) so calls resolve across functions.
+   */
+  forFunction(): CompilerContext {
+    return new CompilerContext(this.baseDirs, {}, this.target, this.module);
+  }
+
+  recordFunction(meta: FunctionMeta): void {
+    this.module.funcMeta.push(meta);
+  }
+
+  // ── v12 stack-variable tracking ──
+
+  /** Push a named value onto the (tracked) EVM stack — e.g. a function param. */
+  pushStack(name: string): void {
+    this.stackDepth++;
+
+    if (name) this.stackVars.set(name, this.stackDepth);
+
+    this.stackOrder.push(name);
+  }
+
+  popStack(): void {
+    if (this.stackDepth > 0) {
+      this.stackDepth--;
+      this.stackOrder.pop();
+    }
+  }
+
+  /** Absolute 1-indexed stack position of a tracked variable (0 = not found). */
+  getStackVarPos(name: string): number {
+    return this.stackVars.get(name) ?? 0;
+  }
+
+  /** Relative-from-top position of a tracked variable (0 = not found). */
+  findStackVar(name: string): number {
+    const stored = this.stackVars.get(name) ?? 0;
+
+    if (stored === 0 || this.stackDepth < stored) return 0;
+
+    return this.stackDepth - stored + 1;
   }
 
   get valueSlotCount(): number {
@@ -74,7 +174,7 @@ export class CompilerContext {
 
   get contractsConfig(): ContractsConfig {
     const config: ContractsConfig = {};
-    for (const [name, info] of this.contracts) {
+    for (const [name, info] of this.module.contracts) {
       config[name] = { abi: info.abi };
     }
 
@@ -98,7 +198,13 @@ export class CompilerContext {
     return this.scopes[this.scopes.length - 1];
   }
 
-  setVar(name: string, kind: VariableKind = 'scalar', elementType?: ElementType, structType?: StructType): Variable {
+  setVar(
+    name: string,
+    kind: VariableKind = 'scalar',
+    elementType?: ElementType,
+    structType?: StructType,
+    isParam = false,
+  ): Variable {
     if (RESERVED_NAMES.has(name)) throw new Error(`'${name}' is a reserved name`);
 
     const scope = this.currentScope;
@@ -107,8 +213,9 @@ export class CompilerContext {
       throw new Error(`variable '${name}' is already declared`);
     }
 
-    const slot = kind === 'scalar' ? this.nextValueSlot++ : this.nextHeapSlot++;
-    const variable: Variable = { name, slot, kind, elementType, structType };
+    // v12 params live on the EVM stack, not a memory slot (slot -1 = unused).
+    const slot = isParam ? -1 : kind === 'scalar' ? this.nextValueSlot++ : this.nextHeapSlot++;
+    const variable: Variable = { name, slot, kind, elementType, structType, isParam };
     scope.variables.set(name, variable);
 
     return variable;
@@ -181,15 +288,15 @@ export class CompilerContext {
   }
 
   registerContract(name: string, abi: Abi): void {
-    if (this.contracts.has(name)) {
+    if (this.module.contracts.has(name)) {
       throw new Error(`Contract "${name}" is already registered.`);
     }
 
-    this.contracts.set(name, { name, abi, methods: parseAbiMethods(abi) });
+    this.module.contracts.set(name, { name, abi, methods: parseAbiMethods(abi) });
   }
 
   lookupContract(name: string): ContractInfo | undefined {
-    return this.contracts.get(name);
+    return this.module.contracts.get(name);
   }
 
   setPendingContractBinding(contractName: string, callTypeOverride?: 'static' | 'delegate'): void {
@@ -199,7 +306,7 @@ export class CompilerContext {
   consumePendingContractBinding(variableName: string): void {
     if (!this.pendingContractBinding) return;
 
-    const contract = this.contracts.get(this.pendingContractBinding.contractName);
+    const contract = this.module.contracts.get(this.pendingContractBinding.contractName);
 
     if (contract) {
       this.boundContracts.set(variableName, {

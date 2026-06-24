@@ -5,11 +5,9 @@ import { encodeBytes, encodeString } from './bytes.js';
 import { encodeArray, encodeIndex } from './array.js';
 import { encodeTuple } from './tuple.js';
 import type { CompilerContext, VariableKind, ElementType, StructType } from '../context.js';
+import type { SaucerLike, SaucerIfLike, SaucerThenLike, SaucerLoopLike, OutputSpec } from './saucer-like.js';
 
-export interface OutputSpec {
-  count: number;
-  typeSpecs: number[];
-}
+export type { OutputSpec };
 
 const MAX_BYTE_1 = 0xff;
 const MAX_BYTE_2 = 0xffff;
@@ -68,7 +66,7 @@ const mergeOffsets = (a: JumpOffsets, b: JumpOffsets): JumpOffsets => ({
   continues: [...a.continues, ...b.continues],
 });
 
-export class Saucer {
+export class Saucer implements SaucerLike {
   readonly _bytes: Uint8Array;
   readonly jumpOffsets: JumpOffsets;
 
@@ -539,7 +537,7 @@ export class Saucer {
   }
 }
 
-class SaucerIf {
+class SaucerIf implements SaucerIfLike {
   constructor(
     private readonly parent: Saucer,
     private readonly condition: Saucer,
@@ -564,7 +562,7 @@ class SaucerIf {
   }
 }
 
-class SaucerThen extends Saucer {
+class SaucerThen extends Saucer implements SaucerThenLike {
   constructor(
     ctx: CompilerContext,
     bytes: Uint8Array,
@@ -600,7 +598,7 @@ class SaucerThen extends Saucer {
   }
 }
 
-class SaucerLoop {
+class SaucerLoop implements SaucerLoopLike {
   constructor(
     private readonly parent: Saucer,
     private readonly condition?: Saucer,

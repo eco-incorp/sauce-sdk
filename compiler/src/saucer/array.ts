@@ -1,6 +1,9 @@
 import { OPS } from './ops.js';
 import { BYTE_OPS, BYTE_WIDTH } from './integer.js';
-import type { Saucer } from './saucer.js';
+
+// Structural view of a builder node — both v1 Saucer and v12 V12Saucer expose
+// `_bytes`, and array literals encode identically for either target.
+type Saucer = { _bytes: Uint8Array };
 
 const MAX_BYTE_1 = 0xff;
 const MAX_BYTE_2 = 0xffff;

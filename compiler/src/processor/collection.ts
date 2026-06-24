@@ -1,5 +1,5 @@
 import type { Expression, ArrayExpression, NewExpression, CallExpression, ObjectExpression, Literal } from 'acorn';
-import { Saucer } from '../saucer/index.js';
+import type { SaucerLike } from '../saucer/index.js';
 import type { CompilerContext } from '../context.js';
 import { processExpression } from './index.js';
 import { extractSortedProperties, extractStructType } from './inference.js';
@@ -25,14 +25,18 @@ const assertConsistentStructFields = (elements: Expression[]): void => {
   if (mismatch) throw new Error('array elements must have consistent struct fields');
 };
 
-export const processArrayExpression = (expr: ArrayExpression, ctx: CompilerContext, saucer: Saucer): Saucer => {
+export const processArrayExpression = (expr: ArrayExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike => {
   const elements = expr.elements.map(assertValidArrayElement);
   assertConsistentStructFields(elements);
 
   return saucer.array(elements.map((el) => processExpression(el, ctx)));
 };
 
-export const processObjectExpression = (expr: ObjectExpression, ctx: CompilerContext, saucer: Saucer): Saucer => {
+export const processObjectExpression = (
+  expr: ObjectExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike => {
   const sorted = extractSortedProperties(expr);
   const elements = sorted.map((p) => processExpression(p.value, ctx));
 
@@ -62,7 +66,7 @@ const extractUint8ArrayArg = (expr: NewExpression | CallExpression): ArrayExpres
   return arg as ArrayExpression;
 };
 
-export const processUint8Array = (expr: NewExpression | CallExpression, saucer: Saucer): Saucer => {
+export const processUint8Array = (expr: NewExpression | CallExpression, saucer: SaucerLike): SaucerLike => {
   const arrayExpr = extractUint8ArrayArg(expr);
   const bytes = new Uint8Array(arrayExpr.elements.map(extractByteLiteral));
 

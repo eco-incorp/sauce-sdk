@@ -10,13 +10,17 @@ import type {
   UpdateExpression,
   AssignmentExpression,
 } from 'acorn';
-import { Saucer } from '../saucer/index.js';
+import type { SaucerLike } from '../saucer/index.js';
 import type { CompilerContext } from '../context.js';
 import { processExpression, processStatement } from './index.js';
 import { applyBinaryOp } from './expression.js';
 import { inferKindWithContext, inferElementTypeWithContext, inferStructTypeWithContext } from './inference.js';
 
-export function processVariableDeclaration(decl: VariableDeclaration, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processVariableDeclaration(
+  decl: VariableDeclaration,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike {
   if (decl.kind === 'var') {
     throw new Error('var is not supported, use const or let');
   }
@@ -34,7 +38,7 @@ export function processVariableDeclaration(decl: VariableDeclaration, ctx: Compi
   }, saucer);
 }
 
-export function processIfStatement(stmt: IfStatement, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processIfStatement(stmt: IfStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   const condition = processExpression(stmt.test, ctx);
   const thenBody = processBlock(stmt.consequent, ctx);
 
@@ -44,34 +48,34 @@ export function processIfStatement(stmt: IfStatement, ctx: CompilerContext, sauc
 
   const elseBody =
     stmt.alternate.type === 'IfStatement'
-      ? processIfStatement(stmt.alternate as IfStatement, ctx, new Saucer(ctx))
+      ? processIfStatement(stmt.alternate as IfStatement, ctx, ctx.newSaucer())
       : processBlock(stmt.alternate, ctx);
 
   return saucer.if(condition).then(thenBody).else(elseBody);
 }
 
-export function processBlock(node: Statement, ctx: CompilerContext): Saucer {
+export function processBlock(node: Statement, ctx: CompilerContext): SaucerLike {
   if (node.type === 'BlockStatement') {
-    return (node as BlockStatement).body.reduce((saucer, stmt) => processStatement(stmt, ctx, saucer), new Saucer(ctx));
+    return (node as BlockStatement).body.reduce((saucer, stmt) => processStatement(stmt, ctx, saucer), ctx.newSaucer());
   }
 
-  return processStatement(node, ctx, new Saucer(ctx));
+  return processStatement(node, ctx, ctx.newSaucer());
 }
 
-export function processForStatement(stmt: ForStatement, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processForStatement(stmt: ForStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   ctx.pushScope();
 
   const init = stmt.init
     ? stmt.init.type === 'VariableDeclaration'
-      ? processVariableDeclaration(stmt.init as VariableDeclaration, ctx, new Saucer(ctx))
-      : processMutation(stmt.init as Expression, ctx, new Saucer(ctx))
+      ? processVariableDeclaration(stmt.init as VariableDeclaration, ctx, ctx.newSaucer())
+      : processMutation(stmt.init as Expression, ctx, ctx.newSaucer())
     : undefined;
 
   const condition = stmt.test ? processExpression(stmt.test, ctx) : undefined;
 
   ctx.pushLoop();
   const body = processBlock(stmt.body, ctx);
-  const update = stmt.update ? processMutation(stmt.update, ctx, new Saucer(ctx)) : undefined;
+  const update = stmt.update ? processMutation(stmt.update, ctx, ctx.newSaucer()) : undefined;
   ctx.popLoop();
 
   ctx.popScope();
@@ -79,7 +83,7 @@ export function processForStatement(stmt: ForStatement, ctx: CompilerContext, sa
   return saucer.for(init, condition, update).loop(body);
 }
 
-export function processWhileStatement(stmt: WhileStatement, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processWhileStatement(stmt: WhileStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   const condition = processExpression(stmt.test, ctx);
 
   ctx.pushLoop();
@@ -89,7 +93,7 @@ export function processWhileStatement(stmt: WhileStatement, ctx: CompilerContext
   return saucer.while(condition).loop(body);
 }
 
-export function storeExpression(name: string, expr: Expression, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function storeExpression(name: string, expr: Expression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   switch (expr.type) {
     case 'ConditionalExpression':
       return processTernaryStore(name, expr as ConditionalExpression, ctx, saucer);
@@ -112,30 +116,40 @@ export function storeExpression(name: string, expr: Expression, ctx: CompilerCon
   }
 }
 
-function processTernaryStore(name: string, expr: ConditionalExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processTernaryStore(
+  name: string,
+  expr: ConditionalExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike {
   const condition = processExpression(expr.test, ctx);
-  const s = new Saucer(ctx);
+  const s = ctx.newSaucer();
   const thenStore = s.store(name, processExpression(expr.consequent, ctx));
-  const elseStore = new Saucer(ctx).store(name, processExpression(expr.alternate, ctx));
+  const elseStore = ctx.newSaucer().store(name, processExpression(expr.alternate, ctx));
 
   return saucer.if(condition).then(thenStore).else(elseStore);
 }
 
-function processUpdateStore(name: string, expr: UpdateExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processUpdateStore(
+  name: string,
+  expr: UpdateExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike {
   if (expr.argument.type !== 'Identifier') {
     throw new Error(`not implemented: update on ${expr.argument.type}`);
   }
 
   const target = expr.argument.name;
-  const s = new Saucer(ctx);
+  const s = ctx.newSaucer();
   const incremented = expr.operator === '++' ? s.add(s.read(target), s.int(1n)) : s.sub(s.read(target), s.int(1n));
-  const assign = (saucer: Saucer) => saucer.store(name, new Saucer(ctx).read(target));
-  const update = (saucer: Saucer) => saucer.store(target, incremented);
+  const assign = (saucer: SaucerLike) => saucer.store(name, ctx.newSaucer().read(target));
+  const update = (saucer: SaucerLike) => saucer.store(target, incremented);
 
   return expr.prefix ? assign(update(saucer)) : update(assign(saucer));
 }
 
-export function processMutation(expr: Expression, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processMutation(expr: Expression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   switch (expr.type) {
     case 'UpdateExpression':
       return processUpdateMutation(expr as UpdateExpression, ctx, saucer);
@@ -150,19 +164,19 @@ export function processMutation(expr: Expression, ctx: CompilerContext, saucer: 
   }
 }
 
-function processUpdateMutation(expr: UpdateExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processUpdateMutation(expr: UpdateExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   if (expr.argument.type !== 'Identifier') {
     throw new Error(`not implemented: update on ${expr.argument.type}`);
   }
 
   const name = expr.argument.name;
-  const s = new Saucer(ctx);
+  const s = ctx.newSaucer();
   const value = expr.operator === '++' ? s.add(s.read(name), s.int(1n)) : s.sub(s.read(name), s.int(1n));
 
   return saucer.store(name, value);
 }
 
-function processAssignmentMutation(expr: AssignmentExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processAssignmentMutation(expr: AssignmentExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   if (expr.left.type !== 'Identifier') {
     throw new Error(`not implemented: assignment to ${expr.left.type}`);
   }
@@ -171,7 +185,7 @@ function processAssignmentMutation(expr: AssignmentExpression, ctx: CompilerCont
 
   if (expr.operator === '=') return storeExpression(name, expr.right, ctx, saucer);
 
-  const s = new Saucer(ctx);
+  const s = ctx.newSaucer();
   const value = applyBinaryOp(s, expr.operator.slice(0, -1), s.read(name), processExpression(expr.right, ctx));
 
   return saucer.store(name, value);

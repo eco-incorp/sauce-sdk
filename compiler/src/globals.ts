@@ -1,11 +1,12 @@
 import type { Expression, Literal, ArrayExpression, ObjectExpression, Property } from 'acorn';
 import { keccak256, toBytes } from 'viem';
-import { OPS, Saucer } from './saucer/index.js';
+import { OPS } from './saucer/index.js';
+import type { SaucerLike } from './saucer/index.js';
 import type { VariableKind } from './context.js';
 import { compile } from './index.js';
 
-type PropertyCompile = (saucer: Saucer) => Saucer;
-type MethodCompile = (saucer: Saucer, args: Expression[], process: (e: Expression) => Saucer) => Saucer;
+type PropertyCompile = (saucer: SaucerLike) => SaucerLike;
+type MethodCompile = (saucer: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => SaucerLike;
 
 export interface GlobalDef {
   kind: VariableKind;
@@ -118,13 +119,13 @@ const parseEmitArgs = (args: Expression[]): EmitArgs => {
 };
 
 const buildTopics = (
-  s: Saucer,
+  s: SaucerLike,
   signature: string,
   fields: Map<string, Expression>,
   indexedNames: string[],
-  process: (e: Expression) => Saucer,
-): Saucer[] => {
-  const topic0 = new Saucer(s.ctx).int(BigInt(keccak256(toBytes(signature))));
+  process: (e: Expression) => SaucerLike,
+): SaucerLike[] => {
+  const topic0 = s.ctx.newSaucer().int(BigInt(keccak256(toBytes(signature))));
 
   return [
     topic0,
@@ -137,18 +138,18 @@ const buildTopics = (
 };
 
 const buildData = (
-  s: Saucer,
+  s: SaucerLike,
   fields: Map<string, Expression>,
   indexedNames: string[],
-  process: (e: Expression) => Saucer,
-): Saucer => {
+  process: (e: Expression) => SaucerLike,
+): SaucerLike => {
   const nonIndexed = [...fields.entries()]
     .filter(([name]) => !indexedNames.includes(name))
     .map(([, expr]) => process(expr));
 
   return nonIndexed.length > 0
-    ? s.abiEncode(new Saucer(s.ctx).tuple(nonIndexed))
-    : new Saucer(s.ctx).bytes(new Uint8Array());
+    ? s.abiEncode(s.ctx.newSaucer().tuple(nonIndexed))
+    : s.ctx.newSaucer().bytes(new Uint8Array());
 };
 
 // Each global maps method/property names to { kind, compile }.
@@ -169,7 +170,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   Math: {
     sqrt: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('Math.sqrt', 1, args);
 
         return s.sqrt(process(args[0]));
@@ -177,7 +178,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     mulDiv: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('Math.mulDiv', 3, args);
 
         return s.mulDiv(process(args[0]), process(args[1]), process(args[2]));
@@ -185,7 +186,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     neg: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('Math.neg', 1, args);
 
         return s.neg(process(args[0]));
@@ -202,7 +203,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   crypto: {
     keccak256: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('crypto.keccak256', 1, args);
 
         return s.keccak256(process(args[0]));
@@ -210,7 +211,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     ecdsaVerify: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('crypto.ecdsaVerify', 3, args);
 
         return s.ecdsaVerify(process(args[0]), process(args[1]), process(args[2]));
@@ -232,7 +233,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   storage: {
     read: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('storage.read', 1, args);
 
         return s.sload(process(args[0]));
@@ -240,7 +241,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     write: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('storage.write', 2, args);
 
         return s.sstore(process(args[0]), process(args[1]));
@@ -248,7 +249,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     tRead: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('storage.tRead', 1, args);
 
         return s.tload(process(args[0]));
@@ -256,7 +257,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     tWrite: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('storage.tWrite', 2, args);
 
         return s.tstore(process(args[0]), process(args[1]));
@@ -269,7 +270,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   Uint8Array: {
     from: {
       kind: 'dynamic',
-      compile: (s: Saucer, args: Expression[], _process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], _process: (e: Expression) => SaucerLike) => {
         if (args.length !== 1) throw new Error('Uint8Array expects exactly 1 argument');
 
         if (args[0].type !== 'ArrayExpression') throw new Error('Uint8Array expects an array literal');
@@ -297,20 +298,20 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   abi: {
     encode: {
       kind: 'dynamic',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         if (args.length === 0) throw new Error('abi.encode expects at least 1 argument');
 
         const tuple =
           args.length === 1 && args[0].type === 'ObjectExpression'
             ? process(args[0])
-            : new Saucer(s.ctx).tuple(args.map(process));
+            : s.ctx.newSaucer().tuple(args.map(process));
 
         return s.abiEncode(tuple);
       },
     },
     decode: {
       kind: 'dynamic',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         if (args.length < 2) throw new Error('abi.decode expects data and at least 1 type argument');
 
         const data = process(args[0]);
@@ -326,9 +327,9 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   // msg.value   — wei sent with the call (uint256)
   // msg.data    — raw calldata (bytes)
   msg: {
-    sender: { kind: 'scalar', compile: (s: Saucer) => s.msgSender() },
-    value: { kind: 'scalar', compile: (s: Saucer) => s.msgValue() },
-    data: { kind: 'dynamic', compile: (s: Saucer) => s.msgData() },
+    sender: { kind: 'scalar', compile: (s: SaucerLike) => s.msgSender() },
+    value: { kind: 'scalar', compile: (s: SaucerLike) => s.msgValue() },
+    data: { kind: 'dynamic', compile: (s: SaucerLike) => s.msgData() },
   },
 
   // block.number      — current block number
@@ -340,21 +341,21 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   // block.blobBaseFee  — blob base fee (EIP-4844)
   // block.chainId      — chain ID (e.g. 1 for mainnet, 31337 for anvil)
   block: {
-    number: { kind: 'scalar', compile: (s: Saucer) => s.blockNumber() },
-    timestamp: { kind: 'scalar', compile: (s: Saucer) => s.blockTimestamp() },
-    coinbase: { kind: 'scalar', compile: (s: Saucer) => s.blockCoinbase() },
-    prevrandao: { kind: 'scalar', compile: (s: Saucer) => s.blockPrevrandao() },
-    gasLimit: { kind: 'scalar', compile: (s: Saucer) => s.blockGasLimit() },
-    baseFee: { kind: 'scalar', compile: (s: Saucer) => s.blockBaseFee() },
-    blobBaseFee: { kind: 'scalar', compile: (s: Saucer) => s.blockBlobBaseFee() },
-    chainId: { kind: 'scalar', compile: (s: Saucer) => s.blockChainId() },
+    number: { kind: 'scalar', compile: (s: SaucerLike) => s.blockNumber() },
+    timestamp: { kind: 'scalar', compile: (s: SaucerLike) => s.blockTimestamp() },
+    coinbase: { kind: 'scalar', compile: (s: SaucerLike) => s.blockCoinbase() },
+    prevrandao: { kind: 'scalar', compile: (s: SaucerLike) => s.blockPrevrandao() },
+    gasLimit: { kind: 'scalar', compile: (s: SaucerLike) => s.blockGasLimit() },
+    baseFee: { kind: 'scalar', compile: (s: SaucerLike) => s.blockBaseFee() },
+    blobBaseFee: { kind: 'scalar', compile: (s: SaucerLike) => s.blockBlobBaseFee() },
+    chainId: { kind: 'scalar', compile: (s: SaucerLike) => s.blockChainId() },
   },
 
   // tx.origin    — transaction originator address
   // tx.gasPrice  — gas price of the transaction
   tx: {
-    origin: { kind: 'scalar', compile: (s: Saucer) => s.txOrigin() },
-    gasPrice: { kind: 'scalar', compile: (s: Saucer) => s.txGasPrice() },
+    origin: { kind: 'scalar', compile: (s: SaucerLike) => s.txOrigin() },
+    gasPrice: { kind: 'scalar', compile: (s: SaucerLike) => s.txGasPrice() },
   },
 
   // address.self               — this contract's address
@@ -365,11 +366,11 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   // address.isContract(addr)   — 1 if addr has code, 0 otherwise
   // address.isEOA(addr)        — 1 if addr has no code, 0 otherwise
   address: {
-    self: { kind: 'scalar', compile: (s: Saucer) => s.addressSelf() },
-    balance: { kind: 'scalar', compile: (s: Saucer) => s.addressBalance() },
+    self: { kind: 'scalar', compile: (s: SaucerLike) => s.addressSelf() },
+    balance: { kind: 'scalar', compile: (s: SaucerLike) => s.addressBalance() },
     balanceOf: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('address.balanceOf()', 1, args);
 
         return s.balanceOf(process(args[0]));
@@ -377,7 +378,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     codeSize: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('address.codeSize()', 1, args);
 
         return s.codeSize(process(args[0]));
@@ -385,7 +386,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     codeHash: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('address.codeHash()', 1, args);
 
         return s.codeHash(process(args[0]));
@@ -393,7 +394,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     isContract: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('address.isContract()', 1, args);
 
         return s.isContract(process(args[0]));
@@ -401,7 +402,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     isEOA: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('address.isEOA()', 1, args);
 
         return s.isEOA(process(args[0]));
@@ -421,7 +422,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   contract: {
     call: {
       kind: 'dynamic',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.call', 3, args);
 
         return s.externalCall(process(args[0]), process(args[1]), process(args[2]));
@@ -429,7 +430,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     static: {
       kind: 'dynamic',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.static', 2, args);
 
         return s.staticCall(process(args[0]), process(args[1]));
@@ -437,7 +438,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     delegate: {
       kind: 'dynamic',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.delegate', 2, args);
 
         return s.delegateCall(process(args[0]), process(args[1]));
@@ -445,7 +446,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     create: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.create', 2, args);
 
         return s.create(process(args[0]), process(args[1]));
@@ -453,7 +454,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     create2: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.create2', 3, args);
 
         return s.create2(process(args[0]), process(args[1]), process(args[2]));
@@ -461,7 +462,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     create3: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.create3', 3, args);
 
         return s.create3(process(args[0]), process(args[1]), process(args[2]));
@@ -469,7 +470,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     predictCreate: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.predictCreate', 2, args);
 
         return s.createAddress(process(args[0]), process(args[1]));
@@ -477,7 +478,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     predictCreate2: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.predictCreate2', 3, args);
 
         return s.create2Address(process(args[0]), process(args[1]), process(args[2]));
@@ -485,7 +486,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     },
     predictCreate3: {
       kind: 'scalar',
-      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+      compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.predictCreate3', 1, args);
 
         return s.create3Address(process(args[0]));
@@ -509,7 +510,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
 export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   gasLeft: {
     kind: 'scalar',
-    compile: (s: Saucer, args: Expression[], _process: (e: Expression) => Saucer) => {
+    compile: (s: SaucerLike, args: Expression[], _process: (e: Expression) => SaucerLike) => {
       expectArity('gasLeft()', 0, args);
 
       return s.gasLeft();
@@ -517,7 +518,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   },
   blockHash: {
     kind: 'scalar',
-    compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
       expectArity('blockHash()', 1, args);
 
       return s.blockHash(process(args[0]));
@@ -525,7 +526,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   },
   blobHash: {
     kind: 'scalar',
-    compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
       expectArity('blobHash()', 1, args);
 
       return s.blobHash(process(args[0]));
@@ -537,7 +538,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   //   emit("Transfer(address,address,uint256)", {from, to, value}, "from", "to")  — with indexed
   emit: {
     kind: 'scalar',
-    compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
       const { signature, fields, indexedNames } = parseEmitArgs(args);
       const topics = buildTopics(s, signature, fields, indexedNames, process);
       const data = buildData(s, fields, indexedNames, process);
@@ -547,7 +548,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   },
   eval: {
     kind: 'scalar',
-    compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
       expectArity('eval()', 1, args);
 
       // String literal: compile at compile time
@@ -556,7 +557,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
         const source = /function\s+main\s*\(/.test(code) ? code : `function main() { ${code} }`;
         const { bytecode } = compile(source);
 
-        return s.eval(new Saucer(s.ctx).bytes(bytecode[0]));
+        return s.eval(s.ctx.newSaucer().bytes(bytecode[0]));
       }
 
       // Dynamic: pass runtime bytecodes to EVAL opcode

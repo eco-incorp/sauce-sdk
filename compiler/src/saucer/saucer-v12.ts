@@ -1,0 +1,1066 @@
+import { OPS } from './ops.js';
+import { OPS_V12 } from './ops-v12.js';
+import { encodeInt } from './integer.js';
+import { encodeBytes, encodeString } from './bytes.js';
+import { encodeArray } from './array.js';
+import type { CompilerContext, VariableKind, ElementType, StructType } from '../context.js';
+import type { SaucerLike, SaucerIfLike, SaucerThenLike, SaucerLoopLike, OutputSpec } from './saucer-like.js';
+
+/**
+ * V12Saucer — postfix (stack-based) bytecode emitter for the engine-v12 Huff
+ * runtime, the gas-efficient sibling of the v1 Solidity interpreter.
+ *
+ *   v1  (Saucer):     [OP][a][b]            prefix tree, variables in slot memory
+ *   v12 (V12Saucer):  [a][b][OP]            postfix stack, params on the EVM stack
+ *
+ * It mirrors `Saucer`'s lowercase method surface (so the processor stays
+ * target-agnostic — see `SaucerLike`) while emitting bytes byte-identical to the
+ * engine-v12 Solidity `V12Saucer.sol` builder. Beyond the shared surface it tracks:
+ *
+ *   - stackEffect    net stack items the expression leaves behind
+ *   - isDynamic      whether the result is a heap descriptor (vs a 32-byte scalar)
+ *   - callPositions  CALL_FUNCTION offset sentinels   (0xFF00|index → byte offset)
+ *   - refPositions   parameter-read SDUP sentinels     (patched at assembly)
+ *
+ * Sentinels propagate on every compose: a child's byte positions shift by the
+ * preceding bytes and its REF depths shift by the preceding stackEffect
+ * (`mergeSentinels`). The assembly in `compile()` resolves them once all offsets
+ * are known. Non-commutative ops swap operands so `a - b` emits `[a][b][SUB]`
+ * with the engine's expected operand order.
+ *
+ * Local `let`/`const` variables still live in slot memory (`WRITE_VALUE`/
+ * `READ_VALUE`, postfix); only function PARAMETERS live on the stack (REF→SDUP
+ * read, SET→SSWAP+SDROP write). `read`/`store` consult the context to pick.
+ */
+
+export interface RefPlaceholder {
+  /** byte offset of the SDUP sentinel inside this builder's bytes */
+  position: number;
+  /** 0-indexed parameter slot (storedStackPos - 1) */
+  paramIndex: number;
+  /** stack depth at the point the REF was emitted */
+  depth: number;
+}
+
+export interface CallPlaceholder {
+  /** byte offset of the 2-byte CALL_FUNCTION sentinel */
+  pos: number;
+  funcIndex: number;
+}
+
+// Non-commutative ops: emit operands [a][b] but the engine wants [b][a], so swap.
+const SWAPPED_OPS = new Set<number>([
+  OPS.SUB,
+  OPS.DIV,
+  OPS.MOD,
+  OPS.EXP,
+  OPS.S_DIV,
+  OPS.S_MOD,
+  OPS.SIGN_EXTEND,
+  OPS.BOOL_GT,
+  OPS.BOOL_LT,
+  OPS.BOOL_GTE,
+  OPS.BOOL_LTE,
+  OPS.BOOL_SGT,
+  OPS.BOOL_SLT,
+  OPS.BOOL_SGTE,
+  OPS.BOOL_SLTE,
+]);
+
+const concat = (...parts: (Uint8Array | number[])[]): Uint8Array => {
+  const arrays = parts.map((p) => (p instanceof Uint8Array ? p : new Uint8Array(p)));
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrays) {
+    out.set(a, off);
+    off += a.length;
+  }
+
+  return out;
+};
+
+const MAX_BYTE_1 = 0xff;
+const MAX_BYTE_2 = 0xffff;
+
+export class V12Saucer implements SaucerLike {
+  constructor(
+    readonly ctx: CompilerContext,
+    readonly _bytes: Uint8Array = new Uint8Array(),
+    readonly stackEffect: number = 0,
+    readonly isDynamic: boolean = false,
+    readonly callPositions: CallPlaceholder[] = [],
+    readonly refPositions: RefPlaceholder[] = [],
+  ) {}
+
+  // ── sentinel propagation ──
+  private static merge(
+    calls: CallPlaceholder[],
+    refs: RefPlaceholder[],
+    src: V12Saucer,
+    posOffset: number,
+    depthOffset: number,
+  ): void {
+    for (const c of src.callPositions) calls.push({ pos: c.pos + posOffset, funcIndex: c.funcIndex });
+    for (const r of src.refPositions)
+      refs.push({ position: r.position + posOffset, paramIndex: r.paramIndex, depth: r.depth + depthOffset });
+  }
+
+  /** Append literal bytes (a constant/context op) to this builder. */
+  private withBytes(extra: Uint8Array | number[], stackEffect: number, isDynamic: boolean): V12Saucer {
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, extra),
+      stackEffect,
+      isDynamic,
+      [...this.callPositions],
+      [...this.refPositions],
+    );
+  }
+
+  join(other: SaucerLike): V12Saucer {
+    const o = other as V12Saucer;
+
+    if (o._bytes.length === 0) return this;
+
+    if (this._bytes.length === 0) return o;
+
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, o, this._bytes.length, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, o._bytes),
+      this.stackEffect + o.stackEffect,
+      o.isDynamic,
+      calls,
+      refs,
+    );
+  }
+
+  // ── core operand shapes ──
+
+  private binary(op: number, aL: SaucerLike, bL: SaucerLike, isDynamic = false): V12Saucer {
+    const a = aL as V12Saucer;
+    const b = bL as V12Saucer;
+    const [first, second] = SWAPPED_OPS.has(op) ? [b, a] : [a, b];
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    const firstOff = this._bytes.length;
+    V12Saucer.merge(calls, refs, first, firstOff, this.stackEffect);
+    V12Saucer.merge(calls, refs, second, firstOff + first._bytes.length, this.stackEffect + first.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, first._bytes, second._bytes, [op]),
+      this.stackEffect + a.stackEffect + b.stackEffect - 1,
+      isDynamic,
+      calls,
+      refs,
+    );
+  }
+
+  private unary(op: number, operandL: SaucerLike, isDynamic = false): V12Saucer {
+    const operand = operandL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, operand, this._bytes.length, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, operand._bytes, [op]),
+      this.stackEffect + operand.stackEffect,
+      isDynamic,
+      calls,
+      refs,
+    );
+  }
+
+  private ternary(op: number, aL: SaucerLike, bL: SaucerLike, cL: SaucerLike, isDynamic = false): V12Saucer {
+    const a = aL as V12Saucer;
+    const b = bL as V12Saucer;
+    const c = cL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    const aOff = this._bytes.length;
+    V12Saucer.merge(calls, refs, a, aOff, this.stackEffect);
+    const bOff = aOff + a._bytes.length;
+    V12Saucer.merge(calls, refs, b, bOff, this.stackEffect + a.stackEffect);
+    const cOff = bOff + b._bytes.length;
+    V12Saucer.merge(calls, refs, c, cOff, this.stackEffect + a.stackEffect + b.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, a._bytes, b._bytes, c._bytes, [op]),
+      this.stackEffect + a.stackEffect + b.stackEffect + c.stackEffect - 2,
+      isDynamic,
+      calls,
+      refs,
+    );
+  }
+
+  /** Append a sequence of operands (reverse order) followed by a header. */
+  private nary(operands: SaucerLike[], header: number[], stackEffect: number, isDynamic: boolean): V12Saucer {
+    const parts: Uint8Array[] = [this._bytes];
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    let posOff = this._bytes.length;
+    let depthOff = this.stackEffect;
+    for (let i = operands.length - 1; i >= 0; i--) {
+      const el = operands[i] as V12Saucer;
+      V12Saucer.merge(calls, refs, el, posOff, depthOff);
+      parts.push(el._bytes);
+      posOff += el._bytes.length;
+      depthOff += el.stackEffect;
+    }
+    parts.push(new Uint8Array(header));
+
+    return new V12Saucer(this.ctx, concat(...parts), stackEffect, isDynamic, calls, refs);
+  }
+
+  // ── context — nullary ──
+  msgSender(): V12Saucer {
+    return this.withBytes([OPS.MSG_SENDER], this.stackEffect + 1, false);
+  }
+  msgValue(): V12Saucer {
+    return this.withBytes([OPS.CALL_VALUE], this.stackEffect + 1, false);
+  }
+  msgData(): V12Saucer {
+    return this.withBytes([OPS.CALLDATA], this.stackEffect + 1, true);
+  }
+  blockNumber(): V12Saucer {
+    return this.withBytes([OPS.BLOCK_NUMBER], this.stackEffect + 1, false);
+  }
+  blockTimestamp(): V12Saucer {
+    return this.withBytes([OPS.TIMESTAMP], this.stackEffect + 1, false);
+  }
+  blockCoinbase(): V12Saucer {
+    return this.withBytes([OPS.COINBASE], this.stackEffect + 1, false);
+  }
+  blockPrevrandao(): V12Saucer {
+    return this.withBytes([OPS.PREVRANDAO], this.stackEffect + 1, false);
+  }
+  blockGasLimit(): V12Saucer {
+    return this.withBytes([OPS.GAS_LIMIT], this.stackEffect + 1, false);
+  }
+  blockBaseFee(): V12Saucer {
+    return this.withBytes([OPS.BASE_FEE], this.stackEffect + 1, false);
+  }
+  blockBlobBaseFee(): V12Saucer {
+    return this.withBytes([OPS.BLOB_BASE_FEE], this.stackEffect + 1, false);
+  }
+  blockChainId(): V12Saucer {
+    return this.withBytes([OPS.CHAIN_ID], this.stackEffect + 1, false);
+  }
+  txOrigin(): V12Saucer {
+    return this.withBytes([OPS.TX_ORIGIN], this.stackEffect + 1, false);
+  }
+  txGasPrice(): V12Saucer {
+    return this.withBytes([OPS.GAS_PRICE], this.stackEffect + 1, false);
+  }
+  addressSelf(): V12Saucer {
+    return this.withBytes([OPS.THIS_ADDRESS], this.stackEffect + 1, false);
+  }
+  addressBalance(): V12Saucer {
+    return this.withBytes([OPS.SELF_BALANCE], this.stackEffect + 1, false);
+  }
+  gasLeft(): V12Saucer {
+    return this.withBytes([OPS.GAS_LEFT], this.stackEffect + 1, false);
+  }
+
+  // ── context — unary ──
+  balanceOf(addr: SaucerLike): V12Saucer {
+    return this.unary(OPS.BALANCE, addr);
+  }
+  blockHash(n: SaucerLike): V12Saucer {
+    return this.unary(OPS.BLOCK_HASH, n);
+  }
+  codeSize(addr: SaucerLike): V12Saucer {
+    return this.unary(OPS.EXT_CODE_SIZE, addr);
+  }
+  codeHash(addr: SaucerLike): V12Saucer {
+    return this.unary(OPS.EXT_CODE_HASH, addr);
+  }
+  blobHash(n: SaucerLike): V12Saucer {
+    return this.unary(OPS.BLOB_HASH, n);
+  }
+  isContract(addr: SaucerLike): V12Saucer {
+    return this.unary(OPS.IS_CONTRACT, addr);
+  }
+  isEOA(addr: SaucerLike): V12Saucer {
+    return this.unary(OPS.IS_EOA, addr);
+  }
+
+  // ── values ──
+  int(value: bigint): V12Saucer {
+    return this.withBytes(encodeInt(value), this.stackEffect + 1, false);
+  }
+  bytes(data: Uint8Array): V12Saucer {
+    return this.withBytes(encodeBytes(data), this.stackEffect + 1, true);
+  }
+  string(value: string): V12Saucer {
+    return this.withBytes(encodeString(value), this.stackEffect + 1, true);
+  }
+
+  tuple(elements: SaucerLike[]): V12Saucer {
+    if (elements.length > MAX_BYTE_1) throw new Error(`tuple too large: ${elements.length} exceeds ${MAX_BYTE_1}`);
+
+    return this.nary(elements, [OPS.TUPLE, elements.length], this.naryEffect(elements), true);
+  }
+
+  array(elements: SaucerLike[]): V12Saucer {
+    // An array literal is a self-contained constant whose encoding (static-packed
+    // for fixed-width literals, inlined for dynamic literals) is identical in v1
+    // and v12 — the engine reads it the same way. Reuse the shared encoder.
+    return this.withBytes(encodeArray(elements), this.stackEffect + 1, true);
+  }
+
+  private naryEffect(elements: SaucerLike[]): number {
+    const sum = elements.reduce((n, e) => n + (e as V12Saucer).stackEffect, 0);
+
+    return this.stackEffect + sum - (elements.length - 1);
+  }
+
+  index(arr: SaucerLike, idx: SaucerLike): V12Saucer {
+    // v12: [idx][arr][INDEX] — idx deeper, array on top.
+    const i = idx as V12Saucer;
+    const a = arr as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, i, this._bytes.length, this.stackEffect);
+    V12Saucer.merge(calls, refs, a, this._bytes.length + i._bytes.length, this.stackEffect + i.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, i._bytes, a._bytes, [OPS.INDEX]),
+      this.stackEffect + i.stackEffect + a.stackEffect - 1,
+      false,
+      calls,
+      refs,
+    );
+  }
+
+  length(arr: SaucerLike): V12Saucer {
+    return this.unary(OPS.LENGTH, arr, false);
+  }
+
+  /** Wrap a scalar operand as a heap descriptor for ops that consume dynamic data. */
+  private static wrapDescriptor(op: V12Saucer): { bytes: Uint8Array; extra: number } {
+    return op.isDynamic ? { bytes: op._bytes, extra: 0 } : { bytes: concat(op._bytes, [OPS_V12.MSTORE]), extra: 1 };
+  }
+
+  concat(operands: SaucerLike[]): V12Saucer {
+    if (operands.length === 0 || operands.length > MAX_BYTE_1)
+      throw new Error(`concat requires 1-255 operands, got ${operands.length}`);
+
+    const parts: Uint8Array[] = [this._bytes];
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    let posOff = this._bytes.length;
+    let depthOff = this.stackEffect;
+    for (let i = operands.length - 1; i >= 0; i--) {
+      const el = operands[i] as V12Saucer;
+      const wrapped = V12Saucer.wrapDescriptor(el);
+      V12Saucer.merge(calls, refs, el, posOff, depthOff);
+      parts.push(wrapped.bytes);
+      posOff += wrapped.bytes.length;
+      depthOff += el.stackEffect;
+    }
+    parts.push(new Uint8Array([OPS.CONCAT, operands.length]));
+
+    return new V12Saucer(this.ctx, concat(...parts), this.naryEffect(operands), true, calls, refs);
+  }
+
+  slice(dataL: SaucerLike, offsetL: SaucerLike, lengthL: SaucerLike): V12Saucer {
+    const data = dataL as V12Saucer;
+
+    if (data.isDynamic) return this.ternary(OPS.SLICE, data, offsetL, lengthL, true);
+
+    // Insert MSTORE after a scalar data operand to make a heap descriptor.
+    const offset = offsetL as V12Saucer;
+    const length = lengthL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    const dataOff = this._bytes.length;
+    V12Saucer.merge(calls, refs, data, dataOff, this.stackEffect);
+    const offsetOff = dataOff + data._bytes.length + 1; // +1 for MSTORE
+    V12Saucer.merge(calls, refs, offset, offsetOff, this.stackEffect + data.stackEffect);
+    const lengthOff = offsetOff + offset._bytes.length;
+    V12Saucer.merge(calls, refs, length, lengthOff, this.stackEffect + data.stackEffect + offset.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, data._bytes, [OPS_V12.MSTORE], offset._bytes, length._bytes, [OPS.SLICE]),
+      this.stackEffect + data.stackEffect + offset.stackEffect + length.stackEffect - 2,
+      true,
+      calls,
+      refs,
+    );
+  }
+
+  abiEncode(tuple: SaucerLike): V12Saucer {
+    return this.unary(OPS.ABI_ENCODE, tuple, true);
+  }
+
+  abiDecode(count: number, dataL: SaucerLike, typeSpecs: number[]): V12Saucer {
+    const data = dataL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, data, this._bytes.length, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, data._bytes, [OPS.ABI_DECODE, count], typeSpecs),
+      this.stackEffect + data.stackEffect,
+      true,
+      calls,
+      refs,
+    );
+  }
+
+  /** v12-only: CAST a dynamic value to a scalar word. */
+  cast(data: SaucerLike): V12Saucer {
+    return this.unary(OPS.CAST, data, false);
+  }
+
+  // ── variables ──
+  store(
+    name: string,
+    valueL: SaucerLike,
+    _kind: VariableKind = 'scalar',
+    elementType?: ElementType,
+    structType?: StructType,
+  ): V12Saucer {
+    const value = valueL as V12Saucer;
+    const existing = this.ctx.getVar(name);
+
+    if (existing?.isParam) {
+      // SET: [value][SSWAP_pos][SDROP] — replace the param in place on the stack.
+      const pos = this.ctx.findStackVar(name);
+
+      if (pos < 1 || pos > 16) throw new Error(`param '${name}' out of stack range: ${pos}`);
+
+      const calls = [...this.callPositions];
+      const refs = [...this.refPositions];
+      V12Saucer.merge(calls, refs, value, this._bytes.length, this.stackEffect);
+
+      return new V12Saucer(
+        this.ctx,
+        concat(this._bytes, value._bytes, [OPS_V12.SSWAP1 + pos - 1, OPS_V12.SDROP]),
+        this.stackEffect + value.stackEffect - 1,
+        false,
+        calls,
+        refs,
+      );
+    }
+
+    // Local: slot store, postfix [value][WRITE_VALUE/WRITE_HEAP][slot].
+    const kind: VariableKind = value.isDynamic ? 'dynamic' : 'scalar';
+    const variable = existing ?? this.ctx.setVar(name, kind, elementType, structType);
+    const op = variable.kind === 'scalar' ? OPS.WRITE_VALUE : OPS.WRITE_HEAP;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, value, this._bytes.length, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, value._bytes, [op, variable.slot]),
+      this.stackEffect + value.stackEffect - 1,
+      variable.kind !== 'scalar',
+      calls,
+      refs,
+    );
+  }
+
+  read(name: string): V12Saucer {
+    const variable = this.ctx.getVar(name);
+
+    if (!variable) throw new Error(`undefined variable: ${name}`);
+
+    if (variable.isParam) {
+      // REF: emit an SDUP sentinel (placeholder); compile() patches the real depth.
+      const storedPos = this.ctx.getStackVarPos(name);
+
+      if (storedPos < 1 || storedPos > 16) throw new Error(`param '${name}' out of stack range: ${storedPos}`);
+
+      const refs = [
+        ...this.refPositions,
+        { position: this._bytes.length, paramIndex: storedPos - 1, depth: this.stackEffect },
+      ];
+
+      return new V12Saucer(
+        this.ctx,
+        concat(this._bytes, [OPS_V12.SDUP1 + storedPos - 1]),
+        this.stackEffect + 1,
+        false,
+        [...this.callPositions],
+        refs,
+      );
+    }
+
+    const op = variable.kind === 'scalar' ? OPS.READ_VALUE : OPS.READ_HEAP;
+
+    return this.withBytes([op, variable.slot], this.stackEffect + 1, variable.kind !== 'scalar');
+  }
+
+  // ── arithmetic ──
+  add(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.ADD, l, r);
+  }
+  sub(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.SUB, l, r);
+  }
+  neg(o: SaucerLike): V12Saucer {
+    return this.unary(OPS.NEG, o);
+  }
+  mul(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.MUL, l, r);
+  }
+  div(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.DIV, l, r);
+  }
+  mod(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.MOD, l, r);
+  }
+  exp(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.EXP, l, r);
+  }
+  sqrt(o: SaucerLike): V12Saucer {
+    return this.unary(OPS.SQRT, o);
+  }
+  mulDiv(a: SaucerLike, b: SaucerLike, c: SaucerLike): V12Saucer {
+    return this.ternary(OPS.MUL_DIV, a, b, c);
+  }
+
+  // ── extended / signed arithmetic (v12-only) ──
+  addMod(a: SaucerLike, b: SaucerLike, n: SaucerLike): V12Saucer {
+    return this.ternary(OPS.ADD_MOD, a, b, n);
+  }
+  mulMod(a: SaucerLike, b: SaucerLike, n: SaucerLike): V12Saucer {
+    return this.ternary(OPS.MUL_MOD, a, b, n);
+  }
+  sDiv(a: SaucerLike, b: SaucerLike): V12Saucer {
+    return this.binary(OPS.S_DIV, a, b);
+  }
+  sMod(a: SaucerLike, b: SaucerLike): V12Saucer {
+    return this.binary(OPS.S_MOD, a, b);
+  }
+  sAr(value: SaucerLike, shift: SaucerLike): V12Saucer {
+    return this.binary(OPS.S_AR, value, shift);
+  }
+  signExtend(k: SaucerLike, value: SaucerLike): V12Saucer {
+    return this.binary(OPS.SIGN_EXTEND, k, value);
+  }
+  sgt(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_SGT, l, r);
+  }
+  slt(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_SLT, l, r);
+  }
+  sgte(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_SGTE, l, r);
+  }
+  slte(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_SLTE, l, r);
+  }
+
+  // ── crypto ──
+  keccak256(dataL: SaucerLike): V12Saucer {
+    const data = dataL as V12Saucer;
+
+    if (data.isDynamic) return this.unary(OPS.KECCAK256, data, false);
+
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, data, this._bytes.length, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, data._bytes, [OPS_V12.MSTORE, OPS.KECCAK256]),
+      this.stackEffect + data.stackEffect,
+      false,
+      calls,
+      refs,
+    );
+  }
+  ecdsaVerify(signer: SaucerLike, hash: SaucerLike, signature: SaucerLike): V12Saucer {
+    return this.ternary(OPS.ECDSA_VERIFY, signer, hash, signature, false);
+  }
+
+  // ── storage ──
+  sload(slot: SaucerLike): V12Saucer {
+    return this.unary(OPS.SLOAD, slot);
+  }
+  sstore(slot: SaucerLike, value: SaucerLike): V12Saucer {
+    // v12: [value][slot][SSTORE] — value before slot.
+    return this.binaryRaw(OPS.SSTORE, value, slot, false);
+  }
+  tload(key: SaucerLike): V12Saucer {
+    return this.unary(OPS.TLOAD, key);
+  }
+  tstore(key: SaucerLike, value: SaucerLike): V12Saucer {
+    return this.binaryRaw(OPS.TSTORE, value, key, false);
+  }
+
+  /** Binary op with explicit (no-swap) operand order: [first][second][OP]. */
+  private binaryRaw(op: number, firstL: SaucerLike, secondL: SaucerLike, isDynamic: boolean): V12Saucer {
+    const first = firstL as V12Saucer;
+    const second = secondL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, first, this._bytes.length, this.stackEffect);
+    V12Saucer.merge(
+      calls,
+      refs,
+      second,
+      this._bytes.length + first._bytes.length,
+      this.stackEffect + first.stackEffect,
+    );
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, first._bytes, second._bytes, [op]),
+      this.stackEffect + first.stackEffect + second.stackEffect - 2,
+      isDynamic,
+      calls,
+      refs,
+    );
+  }
+
+  // ── create ──
+  create(value: SaucerLike, bytecode: SaucerLike): V12Saucer {
+    return this.binary(OPS.CREATE, value, bytecode);
+  }
+  create2(value: SaucerLike, salt: SaucerLike, bytecode: SaucerLike): V12Saucer {
+    return this.ternary(OPS.CREATE2, value, salt, bytecode);
+  }
+  create3(value: SaucerLike, salt: SaucerLike, bytecode: SaucerLike): V12Saucer {
+    return this.ternary(OPS.CREATE3, value, salt, bytecode);
+  }
+  createAddress(deployer: SaucerLike, nonce: SaucerLike): V12Saucer {
+    return this.binary(OPS.CREATE_ADDRESS, deployer, nonce);
+  }
+  create2Address(deployer: SaucerLike, salt: SaucerLike, bytecodeHash: SaucerLike): V12Saucer {
+    return this.ternary(OPS.CREATE2_ADDRESS, deployer, salt, bytecodeHash);
+  }
+  create3Address(salt: SaucerLike): V12Saucer {
+    return this.unary(OPS.CREATE3_ADDRESS, salt);
+  }
+
+  // ── bitwise ──
+  bitAnd(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.AND, l, r);
+  }
+  bitOr(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.OR, l, r);
+  }
+  bitXor(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.XOR, l, r);
+  }
+  bitNot(o: SaucerLike): V12Saucer {
+    return this.unary(OPS.NOT, o);
+  }
+  shl(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.SHL, l, r);
+  }
+  shr(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.SHR, l, r);
+  }
+
+  // ── comparison / boolean ──
+  eq(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_EQ, l, r);
+  }
+  neq(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_NEQ, l, r);
+  }
+  gt(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_GT, l, r);
+  }
+  lt(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_LT, l, r);
+  }
+  gte(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_GTE, l, r);
+  }
+  lte(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_LTE, l, r);
+  }
+  and(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_AND, l, r);
+  }
+  or(l: SaucerLike, r: SaucerLike): V12Saucer {
+    return this.binary(OPS.BOOL_OR, l, r);
+  }
+  not(o: SaucerLike): V12Saucer {
+    return this.unary(OPS.BOOL_NOT, o);
+  }
+  isZero(o: SaucerLike): V12Saucer {
+    return this.unary(OPS.BOOL_ZERO, o);
+  }
+  isNotZero(o: SaucerLike): V12Saucer {
+    return this.unary(OPS.BOOL_NOT_ZERO, o);
+  }
+
+  // ── control flow ──
+  if(condition: SaucerLike): SaucerIfLike {
+    return new V12If(this, condition as V12Saucer);
+  }
+  for(init?: SaucerLike, condition?: SaucerLike, update?: SaucerLike): SaucerLoopLike {
+    const parent = init ? this.join(init) : this;
+
+    return new V12Loop(parent, condition as V12Saucer | undefined, update as V12Saucer | undefined);
+  }
+  while(condition: SaucerLike): SaucerLoopLike {
+    return new V12Loop(this, condition as V12Saucer, undefined);
+  }
+  break(): V12Saucer {
+    throw new Error('break is not supported with target v12 yet');
+  }
+  continue(): V12Saucer {
+    throw new Error('continue is not supported with target v12 yet');
+  }
+
+  // ── calls ──
+  callFunction(functionName: string, args: SaucerLike[]): V12Saucer {
+    if (args.length > MAX_BYTE_1) throw new Error(`too many params (max 255), got ${args.length}`);
+
+    const index = this.ctx.getFunc(functionName);
+    const parts: Uint8Array[] = [this._bytes];
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    let posOff = this._bytes.length;
+    let depthOff = this.stackEffect;
+    for (const argL of args) {
+      const arg = argL as V12Saucer;
+      V12Saucer.merge(calls, refs, arg, posOff, depthOff);
+      parts.push(arg._bytes);
+      posOff += arg._bytes.length;
+      depthOff += arg.stackEffect;
+    }
+    const sentinel = (0xff00 | index) & 0xffff;
+    const callPos = posOff + 1; // position of the 2-byte sentinel
+    parts.push(new Uint8Array([OPS.CALL_FUNCTION, (sentinel >> 8) & 0xff, sentinel & 0xff, args.length]));
+    calls.push({ pos: callPos, funcIndex: index });
+    const sum = args.reduce((n, a) => n + (a as V12Saucer).stackEffect, 0);
+
+    return new V12Saucer(this.ctx, concat(...parts), this.stackEffect + sum - args.length + 1, false, calls, refs);
+  }
+
+  externalCall(target: SaucerLike, value: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
+    const raw = this.ternary(OPS.CALL, target, value, calldata, true);
+
+    return raw.decodeOutput(output);
+  }
+  staticCall(target: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
+    const raw = this.binaryRaw(OPS.STATIC, target, calldata, true);
+
+    return raw.decodeOutput(output);
+  }
+  delegateCall(target: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
+    const raw = this.binaryRaw(OPS.DELEGATE, target, calldata, true);
+
+    return raw.decodeOutput(output);
+  }
+
+  private decodeOutput(output?: OutputSpec): V12Saucer {
+    if (!output?.count) return this;
+
+    // Decode in place: the raw call bytes ARE the data operand of ABI_DECODE.
+    const decoded = new V12Saucer(this.ctx).abiDecode(output.count, this, output.typeSpecs);
+
+    if (output.count > 1) return decoded;
+
+    return new V12Saucer(this.ctx).index(decoded, new V12Saucer(this.ctx).int(0n));
+  }
+
+  catch(handlerL: SaucerLike): V12Saucer {
+    const handler = handlerL as V12Saucer;
+
+    if (handler._bytes.length > MAX_BYTE_1)
+      throw new Error(`catch handler too large: ${handler._bytes.length} bytes exceeds 255`);
+
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, handler, this._bytes.length + 2, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, [OPS.CATCH, handler._bytes.length], handler._bytes),
+      this.stackEffect,
+      this.isDynamic,
+      calls,
+      refs,
+    );
+  }
+
+  // ── statements ──
+  return(saucer?: SaucerLike): V12Saucer {
+    // v12: the return value is just left on the stack; build() appends MSTORE and
+    // the assembly terminates the function. No explicit STOP byte.
+    return saucer ? this.join(saucer) : this;
+  }
+
+  revert(dataL: SaucerLike): V12Saucer {
+    const data = dataL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    V12Saucer.merge(calls, refs, data, this._bytes.length, this.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, data._bytes, [OPS.REVERT]),
+      this.stackEffect + data.stackEffect - 1,
+      false,
+      calls,
+      refs,
+    );
+  }
+
+  log(dataL: SaucerLike, topics: SaucerLike[]): V12Saucer {
+    if (topics.length > 4) throw new Error(`log supports 0-4 topics, got ${topics.length}`);
+
+    const data = dataL as V12Saucer;
+    const parts: Uint8Array[] = [this._bytes, data._bytes];
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    let posOff = this._bytes.length;
+    let depthOff = this.stackEffect;
+    V12Saucer.merge(calls, refs, data, posOff, depthOff);
+    posOff += data._bytes.length;
+    depthOff += data.stackEffect;
+    let sum = data.stackEffect;
+    for (const topicL of topics) {
+      const topic = topicL as V12Saucer;
+      V12Saucer.merge(calls, refs, topic, posOff, depthOff);
+      parts.push(topic._bytes);
+      posOff += topic._bytes.length;
+      depthOff += topic.stackEffect;
+      sum += topic.stackEffect;
+    }
+    parts.push(new Uint8Array([OPS.LOG, topics.length]));
+
+    return new V12Saucer(this.ctx, concat(...parts), this.stackEffect + sum - topics.length - 1, false, calls, refs);
+  }
+
+  eval(bytecode: SaucerLike): V12Saucer {
+    return this.unary(OPS.EVAL, bytecode, true);
+  }
+
+  // ── raw stack ops (v12-only) ──
+  sswap(n: number): V12Saucer {
+    if (n < 1 || n > 16) throw new Error(`SSWAP position out of range (1-16): ${n}`);
+
+    return this.withBytes([OPS_V12.SSWAP1 + n - 1], this.stackEffect, this.isDynamic);
+  }
+  sdrop(): V12Saucer {
+    return this.withBytes([OPS_V12.SDROP], this.stackEffect - 1, this.isDynamic);
+  }
+  srot(): V12Saucer {
+    return this.withBytes([OPS_V12.SROT], this.stackEffect, this.isDynamic);
+  }
+
+  // ── build ──
+  /** Main body: append MSTORE for a scalar result (the engine expects a descriptor). */
+  build(): Uint8Array {
+    if (!this.isDynamic && this._bytes.length > 0) {
+      return concat(this._bytes, [OPS_V12.MSTORE]);
+    }
+
+    return this._bytes;
+  }
+
+  /** Helper body: prepend ALLOCATE_VALUE/ALLOCATE_HEAP for local slots (no MSTORE). */
+  buildFunctionBody(): Uint8Array {
+    const prefix: number[] = [];
+
+    if (this.ctx.valueSlotCount > 0) prefix.push(OPS.ALLOCATE_VALUE, this.ctx.valueSlotCount);
+
+    if (this.ctx.heapSlotCount > 0) prefix.push(OPS.ALLOCATE_HEAP, this.ctx.heapSlotCount);
+
+    return prefix.length > 0 ? concat(new Uint8Array(prefix), this._bytes) : this._bytes;
+  }
+}
+
+// ── control-flow helper classes (mirror v1 SaucerIf/SaucerThen/SaucerLoop) ──
+
+class V12If implements SaucerIfLike {
+  constructor(
+    private readonly parent: V12Saucer,
+    private readonly condition: V12Saucer,
+  ) {}
+
+  then(thenBodyL: SaucerLike): SaucerThenLike {
+    const thenBody = thenBodyL as V12Saucer;
+    const parent = this.parent;
+    const cond = this.condition;
+    const thenLen = thenBody._bytes.length;
+    const stackEffect = parent.stackEffect + cond.stackEffect - 1 + thenBody.stackEffect;
+
+    const calls = [...parent.callPositions];
+    const refs = [...parent.refPositions];
+
+    if (thenLen > MAX_BYTE_1) {
+      // IF_2 with a 2-byte skip.
+      if (thenLen > MAX_BYTE_2) throw new Error(`body too large: ${thenLen} bytes exceeds ${MAX_BYTE_2}`);
+
+      mergeInto(calls, refs, cond, parent._bytes.length, parent.stackEffect);
+      const ifOpOffset = parent._bytes.length + cond._bytes.length;
+      const bytes = concat(
+        parent._bytes,
+        cond._bytes,
+        [OPS.IF_2, (thenLen >> 8) & 0xff, thenLen & 0xff],
+        thenBody._bytes,
+      );
+      mergeInto(calls, refs, thenBody, ifOpOffset + 3, parent.stackEffect + cond.stackEffect - 1);
+
+      return new V12Then(parent.ctx, bytes, stackEffect, thenBody.isDynamic, calls, refs, ifOpOffset, true);
+    }
+
+    mergeInto(calls, refs, cond, parent._bytes.length, parent.stackEffect);
+    const ifOpOffset = parent._bytes.length + cond._bytes.length;
+    const bytes = concat(parent._bytes, cond._bytes, [OPS.IF, thenLen], thenBody._bytes);
+    mergeInto(calls, refs, thenBody, ifOpOffset + 2, parent.stackEffect + cond.stackEffect - 1);
+
+    return new V12Then(parent.ctx, bytes, stackEffect, thenBody.isDynamic, calls, refs, ifOpOffset, false);
+  }
+}
+
+class V12Then extends V12Saucer implements SaucerThenLike {
+  constructor(
+    ctx: CompilerContext,
+    bytes: Uint8Array,
+    stackEffect: number,
+    isDynamic: boolean,
+    calls: CallPlaceholder[],
+    refs: RefPlaceholder[],
+    private readonly ifOpOffset: number,
+    private readonly wide: boolean,
+  ) {
+    super(ctx, bytes, stackEffect, isDynamic, calls, refs);
+  }
+
+  else(elseBodyL: SaucerLike): V12Saucer {
+    const elseBody = elseBodyL as V12Saucer;
+    const elseLen = elseBody._bytes.length;
+    const skipOffset = this.ifOpOffset + 1;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+
+    const jumpWide = elseLen > MAX_BYTE_1;
+
+    if (jumpWide && elseLen > MAX_BYTE_2) throw new Error(`body too large: ${elseLen} bytes exceeds ${MAX_BYTE_2}`);
+
+    const jumpHeader = jumpWide ? [OPS.JUMP_2, (elseLen >> 8) & 0xff, elseLen & 0xff] : [OPS.JUMP, elseLen];
+    const bytes = new Uint8Array(concat(this._bytes, jumpHeader, elseBody._bytes));
+
+    // Grow the IF skip so a false condition jumps past the then-body AND the JUMP.
+    const cur = this.wide ? (this._bytes[skipOffset] << 8) | this._bytes[skipOffset + 1] : this._bytes[skipOffset];
+    const next = cur + jumpHeader.length;
+
+    if (this.wide) {
+      bytes[skipOffset] = (next >> 8) & 0xff;
+      bytes[skipOffset + 1] = next & 0xff;
+    } else {
+      if (next > MAX_BYTE_1) throw new Error(`body too large: ${next} bytes exceeds ${MAX_BYTE_1}`);
+
+      bytes[skipOffset] = next & 0xff;
+    }
+
+    mergeInto(calls, refs, elseBody, this._bytes.length + jumpHeader.length, this.stackEffect);
+
+    return new V12Saucer(this.ctx, bytes, this.stackEffect + elseBody.stackEffect, elseBody.isDynamic, calls, refs);
+  }
+}
+
+class V12Loop implements SaucerLoopLike {
+  constructor(
+    private readonly parent: V12Saucer,
+    private readonly condition?: V12Saucer,
+    private readonly update?: V12Saucer,
+  ) {}
+
+  loop(bodyL: SaucerLike): V12Saucer {
+    const body = bodyL as V12Saucer;
+    const parent = this.parent;
+    const ctx = parent.ctx;
+    const empty = new V12Saucer(ctx);
+    const condition = this.condition ?? empty;
+    const update = this.update ?? empty;
+
+    // FOR layout: [parent][JUMP incrLen][update][condition][IF skip][body][JUMP_BACK]
+    const calls = [...parent.callPositions];
+    const refs = [...parent.refPositions];
+
+    const incrLen = update._bytes.length;
+    const jumpHeader = incrLen > MAX_BYTE_1 ? [OPS.JUMP_2, (incrLen >> 8) & 0xff, incrLen & 0xff] : [OPS.JUMP, incrLen];
+
+    let posOff = parent._bytes.length + jumpHeader.length;
+    mergeInto(calls, refs, update, posOff, parent.stackEffect);
+    posOff += update._bytes.length;
+    mergeInto(calls, refs, condition, posOff, parent.stackEffect);
+    posOff += condition._bytes.length;
+
+    const head = concat(parent._bytes, jumpHeader, update._bytes, condition._bytes, [OPS.IF, 0]);
+    const ifOffset = head.length - 2; // IF opcode position; skip byte at ifOffset+1
+    // Back-jump span = [increment][condition][IF+skip] + body + JUMP_BACK. It lands
+    // at the increment (AFTER the JUMP-over-increment header), so exclude that header.
+    const loopPartsLen = incrLen + condition._bytes.length + 2;
+
+    const bodyLen = body._bytes.length;
+
+    if (bodyLen > MAX_BYTE_2) throw new Error(`loop body too large: ${bodyLen} bytes exceeds ${MAX_BYTE_2}`);
+
+    const baseBackCount = loopPartsLen + bodyLen;
+
+    let prefix: Uint8Array;
+    let backHeader: number[];
+
+    if (bodyLen > 253 || baseBackCount + 2 > MAX_BYTE_1) {
+      const skipVal = bodyLen + 3; // body + JUMP_BACK_2(1) + count(2)
+
+      if (skipVal > MAX_BYTE_1) {
+        // Upgrade IF → IF_2 (2-byte skip), shifting body sentinels by +1.
+        const before = head.slice(0, ifOffset);
+        prefix = concat(before, [OPS.IF_2, (skipVal >> 8) & 0xff, skipVal & 0xff]);
+        const backCount = loopPartsLen + 1 + bodyLen + 3;
+
+        if (backCount > MAX_BYTE_2) throw new Error(`loop too large: ${backCount} exceeds ${MAX_BYTE_2}`);
+
+        backHeader = [OPS.JUMP_BACK_2, (backCount >> 8) & 0xff, backCount & 0xff];
+      } else {
+        prefix = new Uint8Array(head);
+        prefix[ifOffset + 1] = skipVal & 0xff;
+        const backCount = baseBackCount + 3;
+
+        if (backCount > MAX_BYTE_2) throw new Error(`loop too large: ${backCount} exceeds ${MAX_BYTE_2}`);
+
+        backHeader = [OPS.JUMP_BACK_2, (backCount >> 8) & 0xff, backCount & 0xff];
+      }
+    } else {
+      const skipVal = bodyLen + 2; // body + JUMP_BACK(2)
+      prefix = new Uint8Array(head);
+      prefix[ifOffset + 1] = skipVal & 0xff;
+      const backCount = baseBackCount + 2;
+      backHeader = [OPS.JUMP_BACK, backCount];
+    }
+
+    mergeInto(calls, refs, body, prefix.length, parent.stackEffect);
+
+    return new V12Saucer(ctx, concat(prefix, body._bytes, backHeader), parent.stackEffect, false, calls, refs);
+  }
+}
+
+// Standalone merge for the helper classes (mirrors V12Saucer.merge).
+function mergeInto(
+  calls: CallPlaceholder[],
+  refs: RefPlaceholder[],
+  src: V12Saucer,
+  posOffset: number,
+  depthOffset: number,
+): void {
+  for (const c of src.callPositions) calls.push({ pos: c.pos + posOffset, funcIndex: c.funcIndex });
+  for (const r of src.refPositions)
+    refs.push({ position: r.position + posOffset, paramIndex: r.paramIndex, depth: r.depth + depthOffset });
+}

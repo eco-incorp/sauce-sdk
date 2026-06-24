@@ -28,8 +28,34 @@ const { bytecode } = compile(source);
 ```typescript
 const { bytecode } = compile(source, {
   baseDirs: ['./artifacts'], // directories to search for contract JSON imports
+  target: 'v1', // bytecode target: 'v1' (default) or 'v12'
 });
 ```
+
+### Bytecode Target (`v1` / `v12`)
+
+The same SauceScript compiles to two bytecode formats:
+
+- **`v1` (default)** — prefix/tree bytecode (`[OP][a][b]`) for the Solidity interpreter
+  engine. Variables live in slot memory. Functions are returned as separate segments
+  in `bytecode[]`.
+- **`v12`** — postfix/stack bytecode (`[a][b][OP]`) for the gas-efficient Huff runtime
+  (`engine-v12`). Function parameters live on the EVM stack (read via `SDUP`, written via
+  `SSWAP`+`SDROP`); local `let`/`const` still use slot memory. All functions are assembled
+  into a **single** blob — `bytecode` is a one-element array `[main · STOP · helpers…]` with
+  `CALL_FUNCTION` offsets and parameter `SDUP` depths resolved at assembly.
+
+```typescript
+const { bytecode } = compile('function main(){ return 1n + 2n }', { target: 'v12' });
+// v12: 0101 0102 21 f2  (postfix: push 1, push 2, ADD, MSTORE)
+// v1 : 21 0101 0102 00  (prefix:  ADD(1, 2), STOP)
+```
+
+Both targets share one processor and the per-type encoders; only the emitting builder differs
+(`Saucer` vs `V12Saucer`, selected via `ctx.newSaucer()`). v12 byte-output is pinned against the
+engine's Solidity `V12Saucer.sol` builder and executed on the real Huff runtime — see the
+`v12-solidity-parity` and `v12-execution` integration suites (run against a full `engine-v12`
+checkout via `SAUCE_ENGINE_V12=…`; they skip cleanly otherwise).
 
 ### With Contract Imports
 

@@ -10,7 +10,8 @@ import type {
   ReturnStatement,
   ThrowStatement,
 } from 'acorn';
-import { Saucer } from '../saucer/index.js';
+import type { SaucerLike } from '../saucer/index.js';
+import { V12Saucer } from '../saucer/index.js';
 import { CompilerContext } from '../context.js';
 import type { Abi } from '../contracts.js';
 import {
@@ -32,7 +33,7 @@ import {
 } from './statement.js';
 import { processArrayExpression, processObjectExpression } from './collection.js';
 
-export function processNode(node: Node, ctx: CompilerContext): Saucer[] {
+export function processNode(node: Node, ctx: CompilerContext): SaucerLike[] {
   switch (node.type) {
     case 'Program':
       return processProgram(node as Program, ctx);
@@ -56,7 +57,7 @@ function processImportDeclaration(stmt: ImportDeclaration, ctx: CompilerContext)
   }
 }
 
-function processProgram(program: Program, ctx: CompilerContext): Saucer[] {
+function processProgram(program: Program, ctx: CompilerContext): SaucerLike[] {
   // Process imports first
   for (const stmt of program.body) {
     if (stmt.type === 'ImportDeclaration') {
@@ -79,6 +80,10 @@ function processProgram(program: Program, ctx: CompilerContext): Saucer[] {
     throw new Error('missing main() function');
   }
 
+  if (ctx.isV12) {
+    return processProgramV12(declarations, mainFunc, ctx);
+  }
+
   const functions = declarations
     .filter((stmt) => stmt.id?.name !== 'main')
     .map((stmt) => {
@@ -92,7 +97,52 @@ function processProgram(program: Program, ctx: CompilerContext): Saucer[] {
   return [...functions, processFunction(mainFunc, ctx)];
 }
 
-function processFunction(stmt: FunctionDeclaration, ctx: CompilerContext = new CompilerContext()) {
+/**
+ * v12: every function (helpers + main) compiles in its own child context (fresh
+ * slots/scopes/stack) sharing the module's function index table, so calls resolve
+ * across functions. Each function's build artifacts are recorded for the single-blob
+ * assembly in compile(). Function names are registered up front so a body can call a
+ * function declared later.
+ */
+function processProgramV12(
+  declarations: FunctionDeclaration[],
+  mainFunc: FunctionDeclaration,
+  ctx: CompilerContext,
+): SaucerLike[] {
+  const helpers = declarations.filter((stmt) => stmt.id?.name !== 'main');
+
+  for (const stmt of helpers) ctx.addFunc(stmt.id?.name);
+  ctx.addFunc('main');
+
+  const helperSaucers = helpers.map((stmt) => processFunctionV12(stmt, ctx));
+  const mainSaucer = processFunctionV12(mainFunc, ctx);
+
+  return [...helperSaucers, mainSaucer];
+}
+
+function processFunctionV12(stmt: FunctionDeclaration, parentCtx: CompilerContext): SaucerLike {
+  const ctx = parentCtx.forFunction();
+  const name = stmt.id?.name ?? 'main';
+  const isMain = name === 'main';
+  const argTypes = isMain ? parentCtx.mainArgTypes : undefined;
+
+  // Params live on the EVM stack (isParam) in declaration order.
+  stmt.params.forEach((param, i) => {
+    if (param.type !== 'Identifier') throw new Error(`Unsupported function variable type: ${param.type}`);
+
+    const argType = argTypes?.[i];
+    ctx.setVar(param.name, argType?.kind ?? 'scalar', argType?.elementType, undefined, true);
+    ctx.pushStack(param.name);
+  });
+
+  const body = stmt.body.body.reduce<SaucerLike>((saucer, st) => processStatement(st, ctx, saucer), ctx.newSaucer());
+
+  ctx.recordFunction({ name, isMain, paramCount: stmt.params.length, saucer: body as V12Saucer });
+
+  return body;
+}
+
+function processFunction(stmt: FunctionDeclaration, ctx: CompilerContext = new CompilerContext()): SaucerLike {
   const argTypes = ctx.mainArgTypes;
 
   stmt.params.forEach((param, i) => {
@@ -102,10 +152,10 @@ function processFunction(stmt: FunctionDeclaration, ctx: CompilerContext = new C
     ctx.setVar(param.name, argType?.kind ?? 'scalar', argType?.elementType);
   });
 
-  return stmt.body.body.reduce((saucer, stmt) => processStatement(stmt, ctx, saucer), new Saucer(ctx));
+  return stmt.body.body.reduce<SaucerLike>((saucer, st) => processStatement(st, ctx, saucer), ctx.newSaucer());
 }
 
-export function processStatement(stmt: Statement, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processStatement(stmt: Statement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   switch (stmt.type) {
     case 'VariableDeclaration':
       return processVariableDeclaration(stmt, ctx, saucer);
@@ -130,16 +180,16 @@ export function processStatement(stmt: Statement, ctx: CompilerContext, saucer: 
   }
 }
 
-function processReturnStatement(stmt: ReturnStatement, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processReturnStatement(stmt: ReturnStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   return stmt.argument ? saucer.return(processExpression(stmt.argument, ctx)) : saucer.return();
 }
 
-function processThrowStatement(stmt: ThrowStatement, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processThrowStatement(stmt: ThrowStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   return saucer.revert(processExpression(stmt.argument as Expression, ctx));
 }
 
-export function processExpression(expr: Expression, ctx: CompilerContext): Saucer {
-  const saucer = new Saucer(ctx);
+export function processExpression(expr: Expression, ctx: CompilerContext): SaucerLike {
+  const saucer = ctx.newSaucer();
   switch (expr.type) {
     case 'Literal':
       return processLiteral(expr as Literal, saucer);
