@@ -72,6 +72,23 @@ inference); `src/saucer/` emits bytecode (`Saucer` builder, `ops.ts` opcode tabl
 `src/context.ts` tracks functions/var kinds/ABIs; `src/contracts.ts` loads contract ABIs from artifact
 JSON for `import { X } from "./X.json"` + `.at()/.view()/.lib()` binding.
 
+**Compiler fixes (this branch):** (a) `new Array(n)` now **infers as DYNAMIC (heap) storage** so the
+TUPLE descriptor survives a variable round-trip — scalar/bytes32 storage dropped the descriptor, so
+`arr[i]` read/write reverted after `let a = new Array(n)`. (b) v12 `staticCall`/`delegateCall`
+`stackEffect` is **-1** (they push a result), not -2 — fixes corrupt SDUP positions when a param is read
+after a static call. (c) v12 assembly emits a **no-param ARG-PROLOGUE entry** that pushes the
+compile-time args then falls through into `main` (the v12 analogue of v1's appended `CALL_FUNCTION` arg
+segment) — so **parameterized recipes run on the Huff runtime**. (`main` is inlined, not a table fn → it
+can't recurse, same as v1.) Engine dep is pinned to `sauce.git#feat/v12-kitchen` (V12Kitchen/V12Pot
+bridge + `NEW_ARRAY`/`SET_INDEX` engine opcodes; PR #176) — a temporary dev pin, retarget to the engine
+default branch after that PR merges.
+
+**Known v12 limit (follow-up):** the Huff runtime's dynamic-value descriptor packs the data pointer in
+16 bits (region `0x5000`→`0xFFFF`, ≈45 KB), so a program whose total dynamic data exceeds that (≈80
+nested-8-element bracket tuples) gets a truncated pointer → garbage read → revert. Normal EcoSwap (≈24
+brackets) is well within budget and runs with exact v1 parity; only oversized (>~80-bracket) programs hit
+it. The fix needs a runtime-wide Huff pointer widening — out of scope here.
+
 **`sdk/`** — a data registry, no runtime logic. `src/protocols/<slug>/` per protocol (`info`,
 `addresses`, `abis` as-const, `functions` SauceScript templates); `src/protocols/index.ts` is the
 query registry. `src/skills/*.md` are AI-ready per-protocol docs (loaded by `loader.ts`, shipped in
@@ -141,6 +158,16 @@ client → prepare → compile → `{ bytecodes, prepared, source }`), `shared/`
 constants, types). **The compiler must be built first** — sdk recipes import it by relative `dist`
 path, dev-tools recipes via the `@eco-incorp/sauce-compiler` workspace dep.
 
+**EcoSwap single-pass (this branch).** EcoSwap's on-chain solver is now a **single-pass array-mutation**
+water-fill: it allocates real arrays (`new Array`, no register banks) and sweeps brackets to a live cut.
+It is **compute-then-pull** — `transferFrom`s exactly the swept `cum` (one guarded terminal refund for
+the limit-price edge), not a pre-pull. It can **adaptively stream** a tick walk past the prepared window
+(gated `ECO_ADAPTIVE`/`opts.adaptive`, `EXTRA_TICKS=64`). `ecoswap.singlepass.unrolled.sauce.ts` is frozen
+as the **gas reference** (vs the array variant). The **on-chain lens is the single source of truth**: it
+emits **survivors-only** plus a header `[discoveredCount, survivorCount, totalL, liqFloor]`, and
+`prepare.ts` consumes them with **no re-filter**. The absolute `MIN_LIQUIDITY` floor was **dropped** —
+relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the sole liquidity filter.
+
 ### Running recipes against a fork / RPC (in `dev-tools/`)
 
 ```sh
@@ -159,8 +186,9 @@ prepares+compiles, `cook()`s, and parses `Transfer` logs. Tokens: `WETH/USDC/DAI
 `dev-tools/artifacts/*.json` (gitignored build output) are read by recipes (`quoting.ts`, the
 `.sauce.ts` JSON imports) and `deploy.ts` (`Router`/`SauceRouter` carry deploy bytecode). Populate
 them with **`pnpm sync-artifacts`**, which copies the `sauce` engine's Foundry build output (`forge
-build` runs in the compiler `postinstall`). This also runs automatically at **`prepack`** so the
-published package ships them.
+build` runs in the compiler `postinstall`). `sync-artifacts` now **also ships `V12Kitchen`/`V12Pot` +
+the Huff runtime creation-code snapshot** (for the dual-engine v12 test path). This also runs
+automatically at **`prepack`** so the published package ships them.
 
 ### Recipe tests
 
@@ -185,6 +213,13 @@ the legacy fork tests:
    addresses** — StateView bakes the PoolManager address as an immutable, so both must sit at the real
    addresses; runtime captured by `recipes/test/harness/v4-bytecode-snapshot.ts`, checked in at
    `fixtures/snapshots/v4-bytecode.json`).
+   **Dual-engine (this branch):** `ecoswap.evm.test.ts` Phase 3 is parametrized
+   `{two-pass, single-pass} × {v1, v12}`; the v12 cells deploy the V12 stack (`deployV12Stack`) and cook
+   through **V12Pot on the Huff runtime**, **gated by `SAUCE_ENGINE_V12=1`** (skip-by-default). The cook
+   block timestamp is pinned (`setNextBlockTimestamp`) because the V3 pool oracle accumulator depends on
+   `block.timestamp`, which drifts across `evm_revert`. Two new tier-2 tests: `ecoswap.adaptive.evm.test.ts`
+   (window-exceeded adaptive fill) and `ecoswap.gas.evm.test.ts` + `GAS.md` (`ECO_GAS=1`, {3 solver
+   variants}×{v1,v12} gas + bytecode size).
    **Prod-mirror tests** replay REAL Base pool state from checked-in snapshots: `*.prodmirror.evm.test.ts`
    for V3 (`prod-snapshot.ts`, heavy ~10 min — one mint per boundary), V2 (`v2-snapshot.ts`, asserts
    output == exact constant-product) and V4 (`v4-snapshot.ts`, re-mints the tick profile into the etched
@@ -220,9 +255,10 @@ the legacy fork tests:
    accepted. EcoSwap discovery is config-injectable — `ecoSwap(config, rpcUrl, sauceRouter, caller,
    poolConfig?)` threads a local `ChainPoolConfig` so the real `discoverPools`→bracket→filter path runs
    against local pools. Discovery now queries each factory across **its own** `FactoryConfig.feeTiers`
-   (forks differ — Pancake V3 uses 2500, not Uniswap's 3000), and prepare applies a **relative-depth
-   filter** (drop pools < `ECO_MIN_REL_BPS`/1e4 of total liquidity, default 1%; per-call `{minRelBps}`
-   opt, 0 disables) on top of the absolute `MIN_LIQUIDITY` floor — so it swaps deep pools, not dust.
+   (forks differ — Pancake V3 uses 2500, not Uniswap's 3000). Liquidity filtering is **relative-depth
+   only** (this branch): drop pools < `ECO_MIN_REL_BPS`/1e4 of total liquidity (default 1%; per-call
+   `{minRelBps}` opt, 0 disables) plus a `>0` aliveness gate — the absolute `MIN_LIQUIDITY` floor was
+   dropped, and the filter now lives in the **lens** (single source of truth; prepare does not re-filter).
 3. **Fork tests (manual)** — `{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests
    (plain `tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router,
    fund/approve, `prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run

@@ -1,31 +1,49 @@
 import { ISauceRouter } from "./artifacts/ISauceRouter.json";
 import { IERC20 } from "./artifacts/IERC20.json";
-import { IUniswapV3Pool } from "./artifacts/IUniswapV3Pool.json";
-import { IStateView } from "./artifacts/IStateView.json";
+import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
+import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 
 // EcoSwap on-chain solver — SINGLE-PASS (live-cut) variant.
 //
 // One sweep over the pre-sorted bracket ladder does what the two-pass solver
-// split across Phase A (find the cut) + Phase B (re-integrate each pool). The
-// trick that makes it fit the array-mutation-free VM: the pool count is bounded
-// (MAX_DIRECT_POOLS), so per-pool input accumulators live in fixed scalar
-// registers i0..i11 (routes in q0..q1), dispatched by an if-ladder on the runtime
-// pool index. Live prices are read once per pool and cached in c0..c11 (sentinel
-// 0 = unseen); V2 live L caches in l0..l11.
+// split across Phase A (find the cut) + Phase B (re-integrate each pool). Per-pool
+// input accumulators and the live price / V2-liquidity caches live in real mutable
+// arrays sized to the (bounded) pool/route counts — new Array(pools.length) /
+// new Array(routes.length) — indexed directly by the runtime pool/route index.
+// new Array(n) zero-inits every slot, so the price cache's sentinel 0 = "unseen"
+// comes for free, and n is bounded by MAX_DIRECT_POOLS=12 / MAX_ROUTES=2, well
+// under the engine's 255-slot NEW_ARRAY cap.
 //
 // Why no explicit cut: brackets are sorted DESC by fee-adjusted marginal price, so
 // the sweep processes the best price first. Each bracket's gross input is computed
 // LIVE (hi = min(curSqrt, near) → drift is absorbed here, so NO cap=0 reverse-
 // bracket hack is needed: a reverse bracket only contributes when curSqrt has
 // actually drifted above spot). We add each bracket's full gross to its pool's
-// register until cum reaches amountIn; the crossing bracket's pool gets the
+// accumulator until cum reaches amountIn; the crossing bracket's pool gets the
 // remaining need. The cut is implicit — every engaged pool ends at ~the same
 // marginal price, and the exact-input swaps realise the geometry. Total assigned
-// == amountIn exactly (no stale-cut refund).
+// (cum) == amountIn exactly when liquidity allows.
+//
+// COMPUTE-THEN-PULL: the sweep is read-only (slot0 / getReserves staticcalls only),
+// so we first compute exactly how much tokenIn the swaps will consume (cum), then
+// transferFrom the caller EXACTLY that — no upfront over-pull, no refund round-trip.
+// The only leftover possible is the limit-price edge (a binding priceLimit makes a
+// V3 swap consume less than its assigned input); one guarded terminal refund returns it.
+//
+// ADAPTIVE DYNAMIC TICK READS (WS4): if a pool's prepared brackets are exhausted
+// while cum < amountIn, the solver continues a streaming live-tick walk for that
+// pool (ticks()/getTickLiquidity staticcalls, ported from the lens forward loop),
+// bounded by EXTRA_TICKS and gated on cum < amountIn + the price limit. DATA-GATED:
+// off → frontier seeds (pools[i][10..13]) are 0 → aStartShift>0 is false → the loop
+// never fires → behavior byte-identical to non-adaptive. V3/V4 only (V2 has a single
+// wide bracket; routes are static). The seed's first far-edge equals the last prepared
+// bracket's far-edge, so the walk is path-additive (no gap, no double-count).
 //
 // Inputs (precomputed off-chain in prepare.ts):
-//   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
+//   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
+//                  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio]
+//                 [10..13] are the adaptive frontier seeds (0 unless prepared adaptive).
 //   routes[r]   = [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks]
 //   brackets[b] = [kind, refIdx, sqrtNear, sqrtFar, liquidity, capacity, sqrtAdjNear, sqrtAdjFar]
 //                 kind: 0=V3 direct, 1=V2 direct, 2=route ; sorted DESC by sqrtAdjNear.
@@ -33,6 +51,36 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 // On-chain a direct bracket uses kind/refIdx/sqrtNear/sqrtFar/liquidity + the live
 // price; capacity[5] is used only for route segments (no live price). All sqrt
 // values are unified out/in Q96.
+
+// ── Pure helpers (copied verbatim from ecoswap.lens.sauce.ts) ─────────────────
+
+// int24 STATICCALL arg (signed tick) from a shifted tick.
+function tickArg(shifted: Uint256, OFFSET: Uint256): Uint256 {
+  if (shifted >= OFFSET) {
+    return shifted - OFFSET;
+  }
+  return Math.neg(OFFSET - shifted);
+}
+
+// Convert a real pool sqrt (token1/token0) into unified out/in sqrt.
+function toOutIn(sqrtReal: Uint256, zeroForOne: Uint256): Uint256 {
+  if (zeroForOne === 1) {
+    return sqrtReal;
+  }
+  const Q192: Uint256 = 2 ** 192;
+  return Q192 / sqrtReal;
+}
+
+// Next REAL sqrt one tickSpacing step in the swap direction.
+//   zeroForOne (price down): sqrt' = mulDiv(sqrt, 2^96, stepRatio)
+//   oneForZero (price up):   sqrt' = mulDiv(sqrt, stepRatio, 2^96)
+function stepReal(sqrtReal: Uint256, stepRatio: Uint256, zeroForOne: Uint256): Uint256 {
+  const Q96: Uint256 = 2 ** 96;
+  if (zeroForOne === 1) {
+    return Math.mulDiv(sqrtReal, Q96, stepRatio);
+  }
+  return Math.mulDiv(sqrtReal, stepRatio, Q96);
+}
 
 function main(
   tokenIn: Address, tokenOut: Address, amountIn: Uint256, caller: Address,
@@ -42,24 +90,19 @@ function main(
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
 
-  token.transferFrom(caller, address.self, amountIn);
-
   const Q96: Uint256 = 2 ** 96;
   const Q192: Uint256 = 2 ** 192;
   const FEE_DENOM: Uint256 = 1000000;
+  const OFFSET: Uint256 = 888000; // tick shift (matches lens / prepare seeds)
+  const HALF128: Uint256 = 2 ** 127; // int128 sign bit
+  const MOD128: Uint256 = 2 ** 128;
 
-  // Per-pool input registers (≤ MAX_DIRECT_POOLS = 12), live-price cache (0 =
-  // unseen), V2 live-L cache; per-route input registers (≤ MAX_ROUTES = 2).
-  let i0: Uint256 = 0; let i1: Uint256 = 0; let i2: Uint256 = 0; let i3: Uint256 = 0;
-  let i4: Uint256 = 0; let i5: Uint256 = 0; let i6: Uint256 = 0; let i7: Uint256 = 0;
-  let i8: Uint256 = 0; let i9: Uint256 = 0; let i10: Uint256 = 0; let i11: Uint256 = 0;
-  let c0: Uint256 = 0; let c1: Uint256 = 0; let c2: Uint256 = 0; let c3: Uint256 = 0;
-  let c4: Uint256 = 0; let c5: Uint256 = 0; let c6: Uint256 = 0; let c7: Uint256 = 0;
-  let c8: Uint256 = 0; let c9: Uint256 = 0; let c10: Uint256 = 0; let c11: Uint256 = 0;
-  let l0: Uint256 = 0; let l1: Uint256 = 0; let l2: Uint256 = 0; let l3: Uint256 = 0;
-  let l4: Uint256 = 0; let l5: Uint256 = 0; let l6: Uint256 = 0; let l7: Uint256 = 0;
-  let l8: Uint256 = 0; let l9: Uint256 = 0; let l10: Uint256 = 0; let l11: Uint256 = 0;
-  let q0: Uint256 = 0; let q1: Uint256 = 0;
+  // Per-pool input accumulators, live out/in-sqrt cache (0 = unseen) and V2 live-L
+  // cache, sized to the pool count; per-route input accumulators sized to routes.
+  let inp: Tuple = new Array(pools.length);
+  let curArr: Tuple = new Array(pools.length);
+  let lArr: Tuple = new Array(pools.length);
+  let rinp: Tuple = new Array(routes.length);
 
   let cum: Uint256 = 0;
   let found: Uint256 = 0;
@@ -79,8 +122,7 @@ function main(
           take = amountIn - cum;
           found = 1;
         }
-        if (rdx === 0) { q0 = q0 + take; }
-        if (rdx === 1) { q1 = q1 + take; }
+        rinp[rdx] = rinp[rdx] + take;
         cum = cum + take;
       } else {
         const pidx: Uint256 = b[1];
@@ -92,27 +134,17 @@ function main(
         const isV2: Uint256 = dp[6];
         const pType: Uint256 = dp[0];
 
-        // read-dispatch cached live state for this pool index
-        let cur: Uint256 = 0;
-        let Lliv: Uint256 = 0;
-        if (pidx === 0) { cur = c0; Lliv = l0; }
-        if (pidx === 1) { cur = c1; Lliv = l1; }
-        if (pidx === 2) { cur = c2; Lliv = l2; }
-        if (pidx === 3) { cur = c3; Lliv = l3; }
-        if (pidx === 4) { cur = c4; Lliv = l4; }
-        if (pidx === 5) { cur = c5; Lliv = l5; }
-        if (pidx === 6) { cur = c6; Lliv = l6; }
-        if (pidx === 7) { cur = c7; Lliv = l7; }
-        if (pidx === 8) { cur = c8; Lliv = l8; }
-        if (pidx === 9) { cur = c9; Lliv = l9; }
-        if (pidx === 10) { cur = c10; Lliv = l10; }
-        if (pidx === 11) { cur = c11; Lliv = l11; }
+        // Cached live state for this pool index (0 = not yet read).
+        let cur: Uint256 = curArr[pidx];
+        let Lliv: Uint256 = lArr[pidx];
 
-        // first touch → read live price (+ V2 live L), cache via write-dispatch
+        // first touch → read live price (+ V2 live L), cache it
         if (cur === 0) {
           let cl: Uint256 = 0;
           let ll: Uint256 = 0;
           if (isV2 === 1) {
+            // Two SEPARATE getReserves() staticcalls (one indexed [0], one [1]):
+            // a stored multi-return reverts on re-index in this VM, so we read twice.
             const r0: Uint256 = IUniswapV2Pair.at(dp[1]).getReserves()[0];
             const r1: Uint256 = IUniswapV2Pair.at(dp[1]).getReserves()[1];
             const inIsToken0: Uint256 = dp[7];
@@ -122,27 +154,17 @@ function main(
             cl = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
           } else {
             if (pType === 2) {
-              const sr4: Uint256 = IStateView.at(dp[8]).getSlot0(dp[9])[0];
+              const sr4: Uint256 = IStateViewFull.at(dp[8]).getSlot0(dp[9])[0];
               cl = zeroForOne === 1 ? sr4 : Q192 / sr4;
             } else {
-              const sr: Uint256 = IUniswapV3Pool.at(dp[1]).slot0()[0];
+              const sr: Uint256 = IUniswapV3PoolFull.at(dp[1]).slot0()[0];
               cl = zeroForOne === 1 ? sr : Q192 / sr;
             }
           }
           cur = cl;
           Lliv = ll;
-          if (pidx === 0) { c0 = cl; l0 = ll; }
-          if (pidx === 1) { c1 = cl; l1 = ll; }
-          if (pidx === 2) { c2 = cl; l2 = ll; }
-          if (pidx === 3) { c3 = cl; l3 = ll; }
-          if (pidx === 4) { c4 = cl; l4 = ll; }
-          if (pidx === 5) { c5 = cl; l5 = ll; }
-          if (pidx === 6) { c6 = cl; l6 = ll; }
-          if (pidx === 7) { c7 = cl; l7 = ll; }
-          if (pidx === 8) { c8 = cl; l8 = ll; }
-          if (pidx === 9) { c9 = cl; l9 = ll; }
-          if (pidx === 10) { c10 = cl; l10 = ll; }
-          if (pidx === 11) { c11 = cl; l11 = ll; }
+          curArr[pidx] = cl;
+          lArr[pidx] = ll;
         }
 
         // integrate this bracket from hi = min(cur, near) down to far, LIVE
@@ -159,18 +181,7 @@ function main(
                   take = amountIn - cum;
                   found = 1;
                 }
-                if (pidx === 0) { i0 = i0 + take; }
-                if (pidx === 1) { i1 = i1 + take; }
-                if (pidx === 2) { i2 = i2 + take; }
-                if (pidx === 3) { i3 = i3 + take; }
-                if (pidx === 4) { i4 = i4 + take; }
-                if (pidx === 5) { i5 = i5 + take; }
-                if (pidx === 6) { i6 = i6 + take; }
-                if (pidx === 7) { i7 = i7 + take; }
-                if (pidx === 8) { i8 = i8 + take; }
-                if (pidx === 9) { i9 = i9 + take; }
-                if (pidx === 10) { i10 = i10 + take; }
-                if (pidx === 11) { i11 = i11 + take; }
+                inp[pidx] = inp[pidx] + take;
                 cum = cum + take;
               }
             }
@@ -180,22 +191,86 @@ function main(
     }
   }
 
-  // ── Execution: one swap per direct pool (amount read-dispatched) ──
-  for (let p = 0; p < pools.length; p = p + 1) {
-    let amt: Uint256 = 0;
-    if (p === 0) { amt = i0; }
-    if (p === 1) { amt = i1; }
-    if (p === 2) { amt = i2; }
-    if (p === 3) { amt = i3; }
-    if (p === 4) { amt = i4; }
-    if (p === 5) { amt = i5; }
-    if (p === 6) { amt = i6; }
-    if (p === 7) { amt = i7; }
-    if (p === 8) { amt = i8; }
-    if (p === 9) { amt = i9; }
-    if (p === 10) { amt = i10; }
-    if (p === 11) { amt = i11; }
+  // ── ADAPTIVE STREAMING TICK WALK (WS4): continue past the prepared window ──
+  // If the prepared brackets under-filled (cum < amountIn) and a pool carries a
+  // frontier seed (aStartShift > 0 → prepared adaptively), resume that pool's tick
+  // walk LIVE from exactly where buildV3Brackets stopped, consuming each step's
+  // gross into inp[ap]/cum until amountIn is met, the price limit binds, or
+  // EXTRA_TICKS steps are read. Mirrors the lens forward loop bit-for-bit. Default
+  // (seeds 0) → this whole block is skipped → byte-identical to non-adaptive.
+  const EXTRA_TICKS: Uint256 = 64; // one window past the frontier; <= 255 (engine for-bound cap)
+  if (cum < amountIn) {
+    for (let ap = 0; ap < pools.length; ap = ap + 1) {
+      if (cum < amountIn) {
+        const ad: Tuple = pools[ap];
+        const aStartShift: Uint256 = ad[10];
+        const aType: Uint256 = ad[0];
+        const aIsV2: Uint256 = ad[6];
+        if (aIsV2 === 0) {
+          if (aStartShift > 0) {
+            const aFeePpm: Uint256 = ad[5];
+            const aTs: Uint256 = ad[3];
+            const aStep: Uint256 = ad[13];
+            const aStateView: Address = ad[8];
+            const aPoolId: Uint256 = ad[9];
+            const aAddr: Address = ad[1];
+            let aShift: Uint256 = aStartShift;
+            let aNearReal: Uint256 = ad[11];
+            let aL: Uint256 = ad[12];
+            let aDone: Uint256 = 0;
+            for (let kx = 0; kx < EXTRA_TICKS; kx = kx + 1) {
+              if (aDone === 0) {
+                const aFarReal: Uint256 = stepReal(aNearReal, aStep, zeroForOne);
+                const aNearOI: Uint256 = toOutIn(aNearReal, zeroForOne);
+                const aFarOI: Uint256 = toOutIn(aFarReal, zeroForOne);
+                // Limit-price guard (REAL-sqrt space): stop this pool if the next
+                // step would cross the binding priceLimit, so inp[ap] never exceeds
+                // what the swap can realize (the terminal refund still catches it).
+                let aLimited: Uint256 = 0;
+                if (zeroForOne === 1) { if (aFarReal <= priceLimit) { aLimited = 1; } }
+                else { if (aFarReal >= priceLimit) { aLimited = 1; } }
+                if (aL > 0) { if (aNearOI > aFarOI) { if (aFarOI > 0) {
+                  const aEffIn: Uint256 = Math.mulDiv(aL, Q96, aFarOI) - Math.mulDiv(aL, Q96, aNearOI);
+                  if (aEffIn > 0) {
+                    const aGross: Uint256 = Math.mulDiv(aEffIn, FEE_DENOM, FEE_DENOM - aFeePpm);
+                    let aTake: Uint256 = aGross;
+                    if (cum + aGross >= amountIn) { aTake = amountIn - cum; aDone = 1; }
+                    inp[ap] = inp[ap] + aTake;
+                    cum = cum + aTake;
+                  }
+                } } }
+                // Cross the boundary tick: update L by liquidityNet (live read).
+                const aArg: Uint256 = tickArg(aShift, OFFSET);
+                let aNet: Uint256 = 0;
+                if (aType === 2) { aNet = IStateViewFull.at(aStateView).getTickLiquidity(aPoolId, aArg)[1]; }
+                else { aNet = IUniswapV3PoolFull.at(aAddr).ticks(aArg)[1]; }
+                const aNeg: Uint256 = aNet >= HALF128 ? 1 : 0;
+                if (zeroForOne === 1) {
+                  if (aNeg === 1) { aL = aL + (MOD128 - aNet); } else { aL = aL >= aNet ? aL - aNet : 0; }
+                  aShift = aShift - aTs;
+                } else {
+                  if (aNeg === 1) { const aMag: Uint256 = MOD128 - aNet; aL = aL >= aMag ? aL - aMag : 0; } else { aL = aL + aNet; }
+                  aShift = aShift + aTs;
+                }
+                aNearReal = aFarReal;
+                if (cum >= amountIn) { aDone = 1; }
+                if (aLimited === 1) { aDone = 1; }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
+  // ── COMPUTE-THEN-PULL: pull EXACTLY what the swaps will consume (cum ≤ amountIn) ──
+  if (cum > 0) {
+    token.transferFrom(caller, address.self, cum);
+  }
+
+  // ── Execution: one swap per direct pool (amount read from the accumulator) ──
+  for (let p = 0; p < pools.length; p = p + 1) {
+    const amt: Uint256 = inp[p];
     if (amt > 0) {
       const dp: Tuple = pools[p];
       const isV2: Uint256 = dp[6];
@@ -241,9 +316,7 @@ function main(
 
   // ── Execution: routes (≤2), hop1 -> hop2 via flat swapV3 ──
   for (let r = 0; r < routes.length; r = r + 1) {
-    let ramt: Uint256 = 0;
-    if (r === 0) { ramt = q0; }
-    if (r === 1) { ramt = q1; }
+    const ramt: Uint256 = rinp[r];
     if (ramt > 0) {
       const route: Tuple = routes[r];
       const inter: Address = route[0];
@@ -255,7 +328,8 @@ function main(
     }
   }
 
-  // Refund any unspent tokenIn (liquidity ran out before amountIn was met).
+  // Guarded terminal refund: the only leftover possible is the limit-price edge
+  // (a binding priceLimit makes a V3 swap consume less than its assigned input).
   const leftover: Uint256 = token.balanceOf(address.self);
   if (leftover > 0) {
     token.transfer(caller, leftover);

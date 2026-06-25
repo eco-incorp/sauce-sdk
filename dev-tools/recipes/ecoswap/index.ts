@@ -43,7 +43,12 @@ export interface EcoSwapOutput {
 
 // ── Compile-arg tuple builders (all values are bigint scalars) ──
 
-/** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId] */
+/**
+ * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
+ *  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio]
+ * The last 4 are the WS4 adaptive frontier seeds (0 unless prepared with adaptive=true;
+ * 0 → the solver's streaming-walk loop is gated off → behavior byte-identical to today).
+ */
 function buildPoolTuple(p: EcoPool): bigint[] {
   return [
     BigInt(p.poolType),
@@ -56,6 +61,10 @@ function buildPoolTuple(p: EcoPool): bigint[] {
     p.inIsToken0 ? 1n : 0n,
     BigInt(p.stateView), // V4 StateView lens (0 for V2/V3)
     BigInt(p.poolId), // V4 poolId (0 for V2/V3)
+    p.adaptiveStartShifted ?? 0n, // [10] adaptive frontier: next un-walked boundary, shifted
+    p.adaptiveNearReal ?? 0n, // [11] REAL sqrt at the near edge
+    p.adaptiveStartL ?? 0n, // [12] active L entering the first un-walked step
+    p.adaptiveStepRatio ?? 0n, // [13] multiplicative step ratio (getSqrtRatioAtTick(ts))
   ];
 }
 
@@ -104,6 +113,9 @@ function buildBracketTuple(b: EcoBracket): bigint[] {
  * @param poolConfig - Optional chain pool-discovery config (factories/fee tiers/
  *   base tokens). Omitted → prepareEcoSwap defaults to BASE_CHAIN_POOL_CONFIG,
  *   preserving prior behavior. Lets tests point discovery at local pools.
+ * @param target - Bytecode target: "v1" (prefix, Solidity Router) or "v12"
+ *   (postfix, Huff runtime). Default "v1". Prepare is target-agnostic (RPC only);
+ *   only the on-chain solver compilation differs.
  */
 export async function ecoSwap(
   config: EcoSwapConfig,
@@ -112,6 +124,7 @@ export async function ecoSwap(
   caller: Hex,
   poolConfig?: ChainPoolConfig,
   opts?: EcoSwapPrepareOpts,
+  target: "v1" | "v12" = "v1",
 ): Promise<EcoSwapOutput> {
   const tempClient = createPublicClient({ transport: http(rpcUrl) });
   const chainId = await tempClient.getChainId();
@@ -143,6 +156,7 @@ export async function ecoSwap(
   const result = compile(jsSource, {
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
+    target,
     args: [
       BigInt(config.tokenIn),
       BigInt(config.tokenOut),

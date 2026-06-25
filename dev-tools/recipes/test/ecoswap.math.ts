@@ -89,3 +89,30 @@ export function getSqrtRatioAtTick(tick: number): bigint {
 export function toOutIn(sqrtReal: bigint, zeroForOne: boolean): bigint {
   return zeroForOne ? sqrtReal : Q192 / sqrtReal;
 }
+
+// ── Adaptive (WS4) streaming-walk helpers ────────────────────
+// Faithful copies of the lens helpers (ecoswap.lens.sauce.ts) + constants, shared
+// by the on-chain solver port and the oracle so both walk the frontier identically.
+
+/** Tick shift (multiple of LCM(spacings)=3000, > max|tick| 887272 so shifted stays ≥0). */
+export const OFFSET = 888000n;
+/** int128 sign bit. */
+export const HALF128 = 1n << 127n;
+/** int128 modulus. */
+export const MOD128 = 1n << 128n;
+
+/** int24 STATICCALL arg (signed tick) from a shifted tick. Mirrors lens `tickArg`. */
+export function tickArg(shifted: bigint): bigint {
+  return shifted >= OFFSET ? shifted - OFFSET : -(OFFSET - shifted);
+}
+
+/**
+ * Next REAL sqrt one tickSpacing step in the swap direction (multiplicative).
+ * Mirrors lens `stepReal` EXACTLY (NOT getSqrtRatioAtTick) so the oracle matches
+ * the on-chain walk bit-for-bit as multiplicative drift accrues over many steps.
+ *   zeroForOne (price down): sqrt' = mulDiv(sqrt, 2^96, stepRatio)
+ *   oneForZero (price up):   sqrt' = mulDiv(sqrt, stepRatio, 2^96)
+ */
+export function stepReal(sqrtReal: bigint, stepRatio: bigint, zeroForOne: boolean): bigint {
+  return zeroForOne ? mulDiv(sqrtReal, Q96, stepRatio) : mulDiv(sqrtReal, stepRatio, Q96);
+}

@@ -221,37 +221,48 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     );
   });
 
-  it("dust pool (below the relative-depth filter) gets ZERO ticks", async () => {
+  it("dust pool (below the relative-depth filter) is DROPPED by the lens", async () => {
     // A third, tiny V3 pool well below 1% of total liquidity. With minRelBps=100
-    // the lens must NOT scan it (scannedForward 0, no ticks).
+    // the lens is the single source of truth and must NOT emit it at all — it is
+    // discovered (counted in the header) but not a survivor (no pool row).
     const minter = c.account0;
     const dustFee = 10000;
     const dustPool = await createAndInitPool(
       c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, dustFee, SQRT_PRICE_1_1,
     );
-    // L tiny vs the 400k/250k/300k pools but above the absolute MIN_LIQUIDITY 1e13.
+    // L tiny vs the 400k/250k/300k pools → below 1% of Σliquidity → dropped.
     await mintPosition(c.walletClient, c.publicClient, stack.helper, dustPool, minter, -12000, 12000, parseEther("0.05"));
 
     const dustConfig: ChainPoolConfig = {
       ...poolConfig,
       feeTiers: [500, 3000, 10000],
     };
-    const { pools } = await runLens(c.publicClient, stack.sauceRouter, dustConfig, {
+    const res = await runLens(c.publicClient, stack.sauceRouter, dustConfig, {
       tokenIn, tokenOut, zeroForOne, amountIn: parseEther("3000"),
-      driftTicks: 2, minLiquidity: 10n ** 13n, minRelBps: 100, maxTicks: MAX_TICKS,
+      driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS,
     });
+    const { pools } = res;
 
+    // SURVIVORS ONLY: the dust pool is NOT emitted as a pool row.
     const dust = pools.find((p) => p.poolType === SwapPoolType.UniV3 && p.fee === dustFee);
-    assert.ok(dust, "dust pool still discovered (present in poolBlob)");
-    assert.equal(dust!.scannedForward, 0, "dust pool gets ZERO forward ticks");
-    assert.equal(dust!.net.size, 0, "dust pool emits no tick rows");
+    assert.equal(dust, undefined, "dust pool dropped by the lens (no pool row)");
 
-    // Deep pools still scanned.
-    const deep = pools.filter((p) => p.poolType === SwapPoolType.UniV3 && p.fee !== dustFee);
+    // Header reflects the drop: discovered counts the dust pool, survivors don't.
+    assert.ok(res.discoveredCount > res.survivorCount, "header: discovered > survivors");
+    assert.equal(res.survivorCount, pools.length, "header survivorCount == returned rows");
+    assert.equal(
+      res.discoveredCount - res.survivorCount, 1,
+      "exactly one pool (the dust pool) dropped",
+    );
+    assert.ok(res.liqFloor > 0n, "relative-depth floor applied (> 0)");
+
+    // Deep pools survive and are still scanned.
+    const deep = pools.filter((p) => p.poolType === SwapPoolType.UniV3);
+    assert.equal(deep.length, 2, "both deep V3 pools survive");
     assert.ok(deep.every((p) => p.scannedForward > 0), "deep V3 pools still scanned");
     console.log(
-      `  [DUST] fee ${dustFee} scannedForward=${dust!.scannedForward}; ` +
-        `deep ${deep.map((p) => `${p.fee}=${p.scannedForward}`).join(" ")}`,
+      `  [DUST] dropped fee ${dustFee}; discovered=${res.discoveredCount} survivors=${res.survivorCount} ` +
+        `floor=${res.liqFloor}; deep ${deep.map((p) => `${p.fee}=${p.scannedForward}`).join(" ")}`,
     );
   });
 

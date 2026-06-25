@@ -25,8 +25,10 @@ import {
   type Account,
 } from "viem";
 
-import { loadArtifact, loadDeployedBytecode } from "./artifacts";
-import { deployContract, writeAndWait } from "./deploy";
+import { existsSync } from "node:fs";
+
+import { loadArtifact, loadDeployedBytecode, normalizeBytecode } from "./artifacts";
+import { deployContract, deployCreationCode, writeAndWait } from "./deploy";
 import {
   MULTICALL3,
   UNISWAP_V4_POOL_MANAGER,
@@ -96,6 +98,17 @@ export const pancakeV3PoolCreationCode = loadArtifact(
   join(PANCAKE, "PancakeV3Pool.sol", "PancakeV3Pool.json"),
 ).bytecode;
 
+// ── v12 engine artifacts (synced by sync-artifacts.js from the feat/v12-kitchen
+// engine). These are absent on an older engine, so they are loaded lazily and the
+// v12 dual-engine path skips when any is missing — see V12_AVAILABLE / deployV12Stack.
+const V12_KITCHEN_PATH = join(ARTIFACTS, "V12Kitchen.json");
+const V12_POT_PATH = join(ARTIFACTS, "V12Pot.json");
+const V12_RUNTIME_PATH = join(ARTIFACTS, "V12RuntimeBytecode.json");
+
+/** True when all three v12 artifacts are present (engine pinned to feat/v12-kitchen + synced). */
+export const V12_AVAILABLE =
+  existsSync(V12_KITCHEN_PATH) && existsSync(V12_POT_PATH) && existsSync(V12_RUNTIME_PATH);
+
 // ── Minimal ABIs for reads ───────────────────────────────────
 export const erc20Abi = parseAbi([
   "function mint(address to, uint256 amount)",
@@ -156,6 +169,11 @@ export const v4HelperAbi = parseAbi([
 export const v4StateViewAbi = parseAbi([
   "function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
   "function getLiquidity(bytes32 poolId) view returns (uint128)",
+]);
+
+export const v12KitchenAbi = parseAbi([
+  "function deployPot(bytes32 salt) returns (address pot)",
+  "function predictPot(address owner, bytes32 salt) view returns (address)",
 ]);
 
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000" as Hex;
@@ -235,6 +253,89 @@ export async function deployStack(
     bytecode: helperArtifact.bytecode,
   });
   return { routerImpl, sauceRouter, factory, helper };
+}
+
+export interface DeployedV12Stack {
+  routerImpl: Hex;
+  sauceRouter: Hex;
+  v12Runtime: Hex;
+  kitchen: Hex;
+  /** Owner's V12Pot — the v12 cook() entrypoint (the v12 analogue of sauceRouter). */
+  pot: Hex;
+}
+
+/**
+ * Deploy the v12 engine stack and the owner's V12Pot, mirroring the engine's
+ * V12KitchenSwap.t.sol wiring:
+ *   Router (impl) → SauceRouter(impl) → V12Kitchen(v12Runtime, sauceRouter)
+ *   → kitchen.deployPot(salt) as `owner`.
+ *
+ * The Pot is the cook() entrypoint: its `cook(bytes[])` delegatecalls the raw v12
+ * program (ingredients[0]) into the Huff runtime, while its fallback delegatecalls
+ * the SauceRouter for swap self-calls / pool callbacks — all in the Pot's context.
+ *
+ * `owner` MUST be the account that will call cook() (the Pot's cook is owner-gated)
+ * and is also the recipe `caller`: the program does transferFrom(caller, self, …),
+ * so the owner approves the POT (not the SauceRouter) for tokenIn. Requires
+ * V12_AVAILABLE (throws otherwise — callers should gate on it / skip).
+ */
+export async function deployV12Stack(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  owner: Account,
+  salt: Hex = "0x0000000000000000000000000000000000000000000000000000000000000000",
+): Promise<DeployedV12Stack> {
+  if (!V12_AVAILABLE) {
+    throw new Error(
+      "v12 artifacts missing (V12Kitchen/V12Pot/V12RuntimeBytecode) — pin the engine to " +
+        "feat/v12-kitchen and run `pnpm --filter ./dev-tools sync-artifacts`",
+    );
+  }
+  const kitchenArtifact = loadArtifact(V12_KITCHEN_PATH);
+  const runtimeCreationCode = normalizeBytecode(
+    (JSON.parse(readFileSync(V12_RUNTIME_PATH, "utf-8")) as { runtimeCreationCode: string })
+      .runtimeCreationCode,
+  );
+
+  // Router impl + SauceRouter proxy (the swap surface the Pot fallback reaches).
+  const routerImpl = await deployContract(walletClient, publicClient, {
+    abi: routerArtifact.abi,
+    bytecode: routerArtifact.bytecode,
+  });
+  const sauceRouter = await deployContract(walletClient, publicClient, {
+    abi: sauceRouterArtifact.abi,
+    bytecode: sauceRouterArtifact.bytecode,
+    args: [routerImpl],
+  });
+
+  // v12 Huff runtime (raw creation code, no ABI) then the Kitchen factory.
+  const v12Runtime = await deployCreationCode(walletClient, publicClient, runtimeCreationCode);
+  const kitchen = await deployContract(walletClient, publicClient, {
+    abi: kitchenArtifact.abi,
+    bytecode: kitchenArtifact.bytecode,
+    args: [v12Runtime, sauceRouter],
+  });
+
+  // Deploy the owner's Pot AS the owner (deployPot bakes in msg.sender as owner),
+  // then read it back via predictPot (deployPot's return value isn't available
+  // off a tx receipt).
+  await writeAndWait(walletClient, publicClient, {
+    address: kitchen,
+    abi: v12KitchenAbi as Abi,
+    functionName: "deployPot",
+    args: [salt],
+    account: owner,
+  });
+  const pot = (await publicClient.readContract({
+    address: kitchen,
+    abi: v12KitchenAbi as Abi,
+    functionName: "predictPot",
+    args: [owner.address, salt],
+  })) as Hex;
+  const code = await publicClient.getCode({ address: pot });
+  if (!code || code === "0x") throw new Error("V12Pot was not deployed at the predicted address");
+
+  return { routerImpl, sauceRouter, v12Runtime, kitchen, pot };
 }
 
 /** Deploy a MintableERC20. */

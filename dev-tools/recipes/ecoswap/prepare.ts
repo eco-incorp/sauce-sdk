@@ -11,8 +11,10 @@
  *      in ONE read-only eth_call cook(): factory getPool/getPair discovery, live
  *      slot0/getReserves/StateView reads, and a windowed ticks()/getTickLiquidity
  *      scan — returned as raw words (see lens.ts). v1 covers V2Standard, V3Standard
- *      and hookless UniswapV4 only.
- *   2. Apply the absolute + relative-depth liquidity filter and the top-N cap.
+ *      and hookless UniswapV4 only. The lens is the SINGLE SOURCE OF TRUTH for
+ *      survivorship: it applies the relative-depth liquidity filter on-chain and
+ *      returns ONLY survivors (no absolute floor) — prepare never re-filters.
+ *   2. Apply the top-N (deepest) cap — a calldata/loop bound, not a liquidity gate.
  *   3. Build brackets from the lens reads: V3/V4 from active L + liquidityNet
  *      (buildV3Brackets); V2 as one wide bracket discretised into geometric steps
  *      (a V2 pool == a single V3 range with L = sqrt(k)).
@@ -48,15 +50,22 @@ import {
 const Q96 = 1n << 96n;
 const Q192 = 1n << 192n;
 const FEE_DENOM = 1_000_000n; // ppm
-
-/** Absolute floor: pools below this liquidity contribute negligibly; excluded. */
-const MIN_LIQUIDITY = 10n ** 13n;
 /**
- * RELATIVE-depth floor (bps of TOTAL discovered liquidity). For one token pair,
- * raw active-L at spot is comparable across V2 (≡ a V3 range with L=√k), V3 and
- * V4, so a pool holding < this fraction of the combined marginal depth would only
- * ever get a dust slice — not worth a swap's gas. Default 100 bps (1%); override
- * with ECO_MIN_REL_BPS, or per-call via prepareEcoSwap opts. 0 disables.
+ * Tick shift used to carry signed ticks as non-negative "shifted" values for the
+ * adaptive frontier seeds (matches the lens OFFSET = 888000; multiple of LCM(3000)
+ * and > max|tick| 887272 so shifted stays ≥0). Only used for adaptive seeds.
+ */
+const OFFSET_TICK = 888000;
+
+/**
+ * RELATIVE-depth floor (bps of TOTAL discovered liquidity) — the SOLE liquidity
+ * gate (no absolute floor). For one token pair, raw active-L at spot is
+ * comparable across V2 (≡ a V3 range with L=√k), V3 and V4, so a pool holding
+ * < this fraction of the combined marginal depth would only ever get a dust
+ * slice — not worth a swap's gas. The on-chain LENS applies this filter and is
+ * the single source of truth for survivorship (prepare never re-filters).
+ * Default 100 bps (1%); override with ECO_MIN_REL_BPS, or per-call via
+ * prepareEcoSwap opts. 0 disables.
  */
 const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
@@ -94,6 +103,16 @@ const V2_FEE_PPM = 3000;
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Hex;
 const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex;
+
+/** Default (off) adaptive frontier seeds — every EcoPool starts here; buildV3Brackets
+ *  overwrites them only when prepared with adaptive=true. Seeds 0 → the on-chain
+ *  adaptive loop is gated off (aStartShift>0 is false). */
+const ADAPTIVE_OFF = {
+  adaptiveStartShifted: 0n,
+  adaptiveNearReal: 0n,
+  adaptiveStartL: 0n,
+  adaptiveStepRatio: 0n,
+} as const;
 
 // ── Math helpers ─────────────────────────────────────────────
 
@@ -266,7 +285,13 @@ function feeToTickSpacing(fee: number): number {
  * changes). NOTE: reverse drift only helps pools the trade already crosses (the trim
  * drops non-crossed pools entirely), same as the forward direction.
  */
-function buildV3Brackets(r: V3Read, refIdx: number, zeroForOne: boolean): EcoBracket[] {
+function buildV3Brackets(
+  r: V3Read,
+  refIdx: number,
+  zeroForOne: boolean,
+  seed?: EcoPool,
+  adaptive = false,
+): EcoBracket[] {
   const brackets: EcoBracket[] = [];
   const feePpm = r.pool.fee;
   const ts = r.tickSpacing;
@@ -316,6 +341,43 @@ function buildV3Brackets(r: V3Read, refIdx: number, zeroForOne: boolean): EcoBra
     nearReal = farReal;
     b += step;
   }
+
+  // ── Adaptive frontier seeds (WS4) ──
+  // The forward loop stopped at the lens's scannedForward boundary. Its carried
+  // (L, nearReal, b) are EXACTLY the entry state for the FIRST un-walked step, so
+  // the on-chain solver resumes the streaming walk from here with NO double-count:
+  // the seed's first far-edge == the last prepared bracket's far-edge (path-additive).
+  // When scannedForward===0 the loop never ran, so (L, nearReal, b) keep their
+  // spot-seed initial values — the unified derivation handles both cases.
+  if (adaptive && seed) {
+    seed.adaptiveStartL = L; // active L entering the first un-walked step
+    seed.adaptiveNearReal = nearReal; // EXACT TickMath sqrt at the last crossed boundary (or spot)
+    seed.adaptiveStartShifted = BigInt(b + OFFSET_TICK); // next (un-walked) boundary, shifted
+    seed.adaptiveStepRatio = getSqrtRatioAtTick(ts); // == lens stepRatioForSpacing
+    seed.adaptiveNet = r.net; // off-chain-only net map for the oracle's mirrored walk
+
+    // bracket-end == adaptive-start assertions (spec §A). Only meaningful once at
+    // least one forward boundary was crossed (otherwise nearReal is spot, not a
+    // TickMath value, and b is the un-shifted spot boundary).
+    if (r.scannedForward > 0) {
+      const expectShift = BigInt(base + OFFSET_TICK) + BigInt(step) * BigInt(r.scannedForward);
+      if (seed.adaptiveStartShifted !== expectShift) {
+        throw new Error(
+          `adaptive seed: startShifted ${seed.adaptiveStartShifted} !== expected ${expectShift} ` +
+            `(base=${base} step=${step} scannedForward=${r.scannedForward})`,
+        );
+      }
+      // nearReal is the TickMath sqrt at the LAST crossed boundary = b - step.
+      const lastCrossed = b - step;
+      const expectNear = getSqrtRatioAtTick(lastCrossed);
+      if (seed.adaptiveNearReal !== expectNear) {
+        throw new Error(
+          `adaptive seed: nearReal ${seed.adaptiveNearReal} !== getSqrtRatioAtTick(${lastCrossed}) ${expectNear}`,
+        );
+      }
+    }
+  }
+
   return brackets;
 }
 
@@ -492,6 +554,20 @@ export interface EcoSwapPrepareOpts {
    * split tests that intentionally mix shallow-but-distinct AMM versions).
    */
   minRelBps?: number;
+  /**
+   * WS4 adaptive dynamic tick reads. When true, buildV3Brackets stamps each
+   * V3/V4 pool's frontier seeds (adaptiveStart*) + adaptiveNet so the on-chain
+   * solver can continue a live streaming tick walk past the prepared window when
+   * a pool's brackets are exhausted while cum < amountIn. Default false → seeds 0
+   * → the solver's adaptive loop never fires → byte-identical to non-adaptive.
+   */
+  adaptive?: boolean;
+  /**
+   * Override the lens forward tick window (default V3_TICK_STEPS = 96). Lets the
+   * adaptive EVM test deliberately prepare a NARROW window so the prepared brackets
+   * under-fill amountIn — then adaptive ON resumes the streaming walk to close the gap.
+   */
+  maxTicks?: number;
 }
 
 export async function prepareEcoSwap(
@@ -502,6 +578,8 @@ export async function prepareEcoSwap(
   opts: EcoSwapPrepareOpts = {},
 ): Promise<EcoSwapPrepared> {
   const minRelBps = opts.minRelBps ?? DEFAULT_MIN_REL_BPS;
+  const adaptive = opts.adaptive ?? false;
+  const maxTicks = opts.maxTicks ?? V3_TICK_STEPS;
   const { tokenIn, tokenOut, amountIn } = config;
   const inLower = tokenIn.toLowerCase();
   const outLower = tokenOut.toLowerCase();
@@ -518,40 +596,33 @@ export async function prepareEcoSwap(
     zeroForOne,
     amountIn,
     driftTicks: SAFETY_TICKS,
-    minLiquidity: MIN_LIQUIDITY,
     minRelBps,
-    maxTicks: V3_TICK_STEPS,
+    maxTicks,
   });
-  const allDirect = lensResult.pools;
 
-  // Absolute floor + usable-type gate. The lens only discovers V2Standard (no
-  // Solidly stable), V3Standard and hookless UniswapV4 — so every returned pool
-  // is already a usable type; we just apply the liquidity floor.
-  const candidates = allDirect.filter((p) => p.liquidity >= MIN_LIQUIDITY);
-
-  // RELATIVE-depth gate: drop pools below minRelBps of the COMBINED liquidity so
-  // we swap against deep pools and don't waste gas on shallow ones (dust slices).
-  const totalLiquidity = candidates.reduce((s, p) => s + p.liquidity, 0n);
-  const relFloor = minRelBps > 0 ? (totalLiquidity * BigInt(minRelBps)) / 10_000n : 0n;
-  const deepEnough = candidates.filter((p) => p.liquidity >= relFloor);
-  const droppedShallow = candidates.filter((p) => p.liquidity < relFloor);
-
-  // Keep the deepest pools only — bounds on-chain loop size and calldata.
-  const usableDirect = deepEnough
+  // The LENS is the single source of truth for survivorship: it already applied
+  // the relative-depth floor on-chain and returns ONLY survivors (every returned
+  // pool is a usable type — V2Standard sans Solidly-stable, V3Standard, hookless
+  // V4). So prepare does NOT re-filter; it just keeps the deepest top-N (a
+  // calldata/loop bound, not a liquidity gate).
+  const survivors = lensResult.pools;
+  const usableDirect = survivors
     .slice()
     .sort((a, b) => (a.liquidity < b.liquidity ? 1 : a.liquidity > b.liquidity ? -1 : 0))
     .slice(0, MAX_DIRECT_POOLS);
 
-  // No silent caps: surface what relative-depth dropped and any top-N truncation.
-  if (droppedShallow.length > 0) {
+  // No silent caps: surface what the lens dropped (relative-depth) and any top-N
+  // truncation. Per-pool droppee detail lives on-chain now — report counts.
+  const droppedByLens = lensResult.discoveredCount - lensResult.survivorCount;
+  if (droppedByLens > 0) {
     console.log(
-      `  EcoSwap dropped ${droppedShallow.length} shallow pool(s) (< ${minRelBps}bps of Σliquidity): ` +
-        droppedShallow.map((p) => `${SwapPoolType[p.poolType]}/${p.fee}(L=${p.liquidity})`).join(", "),
+      `  EcoSwap lens dropped ${droppedByLens} shallow pool(s) (< ${minRelBps}bps of Σliquidity, ` +
+        `floor L=${lensResult.liqFloor} of Σ${lensResult.totalLiquidity})`,
     );
   }
-  if (deepEnough.length > MAX_DIRECT_POOLS) {
+  if (survivors.length > MAX_DIRECT_POOLS) {
     console.log(
-      `  EcoSwap capped to deepest ${MAX_DIRECT_POOLS} of ${deepEnough.length} pools (ECO_MAX_POOLS)`,
+      `  EcoSwap capped to deepest ${MAX_DIRECT_POOLS} of ${survivors.length} survivor pools (ECO_MAX_POOLS)`,
     );
   }
   const v3Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV3);
@@ -582,11 +653,11 @@ export async function prepareEcoSwap(
     const [hop1, hop2] = await Promise.all([
       runLens(client, sauceRouterAddress, poolConfig, {
         tokenIn, tokenOut: baseToken, zeroForOne: z1,
-        amountIn, driftTicks: SAFETY_TICKS, minLiquidity: MIN_LIQUIDITY, minRelBps, maxTicks: V3_TICK_STEPS,
+        amountIn, driftTicks: SAFETY_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
       }),
       runLens(client, sauceRouterAddress, poolConfig, {
         tokenIn: baseToken, tokenOut, zeroForOne: z2,
-        amountIn, driftTicks: SAFETY_TICKS, minLiquidity: MIN_LIQUIDITY, minRelBps, maxTicks: V3_TICK_STEPS,
+        amountIn, driftTicks: SAFETY_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
       }),
     ]);
     // The on-chain route handler executes BOTH hops via flat swapV3, so only V3
@@ -617,7 +688,7 @@ export async function prepareEcoSwap(
   // V3 (lens already returned slot0 + windowed ticks() per pool)
   for (const p of v3Raw) {
     const refIdx = pools.length;
-    pools.push({
+    const pool: EcoPool = {
       poolType: p.poolType,
       address: p.address,
       fee: p.fee,
@@ -628,15 +699,17 @@ export async function prepareEcoSwap(
       inIsToken0: zeroForOne, // V3 PoolKey orientation = token sort order
       stateView: ZERO_ADDRESS,
       poolId: ZERO_BYTES32,
+      ...ADAPTIVE_OFF,
       source: "lens V3",
-    });
-    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne));
+    };
+    pools.push(pool);
+    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne, pool, adaptive));
   }
 
   // V4 (singleton; lens read StateView slot0 + windowed getTickLiquidity)
   for (const p of v4Raw) {
     const refIdx = pools.length;
-    pools.push({
+    const pool: EcoPool = {
       poolType: p.poolType,
       address: p.address, // PoolManager singleton
       fee: p.fee,
@@ -647,9 +720,11 @@ export async function prepareEcoSwap(
       inIsToken0: zeroForOne,
       stateView: p.stateView,
       poolId: p.poolId,
+      ...ADAPTIVE_OFF,
       source: "lens V4",
-    });
-    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne));
+    };
+    pools.push(pool);
+    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne, pool, adaptive));
   }
 
   // V2 (lens returned synthetic out/in sqrt + synthetic L + inIsToken0)
@@ -666,6 +741,7 @@ export async function prepareEcoSwap(
       inIsToken0: p.inIsToken0,
       stateView: ZERO_ADDRESS,
       poolId: ZERO_BYTES32,
+      ...ADAPTIVE_OFF, // V2 has a single wide bracket — no streaming walk
       source: "lens V2",
     });
     brackets.push(

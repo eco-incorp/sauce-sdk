@@ -14,19 +14,21 @@ import { IStateViewFull } from "./IStateViewFull.json";
 //
 // THREE INTERNAL PASSES (all in one eth_call):
 //   1. CHEAP STATE PASS — discover all pools, read slot0 + liquidity ONLY (no
-//      ticks). Sum total liquidity. Apply the SAME filter prepare.ts uses
-//      (absolute MIN_LIQUIDITY + relative-depth minRelBps of total) to mark
-//      SURVIVORS. Track the DEEPEST survivor's coords (max active L).
+//      ticks). Sum total liquidity. Apply the relative-depth filter (minRelBps
+//      of total Σliquidity) to mark SURVIVORS. Track the DEEPEST survivor's
+//      coords (max active L).
 //   2. FLOOR PASS — lazily walk the deepest survivor in the swap direction
 //      until its cumulative gross capacity covers amountIn. Record floorAdj =
 //      feeAdjust(far) at the stop. floorAdj is a SAFE UPPER BOUND on every
 //      pool's needed tick depth (deepest pool has the smallest eats-all
 //      excursion → adding shallower pools only RAISES the cut).
-//   3. BOUNDED PASS — for every survivor, lazy-walk forward until
+//   3. BOUNDED PASS — for every SURVIVOR, lazy-walk forward until
 //      (cumIn >= amountIn) OR (feeAdjust(far) <= floorAdj), then driftTicks MORE
 //      forward, plus read driftTicks on the REVERSE side of spot for runtime
 //      drift. Hard cap at MAX_TICKS. Emit pool row (incl scannedForward) + tick
-//      rows. Non-survivors / dust pools get scannedForward=0 and ZERO tick rows.
+//      rows. NON-survivors (below the relative-depth floor) are NOT emitted at
+//      all — the lens is the single source of truth for survivorship, so the
+//      off-chain consumer treats every returned pool row as a survivor.
 //
 // TICK REPRESENTATION (avoids sign-magnitude branching): a tick is carried as a
 // non-negative "shifted" value s = tick + OFFSET, OFFSET = 888000 (a multiple of
@@ -43,7 +45,6 @@ import { IStateViewFull } from "./IStateViewFull.json";
 //   zeroForOne        : Uint256 (1 if tokenIn < tokenOut)
 //   amountIn          : Uint256 (gross tokenIn; sizes the lazy walk)
 //   driftTicks        : Uint256 (extra boundaries past the stop, each side)
-//   minLiquidity      : Uint256 (absolute floor; MIN_LIQUIDITY)
 //   minRelBps         : Uint256 (relative-depth floor in bps of Σliquidity)
 //   maxTicks          : Uint256 (hard cap on forward tick reads per pool)
 //   v3Factories[i]    = [factoryAddr]
@@ -56,13 +57,23 @@ import { IStateViewFull } from "./IStateViewFull.json";
 // ── Return shape (off-chain abi.decode against this EXACTLY) ──────────────────
 //   abi.encode(poolBlob: bytes, tickBlob: bytes)
 //
-//   poolBlob = concatenated 32-byte words, POOL_STRIDE = 13 words per pool:
+//   poolBlob = a HEADER followed by SURVIVOR pool rows. The lens is the single
+//   source of truth for survivorship: only pools with L >= liqFloor (relative-
+//   depth floor) are emitted, so the consumer never re-filters.
+//
+//   HEADER (HEADER_WORDS = 4 words, exactly once at the start):
+//     [0] discoveredCount (alive pools seen across all families)
+//     [1] survivorCount   (pool rows that follow)
+//     [2] totalL          (Σ liquidity over alive pools, for diagnostics)
+//     [3] liqFloor        (the relative-depth survivor threshold actually applied)
+//
+//   then survivorCount rows, POOL_STRIDE = 13 words per pool:
 //     [0] poolType (0=V2,1=V3,2=V4)  [1] address  [2] fee  [3] tickSpacing
 //     [4] hooks(0)  [5] sqrtPriceX96 (synthetic out/in for V2)
 //     [6] liquidity (synthetic √(rIn·rOut) for V2)  [7] tickRaw (int24 ZERO-EXT)
 //     [8] inIsToken0 (V2 only)  [9] stateView (V4)  [10] poolId (V4)
-//     [11] scannedForward (forward tick boundaries walked; 0 for V2/dust)
-//     [12] scannedReverse (reverse-drift tick boundaries walked; 0 for V2/dust)
+//     [11] scannedForward (forward tick boundaries walked; 0 for V2)
+//     [12] scannedReverse (reverse-drift tick boundaries walked; 0 for V2)
 //
 //   tickBlob = concatenated 32-byte words, TICK_STRIDE = 3 words per tick row:
 //     [0] poolIdx  [1] tickIndexRaw (int24 ZERO-EXT)  [2] liquidityNetRaw (int128 ZERO-EXT)
@@ -109,7 +120,6 @@ function main(
   zeroForOne: Uint256,
   amountIn: Uint256,
   driftTicks: Uint256,
-  minLiquidity: Uint256,
   minRelBps: Uint256,
   maxTicks: Uint256,
   v3Factories: Tuple,
@@ -122,6 +132,7 @@ function main(
   let poolBlob: bytes = abi.encode(tokenIn).slice(0, 0);
   let tickBlob: bytes = abi.encode(tokenIn).slice(0, 0);
   let poolCount: Uint256 = 0;
+  let discovered: Uint256 = 0; // alive pools seen across all families (for header)
 
   const OFFSET: Uint256 = 888000; // tick shift (multiple of LCM(spacings)=3000, > max|tick|)
   const Q96: Uint256 = 2 ** 96;
@@ -130,8 +141,9 @@ function main(
   const MOD128: Uint256 = 2 ** 128;
 
   // ════ PASS 1: CHEAP STATE — discover + slot0 + liquidity (NO ticks) ════
-  // Accumulate total liquidity over candidates above the absolute floor and
-  // track the deepest survivor's coords (used by the floor pass).
+  // Accumulate total liquidity over every ALIVE pool (L > 0) and track the
+  // deepest pool's coords (used by the floor pass). Survivorship is decided
+  // below by the relative-depth floor alone (no absolute floor).
   let totalL: Uint256 = 0;
   let deepKind: Uint256 = 0; // 1=V3, 2=V4, 0=none
   let deepL: Uint256 = 0;
@@ -156,8 +168,9 @@ function main(
         const sqrtP: Uint256 = IUniswapV3PoolFull.at(poolAddr).slot0()[0];
         const liq: Uint256 = IUniswapV3PoolFull.at(poolAddr).liquidity();
         if (sqrtP > 0) {
-          if (liq >= minLiquidity) {
+          if (liq > 0) {
             totalL = totalL + liq;
+            discovered = discovered + 1;
             if (liq > deepL) {
               deepL = liq;
               deepKind = 1;
@@ -189,8 +202,9 @@ function main(
       const sqrtP4: Uint256 = IStateViewFull.at(stateView).getSlot0(poolId)[0];
       if (sqrtP4 > 0) {
         const liq4: Uint256 = IStateViewFull.at(stateView).getLiquidity(poolId);
-        if (liq4 >= minLiquidity) {
+        if (liq4 > 0) {
           totalL = totalL + liq4;
+          discovered = discovered + 1;
           if (liq4 > deepL) {
             deepL = liq4;
             deepKind = 2;
@@ -221,20 +235,19 @@ function main(
       if (lr0 > 0) {
         if (lr1 > 0) {
           const synthLpre: Uint256 = Math.sqrt(lr0 * lr1);
-          if (synthLpre >= minLiquidity) {
+          if (synthLpre > 0) {
             totalL = totalL + synthLpre;
+            discovered = discovered + 1;
           }
         }
       }
     }
   }
 
-  // Relative-depth floor (bps of Σliquidity). Survivor iff L >= max(absolute, rel).
+  // Relative-depth floor (bps of Σliquidity) is the SOLE survivor gate now (no
+  // absolute floor). Survivor iff L >= relFloor; minRelBps=0 keeps every alive pool.
   const relFloor: Uint256 = minRelBps > 0 ? Math.mulDiv(totalL, minRelBps, 10000) : 0;
-  let liqFloor: Uint256 = minLiquidity;
-  if (relFloor > liqFloor) {
-    liqFloor = relFloor;
-  }
+  const liqFloor: Uint256 = relFloor;
 
   // ════ PASS 2: FLOOR — lazy-walk the deepest survivor → floorAdj ════
   // floorAdj defaults to 0 (no bound: walk every survivor to maxTicks) when the
@@ -312,9 +325,16 @@ function main(
       if (poolAddr3 !== 0) {
         const sqrt3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
         const liq3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).liquidity();
+        // SURVIVOR iff alive AND at/above the relative-depth floor. When liqFloor
+        // is 0 (minRelBps=0) the > 0 check still drops empty pools.
+        let surv3: Uint256 = 0;
+        if (liq3 > 0) {
+          if (liq3 >= liqFloor) {
+            surv3 = 1;
+          }
+        }
         if (sqrt3 > 0) {
-          if (liq3 >= minLiquidity) {
-            const isSurv: Uint256 = liq3 >= liqFloor ? 1 : 0;
+          if (surv3 === 1) {
             const ts3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).tickSpacing();
             const tick3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[1];
             const idx3: Uint256 = poolCount;
@@ -327,17 +347,15 @@ function main(
               revShift3 = baseRev3 + ts3;
             }
             let scanRev3: Uint256 = 0; // reverse boundaries walked (= count emitted)
-            if (isSurv === 1) {
-              for (let rd3 = 0; rd3 < driftTicks; rd3 = rd3 + 1) {
-                const ra3: Uint256 = tickArg(revShift3, OFFSET);
-                const rn3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).ticks(ra3)[1];
-                tickBlob = tickBlob.concat(abi.encode(idx3, ra3, rn3));
-                scanRev3 = scanRev3 + 1;
-                if (zeroForOne === 1) {
-                  revShift3 = revShift3 + ts3; // further up
-                } else {
-                  revShift3 = revShift3 - ts3; // further down
-                }
+            for (let rd3 = 0; rd3 < driftTicks; rd3 = rd3 + 1) {
+              const ra3: Uint256 = tickArg(revShift3, OFFSET);
+              const rn3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).ticks(ra3)[1];
+              tickBlob = tickBlob.concat(abi.encode(idx3, ra3, rn3));
+              scanRev3 = scanRev3 + 1;
+              if (zeroForOne === 1) {
+                revShift3 = revShift3 + ts3; // further up
+              } else {
+                revShift3 = revShift3 - ts3; // further down
               }
             }
 
@@ -354,9 +372,6 @@ function main(
             let stop3: Uint256 = 0;    // hit cumIn>=amountIn OR feeAdj(far)<=floorAdj
             let drift3: Uint256 = 0;   // extra ticks emitted after stop
             let done3: Uint256 = 0;
-            if (isSurv === 0) {
-              done3 = 1;
-            }
             for (let k3 = 0; k3 < maxTicks; k3 = k3 + 1) {
               if (done3 === 0) {
                 const argW3: Uint256 = tickArg(curShift3, OFFSET);
@@ -443,11 +458,15 @@ function main(
           const reserveIn: Uint256 = inIsT0 === 1 ? r0 : r1;
           const reserveOut: Uint256 = inIsT0 === 1 ? r1 : r0;
           const synthL: Uint256 = Math.sqrt(reserveIn * reserveOut);
-          const synthSqrt: Uint256 = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
-          poolBlob = poolBlob.concat(
-            abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
-          );
-          poolCount = poolCount + 1;
+          // SURVIVORS ONLY: drop V2 pools below the relative-depth floor (matches
+          // the V3/V4 gate so the lens decides V2 survivorship too).
+          if (synthL >= liqFloor) {
+            const synthSqrt: Uint256 = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
+            poolBlob = poolBlob.concat(
+              abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
+            );
+            poolCount = poolCount + 1;
+          }
         }
       }
     }
@@ -468,8 +487,14 @@ function main(
       const sqrtP43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[0];
       if (sqrtP43 > 0) {
         const liq43: Uint256 = IStateViewFull.at(stateView3).getLiquidity(poolId3);
-        if (liq43 >= minLiquidity) {
-          const isSurv4: Uint256 = liq43 >= liqFloor ? 1 : 0;
+        // SURVIVOR iff alive AND at/above the relative-depth floor (single gate).
+        let surv4: Uint256 = 0;
+        if (liq43 > 0) {
+          if (liq43 >= liqFloor) {
+            surv4 = 1;
+          }
+        }
+        if (surv4 === 1) {
           const tick43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[1];
           const idx43: Uint256 = poolCount;
 
@@ -479,17 +504,15 @@ function main(
             revShift4 = baseRev4 + v4ts3;
           }
           let scanRev4: Uint256 = 0; // reverse boundaries walked (= count emitted)
-          if (isSurv4 === 1) {
-            for (let rd4 = 0; rd4 < driftTicks; rd4 = rd4 + 1) {
-              const ra4: Uint256 = tickArg(revShift4, OFFSET);
-              const rn4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, ra4)[1];
-              tickBlob = tickBlob.concat(abi.encode(idx43, ra4, rn4));
-              scanRev4 = scanRev4 + 1;
-              if (zeroForOne === 1) {
-                revShift4 = revShift4 + v4ts3;
-              } else {
-                revShift4 = revShift4 - v4ts3;
-              }
+          for (let rd4 = 0; rd4 < driftTicks; rd4 = rd4 + 1) {
+            const ra4: Uint256 = tickArg(revShift4, OFFSET);
+            const rn4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, ra4)[1];
+            tickBlob = tickBlob.concat(abi.encode(idx43, ra4, rn4));
+            scanRev4 = scanRev4 + 1;
+            if (zeroForOne === 1) {
+              revShift4 = revShift4 + v4ts3;
+            } else {
+              revShift4 = revShift4 - v4ts3;
             }
           }
 
@@ -505,9 +528,6 @@ function main(
           let stop4: Uint256 = 0;
           let drift4: Uint256 = 0;
           let done4: Uint256 = 0;
-          if (isSurv4 === 0) {
-            done4 = 1;
-          }
           for (let k4 = 0; k4 < maxTicks; k4 = k4 + 1) {
             if (done4 === 0) {
               const argW4: Uint256 = tickArg(curShift4, OFFSET);
@@ -577,5 +597,9 @@ function main(
     }
   }
 
-  return abi.encode(poolBlob, tickBlob);
+  // Prepend the 4-word HEADER so the decoder reads survivorship straight from the
+  // lens (single source of truth): discoveredCount, survivorCount (= poolCount),
+  // totalL, liqFloor. Every row after the header is a survivor.
+  const header: bytes = abi.encode(discovered, poolCount, totalL, liqFloor);
+  return abi.encode(header.concat(poolBlob), tickBlob);
 }

@@ -124,6 +124,73 @@ describe("ecoswap.sauce.ts", () => {
   });
 });
 
+// ── The SINGLE-PASS (live-cut) array solver ──────────────────────────────────
+// Same arg shape as ecoswap.sauce.ts, but lowers new Array(n) + arr[i]=… element
+// mutation. Must compile clean on BOTH the v1 (prefix) and v12 (postfix-Huff)
+// targets — this catches array-mutation lowering regressions on either engine.
+describe("ecoswap.singlepass.sauce.ts", () => {
+  const SINGLEPASS = join(RECIPE_DIR, "ecoswap.singlepass.sauce.ts");
+
+  // Compile the single-pass solver for BOTH targets with the given fixture and
+  // assert each produces >=1 non-empty bytecode segment.
+  function compileBoth(poolsArg: bigint[][], bracketsArg: bigint[][]) {
+    const source = readFileSync(SINGLEPASS, "utf-8");
+    const stripped = stripTypes(source);
+    const args = [WETH, USDC, 10n ** 18n, CALLER, 1n, PRICE_LIMIT, poolsArg, routes, bracketsArg];
+
+    const v1: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args });
+    const v12: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args, target: "v12" });
+
+    for (const [label, result] of [["v1", v1], ["v12", v12]] as const) {
+      const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;
+      assert.ok(Array.isArray(segments) && segments.length >= 1, `${label}: should produce >=1 bytecode segment`);
+      for (const seg of segments) assert.ok(seg.length > 0, `${label}: segment should not be empty`);
+    }
+  }
+
+  it("single-pass compiles a 2-V3-pool fixture (v1 + v12)", () => {
+    compileBoth(pools, brackets);
+  });
+
+  // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1)
+  // plus the V2 getReserves staticcall path in the live-price cache.
+  it("single-pass compiles a V2 + V3 mix (v1 + v12)", () => {
+    // [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
+    const mixedPools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n],
+      [0n, BigInt("0xcccc000000000000000000000000000000000003"), 3000n, 0n, 0n, 3000n, 1n, 1n, 0n, 0n],
+    ];
+    // V2 brackets carry kind=1 (EcoBracketKind.V2).
+    const v2Brkt = (refIdx: bigint, near: bigint, far: bigint, L: bigint): bigint[] => {
+      const cap = (L * Q96) / far - (L * Q96) / near;
+      return [1n, refIdx, near, far, L, cap > 0n ? cap : 1n, near, far];
+    };
+    const mixedBrackets: bigint[][] = [
+      brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
+      v2Brkt(1n, sqrtNear, (sqrtNear * 99n) / 100n, 5n * 10n ** 17n),
+      v2Brkt(1n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 5n * 10n ** 17n),
+    ];
+    compileBoth(mixedPools, mixedBrackets);
+  });
+
+  // V4 pool — guards the StateView getSlot0 read (dp[8]/dp[9]) + unified swap poolType=2.
+  it("single-pass compiles a V4 pool (v1 + v12)", () => {
+    const STATE_VIEW = BigInt("0xA3c0c9b65baD0189c5c041BF29d8f6DCF1c8e3e1");
+    const POOL_ID = BigInt("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+    const POOL_MANAGER = BigInt("0x498581fF718922c3f8e6A244956aF099B2652b2b");
+    // poolType=2 (V4), tickSpacing=60, stateView + poolId populated.
+    const v4Pools: bigint[][] = [
+      [2n, POOL_MANAGER, 3000n, 60n, 0n, 3000n, 0n, 1n, STATE_VIEW, POOL_ID],
+    ];
+    // V4 brackets carry kind=0 (concentrated, same geometry as V3).
+    const v4Brackets: bigint[][] = [
+      brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
+      brkt(0n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 10n ** 18n),
+    ];
+    compileBoth(v4Pools, v4Brackets);
+  });
+});
+
 // ── The on-chain PREPARE LENS (read-only discovery+state+ticks) ───────────────
 describe("ecoswap.lens.sauce.ts", () => {
   // Compile the lens with the SAME arg shape lens.ts passes (factory/feeTier/spec
@@ -145,12 +212,13 @@ describe("ecoswap.lens.sauce.ts", () => {
     const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
     const result: any = compile(stripTypes(source), {
       baseDirs: [REPO_ROOT, RECIPE_DIR],
-      // SAME 14-arg lazy shape lens.ts passes:
-      //   tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minLiquidity,minRelBps,maxTicks,
+      // SAME 13-arg lazy shape lens.ts passes (no absolute floor — relative-depth
+      // minRelBps is the sole liquidity gate):
+      //   tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minRelBps,maxTicks,
       //   v3Factories,v3FeeTiers[fee,stepRatio],v2Factories,v4Factories,v4Specs[fee,ts,stepRatio],v4PoolIds
       args: [
         TOKEN_IN, TOKEN_OUT, zeroForOne,
-        1000n, 2n, 10n ** 13n, 100n, 96n,
+        1000n, 2n, 100n, 96n,
         [[FACTORY]],                       // v3Factories
         [[500n, STEP_10], [3000n, STEP_60]], // v3FeeTiers [fee, stepRatio]
         [[V2_FACTORY]],                    // v2Factories

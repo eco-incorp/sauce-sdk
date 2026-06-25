@@ -24,6 +24,11 @@ const ARTIFACTS = ["IERC20", "ISauceRouter", "IUniswapV3Pool", "Router", "SauceR
 // (name -> containing `<file>.sol` dir). IStateView lives in IUniswapV4.sol.
 const EXTRA_ARTIFACTS = { IStateView: "IUniswapV4.sol" };
 
+// V12 bridge contracts (engine/out). The Huff v12 runtime path deploys via the
+// V12Kitchen/V12Pot proxy pair instead of the Solidity Router. Soft group: an
+// older engine without them only warns (the v1 Router sync above still hard-fails).
+const V12_ARTIFACTS = ["V12Kitchen", "V12Pot"];
+
 // engine/out is reachable via the stable-named `sauce` symlink in compiler's (or the
 // hoisted root) node_modules — avoids hardcoding the SHA-pinned pnpm store path.
 const OUT_CANDIDATES = [
@@ -67,5 +72,35 @@ if (missing.length) {
   process.exit(1);
 }
 
-const total = ARTIFACTS.length + Object.keys(EXTRA_ARTIFACTS).length;
+// V12 extras: bridge contracts + the Huff runtime creation-code snapshot. Soft —
+// an older engine (pre-v12) lacks these, so warn (don't hard-fail) and let the v1
+// flow proceed. engine-v12/snapshots lives one level up from engine/out.
+const ENGINE_ROOT = resolve(engineOut, "..", "..");
+let v12Copied = 0;
+const v12Missing = [];
+for (const name of V12_ARTIFACTS) {
+  const src = resolve(engineOut, `${name}.sol`, `${name}.json`);
+  if (existsSync(src)) {
+    copyFileSync(src, resolve(ARTIFACTS_DIR, `${name}.json`));
+    v12Copied++;
+  } else {
+    v12Missing.push(name);
+  }
+}
+const v12SnapshotSrc = resolve(ENGINE_ROOT, "engine-v12", "snapshots", "V12RuntimeBytecode.json");
+if (existsSync(v12SnapshotSrc)) {
+  copyFileSync(v12SnapshotSrc, resolve(ARTIFACTS_DIR, "V12RuntimeBytecode.json"));
+  v12Copied++;
+} else {
+  v12Missing.push("V12RuntimeBytecode");
+}
+
+if (v12Missing.length) {
+  console.warn(
+    `[sync-artifacts] V12 extras not found (engine predates v12 runtime?): ${v12Missing.join(", ")} ` +
+      "— v12 recipe path will be unavailable; v1 sync unaffected.",
+  );
+}
+
+const total = ARTIFACTS.length + Object.keys(EXTRA_ARTIFACTS).length + v12Copied;
 console.log(`[sync-artifacts] copied ${total} artifacts -> dev-tools/artifacts/`);

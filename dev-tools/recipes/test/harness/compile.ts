@@ -16,7 +16,10 @@ import type { Hex } from "viem";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler") as {
-  compile: (src: string, opts: { baseDirs: string[]; args?: unknown[] }) => {
+  compile: (
+    src: string,
+    opts: { baseDirs: string[]; args?: unknown[]; target?: "v1" | "v12" },
+  ) => {
     bytecode?: Uint8Array[];
     bytecodes?: Uint8Array[];
     warnings?: unknown[];
@@ -41,14 +44,17 @@ function toHex(bytes: Uint8Array): Hex {
  * Compile a TS-typed SauceScript string with the given compiler args.
  * `recipeDir` (for recipe-local JSON imports) defaults to the ecoswap dir; the
  * minimal gate script only imports from ./artifacts so either works.
+ * `target` selects the bytecode surface: "v1" (prefix, Solidity Router) or "v12"
+ * (postfix, Huff runtime). Both produce a `bytes[]` blob that cook() accepts.
  */
 export function compileSauce(
   tsSource: string,
   args: unknown[],
   recipeDir: string = ECOSWAP_DIR,
+  target: "v1" | "v12" = "v1",
 ): { bytecodes: Hex[]; warnings: unknown[] } {
   const jsSource = stripTypes(tsSource);
-  const result = compile(jsSource, { baseDirs: [DEV_TOOLS, recipeDir], args });
+  const result = compile(jsSource, { baseDirs: [DEV_TOOLS, recipeDir], args, target });
   const segments = result.bytecode ?? result.bytecodes ?? [];
   return { bytecodes: segments.map(toHex), warnings: result.warnings ?? [] };
 }

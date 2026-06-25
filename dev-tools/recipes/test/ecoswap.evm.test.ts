@@ -24,7 +24,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseEther, type Hex } from "viem";
+import { parseEther, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -33,6 +33,8 @@ import { cook } from "./harness/cook";
 import {
   ensureMulticall3,
   deployStack,
+  deployV12Stack,
+  V12_AVAILABLE,
   deploySortedTokens,
   createAndInitPool,
   mint,
@@ -51,6 +53,7 @@ import {
   getV4Liquidity,
   SQRT_PRICE_1_1,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
 import {
   MIN_SQRT_RATIO,
@@ -67,6 +70,14 @@ const HARNESS = join(__dirname, "harness");
 
 // A huge approval/mint cap so funding never bottlenecks the test.
 const HUGE = parseEther("1000000000");
+
+// Opt-in for the v12 (Huff) engine cells. They run only when the v12 engine
+// artifacts are present (V12_AVAILABLE) AND this is set, so an older engine or a
+// default run stays green. Mirrors the gated engine-v12 parity/exec convention.
+const V12_OPT_IN =
+  process.env.SAUCE_ENGINE_V12 === "1" || process.env.SAUCE_ENGINE_V12 === "true";
+/** True when the v12 engine cells should actually run (artifacts + opt-in). */
+const V12_ENABLED = V12_AVAILABLE && V12_OPT_IN;
 
 describe("EcoSwap local EVM integration", () => {
   let anvil: AnvilHandle;
@@ -221,10 +232,20 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
+  // v12 engine stack (Router→SauceRouter→V12Kitchen→Pot), deployed on the SAME
+  // anvil sharing the SAME pools. null when v12 artifacts are absent — the v12
+  // engine cells then skip. The pools don't care which router swaps them (the
+  // Router authenticates V3 callbacks via transient storage, not a fixed address).
+  let v12: DeployedV12Stack | null = null;
   let tokenIn: Hex; // == token0 (zeroForOne = true)
   let tokenOut: Hex; // == token1
   let poolConfig: ChainPoolConfig;
   const poolsByFee = new Map<number, Hex>();
+  // Clean post-setup snapshot. Every Phase 3 / 3b run reverts to it first so each
+  // prepares + cooks against the IDENTICAL fresh pool state (the runs share one
+  // anvil; without this the prior run's swaps would drift the pools and the
+  // single-pass exact-equality checks would no longer hold).
+  let cleanSnapshot: Hex;
 
   before(async () => {
     anvil = await startAnvil();
@@ -281,11 +302,45 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
       feeTiers: [500, 3000, 10000],
       baseTokens: [tokenIn, tokenOut],
     };
+
+    // v12 engine stack (same anvil, same pools). The Pot is owned by account0 (the
+    // cook caller); account0 approves the POT for tokenIn since the v12 program does
+    // transferFrom(caller, self=Pot, …). Deployed only when the v12 cells will run
+    // (artifacts present + opt-in) so a default/older-engine run skips the cost.
+    if (V12_ENABLED) {
+      const owner = c.walletClient.account as Account;
+      v12 = await deployV12Stack(c.walletClient, c.publicClient, owner);
+      await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+    }
+
+    cleanSnapshot = await c.testClient.snapshot();
   });
 
   after(() => {
     anvil?.stop();
   });
+
+  // A fixed, far-future timestamp every cell's cook block is pinned to. The cook's
+  // V3 swaps touch the pool oracle, whose accumulator arithmetic depends on the
+  // delta since the last observation — so a wall-clock-derived block timestamp made
+  // the SAME bytecode against the SAME (snapshot-restored) pool state execute
+  // nondeterministically (gas varied; the oversized two-pass cook occasionally
+  // reverted). Pinning it makes the block context identical for every cell. Year
+  // ~2033, safely after the snapshot block's timestamp (setNextBlockTimestamp
+  // requires strictly-increasing).
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+
+  // Revert to the clean post-setup state and re-snapshot for the next run. anvil
+  // invalidates a snapshot id once reverted into (and any taken after it), so we
+  // must re-snapshot each time. Mirrors the prod-mirror drift / gas harnesses.
+  // After the revert, pin the next block's timestamp so every cell cooks against an
+  // IDENTICAL state + block context — without this the V3 oracle's timestamp
+  // dependence made the oversized two-pass cook flaky (see COOK_BLOCK_TIMESTAMP).
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
 
   /** Post-swap fee-adjusted out/in marginal price for a pool (mirrors prepare). */
   async function feeAdjMarginal(pool: Hex, feePpm: number): Promise<bigint> {
@@ -294,7 +349,45 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     return feeAdjust(outIn, feePpm);
   }
 
-  it("Phase 3 — splits amountIn across pools with marginal-price equalization", async () => {
+  // ── Solver matrix ────────────────────────────────────────────
+  // Phase 3 / 3b run against BOTH on-chain solvers. ECO_SOLVER drives the SAME
+  // switch in two places: ecoSwap()/index.ts picks the solver source file, and
+  // ecoswap.reference.ts picks the matching oracle — so the env set here makes the
+  // compiled bytecode and the cross-check oracle agree by construction. Each body
+  // sets the env, runs, and restores it in a finally so it never leaks to other
+  // phases (Phase 4/5/6 expect two-pass, the default).
+  const SOLVERS: { name: string; solver: string | undefined }[] = [
+    { name: "two-pass", solver: undefined },
+    { name: "singlepass", solver: "singlepass" },
+  ];
+
+  function withSolver<T>(solver: string | undefined, body: () => Promise<T>): Promise<T> {
+    const prev = process.env.ECO_SOLVER;
+    if (solver === undefined) delete process.env.ECO_SOLVER;
+    else process.env.ECO_SOLVER = solver;
+    const restore = () => {
+      if (prev === undefined) delete process.env.ECO_SOLVER;
+      else process.env.ECO_SOLVER = prev;
+    };
+    return body().then(
+      (v) => {
+        restore();
+        return v;
+      },
+      (e) => {
+        restore();
+        throw e;
+      },
+    );
+  }
+
+  async function runPhase3(solverName: string, engine: "v1" | "v12"): Promise<void> {
+    await resetPools();
+    const isSinglePass = solverName === "singlepass";
+    const target = engine === "v12" ? "v12" : "v1";
+    // cook() target: v1 → the SauceRouter, v12 → the owner's V12Pot (delegatecalls
+    // the Huff runtime for cook + the SauceRouter for swap callbacks, same context).
+    const cookTarget = engine === "v12" ? v12!.pot : stack.sauceRouter;
     const amountIn = parseEther("5000");
     const caller = c.account0;
 
@@ -308,12 +401,17 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
     // Run REAL discovery → tick reads → bracket build → water-fill → compile.
+    // Quote against a SauceRouter either way (the v12 Pot's fallback reaches the
+    // same swap surface, but quoting is off-chain and target-agnostic — prepare
+    // only does RPC reads); `target` selects the v1 vs v12 solver compilation.
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       anvil.rpcUrl,
-      stack.sauceRouter,
+      engine === "v12" ? v12!.sauceRouter : stack.sauceRouter,
       caller,
       poolConfig,
+      undefined,
+      target,
     );
 
     // prepared diagnostics
@@ -323,9 +421,10 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     assert.ok(prepared.brackets.length > 0, "should build brackets");
     assert.ok(prepared.zeroForOne, "tokenIn < tokenOut → zeroForOne");
 
-    // Approve + cook.
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    // Approve + cook. The program does transferFrom(caller, self=cookTarget, …), so
+    // approve the cook target (SauceRouter for v1, the Pot for v12).
+    await approve(c.walletClient, c.publicClient, tokenIn, cookTarget, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, cookTarget, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed");
 
     // ── Per-pool executed input (tokenIn reserve delta) ──
@@ -345,12 +444,27 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const spent = callerInBefore - callerInAfter;
     const received = callerOutAfter - callerOutBefore;
     assert.ok(received > 0n, "caller received tokenOut");
-    // Leftover refunded should be a small fraction (liquidity is ample here).
     const leftover = amountIn - spent;
-    assert.ok(
-      leftover * 100n <= amountIn, // <=1% unspent
-      `caller should spend ~all amountIn (spent ${spent}, leftover ${leftover})`,
-    );
+
+    // ── Oracle cross-check (deterministic local state == prepared state) ──
+    // The reference auto-selects the matching solver from ECO_SOLVER (set by
+    // withSolver), so ref.totalInput is the exact gross the on-chain sweep assigns.
+    const ref = ecoSwapReference(prepared, amountIn);
+
+    if (isSinglePass) {
+      // Compute-then-pull: the sweep pulls EXACTLY cum == ref.totalInput, and with
+      // no binding priceLimit (these pools never hit one here) the guarded terminal
+      // refund never fires — so spent is exact and leftover is zero.
+      assert.equal(spent, ref.totalInput, "single-pass: spent == oracle totalInput EXACTLY");
+      assert.equal(leftover, 0n, "single-pass: no leftover (compute-then-pull, no limit hit)");
+    } else {
+      // Two-pass over-pulls amountIn upfront then refunds the unspent remainder;
+      // ample liquidity here means the undershoot (and thus the refund) is small.
+      assert.ok(
+        leftover * 100n <= amountIn, // <=1% unspent
+        `two-pass: caller should spend ~all amountIn (spent ${spent}, leftover ${leftover})`,
+      );
+    }
 
     // ── Marginal-price equalization across the pools that received input ──
     const marginals: { fee: number; adj: bigint }[] = [];
@@ -370,11 +484,7 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const spread = Number(maxAdj - minAdj) / Number(maxAdj);
     assert.ok(spread < 0.02, `post-swap fee-adj marginal prices should cluster (spread ${spread})`);
 
-    // ── Oracle cross-check (deterministic local state == prepared state) ──
-    const ref = ecoSwapReference(prepared, amountIn);
-    // Map reference perPoolInput (indexed by prepared.pools) to fee.
-    const feeOfPool = new Map<Hex, number>();
-    for (const p of prepared.pools) feeOfPool.set(p.address.toLowerCase() as Hex, p.feePpm);
+    // ── Per-pool oracle cross-check (deterministic local state == prepared state) ──
     for (let i = 0; i < prepared.pools.length; i++) {
       const fee = prepared.pools[i].feePpm;
       const refIn = ref.perPoolInput[i];
@@ -393,20 +503,25 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     }
 
     console.log(
-      `  [P3] split spent=${spent} received=${received} leftover=${leftover}\n` +
+      `  [P3:${solverName}/${engine}] split spent=${spent} received=${received} leftover=${leftover}\n` +
         `       per-pool tokenIn: ${feesUsed.map((f) => `${f}=${perPoolOnchain.get(f)}`).join(" ")}\n` +
         `       fee-adj marginals: ${marginals.map((m) => `${m.fee}=${m.adj}`).join(" ")} spread=${spread}\n` +
-        `       oracle perPoolInput: ${ref.perPoolInput.map((v, i) => `${prepared.pools[i].feePpm}=${v}`).join(" ")} cut=${ref.cutSqrtAdj}`,
+        `       oracle totalInput=${ref.totalInput} perPoolInput: ${ref.perPoolInput.map((v, i) => `${prepared.pools[i].feePpm}=${v}`).join(" ")} cut=${ref.cutSqrtAdj}`,
     );
-  });
+  }
 
-  it("Phase 3b — large amountIn: succeeds, splits, spends up to amountIn", async () => {
+  async function runPhase3b(solverName: string, engine: "v1" | "v12"): Promise<void> {
+    await resetPools();
+    const isSinglePass = solverName === "singlepass";
+    const target = engine === "v12" ? "v12" : "v1";
+    const cookTarget = engine === "v12" ? v12!.pot : stack.sauceRouter;
     // A large trade. These pools are deep (±12000-tick positions), so the lens
     // window absorbs it: the single-pass solver spends amountIn EXACTLY (the
     // crossing pool takes the remainder), while the two-pass solver re-derives
     // per-pool integrals that slightly undershoot and refund the leftover — both
-    // are valid. The genuine window-EXCEEDED refund path (live price drifts past
-    // the prepared ticks) is exercised by the adaptive dynamic-read test.
+    // are valid. The genuine window-EXCEEDED path (live price drifts past the
+    // prepared ticks) is covered by the adaptive solver test (forthcoming in this
+    // branch), not here — here the window comfortably contains the whole trade.
     const amountIn = parseEther("50000");
     const caller = c.account0;
 
@@ -416,12 +531,14 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const { bytecodes } = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       anvil.rpcUrl,
-      stack.sauceRouter,
+      engine === "v12" ? v12!.sauceRouter : stack.sauceRouter,
       caller,
       poolConfig,
+      undefined,
+      target,
     );
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    await approve(c.walletClient, c.publicClient, tokenIn, cookTarget, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, cookTarget, bytecodes);
     assert.equal(receipt.status, "success", "oversized cook() must still succeed");
 
     const callerInAfter = await balanceOf(c.publicClient, tokenIn, caller);
@@ -429,10 +546,60 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const spent = callerInBefore - callerInAfter;
     const received = callerOutAfter - callerOutBefore;
     assert.ok(received > 0n, "should still receive output");
-    assert.ok(spent > 0n && spent <= amountIn, "spends up to amountIn (exact for single-pass, undershoot for two-pass)");
 
-    console.log(`  [P3b] large trade: spent ${spent} of ${amountIn}, received ${received}, refunded ${amountIn - spent}`);
-  });
+    if (isSinglePass) {
+      // Deep pools + window absorbs the trade → the crossing pool takes the
+      // remaining need, so cum == amountIn and compute-then-pull spends it exactly.
+      assert.equal(spent, amountIn, "single-pass: spends amountIn EXACTLY (crossing pool takes remainder)");
+    } else {
+      assert.ok(
+        spent > 0n && spent <= amountIn,
+        "two-pass: spends up to amountIn (per-pool re-derivation may undershoot)",
+      );
+    }
+
+    console.log(
+      `  [P3b:${solverName}/${engine}] large trade: spent ${spent} of ${amountIn}, received ${received}, refunded ${amountIn - spent}`,
+    );
+  }
+
+  // ── Engine matrix ────────────────────────────────────────────
+  // The SAME compiled solver runs on BOTH engines: v1 cooks the prefix bytecode
+  // through the Solidity SauceRouter; v12 cooks the postfix (Huff) bytecode through
+  // a V12Pot (which delegatecalls the Huff runtime for cook + the SauceRouter for
+  // swap callbacks, all in the Pot's context). The dimension is orthogonal to the
+  // solver dimension — every (solver × engine) cell is generated below.
+  //
+  // The v12 cells are skip-by-default (V12_ENABLED = artifacts present + opt-in via
+  // SAUCE_ENGINE_V12), so CI on an older engine, or without the opt-in, stays green.
+  // Mirrors the gated engine-v12 parity/exec tests (the compiler-v12-target convention).
+  const ENGINES: { engine: "v1" | "v12"; skip: boolean }[] = [
+    { engine: "v1", skip: false },
+    { engine: "v12", skip: !V12_ENABLED },
+  ];
+
+  // Generate one it() per (solver × engine) inside this describe so all share the
+  // one before() anvil/stack. Each run resetPools() first (revert to the clean
+  // snapshot), so every trade prepares + cooks against the IDENTICAL fresh pools —
+  // order-independent.
+  for (const { name, solver } of SOLVERS) {
+    for (const { engine, skip } of ENGINES) {
+      it(
+        `Phase 3 [${name}/${engine}] — splits amountIn across pools with marginal-price equalization`,
+        { skip },
+        async () => {
+          await withSolver(solver, () => runPhase3(name, engine));
+        },
+      );
+      it(
+        `Phase 3b [${name}/${engine}] — large amountIn: succeeds, splits, spends up to amountIn`,
+        { skip },
+        async () => {
+          await withSolver(solver, () => runPhase3b(name, engine));
+        },
+      );
+    }
+  }
 });
 
 // ── Phase 4: mixed V2 + V3 split (etched constant-product pair) ───────

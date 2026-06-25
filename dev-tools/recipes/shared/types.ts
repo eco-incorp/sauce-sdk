@@ -247,6 +247,28 @@ export interface EcoPool {
   stateView: Hex;
   /** V4 only: poolId = keccak256(abi.encode(PoolKey)) (0x0 for V2/V3). */
   poolId: Hex;
+  /**
+   * Adaptive (WS4) frontier seeds for the on-chain streaming tick walk — the
+   * point where buildV3Brackets STOPPED reading the prepared window. The solver
+   * resumes a live ticks()/getTickLiquidity walk from here when a pool's brackets
+   * are exhausted while cum < amountIn. Default 0 (off) → loop never fires →
+   * behavior byte-identical to non-adaptive. V3/V4 only (V2 has one wide bracket).
+   */
+  /** (tick + OFFSET) of the first un-walked boundary; OFFSET = 888000. 0 = off. */
+  adaptiveStartShifted: bigint;
+  /** REAL sqrt (token1/token0, Q96) at the near edge = getSqrtRatioAtTick(last crossed boundary). */
+  adaptiveNearReal: bigint;
+  /** Active L entering the first un-walked step. */
+  adaptiveStartL: bigint;
+  /** floor(sqrt(1.0001^ts)*2^96) = getSqrtRatioAtTick(ts) — the multiplicative step ratio. */
+  adaptiveStepRatio: bigint;
+  /**
+   * OFF-CHAIN-ONLY liquidityNet map (tick → net) for the oracle's mirrored walk.
+   * Populated from the lens `net` map in buildV3Brackets. NOT in the compiler tuple
+   * (the on-chain solver reads net live via ticks()/getTickLiquidity). Undefined when
+   * not prepared adaptively.
+   */
+  adaptiveNet?: Map<number, bigint>;
   source: string;
 }
 

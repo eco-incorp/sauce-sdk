@@ -22,7 +22,17 @@
  */
 
 import { EcoBracketKind, type EcoSwapPrepared } from "../shared/types";
-import { Q96, FEE_DENOM, isqrt, mulDiv } from "./ecoswap.math";
+import {
+  Q96,
+  FEE_DENOM,
+  isqrt,
+  mulDiv,
+  stepReal,
+  toOutIn,
+  HALF128,
+  MOD128,
+  tickArg,
+} from "./ecoswap.math";
 
 export interface EcoSwapReferenceResult {
   cutSqrtAdj: bigint;
@@ -41,8 +51,10 @@ function sqrtScale(feePpm: bigint): bigint {
 
 export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): EcoSwapReferenceResult {
   // ECO_SOLVER=singlepass selects the single-pass (live-cut) solver; mirror it.
+  // ECO_ADAPTIVE=1 additionally mirrors the WS4 streaming tick walk (only meaningful
+  // when prepared adaptively — i.e. pools carry adaptiveStartShifted seeds).
   if (process.env.ECO_SOLVER === "singlepass") {
-    return singlePassReference(prepared, amountIn);
+    return singlePassReference(prepared, amountIn, process.env.ECO_ADAPTIVE === "1");
   }
   const { pools, routes, brackets } = prepared;
 
@@ -206,7 +218,11 @@ export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): E
  * equalised post-fee marginals; output differs only at the flat optimum (<0.1% on
  * fine ticks).
  */
-function singlePassReference(prepared: EcoSwapPrepared, amountIn: bigint): EcoSwapReferenceResult {
+function singlePassReference(
+  prepared: EcoSwapPrepared,
+  amountIn: bigint,
+  adaptive = false,
+): EcoSwapReferenceResult {
   const { pools, routes, brackets } = prepared;
   const perPoolInput: bigint[] = new Array(pools.length).fill(0n);
   const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
@@ -273,6 +289,81 @@ function singlePassReference(prepared: EcoSwapPrepared, amountIn: bigint): EcoSw
           perPoolInput[p] = perPoolInput[p] + take;
           cum = cum + take;
         }
+      }
+    }
+  }
+
+  // ── ADAPTIVE STREAMING TICK WALK (WS4 oracle mirror) ──
+  // Mirrors ecoswap.singlepass.sauce.ts's adaptive block EXACTLY: when the sweep
+  // under-filled and a pool carries a frontier seed, resume its tick walk using the
+  // SAME multiplicative stepReal (NOT getSqrtRatioAtTick), toOutIn, mulDiv+fee-grossup,
+  // and the SAME int128 raw-uint L update — reading net from the off-chain adaptiveNet
+  // map keyed by signed tick. Gated by `adaptive`; default false → no-op (regression pin).
+  const EXTRA_TICKS = 64;
+  if (adaptive && cum < amountIn) {
+    const zeroForOne = prepared.zeroForOne;
+    const z = zeroForOne ? 1 : 0;
+    const priceLimit = prepared.priceLimit;
+    for (let ap = 0; ap < pools.length; ap++) {
+      if (cum >= amountIn) break;
+      const ad = pools[ap];
+      if (ad.isV2) continue;
+      const aStartShift = ad.adaptiveStartShifted ?? 0n;
+      if (aStartShift <= 0n) continue; // not prepared adaptively → skip (off → no-op)
+      const aFeePpm = BigInt(ad.feePpm);
+      const aTs = BigInt(ad.tickSpacing);
+      const aStep = ad.adaptiveStepRatio ?? 0n;
+      const aNet = ad.adaptiveNet ?? new Map<number, bigint>();
+      let aShift = aStartShift;
+      let aNearReal = ad.adaptiveNearReal ?? 0n;
+      let aL = ad.adaptiveStartL ?? 0n;
+      let aDone = false;
+      for (let kx = 0; kx < EXTRA_TICKS; kx++) {
+        if (aDone) break;
+        const aFarReal = stepReal(aNearReal, aStep, zeroForOne);
+        const aNearOI = toOutIn(aNearReal, zeroForOne);
+        const aFarOI = toOutIn(aFarReal, zeroForOne);
+        let aLimited = false;
+        if (z === 1) {
+          if (aFarReal <= priceLimit) aLimited = true;
+        } else {
+          if (aFarReal >= priceLimit) aLimited = true;
+        }
+        if (aL > 0n && aNearOI > aFarOI && aFarOI > 0n) {
+          const aEffIn = mulDiv(aL, Q96, aFarOI) - mulDiv(aL, Q96, aNearOI);
+          if (aEffIn > 0n) {
+            const aGross = mulDiv(aEffIn, FEE_DENOM, FEE_DENOM - aFeePpm);
+            let aTake = aGross;
+            if (cum + aGross >= amountIn) {
+              aTake = amountIn - cum;
+              aDone = true;
+            }
+            perPoolInput[ap] = perPoolInput[ap] + aTake;
+            cum = cum + aTake;
+          }
+        }
+        // Cross the boundary: update L by liquidityNet. The on-chain solver reads
+        // the RAW uint128 word, so reconstruct it from the signed map value and run
+        // the identical sign/clamp branches (bit-for-bit with the engine path).
+        const signedNet = aNet.get(Number(tickArg(aShift))) ?? 0n;
+        const raw = signedNet >= 0n ? signedNet : signedNet + MOD128;
+        const neg = raw >= HALF128;
+        if (z === 1) {
+          if (neg) aL = aL + (MOD128 - raw);
+          else aL = aL >= raw ? aL - raw : 0n;
+          aShift = aShift - aTs;
+        } else {
+          if (neg) {
+            const mag = MOD128 - raw;
+            aL = aL >= mag ? aL - mag : 0n;
+          } else {
+            aL = aL + raw;
+          }
+          aShift = aShift + aTs;
+        }
+        aNearReal = aFarReal;
+        if (cum >= amountIn) aDone = true;
+        if (aLimited) aDone = true;
       }
     }
   }
