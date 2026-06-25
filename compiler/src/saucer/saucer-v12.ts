@@ -658,8 +658,20 @@ export class V12Saucer implements SaucerLike {
     return this.binaryRaw(OPS.TSTORE, value, key, false);
   }
 
-  /** Binary op with explicit (no-swap) operand order: [first][second][OP]. */
-  private binaryRaw(op: number, firstL: SaucerLike, secondL: SaucerLike, isDynamic: boolean): V12Saucer {
+  /**
+   * Binary op with explicit (no-swap) operand order: [first][second][OP].
+   * `opStackEffect` is the opcode's own net stack delta: -2 for ops that consume
+   * both operands and push nothing (SSTORE/TSTORE), -1 for ops that leave a result
+   * (STATIC/DELEGATE push a descriptor). Mirrors `../sauce/engine-v12/src/V12Saucer.sol`
+   * (`_propagate2(..., -2)` for the stores vs `_binaryOp(..., -1)` for the calls).
+   */
+  private binaryRaw(
+    op: number,
+    firstL: SaucerLike,
+    secondL: SaucerLike,
+    isDynamic: boolean,
+    opStackEffect = -2,
+  ): V12Saucer {
     const first = firstL as V12Saucer;
     const second = secondL as V12Saucer;
     const calls = [...this.callPositions];
@@ -670,7 +682,7 @@ export class V12Saucer implements SaucerLike {
     return new V12Saucer(
       this.ctx,
       concat(this._bytes, first._bytes, second._bytes, [op]),
-      this.stackEffect + first.stackEffect + second.stackEffect - 2,
+      this.stackEffect + first.stackEffect + second.stackEffect + opStackEffect,
       isDynamic,
       calls,
       refs,
@@ -799,12 +811,14 @@ export class V12Saucer implements SaucerLike {
     return raw.decodeOutput(output);
   }
   staticCall(target: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
-    const raw = this.binaryRaw(OPS.STATIC, target, calldata, true);
+    // STATIC consumes target+calldata and pushes a result descriptor → net -1.
+    const raw = this.binaryRaw(OPS.STATIC, target, calldata, true, -1);
 
     return raw.decodeOutput(output);
   }
   delegateCall(target: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
-    const raw = this.binaryRaw(OPS.DELEGATE, target, calldata, true);
+    // DELEGATE consumes target+calldata and pushes a result descriptor → net -1.
+    const raw = this.binaryRaw(OPS.DELEGATE, target, calldata, true, -1);
 
     return raw.decodeOutput(output);
   }

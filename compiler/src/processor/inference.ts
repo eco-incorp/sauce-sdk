@@ -35,9 +35,6 @@ export const resolveInstanceMethod = (expr: CallExpression): { method: string; o
   return { method: (member.property as { name: string }).name, object: member.object as Expression };
 };
 
-const isUint8ArrayNew = (expr: NewExpression): boolean =>
-  expr.callee.type === 'Identifier' && (expr.callee as { name: string }).name === 'Uint8Array';
-
 const isDynamicMethod = (expr: CallExpression): boolean => {
   const instance = resolveInstanceMethod(expr);
 
@@ -65,7 +62,10 @@ export const inferKind = (expr: Expression): VariableKind => {
     case 'TaggedTemplateExpression':
       return 'dynamic';
     case 'NewExpression':
-      return isUint8ArrayNew(expr as NewExpression) ? 'dynamic' : 'scalar';
+      // Both supported forms — `new Array(n)` (TUPLE descriptor) and `new Uint8Array(...)`
+      // (heap bytes) — are dynamic/heap-stored. Scalar (WRITE_VALUE) storage would drop
+      // the descriptor, breaking `let a = new Array(n); a[i]` round-trips.
+      return 'dynamic';
     case 'CallExpression':
       return (
         inferGlobalCallKind(expr as CallExpression) ?? (isDynamicMethod(expr as CallExpression) ? 'dynamic' : 'scalar')

@@ -11,7 +11,7 @@ import { OPS } from './saucer/ops.js';
 import { OPS_V12 } from './saucer/ops-v12.js';
 import { encodeInt } from './saucer/integer.js';
 import { encodeBytes } from './saucer/bytes.js';
-import { concatBytes } from './saucer/saucer-v12.js';
+import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import type { RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
 import type { ContractsConfig } from './contracts.js';
 
@@ -86,9 +86,13 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
   const saucers = processNode(ast, ctx);
 
   if (target === 'v12') {
-    // v12 assembles every function into a single blob; args are provided to main
-    // on the EVM stack by the runtime, not appended as an invocation segment.
-    return { bytecode: [assembleV12(ctx)], warnings: ctx.warnings };
+    // v12 assembles every function into a single blob. The runtime entry pushes
+    // only a stack-bottom sentinel and jumps to offset 0 — it does NOT marshal
+    // main()'s parameters onto the stack. So when args are supplied, we synthesize
+    // a no-param WRAPPER entry that pushes the args and CALL_FUNCTIONs the original
+    // main (now a normal table function whose params arrive via the call frame) —
+    // the v12 analogue of v1's appended [CALL_FUNCTION, mainIndex, argCount, …args].
+    return { bytecode: [assembleV12(ctx, options.args ?? [])], warnings: ctx.warnings };
   }
 
   const bytecodes = saucers.map((saucer) => saucer.build());
@@ -112,16 +116,26 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
 // to each helper's absolute byte offset; parameter-read SDUP sentinels (recorded
 // as refPositions) are patched to a concrete SDUPn from the tracked stack depth.
 
-function patchCalls(bc: Uint8Array, calls: CallPlaceholder[], funcOffsets: number[], posShift = 0): void {
+function patchCalls(
+  bc: Uint8Array,
+  calls: CallPlaceholder[],
+  funcOffsets: (number | undefined)[],
+  posShift = 0,
+  mainIndex = -1,
+): void {
   for (const { pos, funcIndex } of calls) {
-    // funcOffsets only covers helpers (main is registered last and has no body
-    // offset). An index past the end is a call to main — unsupported, and leaving
-    // the sentinel unpatched would emit corrupt bytecode, so fail loudly.
-    if (funcIndex >= funcOffsets.length) {
-      throw new Error(`cannot resolve CALL_FUNCTION target (index ${funcIndex}); calling main() is not supported`);
+    // funcOffsets maps a function's REGISTRY index to its absolute body offset.
+    // main has no body offset — it is the entry (no-arg path) or inlined behind the
+    // arg-prologue (with-args path), so a main() self-call can't be resolved.
+    const offset = funcOffsets[funcIndex];
+    if (offset === undefined) {
+      if (funcIndex === mainIndex) {
+        throw new Error(`cannot resolve CALL_FUNCTION target (index ${funcIndex}); calling main() is not supported`);
+      }
+
+      throw new Error(`cannot resolve CALL_FUNCTION target (index ${funcIndex}); no body offset recorded`);
     }
 
-    const offset = funcOffsets[funcIndex];
     bc[pos + posShift] = (offset >> 8) & 0xff;
     bc[pos + posShift + 1] = offset & 0xff;
   }
@@ -133,15 +147,23 @@ function patchSdup(bc: Uint8Array, position: number, realPos: number): void {
   bc[position] = OPS_V12.SDUP1 + realPos - 1;
 }
 
-function assembleV12(ctx: CompilerContext): Uint8Array {
+function assembleV12(ctx: CompilerContext, args: ArgValue[]): Uint8Array {
   const meta: FunctionMeta[] = ctx.funcMeta;
   const mainMeta = meta.find((m) => m.isMain);
 
   if (!mainMeta) throw new Error('missing main() function');
 
+  // With compile-time args, main becomes a normal table function called by a
+  // synthesized no-param wrapper entry (see the wrapper path below). Without args,
+  // main is the entry itself (the runtime jumps to offset 0) — preserved exactly.
+  if (args.length > 0) {
+    return assembleV12WithArgs(ctx, mainMeta, meta, args);
+  }
+
   const helpers = meta.filter((m) => !m.isMain); // function-index order (0..n-1)
   const main = mainMeta.saucer;
   const mainBc = main.build();
+  const mainIndex = ctx.getFunc('main');
 
   // Main params are pre-pushed by the runtime, so no frame-pointer offset.
   const patchMainRefs = (bc: Uint8Array, refs: RefPlaceholder[]): void => {
@@ -151,7 +173,7 @@ function assembleV12(ctx: CompilerContext): Uint8Array {
   if (helpers.length === 0) {
     // No helper bodies to jump to: any CALL_FUNCTION here is a main() self-call,
     // which patchCalls rejects (empty offset table) rather than emit corrupt bytes.
-    patchCalls(mainBc, main.callPositions, []);
+    patchCalls(mainBc, main.callPositions, [], 0, mainIndex);
     patchMainRefs(mainBc, main.refPositions);
 
     return mainBc;
@@ -164,15 +186,16 @@ function assembleV12(ctx: CompilerContext): Uint8Array {
     return { meta: h, saucer, bc, prefixLen: bc.length - saucer._bytes.length };
   });
 
-  // Absolute offsets: main + STOP, then each helper + FUNC_RETURN.
-  const funcOffsets: number[] = [];
+  // Helper registry indices are 0..n-1 (main is registered last, index n); main is
+  // the entry here so its slot stays undefined (a main self-call is unsupported).
+  const funcOffsets: (number | undefined)[] = [];
   let off = mainBc.length + 1;
   for (const h of built) {
     funcOffsets.push(off);
     off += h.bc.length + 1;
   }
 
-  patchCalls(mainBc, main.callPositions, funcOffsets);
+  patchCalls(mainBc, main.callPositions, funcOffsets, 0, mainIndex);
   patchMainRefs(mainBc, main.refPositions);
 
   for (const h of built) {
@@ -188,6 +211,87 @@ function assembleV12(ctx: CompilerContext): Uint8Array {
   for (const h of built) parts.push(h.bc, [OPS_V12.FUNC_RETURN]);
 
   return concatBytes(parts);
+}
+
+// ── v12 arg-prologue path: [arg pushes][main body][STOP][helper][FUNC_RETURN]… ──
+//
+// A synthesized no-param ENTRY pushes the compile-time args, then main's body is
+// INLINED right after (fall-through) — main reads its params straight off the stack
+// with the MAIN SDUP formula (depth + paramCount - paramIndex), NO call frame.
+//
+// Why inline rather than CALL_FUNCTION the original main: a CALL_FUNCTION frame adds
+// a frame-pointer word ABOVE the params (the helper +1), so a main reading its first
+// param under ~7 live locals lands at SDUP17 — past the EVM DUP16 ceiling. Falling
+// through with the args already on the stack keeps the deepest read at SDUP16. The
+// args sit above the runtime's stack-bottom sentinel; main never reads below them.
+// (main therefore can't be recursive — it's inlined, not a table entry — which is
+// fine: v1 likewise cannot call main, and recipes never recurse main.)
+function assembleV12WithArgs(
+  ctx: CompilerContext,
+  mainMeta: FunctionMeta,
+  meta: FunctionMeta[],
+  args: ArgValue[],
+): Uint8Array {
+  // Prologue: push each arg (postfix, forward order so arg0 is deepest = paramIndex 0).
+  const argBytes = args.map((a) => encodeArgValueV12(ctx, a)._bytes);
+  const prologue = concatBytes(argBytes);
+  const prologueLen = prologue.length;
+
+  const main = mainMeta.saucer;
+  const mainBody = main.build(); // result-MSTORE appended, no ALLOCATE prefix (entry, like the no-arg path)
+  const helpers = meta.filter((m) => !m.isMain); // registry indices 0..n-1
+
+  const built = helpers.map((h) => {
+    const saucer = h.saucer;
+    const bc = saucer.buildFunctionBody();
+
+    return { meta: h, saucer, bc, prefixLen: bc.length - saucer._bytes.length };
+  });
+
+  // funcOffsets keyed by registry index (helpers 0..n-1; main is inlined so its slot
+  // stays undefined — a main self-call is unsupported, same as the no-arg path).
+  const funcOffsets: (number | undefined)[] = [];
+  let off = prologueLen + mainBody.length + 1; // after [prologue][main body][STOP]
+  for (const h of built) {
+    funcOffsets[ctx.getFunc(h.meta.name)] = off;
+    off += h.bc.length + 1; // body + FUNC_RETURN
+  }
+
+  // main's sentinels are patched in its own standalone array (positions relative to
+  // mainBody; build() prepends no ALLOCATE, so no posShift). main reads params with
+  // the MAIN formula — the args are directly on the stack, no frame-pointer word.
+  // main is inlined (not a table entry), so a main() self-call is unsupported.
+  patchCalls(mainBody, main.callPositions, funcOffsets, 0, ctx.getFunc('main'));
+  for (const r of main.refPositions) {
+    patchSdup(mainBody, r.position, r.depth + mainMeta.paramCount - r.paramIndex);
+  }
+
+  // Helpers are entered via CALL_FUNCTION → +1 frame-pointer word.
+  for (const h of built) {
+    patchCalls(h.bc, h.saucer.callPositions, funcOffsets, h.prefixLen);
+    for (const r of h.saucer.refPositions) {
+      patchSdup(h.bc, r.position + h.prefixLen, r.depth + 1 + h.meta.paramCount - r.paramIndex);
+    }
+  }
+
+  const parts: (Uint8Array | number[])[] = [prologue, mainBody, [OPS.STOP]];
+  for (const h of built) parts.push(h.bc, [OPS_V12.FUNC_RETURN]);
+
+  return concatBytes(parts);
+}
+
+// Postfix arg encoder mirroring `encodeArgValue` (the v1 prefix form) but emitting
+// V12 builder ops: scalar → int push, hex string → bytes, array → tuple(elems).
+// Built via the V12Saucer methods so the runtime decodes args identically to how
+// the compiler builds the same values inline (nested tuples recurse).
+function encodeArgValueV12(ctx: CompilerContext, v: ArgValue): V12Saucer {
+  if (Array.isArray(v)) {
+    return new V12Saucer(ctx).tuple(v.map((el) => encodeArgValueV12(ctx, el)));
+  }
+
+  if (typeof v === 'string') return new V12Saucer(ctx).bytes(hexToBytes(v));
+
+  return new V12Saucer(ctx).int(typeof v === 'bigint' ? v : BigInt(v));
 }
 
 function encodeArgValue(v: ArgValue): Uint8Array {
