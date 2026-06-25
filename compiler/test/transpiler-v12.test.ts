@@ -389,4 +389,63 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
       expect(() => compileV12('function main(){ while (1) { break } }')).toThrow(/break.*v12/);
     });
   });
+
+  // ── compile-time args: the no-param arg-prologue entry ──────────────────────
+  // The runtime entry pushes only a stack-bottom sentinel; it does not marshal
+  // main()'s params. So compile(src, { args }) synthesizes a PROLOGUE that pushes
+  // the args (postfix) and falls through into main's inlined body, which reads its
+  // params with the MAIN SDUP formula (no call-frame word). These tests pin the
+  // structure + range; engine execution (returning the arg) is covered by the
+  // dev-tools v12 EVM suite.
+  describe('compile-time args (v12 arg-prologue)', () => {
+    const v12 = (src: string, args: (bigint | bigint[])[]) =>
+      Array.from(compile(src, { target: 'v12', args }).bytecode[0]);
+
+    it('with no args, main is the entry — no prologue prepended (unchanged)', () => {
+      // A trivial no-arg program is just `[push 1][MSTORE]` — the same bytes the
+      // builder emits, with NO leading arg pushes.
+      const noArgs = v12('function main(){ return 1 }', []);
+      expect(noArgs).toEqual([OPS.BYTE_1, 1, OPS_V12.MSTORE]);
+    });
+
+    it('prepends an arg-push prologue and reads params with SDUP (no frame word)', () => {
+      // `main(x){ return x }` with arg [42]: prologue pushes 42, then main reads it.
+      // paramCount 1, paramIndex 0, depth 0 → MAIN formula SDUP1. Result MSTORE'd,
+      // then STOP. (No CALL_FUNCTION — main is inlined behind the prologue.)
+      const bc = v12('function main(x){ return x }', [42n]);
+      expect(bc).toEqual([OPS.BYTE_1, 42, OPS_V12.SDUP1, OPS_V12.MSTORE, OPS.STOP]);
+    });
+
+    it('pushes multiple args forward (arg0 deepest) so SDUP picks the right param', () => {
+      // `main(x,y){ return y }` [3,4]: prologue pushes 3 then 4 (y on top). y is
+      // paramIndex 1 → MAIN formula SDUP1 (top). The deepest param (x) would be SDUP2.
+      const bc = v12('function main(x,y){ return y }', [3n, 4n]);
+      expect(bc).toEqual([OPS.BYTE_1, 3, OPS.BYTE_1, 4, OPS_V12.SDUP1, OPS_V12.MSTORE, OPS.STOP]);
+    });
+
+    it('builds a TUPLE arg on the stack (postfix: elements then TUPLE)', () => {
+      // `main(t){ return t[1] }` [[5,9,2]]: prologue builds the tuple, then INDEX 1.
+      // The arg push is the v12 tuple encoding (elements reversed by the builder,
+      // then [TUPLE, 3]); leading bytes must be the tuple, last meaningful op INDEX.
+      const bc = v12('function main(t){ return t[1] }', [[5n, 9n, 2n]]);
+      // contains a TUPLE of 3 and an INDEX, and ends MSTORE + STOP.
+      expect(bc).toContain(OPS.TUPLE);
+      expect(bc[bc.indexOf(OPS.TUPLE) + 1]).toBe(3); // tuple length
+      expect(bc).toContain(OPS.INDEX);
+      expect(bc.slice(-2)).toEqual([OPS_V12.MSTORE, OPS.STOP]);
+    });
+
+    it('a deep multi-param main stays within the SDUP1-16 ceiling (no +1 frame word)', () => {
+      // 9 params with a param read under several live locals would hit SDUP17 if main
+      // were CALL_FUNCTION'd (the helper-frame +1 word) — past the EVM DUP16 limit, so
+      // patchSdup would throw `REF position out of range: 17`. The fall-through prologue
+      // (no frame word) keeps the deepest read at ≤16, so this must compile clean.
+      const src =
+        'function main(a,b,c,d,e,f,g,h,i){' +
+        ' const l1=a+b; const l2=c+d; const l3=e+f; const l4=g+h; const l5=l1+l2; const l6=l3+l4;' +
+        ' return a + i + l5 + l6; }';
+      const args = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n];
+      expect(() => compile(src, { target: 'v12', args })).not.toThrow();
+    });
+  });
 });

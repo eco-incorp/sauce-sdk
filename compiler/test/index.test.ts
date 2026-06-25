@@ -127,15 +127,17 @@ describe('array mutation (v1)', () => {
   it('compiles new Array(n) → NEW_ARRAY', () => {
     const result = compile('function main() { let a = new Array(3); return a; }');
     expect(result.bytecode[0]).toContain(OPS.NEW_ARRAY);
+    // `new Array(n)` is a heap descriptor (TUPLE), so it is stored via HEAP slots —
+    // VALUE storage (bytes32) would drop the descriptor, breaking `a[i]` round-trips.
     expect(Array.from(result.bytecode[0])).toEqual([
-      OPS.ALLOCATE_VALUE,
-      1, // one value slot for `a`
-      OPS.WRITE_VALUE,
+      OPS.ALLOCATE_HEAP,
+      1, // one heap slot for `a`
+      OPS.WRITE_HEAP,
       0,
       OPS.NEW_ARRAY,
       OPS.BYTE_1,
       3, // a = new Array(3)
-      OPS.READ_VALUE,
+      OPS.READ_HEAP,
       0, // return a
       OPS.STOP,
     ]);
@@ -150,24 +152,26 @@ describe('array mutation (v1)', () => {
   it('compiles arr[i] = x on a new Array → SET_INDEX, prefix [value][index][array]', () => {
     const result = compile('function main() { let a = new Array(3); a[0] = 9; return a; }');
     expect(result.bytecode[0]).toContain(OPS.SET_INDEX);
+    // The `new Array` descriptor round-trips through HEAP slots (ALLOCATE_HEAP/
+    // WRITE_HEAP/READ_HEAP) — SET_INDEX reads the descriptor, mutates it, writes back.
     expect(Array.from(result.bytecode[0])).toEqual([
-      OPS.ALLOCATE_VALUE,
+      OPS.ALLOCATE_HEAP,
       1,
-      OPS.WRITE_VALUE,
+      OPS.WRITE_HEAP,
       0,
       OPS.NEW_ARRAY,
       OPS.BYTE_1,
       3, // a = new Array(3)
-      OPS.WRITE_VALUE,
+      OPS.WRITE_HEAP,
       0, // a =
       OPS.SET_INDEX,
       OPS.BYTE_1,
       9,
       OPS.BYTE_1,
       0,
-      OPS.READ_VALUE,
+      OPS.READ_HEAP,
       0, //   setIndex(value 9, index 0, array a)
-      OPS.READ_VALUE,
+      OPS.READ_HEAP,
       0, // return a
       OPS.STOP,
     ]);
