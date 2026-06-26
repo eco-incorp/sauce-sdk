@@ -67,6 +67,17 @@ export class CompilerContext {
   private nextValueSlot = 0;
   private nextHeapSlot = 0;
   private nextTempId = 0;
+  // High-water marks: the ALLOCATE_VALUE/ALLOCATE_HEAP prefix must cover the largest
+  // slot INDEX ever used (slots are reused across non-overlapping scopes, so the
+  // live count is far below the total declared). Slot indices are 1 byte, so >255
+  // distinct LIVE slots would wrap — slot reuse keeps real programs well under that.
+  private maxValueSlot = 0;
+  private maxHeapSlot = 0;
+  // Free-lists of slot indices released when a scope pops (its locals go out of
+  // scope, so a later sibling scope can reuse the slot). SauceScript has no
+  // closures, so a block-scoped local can never be read after its scope ends.
+  private freeValueSlots: number[] = [];
+  private freeHeapSlots: number[] = [];
 
   /** Module-level state, shared across a v12 module's per-function contexts. */
   private readonly module: SharedModule;
@@ -78,6 +89,17 @@ export class CompilerContext {
   // the per-function stack layout so reads/writes resolve to SDUP/SSWAP positions.
   private stackDepth = 0;
   private stackVars: Map<string, number> = new Map();
+
+  /**
+   * v12: true while compiling main()'s body. main is INLINED (no call frame,
+   * terminated by the assembly's trailing STOP), so its `return` just leaves the
+   * value on the stack. A HELPER is entered via CALL_FUNCTION, so EVERY `return`
+   * in it must emit FUNC_RETURN to pop its frame+params and jump back — including
+   * an EARLY return inside a conditional, which otherwise just leaks the value and
+   * falls through into the rest of the body (corrupting the stack — see
+   * V12Saucer.return).
+   */
+  isMainFunction = true;
 
   /** Type info for main() function parameters, inferred from args option */
   mainArgTypes?: { kind: VariableKind; elementType?: ElementType }[];
@@ -154,16 +176,18 @@ export class CompilerContext {
   }
 
   get valueSlotCount(): number {
-    return this.nextValueSlot;
+    // High-water mark (largest index + 1), NOT the total declared — slots are reused
+    // across non-overlapping scopes, so this is what the ALLOCATE_VALUE prefix needs.
+    return this.maxValueSlot;
   }
 
   get heapSlotCount(): number {
-    return this.nextHeapSlot;
+    return this.maxHeapSlot;
   }
 
   /** @deprecated Use valueSlotCount instead */
   get slotCount(): number {
-    return this.nextValueSlot;
+    return this.maxValueSlot;
   }
 
   get resolvedBaseDirs(): string[] {
@@ -189,7 +213,15 @@ export class CompilerContext {
       throw new Error('cannot pop global scope');
     }
 
-    this.scopes.pop();
+    // Release this scope's memory slots so a later sibling scope can reuse them.
+    // (v12 params are slot -1 and live on the stack — skip those.) No closures in
+    // SauceScript, so a popped local is unreachable and its slot is safe to reuse.
+    const scope = this.scopes.pop()!;
+    for (const v of scope.variables.values()) {
+      if (v.slot < 0) continue;
+      if (v.kind === 'scalar') this.freeValueSlots.push(v.slot);
+      else this.freeHeapSlots.push(v.slot);
+    }
   }
 
   get currentScope(): Scope {
@@ -212,7 +244,18 @@ export class CompilerContext {
     }
 
     // v12 params live on the EVM stack, not a memory slot (slot -1 = unused).
-    const slot = isParam ? -1 : kind === 'scalar' ? this.nextValueSlot++ : this.nextHeapSlot++;
+    // Memory-slot allocation reuses a slot freed by a popped sibling scope (lower
+    // index → tighter packing → fewer total slots), else bumps the high-water mark.
+    let slot: number;
+    if (isParam) {
+      slot = -1;
+    } else if (kind === 'scalar') {
+      slot = this.freeValueSlots.length > 0 ? this.freeValueSlots.pop()! : this.nextValueSlot++;
+      if (slot + 1 > this.maxValueSlot) this.maxValueSlot = slot + 1;
+    } else {
+      slot = this.freeHeapSlots.length > 0 ? this.freeHeapSlots.pop()! : this.nextHeapSlot++;
+      if (slot + 1 > this.maxHeapSlot) this.maxHeapSlot = slot + 1;
+    }
     const variable: Variable = { name, slot, kind, elementType, structType, isParam };
     scope.variables.set(name, variable);
 

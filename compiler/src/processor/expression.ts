@@ -245,7 +245,46 @@ function processAbiArg(arg: Expression, param: AbiParameter | undefined, ctx: Co
   return processExpression(arg, ctx);
 }
 
-function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], ctx: CompilerContext): SaucerLike {
+/**
+ * True iff an ABI parameter is fully STATIC — an elementary static type (uintN /
+ * intN / address / bool / bytesN), a fixed-size array of statics, or a tuple all of
+ * whose components are (recursively) static. Dynamic: bytes/string, any T[] (or
+ * unsized), a fixed array of dynamics, or a tuple with any dynamic component.
+ *
+ * Used to decide whether a nested struct component can be FLATTENED into its parent
+ * tuple at the ABI-encode boundary (see flattenStaticStructFields). For a fully
+ * static struct the flat and nested ABI encodings are byte-identical (no offsets
+ * either way), so flattening is transparent on the v1 engine — and it sidesteps a
+ * v12 Huff ABI_ENCODE bug whose static-tuple inliner only scans ONE level deep: it
+ * sees a nested TUPLE element (a static struct field, e.g. SwapParams.poolKey) as
+ * "dynamic" and prepends a spurious head offset, shifting every field by one word
+ * and corrupting the call (the v1 runtime recurses correctly). Emitting the static
+ * fields flat keeps the descriptor a flat tuple of scalars, which both engines
+ * encode identically and correctly. (Dynamic nested tuples are left nested — they
+ * genuinely need offset encoding, which both engines handle.)
+ */
+function isStaticAbiParam(param: AbiParameter): boolean {
+  const t = param.type;
+  if (t === 'tuple') return (param.components ?? []).every(isStaticAbiParam);
+  if (t.endsWith('[]')) return false; // dynamic-length array
+  const fixedArray = /^(.*)\[(\d+)\]$/.exec(t);
+  if (fixedArray) {
+    // T[k]: static iff element type T is static.
+    return isStaticAbiParam({ ...param, type: fixedArray[1] });
+  }
+  return t !== 'bytes' && t !== 'string';
+}
+
+/**
+ * Build the ordered SaucerLike elements for a struct, flattening any fully-static
+ * nested-tuple component into the parent (recursively) so the emitted descriptor is
+ * a flat tuple of scalar leaves. See isStaticAbiParam for why.
+ */
+function flattenStaticStructFields(
+  obj: ObjectExpression,
+  components: AbiParameter[],
+  ctx: CompilerContext,
+): SaucerLike[] {
   const byName = new Map<string, Expression>();
   for (const prop of obj.properties) {
     if (prop.type !== 'Property') throw new Error('spread properties are not supported');
@@ -255,17 +294,30 @@ function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], c
     byName.set(key, p.shorthand ? ({ type: 'Identifier', name: key } as Expression) : (p.value as Expression));
   }
 
-  const elements = components.map((component) => {
+  const out: SaucerLike[] = [];
+  for (const component of components) {
     if (!component.name) throw new Error('ABI tuple components must be named to encode an object literal');
 
     const value = byName.get(component.name);
 
     if (!value) throw new Error(`missing struct field '${component.name}' in object literal`);
 
-    return processAbiArg(value, component, ctx);
-  });
+    // Flatten an all-static nested struct given as an object literal: splice its
+    // (recursively flattened) fields into the parent instead of nesting a tuple.
+    if (component.type === 'tuple' && value.type === 'ObjectExpression' && isStaticAbiParam(component)) {
+      out.push(
+        ...flattenStaticStructFields(value as ObjectExpression, component.components ?? [], ctx),
+      );
+      continue;
+    }
 
-  return ctx.newSaucer().tuple(elements);
+    out.push(processAbiArg(value, component, ctx));
+  }
+  return out;
+}
+
+function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], ctx: CompilerContext): SaucerLike {
+  return ctx.newSaucer().tuple(flattenStaticStructFields(obj, components, ctx));
 }
 
 function processContractCall(

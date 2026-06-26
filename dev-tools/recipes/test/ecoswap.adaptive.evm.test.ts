@@ -1,18 +1,20 @@
 /**
  * EcoSwap ADAPTIVE dynamic tick reads — LOCAL EVM integration test (WS4).
  *
- * The load-bearing window-EXCEEDED test (spec §F4). A single V3 pool holds liquidity
- * across MANY ticks (one wide position → constant active L through the whole walk
- * region, since the only initialized ticks are the far-away position boundaries). We
- * prepare with a deliberately NARROW lens window (small maxTicks) so the prepared
- * brackets UNDER-FILL amountIn, then:
+ * The load-bearing window-EXCEEDED test (spec §F4). The adaptive streaming tick
+ * walk is ALWAYS ON: whenever the prepared bracket window under-fills amountIn, the
+ * on-chain solver keeps reading live ticks past the window from the frontier seed to
+ * close the gap. There is no flag to turn it off — the only gates are data (a pool
+ * with no frontier, e.g. V2, is skipped) and need (it runs only when cum < amountIn).
  *
- *   (1) adaptive OFF → the single-pass solver runs out of prepared brackets and
- *       spends < amountIn (the gap exists; compute-then-pull pulls only what it can
- *       fill, no revert).
- *   (2) adaptive ON  → the solver resumes a LIVE streaming tick walk from the
- *       frontier seed and fills the gap: spends == amountIn EXACTLY, leftover == 0,
- *       and tokenOut matches the adaptive reference oracle.
+ * A single V3 pool holds liquidity across MANY ticks (one wide position → constant
+ * active L through the whole walk region, since the only initialized ticks are the
+ * far-away position boundaries). We prepare with a deliberately NARROW lens window
+ * (small maxTicks) so the PREPARED brackets alone UNDER-FILL amountIn — we assert
+ * that off-chain (Σ prepared capacity < amountIn) — then cook and assert the
+ * always-on streaming walk resumes from the frontier seed and FILLS the gap: spends
+ * == amountIn EXACTLY, leftover == 0, the pool receives all of amountIn, received > 0,
+ * and tokenOut matches the (always-adaptive) reference oracle.
  *
  * Why oracle == on-chain here is exact: inside the wide position there are NO
  * initialized ticks, so every adaptive ticks() read returns net 0 → L is constant.
@@ -20,10 +22,6 @@
  * L constant. Both walk the identical constant-L region with the same multiplicative
  * stepReal, so they agree bit-for-bit (no multiplicative-vs-exact drift across an
  * initialized boundary).
- *
- * Adaptive is a SINGLE-PASS-solver feature, so these run under ECO_SOLVER=singlepass
- * (set/restored around each case). The reference auto-selects singlePassReference +
- * the adaptive mirror from ECO_SOLVER / ECO_ADAPTIVE.
  *
  * Run: npx tsx --test recipes/test/ecoswap.adaptive.evm.test.ts
  */
@@ -48,18 +46,31 @@ import {
   getSlot0,
   SQRT_PRICE_1_1,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
+import {
+  type Engine,
+  engineCells,
+  maybeDeployV12Stack,
+  cookTarget,
+  quoteRouter,
+} from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
 import { feeAdjust, toOutIn } from "./ecoswap.math";
+import type { Account } from "viem";
 
 const HUGE = parseEther("1000000000");
 
-describe("EcoSwap adaptive dynamic tick reads (window-EXCEEDED streaming walk)", () => {
+// Engine cells driven by ECO_ENGINE (default v12). See harness/engine.ts.
+const ENGINE_CELLS = engineCells();
+
+describe("EcoSwap adaptive dynamic tick reads (always-on window-EXCEEDED streaming walk)", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
   let tokenIn: Hex; // token0 (zeroForOne)
   let tokenOut: Hex; // token1
   let pool: Hex;
@@ -108,6 +119,10 @@ describe("EcoSwap adaptive dynamic tick reads (window-EXCEEDED streaming walk)",
       baseTokens: [tokenIn, tokenOut], // no routes
     };
 
+    // v12 stack (same anvil/pool) when a v12 cell runs; approve the Pot for tokenIn.
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
     cleanSnapshot = await c.testClient.snapshot();
   });
 
@@ -115,15 +130,16 @@ describe("EcoSwap adaptive dynamic tick reads (window-EXCEEDED streaming walk)",
     anvil?.stop();
   });
 
-  // Revert to clean pool state + re-snapshot so each case prepares + cooks against
+  // Revert to clean pool state + re-snapshot so the case prepares + cooks against
   // the IDENTICAL fresh pool (anvil invalidates a snapshot id once reverted into).
   async function resetPool(): Promise<void> {
     await c.testClient.revert({ id: cleanSnapshot });
     cleanSnapshot = await c.testClient.snapshot();
   }
 
-  /** Run prepare+compile+cook for one (adaptive) setting; returns balances + prepared. */
-  async function runCase(adaptive: boolean) {
+  async function runAdaptive(engine: Engine): Promise<void> {
+    await resetPool();
+    const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
     const poolInBefore = await balanceOf(c.publicClient, tokenIn, pool);
     const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
@@ -132,113 +148,81 @@ describe("EcoSwap adaptive dynamic tick reads (window-EXCEEDED streaming walk)",
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn: AMOUNT_IN },
       anvil.rpcUrl,
-      stack.sauceRouter,
+      quoteRouter(engine, stack, v12),
       caller,
       poolConfig,
-      { maxTicks: NARROW_MAX_TICKS, adaptive },
+      { maxTicks: NARROW_MAX_TICKS },
+      engine,
     );
 
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, AMOUNT_IN);
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    // The PREPARED brackets alone cannot cover amountIn — the narrow window is
+    // deliberately too small. (This is the precondition the always-on walk closes:
+    // without it the swap would under-fill, as the old adaptive-OFF path did.)
+    const preparedCapacity = prepared.brackets.reduce((acc, b) => acc + b.capacity, 0n);
+    assert.ok(
+      preparedCapacity < AMOUNT_IN,
+      `prepared window must UNDER-FILL amountIn (Σ capacity ${preparedCapacity} < ${AMOUNT_IN})`,
+    );
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, AMOUNT_IN);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed");
 
     const poolInAfter = await balanceOf(c.publicClient, tokenIn, pool);
     const callerInAfter = await balanceOf(c.publicClient, tokenIn, caller);
     const callerOutAfter = await balanceOf(c.publicClient, tokenOut, caller);
-    const leftover = await balanceOf(c.publicClient, tokenIn, stack.sauceRouter);
+    // Compute-then-pull leaves no leftover on the cook target (router or Pot).
+    const leftover = await balanceOf(c.publicClient, tokenIn, target);
 
-    return {
-      prepared,
-      poolInDelta: poolInAfter - poolInBefore,
-      spent: callerInBefore - callerInAfter,
-      received: callerOutAfter - callerOutBefore,
-      leftover,
-    };
-  }
+    const poolInDelta = poolInAfter - poolInBefore;
+    const spent = callerInBefore - callerInAfter;
+    const received = callerOutAfter - callerOutBefore;
 
-  function withEnv(env: Record<string, string | undefined>, body: () => Promise<void>): Promise<void> {
-    const prev: Record<string, string | undefined> = {};
-    for (const k of Object.keys(env)) {
-      prev[k] = process.env[k];
-      if (env[k] === undefined) delete process.env[k];
-      else process.env[k] = env[k]!;
-    }
-    const restore = () => {
-      for (const k of Object.keys(prev)) {
-        if (prev[k] === undefined) delete process.env[k];
-        else process.env[k] = prev[k]!;
-      }
-    };
-    return body().then(
-      (v) => { restore(); return v; },
-      (e) => { restore(); throw e; },
+    // The always-on streaming walk resumes from the frontier seed and fills the
+    // remaining gap → spends amountIn EXACTLY, no leftover.
+    assert.equal(spent, AMOUNT_IN, "always-on adaptive walk must FULL-FILL (spent == amountIn)");
+    assert.equal(leftover, 0n, "no leftover on the router (compute-then-pull, no limit hit)");
+    assert.equal(poolInDelta, AMOUNT_IN, "all of amountIn lands in the pool");
+    assert.ok(received > 0n, "received tokenOut");
+
+    // Oracle (always-adaptive single-pass) cross-check. Constant-L walk region → exact:
+    // perPoolInput sums to amountIn and tokenOut matches within a tight ppm band.
+    const ref = ecoSwapReference(prepared, AMOUNT_IN);
+    assert.equal(ref.totalInput, AMOUNT_IN, "adaptive oracle also full-fills to amountIn");
+    assert.equal(ref.perPoolInput[0], AMOUNT_IN, "single pool absorbs all input in the oracle");
+
+    // Marginal: post-swap fee-adjusted out/in price moved DOWN (zeroForOne) — the
+    // single engaged pool's marginal is the implicit cut. (With one pool, marginal
+    // "equalization" is trivially satisfied; we assert the price actually moved.)
+    const { sqrtPriceX96 } = await getSlot0(c.publicClient, pool);
+    const adjAfter = feeAdjust(toOutIn(sqrtPriceX96, true), 3000);
+    const adjStart = feeAdjust(toOutIn(SQRT_PRICE_1_1, true), 3000);
+    assert.ok(adjAfter < adjStart, "zeroForOne swap lowers the pool's fee-adj marginal");
+
+    // tokenOut realized on-chain vs the analytic constant-L expectation. Over a
+    // constant-L region the engine output and the oracle geometry agree to a tight
+    // band (integer truncation only); assert within 50 ppm.
+    const refOut = analyticOut(SQRT_PRICE_1_1, sqrtPriceX96, parseEther("800000"));
+    const diff = received > refOut ? received - refOut : refOut - received;
+    const ppm = (diff * 1_000_000n) / (received > 0n ? received : 1n);
+    assert.ok(ppm < 50n, `tokenOut matches constant-L geometry within 50ppm (got ${ppm}ppm, on=${received} ref=${refOut})`);
+
+    console.log(
+      `  [adaptive always-on ${engine}] preparedCap=${preparedCapacity} (< ${AMOUNT_IN}) ` +
+        `spent=${spent} (==amountIn) leftover=${leftover} received=${received} ` +
+        `oracleOut(geom)=${refOut} ppm=${ppm}`,
     );
   }
 
-  it("adaptive OFF — prepared brackets under-fill the narrow window (gap exists)", async () => {
-    await withEnv({ ECO_SOLVER: "singlepass", ECO_ADAPTIVE: undefined }, async () => {
-      await resetPool();
-      const r = await runCase(false);
-
-      // The narrow window can't cover amountIn → the solver fills only what the
-      // prepared brackets supply, spending strictly less than amountIn.
-      assert.ok(r.spent > 0n, "should still fill the prepared depth");
-      assert.ok(r.spent < AMOUNT_IN, `adaptive OFF must UNDER-FILL (spent ${r.spent} of ${AMOUNT_IN})`);
-      assert.equal(r.poolInDelta, r.spent, "all spent input lands in the pool");
-      assert.ok(r.received > 0n, "received tokenOut");
-
-      // Oracle (non-adaptive single-pass) agrees: totalInput == spent (under-fill).
-      const ref = ecoSwapReference(r.prepared, AMOUNT_IN);
-      assert.equal(r.spent, ref.totalInput, "OFF: spent == non-adaptive oracle totalInput");
-      assert.ok(ref.totalInput < AMOUNT_IN, "OFF: oracle also under-fills");
-
-      console.log(
-        `  [adaptive OFF] spent=${r.spent} of ${AMOUNT_IN} (gap=${AMOUNT_IN - r.spent}) received=${r.received}`,
-      );
-    });
-  });
-
-  it("adaptive ON — streaming walk closes the gap (full fill, leftover 0, oracle match)", async () => {
-    await withEnv({ ECO_SOLVER: "singlepass", ECO_ADAPTIVE: "1" }, async () => {
-      await resetPool();
-      const r = await runCase(true);
-
-      // The adaptive streaming walk resumes from the frontier seed and fills the
-      // remaining gap → spends amountIn EXACTLY, no leftover.
-      assert.equal(r.spent, AMOUNT_IN, "adaptive ON must FULL-FILL (spent == amountIn)");
-      assert.equal(r.leftover, 0n, "no leftover on the router (compute-then-pull, no limit hit)");
-      assert.equal(r.poolInDelta, AMOUNT_IN, "all of amountIn lands in the pool");
-      assert.ok(r.received > 0n, "received tokenOut");
-
-      // Oracle (adaptive single-pass) cross-check. Constant-L walk region → exact:
-      // perPoolInput sums to amountIn and tokenOut matches within a tight ppm band.
-      const ref = ecoSwapReference(r.prepared, AMOUNT_IN);
-      assert.equal(ref.totalInput, AMOUNT_IN, "adaptive oracle also full-fills to amountIn");
-      assert.equal(ref.perPoolInput[0], AMOUNT_IN, "single pool absorbs all input in the oracle");
-
-      // Marginal: post-swap fee-adjusted out/in price moved DOWN (zeroForOne) — the
-      // single engaged pool's marginal is the implicit cut. (With one pool, marginal
-      // "equalization" is trivially satisfied; we assert the price actually moved.)
-      const { sqrtPriceX96 } = await getSlot0(c.publicClient, pool);
-      const adjAfter = feeAdjust(toOutIn(sqrtPriceX96, true), 3000);
-      const adjStart = feeAdjust(toOutIn(SQRT_PRICE_1_1, true), 3000);
-      assert.ok(adjAfter < adjStart, "zeroForOne swap lowers the pool's fee-adj marginal");
-
-      // tokenOut realized on-chain vs the analytic constant-L expectation. Over a
-      // constant-L region the engine output and the oracle geometry agree to a tight
-      // band (integer truncation only); assert within 50 ppm.
-      const onchainOut = r.received;
-      const refOut = analyticOut(SQRT_PRICE_1_1, sqrtPriceX96, parseEther("800000"));
-      const diff = onchainOut > refOut ? onchainOut - refOut : refOut - onchainOut;
-      const ppm = (diff * 1_000_000n) / (onchainOut > 0n ? onchainOut : 1n);
-      assert.ok(ppm < 50n, `tokenOut matches constant-L geometry within 50ppm (got ${ppm}ppm, on=${onchainOut} ref=${refOut})`);
-
-      console.log(
-        `  [adaptive ON] spent=${r.spent} (==amountIn) leftover=${r.leftover} received=${r.received} ` +
-          `oracleOut(geom)=${refOut} ppm=${ppm}`,
-      );
-    });
-  });
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(
+      `always-on streaming walk closes the under-filled narrow window [${engine}] (full fill, leftover 0, oracle match)`,
+      { skip },
+      async () => {
+        await runAdaptive(engine);
+      },
+    );
+  }
 });
 
 /**

@@ -314,12 +314,21 @@ export async function runLens(
   const bytecodes = segments.map(toHex);
 
   // ONE read-only eth_call cook() — the entire discovery + state + tick read.
+  // The lens runs up to 4 discovery passes × maxTicks × every pool of staticcalls
+  // on the interpreter, which for a large universe (≈10 pools) blows past the
+  // default eth_call gas cap (a node caps an eth_call's gas at the block gas
+  // limit). Since this is a read-only call (never mined), pass a high explicit gas
+  // so the node uses it as the call cap — set up to the test anvil's raised block
+  // gas limit (harness/anvil.ts boots with --gas-limit 2e9). On a live RPC this is
+  // clamped to that provider's eth_call cap, which is plenty for a single chain's
+  // direct-pool universe.
   const { result: returnData } = await client.simulateContract({
     address: sauceRouter,
     abi: cookAbi as Abi,
     functionName: "cook",
     args: [bytecodes],
     account: "0x0000000000000000000000000000000000000001" as Hex,
+    gas: 2_000_000_000n,
   });
 
   const [poolBlob, tickBlob] = decodeAbiParameters(

@@ -1,7 +1,7 @@
 /**
  * EcoSwap solver GAS + BYTECODE-SIZE comparison harness (WS8).
  *
- * Compares the THREE EcoSwap solver source variants — all sharing the IDENTICAL
+ * Compares the TWO EcoSwap solver source variants — all sharing the IDENTICAL
  *   main(tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit, pools, routes, brackets)
  * arg shape — over the full {variant × target} matrix:
  *
@@ -68,18 +68,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const GAS_MD = join(ECOSWAP_DIR, "GAS.md");
 const HUGE = parseEther("1000000000");
 
-// ── The three solver variants under test (same arg shape) ──────
+// ── The two solver variants under test (same arg shape) ──────
 const SOLVERS: { key: string; file: string; label: string }[] = [
-  { key: "two-pass", file: "ecoswap.sauce.ts", label: "two-pass (Phase A + B)" },
-  {
-    key: "singlepass-unrolled",
-    file: "ecoswap.singlepass.unrolled.sauce.ts",
-    label: "single-pass, unrolled registers (frozen ref)",
-  },
   {
     key: "singlepass-array",
-    file: "ecoswap.singlepass.sauce.ts",
-    label: "single-pass, array-mutation + adaptive walk (rewrite)",
+    file: "ecoswap.sauce.ts",
+    label: "single-pass, array-mutation + adaptive walk (default solver)",
+  },
+  {
+    key: "singlepass-unrolled",
+    file: "ecoswap.unrolled.sauce.ts",
+    label: "single-pass, unrolled registers (frozen ref)",
   },
 ];
 
@@ -238,9 +237,9 @@ function writeGasMd(): void {
   lines.push("## Methodology");
   lines.push("");
   lines.push(
-    "Three EcoSwap solver source variants share the IDENTICAL " +
+    "Two EcoSwap single-pass solver source variants share the IDENTICAL " +
       "`main(tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit, pools, routes, brackets)` " +
-      "signature — `index.ts` feeds the same args to whichever it selects:",
+      "signature (`index.ts` always compiles the canonical `ecoswap.sauce.ts`):",
   );
   lines.push("");
   for (const s of SOLVERS) {
@@ -354,7 +353,6 @@ function writeGasMd(): void {
   // Takeaways — assembled from whatever was actually measured this run.
   const arrSize = sizeBytes.get("singlepass-array");
   const unrSize = sizeBytes.get("singlepass-unrolled");
-  const tpSize = sizeBytes.get("two-pass");
   const arrGas = execGas.get("singlepass-array");
   const unrGas = execGas.get("singlepass-unrolled");
   const bullets: string[] = [];
@@ -408,12 +406,6 @@ function writeGasMd(): void {
     );
   }
   // Compile/exec coverage caveats.
-  if (tpSize && tpSize.v12 === null && sizeNotes.has("two-pass/v12")) {
-    bullets.push(
-      "**Coverage.** The two-pass solver does NOT compile to v12 " +
-        `(\`${sizeNotes.get("two-pass/v12")}\`); the single-pass variants compile to both targets.`,
-    );
-  }
   const execFails = [...execNotes.keys()];
   if (execFails.length > 0) {
     bullets.push(

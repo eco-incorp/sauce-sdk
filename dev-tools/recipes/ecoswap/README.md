@@ -43,13 +43,17 @@ they sort into one global ladder regardless of AMM type or fee tier.
 4. Fee-adjust each bracket's sqrt boundaries, compute its gross input capacity, and **sort the whole
    ladder descending** by fee-adjusted marginal price.
 
-**On-chain (`ecoswap.sauce.ts`)**
+**On-chain (`ecoswap.sauce.ts`)** — a **single-pass** (live-cut) sweep: it reads each pool's live price
+once and accumulates bracket capacity along the ladder until the input is exhausted, so the cut is
+**implicit** (where the sweep stops) and the swaps are computed then pulled (compute-then-pull). Phase A /
+Phase B below describe the equivalent water-fill outcome the one sweep realises.
 - **Phase A** — walk the pre-sorted ladder once, summing capacity until `amountIn` is reached, to find
   the common marginal-price cut `cutSqrtAdj` (the water-fill level).
 - **Phase B** — for each direct pool, re-read its **live** price (V3 `slot0` / V4 `StateView.getSlot0`
   by poolId / V2 `getReserves`), integrate the exact input to move from the live price down to the cut,
   and do one swap (V3 → flat `swapV3`; V2/V4 → unified `swap(SwapParams)`). Routes allocate whole
-  segments above the cut and swap hop1 → hop2. Unspent dust is refunded.
+  segments above the cut and swap hop1 → hop2. Compute-then-pull pulls exactly what the swaps consume;
+  one guarded terminal refund covers the limit-price edge.
 
 Equal marginal price at the cut ⇒ synchronized minimal slippage across all venues.
 
@@ -231,7 +235,9 @@ sign-recovered off-chain via `BigInt.asIntN`):
 
 ### 4 · Executing on-chain (`ecoswap.sauce.ts`)
 
-Two passes. The solver needed **zero change** for reverse-drift — the `capacity=0` invariant carries it.
+A single live-cut sweep, explained below as the equivalent two-phase water-fill (Phase A finds the cut,
+Phase B executes at live prices). The solver needed **zero change** for reverse-drift — the `capacity=0`
+invariant carries it.
 
 **Phase A — water-fill to the common cut.**
 

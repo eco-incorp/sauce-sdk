@@ -67,9 +67,21 @@ export async function startAnvil(opts: { timeoutMs?: number } = {}): Promise<Anv
     const rpcUrl = `http://127.0.0.1:${port}`;
     const child: ChildProcess = spawn(
       "anvil",
-      // Raise the block gas limit so batched mints (many V3 positions per tx, used
-      // by the prod-mirror reconstruction) fit in a single block.
-      ["--port", String(port), "--silent", "--gas-limit", "200000000"],
+      // Raise the block gas limit high so (a) batched mints (many V3 positions per
+      // tx, used by the prod-mirror reconstruction) fit in a single block, and
+      // (b) the read-only lens eth_call can request multi-hundred-million gas:
+      // anvil caps an eth_call's gas at the block gas limit (it has no separate
+      // --rpc-gas-cap), and the full discovery+state+tick scan over a ~10-pool
+      // universe (4 passes × 96 ticks × ~10 pools of staticcalls on the v1
+      // interpreter) exceeds the prior 200M. 2e9 is well within u64 / JS safe-int,
+      // so gas estimation for the mint txs is unaffected (unlike
+      // --disable-block-gas-limit, which sets the limit to u64::MAX and perturbs
+      // the mint path).
+      // --no-request-size-limit: the prod-mirror state cache loads a reconstructed
+      // anvil state via anvil_loadState, whose hex payload (~2.5MB for the 10-pool
+      // all-pools fixture) exceeds anvil's default 2MB request body limit — without
+      // this the loadState RPC fails with "JSON is not a valid request object".
+      ["--port", String(port), "--silent", "--gas-limit", "2000000000", "--no-request-size-limit"],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
 

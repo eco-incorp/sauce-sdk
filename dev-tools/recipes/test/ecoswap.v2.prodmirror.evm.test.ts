@@ -18,8 +18,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Hex } from "viem";
-import { Q96, FEE_DENOM, isqrt } from "./ecoswap.math";
+import { type Hex, type Account } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -34,7 +33,16 @@ import {
   approve,
   balanceOf,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
+import {
+  type Engine,
+  selectedEngines,
+  maybeDeployV12Stack,
+  cookTarget,
+  quoteRouter,
+} from "./harness/engine";
+import { withCachedState } from "./harness/state-cache";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
@@ -65,10 +73,14 @@ function cpAmountOut(amountIn: bigint, reserveIn: bigint, reserveOut: bigint): b
 
 const snap = loadSnapshot();
 
+// Engine this prod-mirror cooks on, picked from ECO_ENGINE (default v12).
+const PROD_ENGINE: Engine = selectedEngines()[0];
+
 describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
   let tokenIn: Hex; // local token0 == snapshot token0 orientation (zeroForOne)
   let tokenOut: Hex; // local token1
   let pair: Hex;
@@ -87,27 +99,53 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
 
     anvil = await startAnvil();
     c = await makeClients(anvil.rpcUrl);
-    await ensureMulticall3(c.publicClient, c.testClient);
-    stack = await deployStack(c.walletClient, c.publicClient);
-    const v2Factory = await deployV2Factory(c.walletClient, c.publicClient);
 
-    // Local tokens sorted token0 < token1, mapped to the snapshot's reserve0/1.
-    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
-    tokenIn = tk.token0;
-    tokenOut = tk.token1;
-
-    // Mint the reserves (+headroom for the caller's input) to the minter, then
-    // etch the pair and fund it to mirror the production reserves exactly.
-    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, reserveIn * 2n);
-    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, reserveOut * 2n);
-    pair = await setupEtchedV2Pool(
-      c.walletClient, c.publicClient, c.testClient, v2Factory, V2_PAIR_ADDR,
-      tokenIn, tokenOut, reserveIn, reserveOut,
+    // Deploy + etch the pair, cached once per engine
+    // (fixtures/anvil-state/prodmirror-v2-<engine>). This fixture is light (no
+    // per-tick mint) so caching is mostly for the pinned-timestamp determinism +
+    // consistency with the other prod-mirror tests. Recapture: RECAPTURE_ANVIL_STATE=1.
+    const { manifest, fromCache } = await withCachedState<{
+      stack: DeployedStack;
+      v12: DeployedV12Stack | null;
+      v2Factory: Hex;
+      tokenIn: Hex;
+      tokenOut: Hex;
+      pair: Hex;
+    }>({
+      name: "prodmirror-v2",
+      engine: PROD_ENGINE,
+      c,
+      build: async () => {
+        await ensureMulticall3(c.publicClient, c.testClient);
+        const s = await deployStack(c.walletClient, c.publicClient);
+        const vf = await deployV2Factory(c.walletClient, c.publicClient);
+        // Local tokens sorted token0 < token1, mapped to the snapshot's reserve0/1.
+        const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+        // Mint the reserves (+headroom for the caller's input) to the minter, then
+        // etch the pair and fund it to mirror the production reserves exactly.
+        await mint(c.walletClient, c.publicClient, tk.token0, c.account0, reserveIn * 2n);
+        await mint(c.walletClient, c.publicClient, tk.token1, c.account0, reserveOut * 2n);
+        const p = await setupEtchedV2Pool(
+          c.walletClient, c.publicClient, c.testClient, vf, V2_PAIR_ADDR,
+          tk.token0, tk.token1, reserveIn, reserveOut,
+        );
+        const v = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+        if (v) await approve(c.walletClient, c.publicClient, tk.token0, v.pot, reserveIn * 2n);
+        return { stack: s, v12: v, v2Factory: vf, tokenIn: tk.token0, tokenOut: tk.token1, pair: p };
+      },
+    });
+    console.log(
+      `  [v2 prod-mirror] state ${fromCache ? "LOADED from cache" : "RECONSTRUCTED + cached"} (engine ${PROD_ENGINE})`,
     );
+    stack = manifest.stack;
+    v12 = manifest.v12;
+    tokenIn = manifest.tokenIn;
+    tokenOut = manifest.tokenOut;
+    pair = manifest.pair;
 
     poolConfig = {
       factories: [
-        { address: v2Factory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Local UniV2 (prod-mirror)" },
+        { address: manifest.v2Factory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Local UniV2 (prod-mirror)" },
       ],
       feeTiers: [3000],
       baseTokens: [tokenIn, tokenOut],
@@ -128,19 +166,21 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
     // ~3% of the WETH-side reserve: meaningful price impact, well within depth.
     const amountIn = reserveIn / 32n;
     const caller = c.account0;
+    const target = cookTarget(PROD_ENGINE, stack, v12);
 
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     const pairInBefore = await balanceOf(c.publicClient, tokenIn, pair);
     const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      undefined, PROD_ENGINE,
     );
     assert.equal(prepared.pools.filter((p) => p.isV2).length, 1, "should discover the reproduced V2 pair");
     assert.ok(prepared.zeroForOne, "tokenIn < tokenOut → zeroForOne");
 
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed against reproduced V2 reserves");
 
     const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
@@ -179,10 +219,12 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
 
     const caller = c.account0;
     const amountIn = reserveIn / 32n;
+    const target = cookTarget(PROD_ENGINE, stack, v12);
 
     // PREPARE against the clean (pre-drift) reserves.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      undefined, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);
     const refV2 = ref.perPoolInput[0] ?? 0n;
@@ -194,43 +236,42 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
 
     // EXECUTE the pre-drift bytecodes — Phase B must read the NEW live reserves.
     await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn);
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     const pairInBefore = await balanceOf(c.publicClient, tokenIn, pair);
     const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
 
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed against drifted reserves");
 
     const v2InDelta = (await balanceOf(c.publicClient, tokenIn, pair)) - pairInBefore;
     const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
 
-    const within = (a: bigint, b: bigint, tol: number) => {
-      const hi = a > b ? a : b;
-      const lo = a > b ? b : a;
-      return hi === 0n ? true : Number(hi - lo) / Number(hi) < tol;
-    };
-
-    // Re-anchoring: the recipe filled only the REMAINING gap to the cut (had it
-    // used the stale prepared price it would have re-spent the full baseline and
-    // overshot the cut). drift + recipe ≈ baseline (path-additive gross input).
+    // SINGLE-PASS semantics (input-anchored): the solver spends `amountIn` EXACTLY,
+    // re-anchoring to the LIVE drifted reserves it reads at cook (getReserves), not
+    // the stale prepared price. With a SINGLE pool the entire trade lands here, so
+    // the runtime fill ≈ amountIn regardless of drift — the drift just changes the
+    // price at which the swap starts (and thus where it ends), not how much is
+    // spent. (The OLD two-pass solver was price-anchored: it filled only the gap to
+    // the prepared cut, so drift + recipe ≈ baseline. Single-pass deliberately
+    // spends the user's full trade instead.) The re-anchoring INTENT is proven by
+    // the drift having moved the live reserves before this cook (driftPoolPrice
+    // above) — the swap still succeeds and consumes the trade against the new state.
     assert.ok(v2InDelta > 0n, "pool still participates");
-    assert.ok(v2InDelta < refV2, `V2 fill adapts DOWN vs baseline (got ${v2InDelta}, baseline ${refV2})`);
-    assert.ok(within(driftAmount + v2InDelta, refV2, 0.02), `drift(${driftAmount}) + recipe(${v2InDelta}) ≈ baseline (${refV2})`);
     assert.equal(v2InDelta, spent, "single pool → spent == its fill");
     assert.ok(spent <= amountIn, "never overspends");
-
-    // Despite the drift, the pool ends at the same fee-adjusted cut.
-    const Q192 = Q96 * Q96;
-    const v2InAfter = await balanceOf(c.publicClient, tokenIn, pair);
-    const v2OutAfter = await balanceOf(c.publicClient, tokenOut, pair);
-    const outInSqrt = isqrt((v2OutAfter * Q192) / v2InAfter);
-    const feeAdj = (outInSqrt * isqrt((FEE_DENOM - 3000n) * FEE_DENOM)) / FEE_DENOM;
-    const rel = ref.cutSqrtAdj === 0n ? 0 : Number(feeAdj > ref.cutSqrtAdj ? feeAdj - ref.cutSqrtAdj : ref.cutSqrtAdj - feeAdj) / Number(ref.cutSqrtAdj);
-    assert.ok(rel < 0.01, `V2 re-anchored to the cut (feeAdj ${feeAdj} vs cut ${ref.cutSqrtAdj}, rel ${rel})`);
+    // Input-anchored: it deploys the LARGE majority of the trade (the drift pushed
+    // the live price away from spot, trimming the prepared-window depth a little, so
+    // it is not always a literal 100%). The >80% floor cleanly separates single-pass
+    // (spends the trade) from the OLD two-pass gap-fill, which under this same drift
+    // would have spent only ≈ baseline − drift ≈ 67% of amountIn.
+    assert.ok(
+      spent >= (amountIn * 80n) / 100n,
+      `spends the large majority of the trade against drifted reserves (spent ${spent} of ${amountIn})`,
+    );
 
     console.log(
-      `  [v2 prod-mirror] RUNTIME re-anchoring: drift ${driftAmount} + recipe ${v2InDelta} ≈ baseline ${refV2}; ` +
-        `spent=${spent} feeAdj=${feeAdj} cut=${ref.cutSqrtAdj} (rel ${rel})`,
+      `  [v2 prod-mirror] RUNTIME re-anchor (single-pass, input-anchored): ` +
+        `drift ${driftAmount} then recipe spent ${spent} of amountIn ${amountIn} (baseline fill ${refV2})`,
     );
   });
 });

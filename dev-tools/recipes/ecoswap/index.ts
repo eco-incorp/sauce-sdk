@@ -46,8 +46,9 @@ export interface EcoSwapOutput {
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
  *  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio]
- * The last 4 are the WS4 adaptive frontier seeds (0 unless prepared with adaptive=true;
- * 0 → the solver's streaming-walk loop is gated off → behavior byte-identical to today).
+ * The last 4 are the WS4 adaptive frontier seeds — always populated for V3/V4 pools
+ * (the streaming walk is always on, resuming past the prepared window when it
+ * under-fills); 0 for V2 (a single wide bracket has no tick frontier → walk skipped).
  */
 function buildPoolTuple(p: EcoPool): bigint[] {
   return [
@@ -145,12 +146,13 @@ export async function ecoSwap(
     opts ?? {},
   );
 
-  // Solver selection: the default two-pass solver, or the single-pass (live-cut)
-  // variant via ECO_SOLVER=singlepass. Both consume the SAME prepared data; the
-  // single-pass folds Phase A+B into one sweep with unrolled per-pool registers.
-  const solverFile =
-    process.env.ECO_SOLVER === "singlepass" ? "ecoswap.singlepass.sauce.ts" : "ecoswap.sauce.ts";
-  const source = readFileSync(join(__dirname, solverFile), "utf-8");
+  // EcoSwap's on-chain solver is the single-pass (live-cut) water-fill in
+  // ecoswap.sauce.ts: one sweep over the prepared bracket ladder allocates each
+  // pool/route into real mutable arrays, computes the exact tokenIn the swaps will
+  // consume, then pulls and executes (compute-then-pull, no over-pull/refund).
+  // ecoswap.unrolled.sauce.ts (register-bank variant) and ecoswap.computeonly.sauce.ts
+  // are frozen gas-comparison references, not selectable here.
+  const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
 
   const result = compile(jsSource, {

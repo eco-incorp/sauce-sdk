@@ -6,8 +6,8 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 
 // EcoSwap on-chain solver — SINGLE-PASS (live-cut) variant.
 //
-// One sweep over the pre-sorted bracket ladder does what the two-pass solver
-// split across Phase A (find the cut) + Phase B (re-integrate each pool). The
+// One sweep over the pre-sorted bracket ladder does in one pass what a two-pass
+// water-fill splits across Phase A (find the cut) + Phase B (re-integrate each pool). The
 // trick that makes it fit the array-mutation-free VM: the pool count is bounded
 // (MAX_DIRECT_POOLS), so per-pool input accumulators live in fixed scalar
 // registers i0..i11 (routes in q0..q1), dispatched by an if-ladder on the runtime

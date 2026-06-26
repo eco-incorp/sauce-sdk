@@ -75,8 +75,8 @@ importers:
         specifier: ^3.8.1
         version: 3.8.3
       sauce:
-        specifier: git+https://github.com/eco-incorp/sauce.git#feat/v12-kitchen
-        version: git+https://git@github.com:eco-incorp/sauce.git#a03cd5554ee3b35bfe8cfb69629f29b12ecf7e52
+        specifier: github:eco-incorp/sauce#feat/v12-descriptor-32bit
+        version: git+https://git@github.com:eco-incorp/sauce.git#fc7d6b4fb95721bb3ee6b57d7abad254efb4bd9e
       ts-jest:
         specifier: ^29.4.6
         version: 29.4.11(@babel/core@7.29.7)(@jest/transform@30.4.1)(@jest/types@30.4.1)(babel-jest@30.4.1(@babel/core@7.29.7))(jest-util@30.4.1)(jest@30.4.2(@types/node@25.9.1))(typescript@5.9.3)
@@ -2552,8 +2552,8 @@ packages:
   react-is@18.3.1:
     resolution: {integrity: sha512-/LLMVyas0ljjAtoYiPqYiL8VWXzUUdThrmU5+n20DZv+a+ClRoevUzw5JxU+Ieh5/c87ytoTBV9G1FiKfNJdmg==}
 
-  react-is@19.2.6:
-    resolution: {integrity: sha512-XjBR15BhXuylgWGuslhDKqlSayuqvqBX91BP8pauG8kd1zY8kotkNWbXksTCNRarse4kuGbe2kIY05ARtwNIvw==}
+  react-is@19.2.7:
+    resolution: {integrity: sha512-kZFnouyVv7eP/Phmrlo9FK+zcAdriZJvzxXHF1Sl1P377WSGe2G/JxVolhTrB/jeV47lKImhNUsijjHAAbcl/A==}
 
   readable-stream@3.6.2:
     resolution: {integrity: sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==}
@@ -2601,8 +2601,8 @@ packages:
   safer-buffer@2.1.2:
     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
 
-  sauce@git+https://git@github.com:eco-incorp/sauce.git#a03cd5554ee3b35bfe8cfb69629f29b12ecf7e52:
-    resolution: {commit: a03cd5554ee3b35bfe8cfb69629f29b12ecf7e52, repo: git@github.com:eco-incorp/sauce.git, type: git}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#fc7d6b4fb95721bb3ee6b57d7abad254efb4bd9e:
+    resolution: {commit: fc7d6b4fb95721bb3ee6b57d7abad254efb4bd9e, repo: git@github.com:eco-incorp/sauce.git, type: git}
     version: 0.0.0
 
   semver@5.7.2:
@@ -6037,7 +6037,7 @@ snapshots:
       '@jest/schemas': 30.4.1
       ansi-styles: 5.2.0
       react-is-18: react-is@18.3.1
-      react-is-19: react-is@19.2.6
+      react-is-19: react-is@19.2.7
 
   prompts@2.4.2:
     dependencies:
@@ -6063,7 +6063,7 @@ snapshots:
 
   react-is@18.3.1: {}
 
-  react-is@19.2.6: {}
+  react-is@19.2.7: {}
 
   readable-stream@3.6.2:
     dependencies:
@@ -6104,7 +6104,7 @@ snapshots:
 
   safer-buffer@2.1.2: {}
 
-  sauce@git+https://git@github.com:eco-incorp/sauce.git#a03cd5554ee3b35bfe8cfb69629f29b12ecf7e52: {}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#fc7d6b4fb95721bb3ee6b57d7abad254efb4bd9e: {}
 
   semver@5.7.2: {}
 

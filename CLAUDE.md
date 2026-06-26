@@ -161,9 +161,11 @@ path, dev-tools recipes via the `@eco-incorp/sauce-compiler` workspace dep.
 **EcoSwap single-pass (this branch).** EcoSwap's on-chain solver is now a **single-pass array-mutation**
 water-fill: it allocates real arrays (`new Array`, no register banks) and sweeps brackets to a live cut.
 It is **compute-then-pull** — `transferFrom`s exactly the swept `cum` (one guarded terminal refund for
-the limit-price edge), not a pre-pull. It can **adaptively stream** a tick walk past the prepared window
-(gated `ECO_ADAPTIVE`/`opts.adaptive`, `EXTRA_TICKS=64`). `ecoswap.singlepass.unrolled.sauce.ts` is frozen
-as the **gas reference** (vs the array variant). The **on-chain lens is the single source of truth**: it
+the limit-price edge), not a pre-pull. It **always** streams a tick walk past the prepared window whenever
+that window under-fills `amountIn` (no flag — gated only by need `cum < amountIn` and data: V3/V4 carry a
+frontier seed, V2 does not; `EXTRA_TICKS=64`). The legacy two-pass solver was removed — single-pass
+is the **sole solver** (`ecoswap.sauce.ts`); `ecoswap.unrolled.sauce.ts` is frozen as the **gas reference**
+(vs the array default). The **on-chain lens is the single source of truth**: it
 emits **survivors-only** plus a header `[discoveredCount, survivorCount, totalL, liqFloor]`, and
 `prepare.ts` consumes them with **no re-filter**. The absolute `MIN_LIQUIDITY` floor was **dropped** —
 relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the sole liquidity filter.
@@ -214,12 +216,12 @@ the legacy fork tests:
    addresses; runtime captured by `recipes/test/harness/v4-bytecode-snapshot.ts`, checked in at
    `fixtures/snapshots/v4-bytecode.json`).
    **Dual-engine (this branch):** `ecoswap.evm.test.ts` Phase 3 is parametrized
-   `{two-pass, single-pass} × {v1, v12}`; the v12 cells deploy the V12 stack (`deployV12Stack`) and cook
+   the **single-pass solver × {v1, v12}**; the v12 cells deploy the V12 stack (`deployV12Stack`) and cook
    through **V12Pot on the Huff runtime**, **gated by `SAUCE_ENGINE_V12=1`** (skip-by-default). The cook
    block timestamp is pinned (`setNextBlockTimestamp`) because the V3 pool oracle accumulator depends on
    `block.timestamp`, which drifts across `evm_revert`. Two new tier-2 tests: `ecoswap.adaptive.evm.test.ts`
-   (window-exceeded adaptive fill) and `ecoswap.gas.evm.test.ts` + `GAS.md` (`ECO_GAS=1`, {3 solver
-   variants}×{v1,v12} gas + bytecode size).
+   (window-exceeded adaptive fill) and `ecoswap.gas.evm.test.ts` + `GAS.md` (`ECO_GAS=1`, {2 single-pass
+   solver variants: array + unrolled}×{v1,v12} gas + bytecode size).
    **Prod-mirror tests** replay REAL Base pool state from checked-in snapshots: `*.prodmirror.evm.test.ts`
    for V3 (`prod-snapshot.ts`, heavy ~10 min — one mint per boundary), V2 (`v2-snapshot.ts`, asserts
    output == exact constant-product) and V4 (`v4-snapshot.ts`, re-mints the tick profile into the etched
@@ -234,13 +236,33 @@ the legacy fork tests:
    (GENUINE pancake pool bytecode that calls `pancakeV3SwapCallback`; deployed from the npm package's
    prebuilt creation code via the `PancakeV3Deployer` fixture, since pancake ships no factory/deployer
    source) + V2 + V4 — then asserts (a) `discoverPools` surfaces all 10 across both forks/every tier
-   (per-factory `feeTiers` catch Pancake's 2500), (b) the **relative-liquidity filter** (1% of total Σ
-   liquidity) keeps only the deep pools (Uni 500+3000, Pancake 100+500) and drops the thin V2/V4 +
-   shallow tiers, and (c) ONE EcoSwap splits across BOTH forks (exercising uniswap+pancake callbacks)
-   with marginals equalized; plus a drift case on a Pancake survivor. The 4 survivors are fully
-   reconstructed (real tick profiles); droppees are light-minted at real price + real active L.
-   Recapture any with `BASE_RPC_URL=<url> npx tsx recipes/test/harness/<x>-snapshot.ts` (V3/Pancake
-   take an optional source-tag arg → `base-WETHUSDC-pancake<fee>.json`).
+   (per-factory `feeTiers` catch Pancake's 2500), (b) the **relative-depth filter** (1% of total Σ
+   IN-RANGE capacity — the gross tokenIn each pool absorbs from spot to the common cut, NOT spot
+   active-L) keeps only the deep pools and drops the thin V2/V4 + shallow tiers, and (c) ONE EcoSwap
+   splits across BOTH forks (exercising uniswap+pancake callbacks) with marginals equalized; plus a
+   drift case on a Pancake survivor. The deep survivors are Uni 500+3000 and Pancake 500 (always),
+   plus Pancake **100** as a **knife-edge** case: its in-range capacity is ≈47.2 WETH ≈ **1.0%** of
+   the Σ, right at the 1% floor — the engines compute Σ with marginally different mulDiv/sqrt rounding
+   (v12 Σ≈4701→floor≈47.01→Pancake-100 **kept**, 4 survivors; v1 Σ≈4741→floor≈47.41→**dropped**, 3
+   survivors), so the test asserts the 3 unambiguous survivors strictly and treats Pancake-100 as the
+   documented engine-dependent borderline. (Verify per-pool capacity with `npx tsx
+   recipes/test/harness/lens-capacity-probe.ts`, which loads the cached state + replays the lens's
+   capacity walk off-chain.) Survivors are fully reconstructed (real tick profiles); droppees are
+   light-minted at real price + real active L.
+   Recapture the prod SNAPSHOTS with `BASE_RPC_URL=<url> npx tsx recipes/test/harness/<x>-snapshot.ts`
+   (V3/Pancake take an optional source-tag arg → `base-WETHUSDC-pancake<fee>.json`).
+   **Anvil-state cache (fast setup).** Reconstruction is deterministic given the engine artifacts +
+   snapshots, so each prod-mirror `before()` reconstructs ONCE per engine, dumps the full anvil state
+   (`anvil_dumpState`) + a small manifest to a CHECKED-IN blob under
+   `recipes/test/fixtures/anvil-state/<fixture>-<engine>.{state.json.gz,manifest.json}` (NOT gitignored
+   — CI + fresh clones load it), and on later runs `anvil_loadState`s it in **seconds** (the whole
+   prod-mirror lane: ~50 min → ~42 s/engine) and pins `block.timestamp` (kills the `evm_revert` oracle
+   drift). Shared harness: `recipes/test/harness/state-cache.ts` (`withCachedState`); anvil boots with
+   `--no-request-size-limit` (the ~2.5 MB loadState payload exceeds anvil's default 2 MB body limit).
+   **RECAPTURE is REQUIRED whenever the engine artifacts OR the reconstruction change** (the blob bakes
+   in the engine bytecode + the reconstructed pools): `RECAPTURE_ANVIL_STATE=1 npx tsx --test
+   recipes/test/<fixture>.prodmirror.evm.test.ts` (and `ECO_ENGINE=v1 …` for the v1 blob). A fresh
+   clone with a missing blob recaptures implicitly on first run. Mirrors the snapshots convention.
    Every prod-mirror test ALSO has a **drift / runtime re-anchoring** case: snapshot the reconstructed
    pools, `prepare()`+compile, move a pool's price with a REAL swap (`harness/drift.ts` cooks the one-swap
    `harness/drift.sauce.ts` through the engine), then `cook()` the pre-drift bytecodes — so Phase B's

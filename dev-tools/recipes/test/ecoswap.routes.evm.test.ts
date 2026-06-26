@@ -41,12 +41,24 @@ import {
   mintPosition,
   SQRT_PRICE_1_1,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
+import {
+  type Engine,
+  engineCells,
+  maybeDeployV12Stack,
+  cookTarget,
+  quoteRouter,
+} from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { EcoBracketKind, type EcoPool, type PoolInfo } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
+import type { Account } from "viem";
 
 const HUGE = parseEther("1000000000");
+
+// Engine cells driven by ECO_ENGINE (default v12). See harness/engine.ts.
+const ENGINE_CELLS = engineCells();
 const Q192 = 1n << 192n;
 const ZERO = "0x0000000000000000000000000000000000000000" as Hex;
 const ZERO32 = "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex;
@@ -56,12 +68,14 @@ describe("EcoSwap multi-hop route (tokenIn -> base -> tokenOut, V3 hops)", () =>
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
   let tokenIn: Hex;
   let base: Hex;
   let tokenOut: Hex;
   let poolAB: Hex;
   let poolBC: Hex;
   let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
 
   before(async () => {
     anvil = await startAnvil();
@@ -102,9 +116,24 @@ describe("EcoSwap multi-hop route (tokenIn -> base -> tokenOut, V3 hops)", () =>
       feeTiers: [HOP_FEE],
       baseTokens: [base], // the intermediate hop token
     };
+
+    // v12 stack (same anvil/pools) when a v12 cell runs; caller is funded per-test
+    // below, then approves the cook target there. Fund + approve the Pot up front so
+    // the route cook can transferFrom(caller, self=Pot, …).
+    const minterAcct = c.account0;
+    await mint(c.walletClient, c.publicClient, tokenIn, minterAcct, parseEther("100000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
   });
 
   after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+  }
 
   /** Minimal EcoPool around a discovered V3 hop pool, for the drift harness's real swap. */
   function hopEco(p: PoolInfo): EcoPool {
@@ -138,13 +167,15 @@ describe("EcoSwap multi-hop route (tokenIn -> base -> tokenOut, V3 hops)", () =>
     return out;
   }
 
-  it("discovers ONE route, ZERO direct pools, and routes through BOTH hops", async () => {
+  async function runRoute(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
     const amountIn = parseEther("2000");
     const caller = c.account0;
-    await mint(c.walletClient, c.publicClient, tokenIn, caller, parseEther("100000"));
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+      caller, poolConfig, undefined, engine,
     );
 
     assert.equal(prepared.pools.length, 0, "no direct tokenIn/tokenOut pool exists");
@@ -165,8 +196,8 @@ describe("EcoSwap multi-hop route (tokenIn -> base -> tokenOut, V3 hops)", () =>
     const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "route cook() must succeed");
 
     const abInDelta = (await balanceOf(c.publicClient, tokenIn, poolAB)) - abInBefore;
@@ -181,10 +212,16 @@ describe("EcoSwap multi-hop route (tokenIn -> base -> tokenOut, V3 hops)", () =>
     assert.ok(leftover * 100n <= amountIn, `route spends ~all amountIn (leftover ${leftover})`);
 
     console.log(
-      `  [ROUTE] spent=${spent} received=${received} leftover=${leftover}\n` +
+      `  [ROUTE ${engine}] spent=${spent} received=${received} leftover=${leftover}\n` +
         `       hop1 tokenIn in=${abInDelta}  hop2 base in=${bcInDelta}`,
     );
-  });
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`discovers ONE route, ZERO direct pools, and routes through BOTH hops [${engine}]`, { skip }, async () => {
+      await runRoute(engine);
+    });
+  }
 
   it("route-segment-implied output tracks a real two-hop swap (fee-correct composition)", async () => {
     const amountIn = parseEther("1500");

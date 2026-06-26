@@ -1,29 +1,100 @@
 import { ISauceRouter } from "./artifacts/ISauceRouter.json";
 import { IERC20 } from "./artifacts/IERC20.json";
-import { IUniswapV3Pool } from "./artifacts/IUniswapV3Pool.json";
-import { IStateView } from "./artifacts/IStateView.json";
+import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
+import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 
-// EcoSwap on-chain solver.
+// EcoSwap on-chain solver — SINGLE-PASS (live-cut) variant.
 //
-// Inputs (all pool data precomputed off-chain in prepare.ts):
-//   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0]
+// One sweep over the pre-sorted bracket ladder does in one pass what a two-pass
+// water-fill splits across Phase A (find the cut) + Phase B (re-integrate each pool). Per-pool
+// input accumulators and the live price / V2-liquidity caches live in real mutable
+// arrays sized to the (bounded) pool/route counts — new Array(pools.length) /
+// new Array(routes.length) — indexed directly by the runtime pool/route index.
+// new Array(n) zero-inits every slot, so the price cache's sentinel 0 = "unseen"
+// comes for free, and n is bounded by MAX_DIRECT_POOLS=12 / MAX_ROUTES=2, well
+// under the engine's 255-slot NEW_ARRAY cap.
+//
+// Why no explicit cut: brackets are sorted DESC by fee-adjusted marginal price, so
+// the sweep processes the best price first. Each bracket's gross input is computed
+// LIVE (hi = min(curSqrt, near) → drift is absorbed here, so NO cap=0 reverse-
+// bracket hack is needed: a reverse bracket only contributes when curSqrt has
+// actually drifted above spot). We add each bracket's full gross to its pool's
+// accumulator until cum reaches amountIn; the crossing bracket's pool gets the
+// remaining need. The cut is implicit — every engaged pool ends at ~the same
+// marginal price, and the exact-input swaps realise the geometry. Total assigned
+// (cum) == amountIn exactly when liquidity allows.
+//
+// COMPUTE-THEN-PULL: the sweep is read-only (slot0 / getReserves staticcalls only),
+// so we first compute exactly how much tokenIn the swaps will consume (cum), then
+// transferFrom the caller EXACTLY that — no upfront over-pull, no refund round-trip.
+// The only leftover possible is the limit-price edge (a binding priceLimit makes a
+// V3 swap consume less than its assigned input); one guarded terminal refund returns it.
+//
+// ADAPTIVE DYNAMIC TICK READS (WS4): ALWAYS ON. Whenever the prepared bracket sweep
+// under-fills (cum < amountIn), the solver continues a streaming live-tick walk
+// (ticks()/getTickLiquidity staticcalls, ported from the lens forward loop), bounded
+// by EXTRA_TICKS and the price limit, to close the gap. V3/V4 only: prepare always
+// stamps each V3/V4 pool's frontier seeds (pools[i][10..13]), so aStartShift>0 holds
+// and the walk resumes from exactly where buildV3Brackets stopped. V2 has a single
+// wide bracket → no frontier → seeds 0 → it is naturally skipped (routes are static
+// too). The seed's first far-edge equals the last prepared bracket's far-edge, so the
+// walk is path-additive (no gap, no double-count). It only does work when needed
+// (cum < amountIn) — a window that already covers amountIn never enters the walk.
+//
+// Inputs (precomputed off-chain in prepare.ts):
+//   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
+//                  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio]
+//                 [10..13] are the adaptive frontier seeds (always set for V3/V4; 0 for V2).
 //   routes[r]   = [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks]
 //   brackets[b] = [kind, refIdx, sqrtNear, sqrtFar, liquidity, capacity, sqrtAdjNear, sqrtAdjFar]
 //                 kind: 0=V3 direct, 1=V2 direct, 2=route ; sorted DESC by sqrtAdjNear.
 //
-// Algorithm:
-//   Phase A — walk the pre-sorted bracket ladder, summing precomputed capacity
-//     until amountIn is reached, to find the common fee-adjusted marginal-price
-//     cut `cutSqrtAdj` (the water-fill level where every pool's post-fee marginal
-//     price is equal).
-//   Phase B — for each direct pool, re-read its LIVE price, integrate the exact
-//     input needed to walk from the live price down to the cut (using its
-//     brackets' liquidity), and do ONE swap. Routes allocate whole segments above
-//     the cut (static capacities) and swap hop1 -> hop2.
+// On-chain a direct bracket uses kind/refIdx/sqrtNear/sqrtFar/liquidity + the live
+// price; capacity[5] is used only for route segments (no live price). All sqrt
+// values are unified out/in Q96.
+
+// ── Pure helpers (copied verbatim from ecoswap.lens.sauce.ts) ─────────────────
+
+// int24 STATICCALL arg (signed tick) from a shifted tick.
 //
-// All sqrt values are unified "out/in" Q96; the single bracket formula is
-//   effIn = L * 2^96 * (1/sqrtFar - 1/sqrtNear);  grossIn = effIn / (1 - fee).
+// SIGN-EXTEND to a full 32-byte word: a value derived from an `intN` contract
+// output (slot0/getSlot0 `tick`) inherits that type's narrow byte-width, so when
+// re-encoded as an `int24` argument the engine emits only the low 3 bytes,
+// ZERO-extended. V3 pools (lax 0.7 decode) tolerate it; the V4 StateView (strict
+// 0.8 decode) reverts bare 0x on a non-sign-extended NEGATIVE tick (real Base pools
+// sit near -201700). OR-ing the high bits both sign-extends and widens to 32 bytes.
+function tickArg(shifted: Uint256, OFFSET: Uint256): Uint256 {
+  const HIGH: Uint256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000;
+  if (shifted >= OFFSET) {
+    const up: Uint256 = shifted - OFFSET;
+    if (up >= 8388608) {
+      return up | HIGH;
+    }
+    return up;
+  }
+  return Math.neg(OFFSET - shifted) | HIGH;
+}
+
+// Convert a real pool sqrt (token1/token0) into unified out/in sqrt.
+function toOutIn(sqrtReal: Uint256, zeroForOne: Uint256): Uint256 {
+  if (zeroForOne === 1) {
+    return sqrtReal;
+  }
+  const Q192: Uint256 = 2 ** 192;
+  return Q192 / sqrtReal;
+}
+
+// Next REAL sqrt one tickSpacing step in the swap direction.
+//   zeroForOne (price down): sqrt' = mulDiv(sqrt, 2^96, stepRatio)
+//   oneForZero (price up):   sqrt' = mulDiv(sqrt, stepRatio, 2^96)
+function stepReal(sqrtReal: Uint256, stepRatio: Uint256, zeroForOne: Uint256): Uint256 {
+  const Q96: Uint256 = 2 ** 96;
+  if (zeroForOne === 1) {
+    return Math.mulDiv(sqrtReal, Q96, stepRatio);
+  }
+  return Math.mulDiv(sqrtReal, stepRatio, Q96);
+}
 
 function main(
   tokenIn: Address, tokenOut: Address, amountIn: Uint256, caller: Address,
@@ -33,203 +104,248 @@ function main(
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
 
-  token.transferFrom(caller, address.self, amountIn);
-
   const Q96: Uint256 = 2 ** 96;
   const Q192: Uint256 = 2 ** 192;
   const FEE_DENOM: Uint256 = 1000000;
+  const OFFSET: Uint256 = 888000; // tick shift (matches lens / prepare seeds)
+  const HALF128: Uint256 = 2 ** 127; // int128 sign bit
+  const MOD128: Uint256 = 2 ** 128;
 
-  // ── Phase A: find the common marginal-price cut ──────────────
+  // Per-pool input accumulators, live out/in-sqrt cache (0 = unseen) and V2 live-L
+  // cache, sized to the pool count; per-route input accumulators sized to routes.
+  let inp: Tuple = new Array(pools.length);
+  let curArr: Tuple = new Array(pools.length);
+  let lArr: Tuple = new Array(pools.length);
+  let rinp: Tuple = new Array(routes.length);
+
   let cum: Uint256 = 0;
-  let cutSqrtAdj: Uint256 = 0;
   let found: Uint256 = 0;
 
-  for (let i = 0; i < brackets.length; i = i + 1) {
+  // ── SINGLE SWEEP: accumulate live gross input per pool/route to the cut ──
+  for (let bi = 0; bi < brackets.length; bi = bi + 1) {
     if (found === 0) {
-      const b: Tuple = brackets[i];
-      const cap: Uint256 = b[5];
+      const b: Tuple = brackets[bi];
+      const kind: Uint256 = b[0];
 
-      if (cum + cap >= amountIn) {
-        const need: Uint256 = amountIn - cum;
-
-        if (b[0] === 2) {
-          // Route segment: linear interpolation in fee-adjusted sqrt space.
-          const an: Uint256 = b[6];
-          const af: Uint256 = b[7];
-          if (an > af) {
-            cutSqrtAdj = an - Math.mulDiv(an - af, need, cap);
-          } else {
-            cutSqrtAdj = an;
-          }
-        } else {
-          // Direct bracket: solve the spot price where partial input === need,
-          // then fee-adjust. need_eff = need * (1 - fee).
-          const dp: Tuple = pools[b[1]];
-          const feePpm: Uint256 = dp[5];
-          const L: Uint256 = b[4];
-          const needEff: Uint256 = Math.mulDiv(need, FEE_DENOM - feePpm, FEE_DENOM);
-          const termNear: Uint256 = Math.mulDiv(L, Q96, b[2]);
-          const termS: Uint256 = termNear + needEff;
-          const cutSpot: Uint256 = Math.mulDiv(L, Q96, termS);
-          const sf: Uint256 = Math.sqrt((FEE_DENOM - feePpm) * FEE_DENOM);
-          cutSqrtAdj = Math.mulDiv(cutSpot, sf, FEE_DENOM);
+      if (kind === 2) {
+        // Route segment — static capacity (no live price), accumulate per route.
+        const rdx: Uint256 = b[1];
+        const cap: Uint256 = b[5];
+        let take: Uint256 = cap;
+        if (cum + cap >= amountIn) {
+          take = amountIn - cum;
+          found = 1;
         }
-        found = 1;
-      }
-      cum = cum + cap;
-    }
-  }
-  // found === 0 → amountIn exceeds all liquidity → cutSqrtAdj stays 0 (fill all).
-
-  let budget: Uint256 = amountIn;
-
-  // ── Phase B (direct pools): integrate live price -> cut, one swap ──
-  for (let p = 0; p < pools.length; p = p + 1) {
-    if (budget > 0) {
-      const dp: Tuple = pools[p];
-      const feePpm: Uint256 = dp[5];
-      const isV2: Uint256 = dp[6];
-      const pType: Uint256 = dp[0];
-
-      // Live current out/in sqrt price + (for V2) live liquidity.
-      let curSqrt: Uint256 = 0;
-      let liveL: Uint256 = 0;
-      if (isV2 === 1) {
-        // Multi-return contract calls must be indexed INLINE (a stored tuple isn't
-        // re-indexable), so getReserves is called per field.
-        const r0: Uint256 = IUniswapV2Pair.at(dp[1]).getReserves()[0];
-        const r1: Uint256 = IUniswapV2Pair.at(dp[1]).getReserves()[1];
-        const inIsToken0: Uint256 = dp[7];
-        const reserveIn: Uint256 = inIsToken0 === 1 ? r0 : r1;
-        const reserveOut: Uint256 = inIsToken0 === 1 ? r1 : r0;
-        liveL = Math.sqrt(reserveIn * reserveOut);
-        curSqrt = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
+        rinp[rdx] = rinp[rdx] + take;
+        cum = cum + take;
       } else {
-        if (pType === 2) {
-          // V4: live price from the StateView lens keyed by poolId
-          // (dp[8]=stateView, dp[9]=poolId). slot0() is multi-return → index inline.
-          const sqrtRealV4: Uint256 = IStateView.at(dp[8]).getSlot0(dp[9])[0];
-          curSqrt = zeroForOne === 1 ? sqrtRealV4 : Q192 / sqrtRealV4;
-        } else {
-          const sqrtReal: Uint256 = IUniswapV3Pool.at(dp[1]).slot0()[0];
-          curSqrt = zeroForOne === 1 ? sqrtReal : Q192 / sqrtReal;
+        const pidx: Uint256 = b[1];
+        const near: Uint256 = b[2];
+        const far: Uint256 = b[3];
+        const Lstat: Uint256 = b[4];
+        const dp: Tuple = pools[pidx];
+        const feePpm: Uint256 = dp[5];
+        const isV2: Uint256 = dp[6];
+        const pType: Uint256 = dp[0];
+
+        // Cached live state for this pool index (0 = not yet read).
+        let cur: Uint256 = curArr[pidx];
+        let Lliv: Uint256 = lArr[pidx];
+
+        // first touch → read live price (+ V2 live L), cache it
+        if (cur === 0) {
+          let cl: Uint256 = 0;
+          let ll: Uint256 = 0;
+          if (isV2 === 1) {
+            // Two SEPARATE getReserves() staticcalls (one indexed [0], one [1]):
+            // a stored multi-return reverts on re-index in this VM, so we read twice.
+            const r0: Uint256 = IUniswapV2Pair.at(dp[1]).getReserves()[0];
+            const r1: Uint256 = IUniswapV2Pair.at(dp[1]).getReserves()[1];
+            const inIsToken0: Uint256 = dp[7];
+            const reserveIn: Uint256 = inIsToken0 === 1 ? r0 : r1;
+            const reserveOut: Uint256 = inIsToken0 === 1 ? r1 : r0;
+            ll = Math.sqrt(reserveIn * reserveOut);
+            cl = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
+          } else {
+            if (pType === 2) {
+              const sr4: Uint256 = IStateViewFull.at(dp[8]).getSlot0(dp[9])[0];
+              cl = zeroForOne === 1 ? sr4 : Q192 / sr4;
+            } else {
+              const sr: Uint256 = IUniswapV3PoolFull.at(dp[1]).slot0()[0];
+              cl = zeroForOne === 1 ? sr : Q192 / sr;
+            }
+          }
+          cur = cl;
+          Lliv = ll;
+          curArr[pidx] = cl;
+          lArr[pidx] = ll;
         }
-      }
 
-      // Per-pool target spot price where its marginal === cut: target = cut / sqrt(1-fee).
-      const sf: Uint256 = Math.sqrt((FEE_DENOM - feePpm) * FEE_DENOM);
-      const targetSpot: Uint256 = sf > 0 ? Math.mulDiv(cutSqrtAdj, FEE_DENOM, sf) : 0;
-
-      // Integrate this pool's brackets from live price down to target.
-      let poolInput: Uint256 = 0;
-      for (let bi = 0; bi < brackets.length; bi = bi + 1) {
-        const b: Tuple = brackets[bi];
-        if (b[0] !== 2 && b[1] === p) {
-          const near: Uint256 = b[2];
-          const far: Uint256 = b[3];
-          const Lb: Uint256 = isV2 === 1 ? liveL : b[4];
-          const hi: Uint256 = curSqrt < near ? curSqrt : near;
-          const lo: Uint256 = targetSpot > far ? targetSpot : far;
-          if (hi > lo && Lb > 0 && lo > 0) {
-            const effIn: Uint256 = Math.mulDiv(Lb, Q96, lo) - Math.mulDiv(Lb, Q96, hi);
-            if (effIn > 0) {
-              poolInput = poolInput + Math.mulDiv(effIn, FEE_DENOM, FEE_DENOM - feePpm);
+        // integrate this bracket from hi = min(cur, near) down to far, LIVE
+        const Lb: Uint256 = isV2 === 1 ? Lliv : Lstat;
+        const hi: Uint256 = cur < near ? cur : near;
+        if (hi > far) {
+          if (Lb > 0) {
+            if (far > 0) {
+              const effIn: Uint256 = Math.mulDiv(Lb, Q96, far) - Math.mulDiv(Lb, Q96, hi);
+              if (effIn > 0) {
+                const capGross: Uint256 = Math.mulDiv(effIn, FEE_DENOM, FEE_DENOM - feePpm);
+                let take: Uint256 = capGross;
+                if (cum + capGross >= amountIn) {
+                  take = amountIn - cum;
+                  found = 1;
+                }
+                inp[pidx] = inp[pidx] + take;
+                cum = cum + take;
+              }
             }
           }
         }
       }
+    }
+  }
 
-      if (poolInput > budget) {
-        poolInput = budget;
+  // ── ADAPTIVE STREAMING TICK WALK (WS4): continue past the prepared window ──
+  // ALWAYS ON, gated only by need + data: if the prepared brackets under-filled
+  // (cum < amountIn) and a pool carries a frontier seed (aStartShift > 0 — always
+  // true for V3/V4, prepare stamps it), resume that pool's tick walk LIVE from
+  // exactly where buildV3Brackets stopped, consuming each step's gross into
+  // inp[ap]/cum until amountIn is met, the price limit binds, or EXTRA_TICKS steps
+  // are read. Mirrors the lens forward loop bit-for-bit. A window that already
+  // covers amountIn never enters this block (cum < amountIn is false); V2 carries
+  // no frontier (seeds 0) so it is skipped.
+  const EXTRA_TICKS: Uint256 = 64; // one window past the frontier; <= 255 (engine for-bound cap)
+  if (cum < amountIn) {
+    for (let ap = 0; ap < pools.length; ap = ap + 1) {
+      if (cum < amountIn) {
+        const ad: Tuple = pools[ap];
+        const aStartShift: Uint256 = ad[10];
+        const aType: Uint256 = ad[0];
+        const aIsV2: Uint256 = ad[6];
+        if (aIsV2 === 0) {
+          if (aStartShift > 0) {
+            const aFeePpm: Uint256 = ad[5];
+            const aTs: Uint256 = ad[3];
+            const aStep: Uint256 = ad[13];
+            const aStateView: Address = ad[8];
+            const aPoolId: Uint256 = ad[9];
+            const aAddr: Address = ad[1];
+            let aShift: Uint256 = aStartShift;
+            let aNearReal: Uint256 = ad[11];
+            let aL: Uint256 = ad[12];
+            let aDone: Uint256 = 0;
+            for (let kx = 0; kx < EXTRA_TICKS; kx = kx + 1) {
+              if (aDone === 0) {
+                const aFarReal: Uint256 = stepReal(aNearReal, aStep, zeroForOne);
+                const aNearOI: Uint256 = toOutIn(aNearReal, zeroForOne);
+                const aFarOI: Uint256 = toOutIn(aFarReal, zeroForOne);
+                // Limit-price guard (REAL-sqrt space): stop this pool if the next
+                // step would cross the binding priceLimit, so inp[ap] never exceeds
+                // what the swap can realize (the terminal refund still catches it).
+                let aLimited: Uint256 = 0;
+                if (zeroForOne === 1) { if (aFarReal <= priceLimit) { aLimited = 1; } }
+                else { if (aFarReal >= priceLimit) { aLimited = 1; } }
+                if (aL > 0) { if (aNearOI > aFarOI) { if (aFarOI > 0) {
+                  const aEffIn: Uint256 = Math.mulDiv(aL, Q96, aFarOI) - Math.mulDiv(aL, Q96, aNearOI);
+                  if (aEffIn > 0) {
+                    const aGross: Uint256 = Math.mulDiv(aEffIn, FEE_DENOM, FEE_DENOM - aFeePpm);
+                    let aTake: Uint256 = aGross;
+                    if (cum + aGross >= amountIn) { aTake = amountIn - cum; aDone = 1; }
+                    inp[ap] = inp[ap] + aTake;
+                    cum = cum + aTake;
+                  }
+                } } }
+                // Cross the boundary tick: update L by liquidityNet (live read).
+                const aArg: Uint256 = tickArg(aShift, OFFSET);
+                let aNet: Uint256 = 0;
+                if (aType === 2) { aNet = IStateViewFull.at(aStateView).getTickLiquidity(aPoolId, aArg)[1]; }
+                else { aNet = IUniswapV3PoolFull.at(aAddr).ticks(aArg)[1]; }
+                const aNeg: Uint256 = aNet >= HALF128 ? 1 : 0;
+                if (zeroForOne === 1) {
+                  if (aNeg === 1) { aL = aL + (MOD128 - aNet); } else { aL = aL >= aNet ? aL - aNet : 0; }
+                  aShift = aShift - aTs;
+                } else {
+                  if (aNeg === 1) { const aMag: Uint256 = MOD128 - aNet; aL = aL >= aMag ? aL - aMag : 0; } else { aL = aL + aNet; }
+                  aShift = aShift + aTs;
+                }
+                aNearReal = aFarReal;
+                if (cum >= amountIn) { aDone = 1; }
+                if (aLimited === 1) { aDone = 1; }
+              }
+            }
+          }
+        }
       }
+    }
+  }
 
-      if (poolInput > 0) {
-        if (isV2 === 1) {
-          // Constant-product pool: unified swap(SwapParams), poolType=UniV2=0.
-          // amountSpecified is NEGATIVE for exact-input on this path (Math.neg —
-          // SUB is checked). poolKey is ignored by _swapV2 but must be ABI-shaped;
-          // currency0/currency1 follow token sort order. payer=self (router holds
-          // the tokens), recipient=self (output forwarded at the end).
-          const c0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
-          const c1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
+  // ── COMPUTE-THEN-PULL: pull EXACTLY what the swaps will consume (cum ≤ amountIn) ──
+  if (cum > 0) {
+    token.transferFrom(caller, address.self, cum);
+  }
+
+  // ── Execution: one swap per direct pool (amount read from the accumulator) ──
+  for (let p = 0; p < pools.length; p = p + 1) {
+    const amt: Uint256 = inp[p];
+    if (amt > 0) {
+      const dp: Tuple = pools[p];
+      const isV2: Uint256 = dp[6];
+      const pType: Uint256 = dp[0];
+      if (isV2 === 1) {
+        // Constant-product: unified swap(SwapParams), poolType=UniV2=0, neg amount.
+        const cc0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
+        const cc1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
+        router.swap({
+          poolType: 0,
+          pool: dp[1],
+          poolKey: { currency0: cc0, currency1: cc1, fee: 0, tickSpacing: 0, hooks: 0 },
+          tokenIn: tokenIn,
+          tokenOut: tokenOut,
+          amountSpecified: Math.neg(amt),
+          sqrtPriceLimitX96: 0,
+          payer: address.self,
+          recipient: address.self,
+        });
+      } else {
+        if (pType === 2) {
+          // V4 singleton: unified swap(SwapParams), poolType=UniV4=2, neg amount.
+          const k0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
+          const k1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
           router.swap({
-            poolType: 0,
+            poolType: 2,
             pool: dp[1],
-            poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
+            poolKey: { currency0: k0, currency1: k1, fee: dp[2], tickSpacing: dp[3], hooks: dp[4] },
             tokenIn: tokenIn,
             tokenOut: tokenOut,
-            amountSpecified: Math.neg(poolInput),
+            amountSpecified: Math.neg(amt),
             sqrtPriceLimitX96: 0,
             payer: address.self,
             recipient: address.self,
           });
         } else {
-          if (pType === 2) {
-            // V4 singleton: unified swap(SwapParams), poolType=UniV4=2. pool = the
-            // PoolManager (dp[1]); the full PoolKey (currency0/currency1 sorted, fee,
-            // tickSpacing, hooks) drives dispatch. amountSpecified NEGATIVE = exact
-            // input. payer=self, recipient=self; limit 0 → router picks the extreme.
-            const k0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
-            const k1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
-            router.swap({
-              poolType: 2,
-              pool: dp[1],
-              poolKey: { currency0: k0, currency1: k1, fee: dp[2], tickSpacing: dp[3], hooks: dp[4] },
-              tokenIn: tokenIn,
-              tokenOut: tokenOut,
-              amountSpecified: Math.neg(poolInput),
-              sqrtPriceLimitX96: 0,
-              payer: address.self,
-              recipient: address.self,
-            });
-          } else {
-            // V3 direct pool: flat legacy swapV3. Positive amountSpecified = exact
-            // input. Router holds the tokens (payer = self); output accrues to self
-            // and is forwarded at the end.
-            router.swapV3(dp[1], tokenIn, tokenOut, poolInput, priceLimit, address.self, address.self);
-          }
+          // V3 direct: flat swapV3, positive = exact input.
+          router.swapV3(dp[1], tokenIn, tokenOut, amt, priceLimit, address.self, address.self);
         }
-        budget = budget - poolInput;
       }
     }
   }
 
-  // ── Phase B (routes): whole segments above the cut, hop1 -> hop2 ──
+  // ── Execution: routes (≤2), hop1 -> hop2 via flat swapV3 ──
   for (let r = 0; r < routes.length; r = r + 1) {
-    if (budget > 0) {
+    const ramt: Uint256 = rinp[r];
+    if (ramt > 0) {
       const route: Tuple = routes[r];
-
-      let routeInput: Uint256 = 0;
-      for (let bi = 0; bi < brackets.length; bi = bi + 1) {
-        const b: Tuple = brackets[bi];
-        if (b[0] === 2 && b[1] === r) {
-          if (b[7] >= cutSqrtAdj) {
-            routeInput = routeInput + b[5];
-          }
-        }
-      }
-
-      if (routeInput > budget) {
-        routeInput = budget;
-      }
-
-      if (routeInput > 0) {
-        // Flat swapV3 per hop (positive = exact input; payer = self holds the
-        // tokens so the callback uses transfer, no approval needed). Assumes V3
-        // hop pools. limit 0 → router picks the extreme bound for the direction.
-        const inter: Address = route[0];
-        router.swapV3(route[2], tokenIn, inter, routeInput, 0, address.self, address.self);
-
-        const interBal: Uint256 = IERC20.at(inter).balanceOf(address.self);
-        if (interBal > 0) {
-          router.swapV3(route[7], inter, tokenOut, interBal, 0, address.self, address.self);
-        }
-        budget = budget - routeInput;
+      const inter: Address = route[0];
+      router.swapV3(route[2], tokenIn, inter, ramt, 0, address.self, address.self);
+      const interBal: Uint256 = IERC20.at(inter).balanceOf(address.self);
+      if (interBal > 0) {
+        router.swapV3(route[7], inter, tokenOut, interBal, 0, address.self, address.self);
       }
     }
   }
 
-  // Refund any unspent tokenIn (drift / liquidity ran out).
+  // Guarded terminal refund: the only leftover possible is the limit-price edge
+  // (a binding priceLimit makes a V3 swap consume less than its assigned input).
   const leftover: Uint256 = token.balanceOf(address.self);
   if (leftover > 0) {
     token.transfer(caller, leftover);

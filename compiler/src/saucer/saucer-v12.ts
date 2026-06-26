@@ -856,9 +856,33 @@ export class V12Saucer implements SaucerLike {
 
   // ── statements ──
   return(saucer?: SaucerLike): V12Saucer {
-    // v12: the return value is just left on the stack; build() appends MSTORE and
-    // the assembly terminates the function. No explicit STOP byte.
-    return saucer ? this.join(saucer) : this;
+    // v12: main is INLINED — its `return` just leaves the value on the stack and the
+    // assembly terminates it (build() appends MSTORE, trailing STOP). A HELPER is
+    // entered via CALL_FUNCTION, so EVERY `return` must emit FUNC_RETURN to pop its
+    // frame+params and jump back to the caller. This MUST include an EARLY return
+    // inside a conditional: without the FUNC_RETURN the value is merely left on the
+    // stack and execution FALLS THROUGH into the rest of the body, leaking a stack
+    // item per call (over a loop of calls → EVM "out of stack"). The function's tail
+    // return self-terminates too, making the assembly's trailing FUNC_RETURN dead
+    // (harmless) code.
+    const withValue = saucer ? this.join(saucer) : this;
+    if (this.ctx.isMainFunction) return withValue;
+
+    // Helper: append FUNC_RETURN — it terminates this path (pops frame+params, jumps
+    // to the caller). For the BUILDER's stack-height bookkeeping, model the whole
+    // `return …` as NET-NEUTRAL (report `this.stackEffect`, the height BEFORE the
+    // return value): control leaves here, so any CONTINUATION (e.g. an enclosing IF's
+    // fall-through, which only runs when this branch was NOT taken) must see the
+    // returning branch as height-neutral, not +1 from the pushed value. SDUP depths
+    // INSIDE the return expression are already resolved against this.stackEffect.
+    return new V12Saucer(
+      this.ctx,
+      concat(withValue._bytes, [OPS_V12.FUNC_RETURN]),
+      this.stackEffect,
+      false,
+      [...withValue.callPositions],
+      [...withValue.refPositions],
+    );
   }
 
   revert(dataL: SaucerLike): V12Saucer {
@@ -931,11 +955,23 @@ export class V12Saucer implements SaucerLike {
 
   /** Helper body: prepend ALLOCATE_VALUE/ALLOCATE_HEAP for local slots (no MSTORE). */
   buildFunctionBody(): Uint8Array {
+    const valueSlots = this.ctx.valueSlotCount;
+    const heapSlots = this.ctx.heapSlotCount;
+
+    // Slot indices are a single byte — >255 live slots would wrap and corrupt an
+    // earlier slot (e.g. a stack param's frame slot). Fail loud (mirrors Saucer.build).
+    if (valueSlots > 0xff) {
+      throw new Error(`too many scalar locals: ${valueSlots} (max 255); slot >=256 would wrap.`);
+    }
+    if (heapSlots > 0xff) {
+      throw new Error(`too many heap (dynamic) locals: ${heapSlots} (max 255); slot >=256 would wrap.`);
+    }
+
     const prefix: number[] = [];
 
-    if (this.ctx.valueSlotCount > 0) prefix.push(OPS.ALLOCATE_VALUE, this.ctx.valueSlotCount);
+    if (valueSlots > 0) prefix.push(OPS.ALLOCATE_VALUE, valueSlots);
 
-    if (this.ctx.heapSlotCount > 0) prefix.push(OPS.ALLOCATE_HEAP, this.ctx.heapSlotCount);
+    if (heapSlots > 0) prefix.push(OPS.ALLOCATE_HEAP, heapSlots);
 
     return prefix.length > 0 ? concat(new Uint8Array(prefix), this._bytes) : this._bytes;
   }

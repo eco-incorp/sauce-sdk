@@ -42,7 +42,7 @@
     "eslint": "^9.39.2",
     "jest": "^30.2.0",
     "prettier": "^3.8.1",
-    "sauce": "git+https://github.com/eco-incorp/sauce.git#feat/v12-kitchen",
+    "sauce": "github:eco-incorp/sauce#feat/v12-descriptor-32bit",
     "ts-jest": "^29.4.6",
     "typescript": "^5.7.0"
   },

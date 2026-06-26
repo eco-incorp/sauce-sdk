@@ -1,0 +1,53 @@
+{
+  "engine": "v12",
+  "data": {
+    "stack": {
+      "routerImpl": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+      "sauceRouter": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+      "factory": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0",
+      "helper": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
+    },
+    "v12": {
+      "routerImpl": "0xdbc43ba45381e02825b14322cddd15ec4b3164e6",
+      "sauceRouter": "0x04c89607413713ec9775e14b954286519d836fef",
+      "v12Runtime": "0x4c4a2f8c81640e47606d3fd77b353e87ba015584",
+      "kitchen": "0x21df544947ba3e8b3c32561399e88b52dc8b2823",
+      "pot": "0x9485D3870d1055938c75EB9dc526E0CaA2316fcd"
+    },
+    "v2Factory": "0xdc64a140aa3e981100a9beca4e685f962f0cf6c9",
+    "pancakeDeployer": "0x5fc8d32690cc91d4c39d9d3abcbd16989f875707",
+    "poolManager": "0x498581fF718922c3f8e6A244956aF099B2652b2b",
+    "stateView": "0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71",
+    "tokenIn": "0x0165878a594ca255338adfa4d48449f69242eb8f",
+    "tokenOut": "0xa513e6e4b8f2a923d98304ec87f64353c4d5c853",
+    "uni500": "0xd67B0d74d84155e3F52094487CA61DA6DB0fE4d8",
+    "uni3000": "0x92F76EFb56E0B609566509c033036EB9B14FbC46",
+    "cake100": "0x61c36a8d610163660E21a8b7359e1Cac0C9133e1",
+    "cake500": "0x23dB4a08f2272df049a4932a4Cc3A6Dc1002B33E",
+    "droppees": [
+      {
+        "label": "uni-100",
+        "address": "0x86AB7A5967B54a0b943140A7926eb5Ec9d076345"
+      },
+      {
+        "label": "uni-10000",
+        "address": "0xe9DE3f35DFF7cE52c619f49B23a87f9F95c295D0"
+      },
+      {
+        "label": "cake-2500",
+        "address": "0x8EFa1819Ff5B279077368d44B593a4543280e402"
+      },
+      {
+        "label": "cake-10000",
+        "address": "0x6743E5c6E1B453372507E8dfD6CA53508721425B"
+      }
+    ],
+    "v2pair": "0x00000000000000000000000000000000ec05a2a2",
+    "v2ReserveIn": {
+      "__bigint__": "327776444724312168662"
+    },
+    "v2ReserveOut": {
+      "__bigint__": "570695702423"
+    }
+  }
+}

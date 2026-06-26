@@ -217,90 +217,11 @@ describe("bracketCapacity", () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// 4. Water-fill cut & conservation (via ecoSwapReference)
-// ─────────────────────────────────────────────────────────────
-describe("water-fill solver (ecoSwapReference)", () => {
-  // Two V3 pools, different fee tiers, several brackets each.
-  const pools = [v3Pool(3000, 60), v3Pool(500, 10)];
-  const L = 10n ** 21n;
-  const ladder = sortLadder([
-    ...v3Brackets(0, 3000, L, 0, 60, 6),
-    ...v3Brackets(1, 500, L * 2n, 5, 10, 8),
-  ]);
-  const prep = prepared(pools, ladder);
-  const cap = totalCapacity(ladder);
-
-  it("conservation: total spent ≤ amountIn, ≤ 1 wei short at a clean fill level", () => {
-    // At fill levels where the water-fill cut lands ON a bracket boundary, Phase A
-    // (capacity sums) and Phase B (per-pool spot reconstruction) reconcile to the
-    // wei. Use 50% of capacity. (At mid-bracket cuts the two phases use different
-    // integer formulas and can underspend more — characterized in the next test.)
-    const amountIn = (cap * 1n) / 2n;
-    const res = ecoSwapReference(prep, amountIn);
-    assert.equal(res.totalInput, res.perPoolInput.reduce((a, b) => a + b, 0n), "Σ perPool === total");
-    assert.ok(res.totalInput <= amountIn, "never overspends");
-    const shortfall = amountIn - res.totalInput;
-    assert.ok(shortfall <= 1n, `shortfall ${shortfall} should be ≤ 1 wei at a clean level`);
-  });
-
-  it("interior cut: the split actually splits (≥ 2 pools funded)", () => {
-    const amountIn = (cap * 1n) / 2n;
-    const res = ecoSwapReference(prep, amountIn);
-    const funded = res.perPoolInput.filter((x) => x > 0n).length;
-    assert.ok(funded >= 2, `expected ≥2 pools funded, got ${funded}`);
-  });
-
-  it("mid-bracket underspend is bounded and never overspends", () => {
-    // Honest characterization: when the cut falls mid-bracket, Phase B's spot
-    // reconstruction can leave a gap up to roughly one partial bracket. The
-    // invariant that MUST hold everywhere is: never overspend, and Σ == total.
-    const total = cap;
-    for (let i = 1; i <= 50; i++) {
-      const amountIn = (total * BigInt(i)) / 50n;
-      const res = ecoSwapReference(prep, amountIn);
-      assert.ok(res.totalInput <= amountIn, `overspend at i=${i}: ${res.totalInput} > ${amountIn}`);
-      assert.equal(res.totalInput, res.perPoolInput.reduce((a, b) => a + b, 0n));
-      // Underspend bounded by the largest single bracket capacity (the partial one).
-      const maxBracket = ladder.reduce((m, b) => (b.capacity > m ? b.capacity : m), 0n);
-      assert.ok(amountIn - res.totalInput <= maxBracket, `underspend exceeds one bracket at i=${i}`);
-    }
-  });
-
-  it("over-capacity: fills everything, never exceeds total capacity", () => {
-    const amountIn = cap * 2n;
-    const res = ecoSwapReference(prep, amountIn);
-    // amountIn exceeds all liquidity → cut stays 0 → every pool integrates to far edge.
-    assert.equal(res.cutSqrtAdj, 0n, "cut is 0 when amountIn exceeds all capacity");
-    assert.ok(res.totalInput <= cap, "cannot spend more than total capacity");
-    // Should fill essentially all capacity (within isqrt/reconstruction slack).
-    assertClose(res.totalInput, cap, 100n, "over-capacity fill ≈ total capacity");
-  });
-
-  it("single pool: all input routes to it", () => {
-    const single = prepared([v3Pool(3000, 60)], v3Brackets(0, 3000, L, 0, 60, 6));
-    const singleCap = totalCapacity(single.brackets);
-    const amountIn = singleCap / 2n;
-    const res = ecoSwapReference(single, amountIn);
-    assert.equal(res.perPoolInput.length, 1);
-    assert.equal(res.totalInput, res.perPoolInput[0], "all input to the one pool");
-    assert.ok(res.totalInput > 0n && res.totalInput <= amountIn);
-    assertClose(res.totalInput, amountIn, 10n, "single pool spends ≈ amountIn");
-  });
-
-  it("empty routes never throw and yield zeros", () => {
-    const res = ecoSwapReference(prep, cap / 4n);
-    assert.deepEqual(res.perRouteInput, []);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-// 5. Water-fill cut & conservation — SINGLE-PASS (live-cut) variant
+// 4. Water-fill cut & conservation — single-pass live-cut (via ecoSwapReference)
 // ─────────────────────────────────────────────────────────────
 describe("water-fill solver — single-pass (live-cut) [ecoSwapReference]", () => {
-  // Reuse the module-level synthetic ladder fixtures (two V3 pools, different fee
-  // tiers). ecoSwapReference dispatches to singlePassReference at CALL TIME based
-  // on ECO_SOLVER, so flipping the env in before()/after() selects the single-pass
-  // path for this block only without touching the two-pass blocks above/below.
+  // Two V3 pools, different fee tiers, several brackets each. ecoSwapReference
+  // mirrors the single-pass on-chain solver in ecoswap.sauce.ts.
   const pools = [v3Pool(3000, 60), v3Pool(500, 10)];
   const L = 10n ** 21n;
   const ladder = sortLadder([
@@ -309,16 +230,6 @@ describe("water-fill solver — single-pass (live-cut) [ecoSwapReference]", () =
   ]);
   const prep = prepared(pools, ladder);
   const cap = totalCapacity(ladder);
-
-  let savedSolver: string | undefined;
-  before(() => {
-    savedSolver = process.env.ECO_SOLVER;
-    process.env.ECO_SOLVER = "singlepass";
-  });
-  after(() => {
-    if (savedSolver === undefined) delete process.env.ECO_SOLVER;
-    else process.env.ECO_SOLVER = savedSolver;
-  });
 
   it("conservation: total spent === Σ perPoolInput", () => {
     for (const frac of [4n, 2n, 1n]) {
@@ -334,9 +245,9 @@ describe("water-fill solver — single-pass (live-cut) [ecoSwapReference]", () =
 
   it("exact spend below capacity: total === amountIn to the wei", () => {
     // The single-pass crossing bracket takes precisely `amountIn - cum`, so below
-    // total capacity it spends amountIn EXACTLY — the key contrast with two-pass,
-    // which undershoots via per-pool re-derivation. Verified: `=== amountIn` holds
-    // cleanly (diff 0) at 25/50/75% on this ladder, no off-by-N.
+    // total capacity it spends amountIn EXACTLY (no per-pool re-derivation gap).
+    // Verified: `=== amountIn` holds cleanly (diff 0) at 25/50/75% on this ladder,
+    // no off-by-N.
     for (const [num, den] of [[1n, 4n], [1n, 2n], [3n, 4n]] as const) {
       const amountIn = (cap * num) / den;
       const res = ecoSwapReference(prep, amountIn);
@@ -358,5 +269,21 @@ describe("water-fill solver — single-pass (live-cut) [ecoSwapReference]", () =
     // its far edge → total == Σ gross capacity.
     assert.ok(res.totalInput <= cap, "cannot spend more than total capacity");
     assertClose(res.totalInput, cap, 100n, "over-capacity fill ≈ total capacity");
+  });
+
+  it("single pool: all input routes to it", () => {
+    const single = prepared([v3Pool(3000, 60)], v3Brackets(0, 3000, L, 0, 60, 6));
+    const singleCap = totalCapacity(single.brackets);
+    const amountIn = singleCap / 2n;
+    const res = ecoSwapReference(single, amountIn);
+    assert.equal(res.perPoolInput.length, 1);
+    assert.equal(res.totalInput, res.perPoolInput[0], "all input to the one pool");
+    assert.ok(res.totalInput > 0n && res.totalInput <= amountIn);
+    assertClose(res.totalInput, amountIn, 10n, "single pool spends ≈ amountIn");
+  });
+
+  it("empty routes never throw and yield zeros", () => {
+    const res = ecoSwapReference(prep, cap / 4n);
+    assert.deepEqual(res.perRouteInput, []);
   });
 });

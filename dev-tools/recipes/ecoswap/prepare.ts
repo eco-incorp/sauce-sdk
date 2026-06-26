@@ -54,7 +54,7 @@ const FEE_DENOM = 1_000_000n; // ppm
 /**
  * Tick shift used to carry signed ticks as non-negative "shifted" values for the
  * adaptive frontier seeds (matches the lens OFFSET = 888000; multiple of LCM(3000)
- * and > max|tick| 887272 so shifted stays ≥0). Only used for adaptive seeds.
+ * and > max|tick| 887272 so shifted stays ≥0). Only used for the adaptive seeds.
  */
 const OFFSET_TICK = 888000;
 
@@ -108,10 +108,13 @@ const V2_FEE_PPM = 3000;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Hex;
 const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex;
 
-/** Default (off) adaptive frontier seeds — every EcoPool starts here; buildV3Brackets
- *  overwrites them only when prepared with adaptive=true. Seeds 0 → the on-chain
- *  adaptive loop is gated off (aStartShift>0 is false). */
-const ADAPTIVE_OFF = {
+/** Initial adaptive frontier seeds — every EcoPool starts here. For V3/V4 pools
+ *  buildV3Brackets ALWAYS overwrites these with the live frontier (next un-walked
+ *  boundary, near sqrt, active L, step ratio), so the on-chain streaming walk can
+ *  resume past the prepared window whenever it under-fills (aStartShift>0). V2 pools
+ *  keep these zeros — a V2 pool is a single wide bracket with no tick frontier, so
+ *  its adaptive loop is naturally skipped (aStartShift>0 is false). */
+const ADAPTIVE_SEED_INIT = {
   adaptiveStartShifted: 0n,
   adaptiveNearReal: 0n,
   adaptiveStartL: 0n,
@@ -294,7 +297,6 @@ function buildV3Brackets(
   refIdx: number,
   zeroForOne: boolean,
   seed?: EcoPool,
-  adaptive = false,
 ): EcoBracket[] {
   const brackets: EcoBracket[] = [];
   const feePpm = r.pool.fee;
@@ -347,13 +349,15 @@ function buildV3Brackets(
   }
 
   // ── Adaptive frontier seeds (WS4) ──
-  // The forward loop stopped at the lens's scannedForward boundary. Its carried
-  // (L, nearReal, b) are EXACTLY the entry state for the FIRST un-walked step, so
-  // the on-chain solver resumes the streaming walk from here with NO double-count:
-  // the seed's first far-edge == the last prepared bracket's far-edge (path-additive).
-  // When scannedForward===0 the loop never ran, so (L, nearReal, b) keep their
-  // spot-seed initial values — the unified derivation handles both cases.
-  if (adaptive && seed) {
+  // ALWAYS stamp the frontier for a V3/V4 pool: the streaming tick walk is always
+  // available, so the on-chain solver can resume past the prepared window whenever
+  // it under-fills. The forward loop stopped at the lens's scannedForward boundary.
+  // Its carried (L, nearReal, b) are EXACTLY the entry state for the FIRST un-walked
+  // step, so the on-chain solver resumes the streaming walk from here with NO
+  // double-count: the seed's first far-edge == the last prepared bracket's far-edge
+  // (path-additive). When scannedForward===0 the loop never ran, so (L, nearReal, b)
+  // keep their spot-seed initial values — the unified derivation handles both cases.
+  if (seed) {
     seed.adaptiveStartL = L; // active L entering the first un-walked step
     seed.adaptiveNearReal = nearReal; // EXACT TickMath sqrt at the last crossed boundary (or spot)
     seed.adaptiveStartShifted = BigInt(b + OFFSET_TICK); // next (un-walked) boundary, shifted
@@ -364,7 +368,11 @@ function buildV3Brackets(
     // least one forward boundary was crossed (otherwise nearReal is spot, not a
     // TickMath value, and b is the un-shifted spot boundary).
     if (r.scannedForward > 0) {
-      const expectShift = BigInt(base + OFFSET_TICK) + BigInt(step) * BigInt(r.scannedForward);
+      // The forward loop's FIRST boundary is direction-dependent (zeroForOne starts
+      // at base, oneForZero at base+ts — see `b` init above); anchor on the same
+      // start so the assertion holds for the price-up walk, not just price-down.
+      const firstBoundary = zeroForOne ? base : base + ts;
+      const expectShift = BigInt(firstBoundary + OFFSET_TICK) + BigInt(step) * BigInt(r.scannedForward);
       if (seed.adaptiveStartShifted !== expectShift) {
         throw new Error(
           `adaptive seed: startShifted ${seed.adaptiveStartShifted} !== expected ${expectShift} ` +
@@ -560,17 +568,10 @@ export interface EcoSwapPrepareOpts {
    */
   minRelBps?: number;
   /**
-   * WS4 adaptive dynamic tick reads. When true, buildV3Brackets stamps each
-   * V3/V4 pool's frontier seeds (adaptiveStart*) + adaptiveNet so the on-chain
-   * solver can continue a live streaming tick walk past the prepared window when
-   * a pool's brackets are exhausted while cum < amountIn. Default false → seeds 0
-   * → the solver's adaptive loop never fires → byte-identical to non-adaptive.
-   */
-  adaptive?: boolean;
-  /**
    * Override the lens forward tick window (default V3_TICK_STEPS = 96). Lets the
    * adaptive EVM test deliberately prepare a NARROW window so the prepared brackets
-   * under-fill amountIn — then adaptive ON resumes the streaming walk to close the gap.
+   * under-fill amountIn — then the always-on streaming walk resumes from the frontier
+   * seed to close the gap.
    */
   maxTicks?: number;
 }
@@ -583,7 +584,6 @@ export async function prepareEcoSwap(
   opts: EcoSwapPrepareOpts = {},
 ): Promise<EcoSwapPrepared> {
   const minRelBps = opts.minRelBps ?? DEFAULT_MIN_REL_BPS;
-  const adaptive = opts.adaptive ?? false;
   const maxTicks = opts.maxTicks ?? V3_TICK_STEPS;
   const { tokenIn, tokenOut, amountIn } = config;
   const inLower = tokenIn.toLowerCase();
@@ -704,11 +704,11 @@ export async function prepareEcoSwap(
       inIsToken0: zeroForOne, // V3 PoolKey orientation = token sort order
       stateView: ZERO_ADDRESS,
       poolId: ZERO_BYTES32,
-      ...ADAPTIVE_OFF,
+      ...ADAPTIVE_SEED_INIT,
       source: "lens V3",
     };
     pools.push(pool);
-    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne, pool, adaptive));
+    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne, pool));
   }
 
   // V4 (singleton; lens read StateView slot0 + windowed getTickLiquidity)
@@ -725,11 +725,11 @@ export async function prepareEcoSwap(
       inIsToken0: zeroForOne,
       stateView: p.stateView,
       poolId: p.poolId,
-      ...ADAPTIVE_OFF,
+      ...ADAPTIVE_SEED_INIT,
       source: "lens V4",
     };
     pools.push(pool);
-    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne, pool, adaptive));
+    brackets.push(...buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne, pool));
   }
 
   // V2 (lens returned synthetic out/in sqrt + synthetic L + inIsToken0)
@@ -746,7 +746,7 @@ export async function prepareEcoSwap(
       inIsToken0: p.inIsToken0,
       stateView: ZERO_ADDRESS,
       poolId: ZERO_BYTES32,
-      ...ADAPTIVE_OFF, // V2 has a single wide bracket — no streaming walk
+      ...ADAPTIVE_SEED_INIT, // V2 has a single wide bracket — no frontier, walk skipped
       source: "lens V2",
     });
     brackets.push(

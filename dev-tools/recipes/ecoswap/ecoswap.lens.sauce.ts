@@ -93,11 +93,28 @@ import { IStateViewFull } from "./IStateViewFull.json";
 // ── Pure helpers (no contract scope needed) ──────────────────────────────────
 
 // int24 STATICCALL arg from a shifted tick.
+//
+// SIGN-EXTEND to a full 32-byte word. The engine stores a value decoded from an
+// `intN`/`uintN` contract output (e.g. slot0/getSlot0 `tick`) at that type's
+// byte-width, and a value derived from it inherits that narrow width — so when it
+// is ABI-ENCODED back as an `int24` call argument the engine emits only the low 3
+// bytes, ZERO-extended. Uniswap V3 pools (Solidity 0.7, lax ABI decode) tolerate a
+// non-sign-extended `int24`, but the Uniswap V4 StateView (Solidity 0.8, strict
+// decode) reverts on it — bare 0x — for any NEGATIVE tick (real Base pools sit near
+// tick -201700). OR-ing the high bits in for negatives both fixes the sign extension
+// AND widens the value back to a full 32-byte word (the literal HIGH is a 32-byte
+// constant), so getTickLiquidity/ticks receive valid `int24` calldata.
 function tickArg(shifted: Uint256, OFFSET: Uint256): Uint256 {
+  // bits [255:24] — set for a negative int24 to sign-extend to int256.
+  const HIGH: Uint256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000;
   if (shifted >= OFFSET) {
-    return shifted - OFFSET;
+    const up: Uint256 = shifted - OFFSET;
+    if (up >= 8388608) {
+      return up | HIGH;
+    } // |tick| >= 2^23 can't happen (MAX_TICK 887272) but keep it total
+    return up;
   }
-  return Math.neg(OFFSET - shifted);
+  return Math.neg(OFFSET - shifted) | HIGH;
 }
 
 // fee-adjusted out/in sqrt: sqrt * sqrt(1-fee) (sqrt(1-fee) scaled by 1e6).

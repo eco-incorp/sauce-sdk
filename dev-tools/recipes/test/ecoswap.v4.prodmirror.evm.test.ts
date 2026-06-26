@@ -20,7 +20,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseEther, type Hex } from "viem";
+import { parseEther, type Hex, type Account } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -35,18 +35,24 @@ import {
   balanceOf,
   getV4Slot0,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
 import { reproduceV4Pool, verifyV4Reproduction, type ReproducedV4Pool } from "./harness/reproduce-v4-pool";
+import { withCachedState } from "./harness/state-cache";
 import type { ProdV4Snapshot } from "./harness/v4-snapshot";
-import { getSqrtRatioAtTick, bracketCapacity, FEE_DENOM, isqrt } from "./ecoswap.math";
+import { getSqrtRatioAtTick, bracketCapacity } from "./ecoswap.math";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
 import { driftPoolPrice } from "./harness/drift";
+import { type Engine, selectedEngines, maybeDeployV12Stack, cookTarget, quoteRouter } from "./harness/engine";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT_DIR = join(__dirname, "fixtures", "snapshots");
 const HUGE = parseEther("1000000000");
+
+// Single engine for this heavy prod-mirror suite (ECO_ENGINE, default v12).
+const PROD_ENGINE: Engine = selectedEngines()[0];
 
 function loadSnapshot(): ProdV4Snapshot | null {
   let files: string[] = [];
@@ -65,6 +71,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
   let poolManager: Hex;
   let stateView: Hex;
   let tokenIn: Hex; // local token0 == snapshot currency0 (zeroForOne)
@@ -82,22 +89,49 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
 
     anvil = await startAnvil();
     c = await makeClients(anvil.rpcUrl);
-    await ensureMulticall3(c.publicClient, c.testClient);
-    stack = await deployStack(c.walletClient, c.publicClient);
 
-    const v4 = await etchV4Singletons(c.publicClient, c.testClient);
-    poolManager = v4.poolManager;
-    stateView = v4.stateView;
-
-    // Local tokens sorted token0 < token1 (mapped to currency0/currency1). Decimals
-    // don't affect fidelity — V4 swap math is over sqrtPrice + L.
-    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
-    tokenIn = tk.token0;
-    tokenOut = tk.token1;
-
-    repro = await reproduceV4Pool(
-      c.walletClient, c.publicClient, poolManager, tokenIn, tokenOut, snap, HUGE,
+    // Full deploy + reconstruction, cached once per engine
+    // (fixtures/anvil-state/prodmirror-v4-<engine>). Recapture: RECAPTURE_ANVIL_STATE=1.
+    const { manifest, fromCache } = await withCachedState<{
+      stack: DeployedStack;
+      v12: DeployedV12Stack | null;
+      poolManager: Hex;
+      stateView: Hex;
+      tokenIn: Hex;
+      tokenOut: Hex;
+      repro: ReproducedV4Pool;
+    }>({
+      name: "prodmirror-v4",
+      engine: PROD_ENGINE,
+      c,
+      build: async () => {
+        await ensureMulticall3(c.publicClient, c.testClient);
+        const s = await deployStack(c.walletClient, c.publicClient);
+        const v4 = await etchV4Singletons(c.publicClient, c.testClient);
+        // Local tokens sorted token0 < token1 (mapped to currency0/currency1).
+        // Decimals don't affect fidelity — V4 swap math is over sqrtPrice + L.
+        const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+        const r = await reproduceV4Pool(
+          c.walletClient, c.publicClient, v4.poolManager, tk.token0, tk.token1, snap!, HUGE,
+        );
+        const v = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+        if (v) await approve(c.walletClient, c.publicClient, tk.token0, v.pot, HUGE);
+        return {
+          stack: s, v12: v, poolManager: v4.poolManager, stateView: v4.stateView,
+          tokenIn: tk.token0, tokenOut: tk.token1, repro: r,
+        };
+      },
+    });
+    console.log(
+      `  [v4 prod-mirror] state ${fromCache ? "LOADED from cache" : "RECONSTRUCTED + cached"} (engine ${PROD_ENGINE})`,
     );
+    stack = manifest.stack;
+    v12 = manifest.v12;
+    poolManager = manifest.poolManager;
+    stateView = manifest.stateView;
+    tokenIn = manifest.tokenIn;
+    tokenOut = manifest.tokenOut;
+    repro = manifest.repro;
 
     poolConfig = {
       factories: [
@@ -134,6 +168,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
 
   it("runs EcoSwap through the reproduced prod V4 pool", async () => {
     if (!snap) return;
+    const target = cookTarget(PROD_ENGINE, stack, v12);
     const caller = c.account0;
 
     // Size the trade to cross ~8 tickSpacings from the live price (bracket formula
@@ -144,7 +179,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
     assert.ok(amountIn > 0n, "computed a positive trade size");
 
     await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn * 2n);
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
 
     const pmInBefore = await balanceOf(c.publicClient, tokenIn, poolManager);
     const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
@@ -152,13 +187,13 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
     const before = await getV4Slot0(c.publicClient, stateView, repro.poolId);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
     );
     assert.equal(prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV4).length, 1, "discovers the V4 pool");
     assert.ok(prepared.pools[0].poolId === repro.poolId, "prepared poolId matches reproduced pool");
     assert.ok(prepared.brackets.length > 0, "builds brackets from reconstructed V4 ticks");
 
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed against reproduced V4 geometry");
 
     const pmInDelta = (await balanceOf(c.publicClient, tokenIn, poolManager)) - pmInBefore;
@@ -189,6 +224,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
 
   it("re-anchors to the live StateView price when the pool drifts after prepare", async () => {
     if (!snap) return;
+    const target = cookTarget(PROD_ENGINE, stack, v12);
     await c.testClient.revert({ id: cleanSnapshot });
 
     const caller = c.account0;
@@ -198,7 +234,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
 
     // PREPARE against the clean (pre-drift) singleton state.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);
     const refV4 = ref.perPoolInput[0] ?? 0n;
@@ -211,40 +247,44 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
 
     // EXECUTE the pre-drift bytecodes — Phase B must read the NEW StateView price.
     await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn);
-    await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     const pmInBefore = await balanceOf(c.publicClient, tokenIn, poolManager);
     const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
 
-    const { receipt } = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed against drifted V4 price");
 
     const v4InDelta = (await balanceOf(c.publicClient, tokenIn, poolManager)) - pmInBefore;
     const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const after = await getV4Slot0(c.publicClient, stateView, repro.poolId);
 
-    const within = (a: bigint, b: bigint, tol: number) => {
-      const hi = a > b ? a : b;
-      const lo = a > b ? b : a;
-      return hi === 0n ? true : Number(hi - lo) / Number(hi) < tol;
-    };
-
-    // Re-anchoring: the recipe filled only the REMAINING gap to the cut from the
-    // drifted live price (drift + recipe ≈ baseline V4 fill).
+    // SINGLE-PASS semantics (input-anchored): the solver spends `amountIn` EXACTLY,
+    // re-anchoring to the LIVE drifted StateView price it reads at cook, not the
+    // stale prepared price. With a SINGLE pool the whole trade lands here, so the
+    // runtime fill ≈ amountIn regardless of drift — the drift just moves where the
+    // swap starts (and thus ends), not how much is spent. (The OLD two-pass solver
+    // was price-anchored: it filled only the gap to the prepared cut, so drift +
+    // recipe ≈ baseline. Single-pass deliberately spends the user's full trade.)
+    // The re-anchoring is proven by `drifted < prepared` (Phase B read the new live
+    // price) combined with a successful, full-amount swap against it.
     assert.ok(v4InDelta > 0n, "pool still participates");
-    assert.ok(v4InDelta < refV4, `V4 fill adapts DOWN vs baseline (got ${v4InDelta}, baseline ${refV4})`);
-    assert.ok(within(driftAmount + v4InDelta, refV4, 0.03), `drift(${driftAmount}) + recipe(${v4InDelta}) ≈ baseline (${refV4})`);
     assert.equal(v4InDelta, spent, "single pool → spent == its fill");
     assert.ok(spent <= amountIn, "never overspends");
+    // Input-anchored: it deploys the LARGE majority of the trade (the drift pushed
+    // the live price away from spot, trimming the prepared-window depth a little, so
+    // it is not always a literal 100%). The >80% floor cleanly separates single-pass
+    // (spends the trade) from the OLD two-pass gap-fill, which under this same drift
+    // would have spent only ≈ baseline − drift ≈ 67% of amountIn.
+    assert.ok(
+      spent >= (amountIn * 80n) / 100n,
+      `spends the large majority of the trade against the drifted price (spent ${spent} of ${amountIn})`,
+    );
     assert.ok(drifted.sqrtPriceX96 < sqrtNear, "drift moved the live price below the prepared price");
 
-    // Despite the drift, the pool ends at the same fee-adjusted cut.
-    const feeAdj = (after.sqrtPriceX96 * isqrt((FEE_DENOM - BigInt(snap.fee)) * FEE_DENOM)) / FEE_DENOM;
-    const rel = ref.cutSqrtAdj === 0n ? 0 : Number(feeAdj > ref.cutSqrtAdj ? feeAdj - ref.cutSqrtAdj : ref.cutSqrtAdj - feeAdj) / Number(ref.cutSqrtAdj);
-    assert.ok(rel < 0.01, `V4 re-anchored to the cut (feeAdj ${feeAdj} vs cut ${ref.cutSqrtAdj}, rel ${rel})`);
-
     console.log(
-      `  [v4 prod-mirror] RUNTIME re-anchoring: drift ${driftAmount} + recipe ${v4InDelta} ≈ baseline ${refV4}; ` +
-        `spent=${spent} tick ${drifted.tick}->${after.tick} feeAdj=${feeAdj} cut=${ref.cutSqrtAdj} (rel ${rel})`,
+      `  [v4 prod-mirror] RUNTIME re-anchor (single-pass, input-anchored): ` +
+        `drift ${driftAmount} then recipe spent ${spent} of amountIn ${amountIn} (baseline fill ${refV4}); ` +
+        `tick ${drifted.tick}->${after.tick}`,
     );
   });
 });

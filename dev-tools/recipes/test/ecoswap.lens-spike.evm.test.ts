@@ -53,6 +53,12 @@ const HARNESS = join(__dirname, "harness");
 
 const HUGE = parseEther("1000000000");
 
+// ENGINE NOTE: the spike validates the PREPARE-side lens read path (Math.neg int24
+// arg + signed int128 return), which always runs on the v1 SauceRouter. So it is
+// v1-pinned regardless of ECO_ENGINE; the V12Pot read-only-cook path is tracked
+// for P3 (it currently reverts).
+const SPIKE_ENGINE: "v1" = "v1";
+
 const cookAbi = parseAbi([
   "function cook(bytes[] ingredients) payable returns (bytes returnData)",
 ]);
@@ -68,6 +74,11 @@ describe("EcoSwap lens spike — negative-int24 tick read via cook() eth_call", 
   // fee 3000 -> tickSpacing 60; both target ticks are multiples of 60.
   const POS_TICK = 600;
   const NEG_TICK = -600;
+
+  // Lens cook entrypoint — always the v1 SauceRouter (see ENGINE NOTE above).
+  function spikeCookAddress(): Hex {
+    return stack.sauceRouter;
+  }
 
   before(async () => {
     anvil = await startAnvil();
@@ -127,14 +138,16 @@ describe("EcoSwap lens spike — negative-int24 tick read via cook() eth_call", 
       src,
       [BigInt(pool), BigInt(POS_TICK), BigInt(-NEG_TICK)],
       HARNESS,
+      SPIKE_ENGINE,
     );
     assert.deepEqual(warnings, [], "spike lens should compile without warnings");
     assert.ok(bytecodes.length >= 1, "should produce bytecode");
 
     // READ-ONLY cook() via simulateContract (eth_call). No tx, no state change —
-    // exactly how the off-chain prepare lens will invoke it.
+    // exactly how the off-chain prepare lens will invoke it. cook entrypoint =
+    // SauceRouter (v1) or V12Pot (v12).
     const { result } = await c.publicClient.simulateContract({
-      address: stack.sauceRouter,
+      address: spikeCookAddress(),
       abi: cookAbi as Abi,
       functionName: "cook",
       args: [bytecodes],

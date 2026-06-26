@@ -48,6 +48,13 @@ const HUGE = parseEther("1000000000");
 const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec05a2a2" as Hex;
 const MAX_TICKS = 96; // mirror prepare.ts V3_TICK_STEPS hard cap
 
+// ENGINE NOTE: the lens is a PREPARE-side read-only eth_call cook that ALWAYS runs
+// on the v1 SauceRouter. ecoSwap()'s `target` selects only the on-chain SOLVER
+// surface — never the lens (prepareEcoSwap → runLens compiles v1). So this decode
+// gate is engine-independent; it stays on v1 even when ECO_ENGINE=v12. Cooking the
+// lens program through the V12Pot's read-only cook is a SEPARATE v12 path (tracked
+// for P3 — it currently reverts), deliberately not exercised here.
+
 describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
@@ -59,6 +66,11 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
   let v2Pair: Hex;
   let poolConfig: ChainPoolConfig;
   let zeroForOne: boolean;
+
+  // Lens cook target + bytecode target — always v1 (see ENGINE NOTE above).
+  function lensCfg(): { target: "v1"; cookAddress: Hex; sauceRouter: Hex } {
+    return { target: "v1", cookAddress: stack.sauceRouter, sauceRouter: stack.sauceRouter };
+  }
 
   before(async () => {
     anvil = await startAnvil();
@@ -126,8 +138,9 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     // Tiny relative to depth → price barely moves → the lazy walk stops almost
     // immediately (stop boundary + driftTicks), never reaching the ±600 ranges.
     const amountIn = parseEther("5");
-    const { pools } = await runLens(c.publicClient, stack.sauceRouter, poolConfig, {
-      tokenIn, tokenOut, zeroForOne, amountIn, driftTicks: 2, maxTicks: MAX_TICKS,
+    const cfg = lensCfg();
+    const { pools } = await runLens(c.publicClient, cfg.cookAddress, poolConfig, {
+      tokenIn, tokenOut, zeroForOne, amountIn, driftTicks: 2, maxTicks: MAX_TICKS, target: cfg.target,
     });
 
     const v3 = pools.filter((p) => p.poolType === SwapPoolType.UniV3);
@@ -166,11 +179,12 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     // shallower pool → the walk must read more forward ticks and cross a real
     // initialized boundary whose net matches the direct read.
     const amountIn = parseEther("200000");
-    const small = await runLens(c.publicClient, stack.sauceRouter, poolConfig, {
-      tokenIn, tokenOut, zeroForOne, amountIn: parseEther("5"), driftTicks: 2, maxTicks: MAX_TICKS,
+    const cfg = lensCfg();
+    const small = await runLens(c.publicClient, cfg.cookAddress, poolConfig, {
+      tokenIn, tokenOut, zeroForOne, amountIn: parseEther("5"), driftTicks: 2, maxTicks: MAX_TICKS, target: cfg.target,
     });
-    const large = await runLens(c.publicClient, stack.sauceRouter, poolConfig, {
-      tokenIn, tokenOut, zeroForOne, amountIn, driftTicks: 2, maxTicks: MAX_TICKS,
+    const large = await runLens(c.publicClient, cfg.cookAddress, poolConfig, {
+      tokenIn, tokenOut, zeroForOne, amountIn, driftTicks: 2, maxTicks: MAX_TICKS, target: cfg.target,
     });
 
     const smallV3 = small.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
@@ -237,9 +251,10 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
       ...poolConfig,
       feeTiers: [500, 3000, 10000],
     };
-    const res = await runLens(c.publicClient, stack.sauceRouter, dustConfig, {
+    const cfg = lensCfg();
+    const res = await runLens(c.publicClient, cfg.cookAddress, dustConfig, {
       tokenIn, tokenOut, zeroForOne, amountIn: parseEther("3000"),
-      driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS,
+      driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS, target: cfg.target,
     });
     const { pools } = res;
 
@@ -268,8 +283,12 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
 
   it("prepare (lazy-lens-driven) brackets reproduce the reference oracle split", async () => {
     const amountIn = parseEther("3000");
+    const cfg = lensCfg();
+    // prepare()'s lens always cooks on v1 internally; this checks `prepared` only
+    // (engine-agnostic). Thread the engine for solver-compile consistency.
     const { prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, c.account0, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cfg.sauceRouter, c.account0, poolConfig,
+      undefined, cfg.target,
     );
 
     assert.equal(prepared.pools.filter((p) => !p.isV2).length, 2, "2 V3 pools prepared");
@@ -344,8 +363,9 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
       `narrow spot-L ${narrowSpotL} exceeds the would-be spot-L floor ${spotLFloorWouldBe} (a spot-L filter keeps it)`,
     );
 
-    const res = await runLens(c.publicClient, stack.sauceRouter, cfg, {
-      tokenIn: tIn, tokenOut: tOut, zeroForOne: z, amountIn, driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS,
+    const eng = lensCfg();
+    const res = await runLens(c.publicClient, eng.cookAddress, cfg, {
+      tokenIn: tIn, tokenOut: tOut, zeroForOne: z, amountIn, driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS, target: eng.target,
     });
 
     // Both pools are discovered; only the DEEP pool survives the in-range filter.

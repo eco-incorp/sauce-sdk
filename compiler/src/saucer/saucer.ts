@@ -541,6 +541,24 @@ export class Saucer implements SaucerLike {
     const valueSlots = this.ctx.valueSlotCount;
     const heapSlots = this.ctx.heapSlotCount;
 
+    // Value/heap slot indices are encoded as a SINGLE byte (READ_VALUE/WRITE_VALUE/
+    // ALLOCATE_VALUE and the HEAP equivalents — see saucer/memory.ts). A program with
+    // more than 256 scalar (or heap) locals would silently wrap slot index ≥256 to
+    // index mod 256, aliasing an earlier slot (e.g. a function parameter) and
+    // corrupting it at runtime. Fail loud at compile time instead of miscompiling.
+    if (valueSlots > 0xff) {
+      throw new Error(
+        `too many scalar locals: ${valueSlots} (max 255). Value-slot indices are 1 byte; ` +
+          `slot >=256 would wrap and corrupt an earlier slot. Split the function or reuse locals.`,
+      );
+    }
+    if (heapSlots > 0xff) {
+      throw new Error(
+        `too many heap (dynamic) locals: ${heapSlots} (max 255). Heap-slot indices are 1 byte; ` +
+          `slot >=256 would wrap and corrupt an earlier slot. Split the function or reuse locals.`,
+      );
+    }
+
     const prefix: number[] = [];
 
     if (valueSlots > 0) prefix.push(OPS.ALLOCATE_VALUE, valueSlots);

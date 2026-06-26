@@ -52,11 +52,23 @@ import {
   getSlot0,
   SQRT_PRICE_1_1,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
+import {
+  type Engine,
+  engineCells,
+  maybeDeployV12Stack,
+  cookTarget,
+  quoteRouter,
+} from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
+import type { Account } from "viem";
 
 const HUGE = parseEther("1000000000");
+
+// Engine cells driven by ECO_ENGINE (default v12). See harness/engine.ts.
+const ENGINE_CELLS = engineCells();
 
 // tickSpacing 10 ⇒ reverse coverage = SAFETY_TICKS(2)*10 = 20 ticks past spot.
 const DEEP_FEE = 500;
@@ -73,9 +85,11 @@ for (const dir of [
     let anvil: AnvilHandle;
     let c: HarnessClients;
     let stack: DeployedStack;
+    let v12: DeployedV12Stack | null = null;
     let tokenIn: Hex;
     let tokenOut: Hex;
     let poolConfig: ChainPoolConfig;
+    let cleanSnapshot: Hex;
     const poolByFee = new Map<number, Hex>();
 
     before(async () => {
@@ -115,23 +129,39 @@ for (const dir of [
         feeTiers: [DEEP_FEE, MEDIUM_FEE],
         baseTokens: [tk.token0, tk.token1],
       };
+
+      // Fund the caller up front so balances survive evm_revert across cells.
+      await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("100000"));
+      await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("100000"));
+
+      // v12 stack (same anvil/pools) when a v12 cell runs; approve the Pot for tokenIn.
+      v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+      if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+      cleanSnapshot = await c.testClient.snapshot();
     });
 
     after(() => anvil?.stop());
 
-    it("a reverse-drifted deep pool fills MORE, conserving input, and the split adapts", async () => {
+    // Revert to the clean post-setup state so each engine cell prepares + cooks
+    // against IDENTICAL fresh pools (cells share one anvil).
+    async function resetPools(): Promise<void> {
+      await c.testClient.revert({ id: cleanSnapshot });
+      cleanSnapshot = await c.testClient.snapshot();
+    }
+
+    async function runReverseDrift(engine: Engine): Promise<void> {
+      await resetPools();
+      const target = cookTarget(engine, stack, v12);
       const amountIn = parseEther("3000");
       const caller = c.account0;
       const deepPool = poolByFee.get(DEEP_FEE)!;
       const medPool = poolByFee.get(MEDIUM_FEE)!;
 
-      // Fund the caller up front so balances survive evm_revert.
-      await mint(c.walletClient, c.publicClient, tokenIn, caller, parseEther("100000"));
-      await mint(c.walletClient, c.publicClient, tokenOut, caller, parseEther("100000"));
-
-      // Prepare+compile ONCE at spot. Both runs execute this exact bytecode.
+      // Prepare+compile ONCE at spot for this engine. Both runs execute this bytecode.
       const { bytecodes, prepared } = await ecoSwap(
-        { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, stack.sauceRouter, caller, poolConfig,
+        { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+        caller, poolConfig, undefined, engine,
       );
       assert.equal(prepared.pools.length, 2, "two V3 pools prepared");
       assert.equal(prepared.pools[0].feePpm, DEEP_FEE, "deepest (fee 500) pool is processed first");
@@ -141,10 +171,10 @@ for (const dir of [
       const snap = await c.testClient.snapshot();
 
       // ── Run A: no drift ──
-      await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+      await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
       const deepInBeforeA = await balanceOf(c.publicClient, tokenIn, deepPool);
       const medInBeforeA = await balanceOf(c.publicClient, tokenIn, medPool);
-      const resA = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+      const resA = await cook(c.walletClient, c.publicClient, target, bytecodes);
       assert.equal(resA.receipt.status, "success", "no-drift cook() succeeds");
       const B = (await balanceOf(c.publicClient, tokenIn, deepPool)) - deepInBeforeA;
       const medA = (await balanceOf(c.publicClient, tokenIn, medPool)) - medInBeforeA;
@@ -174,10 +204,10 @@ for (const dir of [
       assert.ok(driftOut > 0n, "drift swap pulled tokenIn out of the deep pool");
 
       // ── Run B: same bytecode, against the reverse-drifted pool ──
-      await approve(c.walletClient, c.publicClient, tokenIn, stack.sauceRouter, amountIn);
+      await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
       const deepInBeforeB = await balanceOf(c.publicClient, tokenIn, deepPool); // AFTER the drift swap
       const medInBeforeB = await balanceOf(c.publicClient, tokenIn, medPool);
-      const resB = await cook(c.walletClient, c.publicClient, stack.sauceRouter, bytecodes);
+      const resB = await cook(c.walletClient, c.publicClient, target, bytecodes);
       assert.equal(resB.receipt.status, "success", "reverse-drift cook() succeeds");
       const D = (await balanceOf(c.publicClient, tokenIn, deepPool)) - deepInBeforeB;
       const medB = (await balanceOf(c.publicClient, tokenIn, medPool)) - medInBeforeB;
@@ -202,9 +232,19 @@ for (const dir of [
       assert.ok(medB < medA, `medium pool's share shrinks under reverse drift (medB=${medB} < medA=${medA})`);
 
       console.log(
-        `  [REV-DRIFT ${dir.name}] B=${B} D=${D} gap=${gap} driftOut=${driftOut} consErr=${consErr}\n` +
+        `  [REV-DRIFT ${dir.name} ${engine}] B=${B} D=${D} gap=${gap} driftOut=${driftOut} consErr=${consErr}\n` +
           `       drift moved deep tick 0 -> ${driftedTick}; medium ${medA} -> ${medB}`,
       );
-    });
+    }
+
+    for (const { engine, skip } of ENGINE_CELLS) {
+      it(
+        `a reverse-drifted deep pool fills MORE, conserving input, and the split adapts [${engine}]`,
+        { skip },
+        async () => {
+          await runReverseDrift(engine);
+        },
+      );
+    }
   });
 }

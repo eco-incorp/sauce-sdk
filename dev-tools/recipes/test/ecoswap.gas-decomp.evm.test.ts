@@ -1,15 +1,14 @@
 /**
  * EcoSwap GAS DECOMPOSITION harness (analysis only — gate ECO_GAS=1).
  *
- * Goal: isolate SOLVER-ARITHMETIC gas from SWAP gas to explain why two-pass edges
- * single-pass on the v12 Huff runtime while single-pass wins on v1.
+ * Goal: isolate SOLVER-ARITHMETIC gas from SWAP gas for the single-pass solver, on
+ * both bytecode targets (v1 Solidity Router and v12 Huff runtime).
  *
  * Method — on the deterministic 3-V3-pool Phase-3 stack (copied from
  * ecoswap.gas.evm.test.ts), measure cook `gasUsed` for:
- *   - FULL solvers (with swaps): two-pass & single-pass(array) × {v1, v12}
- *   - COMPUTE-ONLY variants (no transferFrom/swap/transfer; full water-fill
- *     arithmetic kept, returns a cheap summary): two-pass-compute &
- *     single-pass-compute × {v1, v12}
+ *   - FULL solver (with swaps): ecoswap.sauce.ts × {v1, v12}
+ *   - COMPUTE-ONLY variant (no transferFrom/swap/transfer; full water-fill
+ *     arithmetic kept, returns a cheap summary): ecoswap.computeonly.sauce.ts × {v1, v12}
  * then DERIVE: solver-arithmetic gas ≈ compute-only; swap gas ≈ full − compute-only.
  *
  * Fairness mirrors the gas test: per-cell anvil snapshot/revert + pinned cook block
@@ -60,19 +59,16 @@ const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
 
 type Target = "v1" | "v12";
 
-// ── The four variants: FULL (with swaps) + COMPUTE-ONLY (arithmetic only) ──
-// "kind" pairs a compute-only variant with its full counterpart for the derivation.
+// ── The two variants: FULL (with swaps) + COMPUTE-ONLY (arithmetic only) ──
+// "kind" pairs the compute-only variant with its full counterpart for the derivation.
 interface Variant {
   key: string;
   file: string;
   kind: "full" | "compute";
-  family: "two-pass" | "single-pass";
 }
 const VARIANTS: Variant[] = [
-  { key: "two-pass.full", file: "ecoswap.sauce.ts", kind: "full", family: "two-pass" },
-  { key: "single-pass.full", file: "ecoswap.singlepass.sauce.ts", kind: "full", family: "single-pass" },
-  { key: "two-pass.compute", file: "ecoswap.computeonly.sauce.ts", kind: "compute", family: "two-pass" },
-  { key: "single-pass.compute", file: "ecoswap.singlepass.computeonly.sauce.ts", kind: "compute", family: "single-pass" },
+  { key: "single-pass.full", file: "ecoswap.sauce.ts", kind: "full" },
+  { key: "single-pass.compute", file: "ecoswap.computeonly.sauce.ts", kind: "compute" },
 ];
 
 // ── Compile-arg tuple builders — copied verbatim from recipes/ecoswap/index.ts ──
@@ -254,7 +250,7 @@ describe("EcoSwap gas decomposition (solver arithmetic vs swaps)", () => {
     anvil?.stop();
   });
 
-  it("measures full + compute-only cook gas across {two-pass, single-pass} × {v1, v12}", async () => {
+  it("measures full + compute-only cook gas for the single-pass solver × {v1, v12}", async () => {
     if (chainSetupFailed || !prepared) {
       assert.fail(`stack setup failed: ${setupErr}`);
     }
@@ -303,90 +299,44 @@ describe("EcoSwap gas decomposition (solver arithmetic vs swaps)", () => {
       gas.set(v.key, cell);
     }
 
-    // ── Decomposition table ────────────────────────────────────
-    const tpFull = gas.get("two-pass.full")!;
+    // ── Decomposition table (single-pass solver) ───────────────
     const spFull = gas.get("single-pass.full")!;
-    const tpComp = gas.get("two-pass.compute")!;
     const spComp = gas.get("single-pass.compute")!;
 
     const derive = (full: bigint | null, comp: bigint | null): bigint | null =>
       full !== null && comp !== null ? full - comp : null;
 
-    const tpSwapV1 = derive(tpFull.v1, tpComp.v1);
-    const tpSwapV12 = derive(tpFull.v12, tpComp.v12);
     const spSwapV1 = derive(spFull.v1, spComp.v1);
     const spSwapV12 = derive(spFull.v12, spComp.v12);
 
-    const rows: [string, bigint | null, bigint | null, bigint | null, bigint | null][] = [
-      ["full (with swaps)", tpFull.v1, tpFull.v12, spFull.v1, spFull.v12],
-      ["compute-only (arith)", tpComp.v1, tpComp.v12, spComp.v1, spComp.v12],
-      ["derived swap (full−compute)", tpSwapV1, tpSwapV12, spSwapV1, spSwapV12],
+    const rows: [string, bigint | null, bigint | null][] = [
+      ["full (with swaps)", spFull.v1, spFull.v12],
+      ["compute-only (arith)", spComp.v1, spComp.v12],
+      ["derived swap (full−compute)", spSwapV1, spSwapV12],
     ];
 
-    console.log("\n=== GAS DECOMPOSITION (gasUsed) ===");
-    console.log(
-      "component".padEnd(30) +
-        "| 2pass v1".padEnd(16) + "| 2pass v12".padEnd(16) +
-        "| 1pass v1".padEnd(16) + "| 1pass v12".padEnd(16),
-    );
-    console.log("-".repeat(30 + 16 * 4));
-    for (const [label, a, b, cc, d] of rows) {
-      console.log(
-        label.padEnd(30) +
-          ("| " + n(a)).padEnd(16) + ("| " + n(b)).padEnd(16) +
-          ("| " + n(cc)).padEnd(16) + ("| " + n(d)).padEnd(16),
-      );
+    console.log("\n=== SINGLE-PASS GAS DECOMPOSITION (gasUsed) ===");
+    console.log("component".padEnd(30) + "| v1".padEnd(16) + "| v12".padEnd(16));
+    console.log("-".repeat(30 + 16 * 2));
+    for (const [label, a, b] of rows) {
+      console.log(label.padEnd(30) + ("| " + n(a)).padEnd(16) + ("| " + n(b)).padEnd(16));
     }
 
-    // ── Key comparisons ────────────────────────────────────────
-    const diff = (a: bigint | null, b: bigint | null): bigint | null =>
-      a !== null && b !== null ? a - b : null;
-    const pct = (a: bigint | null, b: bigint | null): string =>
-      a !== null && b !== null && b !== 0n
-        ? `${(((Number(a) - Number(b)) / Number(b)) * 100).toFixed(1)}%`
+    // ── Arithmetic vs swap share, per target ────────────────────
+    const pctOf = (part: bigint | null, whole: bigint | null): string =>
+      part !== null && whole !== null && whole !== 0n
+        ? `${((Number(part) / Number(whole)) * 100).toFixed(0)}%`
         : "—";
+    console.log("\n=== ARITHMETIC SHARE (compute-only / full) ===");
+    console.log(`v1:  arithmetic ${pctOf(spComp.v1, spFull.v1)}  swap ${pctOf(spSwapV1, spFull.v1)}`);
+    console.log(`v12: arithmetic ${pctOf(spComp.v12, spFull.v12)}  swap ${pctOf(spSwapV12, spFull.v12)}`);
 
-    console.log("\n=== KEY COMPARISONS (single-pass − two-pass) ===");
-    console.log(
-      `FULL:         v1 ${n(diff(spFull.v1, tpFull.v1))} (${pct(spFull.v1, tpFull.v1)})   ` +
-        `v12 ${n(diff(spFull.v12, tpFull.v12))} (${pct(spFull.v12, tpFull.v12)})`,
-    );
-    console.log(
-      `COMPUTE-ONLY: v1 ${n(diff(spComp.v1, tpComp.v1))} (${pct(spComp.v1, tpComp.v1)})   ` +
-        `v12 ${n(diff(spComp.v12, tpComp.v12))} (${pct(spComp.v12, tpComp.v12)})`,
-    );
-    console.log(
-      `DERIVED SWAP: v1 ${n(diff(spSwapV1, tpSwapV1))}   v12 ${n(diff(spSwapV12, tpSwapV12))}`,
-    );
-
-    // Verdict heuristic: is the crossover in ARITHMETIC (compute-only) or SWAPS?
-    const fullCross = diff(spFull.v1, tpFull.v1) !== null && diff(spFull.v12, tpFull.v12) !== null
-      ? Number(diff(spFull.v12, tpFull.v12)) - Number(diff(spFull.v1, tpFull.v1))
-      : null;
-    const compCross = diff(spComp.v1, tpComp.v1) !== null && diff(spComp.v12, tpComp.v12) !== null
-      ? Number(diff(spComp.v12, tpComp.v12)) - Number(diff(spComp.v1, tpComp.v1))
-      : null;
-    const swapCross = diff(spSwapV1, tpSwapV1) !== null && diff(spSwapV12, tpSwapV12) !== null
-      ? Number(diff(spSwapV12, tpSwapV12)) - Number(diff(spSwapV1, tpSwapV1))
-      : null;
-    console.log(
-      `\n[crossover Δ(sp−tp) from v1→v12]  full=${fullCross ?? "—"}  ` +
-        `compute=${compCross ?? "—"}  swap=${swapCross ?? "—"}`,
-    );
-    if (compCross !== null && swapCross !== null) {
-      const share = Math.abs(compCross) / (Math.abs(compCross) + Math.abs(swapCross));
-      console.log(
-        `[crossover attribution] arithmetic accounts for ${(share * 100).toFixed(0)}% of the v1→v12 swing`,
-      );
-    }
     if (notes.size > 0) {
       console.log(`\n[notes] ${[...notes].map(([k, val]) => `${k}: ${val}`).join("; ")}`);
     }
 
-    // The whole point is the four-cell compute-only block + the two full pairs.
-    assert.ok(tpFull.v1 !== null, "two-pass full v1 must execute");
+    // The decomposition needs the single-pass full + compute-only cells.
     assert.ok(spFull.v1 !== null, "single-pass full v1 must execute");
-    assert.ok(tpComp.v1 !== null, "two-pass compute-only v1 must execute");
     assert.ok(spComp.v1 !== null, "single-pass compute-only v1 must execute");
   });
 });
