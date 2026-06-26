@@ -254,7 +254,7 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
       res.discoveredCount - res.survivorCount, 1,
       "exactly one pool (the dust pool) dropped",
     );
-    assert.ok(res.liqFloor > 0n, "relative-depth floor applied (> 0)");
+    assert.ok(res.capacityFloor > 0n, "in-range-capacity floor applied (> 0)");
 
     // Deep pools survive and are still scanned.
     const deep = pools.filter((p) => p.poolType === SwapPoolType.UniV3);
@@ -262,7 +262,7 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     assert.ok(deep.every((p) => p.scannedForward > 0), "deep V3 pools still scanned");
     console.log(
       `  [DUST] dropped fee ${dustFee}; discovered=${res.discoveredCount} survivors=${res.survivorCount} ` +
-        `floor=${res.liqFloor}; deep ${deep.map((p) => `${p.fee}=${p.scannedForward}`).join(" ")}`,
+        `floor=${res.capacityFloor}; deep ${deep.map((p) => `${p.fee}=${p.scannedForward}`).join(" ")}`,
     );
   });
 
@@ -287,6 +287,79 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     console.log(
       `  [LAZY-PREP] ${prepared.brackets.length} brackets, oracle split ` +
         `${ref.perPoolInput.map((v, i) => `${prepared.pools[i].feePpm}=${v}`).join(" ")} cut=${ref.cutSqrtAdj}`,
+    );
+  });
+
+  it("IN-RANGE capacity filter drops a narrow high-spot-L pool a spot-L filter would keep", async () => {
+    // The filter now keys on IN-RANGE (windowed) capacity, not spot active-L. Build
+    // two pools on FRESH tokens (clean fee namespace, independent of the shared pools):
+    //   - DEEP pool (fee 3000): moderate L over a WIDE [-12000,12000] range. Its L
+    //     persists across the whole crossed window → large in-range capacity. As the
+    //     deepest IN-RANGE pool (shallowest solo-excursion to amountIn) it also bounds
+    //     floorAdj — MEASURE A derives that by measuring, NOT from spot-L.
+    //   - NARROW pool (fee 500): a LARGE L packed into a single tickSpacing band
+    //     [-10,10] right at spot and NOTHING else. Spot liquidity() is large (a spot-L
+    //     filter keeps it), but the trade walks straight out of the band → past it L=0
+    //     → tiny in-range capacity → the in-range filter DROPS it.
+    const minter = c.account0;
+    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+    const tIn = tk.token0;
+    const tOut = tk.token1;
+    const z = BigInt(tIn) < BigInt(tOut);
+    await mint(c.walletClient, c.publicClient, tIn, minter, parseEther("50000000"));
+    await mint(c.walletClient, c.publicClient, tOut, minter, parseEther("50000000"));
+    await approve(c.walletClient, c.publicClient, tIn, stack.helper, HUGE);
+    await approve(c.walletClient, c.publicClient, tOut, stack.helper, HUGE);
+
+    const DEEP_L = parseEther("800000");
+    const NARROW_L = parseEther("400000");
+    const deepPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tIn, tOut, 3000, SQRT_PRICE_1_1,
+    );
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, deepPool, minter, -12000, 12000, DEEP_L);
+    const narrowPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tIn, tOut, 500, SQRT_PRICE_1_1,
+    );
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, narrowPool, minter, -10, 10, NARROW_L);
+
+    const cfg: ChainPoolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+      ],
+      feeTiers: [500, 3000],
+      baseTokens: [tIn, tOut],
+    };
+
+    // A trade big enough to walk WELL past the narrow ±10 band (so its capacity is
+    // exhausted) yet inside the deep pool's reach so floorAdj is bounded (> 0).
+    const amountIn = parseEther("100000");
+
+    // Spot-L sanity: the NARROW pool's spot active-L exceeds what a 1%-of-Σspot-L
+    // floor would be — i.e. a pure spot-L filter WOULD KEEP it.
+    const deepSpotL = await getLiquidity(c.publicClient, deepPool);
+    const narrowSpotL = await getLiquidity(c.publicClient, narrowPool);
+    const spotLFloorWouldBe = ((deepSpotL + narrowSpotL) * 100n) / 10000n; // 1% of Σ spot-L
+    assert.ok(
+      narrowSpotL > spotLFloorWouldBe,
+      `narrow spot-L ${narrowSpotL} exceeds the would-be spot-L floor ${spotLFloorWouldBe} (a spot-L filter keeps it)`,
+    );
+
+    const res = await runLens(c.publicClient, stack.sauceRouter, cfg, {
+      tokenIn: tIn, tokenOut: tOut, zeroForOne: z, amountIn, driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS,
+    });
+
+    // Both pools are discovered; only the DEEP pool survives the in-range filter.
+    assert.equal(res.discoveredCount, 2, "both pools discovered");
+    assert.equal(res.discoveredCount - res.survivorCount, 1, "exactly one pool dropped");
+    const survFees = res.pools.map((p) => p.fee).sort((a, b) => a - b);
+    assert.deepEqual(survFees, [3000], "only the DEEP (fee 3000) pool survives");
+    const narrow = res.pools.find((p) => p.fee === 500);
+    assert.equal(narrow, undefined, "narrow high-spot-L pool dropped by the in-range filter");
+    assert.ok(res.capacityFloor > 0n, "in-range-capacity floor applied (floorAdj bounded)");
+
+    console.log(
+      `  [IN-RANGE] spot-L deep=${deepSpotL} narrow=${narrowSpotL} (spot-L floor would be ${spotLFloorWouldBe}); ` +
+        `in-range Σcap=${res.totalInRangeCapacity} capFloor=${res.capacityFloor}; survivors fees ${survFees.join(",")}`,
     );
   });
 });

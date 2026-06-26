@@ -12,23 +12,35 @@ import { IStateViewFull } from "./IStateViewFull.json";
 // cross — NOT a fixed 96-tick window. Returns ONLY RAW reads; the off-chain TS
 // (prepare.ts) builds brackets, sorts, water-fills, trims and composes routes.
 //
-// THREE INTERNAL PASSES (all in one eth_call):
-//   1. CHEAP STATE PASS — discover all pools, read slot0 + liquidity ONLY (no
-//      ticks). Sum total liquidity. Apply the relative-depth filter (minRelBps
-//      of total Σliquidity) to mark SURVIVORS. Track the DEEPEST survivor's
-//      coords (max active L).
-//   2. FLOOR PASS — lazily walk the deepest survivor in the swap direction
-//      until its cumulative gross capacity covers amountIn. Record floorAdj =
-//      feeAdjust(far) at the stop. floorAdj is a SAFE UPPER BOUND on every
-//      pool's needed tick depth (deepest pool has the smallest eats-all
-//      excursion → adding shallower pools only RAISES the cut).
-//   3. BOUNDED PASS — for every SURVIVOR, lazy-walk forward until
-//      (cumIn >= amountIn) OR (feeAdjust(far) <= floorAdj), then driftTicks MORE
-//      forward, plus read driftTicks on the REVERSE side of spot for runtime
-//      drift. Hard cap at MAX_TICKS. Emit pool row (incl scannedForward) + tick
-//      rows. NON-survivors (below the relative-depth floor) are NOT emitted at
-//      all — the lens is the single source of truth for survivorship, so the
-//      off-chain consumer treats every returned pool row as a survivor.
+// FOUR INTERNAL PASSES (all in one eth_call). SPOT ACTIVE-L IS NEVER USED AS A DEPTH
+// OR SELECTION METRIC — only as each pool's tick-walk ENTRY liquidity (the active L at
+// the current tick, needed to integrate the first bracket). A narrow band of huge
+// spot-L right at spot can't cover amountIn within maxTicks, so a spot-L-derived floor
+// would silently disable the filter; measuring every pool sidesteps that.
+//   1. CHEAP STATE PASS — discover all pools, read slot0 + liquidity ONLY (no ticks).
+//      Just count ALIVE pools (sqrtP>0 && L>0) per family for the header. No depth
+//      ranking, no spot-L sum.
+//   2. MEASURE A (window floor BY MEASURING) — for EVERY alive pool, self-walk forward
+//      until its OWN cumIn covers amountIn; record soloFloor = feeAdjust(far) at that
+//      step (V2: closed-form). floorAdj = the SHALLOWEST solo floor among pools that
+//      solo-covered amountIn = the MAX feeAdj-price among non-zero solo floors (out/in
+//      price decreases with depth, so shallowest = highest = MAX). That is the deepest-
+//      IN-RANGE pool's excursion — a tight-but-safe common bound, since the true shared
+//      cut is at-or-shallower than every solo floor. If NO pool solo-covers amountIn →
+//      floorAdj=0 → trade exceeds all depth → keep every alive pool. Deep pools early-
+//      stop at amountIn, so this is cheap. Produces only the scalar floorAdj (no emit).
+//   3. MEASURE B (capacity to the common floor) — walk EVERY ALIVE pool forward to
+//      (feeAdjust(far) <= floorAdj OR cumIn>=amountIn OR maxTicks); cap = cumIn at the
+//      stop; store capArr[ord]; totalCap += cap (V2: closed-form to floorAdj). capFloor
+//      = minRelBps of totalCap (0 when floorAdj=0 or minRelBps=0).
+//   4. EMIT PASS — for every SURVIVOR (capArr[ord] >= capFloor), lazy-walk forward until
+//      (cumIn >= amountIn) OR (feeAdjust(far) <= floorAdj), then driftTicks MORE forward,
+//      plus read driftTicks on the REVERSE side of spot for runtime drift. Hard cap at
+//      MAX_TICKS. Emit pool row (incl scannedForward) + tick rows. NON-survivors are NOT
+//      emitted — the lens is the single source of truth for survivorship, so the off-
+//      chain consumer treats every returned pool row as a survivor. MEASURE B and EMIT
+//      iterate ALIVE pools in the SAME order (V3→V2→V4) with the IDENTICAL aliveness
+//      gate, so the capacity ordinal lines up with emission.
 //
 // TICK REPRESENTATION (avoids sign-magnitude branching): a tick is carried as a
 // non-negative "shifted" value s = tick + OFFSET, OFFSET = 888000 (a multiple of
@@ -45,7 +57,7 @@ import { IStateViewFull } from "./IStateViewFull.json";
 //   zeroForOne        : Uint256 (1 if tokenIn < tokenOut)
 //   amountIn          : Uint256 (gross tokenIn; sizes the lazy walk)
 //   driftTicks        : Uint256 (extra boundaries past the stop, each side)
-//   minRelBps         : Uint256 (relative-depth floor in bps of Σliquidity)
+//   minRelBps         : Uint256 (survivor floor in bps of Σ in-range capacity)
 //   maxTicks          : Uint256 (hard cap on forward tick reads per pool)
 //   v3Factories[i]    = [factoryAddr]
 //   v3FeeTiers[j]     = [fee, stepRatio]            stepRatio=floor(sqrt(1.0001^ts)*2^96)
@@ -58,14 +70,14 @@ import { IStateViewFull } from "./IStateViewFull.json";
 //   abi.encode(poolBlob: bytes, tickBlob: bytes)
 //
 //   poolBlob = a HEADER followed by SURVIVOR pool rows. The lens is the single
-//   source of truth for survivorship: only pools with L >= liqFloor (relative-
-//   depth floor) are emitted, so the consumer never re-filters.
+//   source of truth for survivorship: only pools whose IN-RANGE capacity >= capFloor
+//   are emitted, so the consumer never re-filters.
 //
 //   HEADER (HEADER_WORDS = 4 words, exactly once at the start):
 //     [0] discoveredCount (alive pools seen across all families)
 //     [1] survivorCount   (pool rows that follow)
-//     [2] totalL          (Σ liquidity over alive pools, for diagnostics)
-//     [3] liqFloor        (the relative-depth survivor threshold actually applied)
+//     [2] totalCap        (Σ in-range/windowed capacity over alive pools)
+//     [3] capFloor        (the in-range-capacity survivor threshold actually applied)
 //
 //   then survivorCount rows, POOL_STRIDE = 13 words per pool:
 //     [0] poolType (0=V2,1=V3,2=V4)  [1] address  [2] fee  [3] tickSpacing
@@ -140,49 +152,33 @@ function main(
   const HALF128: Uint256 = 2 ** 127; // int128 sign bit
   const MOD128: Uint256 = 2 ** 128;
 
-  // ════ PASS 1: CHEAP STATE — discover + slot0 + liquidity (NO ticks) ════
-  // Accumulate total liquidity over every ALIVE pool (L > 0) and track the
-  // deepest pool's coords (used by the floor pass). Survivorship is decided
-  // below by the relative-depth floor alone (no absolute floor).
-  let totalL: Uint256 = 0;
-  let deepKind: Uint256 = 0; // 1=V3, 2=V4, 0=none
-  let deepL: Uint256 = 0;
-  let deepAddr: Address = 0;
-  let deepFee: Uint256 = 0;
-  let deepTs: Uint256 = 0;
-  let deepStep: Uint256 = 0;
-  let deepSqrt: Uint256 = 0;
-  let deepTick: Uint256 = 0;
-  let deepStateView: Address = 0;
-  let deepPoolId: Uint256 = 0;
+  // Upper bound on the pool count across all families (V3 factories×feeTiers + V2
+  // factories + V4 factories×specs) — sizes the measure pass's per-pool capacity
+  // array. All small (≤255). getPool/getPair return 0 for absent tiers, so the
+  // actual ALIVE count (the live ordinal) is ≤ this.
+  const maxPools: Uint256 =
+    v3Factories.length * v3FeeTiers.length +
+    v2Factories.length +
+    v4Factories.length * v4Specs.length;
 
+  // ════ PASS 1: CHEAP STATE — discover + slot0 + liquidity (NO ticks) ════
+  // Count ALIVE pools (sqrtP>0 && L>0) per family for the header's discoveredCount.
+  // Spot active-L is NEVER used as a depth or selection metric: the only legitimate
+  // use of active L is as each pool's walk-ENTRY liquidity (re-read per pool in the
+  // measure passes below). There is no deepest-by-spot-L pool and no spot-L floor.
   for (let fi = 0; fi < v3Factories.length; fi = fi + 1) {
     const vf: Tuple = v3Factories[fi];
     const factory: Address = vf[0];
     for (let ti = 0; ti < v3FeeTiers.length; ti = ti + 1) {
       const ft: Tuple = v3FeeTiers[ti];
       const fee: Uint256 = ft[0];
-      const step: Uint256 = ft[1];
       const poolAddr: Address = IUniswapV3Factory.at(factory).getPool(tokenIn, tokenOut, fee);
       if (poolAddr !== 0) {
         const sqrtP: Uint256 = IUniswapV3PoolFull.at(poolAddr).slot0()[0];
         const liq: Uint256 = IUniswapV3PoolFull.at(poolAddr).liquidity();
         if (sqrtP > 0) {
           if (liq > 0) {
-            totalL = totalL + liq;
             discovered = discovered + 1;
-            if (liq > deepL) {
-              deepL = liq;
-              deepKind = 1;
-              deepAddr = poolAddr;
-              deepFee = fee;
-              deepTs = IUniswapV3PoolFull.at(poolAddr).tickSpacing();
-              deepStep = step;
-              deepSqrt = sqrtP;
-              deepTick = IUniswapV3PoolFull.at(poolAddr).slot0()[1];
-              deepStateView = 0;
-              deepPoolId = 0;
-            }
           }
         }
       }
@@ -194,37 +190,18 @@ function main(
     const stateView: Address = vf4[1];
     for (let si = 0; si < v4Specs.length; si = si + 1) {
       const spec: Tuple = v4Specs[si];
-      const v4fee: Uint256 = spec[0];
-      const v4ts: Uint256 = spec[1];
-      const v4step: Uint256 = spec[2];
       const idRow: Tuple = v4PoolIds[qi * v4Specs.length + si];
       const poolId: Uint256 = idRow[0];
       const sqrtP4: Uint256 = IStateViewFull.at(stateView).getSlot0(poolId)[0];
       if (sqrtP4 > 0) {
         const liq4: Uint256 = IStateViewFull.at(stateView).getLiquidity(poolId);
         if (liq4 > 0) {
-          totalL = totalL + liq4;
           discovered = discovered + 1;
-          if (liq4 > deepL) {
-            deepL = liq4;
-            deepKind = 2;
-            deepAddr = vf4[0];
-            deepFee = v4fee;
-            deepTs = v4ts;
-            deepStep = v4step;
-            deepSqrt = sqrtP4;
-            deepTick = IStateViewFull.at(stateView).getSlot0(poolId)[1];
-            deepStateView = stateView;
-            deepPoolId = poolId;
-          }
         }
       }
     }
   }
 
-  // V2 synthetic L also counts toward Σliquidity (prepare.ts includes V2 in the
-  // total), so the relative-depth floor matches prepare's EXACTLY → the lens never
-  // drops a pool prepare would keep (no phantom-data gap).
   for (let vli = 0; vli < v2Factories.length; vli = vli + 1) {
     const vlf: Tuple = v2Factories[vli];
     const factoryL: Address = vlf[0];
@@ -236,7 +213,6 @@ function main(
         if (lr1 > 0) {
           const synthLpre: Uint256 = Math.sqrt(lr0 * lr1);
           if (synthLpre > 0) {
-            totalL = totalL + synthLpre;
             discovered = discovered + 1;
           }
         }
@@ -244,75 +220,444 @@ function main(
     }
   }
 
-  // Relative-depth floor (bps of Σliquidity) is the SOLE survivor gate now (no
-  // absolute floor). Survivor iff L >= relFloor; minRelBps=0 keeps every alive pool.
-  const relFloor: Uint256 = minRelBps > 0 ? Math.mulDiv(totalL, minRelBps, 10000) : 0;
-  const liqFloor: Uint256 = relFloor;
-
-  // ════ PASS 2: FLOOR — lazy-walk the deepest survivor → floorAdj ════
-  // floorAdj defaults to 0 (no bound: walk every survivor to maxTicks) when the
-  // walk never covers amountIn (amountIn exceeds the deepest pool's depth).
+  // ════ MEASURE A: derive the window floor BY MEASURING (no spot L) ════
+  // For EVERY alive pool, self-walk forward until its OWN cumulative gross input
+  // covers amountIn; record that pool's solo-excursion fee-adjusted price soloFloor
+  // = feeAdj(farOI, fee) at the step it crosses amountIn. The shared window floor
+  // `floorAdj` = the SHALLOWEST solo floor across pools that solo-covered amountIn.
+  //
+  // In unified out/in space the price DECREASES with depth, so a SHALLOWER excursion
+  // is a HIGHER feeAdj-price → "shallowest solo floor" = the MAX soloFloor among the
+  // non-zero ones. That pool is the deepest-IN-RANGE one (covers amountIn with the
+  // least excursion); the true shared cut sits at-or-above every solo floor, so the
+  // MAX solo floor is the tightest SAFE common bound. If NO pool solo-covers amountIn
+  // within maxTicks, floorAdj stays 0 → trade exceeds all depth → keep every alive
+  // pool (filter disabled). Each walk early-stops at amountIn, so deep pools are cheap.
+  // The walks are INLINED (compiler forbids helper→helper calls; the walk needs
+  // stepReal/toOutIn/feeAdj/tickArg).
   let floorAdj: Uint256 = 0;
-  if (deepKind > 0) {
-    const baseShift: Uint256 = ((deepTick + OFFSET) / deepTs) * deepTs;
-    // oneForZero walk starts one spacing ABOVE base.
-    let curShift: Uint256 = baseShift;
-    if (zeroForOne === 0) {
-      curShift = baseShift + deepTs;
-    }
-    let L: Uint256 = deepL;
-    let nearReal: Uint256 = deepSqrt;
-    let cumIn: Uint256 = 0;
-    let doneF: Uint256 = 0;
-    for (let kf = 0; kf < maxTicks; kf = kf + 1) {
-      if (doneF === 0) {
-        const farReal: Uint256 = stepReal(nearReal, deepStep, zeroForOne);
-        const nearOI: Uint256 = toOutIn(nearReal, zeroForOne);
-        const farOI: Uint256 = toOutIn(farReal, zeroForOne);
-        if (L > 0) {
-          if (nearOI > farOI) {
-            const effIn: Uint256 = Math.mulDiv(L, Q96, farOI) - Math.mulDiv(L, Q96, nearOI);
-            const grossIn: Uint256 = Math.mulDiv(effIn, 1000000, 1000000 - deepFee);
-            cumIn = cumIn + grossIn;
+
+  // — V3 solo walks —
+  for (let fa3 = 0; fa3 < v3Factories.length; fa3 = fa3 + 1) {
+    const vfa3: Tuple = v3Factories[fa3];
+    const factoryA3: Address = vfa3[0];
+    for (let ta3 = 0; ta3 < v3FeeTiers.length; ta3 = ta3 + 1) {
+      const fta3: Tuple = v3FeeTiers[ta3];
+      const feeA3: Uint256 = fta3[0];
+      const stepA3: Uint256 = fta3[1];
+      const poolA3: Address = IUniswapV3Factory.at(factoryA3).getPool(tokenIn, tokenOut, feeA3);
+      if (poolA3 !== 0) {
+        const sqrtA3: Uint256 = IUniswapV3PoolFull.at(poolA3).slot0()[0];
+        const liqA3: Uint256 = IUniswapV3PoolFull.at(poolA3).liquidity();
+        if (sqrtA3 > 0) {
+          if (liqA3 > 0) {
+            const tsA3: Uint256 = IUniswapV3PoolFull.at(poolA3).tickSpacing();
+            const tickA3: Uint256 = IUniswapV3PoolFull.at(poolA3).slot0()[1];
+            const baseA3: Uint256 = ((tickA3 + OFFSET) / tsA3) * tsA3;
+            let curA3: Uint256 = baseA3;
+            if (zeroForOne === 0) {
+              curA3 = baseA3 + tsA3;
+            }
+            let La3: Uint256 = liqA3;
+            let nearRealA3: Uint256 = sqrtA3;
+            let cumA3: Uint256 = 0;
+            let doneA3: Uint256 = 0;
+            for (let ka3 = 0; ka3 < maxTicks; ka3 = ka3 + 1) {
+              if (doneA3 === 0) {
+                const farRealA3: Uint256 = stepReal(nearRealA3, stepA3, zeroForOne);
+                const nearOIa3: Uint256 = toOutIn(nearRealA3, zeroForOne);
+                const farOIa3: Uint256 = toOutIn(farRealA3, zeroForOne);
+                if (La3 > 0) {
+                  if (nearOIa3 > farOIa3) {
+                    const effA3: Uint256 = Math.mulDiv(La3, Q96, farOIa3) - Math.mulDiv(La3, Q96, nearOIa3);
+                    cumA3 = cumA3 + Math.mulDiv(effA3, 1000000, 1000000 - feeA3);
+                  }
+                }
+                const argA3: Uint256 = tickArg(curA3, OFFSET);
+                const netA3: Uint256 = IUniswapV3PoolFull.at(poolA3).ticks(argA3)[1];
+                const isNegA3: Uint256 = netA3 >= HALF128 ? 1 : 0;
+                if (zeroForOne === 1) {
+                  if (isNegA3 === 1) {
+                    La3 = La3 + (MOD128 - netA3);
+                  } else {
+                    La3 = La3 >= netA3 ? La3 - netA3 : 0;
+                  }
+                  curA3 = curA3 - tsA3;
+                } else {
+                  if (isNegA3 === 1) {
+                    const magA3: Uint256 = MOD128 - netA3;
+                    La3 = La3 >= magA3 ? La3 - magA3 : 0;
+                  } else {
+                    La3 = La3 + netA3;
+                  }
+                  curA3 = curA3 + tsA3;
+                }
+                nearRealA3 = farRealA3;
+                if (cumA3 >= amountIn) {
+                  const soloA3: Uint256 = feeAdj(farOIa3, feeA3);
+                  if (soloA3 > floorAdj) {
+                    floorAdj = soloA3;
+                  }
+                  doneA3 = 1;
+                }
+              }
+            }
           }
-        }
-        // Cross the boundary tick: update L by liquidityNet.
-        const argW: Uint256 = tickArg(curShift, OFFSET);
-        let netRaw: Uint256 = 0;
-        if (deepKind === 2) {
-          netRaw = IStateViewFull.at(deepStateView).getTickLiquidity(deepPoolId, argW)[1];
-        } else {
-          netRaw = IUniswapV3PoolFull.at(deepAddr).ticks(argW)[1];
-        }
-        const isNeg: Uint256 = netRaw >= HALF128 ? 1 : 0;
-        if (zeroForOne === 1) {
-          // moving down: L -= net
-          if (isNeg === 1) {
-            L = L + (MOD128 - netRaw);
-          } else {
-            L = L >= netRaw ? L - netRaw : 0;
-          }
-          curShift = curShift - deepTs;
-        } else {
-          // moving up: L += net
-          if (isNeg === 1) {
-            const mag: Uint256 = MOD128 - netRaw;
-            L = L >= mag ? L - mag : 0;
-          } else {
-            L = L + netRaw;
-          }
-          curShift = curShift + deepTs;
-        }
-        nearReal = farReal;
-        if (cumIn >= amountIn) {
-          floorAdj = feeAdj(farOI, deepFee);
-          doneF = 1;
         }
       }
     }
   }
 
-  // ════ PASS 3: BOUNDED — per survivor, lazy-walk + emit ════
+  // — V2 solo floor (closed form; V2 fee pinned to 3000). V2 has infinite range, so
+  // it ALWAYS solo-covers amountIn: invert the constant-product gross-in equation for
+  // the out/in sqrt s where grossIn(near→s)=amountIn, then soloFloor=feeAdj(s,3000).
+  //   effIn = amountIn*(1-fee);  L*Q96/s = L*Q96/near + effIn;  s = L*Q96/(that). —
+  for (let va = 0; va < v2Factories.length; va = va + 1) {
+    const vfa2: Tuple = v2Factories[va];
+    const factoryA2: Address = vfa2[0];
+    const pairA: Address = IUniswapV2Factory.at(factoryA2).getPair(tokenIn, tokenOut);
+    if (pairA !== 0) {
+      const ar0: Uint256 = IUniswapV2Pair.at(pairA).getReserves()[0];
+      const ar1: Uint256 = IUniswapV2Pair.at(pairA).getReserves()[1];
+      if (ar0 > 0) {
+        if (ar1 > 0) {
+          const t0A: Address = IUniswapV2Pair.at(pairA).token0();
+          const inIsT0A: Uint256 = t0A === tokenIn ? 1 : 0;
+          const rInA: Uint256 = inIsT0A === 1 ? ar0 : ar1;
+          const rOutA: Uint256 = inIsT0A === 1 ? ar1 : ar0;
+          const synthLA: Uint256 = Math.sqrt(rInA * rOutA);
+          if (synthLA > 0) {
+            const nearA: Uint256 = Math.sqrt(Math.mulDiv(rOutA, Q192, rInA));
+            const effA2: Uint256 = Math.mulDiv(amountIn, 1000000 - 3000, 1000000);
+            const invNearA: Uint256 = Math.mulDiv(synthLA, Q96, nearA);
+            const invLowA: Uint256 = invNearA + effA2;
+            if (invLowA > 0) {
+              const sLowA: Uint256 = Math.mulDiv(synthLA, Q96, invLowA);
+              const sf2A: Uint256 = Math.sqrt((1000000 - 3000) * 1000000);
+              const soloA2: Uint256 = Math.mulDiv(sLowA, sf2A, 1000000);
+              if (soloA2 > floorAdj) {
+                floorAdj = soloA2;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // — V4 solo walks (StateView) —
+  for (let qa = 0; qa < v4Factories.length; qa = qa + 1) {
+    const vfa4: Tuple = v4Factories[qa];
+    const stateViewA: Address = vfa4[1];
+    for (let sa = 0; sa < v4Specs.length; sa = sa + 1) {
+      const specA: Tuple = v4Specs[sa];
+      const feeA4: Uint256 = specA[0];
+      const tsA4: Uint256 = specA[1];
+      const stepA4: Uint256 = specA[2];
+      const idRowA: Tuple = v4PoolIds[qa * v4Specs.length + sa];
+      const poolIdA: Uint256 = idRowA[0];
+      const sqrtA4: Uint256 = IStateViewFull.at(stateViewA).getSlot0(poolIdA)[0];
+      if (sqrtA4 > 0) {
+        const liqA4: Uint256 = IStateViewFull.at(stateViewA).getLiquidity(poolIdA);
+        if (liqA4 > 0) {
+          const tickA4: Uint256 = IStateViewFull.at(stateViewA).getSlot0(poolIdA)[1];
+          const baseA4: Uint256 = ((tickA4 + OFFSET) / tsA4) * tsA4;
+          let curA4: Uint256 = baseA4;
+          if (zeroForOne === 0) {
+            curA4 = baseA4 + tsA4;
+          }
+          let La4: Uint256 = liqA4;
+          let nearRealA4: Uint256 = sqrtA4;
+          let cumA4: Uint256 = 0;
+          let doneA4: Uint256 = 0;
+          for (let ka4 = 0; ka4 < maxTicks; ka4 = ka4 + 1) {
+            if (doneA4 === 0) {
+              const farRealA4: Uint256 = stepReal(nearRealA4, stepA4, zeroForOne);
+              const nearOIa4: Uint256 = toOutIn(nearRealA4, zeroForOne);
+              const farOIa4: Uint256 = toOutIn(farRealA4, zeroForOne);
+              if (La4 > 0) {
+                if (nearOIa4 > farOIa4) {
+                  const effA4: Uint256 = Math.mulDiv(La4, Q96, farOIa4) - Math.mulDiv(La4, Q96, nearOIa4);
+                  cumA4 = cumA4 + Math.mulDiv(effA4, 1000000, 1000000 - feeA4);
+                }
+              }
+              const argA4: Uint256 = tickArg(curA4, OFFSET);
+              const netA4: Uint256 = IStateViewFull.at(stateViewA).getTickLiquidity(poolIdA, argA4)[1];
+              const isNegA4: Uint256 = netA4 >= HALF128 ? 1 : 0;
+              if (zeroForOne === 1) {
+                if (isNegA4 === 1) {
+                  La4 = La4 + (MOD128 - netA4);
+                } else {
+                  La4 = La4 >= netA4 ? La4 - netA4 : 0;
+                }
+                curA4 = curA4 - tsA4;
+              } else {
+                if (isNegA4 === 1) {
+                  const magA4: Uint256 = MOD128 - netA4;
+                  La4 = La4 >= magA4 ? La4 - magA4 : 0;
+                } else {
+                  La4 = La4 + netA4;
+                }
+                curA4 = curA4 + tsA4;
+              }
+              nearRealA4 = farRealA4;
+              if (cumA4 >= amountIn) {
+                const soloA4: Uint256 = feeAdj(farOIa4, feeA4);
+                if (soloA4 > floorAdj) {
+                  floorAdj = soloA4;
+                }
+                doneA4 = 1;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ════ MEASURE B: in-range (windowed) capacity to the COMMON floor ════
+  // The survivor gate is IN-RANGE CAPACITY, not spot active-L: walk every alive pool
+  // forward (swap direction) accumulating the gross tokenIn it absorbs from spot down
+  // to the COMMON window floor `floorAdj` measured in MEASURE A (or amountIn / maxTicks
+  // first), and store it per pool in capArr. The ordinal `ord` is incremented once per
+  // ALIVE pool in the SAME order the EMIT pass uses — V3 (factories×feeTiers) → V2
+  // (factories) → V4 (factories×specs) — with the IDENTICAL aliveness gate, so
+  // capArr[ord] lines up with the survivor decision below. A narrow band of huge spot
+  // active-L right at spot contributes only its in-range slice here, so it no longer
+  // poses as depth. The V3/V4 capacity walks are INLINED (the compiler does not support
+  // helper→helper calls, and the walk needs stepReal/toOutIn/feeAdj/tickArg) — the same
+  // forward-walk body as MEASURE A / the EMIT pass, but emitting nothing and stopping
+  // AT the floor (no drift). V2 has no ticks → closed-form windowed capacity to floorAdj.
+  let capArr: Tuple = new Array(maxPools);
+  let totalCap: Uint256 = 0;
+  let ord: Uint256 = 0;
+
+  for (let fm = 0; fm < v3Factories.length; fm = fm + 1) {
+    const vfm: Tuple = v3Factories[fm];
+    const factoryM: Address = vfm[0];
+    for (let tm = 0; tm < v3FeeTiers.length; tm = tm + 1) {
+      const ftm: Tuple = v3FeeTiers[tm];
+      const feeM: Uint256 = ftm[0];
+      const stepM: Uint256 = ftm[1];
+      const poolM: Address = IUniswapV3Factory.at(factoryM).getPool(tokenIn, tokenOut, feeM);
+      if (poolM !== 0) {
+        const sqrtM: Uint256 = IUniswapV3PoolFull.at(poolM).slot0()[0];
+        const liqM: Uint256 = IUniswapV3PoolFull.at(poolM).liquidity();
+        if (sqrtM > 0) {
+          if (liqM > 0) {
+            const tsM: Uint256 = IUniswapV3PoolFull.at(poolM).tickSpacing();
+            const tickM: Uint256 = IUniswapV3PoolFull.at(poolM).slot0()[1];
+            // IN-RANGE capacity walk — byte-for-byte the PASS-2 floor / PASS-3
+            // forward walk body (same stepReal/toOutIn/feeAdj, same int128 sign
+            // recovery, same L update, same mulDiv gross-in), but emits NOTHING and
+            // STOPS at the cut WITHOUT drift. cumIn at the stop = windowed capacity.
+            // (Inlined, not a helper: the compiler does not support helper→helper
+            // calls, and the walk calls stepReal/toOutIn/feeAdj/tickArg.)
+            const baseShiftM: Uint256 = ((tickM + OFFSET) / tsM) * tsM;
+            let curShiftM: Uint256 = baseShiftM;
+            if (zeroForOne === 0) {
+              curShiftM = baseShiftM + tsM;
+            }
+            let LM: Uint256 = liqM;
+            let nearRealM: Uint256 = sqrtM;
+            let cumInM: Uint256 = 0;
+            let doneM: Uint256 = 0;
+            for (let km = 0; km < maxTicks; km = km + 1) {
+              if (doneM === 0) {
+                const farRealM: Uint256 = stepReal(nearRealM, stepM, zeroForOne);
+                const nearOIM: Uint256 = toOutIn(nearRealM, zeroForOne);
+                const farOIM: Uint256 = toOutIn(farRealM, zeroForOne);
+                if (LM > 0) {
+                  if (nearOIM > farOIM) {
+                    const effInM: Uint256 = Math.mulDiv(LM, Q96, farOIM) - Math.mulDiv(LM, Q96, nearOIM);
+                    cumInM = cumInM + Math.mulDiv(effInM, 1000000, 1000000 - feeM);
+                  }
+                }
+                const argWM: Uint256 = tickArg(curShiftM, OFFSET);
+                const netM: Uint256 = IUniswapV3PoolFull.at(poolM).ticks(argWM)[1];
+                const isNegM: Uint256 = netM >= HALF128 ? 1 : 0;
+                if (zeroForOne === 1) {
+                  if (isNegM === 1) {
+                    LM = LM + (MOD128 - netM);
+                  } else {
+                    LM = LM >= netM ? LM - netM : 0;
+                  }
+                  curShiftM = curShiftM - tsM;
+                } else {
+                  if (isNegM === 1) {
+                    const magM: Uint256 = MOD128 - netM;
+                    LM = LM >= magM ? LM - magM : 0;
+                  } else {
+                    LM = LM + netM;
+                  }
+                  curShiftM = curShiftM + tsM;
+                }
+                nearRealM = farRealM;
+                const faM: Uint256 = feeAdj(farOIM, feeM);
+                let hitFloorM: Uint256 = 0;
+                if (floorAdj > 0) {
+                  if (faM <= floorAdj) {
+                    hitFloorM = 1;
+                  }
+                }
+                if (cumInM >= amountIn) {
+                  doneM = 1;
+                } else {
+                  if (hitFloorM === 1) {
+                    doneM = 1;
+                  }
+                }
+              }
+            }
+            capArr[ord] = cumInM;
+            totalCap = totalCap + cumInM;
+            ord = ord + 1;
+          }
+        }
+      }
+    }
+  }
+
+  for (let vm = 0; vm < v2Factories.length; vm = vm + 1) {
+    const vfm2: Tuple = v2Factories[vm];
+    const factoryM2: Address = vfm2[0];
+    const pairM: Address = IUniswapV2Factory.at(factoryM2).getPair(tokenIn, tokenOut);
+    if (pairM !== 0) {
+      const mr0: Uint256 = IUniswapV2Pair.at(pairM).getReserves()[0];
+      const mr1: Uint256 = IUniswapV2Pair.at(pairM).getReserves()[1];
+      if (mr0 > 0) {
+        if (mr1 > 0) {
+          const t0M: Address = IUniswapV2Pair.at(pairM).token0();
+          const inIsT0M: Uint256 = t0M === tokenIn ? 1 : 0;
+          const rInM: Uint256 = inIsT0M === 1 ? mr0 : mr1;
+          const rOutM: Uint256 = inIsT0M === 1 ? mr1 : mr0;
+          const synthLM: Uint256 = Math.sqrt(rInM * rOutM);
+          if (synthLM > 0) {
+            // V2 windowed capacity (closed form; engine pins V2 fee to 3000). near
+            // = synthetic out/in sqrt. Invert the fee-adjusted floor out of adjusted
+            // space, then capacity = gross-in to walk near→farThr (V2 analogue of
+            // prepare.ts bracketCapacity), clamped at amountIn.
+            const nearM: Uint256 = Math.sqrt(Math.mulDiv(rOutM, Q192, rInM));
+            const sf2: Uint256 = Math.sqrt((1000000 - 3000) * 1000000);
+            const farThr: Uint256 = Math.mulDiv(floorAdj, 1000000, sf2);
+            let capV2: Uint256 = 0;
+            if (farThr > 0) {
+              if (farThr < nearM) {
+                const effIn2: Uint256 = Math.mulDiv(synthLM, Q96, farThr) - Math.mulDiv(synthLM, Q96, nearM);
+                capV2 = Math.mulDiv(effIn2, 1000000, 1000000 - 3000);
+              }
+            }
+            let capM2: Uint256 = capV2;
+            if (capV2 > amountIn) {
+              capM2 = amountIn;
+            }
+            capArr[ord] = capM2;
+            totalCap = totalCap + capM2;
+            ord = ord + 1;
+          }
+        }
+      }
+    }
+  }
+
+  for (let qm = 0; qm < v4Factories.length; qm = qm + 1) {
+    const vfm4: Tuple = v4Factories[qm];
+    const poolMgrM: Address = vfm4[0];
+    const stateViewM: Address = vfm4[1];
+    for (let sm = 0; sm < v4Specs.length; sm = sm + 1) {
+      const specM: Tuple = v4Specs[sm];
+      const v4feeM: Uint256 = specM[0];
+      const v4tsM: Uint256 = specM[1];
+      const v4stepM: Uint256 = specM[2];
+      const idRowM: Tuple = v4PoolIds[qm * v4Specs.length + sm];
+      const poolIdM: Uint256 = idRowM[0];
+      const sqrtM4: Uint256 = IStateViewFull.at(stateViewM).getSlot0(poolIdM)[0];
+      if (sqrtM4 > 0) {
+        const liqM4: Uint256 = IStateViewFull.at(stateViewM).getLiquidity(poolIdM);
+        if (liqM4 > 0) {
+          const tickM4: Uint256 = IStateViewFull.at(stateViewM).getSlot0(poolIdM)[1];
+          // IN-RANGE capacity walk (V4 via StateView.getTickLiquidity) — same body
+          // as the V3 measure walk above; inlined (no helper→helper calls).
+          const baseShiftM4: Uint256 = ((tickM4 + OFFSET) / v4tsM) * v4tsM;
+          let curShiftM4: Uint256 = baseShiftM4;
+          if (zeroForOne === 0) {
+            curShiftM4 = baseShiftM4 + v4tsM;
+          }
+          let LM4: Uint256 = liqM4;
+          let nearRealM4: Uint256 = sqrtM4;
+          let cumInM4: Uint256 = 0;
+          let doneM4: Uint256 = 0;
+          for (let km4 = 0; km4 < maxTicks; km4 = km4 + 1) {
+            if (doneM4 === 0) {
+              const farRealM4: Uint256 = stepReal(nearRealM4, v4stepM, zeroForOne);
+              const nearOIM4: Uint256 = toOutIn(nearRealM4, zeroForOne);
+              const farOIM4: Uint256 = toOutIn(farRealM4, zeroForOne);
+              if (LM4 > 0) {
+                if (nearOIM4 > farOIM4) {
+                  const effInM4: Uint256 = Math.mulDiv(LM4, Q96, farOIM4) - Math.mulDiv(LM4, Q96, nearOIM4);
+                  cumInM4 = cumInM4 + Math.mulDiv(effInM4, 1000000, 1000000 - v4feeM);
+                }
+              }
+              const argWM4: Uint256 = tickArg(curShiftM4, OFFSET);
+              const netM4: Uint256 = IStateViewFull.at(stateViewM).getTickLiquidity(poolIdM, argWM4)[1];
+              const isNegM4: Uint256 = netM4 >= HALF128 ? 1 : 0;
+              if (zeroForOne === 1) {
+                if (isNegM4 === 1) {
+                  LM4 = LM4 + (MOD128 - netM4);
+                } else {
+                  LM4 = LM4 >= netM4 ? LM4 - netM4 : 0;
+                }
+                curShiftM4 = curShiftM4 - v4tsM;
+              } else {
+                if (isNegM4 === 1) {
+                  const magM4: Uint256 = MOD128 - netM4;
+                  LM4 = LM4 >= magM4 ? LM4 - magM4 : 0;
+                } else {
+                  LM4 = LM4 + netM4;
+                }
+                curShiftM4 = curShiftM4 + v4tsM;
+              }
+              nearRealM4 = farRealM4;
+              const faM4: Uint256 = feeAdj(farOIM4, v4feeM);
+              let hitFloorM4: Uint256 = 0;
+              if (floorAdj > 0) {
+                if (faM4 <= floorAdj) {
+                  hitFloorM4 = 1;
+                }
+              }
+              if (cumInM4 >= amountIn) {
+                doneM4 = 1;
+              } else {
+                if (hitFloorM4 === 1) {
+                  doneM4 = 1;
+                }
+              }
+            }
+          }
+          capArr[ord] = cumInM4;
+          totalCap = totalCap + cumInM4;
+          ord = ord + 1;
+        }
+      }
+    }
+  }
+
+  // In-range-capacity survivor floor (bps of Σ windowed capacity). When floorAdj is
+  // 0 (NO pool solo-covered amountIn within maxTicks → trade exceeds all depth) OR
+  // minRelBps is 0, the floor is 0 and every alive pool survives.
+  let capFloor: Uint256 = 0;
+  if (floorAdj > 0) {
+    if (minRelBps > 0) {
+      capFloor = Math.mulDiv(totalCap, minRelBps, 10000);
+    }
+  }
+
+  // ════ EMIT PASS: per survivor, lazy-walk + emit ════
+  // Survivorship is decided by in-range capacity (capArr[ord3], the SAME ordinal as
+  // MEASURE B above — alive pools in V3→V2→V4 order), NOT spot active-L. The forward
+  // walk stops on (feeAdj(far) <= floorAdj OR cumIn>=amountIn) then drifts, as before
+  // — floorAdj is now the measured common floor from MEASURE A.
+  let ord3: Uint256 = 0;
   // V3 survivors.
   for (let fi3 = 0; fi3 < v3Factories.length; fi3 = fi3 + 1) {
     const vf3: Tuple = v3Factories[fi3];
@@ -325,12 +670,20 @@ function main(
       if (poolAddr3 !== 0) {
         const sqrt3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
         const liq3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).liquidity();
-        // SURVIVOR iff alive AND at/above the relative-depth floor. When liqFloor
-        // is 0 (minRelBps=0) the > 0 check still drops empty pools.
+        // ALIVE (sqrt>0 && L>0) is the ordinal gate — IDENTICAL to the measure
+        // pass — so capArr[ord3] is THIS pool's in-range capacity. SURVIVOR iff
+        // capFloor===0 (no bound / minRelBps=0) OR capArr[ord3] >= capFloor.
         let surv3: Uint256 = 0;
-        if (liq3 > 0) {
-          if (liq3 >= liqFloor) {
-            surv3 = 1;
+        if (sqrt3 > 0) {
+          if (liq3 > 0) {
+            if (capFloor === 0) {
+              surv3 = 1;
+            } else {
+              if (capArr[ord3] >= capFloor) {
+                surv3 = 1;
+              }
+            }
+            ord3 = ord3 + 1;
           }
         }
         if (sqrt3 > 0) {
@@ -458,14 +811,27 @@ function main(
           const reserveIn: Uint256 = inIsT0 === 1 ? r0 : r1;
           const reserveOut: Uint256 = inIsT0 === 1 ? r1 : r0;
           const synthL: Uint256 = Math.sqrt(reserveIn * reserveOut);
-          // SURVIVORS ONLY: drop V2 pools below the relative-depth floor (matches
-          // the V3/V4 gate so the lens decides V2 survivorship too).
-          if (synthL >= liqFloor) {
-            const synthSqrt: Uint256 = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
-            poolBlob = poolBlob.concat(
-              abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
-            );
-            poolCount = poolCount + 1;
+          // SURVIVORS ONLY: drop V2 pools below the in-range-capacity floor (matches
+          // the V3/V4 gate so the lens decides V2 survivorship too). synthL>0 is the
+          // ordinal gate (IDENTICAL to the measure pass); capArr[ord3] is this pool's
+          // windowed capacity.
+          if (synthL > 0) {
+            let survV2: Uint256 = 0;
+            if (capFloor === 0) {
+              survV2 = 1;
+            } else {
+              if (capArr[ord3] >= capFloor) {
+                survV2 = 1;
+              }
+            }
+            ord3 = ord3 + 1;
+            if (survV2 === 1) {
+              const synthSqrt: Uint256 = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
+              poolBlob = poolBlob.concat(
+                abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
+              );
+              poolCount = poolCount + 1;
+            }
           }
         }
       }
@@ -487,12 +853,19 @@ function main(
       const sqrtP43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[0];
       if (sqrtP43 > 0) {
         const liq43: Uint256 = IStateViewFull.at(stateView3).getLiquidity(poolId3);
-        // SURVIVOR iff alive AND at/above the relative-depth floor (single gate).
+        // ALIVE (sqrt>0 && L>0) is the ordinal gate — IDENTICAL to the measure pass —
+        // so capArr[ord3] is this pool's in-range capacity. SURVIVOR iff capFloor===0
+        // OR capArr[ord3] >= capFloor.
         let surv4: Uint256 = 0;
         if (liq43 > 0) {
-          if (liq43 >= liqFloor) {
+          if (capFloor === 0) {
             surv4 = 1;
+          } else {
+            if (capArr[ord3] >= capFloor) {
+              surv4 = 1;
+            }
           }
+          ord3 = ord3 + 1;
         }
         if (surv4 === 1) {
           const tick43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[1];
@@ -599,7 +972,8 @@ function main(
 
   // Prepend the 4-word HEADER so the decoder reads survivorship straight from the
   // lens (single source of truth): discoveredCount, survivorCount (= poolCount),
-  // totalL, liqFloor. Every row after the header is a survivor.
-  const header: bytes = abi.encode(discovered, poolCount, totalL, liqFloor);
+  // totalCap (Σ in-range capacity), capFloor (the in-range-capacity threshold).
+  // Every row after the header is a survivor.
+  const header: bytes = abi.encode(discovered, poolCount, totalCap, capFloor);
   return abi.encode(header.concat(poolBlob), tickBlob);
 }

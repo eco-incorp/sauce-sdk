@@ -12,7 +12,8 @@
  *      slot0/getReserves/StateView reads, and a windowed ticks()/getTickLiquidity
  *      scan — returned as raw words (see lens.ts). v1 covers V2Standard, V3Standard
  *      and hookless UniswapV4 only. The lens is the SINGLE SOURCE OF TRUTH for
- *      survivorship: it applies the relative-depth liquidity filter on-chain and
+ *      survivorship: it measures each pool's IN-RANGE capacity across the crossed
+ *      ticks (not spot active-L), applies the relative-depth filter on-chain, and
  *      returns ONLY survivors (no absolute floor) — prepare never re-filters.
  *   2. Apply the top-N (deepest) cap — a calldata/loop bound, not a liquidity gate.
  *   3. Build brackets from the lens reads: V3/V4 from active L + liquidityNet
@@ -58,14 +59,17 @@ const FEE_DENOM = 1_000_000n; // ppm
 const OFFSET_TICK = 888000;
 
 /**
- * RELATIVE-depth floor (bps of TOTAL discovered liquidity) — the SOLE liquidity
- * gate (no absolute floor). For one token pair, raw active-L at spot is
- * comparable across V2 (≡ a V3 range with L=√k), V3 and V4, so a pool holding
- * < this fraction of the combined marginal depth would only ever get a dust
- * slice — not worth a swap's gas. The on-chain LENS applies this filter and is
- * the single source of truth for survivorship (prepare never re-filters).
- * Default 100 bps (1%); override with ECO_MIN_REL_BPS, or per-call via
- * prepareEcoSwap opts. 0 disables.
+ * RELATIVE-depth floor (bps of TOTAL IN-RANGE capacity across crossed ticks) — the
+ * SOLE liquidity gate (no absolute floor). A pool's in-range capacity is the gross
+ * tokenIn it can absorb walking from spot to the trade's price floor (NOT its spot
+ * active-L): this is comparable across V2 (≡ a V3 range with L=√k), V3 and V4, and
+ * — unlike spot-L — does not reward a narrow band of huge liquidity concentrated
+ * right at spot that the trade immediately walks out of. A pool below this fraction
+ * of the combined in-range depth would only ever get a dust slice — not worth a
+ * swap's gas. The on-chain LENS measures this capacity and applies the filter; it is
+ * the single source of truth for survivorship (prepare never re-filters). Default
+ * 100 bps (1%); override with ECO_MIN_REL_BPS, or per-call via prepareEcoSwap opts.
+ * 0 disables.
  */
 const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
@@ -548,10 +552,11 @@ function buildRouteBracketsLocal(
 /** Tuning knobs for off-chain preparation (overridable per call; mainly for tests). */
 export interface EcoSwapPrepareOpts {
   /**
-   * Drop pools whose liquidity is below this many bps of TOTAL discovered
-   * liquidity (default DEFAULT_MIN_REL_BPS = ECO_MIN_REL_BPS env or 100 = 1%).
-   * Set 0 to keep every pool above the absolute floor (used by cross-version
-   * split tests that intentionally mix shallow-but-distinct AMM versions).
+   * Drop pools whose IN-RANGE (windowed) capacity is below this many bps of the
+   * Σ in-range capacity across alive pools (default DEFAULT_MIN_REL_BPS =
+   * ECO_MIN_REL_BPS env or 100 = 1%). Set 0 to disable the filter and keep every
+   * alive pool (used by cross-version split tests that intentionally mix
+   * shallow-but-distinct AMM versions).
    */
   minRelBps?: number;
   /**
@@ -601,10 +606,10 @@ export async function prepareEcoSwap(
   });
 
   // The LENS is the single source of truth for survivorship: it already applied
-  // the relative-depth floor on-chain and returns ONLY survivors (every returned
-  // pool is a usable type — V2Standard sans Solidly-stable, V3Standard, hookless
-  // V4). So prepare does NOT re-filter; it just keeps the deepest top-N (a
-  // calldata/loop bound, not a liquidity gate).
+  // the relative-depth IN-RANGE-capacity floor on-chain and returns ONLY survivors
+  // (every returned pool is a usable type — V2Standard sans Solidly-stable,
+  // V3Standard, hookless V4). So prepare does NOT re-filter; it just keeps the
+  // deepest top-N by spot liquidity (a calldata/loop bound, not a liquidity gate).
   const survivors = lensResult.pools;
   const usableDirect = survivors
     .slice()
@@ -616,8 +621,8 @@ export async function prepareEcoSwap(
   const droppedByLens = lensResult.discoveredCount - lensResult.survivorCount;
   if (droppedByLens > 0) {
     console.log(
-      `  EcoSwap lens dropped ${droppedByLens} shallow pool(s) (< ${minRelBps}bps of Σliquidity, ` +
-        `floor L=${lensResult.liqFloor} of Σ${lensResult.totalLiquidity})`,
+      `  EcoSwap lens dropped ${droppedByLens} shallow pool(s) (< ${minRelBps}bps of Σ in-range ` +
+        `capacity, floor=${lensResult.capacityFloor} of Σ${lensResult.totalInRangeCapacity})`,
     );
   }
   if (survivors.length > MAX_DIRECT_POOLS) {

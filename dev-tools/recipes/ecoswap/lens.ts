@@ -11,12 +11,13 @@
  *
  * Return shape (must mirror ecoswap.lens.sauce.ts EXACTLY):
  *   abi.encode(poolBlob: bytes, tickBlob: bytes)
- *   poolBlob = a 4-word HEADER [discoveredCount, survivorCount, totalL, liqFloor]
+ *   poolBlob = a 4-word HEADER [discoveredCount, survivorCount, totalCap, capFloor]
  *              followed by survivorCount × 13-word pool rows
  *              [type,addr,fee,tickSpacing,hooks,sqrtP,liq,tickRaw,inIsToken0,stateView,poolId,scannedForward,scannedReverse]
  *   tickBlob = 3 words/row:   [poolIdx, tickIndexRaw, liquidityNetRaw]
- * The lens is the SINGLE SOURCE OF TRUTH for survivorship: it only emits pool
- * rows that clear the relative-depth floor, so the consumer never re-filters.
+ * The lens is the SINGLE SOURCE OF TRUTH for survivorship: it only emits pool rows
+ * whose IN-RANGE (windowed) capacity clears the relative-depth floor — measured
+ * across the crossed ticks, not spot active-L — so the consumer never re-filters.
  * Signed words (tickRaw int24, tickIndexRaw int24, liquidityNetRaw int128) are
  * ZERO-extended on return; reinterpreted here via BigInt.asIntN.
  *
@@ -58,7 +59,7 @@ const { compile } = require("@eco-incorp/sauce-compiler");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 
-const HEADER_WORDS = 4; // [discoveredCount, survivorCount, totalL, liqFloor]
+const HEADER_WORDS = 4; // [discoveredCount, survivorCount, totalCap, capFloor]
 const POOL_STRIDE = 13;
 const TICK_STRIDE = 3;
 const ZERO_HOOKS = "0x0000000000000000000000000000000000000000" as Hex;
@@ -199,16 +200,16 @@ export interface LensPool {
 
 /** Decoded lens output: every SURVIVOR pool with live state + tick window. */
 export interface LensResult {
-  /** Survivor pools (already past the relative-depth floor on-chain). */
+  /** Survivor pools (already past the in-range-capacity floor on-chain). */
   pools: LensPool[];
   /** Total alive pools the lens discovered (survivors + dropped). */
   discoveredCount: number;
   /** Pool rows actually returned (= pools.length). */
   survivorCount: number;
-  /** Σ liquidity over alive pools (diagnostics). */
-  totalLiquidity: bigint;
-  /** The relative-depth survivor threshold the lens applied. */
-  liqFloor: bigint;
+  /** Σ IN-RANGE (windowed) capacity over alive pools, in gross tokenIn (diagnostics). */
+  totalInRangeCapacity: bigint;
+  /** The in-range-capacity survivor threshold the lens applied (gross tokenIn). */
+  capacityFloor: bigint;
 }
 
 export interface LensCallParams {
@@ -220,9 +221,10 @@ export interface LensCallParams {
   /** Extra tick boundaries scanned past the stop, on EACH side (default 2). */
   driftTicks?: number;
   /**
-   * Relative-depth floor in bps of Σliquidity — the SOLE survivor gate (no
-   * absolute floor). Pools below this fraction of total liquidity are not
-   * emitted. 0 disables (every alive pool survives).
+   * Survivor floor in bps of Σ IN-RANGE capacity — the SOLE survivor gate (no
+   * absolute floor). Pools whose windowed capacity (gross tokenIn absorbed across
+   * the crossed ticks) is below this fraction of the total are not emitted. 0
+   * disables (every alive pool survives).
    */
   minRelBps?: number;
   /** Hard cap on forward tick reads per pool (mirrors prepare.ts V3_TICK_STEPS=96). */
@@ -336,8 +338,8 @@ export function decodeLens(poolBlob: Hex, tickBlob: Hex): LensResult {
   // HEADER (4 words) precedes the survivor rows. Every row after it is a survivor.
   const discoveredCount = pw.length >= HEADER_WORDS ? Number(pw[0]) : 0;
   const survivorCount = pw.length >= HEADER_WORDS ? Number(pw[1]) : 0;
-  const totalLiquidity = pw.length >= HEADER_WORDS ? pw[2] : 0n;
-  const liqFloor = pw.length >= HEADER_WORDS ? pw[3] : 0n;
+  const totalInRangeCapacity = pw.length >= HEADER_WORDS ? pw[2] : 0n;
+  const capacityFloor = pw.length >= HEADER_WORDS ? pw[3] : 0n;
   const rowsBase = HEADER_WORDS;
   const nPools = Math.floor((pw.length - rowsBase) / POOL_STRIDE);
 
@@ -378,5 +380,5 @@ export function decodeLens(poolBlob: Hex, tickBlob: Hex): LensResult {
     if (net !== 0n) pools[poolIdx].net.set(tickIdx, net);
   }
 
-  return { pools, discoveredCount, survivorCount, totalLiquidity, liqFloor };
+  return { pools, discoveredCount, survivorCount, totalInRangeCapacity, capacityFloor };
 }
