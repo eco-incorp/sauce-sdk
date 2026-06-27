@@ -84,11 +84,24 @@ jobs:
       - name: Actions — unit tests
         run: pnpm --filter './actions' test:unit
 
-      - name: Dev Tools — sync engine artifacts
-        # The recipe compile tests import contract ABIs from dev-tools/artifacts/
-        # (gitignored build output). sync-artifacts copies them from the sauce engine's
-        # forge-build output, produced by the compiler postinstall during `pnpm install`.
+      - name: Sync engine artifacts
+        # The recipe tests import contract ABIs from sdk/src/artifacts/ (gitignored build
+        # output). sync-artifacts copies them — plus the v12 runtime (V12Kitchen/V12Pot/
+        # V12RuntimeBytecode) — from the sauce engine's forge-build output, produced by the
+        # compiler postinstall during `pnpm install`. v12 is the default test engine, so the
+        # EVM harness throws ("v12 artifacts missing") unless these are present (V12_AVAILABLE).
         run: pnpm --filter './dev-tools' sync-artifacts
 
-      - name: Dev Tools — test
-        run: pnpm --filter './dev-tools' test
+      - name: Recipes — fast tests (compile + math)
+        # No anvil, no RPC: compiles every recipe to bytecode and runs the pure-bigint
+        # known-answer math (TickMath, fee-adjust, water-fill conservation).
+        run: pnpm --filter './sdk' test:recipes
+
+      - name: Recipes — local EVM tests
+        # *.evm.test.ts only — boots a fresh anvil (NO fork) per file, deploys the real
+        # protocol + Sauce engine bytecode, and cooks the compiled recipe (default v12 engine).
+        # The BASE_RPC_URL fork tests ({mega,alpha,giga}swap, ecoswap.test.ts) are plain
+        # .test.ts and are NOT matched by the *.evm.test.ts glob, so they never run here.
+        # Runs with --test-concurrency=1 (set in the test:recipes:evm script) so the per-file
+        # anvil/shared-state tests don't contend under node:test's default file parallelism.
+        run: pnpm --filter './sdk' test:recipes:evm
