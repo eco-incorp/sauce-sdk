@@ -60,19 +60,24 @@ export async function makeClients(
 
   const account = privateKeyToAccount(ANVIL_PK_0);
 
+  // Generous RPC timeout (10 min): the heavy prod-mirror cooks can run slow on a
+  // CPU-starved / shared CI runner, so we want contention to surface as slow-but-green
+  // rather than a hard viem RPC timeout failure (the cook is normally seconds).
+  const RPC_TIMEOUT = 600_000;
+
   const publicClient = createPublicClient({
     chain,
-    transport: http(rpcUrl, { timeout: 120_000 }),
+    transport: http(rpcUrl, { timeout: RPC_TIMEOUT }),
   });
   const walletClient = createWalletClient({
     account,
     chain,
-    transport: http(rpcUrl, { timeout: 120_000 }),
+    transport: http(rpcUrl, { timeout: RPC_TIMEOUT }),
   });
   const testClient = createTestClient({
     mode: "anvil",
     chain,
-    transport: http(rpcUrl, { timeout: 120_000 }),
+    transport: http(rpcUrl, { timeout: RPC_TIMEOUT }),
   });
 
   return {
