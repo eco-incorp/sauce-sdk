@@ -1,8 +1,12 @@
 #!/usr/bin/env node
-// Copies the contract artifacts the dev-tools recipes and deploy.ts read at runtime
-// into dev-tools/artifacts/. That directory is gitignored (build output) but ships in
-// the published package (root package.json `files`), so this runs at `prepack` — and
-// on demand via `pnpm sync-artifacts` for local recipe runs / fork tests.
+// Copies the contract artifacts the recipes and dev-tools deploy.ts read at runtime
+// into sdk/src/artifacts/ (the canonical home, co-located with the recipe tree that is
+// the primary consumer). That directory is gitignored (build output) but ships in the
+// published package (root package.json `files`), so this runs at `prepack` — and on
+// demand via `pnpm sync-artifacts` for local recipe runs / fork tests.
+//
+// Recipes resolve `./artifacts/X.json` via their `REPO_ROOT` (= sdk/src); the dev-tools
+// deploy/start flow reads the same dir by its sdk-relative path.
 //
 // Source: the `sauce` git dep's Foundry build output (engine/out/<X>.sol/<X>.json),
 // produced by the compiler's postinstall `forge build`. Requires Foundry installed and
@@ -14,7 +18,7 @@ import { fileURLToPath } from "url";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEV_TOOLS_DIR = resolve(SCRIPT_DIR, "..");
 const REPO_ROOT = resolve(DEV_TOOLS_DIR, "..");
-const ARTIFACTS_DIR = resolve(DEV_TOOLS_DIR, "artifacts");
+const ARTIFACTS_DIR = resolve(REPO_ROOT, "sdk", "src", "artifacts");
 
 // Contracts the recipes (`import … from "./artifacts/X.json"`, quoting.ts) and the
 // deploy/fork-test flow (Router + SauceRouter, which carry deploy bytecode) read.
@@ -103,4 +107,4 @@ if (v12Missing.length) {
 }
 
 const total = ARTIFACTS.length + Object.keys(EXTRA_ARTIFACTS).length + v12Copied;
-console.log(`[sync-artifacts] copied ${total} artifacts -> dev-tools/artifacts/`);
+console.log(`[sync-artifacts] copied ${total} artifacts -> sdk/src/artifacts/`);

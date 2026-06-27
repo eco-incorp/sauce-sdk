@@ -6,50 +6,23 @@
  */
 
 import type { PublicClient, Hex } from "viem";
+import { readFileSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import type { PoolInfo, QuoteResult } from "./types.js";
 
-const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Hex;
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-/** Minimal ABI for SauceRouter.quote() */
-const sauceRouterQuoteAbi = [
-  {
-    name: "quote",
-    type: "function",
-    stateMutability: "nonpayable",
-    inputs: [
-      {
-        name: "params",
-        type: "tuple",
-        components: [
-          { name: "poolType", type: "uint8" },
-          { name: "pool", type: "address" },
-          {
-            name: "poolKey",
-            type: "tuple",
-            components: [
-              { name: "currency0", type: "address" },
-              { name: "currency1", type: "address" },
-              { name: "fee", type: "uint24" },
-              { name: "tickSpacing", type: "int24" },
-              { name: "hooks", type: "address" },
-            ],
-          },
-          { name: "stateView", type: "address" },
-          { name: "tokenIn", type: "address" },
-          { name: "tokenOut", type: "address" },
-          { name: "amountSpecified", type: "int256" },
-          { name: "sqrtPriceLimitX96", type: "uint160" },
-        ],
-      },
-    ],
-    outputs: [
-      { name: "amountIn", type: "uint256" },
-      { name: "amountOut", type: "uint256" },
-      { name: "sqrtPriceAfter", type: "uint160" },
-      { name: "gasEstimate", type: "uint256" },
-    ],
-  },
-] as const;
+// Load ISauceRouter ABI from local artifacts
+const sauceRouterArtifact = JSON.parse(
+  readFileSync(
+    join(__dirname, "..", "..", "artifacts", "ISauceRouter.json"),
+    "utf-8",
+  ),
+);
+export const sauceRouterAbi = sauceRouterArtifact.abi;
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Hex;
 
 /**
  * Quote a swap on a single pool via SauceRouter.quote().
@@ -90,21 +63,21 @@ export async function quotePool(
   try {
     const { result } = await client.simulateContract({
       address: sauceRouterAddress,
-      abi: sauceRouterQuoteAbi,
+      abi: sauceRouterAbi,
       functionName: "quote",
       args: [quoteParams],
     });
 
-    const r = result as unknown as { amountIn: bigint; amountOut: bigint; sqrtPriceAfter: bigint; gasEstimate: bigint };
+    const r = result as { amountIn: bigint; amountOut: bigint; sqrtPriceAfter: bigint; gasEstimate: bigint };
     return {
       amountIn: r.amountIn,
       amountOut: r.amountOut,
       sqrtPriceAfter: r.sqrtPriceAfter,
       gasEstimate: r.gasEstimate,
     };
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message?.slice(0, 120) : String(e);
-    console.warn(`  quote failed for pool ${pool.address} (fee=${pool.fee}): ${msg}`);
+  } catch (e: any) {
+    // Pool may not support the swap or may have insufficient liquidity
+    console.warn(`  quote failed for pool ${pool.address} (fee=${pool.fee}): ${e.message?.slice(0, 120)}`);
     return {
       amountIn: 0n,
       amountOut: 0n,

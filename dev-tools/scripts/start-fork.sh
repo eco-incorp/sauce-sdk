@@ -26,10 +26,11 @@ if [ -n "$FORK_BLOCK" ]; then
     BLOCK_ARG="--fork-block-number $FORK_BLOCK"
 fi
 
-# Check for Sauce artifact
-if [ ! -f "$REPO_ROOT/artifacts/ISauceRouter.json" ]; then
-    echo "Error: artifacts/ISauceRouter.json not found."
-    echo "Run './engine/export-artifact.sh' from the repo root to generate it."
+# Check for Sauce artifact (canonical location: sdk/src/artifacts/)
+ARTIFACTS_DIR="$(cd "$REPO_ROOT/.." && pwd)/sdk/src/artifacts"
+if [ ! -f "$ARTIFACTS_DIR/ISauceRouter.json" ]; then
+    echo "Error: sdk/src/artifacts/ISauceRouter.json not found."
+    echo "Run 'pnpm sync-artifacts' from dev-tools (needs the forge-built engine)."
     exit 1
 fi
 

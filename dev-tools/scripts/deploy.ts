@@ -24,12 +24,14 @@ async function main() {
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
   const account = privateKeyToAccount(privateKey);
 
-  // Load artifacts from local artifacts/ directory
+  // Load engine artifacts from the canonical sdk/src/artifacts/ location
+  // (populated by `pnpm sync-artifacts`; shared with the recipe tree).
+  const ARTIFACTS = join(__dirname, "..", "..", "sdk", "src", "artifacts");
   const routerImplArtifact = JSON.parse(
-    readFileSync(join(__dirname, "../artifacts/Router.json"), "utf-8"),
+    readFileSync(join(ARTIFACTS, "Router.json"), "utf-8"),
   );
   const sauceRouterArtifact = JSON.parse(
-    readFileSync(join(__dirname, "../artifacts/SauceRouter.json"), "utf-8"),
+    readFileSync(join(ARTIFACTS, "SauceRouter.json"), "utf-8"),
   );
 
   // Get the actual chain ID from the RPC (may be mainnet when forking)

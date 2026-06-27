@@ -29,7 +29,9 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { WETH, USDC, DAI, USDbC } from "../recipes/shared/constants";
+// Recipes are the canonical sdk tree (sdk/src/recipes); imported here as source so
+// the runner works via tsx without a prior build. See sdk/src/recipes/index.ts.
+import { WETH, USDC, DAI, USDbC } from "../../sdk/src/recipes/shared/constants";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -112,14 +114,14 @@ async function main() {
       console.error('    "tokenIn": "0x...", "tokenOut": "0x...", "amountIn": "1000000000000000000" }] }');
       process.exit(1);
     }
-    const { CHAIN_POOL_CONFIGS } = await import("../recipes/shared/constants");
+    const { CHAIN_POOL_CONFIGS } = await import("../../sdk/src/recipes/shared/constants");
     const configJson = JSON.parse(readFileSync(configPath, "utf-8"));
     const chains = configJson.chains.map((c: any) => ({
       ...c,
       amountIn: BigInt(c.amountIn),
       poolConfig: c.poolConfig ?? CHAIN_POOL_CONFIGS[c.name] ?? undefined,
     }));
-    const { terraSwap } = await import("../recipes/terraswap/index");
+    const { terraSwap } = await import("../../sdk/src/recipes/terraswap/index");
     const result = await terraSwap({ chains }, PRIVATE_KEY);
 
     console.log("\n========================================");
@@ -303,7 +305,7 @@ async function main() {
   let bytecodes: Hex[];
 
   if (recipeName === "megaswap") {
-    const { megaSwap } = await import("../recipes/megaswap/index");
+    const { megaSwap } = await import("../../sdk/src/recipes/megaswap/index");
     const result = await megaSwap(
       { tokenIn, tokenOut, amountIn },
       rpcUrl,
@@ -321,7 +323,7 @@ async function main() {
     console.log(`  Step size: ${result.prepared.stepSize}`);
     console.log(`  Expected output: ${result.prepared.expectedOutput}`);
   } else if (recipeName === "alphaswap") {
-    const { alphaSwap } = await import("../recipes/alphaswap/index");
+    const { alphaSwap } = await import("../../sdk/src/recipes/alphaswap/index");
     const result = await alphaSwap(
       { tokenIn, tokenOut, amountIn },
       rpcUrl,
@@ -341,7 +343,7 @@ async function main() {
       console.log(`    via ${r.intermediateToken.slice(0, 10)}...`);
     }
   } else if (recipeName === "gigaswap") {
-    const { gigaSwap } = await import("../recipes/gigaswap/index");
+    const { gigaSwap } = await import("../../sdk/src/recipes/gigaswap/index");
     const result = await gigaSwap(
       { tokenIn, tokenOut, amountIn },
       rpcUrl,
@@ -371,7 +373,7 @@ async function main() {
     console.log(`  Global price limit: ${result.prepared.globalPriceLimit}`);
     console.log(`  Direction: ${result.prepared.zeroForOne ? "zeroForOne" : "oneForZero"}`);
   } else if (recipeName === "ecoswap") {
-    const { ecoSwap } = await import("../recipes/ecoswap/index");
+    const { ecoSwap } = await import("../../sdk/src/recipes/ecoswap/index");
     const result = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       rpcUrl,

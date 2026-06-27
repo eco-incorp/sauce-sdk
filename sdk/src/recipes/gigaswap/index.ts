@@ -1,8 +1,8 @@
 /**
- * AlphaSwap recipe entry point.
+ * GigaSwap recipe entry point.
  *
- * Off-chain:  discover pools via factory multicalls (fast, no quoting)
- * On-chain:   read liquidity, split by depth, execute swaps (SauceScript)
+ * Off-chain:  quote-based depth measurement → proportional split → global price limit
+ * On-chain:   series 1 (splits + price limit) → series 2 (leftover sweep)
  */
 
 import { createPublicClient, http, defineChain, type Hex } from "viem";
@@ -12,9 +12,9 @@ import { fileURLToPath } from "url";
 import { readFileSync } from "fs";
 import ts from "typescript";
 
-import { prepareAlphaSwap } from "./prepare.js";
-import { MULTICALL3, SwapPoolType } from "../shared/constants.js";
-import type { AlphaSwapConfig, AlphaSwapPrepared, PoolInfo, DiscoveredMultiHopRoute } from "../shared/types.js";
+import { prepareGigaSwap } from "./prepare.js";
+import { MULTICALL3 } from "../shared/constants.js";
+import type { GigaSwapConfig, GigaSwapPrepared, DiscoveredMultiHopRoute } from "../shared/types.js";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler");
@@ -35,25 +35,28 @@ function stripTypes(source: string): string {
   }).outputText;
 }
 
-export interface AlphaSwapOutput {
+export interface GigaSwapOutput {
   /** Compiled bytecodes ready for cook() */
   bytecodes: Hex[];
-  /** Discovered pool data (no quotes — decisions are on-chain) */
-  prepared: AlphaSwapPrepared;
+  /** Prepared pool data with splits and price limit */
+  prepared: GigaSwapPrepared;
   /** Generated SauceScript source (for debugging) */
   source: string;
 }
 
 /**
- * Build a pool tuple: [poolType, poolAddress, fee, tickSpacing, hooks]
+ * Build a direct pool tuple:
+ * [poolType, poolAddress, fee, tickSpacing, hooks, splitAmount, preSqrtPrice]
  */
-function buildPoolTuple(p: PoolInfo): bigint[] {
+function buildDirectPoolTuple(p: { pool: { address: Hex; fee: number; poolType: number; sqrtPriceX96: bigint }; splitAmount: bigint }): bigint[] {
   return [
-    BigInt(p.poolType),
-    BigInt(p.address),
-    BigInt(p.fee),
+    BigInt(p.pool.poolType),
+    BigInt(p.pool.address),
+    BigInt(p.pool.fee),
     0n,  // tickSpacing (0 for V3)
     0n,  // hooks (0 for V3)
+    p.splitAmount,
+    p.pool.sqrtPriceX96,  // pre-swap price for series 2 depth measurement
   ];
 }
 
@@ -61,38 +64,41 @@ function buildPoolTuple(p: PoolInfo): bigint[] {
  * Build a multi-hop route tuple:
  * [intermediateToken,
  *  hop1PoolType, hop1Pool, hop1Fee, hop1TickSpacing, hop1Hooks,
- *  hop2PoolType, hop2Pool, hop2Fee, hop2TickSpacing, hop2Hooks]
+ *  hop2PoolType, hop2Pool, hop2Fee, hop2TickSpacing, hop2Hooks,
+ *  splitAmount, hop1PreSqrtPrice]
  */
-function buildMultiHopTuple(r: DiscoveredMultiHopRoute): bigint[] {
+function buildMultiHopTuple(r: { route: DiscoveredMultiHopRoute; splitAmount: bigint }): bigint[] {
   return [
-    BigInt(r.intermediateToken),
-    BigInt(r.hop1Pool.poolType),
-    BigInt(r.hop1Pool.address),
-    BigInt(r.hop1Pool.fee),
+    BigInt(r.route.intermediateToken),
+    BigInt(r.route.hop1Pool.poolType),
+    BigInt(r.route.hop1Pool.address),
+    BigInt(r.route.hop1Pool.fee),
     0n,  // hop1 tickSpacing
     0n,  // hop1 hooks
-    BigInt(r.hop2Pool.poolType),
-    BigInt(r.hop2Pool.address),
-    BigInt(r.hop2Pool.fee),
+    BigInt(r.route.hop2Pool.poolType),
+    BigInt(r.route.hop2Pool.address),
+    BigInt(r.route.hop2Pool.fee),
     0n,  // hop2 tickSpacing
     0n,  // hop2 hooks
+    r.splitAmount,
+    r.route.hop1Pool.sqrtPriceX96,  // hop1 pre-swap price for series 2
   ];
 }
 
 /**
- * Prepare and compile an AlphaSwap.
+ * Prepare and compile a GigaSwap.
  *
  * @param config - Swap configuration (tokenIn, tokenOut, amountIn)
- * @param rpcUrl - RPC URL for pool discovery
- * @param sauceRouterAddress - Deployed SauceRouter address (unused; kept for API compat)
+ * @param rpcUrl - RPC URL for the chain
+ * @param sauceRouterAddress - Deployed SauceRouter address
  * @param caller - Address that will call cook() (for transferFrom)
  */
-export async function alphaSwap(
-  config: AlphaSwapConfig,
+export async function gigaSwap(
+  config: GigaSwapConfig,
   rpcUrl: string,
   sauceRouterAddress: Hex,
   caller: Hex,
-): Promise<AlphaSwapOutput> {
+): Promise<GigaSwapOutput> {
   // Fetch chain ID and create client with multicall support
   const tempClient = createPublicClient({ transport: http(rpcUrl) });
   const chainId = await tempClient.getChainId();
@@ -108,21 +114,22 @@ export async function alphaSwap(
     transport: http(rpcUrl, { timeout: 120_000 }),
   });
 
-  // Off-chain: discover pools (no quoting)
-  const prepared = await prepareAlphaSwap(config, client);
+  // Off-chain: discover, quote, split, derive price limit
+  const prepared = await prepareGigaSwap(config, client, sauceRouterAddress);
 
   console.log(
-    `  Discovered: ${prepared.directPools.length} direct pools, ${prepared.multiHopRoutes.length} multi-hop routes`,
+    `  GigaSwap: ${prepared.priceLimitedPools.length} V3 pools, ` +
+      `${prepared.noLimitPools.length} V2 pools, ` +
+      `${prepared.multiHopRoutes.length} multi-hop routes`,
   );
 
   // Read static SauceScript (no source manipulation!)
-  const source = readFileSync(join(__dirname, "alphaswap.sauce.ts"), "utf-8");
-
-  // Strip TypeScript types for the transpiler (it parses JS)
+  const source = readFileSync(join(__dirname, "gigaswap.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
 
   // Build pool data as arrays of tuples for compile args
-  const directPoolTuples = prepared.directPools.map(buildPoolTuple);
+  const priceLimitedTuples = prepared.priceLimitedPools.map(buildDirectPoolTuple);
+  const noLimitTuples = prepared.noLimitPools.map(buildDirectPoolTuple);
   const multiHopTuples = prepared.multiHopRoutes.map(buildMultiHopTuple);
 
   // Compile to Sauce bytecodes — pool data passed as function args
@@ -133,8 +140,10 @@ export async function alphaSwap(
       config.tokenOut,                        // tokenOut: Address
       config.amountIn,                        // amountIn: Uint256
       caller,                                 // caller: Address
-      directPoolTuples,                       // directPools: Tuple of Tuples
+      priceLimitedTuples,                     // priceLimitedPools: Tuple of Tuples (V3/V4)
+      noLimitTuples,                          // noLimitPools: Tuple of Tuples (V2/Solidly)
       multiHopTuples,                         // multiHopRoutes: Tuple of Tuples
+      prepared.globalPriceLimit,              // globalPriceLimit: Uint256
     ],
   });
 

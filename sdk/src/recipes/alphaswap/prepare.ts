@@ -1,7 +1,7 @@
 /**
  * AlphaSwap off-chain preparation.
  *
- * Only discovers pools -- all runtime decisions (liquidity measurement,
+ * Only discovers pools — all runtime decisions (liquidity measurement,
  * amount splitting) happen on-chain in the generated SauceScript.
  *
  * Off-chain:  pool discovery via factory multicalls
@@ -22,7 +22,7 @@ import type {
 const MIN_LIQUIDITY = 10n ** 13n;
 
 /**
- * Discover pools for an AlphaSwap. No quoting -- all intelligence is on-chain.
+ * Discover pools for an AlphaSwap. No quoting — all intelligence is on-chain.
  */
 export async function prepareAlphaSwap(
   config: AlphaSwapConfig,
@@ -32,7 +32,7 @@ export async function prepareAlphaSwap(
   const inLower = tokenIn.toLowerCase();
   const outLower = tokenOut.toLowerCase();
 
-  // Step 1: Discover direct pools (tokenIn -> tokenOut)
+  // Step 1: Discover direct pools (tokenIn → tokenOut)
   const allDirect = await discoverPools(tokenIn, tokenOut, client);
   const directPools = allDirect.filter((p) => p.liquidity >= MIN_LIQUIDITY);
 

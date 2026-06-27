@@ -6,26 +6,21 @@
  */
 
 import { createPublicClient, http, defineChain, type Hex } from "viem";
-import { readFileSync } from "fs";
+import { createRequire } from "module";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { readFileSync } from "fs";
 import ts from "typescript";
-import { compile as _compile } from "../../../../compiler/dist/index.js";
 
 import { prepareMegaSwap } from "./prepare.js";
 import { MULTICALL3, SwapPoolType } from "../shared/constants.js";
 import type { MegaSwapConfig, MegaSwapResult } from "../shared/types.js";
 
-// The full compiler (compiler-poc) supports args/bytecodes beyond the published types.
-type ArgValue = string | bigint | bigint[][] | bigint[];
-type FullCompile = (source: string, options?: {
-  args?: ArgValue[];
-  baseDir?: string;
-  [k: string]: unknown;
-}) => { bytecodes: Uint8Array[]; bytecode: Uint8Array; warnings: string[] };
-const compile = _compile as unknown as FullCompile;
+const require = createRequire(import.meta.url);
+const { compile } = require("@eco-incorp/sauce-compiler");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, "..", "..");
 
 function toHex(bytes: Uint8Array): Hex {
   return ("0x" + Buffer.from(bytes).toString("hex")) as Hex;
@@ -101,8 +96,9 @@ export async function megaSwap(
   // Build pools array as array of tuples for compile args
   const poolTuples = prepared.pools.map(buildPoolTuple);
 
-  // Compile to Sauce bytecodes -- pool data passed as function args
+  // Compile to Sauce bytecodes — pool data passed as function args
   const result = compile(jsSource, {
+    baseDir: REPO_ROOT,
     args: [
       config.tokenIn,              // tokenIn: Address
       config.tokenOut,             // tokenOut: Address

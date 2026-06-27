@@ -100,13 +100,15 @@ wraps, stakes) to bytecode. Actions **chain**: output feeds the next implicitly 
 `saveOutputAs`/`amountRef`. See `actions/AMM_SWAP_INTERFACES.md`.
 
 **`dev-tools/`** — harness: `start:local`/`start:fork` boot a hardhat net + deploy the engine;
-`npm run sauce <file.js> [args]` compiles+runs a SauceScript; `npm run recipe …` runs recipes.
+`npm run sauce <file.js> [args]` compiles+runs a SauceScript; `npm run recipe …` runs recipes (the
+runner imports them from the canonical `sdk/src/recipes/` tree). The recipes themselves now live in
+`sdk/` — dev-tools keeps only the CLI runner + the local hardhat env. See **Recipes** below.
 
 ## The swap Router (`../sauce/engine/src/Router.sol`)
 
 Lives in the **private engine repo**, not here, but recipes target it (its `Router`/`SauceRouter`
 artifacts are what `cook()` runs against). `SauceRouter` is a thin delegatecall proxy → `Router`
-(`~1218` lines). Recipes import the minimal `ISauceRouter` ABI from `dev-tools/artifacts/`.
+(`~1218` lines). Recipes import the minimal `ISauceRouter` ABI from `sdk/src/artifacts/`.
 
 **Entry points** (all the `swap*` ones are `onlySelf` — callable only via `cook()` from the same
 contract, so a recipe calls them as `ISauceRouter.at(address.self).swapX(...)`):
@@ -144,19 +146,22 @@ BalancerV2=4, DODOV2=5, TraderJoeLB=6, MaverickV2=7, WOOFi=8`.
 
 ## Recipes
 
-A recipe prepares pool data off-chain and executes it on-chain via one `cook()`. **Recipes exist in
-two drifted trees:**
-
-- `sdk/src/recipes/` — published library copy (`megaswap`, `alphaswap`), **untested**, behind dev-tools.
-- `dev-tools/recipes/` — source of truth (`megaswap`, `alphaswap`, `gigaswap`, `terraswap`), with the
-  CLI runner and fork tests. **Trust this tree.**
+A recipe prepares pool data off-chain and executes it on-chain via one `cook()`. **Recipes live in ONE
+canonical tree: `sdk/src/recipes/`** (`megaswap`, `alphaswap`, `gigaswap`, `terraswap`, `ecoswap` + the
+full test suite + harness + fixtures). This is the published `/recipes` export (and is re-exported from
+the sdk's main entry). The dev-tools package keeps only the **runner CLI** (`scripts/recipe.ts`,
+`scripts/run.ts`, the start/stop shell scripts), which imports the recipes from the sdk tree by source
+path (`../../sdk/src/recipes/…`, run via tsx). *(Historical note: the recipes used to live at
+`dev-tools/recipes/`, with an older drifted copy under `sdk/src/recipes/`; the dev-tools tree was moved
+in and is now the single source of truth.)*
 
 Each recipe dir: `prepare.ts` (off-chain read-only RPC — discover/quote pools, compute slippage),
 `<name>.sauce.ts` (a **static** SauceScript template — not string-interpolated; read from disk, types
 stripped via `ts.transpileModule`, pool data passed as compiler **`args`**), `index.ts` (orchestrator:
 client → prepare → compile → `{ bytecodes, prepared, source }`), `shared/` (pool-discovery, quoting,
-constants, types). **The compiler must be built first** — sdk recipes import it by relative `dist`
-path, dev-tools recipes via the `@eco-incorp/sauce-compiler` workspace dep.
+constants, types). **The compiler must be built first** — recipes resolve it via the
+`@eco-incorp/sauce-compiler` workspace dep (added to `sdk`); the fast compile tests import its built
+`dist` by relative path.
 
 **EcoSwap single-pass (this branch).** EcoSwap's on-chain solver is now a **single-pass array-mutation**
 water-fill: it allocates real arrays (`new Array`, no register banks) and sweeps brackets to a live cut.
@@ -173,47 +178,68 @@ relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the sole liquidit
 ### Running recipes against a fork / RPC (in `dev-tools/`)
 
 ```sh
-pnpm sync-artifacts                                          # populate dev-tools/artifacts/ (once)
+pnpm sync-artifacts                                          # populate sdk/src/artifacts/ (once)
 npm run start:fork https://eth-mainnet.g.alchemy.com/v2/KEY  # boot fork + deploy, writes .deployment.json
 npm run recipe megaswap WETH USDC 1
 npm run stop
 npm run recipe megaswap WETH USDC 0.01 -- --network base     # live: hardcoded router + BASE_RPC_URL + PRIVATE_KEY
 ```
 
-`scripts/recipe.ts` reads `.deployment.json`, auto-wraps ETH→WETH, auto-approves the router,
-prepares+compiles, `cook()`s, and parses `Transfer` logs. Tokens: `WETH/USDC/DAI/USDbC` or raw `0x`.
+`dev-tools/scripts/recipe.ts` (the CLI runner) imports the recipes from `sdk/src/recipes/`, reads
+`.deployment.json`, auto-wraps ETH→WETH, auto-approves the router, prepares+compiles, `cook()`s, and
+parses `Transfer` logs. Tokens: `WETH/USDC/DAI/USDbC` or raw `0x`.
 
 ### Artifacts
 
-`dev-tools/artifacts/*.json` (gitignored build output) are read by recipes (`quoting.ts`, the
-`.sauce.ts` JSON imports) and `deploy.ts` (`Router`/`SauceRouter` carry deploy bytecode). Populate
-them with **`pnpm sync-artifacts`**, which copies the `sauce` engine's Foundry build output (`forge
-build` runs in the compiler `postinstall`). `sync-artifacts` now **also ships `V12Kitchen`/`V12Pot` +
-the Huff runtime creation-code snapshot** (for the dual-engine v12 test path). This also runs
-automatically at **`prepack`** so the published package ships them.
+`sdk/src/artifacts/*.json` (gitignored build output) are the **canonical** engine artifacts, read by the
+recipes (`quoting.ts`, the `.sauce.ts` JSON imports — resolved via each recipe's `REPO_ROOT` = `sdk/src`)
+and by dev-tools' `deploy.ts` + start scripts (`Router`/`SauceRouter` carry deploy bytecode). Populate
+them with **`pnpm sync-artifacts`** (`dev-tools/scripts/sync-artifacts.js`), which copies the `sauce`
+engine's Foundry build output (`forge build` runs in the compiler `postinstall`) into `sdk/src/artifacts/`.
+`sync-artifacts` **also ships `V12Kitchen`/`V12Pot` + the Huff runtime creation-code snapshot** (for the
+dual-engine v12 test path). It runs automatically at **`prepack`** so the published package ships them
+(root `package.json` `files` lists `sdk/src/artifacts`).
+
+**Dist runtime assets (published-recipe completeness).** `tsc` compiles the recipe `.ts` to
+`sdk/dist/recipes/` but does NOT emit the assets the recipes read at *runtime*: the `.sauce.ts` templates
+(`readFileSync(join(__dirname, "<n>.sauce.ts"))`), the checked-in sibling ABI `*.json` (the `.sauce.ts`
+`import`s them, resolved by the compiler's `baseDirs:[REPO_ROOT,__dirname]`), and `./artifacts/*.json`
+(`REPO_ROOT = join(__dirname,"..","..")` = `dist` when running from `dist/recipes/<n>/`). So sdk's `build`
+is **`tsc && node scripts/copy-recipe-assets.mjs`**: the copy step mirrors `src/recipes/**/*.{sauce.ts,json}`
+→ `dist/recipes/` (excluding `test/`) and `src/artifacts/*.json` → `dist/artifacts/`. `prepack` runs
+`sync-artifacts` THEN the copy, so the tarball's `dist/artifacts` is fresh. Recipe relative imports MUST
+carry the `.js` extension (Node-ESM requirement; the dev-tools tree was authored extensionless and was fixed
+on the move) or the published `dist/recipes/index.js` barrel fails to import. The dist-resolution smoke
+(`src/recipes/test/dist-resolution.smoke.mjs`) guards this: it imports the built barrel and compiles a recipe
+from `dist` with the recipe's own dist `baseDirs`.
 
 ### Recipe tests
 
-Three tiers under `dev-tools/recipes/test/`, all using the **node:test** runner (`tsx --test`) except
-the legacy fork tests:
+Three tiers under `sdk/src/recipes/test/`, all using the **node:test** runner (`tsx --test`) except the
+legacy fork tests. Run from the **sdk** workspace: `pnpm --filter './sdk' test:recipes` (fast) /
+`test:recipes:evm` (anvil). The `test/` tree is in-repo only — it is excluded from publish via **`files`
+negation** in the root `package.json` (`"!sdk/src/recipes/test"`, `"!sdk/src/recipes/test/**"`) so the
+~5 MB anvil-state fixtures don't ship; recipe SOURCE does ship under `sdk/src/recipes`. (Note: a root
+`.npmignore` does NOT work here — when `files` whitelists `sdk/src/recipes`, npm ignores `.npmignore` for
+those paths, so the `!`-negation entries in `files` are the mechanism.)
 
-1. **Fast, no-network (`npm run test:recipes`, also part of `npm test`)** — `compile.test.ts` +
-   `ecoswap.compile.test.ts` (compile all 4 drifted recipes + ecoswap to bytecode) and
+1. **Fast, no-network (`pnpm --filter './sdk' test:recipes`)** — `compile.test.ts` +
+   `ecoswap.compile.test.ts` (compile all 4 flat recipes + ecoswap to bytecode) and
    `ecoswap.math.test.ts` (pure-bigint known-answer math: TickMath `getSqrtRatioAtTick`, fee-adjust,
    V2≡V3-bracket unification, water-fill conservation/interior-cut via the `ecoswap.reference.ts`
    oracle). No anvil, no RPC.
-2. **Local EVM simulation (`npm run test:recipes:evm`)** — `*.evm.test.ts`. Boots a fresh **anvil (NO
+2. **Local EVM simulation (`pnpm --filter './sdk' test:recipes:evm`)** — `*.evm.test.ts`. Boots a fresh **anvil (NO
    fork)**, etches Multicall3, deploys the **real** `@uniswap/v3-core` Factory + the Sauce engine
    (`Router`→`SauceRouter`), mints our own concentrated liquidity across ticks via a `V3LiquidityHelper`,
    then runs the compiled recipe through `cook()` and asserts the split + marginal-price equalization,
    cross-checked against the `ecoswap.reference.ts` oracle. The script first `forge build`s the Solidity
-   fixtures (`recipes/test/fixtures/`: `MintableERC20`, `V3LiquidityHelper`, `V2Pair`/`V2Factory`,
+   fixtures (`src/recipes/test/fixtures/`: `MintableERC20`, `V3LiquidityHelper`, `V2Pair`/`V2Factory`,
    `V4LiquidityHelper`) — **Foundry required**. EcoSwap executes **V2, V3 and V4**: V3 via flat
    `swapV3`; V2/V4 via the unified `swap(SwapParams)` (nested `PoolKey`, negative `amountSpecified`).
    `ecoswap.evm.test.ts` covers V3 splits, a V2+V3 mix (canonical pair runtime **etched** + funded),
    solo V4 and a V3+V4 split (**real Base PoolManager + StateView runtime etched at their canonical
    addresses** — StateView bakes the PoolManager address as an immutable, so both must sit at the real
-   addresses; runtime captured by `recipes/test/harness/v4-bytecode-snapshot.ts`, checked in at
+   addresses; runtime captured by `src/recipes/test/harness/v4-bytecode-snapshot.ts`, checked in at
    `fixtures/snapshots/v4-bytecode.json`).
    **Dual-engine (this branch):** `ecoswap.evm.test.ts` Phase 3 is parametrized
    the **single-pass solver × {v1, v12}**; the v12 cells deploy the V12 stack (`deployV12Stack`) and cook
@@ -246,22 +272,22 @@ the legacy fork tests:
    (v12 Σ≈4701→floor≈47.01→Pancake-100 **kept**, 4 survivors; v1 Σ≈4741→floor≈47.41→**dropped**, 3
    survivors), so the test asserts the 3 unambiguous survivors strictly and treats Pancake-100 as the
    documented engine-dependent borderline. (Verify per-pool capacity with `npx tsx
-   recipes/test/harness/lens-capacity-probe.ts`, which loads the cached state + replays the lens's
+   src/recipes/test/harness/lens-capacity-probe.ts`, which loads the cached state + replays the lens's
    capacity walk off-chain.) Survivors are fully reconstructed (real tick profiles); droppees are
    light-minted at real price + real active L.
-   Recapture the prod SNAPSHOTS with `BASE_RPC_URL=<url> npx tsx recipes/test/harness/<x>-snapshot.ts`
+   Recapture the prod SNAPSHOTS with `BASE_RPC_URL=<url> npx tsx src/recipes/test/harness/<x>-snapshot.ts`
    (V3/Pancake take an optional source-tag arg → `base-WETHUSDC-pancake<fee>.json`).
    **Anvil-state cache (fast setup).** Reconstruction is deterministic given the engine artifacts +
    snapshots, so each prod-mirror `before()` reconstructs ONCE per engine, dumps the full anvil state
    (`anvil_dumpState`) + a small manifest to a CHECKED-IN blob under
-   `recipes/test/fixtures/anvil-state/<fixture>-<engine>.{state.json.gz,manifest.json}` (NOT gitignored
+   `src/recipes/test/fixtures/anvil-state/<fixture>-<engine>.{state.json.gz,manifest.json}` (NOT gitignored
    — CI + fresh clones load it), and on later runs `anvil_loadState`s it in **seconds** (the whole
    prod-mirror lane: ~50 min → ~42 s/engine) and pins `block.timestamp` (kills the `evm_revert` oracle
-   drift). Shared harness: `recipes/test/harness/state-cache.ts` (`withCachedState`); anvil boots with
+   drift). Shared harness: `src/recipes/test/harness/state-cache.ts` (`withCachedState`); anvil boots with
    `--no-request-size-limit` (the ~2.5 MB loadState payload exceeds anvil's default 2 MB body limit).
    **RECAPTURE is REQUIRED whenever the engine artifacts OR the reconstruction change** (the blob bakes
    in the engine bytecode + the reconstructed pools): `RECAPTURE_ANVIL_STATE=1 npx tsx --test
-   recipes/test/<fixture>.prodmirror.evm.test.ts` (and `ECO_ENGINE=v1 …` for the v1 blob). A fresh
+   src/recipes/test/<fixture>.prodmirror.evm.test.ts` (and `ECO_ENGINE=v1 …` for the v1 blob). A fresh
    clone with a missing blob recaptures implicitly on first run. Mirrors the snapshots convention.
    Every prod-mirror test ALSO has a **drift / runtime re-anchoring** case: snapshot the reconstructed
    pools, `prepare()`+compile, move a pool's price with a REAL swap (`harness/drift.ts` cooks the one-swap
@@ -271,7 +297,7 @@ the legacy fork tests:
    and still re-anchored to the cut — in the combined test the drifted pool's share shrinks while untouched
    pools keep theirs, i.e. the split adapts at runtime. Drift cases revert to a clean snapshot via viem's
    `testClient` (anvil `evm_snapshot`/`evm_revert`) so they prepare against the same pools as the no-drift run.
-   The harness lives in `recipes/test/harness/`. Why local pools work: the engine `Router` authenticates
+   The harness lives in `src/recipes/test/harness/`. Why local pools work: the engine `Router` authenticates
    V3 swap callbacks via transient storage (`expectedPool`), not a hardcoded factory/CREATE2 check, and
    V4 callbacks via the in-flight PoolManager — so non-canonical locally-deployed/etched pools are
    accepted. EcoSwap discovery is config-injectable — `ecoSwap(config, rpcUrl, sauceRouter, caller,
@@ -284,8 +310,8 @@ the legacy fork tests:
 3. **Fork tests (manual)** — `{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests
    (plain `tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router,
    fund/approve, `prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run
-   manually (`BASE_RPC_URL=<url> npx tsx recipes/test/megaswap.test.ts`). `terraswap` has no test; sdk
-   recipes have no tests.
+   manually (`BASE_RPC_URL=<url> npx tsx src/recipes/test/megaswap.test.ts` from `sdk/`). `terraswap` has
+   no fork test. These spawn `hardhat node` from `dev-tools/` (where the hardhat config + fork env live).
 
 ## Publishing
 

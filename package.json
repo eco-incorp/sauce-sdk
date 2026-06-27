@@ -53,11 +53,13 @@
     "sdk/src/skills",
     "sdk/src/protocols",
     "sdk/src/recipes",
+    "!sdk/src/recipes/test",
+    "!sdk/src/recipes/test/**",
+    "sdk/src/artifacts",
     "actions/dist",
     "dev-tools/scripts",
     "dev-tools/src",
     "dev-tools/sauce",
-    "dev-tools/artifacts",
     "dev-tools/hardhat.config.cjs",
     "dev-tools/README.md"
   ],
@@ -66,7 +68,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "format": "pnpm -r --if-present format",
-    "prepack": "node dev-tools/scripts/sync-artifacts.js"
+    "prepack": "node dev-tools/scripts/sync-artifacts.js && node sdk/scripts/copy-recipe-assets.mjs"
   },
   "dependencies": {
     "acorn": "^8.15.0",
