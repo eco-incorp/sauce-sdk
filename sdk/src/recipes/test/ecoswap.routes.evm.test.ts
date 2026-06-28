@@ -48,7 +48,6 @@ import {
   engineCells,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { EcoBracketKind, type EcoPool, type PoolInfo } from "../shared/types";
@@ -174,7 +173,7 @@ describe("EcoSwap multi-hop route (tokenIn -> base -> tokenOut, V3 hops)", () =>
     const caller = c.account0;
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
       caller, poolConfig, undefined, engine,
     );
 

@@ -140,17 +140,24 @@ describe("ecoswap.lens.sauce.ts", () => {
   const STEP_10 = 79232123823359799118286999567n; // sqrt(1.0001^10)*2^96 (fee 500)
   const STEP_60 = 79426470787362580746886972461n; // sqrt(1.0001^60)*2^96 (fee 3000)
 
-  function compileLens(zeroForOne: bigint) {
+  // main(cfg, v3Factories, v3FeeTiers, v2Factories, v4Factories, v4Specs, v4PoolIds):
+  // the 7 SCALARS bundled into one `cfg` tuple (the EXACT shape lens.ts builds) + the
+  // 6 tuple-of-tuples params kept separate. Bundling only the scalars clears the v12
+  // SDUP16 overflow (13 separate params → "REF position out of range") while keeping
+  // the tuple params at the depth-2 access that round-trips on BOTH engines (folding
+  // them into cfg would make a depth-3 nested-arg var read that reverts INDEX on v1).
+  // Compile both targets.
+  function compileLens(zeroForOne: bigint, target: "v1" | "v12") {
     const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
     const result: any = compile(stripTypes(source), {
       baseDirs: [REPO_ROOT, RECIPE_DIR],
-      // SAME 13-arg lazy shape lens.ts passes (no absolute floor — relative-depth
-      // minRelBps is the sole liquidity gate):
-      //   tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minRelBps,maxTicks,
-      //   v3Factories,v3FeeTiers[fee,stepRatio],v2Factories,v4Factories,v4Specs[fee,ts,stepRatio],v4PoolIds
+      target,
+      // cfg[0..6]: tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minRelBps,maxTicks
+      //   (no absolute floor — relative-depth minRelBps is the sole liquidity gate),
+      //   then v3Factories,v3FeeTiers[fee,stepRatio],v2Factories,v4Factories,
+      //   v4Specs[fee,ts,stepRatio],v4PoolIds as separate tuple params.
       args: [
-        TOKEN_IN, TOKEN_OUT, zeroForOne,
-        1000n, 2n, 100n, 96n,
+        [TOKEN_IN, TOKEN_OUT, zeroForOne, 1000n, 2n, 100n, 96n],
         [[FACTORY]],                       // v3Factories
         [[500n, STEP_10], [3000n, STEP_60]], // v3FeeTiers [fee, stepRatio]
         [[V2_FACTORY]],                    // v2Factories
@@ -162,15 +169,17 @@ describe("ecoswap.lens.sauce.ts", () => {
     return result.bytecode ?? result.bytecodes;
   }
 
-  it("compiles the lens for zeroForOne (price-down tick walk)", () => {
-    const segments: Uint8Array[] = compileLens(1n);
-    assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
-    for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
-  });
+  for (const target of ["v1", "v12"] as const) {
+    it(`compiles the lens for zeroForOne (price-down tick walk) [${target}]`, () => {
+      const segments: Uint8Array[] = compileLens(1n, target);
+      assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
+      for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
+    });
 
-  it("compiles the lens for oneForZero (price-up tick walk)", () => {
-    const segments: Uint8Array[] = compileLens(0n);
-    assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
-    for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
-  });
+    it(`compiles the lens for oneForZero (price-up tick walk) [${target}]`, () => {
+      const segments: Uint8Array[] = compileLens(0n, target);
+      assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
+      for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
+    });
+  }
 });

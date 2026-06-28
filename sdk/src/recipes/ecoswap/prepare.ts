@@ -74,22 +74,23 @@ const OFFSET_TICK = 888000;
 const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
  * Tick boundaries scanned per V3 pool in the swap direction (fetch window).
- * Fetched generously by the lens in one eth_call; the ladder is then TRIMMED to the ticks
- * the trade actually crosses (see SAFETY_TICKS), so on-chain gas/calldata scale
- * with trade size, not with this window. Must be wide enough to reach the cut
- * for the largest expected trade.
+ * Fetched generously by the lens in one eth_call; the ladder is then TRIMMED to EXACTLY
+ * the ticks the trade crosses (WS2: no safety buffer — the on-chain solver reads any
+ * runtime drift LIVE), so on-chain gas/calldata scale with trade size, not this window.
+ * Must be wide enough to reach the cut for the largest expected trade.
  */
 const V3_TICK_STEPS = 96;
-/** Geometric brackets emitted per V2 pool (also trimmed to crossed + safety). */
+/** Geometric brackets emitted per V2 pool (also trimmed to exactly the crossed range). */
 const V2_BRACKETS = 16;
 /** Cap on direct pools (top-N by liquidity) — bounds on-chain loop + calldata. */
 const MAX_DIRECT_POOLS = Number(process.env.ECO_MAX_POOLS ?? 12);
 /**
- * Per-pool safety margin: after the off-chain water-fill determines how many
- * brackets each pool crosses, keep this many EXTRA brackets just past the cut so
- * a pool can fill slightly deeper than estimated if live prices drift at runtime.
+ * Forward drift buffer (extra lens tick boundaries past the cut) for ROUTE hops ONLY.
+ * Direct pools use 0 (the on-chain pre-fill + forward walk read drift live), but routes
+ * compose off-chain via localQuote and execute in one flat swapV3 per hop with no live
+ * walk, so their prepared bracket curve must extend slightly past the sampled amountIn.
  */
-const SAFETY_TICKS = 2;
+const ROUTE_DRIFT_TICKS = 2;
 /** Always keep at least this many brackets (so tiny trades still split sensibly). */
 const MIN_BRACKETS = 8;
 /** Per-bracket price step for V2 discretisation (~0.5% per bracket in sqrt). */
@@ -119,6 +120,10 @@ const ADAPTIVE_SEED_INIT = {
   adaptiveNearReal: 0n,
   adaptiveStartL: 0n,
   adaptiveStepRatio: 0n,
+  // Pre-fill (against-swap drift) seeds — buildV3Brackets overwrites for V3/V4 pools
+  // with a prepared window; V2 keeps these zeros (no pre-fill, no tick frontier).
+  topNearReal: 0n,
+  bracketCount: 0,
 } as const;
 
 // ── Math helpers ─────────────────────────────────────────────
@@ -304,28 +309,11 @@ function buildV3Brackets(
   const base = Math.floor(r.tick / ts) * ts;
   const spotReal = r.pool.sqrtPriceX96;
 
-  // ── Reverse-side brackets (above spot; capacity 0, drift-only) ──
-  let Lr = r.activeLiquidity; // active L applies across the spot bucket [base, base+ts]
-  let innerReal = spotReal; // far (lower-out/in) edge of the current reverse bracket
-  let rb = zeroForOne ? base + ts : base; // first reverse boundary
-  const rstep = zeroForOne ? ts : -ts;
-  for (let k = 0; k < r.scannedReverse; k++) {
-    const outerReal = getSqrtRatioAtTick(rb); // farther-from-spot edge
-    const a = toOutIn(innerReal, zeroForOne);
-    const c = toOutIn(outerReal, zeroForOne);
-    const near = a > c ? a : c;
-    const far = a > c ? c : a;
-    if (Lr > 0n && far > 0n && near > far) {
-      const rev = makeBracket(EcoBracketKind.V3, refIdx, near, far, Lr, feePpm);
-      rev.capacity = 0n; // excluded from the water-fill cut; used only by Phase B re-anchoring
-      brackets.push(rev);
-    }
-    const net = r.net.get(rb) ?? 0n;
-    Lr = zeroForOne ? Lr + net : Lr - net; // reverse crossing is the mirror of forward
-    if (Lr < 0n) Lr = 0n;
-    innerReal = outerReal;
-    rb += rstep;
-  }
+  // WS2 §3.2: the capacity-0 reverse-side brackets (above spot, drift-only) are GONE.
+  // Against-swap drift is now read LIVE by the on-chain solver's pre-fill (it walks the
+  // gap (topNearOI, liveCur] down from the live tick), so prepare no longer fabricates
+  // reverse brackets. The pre-fill seeds (topNearReal/bracketCount, stamped below) are
+  // computed from the FORWARD loop + spot, so dropping the reverse scan costs nothing.
 
   // ── Forward brackets (swap direction) ──
   // STOP at the lazy lens's scanned forward boundary — never walk past the data
@@ -334,12 +322,14 @@ function buildV3Brackets(
   let nearReal = spotReal; // real sqrt at the near edge (starts live)
   let b = zeroForOne ? base : base + ts; // first boundary tick in swap dir
   const step = zeroForOne ? -ts : ts;
+  let fwdCount = 0; // forward brackets actually emitted (≤ scannedForward; pre-fill seed)
   for (let k = 0; k < r.scannedForward; k++) {
     const farReal = getSqrtRatioAtTick(b);
     const near = toOutIn(nearReal, zeroForOne);
     const far = toOutIn(farReal, zeroForOne);
     if (L > 0n && far > 0n && near > far) {
       brackets.push(makeBracket(EcoBracketKind.V3, refIdx, near, far, L, feePpm));
+      fwdCount++;
     }
     const net = r.net.get(b) ?? 0n;
     L = zeroForOne ? L - net : L + net;
@@ -363,6 +353,28 @@ function buildV3Brackets(
     seed.adaptiveStartShifted = BigInt(b + OFFSET_TICK); // next (un-walked) boundary, shifted
     seed.adaptiveStepRatio = getSqrtRatioAtTick(ts); // == lens stepRatioForSpacing
     seed.adaptiveNet = r.net; // off-chain-only net map for the oracle's mirrored walk
+
+    // Pre-fill (against-swap drift) seeds (WS2 §3.1): the STOP target is the prepare-
+    // time spot real sqrt — stamped == spotReal so the pre-fill's topNearOI
+    // (toOutIn(spotReal)) exactly equals the top forward bracket's sqrtNear (built from
+    // the same spotReal, first forward iteration nearReal=spotReal). bracketCount=0 ⇒
+    // no window ⇒ pre-fill skipped + forward walk runs from spot (no-bracket / quote path).
+    seed.topNearReal = spotReal;
+    seed.bracketCount = fwdCount;
+
+    // Seam invariant (WS2 §3.1, risk 4): toOutIn(topNearReal) must equal the FIRST
+    // forward bracket's sqrtNear so the pre-fill/sweep seam is exact (no overlap/sliver).
+    // The first forward bracket is built with near=toOutIn(spotReal) (first iteration
+    // nearReal=spotReal), so this holds by construction; assert when a bracket exists.
+    if (fwdCount > 0) {
+      const topNearOI = toOutIn(spotReal, zeroForOne);
+      const firstFwd = brackets.find((bk) => bk.capacity > 0n);
+      if (firstFwd && firstFwd.sqrtNear !== topNearOI) {
+        throw new Error(
+          `pre-fill seam: toOutIn(topNearReal)=${topNearOI} !== first forward bracket sqrtNear=${firstFwd.sqrtNear}`,
+        );
+      }
+    }
 
     // bracket-end == adaptive-start assertions (spec §A). Only meaningful once at
     // least one forward boundary was crossed (otherwise nearReal is spot, not a
@@ -574,17 +586,37 @@ export interface EcoSwapPrepareOpts {
    * seed to close the gap.
    */
   maxTicks?: number;
+  /**
+   * Engine target for the on-chain LENS read (the discovery/state/tick eth_call cook).
+   * DEFAULT "v12" — the production engine; the lens is now v12-native (its MEASURE-B
+   * computation + return decode are verified on v12). The lens read is engine-agnostic in
+   * VALUE (same survivors/header on either engine), so this only selects which engine the
+   * read runs on; it MUST match the engine deployed at `lensCookEntry`. Set "v1" for the
+   * legacy SauceRouter path.
+   */
+  lensTarget?: "v1" | "v12";
+  /**
+   * The account to simulate the read-only lens cook from. v1's SauceRouter.cook is open,
+   * so the default sentinel works. On v12 the V12Pot.cook is owner-gated, so the read
+   * MUST originate from the Pot owner — callers pass the cook caller here.
+   */
+  caller?: Hex;
 }
 
 export async function prepareEcoSwap(
   config: EcoSwapConfig,
   client: PublicClient,
-  sauceRouterAddress: Hex,
+  // The LENS cook entrypoint — the engine address the read-only discovery/state/tick
+  // cook() runs against (matches lensTarget): the v1 SauceRouter on v1, the owner's
+  // V12Pot on v12 (the lens is the only on-chain call prepare makes — no separate quote RPC).
+  lensCookEntry: Hex,
   poolConfig: ChainPoolConfig = BASE_CHAIN_POOL_CONFIG,
   opts: EcoSwapPrepareOpts = {},
 ): Promise<EcoSwapPrepared> {
   const minRelBps = opts.minRelBps ?? DEFAULT_MIN_REL_BPS;
   const maxTicks = opts.maxTicks ?? V3_TICK_STEPS;
+  const target = opts.lensTarget ?? "v12";
+  const caller = opts.caller;
   const { tokenIn, tokenOut, amountIn } = config;
   const inLower = tokenIn.toLowerCase();
   const outLower = tokenOut.toLowerCase();
@@ -594,15 +626,19 @@ export async function prepareEcoSwap(
   // ── Discover + read direct pools via the on-chain LENS (ONE eth_call) ──
   // Replaces ~all direct-pool discovery/state/tick/token0 RPCs: the lens runs
   // discovery + slot0/getReserves/StateView + a windowed tick scan inside ONE
-  // read-only cook() eth_call and returns raw reads, decoded into LensPool[].
-  const lensResult = await runLens(client, sauceRouterAddress, poolConfig, {
+  // read-only cook() eth_call and returns raw reads, decoded into LensPool[]. The
+  // lens program is compiled to `target` and cooked through `lensCookEntry` (the
+  // matching engine), simulated from `caller` (the Pot owner on v12).
+  const lensResult = await runLens(client, lensCookEntry, poolConfig, {
     tokenIn,
     tokenOut,
     zeroForOne,
     amountIn,
-    driftTicks: SAFETY_TICKS,
+    driftTicks: 0, // WS2 §3.3: no reverse/forward drift scan — the solver reads drift LIVE.
     minRelBps,
     maxTicks,
+    target,
+    account: caller,
   });
 
   // The LENS is the single source of truth for survivorship: it already applied
@@ -655,14 +691,22 @@ export async function prepareEcoSwap(
     if (bl === inLower || bl === outLower) continue;
     const z1 = inLower < bl;
     const z2 = bl < outLower;
+    // ROUTE hops keep a small forward drift buffer (ROUTE_DRIFT_TICKS): unlike DIRECT
+    // pools, routes execute off-chain-composed in ONE flat swapV3 per hop with NO
+    // on-chain live walk to compensate for an under-reaching window — so the prepared
+    // bracket curve must extend slightly past the sampled amountIn for the off-chain
+    // localQuote composition to track the real two-hop swap to truncation. (Direct
+    // pools use driftTicks:0 because the solver's pre-fill + forward walk read drift live.)
     const [hop1, hop2] = await Promise.all([
-      runLens(client, sauceRouterAddress, poolConfig, {
+      runLens(client, lensCookEntry, poolConfig, {
         tokenIn, tokenOut: baseToken, zeroForOne: z1,
-        amountIn, driftTicks: SAFETY_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
+        amountIn, driftTicks: ROUTE_DRIFT_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
+        target, account: caller,
       }),
-      runLens(client, sauceRouterAddress, poolConfig, {
+      runLens(client, lensCookEntry, poolConfig, {
         tokenIn: baseToken, tokenOut, zeroForOne: z2,
-        amountIn, driftTicks: SAFETY_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
+        amountIn, driftTicks: ROUTE_DRIFT_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
+        target, account: caller,
       }),
     ]);
     // The on-chain route handler executes BOTH hops via flat swapV3, so only V3
@@ -785,10 +829,12 @@ export async function prepareEcoSwap(
   // ── Sort the global ladder DESC by fee-adjusted near price ──
   brackets.sort((a, b) => (a.sqrtAdjNear < b.sqrtAdjNear ? 1 : a.sqrtAdjNear > b.sqrtAdjNear ? -1 : 0));
 
-  // ── Off-chain water-fill pre-run → trim to crossed ticks + safety ──
-  // Walk the sorted ladder accumulating capacity until amountIn is covered. Every
-  // bracket up to that cut is a tick the trade crosses; keep them all, then keep
-  // SAFETY_TICKS extra brackets per crossing pool/route for live-price drift.
+  // ── Off-chain water-fill pre-run → trim to EXACTLY the crossed ticks ──
+  // WS2 §3.2: drop the +SAFETY_TICKS past-cut buffer. Walk the sorted ladder
+  // accumulating capacity until amountIn is covered; keep ONLY brackets[0..cutIdx] (the
+  // ticks the trade actually crosses). Past-window with-swap drift is read LIVE by the
+  // on-chain forward walk (resumed from each pool's frontier seed), and against-window
+  // against-swap drift by the pre-fill — so no prepared safety buffer is needed.
   let covered = 0n;
   let cutIdx = brackets.length - 1;
   for (let i = 0; i < brackets.length; i++) {
@@ -799,35 +845,43 @@ export async function prepareEcoSwap(
     }
   }
 
-  const refKey = (b: EcoBracket) => `${b.kind}:${b.refIdx}`;
-  const crossed = new Set<string>();
-  for (let i = 0; i <= cutIdx; i++) crossed.add(refKey(brackets[i]));
-
-  const extra = new Map<string, number>();
-  const kept: EcoBracket[] = [];
-  for (let i = 0; i < brackets.length; i++) {
-    if (i <= cutIdx) {
-      kept.push(brackets[i]);
-      continue;
-    }
-    const k = refKey(brackets[i]);
-    if (!crossed.has(k)) continue; // don't extend pools the trade never reaches
-    const n = extra.get(k) ?? 0;
-    if (n < SAFETY_TICKS) {
-      kept.push(brackets[i]);
-      extra.set(k, n + 1);
-    }
-  }
+  const kept: EcoBracket[] = brackets.slice(0, cutIdx + 1);
 
   const trimmed =
     kept.length >= MIN_BRACKETS ? kept : brackets.slice(0, Math.min(brackets.length, MIN_BRACKETS));
+
+  // ── V2 constant-L streaming seed (WS2 #104) ──
+  // A V2 pool is a single √k curve over the ENTIRE price range, so the on-chain solver
+  // can stream geometric out/in slices past its prepared window at the LIVE constant L
+  // when it under-fills (with-swap / favorable drift) — the cheap analogue of the V3/V4
+  // tick walk, with NO tick reads. Stamp each V2 pool's frontier = the deepest KEPT V2
+  // bracket's far edge (out/in), so the forward walk resumes EXACTLY where the sweep
+  // stopped (path-additive — no gap, no double-count). adaptiveStartShifted=1 is the
+  // V2-walk enable flag (the solver gates the V2 branch on it); adaptiveNearReal carries
+  // the out/in frontier (NOT a real sqrt — V2 streams in out/in space directly). The
+  // live √k is read on-chain (getReserves), so it is NOT stamped. When a V2 pool got no
+  // kept brackets (shouldn't happen — V2 always anchors a window) the flag stays 0.
+  for (let pi = 0; pi < pools.length; pi++) {
+    const pool = pools[pi];
+    if (!pool.isV2) continue;
+    let deepestFar = 0n; // smallest out/in far among this pool's kept V2 brackets
+    for (const b of trimmed) {
+      if (b.kind === EcoBracketKind.V2 && b.refIdx === pi) {
+        if (deepestFar === 0n || b.sqrtFar < deepestFar) deepestFar = b.sqrtFar;
+      }
+    }
+    if (deepestFar > 0n) {
+      pool.adaptiveStartShifted = 1n; // V2-walk enable flag
+      pool.adaptiveNearReal = deepestFar; // out/in frontier (deepest kept far)
+    }
+  }
 
   const nV4 = pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
   const nV3 = pools.filter((p) => p.poolType === SwapPoolType.UniV3).length;
   const nV2 = pools.filter((p) => p.isV2).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2, ${routes.length} routes, ` +
-      `${trimmed.length}/${brackets.length} brackets kept (crossed+${SAFETY_TICKS}), ` +
+      `${trimmed.length}/${brackets.length} brackets kept (crossed only; live walk handles drift), ` +
       `coverage=${covered >= amountIn ? "full" : "partial"}`,
   );
 

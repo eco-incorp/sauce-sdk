@@ -22,6 +22,9 @@ import {
   bracketCapacity,
   getSqrtRatioAtTick,
   toOutIn,
+  V2_STEP_BPS,
+  V2_STEP_DEN,
+  v2WalkGross,
 } from "./ecoswap.math";
 import { ecoSwapReference } from "./ecoswap.reference";
 import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
@@ -82,6 +85,47 @@ function v3Brackets(refIdx: number, feePpm: number, L: bigint, startTick: number
     b -= spacing;
   }
   return out;
+}
+
+/** Synthetic V2 pool (constant-product, engine fee 0.3%). */
+function v2Pool(): EcoPool {
+  return {
+    poolType: SwapPoolType.UniV2,
+    address: "0x00000000000000000000000000000000000000a2" as `0x${string}`,
+    fee: 3000,
+    tickSpacing: 0,
+    hooks: "0x0000000000000000000000000000000000000000",
+    feePpm: 3000,
+    isV2: true,
+    inIsToken0: true,
+    source: "synthetic-v2",
+  };
+}
+
+/**
+ * Build a V2 pool's window brackets exactly as prepare.ts's buildV2Brackets: geometric
+ * out/in steps (far = near - near*V2_STEP_BPS/V2_STEP_DEN) at constant L = √k, fee 0.3%.
+ * Returns the brackets AND the deepest far (out/in frontier the WS2 #104 stream resumes from).
+ */
+function v2Brackets(refIdx: number, L: bigint, spotNear: bigint, feePpm: number, n: number): { brackets: EcoBracket[]; deepestFar: bigint } {
+  const out: EcoBracket[] = [];
+  let near = spotNear;
+  for (let i = 0; i < n; i++) {
+    const far = near - (near * V2_STEP_BPS) / V2_STEP_DEN;
+    if (far <= 0n || far >= near) break;
+    out.push({
+      kind: EcoBracketKind.V2,
+      refIdx,
+      sqrtNear: near,
+      sqrtFar: far,
+      liquidity: L,
+      capacity: bracketCapacity(L, near, far, feePpm),
+      sqrtAdjNear: feeAdjust(near, feePpm),
+      sqrtAdjFar: feeAdjust(far, feePpm),
+    });
+    near = far;
+  }
+  return { brackets: out, deepestFar: out.length ? out[out.length - 1].sqrtFar : 0n };
 }
 
 /** Sort a ladder DESC by sqrtAdjNear, exactly as prepare.ts does (line 510). */
@@ -285,5 +329,171 @@ describe("water-fill solver — single-pass (live-cut) [ecoSwapReference]", () =
   it("empty routes never throw and yield zeros", () => {
     const res = ecoSwapReference(prep, cap / 4n);
     assert.deepEqual(res.perRouteInput, []);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 5. WS2 pre-fill (against-swap drift) — oracle mirror (ecoSwapReference §2.1)
+// ─────────────────────────────────────────────────────────────
+describe("WS2 pre-fill — against-swap drift gap fill [ecoSwapReference]", () => {
+  // ONE V3 pool (fee 3000, ts 60), constant L over the gap (empty adaptiveNet → no
+  // boundary nets → L unchanged). Prepare-time spot = tick 0 (topNearReal = Q96). The
+  // modeled LIVE price has drifted UP to tick 120 (liveCurRealOverride). The pre-fill
+  // walks DOWN from the live tick to topNearOI, water-filling the gap (tick 120 → 0).
+  const L = 10n ** 21n;
+  const FEE = 3000;
+  const STEP = getSqrtRatioAtTick(60); // multiplicative ts-step ratio (== prepare's seed)
+  const spotReal = getSqrtRatioAtTick(0); // = Q96
+  const liveReal = getSqrtRatioAtTick(120); // 2 ts above spot (against-swap drift)
+
+  function drifted(): EcoSwapPrepared {
+    const pool: EcoPool = {
+      ...v3Pool(FEE, 60),
+      adaptiveStepRatio: STEP,
+      adaptiveNet: new Map<number, bigint>(), // no initialized ticks in the gap → constant L
+      // pre-fill stop target = prepare-time spot real sqrt
+      topNearReal: spotReal,
+      bracketCount: 1,
+      // modeled live (drifted-up) state
+      liveCurRealOverride: liveReal,
+      liveTickOverride: 120,
+      liveLOverride: L,
+    };
+    // ONE in-window forward bracket starting at spot so the sweep has a pool to see,
+    // but the trade is sized to be covered entirely by the gap pre-fill below.
+    const ladder = v3Brackets(0, FEE, L, 0, 60, 4);
+    return { pools: [pool], routes: [], brackets: sortLadder(ladder), zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n };
+  }
+
+  it("fills the gap (topNearOI, liveCur] at constant L — matches analytic gross", () => {
+    // Analytic gap gross over a constant-L, no-crossing region telescopes to the gross
+    // between liveCur and topNearOI (intermediate step boundaries cancel), so it equals
+    // bracketCapacity(L, liveCur_oi, topNear_oi, fee). zeroForOne → out/in == real sqrt.
+    const liveOI = toOutIn(liveReal, true);
+    const topNearOI = toOutIn(spotReal, true);
+    const analyticGap = bracketCapacity(L, liveOI, topNearOI, FEE);
+    assert.ok(analyticGap > 0n, "gap has positive capacity");
+
+    // amountIn bigger than the gap but smaller than gap + the in-window bracket, so the
+    // gap is fully filled by the pre-fill and the sweep adds the remainder.
+    const amountIn = analyticGap * 2n;
+    const res = ecoSwapReference(drifted(), amountIn);
+    // The pool's input includes BOTH the pre-fill gap AND the in-window sweep — assert
+    // it fully covers at least the analytic gap (the pre-fill ran) and total == amountIn.
+    assert.ok(res.perPoolInput[0] >= analyticGap, `pool got >= gap (${res.perPoolInput[0]} >= ${analyticGap})`);
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly (gap + in-window covers it)");
+
+    // Isolate the gap alone: amountIn == analyticGap → only the pre-fill runs, exact.
+    const gapOnly = ecoSwapReference(drifted(), analyticGap);
+    assertClose(gapOnly.perPoolInput[0], analyticGap, 50n, "gap-only fill == analytic gap (within step truncation)");
+    assert.ok(gapOnly.totalInput <= analyticGap, "gap-only never exceeds the gap");
+  });
+
+  it("is a NO-OP without a live override (modeled live == spot → no gap)", () => {
+    // Same pool WITHOUT the override fields → liveCur defaults to topNearReal → liveCur
+    // <= topNearOI → pre-fill skipped → identical to the plain single-pass sweep.
+    const noDrift: EcoSwapPrepared = {
+      pools: [{ ...v3Pool(FEE, 60), adaptiveStepRatio: STEP, adaptiveNet: new Map(), topNearReal: spotReal, bracketCount: 1 }],
+      routes: [],
+      brackets: sortLadder(v3Brackets(0, FEE, L, 0, 60, 4)),
+      zeroForOne: true,
+      priceLimit: 0n,
+      expectedInputCovered: 0n,
+    };
+    const cap = totalCapacity(noDrift.brackets);
+    const res = ecoSwapReference(noDrift, cap / 2n);
+    // No pre-fill: the sweep alone covers it, exactly like the non-pre-fill path.
+    assert.equal(res.totalInput, cap / 2n, "no-override = plain sweep, spends amountIn exactly");
+    assert.ok(res.perPoolInput[0] === cap / 2n, "all to the one pool via the sweep");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 6. V2 constant-L FORWARD STREAM (with-swap drift) — oracle mirror (WS2 #104)
+// ─────────────────────────────────────────────────────────────
+describe("V2 constant-L forward stream — under-fill past the window [ecoSwapReference]", () => {
+  // ONE synthetic V2 pool (constant-product √k, engine fee 0.3%). A small prepared
+  // window (4 geometric brackets) is stamped with the WS2 #104 frontier seed
+  // (adaptiveStartShifted=1 enable flag, adaptiveNearReal = deepest kept far). With an
+  // amountIn larger than the window capacity the single-pass sweep under-fills, so the
+  // V2 forward stream resumes from the frontier and keeps emitting geometric slices at
+  // the constant L until amountIn — the cheap analogue of the V3/V4 tick walk (no ticks).
+  const reserveIn = 1_000_000n * 10n ** 18n;
+  const reserveOut = 2_000_000n * 10n ** 18n;
+  const k = reserveIn * reserveOut;
+  const L = isqrt(k); // √k = the constant V2 liquidity
+  const FEE = 3000;
+  const FEE_PPM = 3000n;
+  const spotNear = isqrt((reserveOut * Q192) / reserveIn); // out/in spot sqrt
+  const WINDOW = 4; // prepared V2 brackets (mirror prepare's kept window)
+
+  function preparedV2(): { prep: EcoSwapPrepared; windowGross: bigint; deepestFar: bigint } {
+    const { brackets, deepestFar } = v2Brackets(0, L, spotNear, FEE, WINDOW);
+    const windowGross = brackets.reduce((s, b) => s + b.capacity, 0n);
+    const pool: EcoPool = {
+      ...v2Pool(),
+      // WS2 #104 V2 stream seed: enable flag + out/in frontier (deepest kept far).
+      adaptiveStartShifted: 1n,
+      adaptiveNearReal: deepestFar,
+      adaptiveStartL: 0n, // V2 reads live √k from the spot bracket's liquidity, not this
+      adaptiveStepRatio: 0n, // V2 streams in out/in space (geometric), no tick step ratio
+      topNearReal: 0n, // V2 has no against-swap pre-fill
+      bracketCount: brackets.length,
+    };
+    const prep: EcoSwapPrepared = {
+      pools: [pool],
+      routes: [],
+      brackets: sortLadder(brackets),
+      zeroForOne: true,
+      priceLimit: 0n,
+      expectedInputCovered: 0n,
+    };
+    return { prep, windowGross, deepestFar };
+  }
+
+  it("streams past the window at constant L — matches the analytic geometric walk to the wei", () => {
+    const { prep, windowGross } = preparedV2();
+
+    // Size amountIn well past the window so the stream MUST fire (and verify the window
+    // alone would under-fill — that's the precondition for the WS2 #104 branch).
+    const amountIn = windowGross * 3n;
+    assert.ok(amountIn > windowGross, "amountIn exceeds the prepared window → sweep under-fills");
+
+    const res = ecoSwapReference(prep, amountIn);
+
+    // KNOWN ANSWER: the window sweep + the V2 stream are ONE contiguous geometric walk
+    // from spotNear at constant L (the stream resumes from the deepest kept far, which is
+    // exactly where the window ended — path-additive). Replay it with the identical
+    // per-slice integer math (window WINDOW slices + up to EXTRA_TICKS=64 stream slices),
+    // capped at amountIn. The oracle's V2 fill must equal this to the wei.
+    const walk = v2WalkGross(L, spotNear, FEE_PPM, WINDOW + 64, amountIn);
+    assert.equal(res.perPoolInput[0], walk.gross, "V2 fill == analytic constant-L geometric walk (exact bigint)");
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly (window + stream cover it)");
+    // The stream actually contributed beyond the window (not a window-only fill).
+    assert.ok(res.perPoolInput[0] > windowGross, `fill exceeds the window (stream fired: ${res.perPoolInput[0]} > ${windowGross})`);
+  });
+
+  it("effIn telescopes to one constant-product integral L·(1/farFinal − 1/spotNear)", () => {
+    // The geometric chain (window + stream) at constant L is a single √k curve, so the
+    // raw effIn (pre-fee-grossup) telescopes EXACTLY: interior boundary terms cancel and
+    // Σ effIn == L·Q96/farFinal − L·Q96/spotNear. We walk the full window+stream span
+    // (no amountIn cap) and check the telescoped identity to the wei, independent of the
+    // oracle (this is the constant-product integral the V2 stream is integrating).
+    const TOTAL_SLICES = WINDOW + 64;
+    // Reproduce the exact slice boundaries the walk visits.
+    let near = spotNear;
+    let sumEffIn = 0n;
+    let farFinal = spotNear;
+    for (let i = 0; i < TOTAL_SLICES; i++) {
+      const far = near - (near * V2_STEP_BPS) / V2_STEP_DEN;
+      if (far <= 0n || far >= near) break;
+      // effIn for this slice (pre-grossup), same integer math as the oracle.
+      sumEffIn += (L * Q96) / far - (L * Q96) / near;
+      farFinal = far;
+      near = far;
+    }
+    // Telescoped closed form: every interior L·Q96/boundary cancels.
+    const telescoped = (L * Q96) / farFinal - (L * Q96) / spotNear;
+    assert.equal(sumEffIn, telescoped, "Σ per-slice effIn telescopes to L·Q96/farFinal − L·Q96/spotNear (exact)");
   });
 });

@@ -59,7 +59,6 @@ import {
   engineCells,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
@@ -160,13 +159,22 @@ for (const dir of [
 
       // Prepare+compile ONCE at spot for this engine. Both runs execute this bytecode.
       const { bytecodes, prepared } = await ecoSwap(
-        { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+        { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
         caller, poolConfig, undefined, engine,
       );
       assert.equal(prepared.pools.length, 2, "two V3 pools prepared");
       assert.equal(prepared.pools[0].feePpm, DEEP_FEE, "deepest (fee 500) pool is processed first");
-      const reverseBrackets = prepared.brackets.filter((b) => b.capacity === 0n);
-      assert.ok(reverseBrackets.length > 0, "prepared ladder carries capacity-0 reverse brackets");
+      // WS2: against-swap drift is now handled by the on-chain LIVE PRE-FILL (it reads
+      // the live tick and water-fills the gap above the prepared window), NOT by prepared
+      // capacity-0 reverse brackets — prepare no longer emits any. Assert they're GONE,
+      // and that the deep pool carries the pre-fill seeds (topNearReal + a window) the
+      // pre-fill needs to fire.
+      assert.equal(
+        prepared.brackets.filter((b) => b.capacity === 0n).length, 0,
+        "no capacity-0 reverse brackets (WS2 reads against-swap drift live)",
+      );
+      assert.ok(prepared.pools[0].topNearReal > 0n, "deep pool carries the pre-fill stop target (topNearReal)");
+      assert.ok(prepared.pools[0].bracketCount > 0, "deep pool has a prepared window → pre-fill can fire");
 
       const snap = await c.testClient.snapshot();
 
@@ -213,8 +221,10 @@ for (const dir of [
       const medB = (await balanceOf(c.publicClient, tokenIn, medPool)) - medInBeforeB;
       assert.ok(D > 0n, "deep pool receives input in the reverse-drift run");
 
-      // PRIMARY — reverse brackets were consumed. Without them Phase B clamps at the
-      // stale spot (hi=min(curSqrt,near=spot)=spot) → integral == baseline → D==B.
+      // PRIMARY — the LIVE pre-fill filled the against-swap-drift gap. Without it the
+      // sweep would cap at the prepared spot near (hi=min(liveCur,near)=near=spot) and
+      // never integrate the (topNearOI, liveCur] gap → D == B. D > B proves the pre-fill
+      // read the live drifted-up tick and water-filled the gap before the sweep.
       assert.ok(D > B, `reverse-drifted deep pool fills MORE (D=${D} > B=${B})`);
 
       // CONSERVATION — the pool ends both runs at the SAME cut price, so its net
@@ -225,7 +235,7 @@ for (const dir of [
       const consErr = Number(gap > driftOut ? gap - driftOut : driftOut - gap) / Number(driftOut);
       assert.ok(
         consErr < 0.02,
-        `D-B (${gap}) must equal the drift outflow (${driftOut}) — path-additive re-anchoring (err ${consErr})`,
+        `D-B (${gap}) must equal the drift outflow (${driftOut}) — pre-fill re-anchoring (err ${consErr})`,
       );
 
       // ADAPTATION — the deep pool's extra fill comes out of the medium pool's share.

@@ -52,19 +52,35 @@ import { IStateViewFull } from "./IStateViewFull.json";
 // ticks()/getTickLiquidity STATICCALLs are gated behind a per-pool `done` flag so
 // gas scales with ticks ACTUALLY read.
 //
-// ── Compiler-arg layout (all bigint scalars / scalar-tuples) ─────────────────
-//   tokenIn, tokenOut : Address
-//   zeroForOne        : Uint256 (1 if tokenIn < tokenOut)
-//   amountIn          : Uint256 (gross tokenIn; sizes the lazy walk)
-//   driftTicks        : Uint256 (extra boundaries past the stop, each side)
-//   minRelBps         : Uint256 (survivor floor in bps of Σ in-range capacity)
-//   maxTicks          : Uint256 (hard cap on forward tick reads per pool)
-//   v3Factories[i]    = [factoryAddr]
-//   v3FeeTiers[j]     = [fee, stepRatio]            stepRatio=floor(sqrt(1.0001^ts)*2^96)
-//   v2Factories[i]    = [factoryAddr]
-//   v4Factories[i]    = [poolManager, stateView]
-//   v4Specs[j]        = [fee, tickSpacing, stepRatio]
-//   v4PoolIds[i*J+j]  = [poolId]
+// ── Compiler-arg layout — scalars bundled into `cfg`, tuples kept separate (v12-native) ──
+// main() takes the 7 SCALARS bundled into one `cfg` tuple plus the 6 tuple-of-tuples
+// params unchanged. The 7 scalars were the problem: as separate params, deep reads of
+// them used depth-sensitive SDUP, which overflows the v12 SDUP16 reference window once
+// the working stack is tall (the big 4-pass body) → "REF position out of range: 17".
+// Bundling them into `cfg` turns each into a heap INDEX read (cfg[i]) at a fixed depth,
+// clearing the overflow on v12.
+//
+// The 6 tuple-of-tuples params are LEFT as separate params on purpose: a top-level
+// tuple-of-tuples param round-trips through a variable correctly on BOTH engines (the
+// solver indexes `pools[i][j]` the same way). Folding them INTO cfg would add one more
+// nesting level (cfg→cfg[7]→[i]→[j]), and a depth-3 nested compile-time-arg tuple read
+// through a variable REVERTS on v1 (SauceInvalidOperationArgs(INDEX) — the nested-tuple
+// descriptor is lost on the var round-trip); only inline depth-3 survives on v1. So the
+// scalars bundle, the tuples don't.
+//
+//   cfg[0]  tokenIn    : Address
+//   cfg[1]  tokenOut   : Address
+//   cfg[2]  zeroForOne : Uint256 (1 if tokenIn < tokenOut)
+//   cfg[3]  amountIn   : Uint256 (gross tokenIn; sizes the lazy walk)
+//   cfg[4]  driftTicks : Uint256 (extra boundaries past the stop, each side)
+//   cfg[5]  minRelBps  : Uint256 (survivor floor in bps of Σ in-range capacity)
+//   cfg[6]  maxTicks   : Uint256 (hard cap on forward tick reads per pool)
+//   v3Factories[i] = [factoryAddr]
+//   v3FeeTiers[j]  = [fee, stepRatio]        stepRatio=floor(sqrt(1.0001^ts)*2^96)
+//   v2Factories[i] = [factoryAddr]
+//   v4Factories[i] = [poolManager, stateView]
+//   v4Specs[j]     = [fee, tickSpacing, stepRatio]
+//   v4PoolIds[i*J+j] = [poolId]
 //
 // ── Return shape (off-chain abi.decode against this EXACTLY) ──────────────────
 //   abi.encode(poolBlob: bytes, tickBlob: bytes)
@@ -144,13 +160,7 @@ function stepReal(sqrtReal: Uint256, stepRatio: Uint256, zeroForOne: Uint256): U
 }
 
 function main(
-  tokenIn: Address,
-  tokenOut: Address,
-  zeroForOne: Uint256,
-  amountIn: Uint256,
-  driftTicks: Uint256,
-  minRelBps: Uint256,
-  maxTicks: Uint256,
+  cfg: Tuple,
   v3Factories: Tuple,
   v3FeeTiers: Tuple,
   v2Factories: Tuple,
@@ -158,6 +168,19 @@ function main(
   v4Specs: Tuple,
   v4PoolIds: Tuple
 ): bytes {
+  // Destructure the bundled SCALARS (see "Compiler-arg layout" above). Bundling the 7
+  // scalars into `cfg` makes their deep reads heap INDEX loads at a fixed depth, so the
+  // tall-stack 4-pass body below stays inside the v12 SDUP16 reference window. The 6
+  // tuple-of-tuples params stay separate (a depth-3 nested-arg read through a var
+  // reverts INDEX on v1; depth-2 tuple params round-trip fine on both engines).
+  const tokenIn: Address = cfg[0];
+  const tokenOut: Address = cfg[1];
+  const zeroForOne: Uint256 = cfg[2];
+  const amountIn: Uint256 = cfg[3];
+  const driftTicks: Uint256 = cfg[4];
+  const minRelBps: Uint256 = cfg[5];
+  const maxTicks: Uint256 = cfg[6];
+
   let poolBlob: bytes = abi.encode(tokenIn).slice(0, 0);
   let tickBlob: bytes = abi.encode(tokenIn).slice(0, 0);
   let poolCount: Uint256 = 0;

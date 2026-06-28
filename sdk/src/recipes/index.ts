@@ -15,8 +15,8 @@ export { gigaSwap } from "./gigaswap/index.js";
 export type { GigaSwapOutput } from "./gigaswap/index.js";
 export { prepareGigaSwap } from "./gigaswap/prepare.js";
 
-export { ecoSwap } from "./ecoswap/index.js";
-export type { EcoSwapOutput } from "./ecoswap/index.js";
+export { ecoSwap, quoteEcoSwap, OZ_ERC20_SLOTS } from "./ecoswap/index.js";
+export type { EcoSwapOutput, QuoteEcoSwapResult, Erc20Slots } from "./ecoswap/index.js";
 export { prepareEcoSwap } from "./ecoswap/prepare.js";
 export type { EcoSwapPrepareOpts } from "./ecoswap/prepare.js";
 

@@ -58,7 +58,6 @@ import {
   engineCells,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import {
   MIN_SQRT_RATIO,
@@ -376,7 +375,7 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       anvil.rpcUrl,
-      quoteRouter(engine, stack, v12),
+      cookTarget(engine, stack, v12),
       caller,
       poolConfig,
       undefined,
@@ -488,7 +487,7 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const { bytecodes } = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       anvil.rpcUrl,
-      quoteRouter(engine, stack, v12),
+      cookTarget(engine, stack, v12),
       caller,
       poolConfig,
       undefined,
@@ -631,7 +630,7 @@ describe("EcoSwap V2 + V3 mixed split (etched V2 pair)", () => {
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
       caller, poolConfig, undefined, engine,
     );
 
@@ -755,7 +754,7 @@ describe("EcoSwap V4 (etched PoolManager + StateView)", () => {
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
       caller, poolConfig, undefined, engine,
     );
     const v4Count = prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
@@ -874,7 +873,7 @@ describe("EcoSwap V3 + V4 mixed split", () => {
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(engine, stack, v12),
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
       caller, poolConfig, undefined, engine,
     );
     assert.equal(prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV3).length, 1, "1 V3 pool");

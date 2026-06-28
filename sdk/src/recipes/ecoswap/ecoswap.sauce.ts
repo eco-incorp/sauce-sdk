@@ -31,21 +31,28 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 // The only leftover possible is the limit-price edge (a binding priceLimit makes a
 // V3 swap consume less than its assigned input); one guarded terminal refund returns it.
 //
-// ADAPTIVE DYNAMIC TICK READS (WS4): ALWAYS ON. Whenever the prepared bracket sweep
-// under-fills (cum < amountIn), the solver continues a streaming live-tick walk
-// (ticks()/getTickLiquidity staticcalls, ported from the lens forward loop), bounded
-// by EXTRA_TICKS and the price limit, to close the gap. V3/V4 only: prepare always
-// stamps each V3/V4 pool's frontier seeds (pools[i][10..13]), so aStartShift>0 holds
-// and the walk resumes from exactly where buildV3Brackets stopped. V2 has a single
-// wide bracket → no frontier → seeds 0 → it is naturally skipped (routes are static
-// too). The seed's first far-edge equals the last prepared bracket's far-edge, so the
-// walk is path-additive (no gap, no double-count). It only does work when needed
-// (cum < amountIn) — a window that already covers amountIn never enters the walk.
+// ADAPTIVE DYNAMIC STREAMING WALK (WS4 + WS2 #104): ALWAYS ON. Whenever the prepared
+// bracket sweep under-fills (cum < amountIn), each pool with a frontier seed continues
+// a streaming walk past its prepared window, bounded by EXTRA_TICKS and the price limit,
+// to close the gap. V3/V4 stream live TICKS (ticks()/getTickLiquidity staticcalls,
+// ported from the lens forward loop) from pools[i][10..13]. V2 streams CONSTANT-L
+// geometric out/in slices (a V2 pool is a single √k curve over the ENTIRE price range
+// — no ticks, no staticcalls) from pools[i][10]=1 (V2 walk flag) + pools[i][11]=deepest
+// prepared far (out/in) at the LIVE √k cached by the sweep — the cheap analogue of the
+// tick walk that makes V2 fully drift-adaptive (its ~16 prepared slices exist for
+// cross-pool marginal granularity, NOT a fixed depth cap). The seed's first far-edge
+// equals the last prepared bracket's far-edge, so the walk is path-additive (no gap, no
+// double-count). It only does work when needed (cum < amountIn) — a window that already
+// covers amountIn never enters the walk. (routes are static — no walk.)
 //
 // Inputs (precomputed off-chain in prepare.ts):
 //   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
-//                  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio]
-//                 [10..13] are the adaptive frontier seeds (always set for V3/V4; 0 for V2).
+//                  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio,
+//                  topNearReal, bracketCount]
+//                 [10..13] are the adaptive frontier seeds. V3/V4: [10]=next un-walked
+//                 boundary (shifted), [11]=near REAL sqrt, [12]=active L, [13]=tick step
+//                 ratio. V2 (WS2 #104): [10]=1 (walk flag), [11]=deepest prepared far
+//                 (out/in); L is read LIVE (√k), the step is the fixed V2 geometric ratio.
 //   routes[r]   = [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks]
 //   brackets[b] = [kind, refIdx, sqrtNear, sqrtFar, liquidity, capacity, sqrtAdjNear, sqrtAdjFar]
 //                 kind: 0=V3 direct, 1=V2 direct, 2=route ; sorted DESC by sqrtAdjNear.
@@ -115,11 +122,133 @@ function main(
   // cache, sized to the pool count; per-route input accumulators sized to routes.
   let inp: Tuple = new Array(pools.length);
   let curArr: Tuple = new Array(pools.length);
-  let lArr: Tuple = new Array(pools.length);
+  let lArr: Tuple = new Array(pools.length); // V2 synthetic L cache (sweep reads at :Lb)
   let rinp: Tuple = new Array(routes.length);
 
   let cum: Uint256 = 0;
   let found: Uint256 = 0;
+
+  const EXTRA_TICKS: Uint256 = 64; // walk budget (pre-fill + forward); <= 255 (engine for-bound cap)
+  // V2 constant-L streaming step: far = near - near*V2_STEP_BPS/10000 (out/in space).
+  // MUST equal prepare's buildV2Brackets step (V2_SQRT_STEP_BPS=25) bit-for-bit so the
+  // V2 forward walk is path-additive with the prepared V2 window. A V2 pool is a SINGLE
+  // constant-L curve (L=sqrt(reserveIn*reserveOut) over the whole price range), so
+  // streaming past its prepared window is FREE — no tick reads, just more geometric
+  // slices at the same live L (the cheap analogue of the V3/V4 tick walk).
+  const V2_STEP_BPS: Uint256 = 25;
+  const V2_STEP_DEN: Uint256 = 10000;
+
+  // ── WS2 PRE-FILL: against-swap drift gap fill (BEFORE the sweep) ──────────────
+  // When the LIVE price has drifted UP past a pool's TOP prepared bracket (the region
+  // (topNearOI, liveCur] — the BEST-priced, never integrated by the sweep which caps
+  // at the top bracket's near via hi=min(cur,near)), water-fill that gap FIRST: it is
+  // the cheapest region so it must precede the sweep. Per V3/V4 pool with a prepared
+  // window (bracketCount>0 && topNearReal>0), first-touch reads live price+tick+L, and
+  // if cur>topNearOI walks live ticks DOWN to topNearReal (same swap direction as the
+  // forward walk → identical stepReal / int128 branches). Caches the live reads so the
+  // sweep's first-touch (gated on curArr[pidx]===0) skips the re-read. No-bracket pools
+  // (bracketCount===0) are skipped here — the forward walk handles them from the spot
+  // seed (§1.6). At zero drift (cur<=topNearOI, the deterministic local case) every pool
+  // no-ops, so the no-drift path is byte-identical.
+  for (let pf = 0; pf < pools.length; pf = pf + 1) {
+    if (found === 0) {
+      const pd: Tuple = pools[pf];
+      const pfIsV2: Uint256 = pd[6];
+      const pfType: Uint256 = pd[0];
+      const topNearReal: Uint256 = pd[14];
+      const bracketCount: Uint256 = pd[15];
+      if (pfIsV2 === 0) {
+        if (bracketCount > 0) {
+          if (topNearReal > 0) {
+            // First-touch live PRICE read (V3/V4): just slot0[0]. The live tick + active
+            // L (2 more staticcalls) are read LAZILY inside the drift gate below — at
+            // zero drift (the common case) the gate is false, so the pre-fill adds NO
+            // extra staticcalls vs the sweep's single price read.
+            let srReal: Uint256 = 0;
+            if (pfType === 2) {
+              srReal = IStateViewFull.at(pd[8]).getSlot0(pd[9])[0];
+            } else {
+              srReal = IUniswapV3PoolFull.at(pd[1]).slot0()[0];
+            }
+            const pfCur: Uint256 = zeroForOne === 1 ? srReal : Q192 / srReal;
+            // Cache only the out/in price for the sweep (skips its re-read). Self-
+            // contained otherwise — no extra cross-scope arrays (v12 slot pressure).
+            curArr[pf] = pfCur;
+
+            const topNearOI: Uint256 = toOutIn(topNearReal, zeroForOne);
+            // Only fill when live drifted UP past the window top (against-swap drift).
+            if (pfCur > topNearOI) {
+              const pfFeePpm: Uint256 = pd[5];
+              const pfTs: Uint256 = pd[3];
+              const pfStep: Uint256 = pd[13];
+              // Live tick + active L (the gap walk's start boundary + entry liquidity) —
+              // read here, only under drift.
+              let liveTick: Uint256 = 0;
+              let liveL: Uint256 = 0;
+              if (pfType === 2) {
+                liveTick = IStateViewFull.at(pd[8]).getSlot0(pd[9])[1];
+                liveL = IStateViewFull.at(pd[8]).getLiquidity(pd[9]);
+              } else {
+                liveTick = IUniswapV3PoolFull.at(pd[1]).slot0()[1];
+                liveL = IUniswapV3PoolFull.at(pd[1]).liquidity();
+              }
+              // Start boundary from the LIVE tick (lens convention, OFFSET-shifted so the
+              // floor-division is unsigned): zeroForOne crosses the live bucket's lower
+              // edge first (pBase); oneForZero starts one ts up (pBase+pfTs).
+              const pBase: Uint256 = ((liveTick + OFFSET) / pfTs) * pfTs;
+              let pShift: Uint256 = pBase;
+              if (zeroForOne === 0) { pShift = pBase + pfTs; }
+              let pNear: Uint256 = srReal; // lens convention: near = raw live real sqrt
+              let pL: Uint256 = liveL;
+              let pDone: Uint256 = 0;
+              for (let px = 0; px < EXTRA_TICKS; px = px + 1) {
+                if (pDone === 0) {
+                  const pFarReal: Uint256 = stepReal(pNear, pfStep, zeroForOne);
+                  const pNearOI: Uint256 = toOutIn(pNear, zeroForOne);
+                  const pFarOI: Uint256 = toOutIn(pFarReal, zeroForOne);
+                  // STOP at the window top: clamp the last partial step's far edge to
+                  // topNearOI so the gap region is exactly (topNearOI, liveCur].
+                  let stopHere: Uint256 = 0;
+                  let fillFarOI: Uint256 = pFarOI;
+                  if (pFarOI <= topNearOI) { fillFarOI = topNearOI; stopHere = 1; }
+                  if (pL > 0) { if (pNearOI > fillFarOI) { if (fillFarOI > 0) {
+                    const pEffIn: Uint256 = Math.mulDiv(pL, Q96, fillFarOI) - Math.mulDiv(pL, Q96, pNearOI);
+                    if (pEffIn > 0) {
+                      const pGross: Uint256 = Math.mulDiv(pEffIn, FEE_DENOM, FEE_DENOM - pfFeePpm);
+                      let pTake: Uint256 = pGross;
+                      if (cum + pGross >= amountIn) { pTake = amountIn - cum; pDone = 1; found = 1; }
+                      inp[pf] = inp[pf] + pTake;
+                      cum = cum + pTake;
+                    }
+                  } } }
+                  if (stopHere === 1) {
+                    pDone = 1;
+                  } else {
+                    // Cross the boundary tick (price moving DOWN = swap direction): SAME
+                    // int128 branches as the forward walk.
+                    const pArg: Uint256 = tickArg(pShift, OFFSET);
+                    let pNet: Uint256 = 0;
+                    if (pfType === 2) { pNet = IStateViewFull.at(pd[8]).getTickLiquidity(pd[9], pArg)[1]; }
+                    else { pNet = IUniswapV3PoolFull.at(pd[1]).ticks(pArg)[1]; }
+                    const pNeg: Uint256 = pNet >= HALF128 ? 1 : 0;
+                    if (zeroForOne === 1) {
+                      if (pNeg === 1) { pL = pL + (MOD128 - pNet); } else { pL = pL >= pNet ? pL - pNet : 0; }
+                      pShift = pShift - pfTs;
+                    } else {
+                      if (pNeg === 1) { const pMag: Uint256 = MOD128 - pNet; pL = pL >= pMag ? pL - pMag : 0; } else { pL = pL + pNet; }
+                      pShift = pShift + pfTs;
+                    }
+                    pNear = pFarReal;
+                  }
+                  if (cum >= amountIn) { pDone = 1; }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
   // ── SINGLE SWEEP: accumulate live gross input per pool/route to the cut ──
   for (let bi = 0; bi < brackets.length; bi = bi + 1) {
@@ -205,16 +334,17 @@ function main(
     }
   }
 
-  // ── ADAPTIVE STREAMING TICK WALK (WS4): continue past the prepared window ──
+  // ── ADAPTIVE STREAMING WALK (WS4 + WS2 #104): continue past the prepared window ──
   // ALWAYS ON, gated only by need + data: if the prepared brackets under-filled
   // (cum < amountIn) and a pool carries a frontier seed (aStartShift > 0 — always
-  // true for V3/V4, prepare stamps it), resume that pool's tick walk LIVE from
-  // exactly where buildV3Brackets stopped, consuming each step's gross into
-  // inp[ap]/cum until amountIn is met, the price limit binds, or EXTRA_TICKS steps
-  // are read. Mirrors the lens forward loop bit-for-bit. A window that already
-  // covers amountIn never enters this block (cum < amountIn is false); V2 carries
-  // no frontier (seeds 0) so it is skipped.
-  const EXTRA_TICKS: Uint256 = 64; // one window past the frontier; <= 255 (engine for-bound cap)
+  // stamped for V3/V4 AND V2 now), resume that pool's walk LIVE from exactly where the
+  // prepared window stopped, consuming each step's gross into inp[ap]/cum until amountIn
+  // is met, the price limit binds, or EXTRA_TICKS steps are read. V3/V4 mirror the lens
+  // forward TICK walk (ticks()/getTickLiquidity, ±liquidityNet at each boundary). V2
+  // streams CONSTANT-L geometric out/in slices (a V2 pool is a single √k curve over the
+  // ENTIRE range — no ticks, no staticcalls — so under favorable/with-swap drift the
+  // solver just emits more slices at the SAME live L, the analogue of the tick walk).
+  // A window that already covers amountIn never enters this block (cum < amountIn false).
   if (cum < amountIn) {
     for (let ap = 0; ap < pools.length; ap = ap + 1) {
       if (cum < amountIn) {
@@ -222,7 +352,51 @@ function main(
         const aStartShift: Uint256 = ad[10];
         const aType: Uint256 = ad[0];
         const aIsV2: Uint256 = ad[6];
-        if (aIsV2 === 0) {
+        if (aIsV2 === 1) {
+          // ── V2 constant-L streaming (WS2 #104) ──
+          // Resume from the deepest prepared V2 bracket's far edge (out/in, stamped in
+          // ad[11]) and keep emitting geometric slices (far = near - near*V2_STEP_BPS/
+          // V2_STEP_DEN — IDENTICAL to prepare's buildV2Brackets step, so path-additive)
+          // at the LIVE constant L (cached by the sweep's V2 first-touch in lArr[ap]).
+          // No tick reads. Bounded by EXTRA_TICKS, amountIn and a >0 floor on far. This
+          // is what lets V2 adapt under with-swap drift: prepare's ~16 slices exist for
+          // cross-pool marginal-price equalization granularity, NOT as a fixed depth cap.
+          if (aStartShift > 0) {
+            const v2FeePpm: Uint256 = ad[5];
+            let v2L: Uint256 = lArr[ap]; // live √k, cached by the sweep's V2 first-touch
+            // Defensive: if this V2 pool was never touched by the sweep (cum hit amountIn
+            // before its first bracket), lArr[ap] is 0 — re-read live reserves so the
+            // constant-L stream has the right L. (Common path: the sweep already cached it.)
+            if (v2L === 0) {
+              const vr0: Uint256 = IUniswapV2Pair.at(ad[1]).getReserves()[0];
+              const vr1: Uint256 = IUniswapV2Pair.at(ad[1]).getReserves()[1];
+              const vIn0: Uint256 = ad[7];
+              const vResIn: Uint256 = vIn0 === 1 ? vr0 : vr1;
+              const vResOut: Uint256 = vIn0 === 1 ? vr1 : vr0;
+              v2L = Math.sqrt(vResIn * vResOut);
+            }
+            let v2Near: Uint256 = ad[11]; // out/in frontier = deepest prepared far
+            let v2Done: Uint256 = 0;
+            for (let vx = 0; vx < EXTRA_TICKS; vx = vx + 1) {
+              if (v2Done === 0) {
+                const v2Far: Uint256 = v2Near - Math.mulDiv(v2Near, V2_STEP_BPS, V2_STEP_DEN);
+                if (v2L > 0) { if (v2Near > v2Far) { if (v2Far > 0) {
+                  const v2EffIn: Uint256 = Math.mulDiv(v2L, Q96, v2Far) - Math.mulDiv(v2L, Q96, v2Near);
+                  if (v2EffIn > 0) {
+                    const v2Gross: Uint256 = Math.mulDiv(v2EffIn, FEE_DENOM, FEE_DENOM - v2FeePpm);
+                    let v2Take: Uint256 = v2Gross;
+                    if (cum + v2Gross >= amountIn) { v2Take = amountIn - cum; v2Done = 1; }
+                    inp[ap] = inp[ap] + v2Take;
+                    cum = cum + v2Take;
+                  }
+                } } }
+                if (v2Far <= 0) { v2Done = 1; }
+                v2Near = v2Far;
+                if (cum >= amountIn) { v2Done = 1; }
+              }
+            }
+          }
+        } else {
           if (aStartShift > 0) {
             const aFeePpm: Uint256 = ad[5];
             const aTs: Uint256 = ad[3];

@@ -45,7 +45,7 @@ import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/const
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
 import { driftPoolPrice } from "./harness/drift";
-import { type Engine, selectedEngines, maybeDeployV12Stack, cookTarget, quoteRouter } from "./harness/engine";
+import { type Engine, selectedEngines, maybeDeployV12Stack, cookTarget } from "./harness/engine";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT_DIR = join(__dirname, "fixtures", "snapshots");
@@ -187,7 +187,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
     const before = await getV4Slot0(c.publicClient, stateView, repro.poolId);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
     );
     assert.equal(prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV4).length, 1, "discovers the V4 pool");
     assert.ok(prepared.pools[0].poolId === repro.poolId, "prepared poolId matches reproduced pool");
@@ -234,7 +234,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
 
     // PREPARE against the clean (pre-drift) singleton state.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);
     const refV4 = ref.perPoolInput[0] ?? 0n;

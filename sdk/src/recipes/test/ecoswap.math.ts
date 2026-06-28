@@ -96,6 +96,13 @@ export function toOutIn(sqrtReal: bigint, zeroForOne: boolean): bigint {
 
 /** Tick shift (multiple of LCM(spacings)=3000, > max|tick| 887272 so shifted stays ≥0). */
 export const OFFSET = 888000n;
+/**
+ * V2 constant-L geometric step (out/in space): far = near - near*V2_STEP_BPS/V2_STEP_DEN.
+ * MUST equal prepare.ts's buildV2Brackets step (V2_SQRT_STEP_BPS=25/10000) AND the
+ * solver's V2_STEP_BPS/V2_STEP_DEN bit-for-bit so the V2 forward-walk mirror is exact.
+ */
+export const V2_STEP_BPS = 25n;
+export const V2_STEP_DEN = 10000n;
 /** int128 sign bit. */
 export const HALF128 = 1n << 127n;
 /** int128 modulus. */
@@ -115,4 +122,55 @@ export function tickArg(shifted: bigint): bigint {
  */
 export function stepReal(sqrtReal: bigint, stepRatio: bigint, zeroForOne: boolean): bigint {
   return zeroForOne ? mulDiv(sqrtReal, Q96, stepRatio) : mulDiv(sqrtReal, stepRatio, Q96);
+}
+
+/** One V2 constant-L geometric slice's gross input, in the solver's exact integer math.
+ *  effIn = L*Q96/far - L*Q96/near (telescopes across a contiguous chain), grossed up by
+ *  FEE_DENOM/(FEE_DENOM-feePpm). Mirrors ecoswap.sauce.ts's V2 forward branch and the
+ *  oracle's V2 stream mirror bit-for-bit (per-slice mulDiv, so per-slice gross-up rounds
+ *  independently — NOT one big mulDiv). */
+export function v2SliceGross(L: bigint, near: bigint, far: bigint, feePpm: bigint): bigint {
+  const effIn = mulDiv(L, Q96, far) - mulDiv(L, Q96, near);
+  return mulDiv(effIn, FEE_DENOM, FEE_DENOM - feePpm);
+}
+
+/**
+ * Analytic replay of the V2 constant-L forward walk (window brackets + WS2 #104 stream)
+ * the oracle/solver performs: starting at out/in `spotNear`, take geometric slices
+ * (`far = near - near*V2_STEP_BPS/V2_STEP_DEN`) at constant L, summing per-slice gross,
+ * stopping when the running gross would cover `amountIn` (taking the exact remainder) or
+ * after `maxSlices` (a >0 capacity floor). Returns the total gross spent and the running
+ * out/in price reached. This is the KNOWN-ANSWER the V2-stream vector asserts against,
+ * exact to the wei (same per-slice integer math as the oracle). With no `amountIn` cap
+ * it sums the full `maxSlices` window+stream; the underlying effIn telescopes to one
+ * L*Q96/farFinal - L*Q96/spotNear (interior boundaries cancel) — the constant-product
+ * integral identity that justifies why the stream is path-additive past the window.
+ */
+export function v2WalkGross(
+  L: bigint,
+  spotNear: bigint,
+  feePpm: bigint,
+  maxSlices: number,
+  amountIn?: bigint,
+): { gross: bigint; near: bigint; slices: number } {
+  let near = spotNear;
+  let gross = 0n;
+  let slices = 0;
+  for (let i = 0; i < maxSlices; i++) {
+    const far = near - mulDiv(near, V2_STEP_BPS, V2_STEP_DEN);
+    if (far <= 0n || far >= near) break;
+    const sliceGross = v2SliceGross(L, near, far, feePpm);
+    if (sliceGross > 0n) {
+      if (amountIn !== undefined && gross + sliceGross >= amountIn) {
+        gross = amountIn; // take the exact remainder; the slice is partially consumed
+        slices++;
+        near = far;
+        return { gross, near, slices };
+      }
+      gross += sliceGross;
+    }
+    slices++;
+    near = far;
+  }
+  return { gross, near, slices };
 }

@@ -53,7 +53,6 @@ import {
   engineCells,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
@@ -148,7 +147,7 @@ describe("EcoSwap adaptive dynamic tick reads (always-on window-EXCEEDED streami
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn: AMOUNT_IN },
       anvil.rpcUrl,
-      quoteRouter(engine, stack, v12),
+      cookTarget(engine, stack, v12),
       caller,
       poolConfig,
       { maxTicks: NARROW_MAX_TICKS },

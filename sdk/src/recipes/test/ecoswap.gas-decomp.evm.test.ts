@@ -75,6 +75,8 @@ const VARIANTS: Variant[] = [
 // (kept byte-for-byte equivalent so the compiler args match what index.ts feeds.)
 
 /** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId] */
+// 16-field tuple matching index.ts (WS4 forward seeds [10..13] + WS2 pre-fill seeds
+// [14..15]); the frozen computeonly/unrolled references read only [0..9] → extras inert.
 function buildPoolTuple(p: EcoPool): bigint[] {
   return [
     BigInt(p.poolType),
@@ -87,6 +89,12 @@ function buildPoolTuple(p: EcoPool): bigint[] {
     p.inIsToken0 ? 1n : 0n,
     BigInt(p.stateView),
     BigInt(p.poolId),
+    p.adaptiveStartShifted ?? 0n,
+    p.adaptiveNearReal ?? 0n,
+    p.adaptiveStartL ?? 0n,
+    p.adaptiveStepRatio ?? 0n,
+    p.topNearReal ?? 0n,
+    BigInt(p.bracketCount ?? 0),
   ];
 }
 

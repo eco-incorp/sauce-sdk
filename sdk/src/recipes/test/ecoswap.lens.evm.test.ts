@@ -38,9 +38,12 @@ import {
   setupEtchedV2Pool,
   SQRT_PRICE_1_1,
   type DeployedStack,
+  type DeployedV12Stack,
 } from "./harness/setup";
+import { type Account } from "viem";
+import { engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
-import { runLens, type LensPool } from "../ecoswap/lens";
+import { runLens, type LensPool, type LensResult } from "../ecoswap/lens";
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
 
@@ -48,12 +51,12 @@ const HUGE = parseEther("1000000000");
 const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec05a2a2" as Hex;
 const MAX_TICKS = 96; // mirror prepare.ts V3_TICK_STEPS hard cap
 
-// ENGINE NOTE: the lens is a PREPARE-side read-only eth_call cook that ALWAYS runs
-// on the v1 SauceRouter. ecoSwap()'s `target` selects only the on-chain SOLVER
-// surface — never the lens (prepareEcoSwap → runLens compiles v1). So this decode
-// gate is engine-independent; it stays on v1 even when ECO_ENGINE=v12. Cooking the
-// lens program through the V12Pot's read-only cook is a SEPARATE v12 path (tracked
-// for P3 — it currently reverts), deliberately not exercised here.
+// ENGINE NOTE: the lens is v12-native (runLens compiles to `target` and cooks through
+// that engine — v1 SauceRouter or the V12Pot's Huff runtime, with a target-gated cook
+// return decode). The lazy-walk/decode GATES below pin to v1 (lensCfg().target) — they
+// compare the lens's decoded reads to DIRECT viem reads, which is engine-independent, so
+// v1 alone suffices and needs no V12Pot/owner wiring. The dedicated v1↔v12 PARITY test at
+// the end cooks the SAME lens on BOTH engines and asserts identical survivors/header.
 
 describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", () => {
   let anvil: AnvilHandle;
@@ -66,8 +69,10 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
   let v2Pair: Hex;
   let poolConfig: ChainPoolConfig;
   let zeroForOne: boolean;
+  let v12: DeployedV12Stack | null = null;
 
-  // Lens cook target + bytecode target — always v1 (see ENGINE NOTE above).
+  // Lens cook target + bytecode target for the v1 decode GATES — always v1 (see ENGINE
+  // NOTE). The PARITY test deploys/uses the v12 stack separately.
   function lensCfg(): { target: "v1"; cookAddress: Hex; sauceRouter: Hex } {
     return { target: "v1", cookAddress: stack.sauceRouter, sauceRouter: stack.sauceRouter };
   }
@@ -120,6 +125,9 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
       feeTiers: [500, 3000],
       baseTokens: [tokenIn, tokenOut],
     };
+
+    // v12 stack for the v1↔v12 parity test (skipped if v12 artifacts absent).
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
   });
 
   after(() => anvil?.stop());
@@ -380,6 +388,54 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     console.log(
       `  [IN-RANGE] spot-L deep=${deepSpotL} narrow=${narrowSpotL} (spot-L floor would be ${spotLFloorWouldBe}); ` +
         `in-range Σcap=${res.totalInRangeCapacity} capFloor=${res.capacityFloor}; survivors fees ${survFees.join(",")}`,
+    );
+  });
+
+  // ── v1 ↔ v12 PARITY: the lens is v12-native; the cook returns the SAME survivors +
+  // header on BOTH engines. Cooks the IDENTICAL lens program on the v1 SauceRouter and
+  // the V12Pot (target-gated compile + return decode) against the shared pools, and
+  // asserts the decoded LensResult is bit-for-bit identical. This is the load-bearing
+  // "v12-native lens == v1" gate (and exercises the v12 cook path end-to-end). ──
+  it("decodes IDENTICAL survivors + header on v1 and v12 (lens is engine-agnostic)", async () => {
+    if (!v12) {
+      console.log("  [PARITY] v12 stack unavailable (artifacts absent) — skipping");
+      return;
+    }
+    const amountIn = parseEther("200000");
+    const common = { tokenIn, tokenOut, zeroForOne, amountIn, driftTicks: 2, minRelBps: 100, maxTicks: MAX_TICKS };
+    // v1: cook on the SauceRouter (open cook, sentinel account). v12: cook on the owner's
+    // V12Pot (owner-gated → simulate from the Pot owner = c.account0).
+    const v1res = await runLens(c.publicClient, stack.sauceRouter, poolConfig, { ...common, target: "v1" });
+    const v12res = await runLens(c.publicClient, cookTarget("v12", stack, v12), poolConfig, {
+      ...common, target: "v12", account: c.account0,
+    });
+
+    // Canonical, field-by-field serialization of the decoded result (incl. per-pool net maps).
+    const sig = (r: LensResult): string =>
+      JSON.stringify({
+        discoveredCount: r.discoveredCount,
+        survivorCount: r.survivorCount,
+        totalInRangeCapacity: r.totalInRangeCapacity.toString(),
+        capacityFloor: r.capacityFloor.toString(),
+        pools: r.pools.map((p) => ({
+          poolType: p.poolType,
+          address: p.address.toLowerCase(),
+          fee: p.fee,
+          tickSpacing: p.tickSpacing,
+          sqrtPriceX96: p.sqrtPriceX96.toString(),
+          liquidity: p.liquidity.toString(),
+          tick: p.tick,
+          scannedForward: p.scannedForward,
+          scannedReverse: p.scannedReverse,
+          net: [...p.net.entries()].map(([k, v]) => `${k}:${v}`).sort().join("|"),
+        })),
+      });
+
+    assert.equal(sig(v12res), sig(v1res), "v12 lens decode IDENTICAL to v1 (survivors + header + tick nets)");
+    assert.ok(v1res.survivorCount > 0, "the lens found at least one survivor (parity is non-trivial)");
+    console.log(
+      `  [PARITY] v1==v12: discovered=${v1res.discoveredCount} survivors=${v1res.survivorCount} ` +
+        `Σcap=${v1res.totalInRangeCapacity} (cooked the lens on the SauceRouter AND the V12Pot)`,
     );
   });
 });

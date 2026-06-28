@@ -78,7 +78,6 @@ import {
   selectedEngines,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import { withCachedState } from "./harness/state-cache";
 import { writeAndWait } from "./harness/deploy";
@@ -387,7 +386,7 @@ describe("EcoSwap ALL-POOLS prod-mirror (Uni V3 ×4 + Pancake V3 ×4 + V2 + V4; 
 
     // ── Filter ON (default 1% of total liquidity): only the deep pools survive ──
     const deep = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       undefined, PROD_ENGINE,
     );
 
@@ -467,7 +466,7 @@ describe("EcoSwap ALL-POOLS prod-mirror (Uni V3 ×4 + Pancake V3 ×4 + V2 + V4; 
     // v12, dropped on v1 — it sits at ≈1.0%, right at the floor). The 3 unambiguous
     // deep survivors (Uni 0.05% + 0.30%, Pancake 0.05%) are always executed.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       undefined, PROD_ENGINE,
     );
     const preparedAddrs = new Set(prepared.pools.map((p) => p.address.toLowerCase()));
@@ -582,7 +581,7 @@ describe("EcoSwap ALL-POOLS prod-mirror (Uni V3 ×4 + Pancake V3 ×4 + V2 + V4; 
 
     // PREPARE + COMPILE against the clean state.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       undefined, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);

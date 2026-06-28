@@ -58,7 +58,6 @@ import {
   selectedEngines,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import { reproducePool, verifyReproduction, type ReproducedPool } from "./harness/reproduce-pool";
 import { reproduceV4Pool, verifyV4Reproduction, type ReproducedV4Pool } from "./harness/reproduce-v4-pool";
@@ -288,7 +287,7 @@ describe("EcoSwap prod-mirror V2+V3+V4 (one swap across all three reproduced Bas
     const v4Before = await getV4Slot0(c.publicClient, stateView, v4repro.poolId);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       // Cross-version split demo: keep all three real pools regardless of the
       // relative-depth filter (the real V2/V4 are genuinely shallow vs the V3 500
       // pool; the dedicated all-pools test exercises the filter instead).
@@ -437,7 +436,7 @@ describe("EcoSwap prod-mirror V2+V3+V4 (one swap across all three reproduced Bas
     // 1) PREPARE + COMPILE against the clean (pre-drift) state. The bytecodes now
     //    embed a ladder/cut snapshotted from these prices.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       // Cross-version split demo: keep all three real pools regardless of the
       // relative-depth filter (the real V2/V4 are genuinely shallow vs the V3 500
       // pool; the dedicated all-pools test exercises the filter instead).
@@ -478,30 +477,49 @@ describe("EcoSwap prod-mirror V2+V3+V4 (one swap across all three reproduced Bas
     const v2InDelta = (await balanceOf(c.publicClient, tokenIn, v2pair)) - v2InBefore;
     const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
 
-    // ── The adaptation (SINGLE-PASS, input-anchored): the solver spends `amountIn`
-    // EXACTLY and re-anchors V3 to its LIVE (drifted-down) slot0 price. From that
-    // lower price V3 has LESS room down to the common cut, so its runtime fill
-    // SHRINKS vs the baseline split — this is the runtime adaptation. Because the
-    // total spent is still amountIn, the budget V3 gives up is absorbed by the
-    // other pools (the cut lands marginally deeper), so V2/V4 fills GROW or hold —
-    // they do NOT shrink. (The OLD two-pass solver was price-anchored: V3 filled
-    // only the gap to the prepared cut so drift + recipe ≈ baseline, and V2/V4 were
-    // unchanged. Single-pass instead always spends the user's full trade.) ──
+    // ── The adaptation (SINGLE-PASS, input-anchored, WS2 #104) ──
+    // The solver spends `amountIn` EXACTLY and re-anchors V3 to its LIVE (drifted-down)
+    // slot0 price (it re-reads slot0 at cook, NOT the stale prepared price). V3's prepared
+    // bracket window + always-on forward tick walk are PATH-ADDITIVE: starting from the
+    // lower drifted price, the sweep fills less in the window but the forward walk streams
+    // exactly the deficit further down the SAME tick profile, so V3's recipe-leg gross
+    // lands at its prepared residual budget (= amountIn − V4 − V2) while V3's PRICE moves
+    // strictly deeper than the no-drift run — that price re-anchoring IS the runtime
+    // adaptation. (We deliberately do NOT assert "V3 shrinks": that describes a
+    // RE-OPTIMIZING/price-anchored solver that would shed V3's share so drift+recipe ≈
+    // baseline. Single-pass is input-anchored — it spends the user's full trade and lets
+    // the drifted pool fill its prepared depth from the new live price, exactly as the
+    // V2 single-pool drift case documents. The genuine correctness gates are: spends
+    // amountIn exactly, conservation, and post-fee marginals equalize at the cut — all
+    // asserted below. The combined drift+recipe input to V3 is LARGER than baseline,
+    // i.e. the opposite of shrinking: the recipe added its full prepared share on top of
+    // the drift.) ──
+    const v3SqlAfter = (await getSlot0(c.publicClient, v3repro.pool)).sqrtPriceX96;
     assert.ok(v3InDelta > 0n, "V3 still participates");
-    assert.ok(v3InDelta < refV3, `V3 fill adapts DOWN vs baseline (got ${v3InDelta}, baseline ${refV3})`);
+    // Re-anchoring proof: the recipe read V3's LIVE (drifted) price, so V3's leg pushed
+    // its price strictly BELOW the post-drift start — i.e. the recipe integrated from the
+    // drifted price, not the stale prepared spot. (zeroForOne → price falls.)
+    assert.ok(
+      v3SqlAfter < v3DriftedSqrt,
+      `V3 re-anchored to its live drifted price and filled further down (${v3DriftedSqrt} -> ${v3SqlAfter})`,
+    );
 
-    // V2/V4 live prices never moved; they absorb the budget V3 gave up, so their
-    // fills hold or grow vs the baseline split (never shrink). A small tolerance
-    // below baseline guards integer/bracket-granularity jitter.
-    assert.ok(v4InDelta >= (refV4 * 95n) / 100n, `V4 fill holds or grows (got ${v4InDelta}, baseline ${refV4})`);
-    assert.ok(v2InDelta >= (refV2 * 95n) / 100n, `V2 fill holds or grows (got ${v2InDelta}, baseline ${refV2})`);
-    // Input-anchored: the trade spends amountIn (almost) exactly across the three
-    // pools. Only one pool was drifted; the other two hold full depth and absorb the
-    // freed budget, so the realised spend stays close to amountIn (>85% floor allows
-    // for bracket-granularity rounding at the deeper cut).
+    // Input-anchored: only V3 drifted; V2/V4 live prices never moved, so they fill their
+    // full prepared depth to the common cut, and V3 takes the residual budget. The
+    // recipe-leg fills track the baseline split closely (V3 is the residual; V2/V4 hold).
+    // A small two-sided tolerance guards integer/bracket-granularity jitter at the cut.
+    const near = (got: bigint, base: bigint) => {
+      const hi = got > base ? got : base;
+      const diff = got > base ? got - base : base - got;
+      return hi === 0n ? got === 0n : Number(diff) / Number(hi) < 0.05;
+    };
+    assert.ok(near(v4InDelta, refV4), `V4 fill holds vs baseline (got ${v4InDelta}, baseline ${refV4})`);
+    assert.ok(near(v2InDelta, refV2), `V2 fill holds vs baseline (got ${v2InDelta}, baseline ${refV2})`);
+    assert.ok(near(v3InDelta, refV3), `V3 leg fills its residual share vs baseline (got ${v3InDelta}, baseline ${refV3})`);
+    // Spends the user's full trade EXACTLY across the three pools (conservation).
     assert.equal(v3InDelta + v4InDelta + v2InDelta, spent, "spent == Σ per-pool deltas (drifted)");
     assert.ok(spent <= amountIn, "never overspends");
-    assert.ok(spent >= (amountIn * 85n) / 100n, `spends the trade under drift (spent ${spent} of ${amountIn})`);
+    assert.ok(spent >= (amountIn * 99n) / 100n, `spends the trade under drift (spent ${spent} of ${amountIn})`);
 
     // 4) Despite the drift, every pool still ends EQUALIZED at the common (now
     //    marginally deeper) cut — the recipe re-anchored V3 from its drifted price
@@ -537,8 +555,8 @@ describe("EcoSwap prod-mirror V2+V3+V4 (one swap across all three reproduced Bas
 
     console.log(
       `  [v2v3v4 prod-mirror] RUNTIME adaptation under drift (single-pass, input-anchored):\n` +
-        `       drifted V3 spotSqrt ${v3DriftedSqrt} (pushed down by drift of ${driftAmount})\n` +
-        `       V3 fill ${v3InDelta} < baseline ${refV3} (shrank); V4 ${v4InDelta} (baseline ${refV4}), V2 ${v2InDelta} (baseline ${refV2}) held/grew\n` +
+        `       drifted V3 spotSqrt ${v3DriftedSqrt} -> post-recipe ${v3SqlAfter} (re-anchored, filled further down)\n` +
+        `       V3 fill ${v3InDelta} (residual; baseline ${refV3}); V4 ${v4InDelta} (baseline ${refV4}), V2 ${v2InDelta} (baseline ${refV2}) held\n` +
         `       spent=${spent} of amountIn ${amountIn}; post-drift marginal sync max rel=${maxPair}`,
     );
   });

@@ -39,6 +39,7 @@ import ts from "typescript";
 import {
   parseAbi,
   decodeAbiParameters,
+  encodeFunctionData,
   keccak256,
   encodeAbiParameters,
   type PublicClient,
@@ -229,18 +230,40 @@ export interface LensCallParams {
   minRelBps?: number;
   /** Hard cap on forward tick reads per pool (mirrors prepare.ts V3_TICK_STEPS=96). */
   maxTicks?: number;
+  /**
+   * Bytecode target for the lens program: "v1" (prefix, Solidity SauceRouter) or
+   * "v12" (postfix, Huff runtime behind a V12Pot). DEFAULT "v12" — the production
+   * engine. The lens read is engine-agnostic in VALUE (same survivors/header on both
+   * engines, verified); the target selects which engine bytecode is cooked, which MUST
+   * match the `cookEntry` deployed in the chain being read (a v12 lens program only runs
+   * on the V12Pot, never on a v1 SauceRouter). The cook RETURN is decoded per-engine (v1
+   * wraps the program output in the ABI `bytes` envelope; the v12 Pot returns it raw).
+   */
+  target?: "v1" | "v12";
+  /**
+   * The account to simulate the read-only cook() from. v1's SauceRouter.cook is
+   * open, so the default sentinel (0x…0001) works. The V12Pot's cook is OWNER-GATED
+   * (reverts NotOwner unless msg.sender == owner|self), so a v12 lens read MUST be
+   * simulated from the Pot's owner — callers pass the cook caller here.
+   */
+  account?: Hex;
 }
+
+const DEFAULT_LENS_ACCOUNT = "0x0000000000000000000000000000000000000001" as Hex;
 
 /**
  * Compile + invoke the lens via ONE eth_call cook() and decode the raw reads.
  *
- * Discovery config is derived from poolConfig: V3Standard factories (each with its
- * own feeTiers), V2Standard factories, and UniswapV4 factories (with stateView).
+ * `cookEntry` is the engine cook entrypoint to run the lens read against: the
+ * SauceRouter on v1, the owner's V12Pot on v12 (mirrors harness/engine.ts's
+ * cookTarget). It must match `params.target` — a v12 lens program only runs on the
+ * Pot. Discovery config is derived from poolConfig: V3Standard factories (each with
+ * its own feeTiers), V2Standard factories, and UniswapV4 factories (with stateView).
  * V4 poolIds are precomputed off-chain (keccak of the sorted PoolKey) and passed in.
  */
 export async function runLens(
   client: PublicClient,
-  sauceRouter: Hex,
+  cookEntry: Hex,
   poolConfig: ChainPoolConfig,
   params: LensCallParams,
 ): Promise<LensResult> {
@@ -248,6 +271,8 @@ export async function runLens(
   const driftTicks = params.driftTicks ?? 2;
   const minRelBps = params.minRelBps ?? 0;
   const maxTicks = params.maxTicks ?? 96;
+  const target = params.target ?? "v12";
+  const account = params.account ?? DEFAULT_LENS_ACCOUNT;
 
   // Group factories the same way discoverPools does, but only the three families
   // the lens understands (V2/V3/V4). Others are not collapsed in v1.
@@ -291,16 +316,27 @@ export async function runLens(
   const source = readFileSync(join(__dirname, "ecoswap.lens.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
 
+  // Args: the 7 SCALARS bundled into a single `cfg` tuple (cfg[0..6]) + the 6 tuple-
+  // of-tuples params kept SEPARATE. Bundling only the scalars converts their deep
+  // reads from depth-sensitive SDUP (which overflowed the v12 SDUP16 window at 13
+  // params → "REF position out of range") to fixed-depth heap INDEX, so the lens now
+  // compiles to v12. The tuple params stay separate because folding them into cfg
+  // would make their reads depth-3 nested-arg INDEX through a variable, which reverts
+  // on v1 (the nested-tuple descriptor is lost on the round-trip). See the layout
+  // comment in ecoswap.lens.sauce.ts.
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
+    target,
     args: [
-      BigInt(tokenIn),
-      BigInt(tokenOut),
-      zeroForOne ? 1n : 0n,
-      amountIn,
-      BigInt(driftTicks),
-      BigInt(minRelBps),
-      BigInt(maxTicks),
+      [
+        BigInt(tokenIn),
+        BigInt(tokenOut),
+        zeroForOne ? 1n : 0n,
+        amountIn,
+        BigInt(driftTicks),
+        BigInt(minRelBps),
+        BigInt(maxTicks),
+      ],
       v3Factories.map((f) => [BigInt(f.address)]),
       v3FeeTiers.map((fee) => [BigInt(fee), stepRatioForSpacing(feeToTickSpacing(fee))]),
       v2Factories.map((f) => [BigInt(f.address)]),
@@ -322,18 +358,42 @@ export async function runLens(
   // gas limit (harness/anvil.ts boots with --gas-limit 2e9). On a live RPC this is
   // clamped to that provider's eth_call cap, which is plenty for a single chain's
   // direct-pool universe.
-  const { result: returnData } = await client.simulateContract({
-    address: sauceRouter,
-    abi: cookAbi as Abi,
-    functionName: "cook",
-    args: [bytecodes],
-    account: "0x0000000000000000000000000000000000000001" as Hex,
-    gas: 2_000_000_000n,
-  });
+  // ── Cook + decode — TARGET-GATED return handling ──
+  // The lens program returns abi.encode(poolBlob, tickBlob). The two engines wrap that
+  // program output DIFFERENTLY:
+  //   • v1 SauceRouter.cook returns it inside the ABI `bytes returnData` envelope
+  //     (offset+len+payload) — so simulateContract auto-decodes the outer `bytes` to the
+  //     program output, then we decodeAbiParameters([bytes,bytes]) on it.
+  //   • v12 V12Pot.cook returns the program output VERBATIM (no outer `bytes` envelope),
+  //     so we read the RAW eth_call return and decodeAbiParameters([bytes,bytes]) on it
+  //     directly. (This is the SAME v1-envelope-vs-v12-raw distinction handled in
+  //     quoteEcoSwap's cook-return decode.)
+  // Both cook from `account` (the V12Pot.cook is owner-gated → must be the Pot owner;
+  // v1's cook is open → the sentinel works).
+  let programOut: Hex;
+  if (target === "v12") {
+    const { data } = await client.call({
+      account,
+      to: cookEntry,
+      data: encodeFunctionData({ abi: cookAbi as Abi, functionName: "cook", args: [bytecodes] }),
+      gas: 2_000_000_000n,
+    });
+    programOut = (data ?? "0x") as Hex;
+  } else {
+    const { result } = await client.simulateContract({
+      address: cookEntry,
+      abi: cookAbi as Abi,
+      functionName: "cook",
+      args: [bytecodes],
+      account,
+      gas: 2_000_000_000n,
+    });
+    programOut = result as Hex;
+  }
 
   const [poolBlob, tickBlob] = decodeAbiParameters(
     [{ type: "bytes" }, { type: "bytes" }],
-    returnData as Hex,
+    programOut,
   ) as [Hex, Hex];
 
   return decodeLens(poolBlob, tickBlob);

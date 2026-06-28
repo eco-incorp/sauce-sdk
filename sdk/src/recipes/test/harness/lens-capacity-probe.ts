@@ -219,13 +219,17 @@ async function main() {
 
     const amountIn = parseEther("3000");
     const zeroForOne = BigInt(manifest.tokenIn) < BigInt(manifest.tokenOut);
-    const router = engine === "v1" ? manifest.stack.sauceRouter : manifest.v12!.sauceRouter;
+    // This is a measurement probe: per-pool in-range capacity is engine-agnostic in
+    // VALUE, so always read through the v1 SauceRouter (present in BOTH cached blobs)
+    // with the v1 lens. The v12 lens requires the owner-gated V12Pot + owner account,
+    // neither of which the cached manifest records.
+    const router = manifest.stack.sauceRouter;
 
     // Filter OFF: emit every alive pool with its full forward walk so we can measure
     // per-pool capacity off-chain (the on-chain header carries Σ + the floor too).
     const all = await runLens(client, router, poolConfig, {
       tokenIn: manifest.tokenIn, tokenOut: manifest.tokenOut, zeroForOne, amountIn,
-      driftTicks: 2, minRelBps: 0, maxTicks: 96,
+      driftTicks: 2, minRelBps: 0, maxTicks: 96, target: "v1",
     });
 
     // MEASURE A (off-chain mirror): floorAdj = shallowest (max) solo floor among pools
@@ -267,7 +271,7 @@ async function main() {
     // Cross-check the on-chain header (Σ, capFloor at 1%) against the off-chain mirror.
     const onchain = await runLens(client, router, poolConfig, {
       tokenIn: manifest.tokenIn, tokenOut: manifest.tokenOut, zeroForOne, amountIn,
-      driftTicks: 2, minRelBps: floorBps, maxTicks: 96,
+      driftTicks: 2, minRelBps: floorBps, maxTicks: 96, target: "v1",
     });
     console.log(
       `\non-chain header: discovered=${onchain.discoveredCount} survivors=${onchain.survivorCount} ` +

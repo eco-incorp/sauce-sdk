@@ -263,12 +263,45 @@ export interface EcoPool {
   /** floor(sqrt(1.0001^ts)*2^96) = getSqrtRatioAtTick(ts) — the multiplicative step ratio. */
   adaptiveStepRatio: bigint;
   /**
+   * PRE-FILL (against-swap drift) seed — pool tuple [14]. REAL sqrt (token1/token0,
+   * Q96) at the TOP prepared bracket's near edge = the prepare-time spot sqrt
+   * (spotReal). The on-chain pre-fill walk's STOP target: when the LIVE price has
+   * drifted UP past the prepared window, the solver water-fills the gap
+   * (topNearOI, liveCur] DOWN to here before the sweep. Stamped == spotReal so the
+   * pre-fill/sweep seam is exact (the top forward bracket's sqrtNear == toOutIn(spotReal)).
+   * 0 ⇒ no top edge known (no brackets) ⇒ pre-fill skipped (the no-bracket forward-
+   * from-spot walk handles the pool). V3/V4 only.
+   */
+  topNearReal: bigint;
+  /**
+   * PRE-FILL no-bracket flag — pool tuple [15]. Number of forward prepared brackets
+   * this pool got. 0 ⇒ NO window ⇒ pre-fill skipped; the forward walk runs from the
+   * spot seed (gap B', the 1-RPC quote path). >0 ⇒ has a window; pre-fill fires only
+   * if live drifted above topNearOI. V3/V4 only.
+   */
+  bracketCount: number;
+  /**
    * OFF-CHAIN-ONLY liquidityNet map (tick → net) for the oracle's mirrored walk.
    * Populated from the lens `net` map in buildV3Brackets. NOT in the compiler tuple
    * (the on-chain solver reads net live via ticks()/getTickLiquidity). Undefined when
    * not prepared adaptively.
    */
   adaptiveNet?: Map<number, bigint>;
+  /**
+   * OFF-CHAIN-ONLY pre-fill drift model (oracle mirror, ecoswap.reference.ts). The
+   * deterministic local tests run live==prepared, so the pre-fill is a no-op unless a
+   * test deliberately models against-swap drift. When set, the oracle treats these as
+   * the modeled LIVE state and runs the same DOWN-walk the on-chain pre-fill does:
+   *   liveCurRealOverride — REAL sqrt of the modeled live (drifted-up) price.
+   *   liveTickOverride    — modeled live tick (drives the start boundary, mirroring
+   *                         the on-chain ((liveTick+OFFSET)/ts)*ts derivation).
+   *   liveLOverride       — modeled live active L (the gap walk's entry liquidity).
+   * Unset ⇒ modeled live == spot (topNearReal) ⇒ no gap ⇒ oracle pre-fill is a no-op,
+   * so every existing vector is unchanged. NOT in the compiler tuple.
+   */
+  liveCurRealOverride?: bigint;
+  liveTickOverride?: number;
+  liveLOverride?: bigint;
   source: string;
 }
 

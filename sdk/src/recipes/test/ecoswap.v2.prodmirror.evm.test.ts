@@ -40,7 +40,6 @@ import {
   selectedEngines,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import { withCachedState } from "./harness/state-cache";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
@@ -174,7 +173,7 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
     const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
 
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       undefined, PROD_ENGINE,
     );
     assert.equal(prepared.pools.filter((p) => p.isV2).length, 1, "should discover the reproduced V2 pair");
@@ -223,7 +222,7 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
 
     // PREPARE against the clean (pre-drift) reserves.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
       undefined, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);

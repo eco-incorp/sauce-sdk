@@ -45,7 +45,6 @@ import {
   selectedEngines,
   maybeDeployV12Stack,
   cookTarget,
-  quoteRouter,
 } from "./harness/engine";
 import {
   reproducePool,
@@ -222,7 +221,7 @@ describe("EcoSwap prod-mirror (reproduced V3 tick state)", () => {
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       anvil.rpcUrl,
-      quoteRouter(PROD_ENGINE, stack, v12),
+      cookTarget(PROD_ENGINE, stack, v12),
       caller,
       poolConfig,
       undefined,
@@ -297,7 +296,7 @@ describe("EcoSwap prod-mirror (reproduced V3 tick state)", () => {
 
     // PREPARE against the clean (pre-drift) tick state.
     const { bytecodes, prepared } = await ecoSwap(
-      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, quoteRouter(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig, undefined, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);
     const refV3 = ref.perPoolInput[0] ?? 0n;
