@@ -866,6 +866,7 @@ export class V12Saucer implements SaucerLike {
     // return self-terminates too, making the assembly's trailing FUNC_RETURN dead
     // (harmless) code.
     const withValue = saucer ? this.join(saucer) : this;
+
     if (this.ctx.isMainFunction) return withValue;
 
     // Helper: append FUNC_RETURN — it terminates this path (pops frame+params, jumps
@@ -955,6 +956,43 @@ export class V12Saucer implements SaucerLike {
 
   /** Helper body: prepend ALLOCATE_VALUE/ALLOCATE_HEAP for local slots (no MSTORE). */
   buildFunctionBody(): Uint8Array {
+    const prefix = this.allocatePrefix();
+
+    return prefix.length > 0 ? concat(new Uint8Array(prefix), this._bytes) : this._bytes;
+  }
+
+  /**
+   * main body: prepend ALLOCATE_VALUE/ALLOCATE_HEAP (declaring main's own frame
+   * stride) AND append the result-MSTORE — main needs BOTH, where a helper gets
+   * only the ALLOCATE prefix (its result stays on the stack for FUNC_RETURN) and
+   * the no-arg `build()` gets only the MSTORE.
+   *
+   * The ALLOCATE prefix declares main's frame stride to the Huff runtime, which
+   * advances VALUES_BASE/HEAP_BASE per CALL_FUNCTION by the CALLER's declared slot
+   * count. The runtime DEFAULTS that count to 0 (a frame must ALLOCATE to stride —
+   * `engine-v12/v12/Runtime.huff` MAIN init; see the frame-isolation spec). So
+   * EVERY slot-using function MUST emit ALLOCATE, unconditionally — exactly like a
+   * helper (`buildFunctionBody`). Without it a main using N slots would leave the
+   * stride at 0 and any helper call would alias main's slots (the callee's frame
+   * starts at main's base, overwriting main's locals). This is emitted for main
+   * regardless of whether it CALLs — a leaf main's prefix is harmless (it strides
+   * no frame), and unconditional emission matches the default-0 contract (a missing
+   * ALLOCATE is a latent aliasing bug, not a no-op). ALLOCATE is stack-neutral, so
+   * SDUP depths are unchanged; only byte positions shift by `prefixLen` (returned so
+   * the assembly can shift main's recorded call/ref sentinels).
+   */
+  buildMain(): { bytes: Uint8Array; prefixLen: number } {
+    const body = this.build(); // result-MSTORE for a scalar result
+    const prefix = this.allocatePrefix();
+
+    return {
+      bytes: prefix.length > 0 ? concat(new Uint8Array(prefix), body) : body,
+      prefixLen: prefix.length,
+    };
+  }
+
+  /** The ALLOCATE_VALUE/ALLOCATE_HEAP frame-declaration prefix for this function. */
+  private allocatePrefix(): number[] {
     const valueSlots = this.ctx.valueSlotCount;
     const heapSlots = this.ctx.heapSlotCount;
 
@@ -963,6 +1001,7 @@ export class V12Saucer implements SaucerLike {
     if (valueSlots > 0xff) {
       throw new Error(`too many scalar locals: ${valueSlots} (max 255); slot >=256 would wrap.`);
     }
+
     if (heapSlots > 0xff) {
       throw new Error(`too many heap (dynamic) locals: ${heapSlots} (max 255); slot >=256 would wrap.`);
     }
@@ -973,7 +1012,7 @@ export class V12Saucer implements SaucerLike {
 
     if (heapSlots > 0) prefix.push(OPS.ALLOCATE_HEAP, heapSlots);
 
-    return prefix.length > 0 ? concat(new Uint8Array(prefix), this._bytes) : this._bytes;
+    return prefix;
   }
 }
 
