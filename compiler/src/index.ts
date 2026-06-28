@@ -128,6 +128,7 @@ function patchCalls(
     // main has no body offset — it is the entry (no-arg path) or inlined behind the
     // arg-prologue (with-args path), so a main() self-call can't be resolved.
     const offset = funcOffsets[funcIndex];
+
     if (offset === undefined) {
       if (funcIndex === mainIndex) {
         throw new Error(`cannot resolve CALL_FUNCTION target (index ${funcIndex}); calling main() is not supported`);
@@ -162,18 +163,24 @@ function assembleV12(ctx: CompilerContext, args: ArgValue[]): Uint8Array {
 
   const helpers = meta.filter((m) => !m.isMain); // function-index order (0..n-1)
   const main = mainMeta.saucer;
-  const mainBc = main.build();
+  // main carries its own ALLOCATE_VALUE/ALLOCATE_HEAP prefix declaring its frame
+  // stride to the runtime (the runtime strides per call by the caller's declared slot
+  // count, default 0), so a main→helper call strides past main's slots and the callee's
+  // frame can't alias/clobber them. ALLOCATE is stack-neutral, so the prefix shifts only
+  // BYTE positions (by mainPrefixLen) — SDUP depths are unchanged.
+  const { bytes: mainBc, prefixLen: mainPrefixLen } = main.buildMain();
   const mainIndex = ctx.getFunc('main');
 
-  // Main params are pre-pushed by the runtime, so no frame-pointer offset.
+  // Main params are pre-pushed by the runtime, so no frame-pointer offset; shift
+  // recorded positions past the ALLOCATE prefix.
   const patchMainRefs = (bc: Uint8Array, refs: RefPlaceholder[]): void => {
-    for (const r of refs) patchSdup(bc, r.position, r.depth + mainMeta.paramCount - r.paramIndex);
+    for (const r of refs) patchSdup(bc, r.position + mainPrefixLen, r.depth + mainMeta.paramCount - r.paramIndex);
   };
 
   if (helpers.length === 0) {
     // No helper bodies to jump to: any CALL_FUNCTION here is a main() self-call,
     // which patchCalls rejects (empty offset table) rather than emit corrupt bytes.
-    patchCalls(mainBc, main.callPositions, [], 0, mainIndex);
+    patchCalls(mainBc, main.callPositions, [], mainPrefixLen, mainIndex);
     patchMainRefs(mainBc, main.refPositions);
 
     return mainBc;
@@ -195,7 +202,7 @@ function assembleV12(ctx: CompilerContext, args: ArgValue[]): Uint8Array {
     off += h.bc.length + 1;
   }
 
-  patchCalls(mainBc, main.callPositions, funcOffsets, 0, mainIndex);
+  patchCalls(mainBc, main.callPositions, funcOffsets, mainPrefixLen, mainIndex);
   patchMainRefs(mainBc, main.refPositions);
 
   for (const h of built) {
@@ -238,7 +245,13 @@ function assembleV12WithArgs(
   const prologueLen = prologue.length;
 
   const main = mainMeta.saucer;
-  const mainBody = main.build(); // result-MSTORE appended, no ALLOCATE prefix (entry, like the no-arg path)
+  // main carries its ALLOCATE_VALUE/ALLOCATE_HEAP prefix (frame-stride declaration)
+  // AND the result-MSTORE. The prefix sits AFTER the arg prologue (which already
+  // pushed the args) and BEFORE main's body; ALLOCATE is stack-neutral so the args
+  // and SDUP depths are untouched — only main's byte positions shift by mainPrefixLen.
+  // Without it, a main→helper call would stride by the default 0 and the callee's
+  // frame would alias/clobber main's slots from base 0.
+  const { bytes: mainBody, prefixLen: mainPrefixLen } = main.buildMain();
   const helpers = meta.filter((m) => !m.isMain); // registry indices 0..n-1
 
   const built = helpers.map((h) => {
@@ -251,19 +264,19 @@ function assembleV12WithArgs(
   // funcOffsets keyed by registry index (helpers 0..n-1; main is inlined so its slot
   // stays undefined — a main self-call is unsupported, same as the no-arg path).
   const funcOffsets: (number | undefined)[] = [];
-  let off = prologueLen + mainBody.length + 1; // after [prologue][main body][STOP]
+  let off = prologueLen + mainBody.length + 1; // after [prologue][main body (+ALLOCATE)][STOP]
   for (const h of built) {
     funcOffsets[ctx.getFunc(h.meta.name)] = off;
     off += h.bc.length + 1; // body + FUNC_RETURN
   }
 
-  // main's sentinels are patched in its own standalone array (positions relative to
-  // mainBody; build() prepends no ALLOCATE, so no posShift). main reads params with
-  // the MAIN formula — the args are directly on the stack, no frame-pointer word.
-  // main is inlined (not a table entry), so a main() self-call is unsupported.
-  patchCalls(mainBody, main.callPositions, funcOffsets, 0, ctx.getFunc('main'));
+  // main's sentinels are patched in its own standalone array; shift recorded positions
+  // past the ALLOCATE prefix. main reads params with the MAIN formula — the args are
+  // directly on the stack, no frame-pointer word. main is inlined (not a table entry),
+  // so a main() self-call is unsupported.
+  patchCalls(mainBody, main.callPositions, funcOffsets, mainPrefixLen, ctx.getFunc('main'));
   for (const r of main.refPositions) {
-    patchSdup(mainBody, r.position, r.depth + mainMeta.paramCount - r.paramIndex);
+    patchSdup(mainBody, r.position + mainPrefixLen, r.depth + mainMeta.paramCount - r.paramIndex);
   }
 
   // Helpers are entered via CALL_FUNCTION → +1 frame-pointer word.

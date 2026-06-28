@@ -279,7 +279,10 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
     describe(category, () => {
       for (const c of list) {
         it(c.name, () => {
-          expect(compileV12(c.src)).toBe(hex(c.ref(v12ctx()).build()));
+          // A single-function (main-only) program assembles as main's buildMain()
+          // bytes — the ALLOCATE frame-stride prefix (when main uses slots) plus the
+          // result-MSTORE — exactly what assembleV12 returns for the no-helper case.
+          expect(compileV12(c.src)).toBe(hex(c.ref(v12ctx()).buildMain().bytes));
         });
       }
     });
@@ -319,8 +322,7 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
       // and the tail return self-terminate, so the body carries TWO 0xf3 returns
       // (plus the assembly's trailing dead one). main is INLINED — it must NOT emit a
       // helper FUNC_RETURN, so its body has no 0xf3.
-      const src =
-        'function clamp(x){ if (x > 10n) { return 10n } return x } function main(){ return clamp(5n) }';
+      const src = 'function clamp(x){ if (x > 10n) { return 10n } return x } function main(){ return clamp(5n) }';
       const bc = compileV12(src);
       const funcReturns = (bc.match(/f3/g) ?? []).length;
       // 2 in-body returns (early + tail) + 1 trailing assembly FUNC_RETURN = 3.
@@ -335,26 +337,29 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
     // assignment targets a MUTABLE collection (new Array → TUPLE, or an object
     // literal → TUPLE); static packed array literals are immutable (see the guard
     // test below) so they are not valid targets.
+    // Each main here uses heap slots (new Array / object literal → TUPLE), so it leads
+    // with main's ALLOCATE_HEAP frame-stride prefix (`c2 <heapSlots>`); the compound
+    // case also declares 1 VALUE slot (`let i`) → `c0 01` precedes the `c2 01`.
     const arrayCases: { name: string; src: string; hex: string }[] = [
       {
         name: 'new Array(n) → [count][NEW_ARRAY]',
         src: 'function main(){ let a = new Array(3); return a }',
-        hex: '01039cc3009800',
+        hex: 'c20101039cc3009800',
       },
       {
         name: 'arr[i] = x on new Array → SET_INDEX, postfix [value][index][array]',
         src: 'function main(){ let a = new Array(3); a[1] = 9; return a }',
-        hex: '01039cc3000109010198009bc3009800',
+        hex: 'c20101039cc3000109010198009bc3009800',
       },
       {
         name: 'obj.field = x → SET_INDEX with field-index UINT (object literal is a TUPLE)',
         src: 'function main(){ let p = { x: 1, y: 2 }; p.x = 9; return p }',
-        hex: '010201019402c3000109010098009bc3009800',
+        hex: 'c201010201019402c3000109010098009bc3009800',
       },
       {
         name: 'compound arr[i] += y on new Array → INDEX read + SET_INDEX write',
         src: 'function main(){ let a = new Array(3); let i = 1; a[i] += 5; return a }',
-        hex: '01039cc3000101c1005000980097010521500098009bc3009800',
+        hex: 'c001c20101039cc3000101c1005000980097010521500098009bc3009800',
       },
     ];
 
@@ -467,6 +472,94 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
         ' return a + i + l5 + l6; }';
       const args = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n];
       expect(() => compile(src, { target: 'v12', args })).not.toThrow();
+    });
+  });
+
+  // ── main() frame-stride declaration (ALLOCATE prefix) ───────────────────────
+  // The Huff runtime advances VALUES_BASE/HEAP_BASE on each CALL_FUNCTION by the
+  // CALLER's declared slot count (recorded by ALLOCATE_VALUE/ALLOCATE_HEAP at the
+  // function's entry), DEFAULTING TO 0 — a frame must ALLOCATE to stride. A HELPER
+  // already emits its ALLOCATE prefix; main (inlined) did NOT, so a slot-using main
+  // calling a helper left CUR_*_SLOTS at 0 and the callee's frame aliased main's
+  // slots from base 0 (clobbering them). main must therefore ALSO emit
+  // ALLOCATE_VALUE/ALLOCATE_HEAP declaring its own high-water slot count — emitted
+  // UNCONDITIONALLY for every slot-using main (the default-0 contract: a missing
+  // ALLOCATE is a latent aliasing bug, not a no-op). (Engine regression twin:
+  // ../sauce engine-v12/test/V12-saucer/V12SaucerFrameBase.t.sol.)
+  describe('main() frame-stride declaration', () => {
+    // main using N declared `a*` value-slot locals plus `h` (the helper-call result)
+    // = N+1 value slots when it calls a helper. Find the ALLOCATE_VALUE entry, assert
+    // it declares the high-water and precedes the CALL_FUNCTION.
+    const mainCallingHelper = (n: number): string => {
+      const decls = Array.from({ length: n }, (_, i) => `let a${i}=${i + 1};`).join(' ');
+      const reads = Array.from({ length: n }, (_, i) => `a${i}`).join('+');
+
+      return `function id(x){ return x } function main(){ ${decls} let h=id(0); return ${reads}+h; }`;
+    };
+
+    it('main with >16 value slots + a helper call emits ALLOCATE_VALUE <high-water> at entry', () => {
+      // 20 `a*` locals + `h` → main's value high-water is 21. Without the ALLOCATE the
+      // runtime strides the id() call by the default 0, so id's frame aliases main's slots
+      // from base 0 (clobbering them). The prefix must declare 21 and precede the call.
+      const bc = compile(mainCallingHelper(20), { target: 'v12' }).bytecode[0];
+      const allocIdx = bc.indexOf(OPS.ALLOCATE_VALUE);
+      const callIdx = bc.indexOf(OPS.CALL_FUNCTION);
+      expect(allocIdx).toBe(0); // main's ALLOCATE is the very first op
+      expect(bc[allocIdx + 1]).toBe(21); // 20 a-locals + h = value-slot high-water
+      expect(callIdx).toBeGreaterThan(allocIdx); // ALLOCATE precedes the call
+    });
+
+    it('a small main with a helper call still declares its frame', () => {
+      // 10 `a*` + `h` = 11 value slots: the prefix declares 11 so the id() call strides
+      // the callee past main's 11 slots (under default-0 it would otherwise alias them).
+      const bc = compile(mainCallingHelper(10), { target: 'v12' }).bytecode[0];
+      expect(bc[0]).toBe(OPS.ALLOCATE_VALUE);
+      expect(bc[1]).toBe(11);
+    });
+
+    it('main with heap (new Array) locals emits ALLOCATE_HEAP <high-water> too', () => {
+      // Heap slots have the SAME frame aliasing. A main with heap array locals must
+      // declare its heap high-water so a helper call strides past them. 18 arrays = 18
+      // heap slots; `h` is the scalar call result (value slot, separate pool).
+      const decls = Array.from({ length: 18 }, (_, i) => `let g${i}=new Array(1);`).join(' ');
+      const src = `function id(x){ return x } function main(){ ${decls} let h=id(0); return g17 }`;
+      const bc = compile(src, { target: 'v12' }).bytecode[0];
+      const heapIdx = bc.indexOf(OPS.ALLOCATE_HEAP);
+      expect(heapIdx).toBeGreaterThanOrEqual(0);
+      expect(bc[heapIdx + 1]).toBe(18); // 18 heap locals
+    });
+
+    it('the ALLOCATE prefix shifts SDUP/CALL positions consistently (compiles + patches clean)', () => {
+      // With compile-time args (the arg-prologue path) the inlined main now also carries
+      // the ALLOCATE prefix; main's recorded SDUP/CALL sentinels must be shifted past it
+      // or patchSdup/patchCalls would target the wrong byte. A >16-slot param-main with a
+      // helper call exercises both shifts — must compile without a REF/offset throw.
+      const decls = Array.from({ length: 20 }, (_, i) => `let a${i}=p+${i};`).join(' ');
+      const reads = Array.from({ length: 20 }, (_, i) => `a${i}`).join('+');
+      const src = `function id(x){ return x } function main(p){ ${decls} let h=id(p); return ${reads}+h; }`;
+      expect(() => compile(src, { target: 'v12', args: [5n] })).not.toThrow();
+    });
+
+    it('a leaf main (no helper call) STILL emits its ALLOCATE prefix (default-0 contract)', () => {
+      // Under the default-0 engine, ALLOCATE is emitted for EVERY slot-using main,
+      // unconditionally — even a call-free one. The prefix is harmless when no frame is
+      // strided, and unconditional emission is the spec contract (a missing ALLOCATE is a
+      // latent aliasing bug). A 20-local leaf main leads with ALLOCATE_VALUE 20 and has no
+      // CALL_FUNCTION.
+      const decls = Array.from({ length: 20 }, (_, i) => `let a${i}=${i + 1};`).join(' ');
+      const reads = Array.from({ length: 20 }, (_, i) => `a${i}`).join('+');
+      const bc = compile(`function main(){ ${decls} return ${reads}; }`, { target: 'v12' }).bytecode[0];
+      expect(bc.indexOf(OPS.CALL_FUNCTION)).toBe(-1);
+      expect(bc[0]).toBe(OPS.ALLOCATE_VALUE);
+      expect(bc[1]).toBe(20);
+    });
+
+    it('a no-slot main (no locals) emits NO ALLOCATE prefix (nothing to declare)', () => {
+      // ALLOCATE is gated on USING slots, not on calling. A main with zero locals has no
+      // value/heap high-water, so allocatePrefix() is empty — `return 1` is just push+MSTORE.
+      const bc = compile('function main(){ return 1 }', { target: 'v12' }).bytecode[0];
+      expect(bc[0]).not.toBe(OPS.ALLOCATE_VALUE);
+      expect(bc[0]).not.toBe(OPS.ALLOCATE_HEAP);
     });
   });
 });
