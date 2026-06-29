@@ -18,7 +18,7 @@
  * and RE-ANCHORS a pool's whole walk to that live spot on ANY drift. This adapter models
  * that read per pool:
  *   - DRIFT (a test sets `liveCurRealOverride`/`liveTickOverride`/`liveLOverride` on the
- *     pool, or `v2LiveOverride`): the modeled live state is the override → the merge
+ *     pool): the modeled live state is the override → the merge
  *     re-anchors the pool's walk to it (symmetric for drift UP and DOWN) and stale-skips its
  *     prepared cache, exactly as the solver does.
  *   - NO DRIFT, seeded pool (real / prod-mirror pools always stamp `topNearReal` + the dn
@@ -32,7 +32,7 @@
  */
 
 import { EcoBracketKind, type EcoSwapPrepared } from "../shared/types";
-import { OFFSET, toOutIn, getSqrtRatioAtTick } from "./ecoswap.math";
+import { toOutIn } from "./ecoswap.math";
 import { kwayReference, type KwayLivePool } from "./ecoswap.kway.reference";
 
 export interface EcoSwapReferenceResult {
@@ -111,7 +111,3 @@ export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): E
     totalInput: res.totalInput,
   };
 }
-
-// Re-exported so callers that previously imported the OFFSET/derivation helpers from this
-// module keep working (the merge derivation lives in ecoswap.kway.reference now).
-export { OFFSET, getSqrtRatioAtTick };

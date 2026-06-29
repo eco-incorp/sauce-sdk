@@ -668,7 +668,7 @@ describe("EcoSwap K-way — B2 cap-binding (reach == PER_POOL budget, solver == 
 // ─────────────────────────────────────────────────────────────
 // C — drift-UP (against-swap drift) → up frontier
 // ─────────────────────────────────────────────────────────────
-describe("EcoSwap K-way — drift-UP (up frontier)", () => {
+describe("EcoSwap K-way — drift-UP (drift-UP re-anchor)", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
@@ -736,7 +736,7 @@ describe("EcoSwap K-way — drift-UP (up frontier)", () => {
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`C [${engine}] one pool drifts UP after prepare → up frontier fills (spot,top], wei-exact == oracle`, { skip }, async () => {
+    it(`C [${engine}] one pool drifts UP after prepare → drift-UP re-anchor fills (spot,top], wei-exact == oracle`, { skip }, async () => {
       await resetPools();
       const target = cookTarget(engine, stack, v12);
       const caller = c.account0;
@@ -2264,7 +2264,7 @@ describe("EcoSwap K-way — H oneForZero bytecode path (split-exactness == oracl
   // H3: oneForZero drift-UP → the up frontier (oneForZero up step) funds (spot,top] before the
   // prepared brackets. The drifted (better-priced) 3000 pool must be funded via the up frontier.
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`H3 [${engine}] oneForZero drift-UP → up frontier fills, wei-exact == oracle`, { skip }, async () => {
+    it(`H3 [${engine}] oneForZero drift-UP → drift-UP re-anchor fills, wei-exact == oracle`, { skip }, async () => {
       const { prepared, deltas } = await runOneForZeroDrift(engine, "down", parseEther("30000"), `H3:${engine}`);
       const driftIdx = prepared.pools.findIndex((p) => p.feePpm === 3000);
       assert.ok(deltas[driftIdx] > 0n, `H3:${engine}: drifted-up pool funded via the oneForZero up frontier`);

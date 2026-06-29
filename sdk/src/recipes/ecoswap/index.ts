@@ -61,9 +61,10 @@ export interface EcoSwapOutput {
  * [10..13] are the WS4 forward/frontier seeds — always populated for V3/V4 pools (the
  * streaming forward walk resumes past the prepared window when it under-fills); 0 for
  * V2 (a single wide bracket has no tick frontier → walk skipped).
- * [14..15] are the WS2 pre-fill seeds: topNearReal (the prepare-time spot real sqrt =
- * the against-swap-drift pre-fill STOP target) and bracketCount (0 ⇒ no window ⇒ the
- * forward walk runs from spot for the no-bracket / 1-RPC quote path). 0 for V2.
+ * [14..15] are the WS2 re-anchor / drift-gate seeds: topNearReal (the prepare-time spot
+ * real sqrt = the drift gate / dn re-anchor trigger) and bracketCount (the kept forward-
+ * bracket count — off-chain bookkeeping; the on-chain solver does NOT read [15]; 0 ⇒ no
+ * window ⇒ the dn walk runs from spot for the no-bracket / 1-RPC quote path). 0 for V2.
  */
 function buildPoolTuple(p: EcoPool): bigint[] {
   return [
@@ -81,7 +82,7 @@ function buildPoolTuple(p: EcoPool): bigint[] {
     p.adaptiveNearReal ?? 0n, // [11] REAL sqrt at the near edge
     p.adaptiveStartL ?? 0n, // [12] active L entering the first un-walked step
     p.adaptiveStepRatio ?? 0n, // [13] multiplicative step ratio (getSqrtRatioAtTick(ts))
-    p.topNearReal ?? 0n, // [14] pre-fill STOP target = prepare-time spot real sqrt
+    p.topNearReal ?? 0n, // [14] drift gate / dn re-anchor trigger = prepare-time spot real sqrt
     BigInt(p.bracketCount ?? 0), // [15] forward bracket count (0 ⇒ no-bracket walk from spot)
   ];
 }

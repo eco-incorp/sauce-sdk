@@ -86,9 +86,10 @@ const V2_BRACKETS = 16;
 const MAX_DIRECT_POOLS = Number(process.env.ECO_MAX_POOLS ?? 12);
 /**
  * Forward drift buffer (extra lens tick boundaries past the cut) for ROUTE hops ONLY.
- * Direct pools use 0 (the on-chain pre-fill + forward walk read drift live), but routes
- * compose off-chain via localQuote and execute in one flat swapV3 per hop with no live
- * walk, so their prepared bracket curve must extend slightly past the sampled amountIn.
+ * Direct pools use 0 (the on-chain solver re-anchors its dn walk to the live spot and
+ * reads drift live), but routes compose off-chain via localQuote and execute in one flat
+ * swapV3 per hop with no live walk, so their prepared bracket curve must extend slightly
+ * past the sampled amountIn.
  */
 const ROUTE_DRIFT_TICKS = 2;
 /** Always keep at least this many brackets (so tiny trades still split sensibly). */
@@ -120,8 +121,8 @@ const ADAPTIVE_SEED_INIT = {
   adaptiveNearReal: 0n,
   adaptiveStartL: 0n,
   adaptiveStepRatio: 0n,
-  // Pre-fill (against-swap drift) seeds — buildV3Brackets overwrites for V3/V4 pools
-  // with a prepared window; V2 keeps these zeros (no pre-fill, no tick frontier).
+  // Re-anchor / drift-gate seeds — buildV3Brackets overwrites for V3/V4 pools with a
+  // prepared window; V2 keeps these zeros (no drift gate, no tick frontier).
   topNearReal: 0n,
   bracketCount: 0,
 } as const;
@@ -322,10 +323,11 @@ function buildV3Brackets(
   const spotReal = r.pool.sqrtPriceX96;
 
   // WS2 §3.2: the capacity-0 reverse-side brackets (above spot, drift-only) are GONE.
-  // Against-swap drift is now read LIVE by the on-chain solver's pre-fill (it walks the
-  // gap (topNearOI, liveCur] down from the live tick), so prepare no longer fabricates
-  // reverse brackets. The pre-fill seeds (topNearReal/bracketCount, stamped below) are
-  // computed from the FORWARD loop + spot, so dropping the reverse scan costs nothing.
+  // Against-swap drift is now read LIVE by the on-chain solver, which re-anchors its dn
+  // walk to the live spot (running it from the live tick), so prepare no longer fabricates
+  // reverse brackets. The re-anchor / drift-gate seeds (topNearReal/bracketCount, stamped
+  // below) are computed from the FORWARD loop + spot, so dropping the reverse scan costs
+  // nothing.
 
   // ── Forward brackets (swap direction) ──
   // STOP at the lazy lens's scanned forward boundary — never walk past the data
@@ -343,7 +345,7 @@ function buildV3Brackets(
   let nearReal = spotReal; // real sqrt at the near edge (starts live = spot)
   let b = zeroForOne ? base : base + ts; // first boundary tick in swap dir
   const step = zeroForOne ? -ts : ts;
-  let fwdCount = 0; // forward brackets actually emitted (≤ scannedForward; pre-fill seed)
+  let fwdCount = 0; // forward brackets actually emitted (≤ scannedForward; re-anchor seed)
   // Per-emitted-bracket dn-frontier ENTRY snapshots. frontier[k] is the resume state
   // (shifted boundary, nearReal, L) AFTER k emitted forward brackets — used by
   // prepareEcoSwap to re-stamp the dn seed CONTIGUOUS with the kept cache after the trim
@@ -387,16 +389,18 @@ function buildV3Brackets(
     seed.adaptiveNet = r.net; // off-chain-only net map for the oracle's mirrored walk
     seed.frontierByCount = frontier; // per-kept-count dn resume state (re-stamped post-trim)
 
-    // Pre-fill (against-swap drift) seeds (WS2 §3.1): the STOP target is the prepare-
-    // time spot real sqrt — stamped == spotReal so the pre-fill's topNearOI
-    // (toOutIn(spotReal)) exactly equals the top forward bracket's sqrtNear (built from
-    // the same spotReal, first forward iteration nearReal=spotReal). bracketCount=0 ⇒
-    // no window ⇒ pre-fill skipped + forward walk runs from spot (no-bracket / quote path).
+    // Window-top / re-anchor-gate seeds (WS2 §3.1): topNearReal is the prepare-time
+    // spot real sqrt — stamped == spotReal so its window-top out/in (toOutIn(spotReal))
+    // exactly equals the top forward bracket's sqrtNear (built from the same spotReal,
+    // first forward iteration nearReal=spotReal). It is the DRIFT GATE / re-anchor
+    // trigger the solver compares the live spot against. bracketCount=0 ⇒ no window ⇒
+    // the dn walk runs from the spot seed (no-bracket / quote path).
     seed.topNearReal = spotReal;
     seed.bracketCount = fwdCount;
 
-    // Seam invariant (WS2 §3.1, risk 4): toOutIn(topNearReal) must equal the FIRST
-    // forward bracket's sqrtNear so the pre-fill/sweep seam is exact (no overlap/sliver).
+    // Window-top seam invariant (WS2 §3.1, risk 4): toOutIn(topNearReal) must equal the
+    // FIRST forward bracket's sqrtNear so the window top and the cache align exactly (no
+    // overlap/sliver) — both the drift gate and the dn re-anchor reference this seam.
     // The first forward bracket is built with near=toOutIn(spotReal) (first iteration
     // nearReal=spotReal), so this holds by construction; assert when a bracket exists.
     if (fwdCount > 0) {
@@ -404,7 +408,7 @@ function buildV3Brackets(
       const firstFwd = brackets.find((bk) => bk.capacity > 0n);
       if (firstFwd && firstFwd.sqrtNear !== topNearOI) {
         throw new Error(
-          `pre-fill seam: toOutIn(topNearReal)=${topNearOI} !== first forward bracket sqrtNear=${firstFwd.sqrtNear}`,
+          `window-top seam: toOutIn(topNearReal)=${topNearOI} !== first forward bracket sqrtNear=${firstFwd.sqrtNear}`,
         );
       }
     }
@@ -734,7 +738,7 @@ export async function prepareEcoSwap(
     // on-chain live walk to compensate for an under-reaching window — so the prepared
     // bracket curve must extend slightly past the sampled amountIn for the off-chain
     // localQuote composition to track the real two-hop swap to truncation. (Direct
-    // pools use driftTicks:0 because the solver's pre-fill + forward walk read drift live.)
+    // pools use driftTicks:0 because the solver re-anchors its dn walk and reads drift live.)
     const [hop1, hop2] = await Promise.all([
       runLens(client, lensCookEntry, poolConfig, {
         tokenIn, tokenOut: baseToken, zeroForOne: z1,
@@ -888,7 +892,8 @@ export async function prepareEcoSwap(
   // accumulating capacity until amountIn is covered; keep ONLY brackets[0..cutIdx] (the
   // ticks the trade actually crosses). Past-window with-swap drift is read LIVE by the
   // on-chain forward walk (resumed from each pool's frontier seed), and against-window
-  // against-swap drift by the pre-fill — so no prepared safety buffer is needed.
+  // against-swap drift by the dn re-anchor to the live spot — so no prepared safety
+  // buffer is needed.
   let covered = 0n;
   let cutIdx = brackets.length - 1;
   for (let i = 0; i < brackets.length; i++) {

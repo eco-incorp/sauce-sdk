@@ -229,7 +229,7 @@ describe("k-way reference == optimal oracle (no-drift, window covers / dn under-
   }
 });
 
-describe("k-way reference == optimal oracle (drift-UP → up frontier)", () => {
+describe("k-way reference == optimal oracle (drift-UP → drift-UP re-anchor)", () => {
   const L1 = 2n * 10n ** 24n;
   const L2 = 10n ** 24n;
   // Both prepared at spot tick 0; pool0 live drifts UP to tick +600 (against the swap).
@@ -250,7 +250,7 @@ describe("k-way reference == optimal oracle (drift-UP → up frontier)", () => {
     { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: L2, net: new Map() },
   ];
   for (const amountIn of [100n * E18, 5000n * E18]) {
-    it(`drift-UP amountIn=${amountIn} — up frontier (spot,top] == oracle, wei-exact`, () => {
+    it(`drift-UP amountIn=${amountIn} — drift-UP re-anchor (spot,top] == oracle, wei-exact`, () => {
       const kw = kwayReference(prepared, amountIn, live);
       const opt = optimalSplit({ pools: optPools, amountIn, zeroForOne: true, priceLimit: PRICE_LIMIT });
       assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
@@ -338,7 +338,7 @@ describe("k-way reference == optimal oracle (cross-version V2 + V3 + V4, equal-f
   }
 });
 
-describe("k-way reference == optimal oracle (V2 drift-UP → V2 up frontier)", () => {
+describe("k-way reference == optimal oracle (V2 drift-UP → V2 drift-UP re-anchor)", () => {
   const resIn = 2_000_000n * E18;
   const resOut = 2_000_000n * E18;
   const v2 = buildV2(0, resIn, resOut, 16);
@@ -354,7 +354,7 @@ describe("k-way reference == optimal oracle (V2 drift-UP → V2 up frontier)", (
   const live: (KwayLivePool | undefined)[] = [{ curOI: driftSpotOI, liveV2L: driftL }];
   const optPools: OptimalPool[] = [{ isV2: true, feePpm: 3000, reserveIn: driftResIn, reserveOut: resOut }];
   for (const amountIn of [100n * E18, 5000n * E18]) {
-    it(`V2 drift-UP amountIn=${amountIn} — V2 up frontier (spot,top] == oracle, wei-exact`, () => {
+    it(`V2 drift-UP amountIn=${amountIn} — V2 drift-UP re-anchor (spot,top] == oracle, wei-exact`, () => {
       const kw = kwayReference(prepared, amountIn, live);
       const opt = optimalSplit({ pools: optPools, amountIn, zeroForOne: true, priceLimit: PRICE_LIMIT });
       assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");

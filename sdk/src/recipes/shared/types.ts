@@ -311,16 +311,17 @@ export interface EcoPool {
    */
   frontierByCount?: { shifted: bigint; nearReal: bigint; L: bigint }[];
   /**
-   * OFF-CHAIN-ONLY pre-fill drift model (oracle mirror, ecoswap.reference.ts). The
-   * deterministic local tests run live==prepared, so the pre-fill is a no-op unless a
-   * test deliberately models against-swap drift. When set, the oracle treats these as
-   * the modeled LIVE state and runs the same DOWN-walk the on-chain pre-fill does:
-   *   liveCurRealOverride — REAL sqrt of the modeled live (drifted-up) price.
+   * OFF-CHAIN-ONLY re-anchor drift model (oracle mirror, ecoswap.reference.ts). The
+   * deterministic local tests run live==prepared, so the re-anchor is a no-op unless a
+   * test deliberately models drift. When set, the oracle treats these as the modeled
+   * LIVE drifted spot and RE-ANCHORS the pool's dn walk to it, exactly as the on-chain
+   * solver does:
+   *   liveCurRealOverride — REAL sqrt of the modeled live (drifted) price.
    *   liveTickOverride    — modeled live tick (drives the start boundary, mirroring
    *                         the on-chain ((liveTick+OFFSET)/ts)*ts derivation).
-   *   liveLOverride       — modeled live active L (the gap walk's entry liquidity).
-   * Unset ⇒ modeled live == spot (topNearReal) ⇒ no gap ⇒ oracle pre-fill is a no-op,
-   * so every existing vector is unchanged. NOT in the compiler tuple.
+   *   liveLOverride       — modeled live active L (the re-anchored walk's entry liquidity).
+   * Unset ⇒ modeled live == spot (topNearReal) ⇒ no drift ⇒ the oracle re-anchor is a
+   * no-op, so every existing vector is unchanged. NOT in the compiler tuple.
    */
   liveCurRealOverride?: bigint;
   liveTickOverride?: number;

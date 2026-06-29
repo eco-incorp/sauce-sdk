@@ -181,7 +181,6 @@ export function kwayReference(
         dnNear[i] = cl; // V2 dn stores OUT/IN directly; re-anchor to the live spot
         dnL[i] = ll;
         dnShift[i] = 0n;
-        dnSteps[i] = 0;
       }
     }
   }
