@@ -1,23 +1,21 @@
 /**
- * EcoSwap single-pass solver gas SCALING MATRIX — across BOTH a pool-count and a
- * bracket-density axis, on both engines (v1 + v12). LOCAL EVM, NO fork.
+ * EcoSwap unified-walk solver gas SCALING MATRIX — across BOTH a pool-count and a
+ * cache-density axis, on both engines (v1 + v12). LOCAL EVM, NO fork.
  *
  * Motivation
  * ──────────
- * The fixed-point gas comparison (src/recipes/test/ecoswap.gas.evm.test.ts, 3 pools /
- * ~24 brackets) is one point. This matrix measures how the single-pass solver's
- * cook gas MOVES as SCALE grows along two axes, and where the v12 descriptor budget
- * caps it:
+ * The fixed-point gas comparison (src/recipes/test/ecoswap.gas.evm.test.ts, 3 pools)
+ * is one point. This matrix measures how the production unified-walk solver's cook gas
+ * MOVES as SCALE grows along two axes, and where the v12 descriptor budget caps it:
  *   • pool count   — 2, 4, 6, 8 distinct-fee-tier V3 pools (≤ MAX_DIRECT_POOLS=12),
  *                    distinct depths so the water-fill genuinely splits.
- *   • bracket density — controlled by trade size: a small "sparse" trade sweeps few
- *                    tickSpacing boundaries (few brackets/pool); a large "dense" trade
- *                    sweeps many. Both stay under the v12 descriptor budget where v12
- *                    can run; configs that exceed it are recorded v1-only + "v12 over
- *                    descriptor budget".
+ *   • cache density — controlled by trade size: a small "sparse" trade scans a shallow
+ *                    per-pool cache window; a large "dense" trade scans deeper. Both stay
+ *                    under the v12 descriptor budget where v12 can run; configs that
+ *                    exceed it are recorded v1-only + "v12 over descriptor budget".
  *
  * For each (poolCount, density) config we measure cook() `gasUsed` for the
- *   single-pass solver × {v1, v12}
+ *   unified-walk solver × {v1, v12}
  * cell set, and verify the swap is correct (split ≥2 pools, fee-adjusted marginals
  * equalise, per-pool on-chain tokenIn delta matches the oracle, total spend exact)
  * and that v1 and v12 give identical output (parity).
@@ -144,7 +142,7 @@ function reason(e: unknown): string {
   return msg.split("\n")[0].slice(0, 120);
 }
 
-describe("EcoSwap gas scaling matrix (pools × bracket density)", () => {
+describe("EcoSwap gas scaling matrix (pools × cache density)", () => {
   if (!process.env.ECO_GAS) {
     it("skipped (set ECO_GAS=1 to run)", () => {
       /* opt-in only — no anvil boot */
@@ -271,8 +269,13 @@ describe("EcoSwap gas scaling matrix (pools × bracket density)", () => {
     );
     assert.equal(prepared.pools.length, nPools, `should discover ${nPools} pools`);
     assert.equal(prepared.routes.length, 0, "no routes (baseTokens == swap pair)");
-    assert.ok(prepared.brackets.length > 0, "should build brackets");
-    if (cfg.brackets === null) cfg.brackets = prepared.brackets.length;
+    // Direct-pool data now lives in the per-pool net cache (prepared.brackets holds ROUTE
+    // segments ONLY — empty here, since baseTokens == the swap pair ⇒ no routes). The realised
+    // "density" of the unified walk is the total per-pool net-cache row count across all pools.
+    const netRowTotal = prepared.pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
+    const windowedPools = prepared.pools.filter((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n).length;
+    assert.ok(windowedPools > 0, "should scan a per-pool cache window for ≥1 pool");
+    if (cfg.brackets === null) cfg.brackets = netRowTotal;
 
     // Per-pool tokenIn reserve before (index-aligned to prepared.pools).
     const inBefore = prepared.pools.map(() => 0n);
@@ -309,8 +312,8 @@ describe("EcoSwap gas scaling matrix (pools × bracket density)", () => {
     // Compute-then-pull: pulls exactly cum == oracle totalInput; no priceLimit is hit
     // here, so spent is exact and leftover is zero.
     const ref = ecoSwapReference(prepared, amountIn);
-    assert.equal(spent, ref.totalInput, "single-pass: spent == oracle totalInput EXACTLY");
-    assert.equal(leftover, 0n, "single-pass: no leftover (compute-then-pull, no limit hit)");
+    assert.equal(spent, ref.totalInput, "unified walk: spent == oracle totalInput EXACTLY");
+    assert.equal(leftover, 0n, "unified walk: no leftover (compute-then-pull, no limit hit)");
 
     // ── Fee-adjusted marginals equalise across filled pools ──
     const adj: bigint[] = [];
@@ -324,7 +327,7 @@ describe("EcoSwap gas scaling matrix (pools × bracket density)", () => {
     assert.ok(spread < 0.02, `post-swap fee-adj marginals should cluster (spread ${spread})`);
 
     // ── Per-pool oracle cross-check ──
-    // Local state is deterministic, so single-pass (compute-then-pull) should match
+    // Local state is deterministic, so the unified walk (compute-then-pull) should match
     // the oracle's perPoolInput closely. Track the max relative deviation.
     let maxDev = cfg.maxOracleDev;
     const tol = 0.02; // tight: deterministic local state
@@ -346,11 +349,11 @@ describe("EcoSwap gas scaling matrix (pools × bracket density)", () => {
     return { gas: receipt.gasUsed, perPool, spent, received };
   }
 
-  // Generate one it() per (poolCount × density) config. Inside, run the single-pass
+  // Generate one it() per (poolCount × density) config. Inside, run the unified-walk
   // solver on both engines, assert correctness + v1≡v12 parity, and record gas.
   for (const nPools of POOL_COUNTS) {
     for (const { name: density, amountIn } of DENSITIES) {
-      it(`config [${nPools} pools / ${density}] — single-pass splits correctly; record gas (v1+v12)`, async () => {
+      it(`config [${nPools} pools / ${density}] — unified walk splits correctly; record gas (v1+v12)`, async () => {
         const cfg: ConfigResult = {
           poolCount: nPools,
           density,
@@ -372,7 +375,7 @@ describe("EcoSwap gas scaling matrix (pools × bracket density)", () => {
             cfg.cells.set(engine, { gas: r.gas, note: null });
             byEngine.set(engine, { perPool: r.perPool, spent: r.spent, received: r.received });
             console.log(
-              `  [${nPools}p/${density}] ${engine}: brackets=${cfg.brackets} gas=${r.gas} ` +
+              `  [${nPools}p/${density}] ${engine}: netRows=${cfg.brackets} gas=${r.gas} ` +
                 `spent=${r.spent} split=${cfg.split}`,
             );
           } catch (e) {
@@ -417,13 +420,13 @@ function writeMatrixSection(): void {
 
   const L: string[] = [];
   L.push("");
-  L.push("## Scaling matrix — single-pass gas across pools × bracket density");
+  L.push("## Scaling matrix — unified-walk gas across pools × cache density");
   L.push("");
   L.push(
     "Generated by `src/recipes/test/ecoswap.gas-matrix.evm.test.ts` (gated on `ECO_GAS=1`). " +
-      "The fixed-point comparison above is one point (3 pools / ~24 brackets); this " +
-      "section measures how the single-pass solver's cook gas MOVES with SCALE along TWO " +
-      "axes, and where the v12 descriptor budget caps it.",
+      "The fixed-point comparison above is one point (3 pools); this section measures how the " +
+      "production unified-walk solver's cook gas MOVES with SCALE along TWO axes, and where the " +
+      "v12 descriptor budget caps it.",
   );
   L.push("");
   L.push("**Axes.**");
@@ -434,11 +437,13 @@ function writeMatrixSection(): void {
       "Distinct fee+depth forces the water-fill to split (cheapest/deepest fills first).",
   );
   L.push(
-    "- **Bracket density** — controlled by trade size. `sparse` = " +
-      `\`parseEther("${DENSITIES[0].amountIn / 10n ** 18n}")\` sweeps few tickSpacing ` +
-      `boundaries per pool; \`dense\` = \`parseEther("${DENSITIES[1].amountIn / 10n ** 18n}")\` ` +
-      "sweeps many. The total bracket count (the off-chain ladder the solver iterates) " +
-      "is the realised density and is reported per config.",
+    "- **Cache density** — controlled by trade size. `sparse` = " +
+      `\`parseEther("${DENSITIES[0].amountIn / 10n ** 18n}")\` scans a shallow per-pool ` +
+      `cache window; \`dense\` = \`parseEther("${DENSITIES[1].amountIn / 10n ** 18n}")\` ` +
+      "scans deeper. The reported `net rows` is the total per-pool net-cache row count " +
+      "(initialised ticks the unified walk reuses) — the realised cache density. These wide " +
+      "single-position pools have no interior initialised ticks, so the rows count is small; " +
+      "the gas is driven by the live per-pool walk + per-pool swap.",
   );
   L.push("");
   L.push(
@@ -460,7 +465,7 @@ function writeMatrixSection(): void {
   // Main gas table.
   L.push("### Gas (`receipt.gasUsed`)");
   L.push("");
-  L.push("| pools | density | brackets | split | v1 gas | v12 gas | v12 − v1 |");
+  L.push("| pools | density | net rows | split | v1 gas | v12 gas | v12 − v1 |");
   L.push("| ---: | --- | ---: | ---: | ---: | ---: | ---: |");
   for (const cfg of sorted) {
     const v1 = cfg.cells.get("v1") ?? { gas: null, note: null };
@@ -495,9 +500,9 @@ function writeMatrixSection(): void {
           `${Math.round(avg(high)).toLocaleString("en-US")} at ≥6 pools)`
         : "";
     bullets.push(
-      `**v1 (Solidity Router) scaling.** Single-pass cook gas grows with both pool count and ` +
-        `bracket density${trend}; the dense trades cross more bracket boundaries, and the ladder ` +
-        "iteration + per-pool swap dominate the cost.",
+      `**v1 (Solidity Router) scaling.** Unified-walk cook gas grows with both pool count and ` +
+        `cache density${trend}; the dense trades walk more tick steps per pool, and the per-pool ` +
+        "live walk + per-pool swap dominate the cost.",
     );
   }
 
@@ -520,20 +525,24 @@ function writeMatrixSection(): void {
     );
   }
 
-  // v12 descriptor budget frontier.
+  // v12 reverts (recorded, not fatal — only v1 must execute).
   const overBudget = sorted.filter((c) => c.cells.get("v12")?.note != null);
   if (v12Available && overBudget.length > 0) {
+    // Distinct revert reasons across the over-budget cells (one selector ⇒ one cause).
+    const reasons = [...new Set(overBudget.map((c) => c.cells.get("v12")!.note!))];
     bullets.push(
-      `**v12 descriptor budget frontier.** The v12 cells go OVER budget (cook reverts) once the ` +
-        "combined pools × bracket descriptor blob grows too large — it is the pools×brackets " +
-        "PRODUCT, not bracket count alone, that trips the ceiling. Over-budget configs: " +
-        overBudget.map((c) => `${c.poolCount}p/${c.density} (${c.brackets} brackets)`).join(", ") +
-        ". These are recorded v1-only; v12 stays feasible at lower pools and/or sparser density.",
+      `**v12 reverts (recorded v1-only).** The v12 cook reverted on these configs: ` +
+        overBudget.map((c) => `${c.poolCount}p/${c.density} (${c.brackets} net rows)`).join(", ") +
+        `. Revert reason(s): ${reasons.join("; ")}. These pools use NON-default fee tiers ` +
+        "(enabled via `enableFeeAmount` with coarse tickSpacings) and wide ±200·ts positions — a " +
+        "configuration the v12 Huff runtime does not cook here, distinct from the 3-pool default-tier " +
+        "fixed point above which DOES run on v12. The reverts are recorded v1-only; reproducing the " +
+        "exact v12 cause on these tiers is an engine follow-up, out of scope for this gas harness.",
     );
   } else if (v12Available) {
     bullets.push(
       "**v12 descriptor budget frontier.** Every measured config stayed within the v12 descriptor " +
-        "budget (no cell reverted) — the pools×brackets product never exceeded the ceiling at these scales.",
+        "budget (no cell reverted) — the pools × cache-depth product never exceeded the ceiling at these scales.",
     );
   }
 
@@ -541,9 +550,9 @@ function writeMatrixSection(): void {
   const devs = sorted.map((c) => c.maxOracleDev).filter((d) => d > 0 || true);
   if (devs.length > 0) {
     bullets.push(
-      `**Correctness.** Across all configs the single-pass on-chain per-pool input matched the ` +
+      `**Correctness.** Across all configs the unified-walk on-chain per-pool input matched the ` +
         `oracle to within ${(Math.max(...devs) * 100).toFixed(2)}% (max relative deviation); ` +
-        "single-pass spent the input exactly (leftover 0) and v1≡v12 output parity held everywhere.",
+        "the unified walk spent the input exactly (leftover 0) and v1≡v12 output parity held everywhere.",
     );
   }
 

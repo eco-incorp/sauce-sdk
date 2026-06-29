@@ -65,6 +65,19 @@ const SYNTHETIC = "synthetic-wethusdc-500.json";
 
 const HUGE = parseEther("1000000000");
 
+// Per-pool net-cache measure (the unified-walk shape): direct-pool cache no longer lives in
+// prepared.brackets (which now holds ROUTE segments only) — each V3/V4 pool carries its own
+// per-pool cache (a scanned window + the initialized-tick netRows inside it). The "cache is
+// populated" signal is a scanned WINDOW (windowTopShifted > 0), independent of whether any
+// INITIALIZED tick fell inside that window: an in-window uninitialized boundary is still served
+// net 0 from the cache (no staticcall), so a scanned window IS a populated cache even with 0
+// netRows. Defined locally (not shared) to avoid cross-file races.
+function cacheWindowedPools(
+  pools: { isV2?: boolean; windowTopShifted?: bigint }[],
+): number {
+  return pools.filter((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n).length;
+}
+
 // Single engine per (heavy) file: the one selected engine (default v12;
 // ECO_ENGINE=v1 forces v1). See harness/engine.ts.
 const PROD_ENGINE: Engine = selectedEngines()[0];
@@ -231,7 +244,7 @@ describe("EcoSwap prod-mirror (reproduced V3 tick state)", () => {
     const v3Count = prepared.pools.filter((p) => !p.isV2).length;
     assert.equal(v3Count, 1, "should discover exactly the 1 reproduced V3 pool");
     assert.equal(prepared.routes.length, 0, "no routes (baseTokens == swap pair)");
-    assert.ok(prepared.brackets.length > 0, "should build brackets from reconstructed ticks");
+    assert.ok(cacheWindowedPools(prepared.pools) > 0, "should build a per-pool net-cache window from reconstructed ticks");
     assert.ok(prepared.zeroForOne, "tokenIn < tokenOut → zeroForOne");
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);

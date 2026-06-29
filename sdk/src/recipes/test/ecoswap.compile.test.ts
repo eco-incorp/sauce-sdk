@@ -29,47 +29,45 @@ function stripTypes(source: string): string {
 }
 
 // ── Minimal fixture: 2 V3 pools, no routes ───────────────────
-const Q96 = 1n << 96n;
-
 const WETH = BigInt("0x4200000000000000000000000000000000000006");
 const USDC = BigInt("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const CALLER = BigInt("0x1111111111111111111111111111111111111111");
 const PRICE_LIMIT = 4295128740n; // MIN_SQRT_RATIO + 1
 
-// [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
+// [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
+//  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
+const OFFSET = 888000n;
+const STEP_10 = 79232123823359799118286999567n; // sqrt(1.0001^10)*2^96 (ts 10)
+const STEP_60 = 79426470787362580746886972461n; // sqrt(1.0001^60)*2^96 (ts 60)
 const pools: bigint[][] = [
-  [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n],
-  [1n, BigInt("0xbbbb000000000000000000000000000000000002"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n],
+  [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+   STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n],
+  [1n, BigInt("0xbbbb000000000000000000000000000000000002"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+   STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 1n, 1n],
 ];
 const routes: bigint[][] = [];
-
-const sqrtNear = 2n * Q96;
-function brkt(refIdx: bigint, near: bigint, far: bigint, L: bigint): bigint[] {
-  // [kind, refIdx, sqrtNear, sqrtFar, liquidity, capacity, sqrtAdjNear, sqrtAdjFar]
-  const cap = (L * Q96) / far - (L * Q96) / near;
-  return [0n, refIdx, near, far, L, cap > 0n ? cap : 1n, near, far];
-}
-const brackets: bigint[][] = [
-  brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
-  brkt(0n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 10n ** 18n),
-  brkt(1n, sqrtNear, (sqrtNear * 99n) / 100n, 5n * 10n ** 17n),
-  brkt(1n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 5n * 10n ** 17n),
+// netCache: [shiftedTick, rawNet] rows — one initialized tick per pool (netStart 0 then 1).
+const netCache: bigint[][] = [
+  [OFFSET - 30n, 10n ** 17n],
+  [OFFSET - 180n, 5n * 10n ** 16n],
 ];
+const routeSegs: bigint[][] = [];
 
-// ── The canonical K-WAY-LAZY merge solver — ecoswap.sauce.ts ─────────────────
-// The sole on-chain solver (one price-ordered merge over {prepared brackets, dn
-// frontiers}). Lowers new Array(n) + arr[i]=… element mutation, and must compile
-// clean on BOTH the v1 (prefix) and v12 (postfix-Huff) targets — this catches
-// array-mutation / merge / V2-dn / dn-exhaustion lowering regressions on either engine.
-describe("ecoswap.sauce.ts (K-way-lazy merge solver)", () => {
+// ── The unified-walk merge solver — ecoswap.sauce.ts ─────────────────
+// The sole on-chain solver (one price-ordered merge over {each pool's live frontier, route
+// segments}). Lowers new Array(n) + arr[i]=… element mutation, the per-pool net-cache cursor,
+// and the V2/V3/V4 live reads, and must compile clean on BOTH the v1 (prefix) and v12
+// (postfix-Huff) targets — this catches array-mutation / merge / net-cursor lowering regressions
+// on either engine.
+describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   const SINGLEPASS = join(RECIPE_DIR, "ecoswap.sauce.ts");
 
-  // Compile the canonical solver for BOTH targets with the given fixture and
-  // assert each produces >=1 non-empty bytecode segment.
-  function compileBoth(poolsArg: bigint[][], bracketsArg: bigint[][]) {
+  // Compile the solver for BOTH targets with the given fixture (16-field pool tuples + the flat
+  // netCache + routeSegs) and assert each produces >=1 non-empty bytecode segment.
+  function compileBoth(poolsArg: bigint[][], netCacheArg: bigint[][], routeSegsArg: bigint[][]) {
     const source = readFileSync(SINGLEPASS, "utf-8");
     const stripped = stripTypes(source);
-    const args = [WETH, USDC, 10n ** 18n, CALLER, 1n, PRICE_LIMIT, poolsArg, routes, bracketsArg];
+    const args = [WETH, USDC, 10n ** 18n, CALLER, PRICE_LIMIT, poolsArg, routes, netCacheArg, routeSegsArg];
 
     const v1: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args });
     const v12: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args, target: "v12" });
@@ -82,28 +80,20 @@ describe("ecoswap.sauce.ts (K-way-lazy merge solver)", () => {
   }
 
   it("compiles a 2-V3-pool fixture (v1 + v12)", () => {
-    compileBoth(pools, brackets);
+    compileBoth(pools, netCache, routeSegs);
   });
 
-  // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1)
-  // plus the V2 getReserves staticcall path in the live-price cache.
+  // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1) plus the
+  // V2 getReserves staticcall path in the live-price read. V2 carries no net cache (netCount 0).
   it("compiles a V2 + V3 mix (v1 + v12)", () => {
-    // [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
     const mixedPools: bigint[][] = [
-      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n],
-      [0n, BigInt("0xcccc000000000000000000000000000000000003"), 3000n, 0n, 0n, 3000n, 1n, 1n, 0n, 0n],
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n],
+      [0n, BigInt("0xcccc000000000000000000000000000000000003"), 3000n, 0n, 0n, 3000n, 1n, 1n, 0n, 0n,
+       0n, 0n, 0n, 0n, 0n, 0n],
     ];
-    // V2 brackets carry kind=1 (EcoBracketKind.V2).
-    const v2Brkt = (refIdx: bigint, near: bigint, far: bigint, L: bigint): bigint[] => {
-      const cap = (L * Q96) / far - (L * Q96) / near;
-      return [1n, refIdx, near, far, L, cap > 0n ? cap : 1n, near, far];
-    };
-    const mixedBrackets: bigint[][] = [
-      brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
-      v2Brkt(1n, sqrtNear, (sqrtNear * 99n) / 100n, 5n * 10n ** 17n),
-      v2Brkt(1n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 5n * 10n ** 17n),
-    ];
-    compileBoth(mixedPools, mixedBrackets);
+    const mixedNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
+    compileBoth(mixedPools, mixedNetCache, routeSegs);
   });
 
   // V4 pool — guards the StateView getSlot0 read (dp[8]/dp[9]) + unified swap poolType=2.
@@ -113,14 +103,11 @@ describe("ecoswap.sauce.ts (K-way-lazy merge solver)", () => {
     const POOL_MANAGER = BigInt("0x498581fF718922c3f8e6A244956aF099B2652b2b");
     // poolType=2 (V4), tickSpacing=60, stateView + poolId populated.
     const v4Pools: bigint[][] = [
-      [2n, POOL_MANAGER, 3000n, 60n, 0n, 3000n, 0n, 1n, STATE_VIEW, POOL_ID],
+      [2n, POOL_MANAGER, 3000n, 60n, 0n, 3000n, 0n, 1n, STATE_VIEW, POOL_ID,
+       STEP_60, OFFSET, OFFSET - 120n, OFFSET - 60n, 0n, 1n],
     ];
-    // V4 brackets carry kind=0 (concentrated, same geometry as V3).
-    const v4Brackets: bigint[][] = [
-      brkt(0n, sqrtNear, (sqrtNear * 99n) / 100n, 10n ** 18n),
-      brkt(0n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 10n ** 18n),
-    ];
-    compileBoth(v4Pools, v4Brackets);
+    const v4NetCache: bigint[][] = [[OFFSET - 60n, 10n ** 17n]];
+    compileBoth(v4Pools, v4NetCache, routeSegs);
   });
 });
 

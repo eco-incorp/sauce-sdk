@@ -134,7 +134,12 @@ describe("EcoSwap 1-RPC quote — local EVM, eth_call state override", () => {
       { tokenIn, tokenOut, amountIn: AMOUNT_IN }, anvil.rpcUrl, quoteEntry, quoteCaller, poolConfig,
       { ...common, noBrackets: true },
     );
-    assert.equal(noBkt.prepared.brackets.length, 0, "no-bracket quote ran with an empty bracket ladder");
+    // No-bracket quote: the per-pool cache window is cleared (windowTopShifted=0) so the walk
+    // staticcalls every boundary from the live spot — the cache (net rows + scanned window) is
+    // empty. (`brackets` carries ROUTE segments only now; there are no routes here either.)
+    const nbCached = noBkt.prepared.pools.some((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n);
+    assert.equal(nbCached, false, "no-bracket quote ran with an empty cache window");
+    assert.equal(noBkt.prepared.brackets.length, 0, "no-bracket quote has no route segments");
     assert.ok(noBkt.amountOut > 0n, "no-bracket quote returns a positive output");
 
     // (2) PREPARED-BRACKET quote — same pool/amount, full prepared ladder.
@@ -142,7 +147,8 @@ describe("EcoSwap 1-RPC quote — local EVM, eth_call state override", () => {
       { tokenIn, tokenOut, amountIn: AMOUNT_IN }, anvil.rpcUrl, quoteEntry, quoteCaller, poolConfig,
       { ...common },
     );
-    assert.ok(withBkt.prepared.brackets.length > 0, "prepared-bracket quote built a ladder");
+    const wbCached = withBkt.prepared.pools.some((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n);
+    assert.ok(wbCached, "prepared-bracket quote built a per-pool cache window");
     assert.ok(withBkt.amountOut > 0n, "prepared-bracket quote returns a positive output");
 
     // AGREEMENT — the no-bracket walk and the prepared-bracket sweep agree to a tight band

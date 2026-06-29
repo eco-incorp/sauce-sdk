@@ -1,19 +1,28 @@
 /**
- * EcoSwap solver GAS + BYTECODE-SIZE comparison harness (WS8).
+ * EcoSwap solver GAS + BYTECODE-SIZE measurement harness.
  *
- * Compares the TWO EcoSwap solver source variants — all sharing the IDENTICAL
+ * Measures the production UNIFIED-WALK solver (`ecoswap.sauce.ts` — one per-pool
+ * live frontier merged k-way with the static route segments, reusing the
+ * drift-invariant per-pool net cache) and, for a historical reference point, the
+ * FROZEN unrolled-register variant (`ecoswap.unrolled.sauce.ts`). The two solvers
+ * no longer share an arg shape: the unified walk takes
+ *   main(tokenIn, tokenOut, amountIn, caller, priceLimit, pools, routes, netCache, routeSegs)
+ * (zeroForOne is DERIVED from the token sort order on-chain; the direct-pool bracket
+ * ladder is gone — each pool is walked live from its net cache), while the frozen
+ * unrolled reference keeps the older
  *   main(tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit, pools, routes, brackets)
- * arg shape — over the full {variant × target} matrix:
+ * shape. Each solver is therefore fed the arg array its OWN signature expects, both
+ * built from the SAME off-chain `prepared`, over the full {solver × target} matrix:
  *
  *   1. EXECUTION GAS (v1 AND v12): boot a fresh anvil, deploy the deterministic
  *      3-V3-pool Phase-3 stack (and, when the v12 engine artifacts are present,
  *      the v12 stack: Router → SauceRouter → V12Kitchen → owner's V12Pot), then
- *      run ONE cook() of each variant compiled to each target and record
+ *      run ONE cook() of each solver compiled to each target and record
  *      receipt.gasUsed. v1 cooks through the SauceRouter; v12 cooks through the
  *      owner's V12Pot (which delegatecalls the Huff runtime for cook + the
  *      SauceRouter for swap callbacks, all in the Pot's context).
  *
- *   2. COMPILED BYTECODE SIZE (v1 AND v12): compile each variant to both targets
+ *   2. COMPILED BYTECODE SIZE (v1 AND v12): compile each solver to both targets
  *      and record the total blob byte length (sum of segment lengths).
  *
  * Fairness (execution gas): every cook() runs against the IDENTICAL pre-swap pool
@@ -62,23 +71,29 @@ import {
 } from "./harness/setup";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
+import { EcoBracketKind } from "../shared/types";
 import type { EcoSwapPrepared, EcoPool, EcoRoute, EcoBracket } from "../shared/types";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GAS_MD = join(ECOSWAP_DIR, "GAS.md");
 const HUGE = parseEther("1000000000");
 
-// ── The two solver variants under test (same arg shape) ──────
-const SOLVERS: { key: string; file: string; label: string }[] = [
+// ── The two solver source variants under test (DIFFERENT arg shapes) ──────
+// `shape` selects which compiler-arg array the solver is fed (see buildUnifiedArgs /
+// buildLegacyArgs): the production unified walk takes the netCache/routeSegs shape;
+// the frozen unrolled reference keeps the older zeroForOne/brackets shape.
+const SOLVERS: { key: string; file: string; label: string; shape: "unified" | "legacy" }[] = [
   {
-    key: "singlepass-array",
+    key: "unified-walk",
     file: "ecoswap.sauce.ts",
-    label: "single-pass, array-mutation + adaptive walk (default solver)",
+    label: "unified per-pool live walk + per-pool net cache, k-way merge (production solver)",
+    shape: "unified",
   },
   {
-    key: "singlepass-unrolled",
+    key: "unrolled",
     file: "ecoswap.unrolled.sauce.ts",
-    label: "single-pass, unrolled registers (frozen ref)",
+    label: "unrolled registers, prepare-time bracket ladder (FROZEN historical reference, divergent arg shape)",
+    shape: "legacy",
   },
 ];
 
@@ -94,18 +109,20 @@ const TARGETS: Target[] = ["v1", "v12"];
 // requires strictly-increasing).
 const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
 
-// ── Compile-arg tuple builders — COPIED from recipes/ecoswap/index.ts ──
-// (kept byte-for-byte equivalent so the compiler args match what index.ts feeds
-//  the solver; do NOT import — this harness must not mutate shared code.)
+// ── Compile-arg builders — COPIED from recipes/ecoswap/index.ts ──
+// (kept equivalent so the compiler args match what index.ts feeds the solver; do
+//  NOT import — this harness must not mutate shared code.) The production solver and
+//  the frozen reference have DIFFERENT signatures, so there are two builders.
+
+// ── UNIFIED-WALK shape (production `ecoswap.sauce.ts`) ──
+// Pool tuple [10..15] = the per-pool net-cache descriptors; the direct-pool bracket
+// ladder is replaced by a flat per-pool netCache + a static routeSegs array.
 
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio,
- *  topNearReal, bracketCount] — the 16-field tuple matching index.ts (the WS4 forward
- *  seeds [10..13] + the WS2 pre-fill seeds [14..15]). The frozen `unrolled` gas reference
- *  reads only [0..9], so the extra fields are inert for it.
+ *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
  */
-function buildPoolTuple(p: EcoPool): bigint[] {
+function buildUnifiedPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[] {
   return [
     BigInt(p.poolType),
     BigInt(p.address),
@@ -117,16 +134,42 @@ function buildPoolTuple(p: EcoPool): bigint[] {
     p.inIsToken0 ? 1n : 0n,
     BigInt(p.stateView),
     BigInt(p.poolId),
-    p.adaptiveStartShifted ?? 0n,
-    p.adaptiveNearReal ?? 0n,
-    p.adaptiveStartL ?? 0n,
-    p.adaptiveStepRatio ?? 0n,
-    p.topNearReal ?? 0n,
-    BigInt(p.bracketCount ?? 0),
+    p.stepRatio ?? 0n,
+    p.windowTopShifted ?? 0n,
+    p.windowBotShifted ?? 0n,
+    p.extremeShifted ?? 0n,
+    BigInt(netStart),
+    BigInt(netCount),
   ];
 }
 
-/** [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks] */
+/** Per-pool tuples + the flat [shiftedTick, rawNet] netCache (per-pool grouped). */
+function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netCache: bigint[][] } {
+  const netCache: bigint[][] = [];
+  const poolTuples: bigint[][] = [];
+  for (const p of pools) {
+    const rows = p.isV2 ? [] : p.netRows ?? [];
+    const netStart = netCache.length;
+    poolTuples.push(buildUnifiedPoolTuple(p, netStart, rows.length));
+    for (const r of rows) netCache.push([r.shiftedTick, r.rawNet]);
+  }
+  return { poolTuples, netCache };
+}
+
+/** [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar] for every Route bracket, sorted DESC sqrtAdjNear. */
+function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
+  return prepared.brackets
+    .filter((b) => b.kind === EcoBracketKind.Route)
+    .slice()
+    .sort((a, b) => {
+      if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
+      if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
+      return a.refIdx - b.refIdx;
+    })
+    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
+}
+
+/** [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks] (both shapes). */
 function buildRouteTuple(r: EcoRoute): bigint[] {
   const { hop1Pool, hop2Pool, intermediateToken } = r.route;
   return [
@@ -144,6 +187,51 @@ function buildRouteTuple(r: EcoRoute): bigint[] {
   ];
 }
 
+/** Production unified-walk arg array (9 args; no zeroForOne — derived on-chain). */
+function buildUnifiedArgs(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  amountIn: bigint,
+  caller: Hex,
+  prepared: EcoSwapPrepared,
+): unknown[] {
+  const { poolTuples, netCache } = buildPoolsAndNetCache(prepared.pools);
+  return [
+    BigInt(tokenIn),
+    BigInt(tokenOut),
+    amountIn,
+    BigInt(caller),
+    prepared.priceLimit,
+    poolTuples,
+    prepared.routes.map(buildRouteTuple),
+    netCache,
+    buildRouteSegs(prepared),
+  ];
+}
+
+// ── LEGACY shape (frozen `ecoswap.unrolled.sauce.ts` reference) ──
+// The unrolled reference reads only pool tuple [0..9] and the prepare-time bracket
+// ladder; it predates the unified walk's per-pool net cache. The 16-field tuple is
+// kept so the positional reads line up, with the now-removed [10..15] fields zeroed
+// (inert for the frozen reference — it never reads them).
+
+/** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId, 0×6] */
+function buildLegacyPoolTuple(p: EcoPool): bigint[] {
+  return [
+    BigInt(p.poolType),
+    BigInt(p.address),
+    BigInt(p.fee),
+    BigInt(p.tickSpacing),
+    BigInt(p.hooks),
+    BigInt(p.feePpm),
+    p.isV2 ? 1n : 0n,
+    p.inIsToken0 ? 1n : 0n,
+    BigInt(p.stateView),
+    BigInt(p.poolId),
+    0n, 0n, 0n, 0n, 0n, 0n,
+  ];
+}
+
 /** [kind, refIdx, sqrtNear, sqrtFar, liquidity, capacity, sqrtAdjNear, sqrtAdjFar] */
 function buildBracketTuple(b: EcoBracket): bigint[] {
   return [
@@ -158,8 +246,8 @@ function buildBracketTuple(b: EcoBracket): bigint[] {
   ];
 }
 
-/** Build the full compiler args array exactly as index.ts does. */
-function buildCompilerArgs(
+/** Frozen unrolled-reference arg array (9 args; zeroForOne + bracket ladder). */
+function buildLegacyArgs(
   tokenIn: Hex,
   tokenOut: Hex,
   amountIn: bigint,
@@ -173,10 +261,24 @@ function buildCompilerArgs(
     BigInt(caller),
     prepared.zeroForOne ? 1n : 0n,
     prepared.priceLimit,
-    prepared.pools.map(buildPoolTuple),
+    prepared.pools.map(buildLegacyPoolTuple),
     prepared.routes.map(buildRouteTuple),
     prepared.brackets.map(buildBracketTuple),
   ];
+}
+
+/** Pick the arg array the given solver's signature expects. */
+function argsForShape(
+  shape: "unified" | "legacy",
+  tokenIn: Hex,
+  tokenOut: Hex,
+  amountIn: bigint,
+  caller: Hex,
+  prepared: EcoSwapPrepared,
+): unknown[] {
+  return shape === "unified"
+    ? buildUnifiedArgs(tokenIn, tokenOut, amountIn, caller, prepared)
+    : buildLegacyArgs(tokenIn, tokenOut, amountIn, caller, prepared);
 }
 
 /** Total compiled blob size in bytes (sum of segment hex lengths). */
@@ -249,14 +351,25 @@ function writeGasMd(): void {
   lines.push("## Methodology");
   lines.push("");
   lines.push(
-    "Two EcoSwap single-pass solver source variants share the IDENTICAL " +
-      "`main(tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit, pools, routes, brackets)` " +
-      "signature (`index.ts` always compiles the canonical `ecoswap.sauce.ts`):",
+    "Two EcoSwap solver source variants are measured. They have DIFFERENT arg shapes — " +
+      "each is fed the compiler-arg array its own `main()` signature expects, both built " +
+      "from the SAME off-chain `prepared` (`index.ts` always compiles the production " +
+      "`ecoswap.sauce.ts`):",
   );
   lines.push("");
   for (const s of SOLVERS) {
     lines.push(`- **${s.key}** — \`recipes/ecoswap/${s.file}\` — ${s.label}`);
   }
+  lines.push("");
+  lines.push(
+    "The production solver signature is " +
+      "`main(tokenIn, tokenOut, amountIn, caller, priceLimit, pools, routes, netCache, routeSegs)` " +
+      "— `zeroForOne` is DERIVED on-chain from the token sort order, and the direct-pool " +
+      "bracket ladder is replaced by a per-pool `netCache` (drift-invariant tick nets reused " +
+      "by a live walk) plus a static `routeSegs` array. The frozen unrolled reference keeps " +
+      "the older `…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer " +
+      "the production solver and is kept only as a historical bytecode-size / gas data point.",
+  );
   lines.push("");
   lines.push(
     "**Stack** (deterministic, no fork): a fresh `anvil` with Multicall3 etched, " +
@@ -274,12 +387,13 @@ function writeGasMd(): void {
   );
   lines.push("");
   lines.push(
-    "**Same prepared data for all variants.** `ecoSwap(...)` runs the off-chain " +
-      "prepare ONCE; the resulting `prepared` (pools/routes/brackets/zeroForOne/" +
-      "priceLimit) is turned into the compiler args array (the `buildPoolTuple`/" +
-      "`buildRouteTuple`/`buildBracketTuple` helpers and arg order copied verbatim " +
-      "from `index.ts`). Every (solver × target) compiles against THOSE args, so " +
-      "the only variables are the solver source and the bytecode target.",
+    "**Same prepared data for both variants.** `ecoSwap(...)` runs the off-chain " +
+      "prepare ONCE; the resulting `prepared` (pools/routes/brackets/net cache/" +
+      "priceLimit) is turned into the compiler-arg array EACH solver's signature " +
+      "expects — the production unified walk gets the `pools`/`netCache`/`routeSegs` " +
+      "shape (builders copied verbatim from `index.ts`), the frozen unrolled reference " +
+      "gets the legacy `pools`/`brackets` shape. Both derive from the same `prepared`, " +
+      "so the only variables are the solver source, its arg shape, and the bytecode target.",
   );
   lines.push("");
   lines.push(
@@ -363,30 +477,30 @@ function writeGasMd(): void {
   lines.push("");
 
   // Takeaways — assembled from whatever was actually measured this run.
-  const arrSize = sizeBytes.get("singlepass-array");
-  const unrSize = sizeBytes.get("singlepass-unrolled");
-  const arrGas = execGas.get("singlepass-array");
-  const unrGas = execGas.get("singlepass-unrolled");
+  const arrSize = sizeBytes.get("unified-walk");
+  const unrSize = sizeBytes.get("unrolled");
+  const arrGas = execGas.get("unified-walk");
+  const unrGas = execGas.get("unrolled");
   const bullets: string[] = [];
 
-  // Array vs unrolled single-pass (size).
+  // Unified walk vs frozen unrolled reference (size).
   if (arrSize && unrSize && arrSize.v1 !== null && unrSize.v1 !== null) {
     const cmp = Number(arrSize.v1) < Number(unrSize.v1) ? "smaller" : Number(arrSize.v1) === Number(unrSize.v1) ? "equal" : "larger";
     bullets.push(
-      `**Array vs unrolled (size).** The array-mutation single-pass solver ` +
+      `**Unified walk vs frozen unrolled reference (size).** The production unified-walk solver ` +
         `(v1 ${Number(arrSize.v1).toLocaleString("en-US")} B) is ${cmp} than the ` +
-        `unrolled-register reference (v1 ${Number(unrSize.v1).toLocaleString("en-US")} B) — ` +
-        "the array indexing replaces the per-pool if-ladder register banks " +
-        "(now also carrying the adaptive dynamic-tick walk).",
+        `frozen unrolled-register reference (v1 ${Number(unrSize.v1).toLocaleString("en-US")} B). ` +
+        "The two are DIFFERENT programs (different arg shapes), so this is a coarse code-density " +
+        "reference, not a like-for-like swap.",
     );
   }
-  // Array vs unrolled single-pass (gas), if both executed.
+  // Unified walk vs frozen reference (gas), if both executed.
   if (arrGas && unrGas && arrGas.v1 !== null && unrGas.v1 !== null) {
     const cmp = BigInt(arrGas.v1) < BigInt(unrGas.v1) ? "less" : BigInt(arrGas.v1) === BigInt(unrGas.v1) ? "equal" : "more";
     bullets.push(
-      `**Array vs unrolled (v1 gas).** The array single-pass uses ${cmp} gas ` +
-        `(${Number(arrGas.v1).toLocaleString("en-US")}) than the unrolled reference ` +
-        `(${Number(unrGas.v1).toLocaleString("en-US")}).`,
+      `**Unified walk vs frozen reference (v1 gas).** The unified walk uses ${cmp} gas ` +
+        `(${Number(arrGas.v1).toLocaleString("en-US")}) than the frozen unrolled reference ` +
+        `(${Number(unrGas.v1).toLocaleString("en-US")}) — different programs, so a coarse reference only.`,
     );
   }
   // v1 vs v12 size.
@@ -394,7 +508,7 @@ function writeGasMd(): void {
     const pct = pctSmaller(arrSize.v1, arrSize.v12);
     bullets.push(
       `**v12 vs v1 (size).** v12 (postfix Huff) is markedly smaller than v1 (prefix) — ` +
-        `e.g. singlepass-array ${Number(arrSize.v12).toLocaleString("en-US")} B vs ` +
+        `e.g. the unified walk ${Number(arrSize.v12).toLocaleString("en-US")} B vs ` +
         `${Number(arrSize.v1).toLocaleString("en-US")} B${pct ? ` (${pct})` : ""}.`,
     );
   }
@@ -553,9 +667,8 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
       assert.ok(true, "size axis skipped: prepared data unavailable");
       return;
     }
-    const args = buildCompilerArgs(tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
-
     for (const s of SOLVERS) {
+      const args = argsForShape(s.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
       const source = readFileSync(join(ECOSWAP_DIR, s.file), "utf-8");
       const cell: Cell = { v1: null, v12: null };
       for (const target of TARGETS) {
@@ -575,11 +688,10 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
       console.log(`  [size] ${s.key}: v1=${cell.v1 ?? "FAIL"}B v12=${cell.v12 ?? "FAIL"}B`);
     }
 
-    // The array single-pass (the WS2 rewrite) must compile to BOTH targets — that
-    // is the point of the rewrite. The unrolled reference compiles to both too.
-    const arr = sizeBytes.get("singlepass-array")!;
-    assert.ok(arr.v1 !== null, "singlepass-array must compile to v1");
-    assert.ok(arr.v12 !== null, "singlepass-array must compile to v12");
+    // The production unified-walk solver must compile to BOTH targets.
+    const arr = sizeBytes.get("unified-walk")!;
+    assert.ok(arr.v1 !== null, "unified-walk must compile to v1");
+    assert.ok(arr.v12 !== null, "unified-walk must compile to v12");
   });
 
   // ── Execution gas (v1 + v12) — fairness via snapshot/revert + pinned ts ──
@@ -588,12 +700,12 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
       assert.ok(true, `execution gas skipped: ${executionBlocker}`);
       return;
     }
-    const args = buildCompilerArgs(tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
 
     // Engines we can actually execute this session.
     const engines: Target[] = v12ExecAvailable ? ["v1", "v12"] : ["v1"];
 
     for (const s of SOLVERS) {
+      const args = argsForShape(s.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
       const source = readFileSync(join(ECOSWAP_DIR, s.file), "utf-8");
       const cell: Cell = execGas.get(s.key) ?? { v1: null, v12: null };
 

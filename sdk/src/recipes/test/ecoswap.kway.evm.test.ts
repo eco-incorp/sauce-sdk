@@ -80,7 +80,7 @@ import {
   HALF128,
   MOD128,
 } from "./ecoswap.math";
-import type { EcoPool } from "../shared/types";
+import type { EcoPool, EcoSwapPrepared } from "../shared/types";
 
 const HUGE = parseEther("1000000000");
 // The K-way merge is now the canonical solver (ecoswap.sauce.ts) — this suite validates the
@@ -92,6 +92,63 @@ const ENGINE_CELLS = engineCells();
 // A far-future block timestamp every cook is pinned to (the V3 oracle accumulator is
 // timestamp-dependent → drifts across evm_revert; pinning makes cells deterministic).
 const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+
+const OFFSET_TICK_TEST = 888000;
+
+// ── Per-pool net-cache measures (the unified-walk shape) ──
+// Direct-pool cache no longer lives in prepared.brackets (which now holds ROUTE segments only):
+// each V3/V4 pool carries its own per-pool netCache rows + the [11..13] window scalars in the
+// pool tuple. These helpers measure that cache so the cache-depth assertions (empty / non-empty /
+// under-fills) keep their meaning against the new layout. The cache is a PURE GAS optimization —
+// the wei-exact equality vs the oracle is the real gate; these only assert the test regime.
+
+/** Total initialized-tick net-cache rows across all direct pools (0 ⇒ no initialized ticks scanned). */
+function cacheRowCount(prepared: EcoSwapPrepared): number {
+  return prepared.pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
+}
+
+/**
+ * Number of direct pools whose cache WINDOW was scanned (windowTopShifted > 0). This is the
+ * "the cache is populated" signal independent of whether any INITIALIZED tick fell inside the
+ * window: a single WIDE position (e.g. [-800000,800000]) has a scanned window but no interior
+ * initialized rows, yet its in-window uninitialized boundaries are still served net 0 from the
+ * cache (no staticcall) — so a scanned window IS a populated cache even with 0 rows. 0 ⇒ no
+ * cache (the maxTicks:0 / 1-RPC quote path ⇒ every boundary staticcalls live).
+ */
+function cacheWindowedPools(prepared: EcoSwapPrepared): number {
+  return prepared.pools.filter((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n).length;
+}
+
+/**
+ * Off-chain windowed capacity (gross tokenIn) for a single direct pool's CACHE WINDOW only —
+ * the input the swap would consume traversing from the live spot down to the deepest scanned
+ * boundary, using the drift-invariant net. Mirrors the on-chain in-window walk so the
+ * "cache under-fills the trade" assertions stay honest under the new shape. Routes excluded.
+ */
+function windowedCapacity(prepared: EcoSwapPrepared): bigint {
+  let cap = 0n;
+  for (const p of prepared.pools) {
+    if (p.isV2) continue;
+    if ((p.windowTopShifted ?? 0n) === 0n || (p.windowBotShifted ?? 0n) === 0n) continue;
+    const botShifted = p.windowBotShifted!;
+    const botTick = Number(botShifted) - OFFSET_TICK_TEST;
+    const limit = getSqrtRatioAtTick(botTick);
+    const net = new Map<number, bigint>();
+    for (const [t, n] of p.adaptiveNet ?? new Map<number, bigint>()) net.set(t, n);
+    const sqrtPriceX96 = p.spotNearReal ?? 0n;
+    if (sqrtPriceX96 === 0n) continue;
+    const tick = (p.spotTickShifted !== undefined ? Number(p.spotTickShifted) - OFFSET_TICK_TEST : 0);
+    const liquidity = p.spotActiveL ?? 0n;
+    const opt = optimalSplit({
+      pools: [{ isV2: false, feePpm: p.feePpm, sqrtPriceX96, tick, tickSpacing: p.tickSpacing, liquidity, net }],
+      amountIn: 1n << 250n,
+      zeroForOne: prepared.zeroForOne,
+      priceLimit: limit,
+    });
+    cap += opt.totalInput;
+  }
+  return cap;
+}
 
 /** Read a V3 pool's live state as an OptimalPool (single wide position ⇒ empty net). */
 async function v3Optimal(
@@ -341,7 +398,7 @@ describe("EcoSwap K-way — V3 scenarios (no-drift, dn under-fill, price-limit, 
     it(`B [${engine}] narrow window under-fills → dn frontier fills to amountIn, wei-exact`, { skip }, async () => {
       await resetPools();
       const { prepared, deltas } = await runAndAssert(engine, parseEther("80000"), { maxTicks: 2 }, `B:${engine}`, true);
-      const preparedCap = prepared.brackets.reduce((s, b) => s + b.capacity, 0n);
+      const preparedCap = windowedCapacity(prepared);
       assert.ok(preparedCap < parseEther("80000"), `B:${engine}: prepared window must under-fill (Σcap ${preparedCap})`);
       const moved = deltas.filter((d) => d > 0n).length;
       assert.ok(moved >= 2, `B:${engine}: split across ≥2 pools`);
@@ -438,7 +495,7 @@ describe("EcoSwap K-way — finite-liquidity exhaustion (early-out, refund, boun
         // minRelBps:0 keeps the pool when maxTicks:0 measures 0 windowed capacity.
         { maxTicks: 0, minRelBps: 0, solverFile: KWAY }, engine,
       );
-      assert.equal(prepared.brackets.length, 0, `EG:${engine}: empty cache (maxTicks:0)`);
+      assert.equal(cacheRowCount(prepared), 0, `EG:${engine}: empty cache (maxTicks:0)`);
 
       // Oracle from TRUE live state + the known initialized-tick net map.
       const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, pool);
@@ -570,7 +627,7 @@ describe("EcoSwap K-way — B2 cap-binding (reach == PER_POOL budget, solver == 
         { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12), caller, poolConfig,
         { maxTicks: 0, minRelBps: 0, solverFile: KWAY }, engine,
       );
-      assert.equal(prepared.brackets.length, 0, `B2:${engine}: empty cache (maxTicks:0)`);
+      assert.equal(cacheRowCount(prepared), 0, `B2:${engine}: empty cache (maxTicks:0)`);
 
       // Oracle from TRUE live state, empty net (single wide position). Its MAX_V3_STEPS ==
       // the solver PER_POOL, so it caps at the SAME reach.
@@ -628,8 +685,8 @@ describe("EcoSwap K-way — B2 cap-binding (reach == PER_POOL budget, solver == 
         { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12), caller, poolConfig,
         { minRelBps: 0, solverFile: KWAY }, engine,
       );
-      assert.ok(prepared.brackets.length > 0, `D2:${engine}: NON-EMPTY cache (default maxTicks, got ${prepared.brackets.length})`);
-      const preparedCap = prepared.brackets.reduce((s, b) => s + b.capacity, 0n);
+      assert.ok(cacheWindowedPools(prepared) > 0, `D2:${engine}: NON-EMPTY cache (default maxTicks, got ${cacheWindowedPools(prepared)})`);
+      const preparedCap = windowedCapacity(prepared);
       assert.ok(preparedCap < amountIn, `D2:${engine}: cache under-fills the over-budget trade (Σcap ${preparedCap})`);
 
       // Oracle from TRUE live state, empty net (single wide position). Its MAX_V3_STEPS ==
@@ -660,7 +717,7 @@ describe("EcoSwap K-way — B2 cap-binding (reach == PER_POOL budget, solver == 
       assert.ok(spent < amountIn, `D2:${engine}: under-fills (cap binds), terminal refund returns the rest`);
       assert.ok(receipt.gasUsed < 1_900_000_000n, `D2:${engine}: gas bounded under the ceiling (${receipt.gasUsed})`);
 
-      console.log(`  [D2:${engine}] cap-binding w/ cache (${prepared.brackets.length} brackets): cum=${pull!.value} (oracle ${opt.totalInput}) of ${amountIn}, gas=${receipt.gasUsed}`);
+      console.log(`  [D2:${engine}] cap-binding w/ cache (${cacheRowCount(prepared)} rows): cum=${pull!.value} (oracle ${opt.totalInput}) of ${amountIn}, gas=${receipt.gasUsed}`);
     });
   }
 });
@@ -879,7 +936,7 @@ describe("EcoSwap K-way — no-bracket quote path (empty cache, dn from spot)", 
         { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12), caller, poolConfig,
         { maxTicks: 0, minRelBps: 0, solverFile: KWAY }, engine,
       );
-      assert.equal(prepared.brackets.length, 0, `D:${engine}: prepared cache must be EMPTY (maxTicks:0)`);
+      assert.equal(cacheRowCount(prepared), 0, `D:${engine}: prepared cache must be EMPTY (maxTicks:0)`);
 
       const optPools: OptimalPool[] = [];
       for (const p of prepared.pools) {
@@ -1603,7 +1660,7 @@ describe("EcoSwap K-way — drift-DOWN mid-grid + initialized-tick L change (B1/
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`(4) [${engine}] LARGE run-until-filled past the old 1024 cap — full fill == oracle, wei-exact`, { skip }, async () => {
       const { prepared, deltas } = await runDriftCell(engine, parseEther("9000000"), DRIFT_MIDGRID, 1, true, `(4):${engine}`);
-      const preparedCap = prepared.brackets.reduce((s, b) => s + b.capacity, 0n);
+      const preparedCap = windowedCapacity(prepared);
       assert.ok(preparedCap < parseEther("9000000"), `(4):${engine}: cache must under-fill (Σcap ${preparedCap})`);
       assert.ok(deltas.every((d) => d > 0n), `(4):${engine}: both pools funded on the deep walk`);
     });
@@ -1613,7 +1670,7 @@ describe("EcoSwap K-way — drift-DOWN mid-grid + initialized-tick L change (B1/
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`(5) [${engine}] EMPTY cache (maxTicks:0) + drift-down mid-grid — wei-exact split == oracle from live alone`, { skip }, async () => {
       const { prepared, p0Tick } = await runDriftCell(engine, parseEther("5000000"), DRIFT_MIDGRID, 0, true, `(5):${engine}`);
-      assert.equal(prepared.brackets.length, 0, `(5):${engine}: prepared cache EMPTY (maxTicks:0)`);
+      assert.equal(cacheRowCount(prepared), 0, `(5):${engine}: prepared cache EMPTY (maxTicks:0)`);
       assert.ok(p0Tick % TS0 !== 0, `(5):${engine}: pool0 mid-grid (${p0Tick})`);
     });
   }
@@ -1629,15 +1686,16 @@ describe("EcoSwap K-way — drift-DOWN mid-grid + initialized-tick L change (B1/
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`(6) [${engine}] FULLY-OUT-OF-RANGE drifted pool (cache fully stale) → live dn-frontier only, wei-exact == oracle`, { skip }, async () => {
       const { prepared, deltas, p0Tick } = await runDriftCell(engine, parseEther("5000000"), DRIFT_MIDGRID, 2, true, `(6):${engine}`);
-      // pool0's whole shallow cache must be ABOVE the post-drift live spot (fully stale): the
-      // deepest pool0 prepared bracket's far edge (out/in) is still > the live out/in spot.
+      // pool0's whole shallow cache window must be ABOVE the post-drift live spot (fully stale):
+      // the deepest scanned boundary (windowBotShifted) out/in is still > the live out/in spot,
+      // so the on-chain walk never reads a cached row — it staticcalls the live dn lattice.
       const p0 = prepared.pools.find((p) => p.feePpm === FEE0)!;
       const { sqrtPriceX96 } = await getSlot0(c.publicClient, poolsByFee.get(FEE0)!.pool);
       const liveOI = toOutIn(sqrtPriceX96, true);
-      const p0Brackets = prepared.brackets.filter((b) => prepared.pools[b.refIdx]?.feePpm === FEE0);
-      assert.ok(p0Brackets.length > 0, `(6):${engine}: pool0 has a (shallow) prepared cache`);
-      const deepestFarOI = p0Brackets.reduce((m, b) => (b.sqrtFar < m ? b.sqrtFar : m), p0Brackets[0].sqrtFar);
-      assert.ok(liveOI < deepestFarOI, `(6):${engine}: live spot below the deepest pool0 bracket → cache fully stale (${liveOI} < ${deepestFarOI})`);
+      assert.ok((p0.windowTopShifted ?? 0n) > 0n, `(6):${engine}: pool0 has a (shallow) prepared cache`);
+      const windowBotTick = Number(p0.windowBotShifted!) - OFFSET_TICK_TEST;
+      const deepestFarOI = toOutIn(getSqrtRatioAtTick(windowBotTick), true);
+      assert.ok(liveOI < deepestFarOI, `(6):${engine}: live spot below the deepest pool0 cache tick → cache fully stale (${liveOI} < ${deepestFarOI})`);
       assert.ok(p0Tick % TS0 !== 0, `(6):${engine}: pool0 drifted mid-grid (${p0Tick})`);
       assert.ok(deltas[prepared.pools.findIndex((p) => p.feePpm === FEE0)] > 0n, `(6):${engine}: drifted pool0 still funded via the live dn-frontier`);
       void p0;
@@ -1755,8 +1813,8 @@ describe("EcoSwap K-way — C2 drift-UP × cap-binding (shared up+dn budget, bou
       { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12), caller, poolConfig,
       { maxTicks, minRelBps: 0, solverFile: KWAY }, engine,
     );
-    if (maxTicks === 0) assert.equal(prepared.brackets.length, 0, `${label}: empty cache (maxTicks:0)`);
-    else assert.ok(prepared.brackets.length > 0, `${label}: NON-EMPTY cache (maxTicks:${maxTicks}, got ${prepared.brackets.length})`);
+    if (maxTicks === 0) assert.equal(cacheWindowedPools(prepared), 0, `${label}: empty cache (maxTicks:0)`);
+    else assert.ok(cacheWindowedPools(prepared) > 0, `${label}: NON-EMPTY cache (maxTicks:${maxTicks}, got ${cacheWindowedPools(prepared)})`);
 
     // DRIFT the pool UP (against the swap) to an EXACT tickSpacing-aligned tick: push its price
     // ABOVE prepare-time spot by swapping the OTHER direction (tokenOut in, oneForZero on this
@@ -1811,7 +1869,7 @@ describe("EcoSwap K-way — C2 drift-UP × cap-binding (shared up+dn budget, bou
     // Spec gas gate: a drift-up cap-binding cook is bounded under the 1.9e9 anvil ceiling.
     assert.ok(receipt.gasUsed < 1_900_000_000n, `${label}: gas bounded under the ceiling (${receipt.gasUsed})`);
 
-    console.log(`  [${label}] drift-up cap-binding (cache ${prepared.brackets.length}): cum=${pull!.value} (oracle ${opt.totalInput}) of ${amountIn}, gas=${receipt.gasUsed}`);
+    console.log(`  [${label}] drift-up cap-binding (cache rows ${cacheRowCount(prepared)}): cum=${pull!.value} (oracle ${opt.totalInput}) of ${amountIn}, gas=${receipt.gasUsed}`);
     return pull!.value;
   }
 
@@ -2177,7 +2235,7 @@ describe("EcoSwap K-way — H oneForZero bytecode path (split-exactness == oracl
     it(`H2 [${engine}] oneForZero dn under-fill → dn frontier fills to amountIn, wei-exact == oracle`, { skip }, async () => {
       await resetPools();
       const { prepared, deltas } = await runOneForZero(engine, parseEther("80000"), { maxTicks: 2 }, `H2:${engine}`);
-      const preparedCap = prepared.brackets.reduce((s, b) => s + b.capacity, 0n);
+      const preparedCap = windowedCapacity(prepared);
       assert.ok(preparedCap < parseEther("80000"), `H2:${engine}: prepared window must under-fill (Σcap ${preparedCap})`);
       assert.ok(deltas.filter((d) => d > 0n).length >= 2, `H2:${engine}: split across ≥2 pools (oneForZero)`);
     });
@@ -2421,8 +2479,8 @@ describe("EcoSwap K-way — H6 oneForZero cap-binding (shallow pool, budget bind
         { minRelBps: 0, solverFile: KWAY }, engine,
       );
       assert.equal(prepared.zeroForOne, false, `H6:${engine}: oneForZero (zeroForOne===false)`);
-      assert.ok(prepared.brackets.length > 0, `H6:${engine}: NON-EMPTY cache (default maxTicks, got ${prepared.brackets.length})`);
-      const preparedCap = prepared.brackets.reduce((s, b) => s + b.capacity, 0n);
+      assert.ok(cacheWindowedPools(prepared) > 0, `H6:${engine}: NON-EMPTY cache (default maxTicks, got ${cacheWindowedPools(prepared)})`);
+      const preparedCap = windowedCapacity(prepared);
       assert.ok(preparedCap < amountIn, `H6:${engine}: cache under-fills the over-budget trade (Σcap ${preparedCap})`);
 
       const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, pool);
@@ -2546,7 +2604,7 @@ describe("EcoSwap K-way — C2-V4 cap-binding on V4 (StateView read path, budget
         { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12), caller, poolConfig,
         { maxTicks: 0, minRelBps: 0, solverFile: KWAY }, engine,
       );
-      assert.equal(prepared.brackets.length, 0, `C2-V4:${engine}: empty cache (maxTicks:0)`);
+      assert.equal(cacheRowCount(prepared), 0, `C2-V4:${engine}: empty cache (maxTicks:0)`);
       assert.ok(prepared.pools.some((p) => p.poolType === SwapPoolType.UniV4), `C2-V4:${engine}: V4 pool discovered`);
 
       // Oracle from the TRUE V4 live state (StateView reads). MAX_V3_STEPS == the solver PER_POOL.

@@ -54,6 +54,17 @@ const HUGE = parseEther("1000000000");
 // Single engine for this heavy prod-mirror suite (ECO_ENGINE, default v12).
 const PROD_ENGINE: Engine = selectedEngines()[0];
 
+// Per-pool net-cache measure (unified-walk shape): direct-pool cache lives per-pool (a scanned
+// window + the initialized-tick netRows inside it), not in prepared.brackets (now ROUTE segments
+// only). The "cache is populated" signal is a scanned WINDOW (windowTopShifted > 0), independent
+// of whether any INITIALIZED tick fell inside it (in-window uninitialized boundaries are served
+// net 0 from the cache, no staticcall). Local to this file (no shared harness) per spec.
+function cacheWindowedPools(
+  pools: { isV2?: boolean; windowTopShifted?: bigint }[],
+): number {
+  return pools.filter((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n).length;
+}
+
 function loadSnapshot(): ProdV4Snapshot | null {
   let files: string[] = [];
   try {
@@ -191,7 +202,7 @@ describe("EcoSwap prod-mirror V4 (reproduced Base singleton pool)", () => {
     );
     assert.equal(prepared.pools.filter((p) => p.poolType === SwapPoolType.UniV4).length, 1, "discovers the V4 pool");
     assert.ok(prepared.pools[0].poolId === repro.poolId, "prepared poolId matches reproduced pool");
-    assert.ok(prepared.brackets.length > 0, "builds brackets from reconstructed V4 ticks");
+    assert.ok(cacheWindowedPools(prepared.pools) > 0, "builds a per-pool net-cache window from reconstructed V4 ticks");
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(receipt.status, "success", "cook() must succeed against reproduced V4 geometry");

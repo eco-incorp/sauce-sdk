@@ -386,7 +386,10 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     const v3Count = prepared.pools.filter((p) => !p.isV2).length;
     assert.equal(v3Count, 3, "should discover 3 V3 pools");
     assert.equal(prepared.routes.length, 0, "no routes (baseTokens == swap pair)");
-    assert.ok(prepared.brackets.length > 0, "should build brackets");
+    // Direct-pool cache is the per-pool net cache (netRows + the scanned window scalars), not
+    // the route-only `brackets`: assert at least one direct pool had its cache window scanned.
+    const cached = prepared.pools.some((p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n);
+    assert.ok(cached, "should build a per-pool cache window");
     assert.ok(prepared.zeroForOne, "tokenIn < tokenOut → zeroForOne");
 
     // Approve + cook. The program does transferFrom(caller, self=target, …), so

@@ -1,23 +1,40 @@
 /**
- * EcoSwap K-WAY-LAZY reference (pure TypeScript bigint math, EVM-free).
+ * EcoSwap UNIFIED-WALK reference (pure TypeScript bigint math, EVM-free).
  *
- * Faithfully mirrors the canonical on-chain K-way solver in `recipes/ecoswap/ecoswap.sauce.ts`:
- * ONE price-ordered merge over two candidate streams — the off-chain-sorted prepared
- * brackets[] (a flat cursor `bc`; the CACHE) and each pool's `dn` deeper frontier. Each step
- * picks the highest fee-adjusted out/in head among {brackets[bc], all active dn[]}, consumes
- * its segment into inp[pool]/cum, and advances ONLY that stream. On ANY live drift a pool
- * re-anchors its SINGLE walk to the live spot (dn frontier from the live tick) and its stale
- * prepared cache is skipped — one continuous from-live-spot grid, symmetric for drift UP and
- * DOWN (== the optimal oracle's v3Segments, which never clamps).
+ * Mirrors the on-chain unified solver in `recipes/ecoswap/ecoswap.sauce.ts` bit-for-bit:
+ * ONE price-ordered k-way merge where every direct pool has ONE frontier walked from its
+ * LIVE spot, deeper, one tickSpacing per step. Each step picks the highest fee-adjusted
+ * out/in head among {each active pool's walk head, each route segment head}, consumes its
+ * segment into the pool/route, and advances ONLY that stream.
  *
- * It takes the SAME prepared dataset the on-chain solver reads (pools tuple fields via the
- * EcoPool fields, brackets[], the off-chain-only adaptiveNet map for tick walks) plus the
- * modeled LIVE state per pool (live out/in spot, live tick, live L for V3/V4; live reserves
- * for V2). In the deterministic no-drift case the modeled live == prepared spot.
+ * THE UNIFIED MODEL — no two-mode cache-vs-re-anchor split. liquidityNet is drift-invariant,
+ * so the walk ALWAYS computes sqrt/price on the LIVE grid (stepReal from the live spot,
+ * identical to the neutral oracle ecoswap.optimal.ts v3Segments) and reuses the cached NET
+ * only. This reference is CURSOR-MECHANISM-FAITHFUL: it builds the SAME per-pool netCache rows
+ * the on-chain pool tuple carries ([shiftedTick, rawNet], only INITIALIZED ticks, sorted in
+ * SWAP DIRECTION — exactly prepare.ts's stampPoolCache), runs the SAME SETUP drift-down skip
+ * (advance the per-pool cursor past cache rows ABOVE the first boundary), and in the walk reads
+ * an IN-WINDOW boundary via that cursor (matching tick ⇒ cached net + advance; in-window
+ * non-match ⇒ net 0, NO map read) and an OUT-OF-WINDOW boundary via the FULL `adaptiveNet` map
+ * (the TS analogue of a live ticks()/getTickLiquidity staticcall — drift-invariant, returns the
+ * same value). So the reference is STRUCTURALLY identical to the solver, not just value-
+ * equivalent: an off-by-one in the cursor (drift-down skip, in-window consume/advance, in-window
+ * uninitialized net=0, out-of-window read) is caught here, not only in the EVM lane. Because the
+ * grid is the live grid and the nets are the drift-invariant nets, this reference is wei-exact
+ * with the neutral oracle BY CONSTRUCTION — same grid, same nets.
  *
- * The integer math (mulDiv truncation), the int128 sign recovery, stepReal, toOutIn, tickArg
- * and the sqrt fee-adjust are all the shared copies in ./ecoswap.math, so this reference is
- * bit-for-bit with both the on-chain solver and the neutral optimal oracle (ecoswap.optimal).
+ * WALK-THROUGH GAPS: a frontier deactivates only on the price limit, the per-pool budget cap,
+ * or (dL==0 AND the boundary is PAST the pool's deepest initialized tick extremeShifted) — so
+ * an interior dL==0 gap keeps walking and resumes when net brings L back (the Issue-2 fix).
+ *
+ * It takes the SAME prepared dataset the on-chain solver reads (the EcoPool unified-walk
+ * fields stepRatio/windowTop/windowBot/extremeShifted/spotTickShifted/spotActiveL + the
+ * off-chain adaptiveNet map + routeSegs) plus the modeled LIVE state per pool (the on-chain
+ * SETUP read). In the deterministic no-drift case the modeled live == the prepare-time spot.
+ *
+ * The integer math (mulDiv truncation, the int128 sign recovery, stepReal, toOutIn, tickArg,
+ * the sqrt fee-adjust) is the shared copies in ./ecoswap.math, so this reference is bit-for-
+ * bit with both the on-chain solver and the neutral optimal oracle (ecoswap.optimal).
  */
 
 import { EcoBracketKind, type EcoSwapPrepared } from "../shared/types";
@@ -38,9 +55,9 @@ import {
 
 /** Modeled LIVE state for one pool (what the on-chain SETUP reads). */
 export interface KwayLivePool {
-  /** Live out/in spot sqrt (curArr). V3/V4: toOutIn(liveRealSqrt); V2: sqrt(resOut*Q192/resIn). */
-  curOI: bigint;
-  // V3/V4 live state (for the dn re-anchor seed + read parity):
+  /** Live out/in spot sqrt. V2 frontier seed (sqrt(resOut*Q192/resIn)); unused for V3/V4. */
+  curOI?: bigint;
+  // V3/V4 live state (the frontier seed):
   liveRealSqrt?: bigint;
   liveTick?: number;
   liveL?: bigint;
@@ -59,6 +76,17 @@ export interface KwayReferenceResult {
    * marginal every engaged pool equalizes to. Used by the prod-mirror equalization asserts.
    */
   cutSqrtAdj: bigint;
+  /**
+   * CURSOR-FIDELITY diagnostic: for EVERY in-window boundary the walk crossed, the net the
+   * per-pool cursor produced MUST equal the net the full `adaptiveNet` map carries for that
+   * tick (a cached initialized row, or 0 for an in-window uninitialized tick). Each crossing
+   * appends `{ shifted, cursorNet, mapNet }`; a non-zero count of rows where cursorNet !=
+   * mapNet is a cursor off-by-one (drift-down skip overshoot/undershoot, a missed advance, or
+   * an in-window uninitialized tick that wrongly consumed a row). The reference itself asserts
+   * equality inline (throws on mismatch) so any vector catches it; this list lets a dedicated
+   * test assert the count and that the cursor path was actually exercised (length > 0).
+   */
+  cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[];
 }
 
 /** fee-adjusted out/in head price (sqrt(1-fee) scaling) — matches the solver feeAdj. */
@@ -67,183 +95,160 @@ function feeAdj(oi: bigint, feePpm: number): bigint {
 }
 
 /**
- * Per-pool frontier walk budget (B2) — MUST match the on-chain solver's PER_POOL
- * (ecoswap.sauce.ts) AND the optimal oracle's MAX_V3_STEPS (ecoswap.optimal.ts)
- * EXACTLY, so the reference and the oracle agree to the wei EVEN WHEN THE CAP BINDS. ONE
- * SHARED per-pool budget (dnSteps[]) is counted on EVERY consumed segment of that pool's
- * single from-live-spot walk — the prepared window-bracket consume AND the dn-frontier step.
- * So window+dn from the live spot are bounded by ONE PER_POOL == the oracle's single
- * MAX_V3_STEPS loop, and a drifted pool reaches EXACTLY the oracle's reach at the cap. The
- * outer merge bound is brackets.length + pools.length*PER_POOL*2 (generous slack for dn scan
- * churn per pool), which dominates the SUM of per-pool reaches so it never itself truncates a
- * fill the per-pool caps would complete. See the on-chain solver for the gas-budget
- * justification of 2048.
+ * Per-pool frontier walk budget — MUST match the on-chain solver's PER_POOL
+ * (ecoswap.sauce.ts) AND the optimal oracle's MAX_V3_STEPS (ecoswap.optimal.ts) EXACTLY, so
+ * the reference and the oracle agree to the wei EVEN WHEN THE CAP BINDS (both bound the SINGLE
+ * from-live-spot walk by the same cap). The outer merge bound is routeSegs.length +
+ * pools.length*PER_POOL*2 (generous slack), which dominates the SUM of per-pool reaches so it
+ * never itself truncates a fill the per-pool caps would complete. See the on-chain solver for
+ * the gas-budget justification of 2048.
  */
 const PER_POOL = 2048;
 
+/** ts-aligned SHIFTED base tick from an int tick — mirrors the solver's tickShiftedBase. */
+function tickShiftedBaseTS(tick: number, ts: bigint): bigint {
+  const shifted = BigInt(tick) + OFFSET;
+  return (shifted / ts) * ts;
+}
+
 /**
- * K-way reference. `live[i]` is the modeled live state for pools[i]; default (omitted)
- * uses the prepared spot (no drift): V3/V4 curOI = toOutIn(topNearReal), V2 curOI =
- * topNearReal (out/in). `priceLimit` is the swap's real-sqrt price limit (dn guard).
+ * Unified-walk reference. `live[i]` is the modeled live state for pools[i]; default (omitted)
+ * uses the prepare-time spot (no drift): V3/V4 from spotTickShifted/topReal/spotActiveL, V2
+ * curOI from the prepared spot out/in. `priceLimit` is the swap's real-sqrt price limit.
  */
 export function kwayReference(
   prepared: EcoSwapPrepared,
   amountIn: bigint,
   live?: (KwayLivePool | undefined)[],
 ): KwayReferenceResult {
-  const { pools, routes, brackets } = prepared;
+  const { pools, routes } = prepared;
   const zeroForOne = prepared.zeroForOne;
   const priceLimit = prepared.priceLimit;
-  // Run-until-filled bound (B2): dominate the oracle's total reach so the cap can never
-  // truncate a trade the oracle fully fills (the old fixed 1024 capped large/fine-grid runs).
-  const SAFETY = brackets.length + pools.length * PER_POOL * 2;
+  // The flat route segments (sorted DESC sqrtAdjNear), competing via one cursor. Held as a
+  // thin slice of the prepared brackets (kind === Route) to keep the existing prepared shape.
+  const routeSegs = (prepared.brackets ?? []).filter((b) => b.kind === EcoBracketKind.Route);
+  // Run-until-filled bound: dominate the oracle's total reach so the cap can never truncate a
+  // trade the oracle fully fills.
+  const SAFETY = routeSegs.length + pools.length * PER_POOL * 2;
   const perPoolInput: bigint[] = new Array(pools.length).fill(0n);
   const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
 
-  // ── SETUP ──
-  const curArr: bigint[] = new Array(pools.length).fill(0n);
+  // ── SETUP: seed the single frontier from the modeled LIVE spot ──
   const lArr: bigint[] = new Array(pools.length).fill(0n);
   const dnOn: boolean[] = new Array(pools.length).fill(false);
-  const dnNear: bigint[] = new Array(pools.length).fill(0n);
+  const dnNear: bigint[] = new Array(pools.length).fill(0n); // V3/V4 real sqrt; V2 out/in
   const dnL: bigint[] = new Array(pools.length).fill(0n);
   const dnShift: bigint[] = new Array(pools.length).fill(0n);
-  const dnSteps: number[] = new Array(pools.length).fill(0); // SHARED per-pool budget (up+window+dn)
+  const dnSteps: number[] = new Array(pools.length).fill(0);
+  // Per-pool net cursor state — the on-chain netCache mechanism, mirrored EXACTLY. Each pool
+  // gets its [shiftedTick, rawNet] rows (only INITIALIZED ticks, sorted SWAP DIRECTION — the
+  // identical build prepare.ts's stampPoolCache flattens into the compiler netCache arg), a
+  // cursor (netCur) positioned by the SETUP drift-down skip, and the window bounds.
+  const netRows: { shifted: bigint; raw: bigint }[][] = new Array(pools.length);
+  const netCur: number[] = new Array(pools.length).fill(0);
+  const cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[] = [];
 
   for (let i = 0; i < pools.length; i++) {
     const pd = pools[i];
-    const isV2 = pd.isV2;
     const lp = live?.[i];
-    let cl = 0n;
-    let ll = 0n;
-    if (isV2) {
-      ll = lp?.liveV2L ?? 0n;
-      // default no-drift: live out/in spot = topNearReal (V2 out/in spot)
-      cl = lp?.curOI ?? pd.topNearReal ?? 0n;
-      if (ll === 0n) {
-        // derive from the deepest-far seed's implied L is not available; require liveV2L
-        // for V2 — the deterministic caller always supplies it.
-        ll = 0n;
-      }
+    netRows[i] = [];
+    if (pd.isV2) {
+      // V2: constant-L stream from the LIVE out/in spot (no ticks, no cache). The deterministic
+      // caller supplies liveV2L (+ curOI); default no-drift derives nothing (caller always sets).
+      const ll = lp?.liveV2L ?? 0n;
+      lArr[i] = ll;
+      dnOn[i] = ll > 0n;
+      dnNear[i] = lp?.curOI ?? 0n; // V2 frontier stores OUT/IN directly
+      dnL[i] = ll;
+      dnShift[i] = 0n;
     } else {
-      const topReal = pd.topNearReal ?? 0n;
-      cl = lp?.curOI ?? toOutIn(topReal, zeroForOne);
-    }
-    curArr[i] = cl;
-    lArr[i] = ll;
+      const ts = BigInt(pd.tickSpacing);
+      // Live near sqrt + boundary + active L: a drift override, else the prepare-time spot.
+      let near: bigint;
+      let sh: bigint;
+      let L: bigint;
+      if (lp?.liveRealSqrt !== undefined) {
+        near = lp.liveRealSqrt;
+        const base = tickShiftedBaseTS(lp.liveTick ?? 0, ts);
+        sh = zeroForOne ? base : base + ts;
+        L = lp.liveL ?? 0n;
+      } else {
+        near = pd.spotNearReal ?? 0n;
+        sh = pd.spotTickShifted ?? 0n;
+        L = pd.spotActiveL ?? 0n;
+      }
+      dnNear[i] = near;
+      dnShift[i] = sh;
+      dnL[i] = L;
+      dnOn[i] = true;
 
-    // dn (deeper) frontier seed
-    const aStartShift = pd.adaptiveStartShifted ?? 0n;
-    dnOn[i] = aStartShift > 0n;
-    dnNear[i] = pd.adaptiveNearReal ?? 0n;
-    dnL[i] = pd.adaptiveStartL ?? 0n;
-    dnShift[i] = aStartShift;
-
-    // dn re-anchor on ANY drift (UP against the swap, or DOWN with it) — symmetric to the
-    // solver SETUP. V3/V4: window top is a REAL sqrt. RE-ANCHOR the SINGLE dn frontier to the
-    // LIVE read whenever the live price differs from the window top, so the whole walk is ONE
-    // continuous tick-lattice grid from the true live spot (== the optimal oracle's v3Segments,
-    // which never clamps). The old up-frontier clamp-and-splice (walk down, clamp the final
-    // segment to the tick-aligned window top, hand off to brackets anchored at a different sqrt)
-    // spliced two grids that don't share a boundary and mis-priced the handoff heads; re-anchoring
-    // makes drift-UP byte-identical to the proven-exact drift-DOWN path. The merge SKIPS this
-    // pool's prepared brackets on ANY drift (cur != window top), so the live frontier and the
-    // cache never double-count. No drift (cl == topOI): neither branch fires, the prepared cache
-    // + prepare-time dn seed run unchanged ⇒ continuity (0 misallocation at 0% drift).
-    if (!isV2) {
-      const topReal = pd.topNearReal ?? 0n;
-      if (topReal > 0n) {
-        const topOI = toOutIn(topReal, zeroForOne);
-        if (cl !== topOI) {
-          const srReal = lp?.liveRealSqrt ?? topReal;
-          const liveTick = BigInt(lp?.liveTick ?? 0);
-          const liveL = lp?.liveL ?? 0n;
-          const ts = BigInt(pd.tickSpacing);
-          const base = ((liveTick + OFFSET) / ts) * ts;
-          let sh = base;
-          if (!zeroForOne) sh = base + ts;
-          dnOn[i] = true;
-          dnNear[i] = srReal; // real sqrt at the LIVE price (dn stores real for V3/V4)
-          dnL[i] = liveL;
-          dnShift[i] = sh;
+      // Build this pool's netCache rows EXACTLY as prepare.ts's stampPoolCache does: every
+      // INITIALIZED tick (signed net != 0), shifted (tick + OFFSET) + RAW uint128 (signed >= 0 ?
+      // signed : signed + 2^128), sorted in SWAP DIRECTION (zeroForOne descending shifted tick,
+      // oneForZero ascending). Prefer the pool's prepared netRows when present (the exact rows the
+      // solver ships); else derive from adaptiveNet so a fixture that only sets the map still
+      // exercises the cursor (the two builds are identical by construction).
+      const rows: { shifted: bigint; raw: bigint }[] = [];
+      if (pd.netRows && pd.netRows.length > 0) {
+        for (const r of pd.netRows) rows.push({ shifted: r.shiftedTick, raw: r.rawNet });
+      } else {
+        const aNet = pd.adaptiveNet ?? new Map<number, bigint>();
+        for (const [tick, signed] of aNet) {
+          if (signed === 0n) continue;
+          const raw = signed >= 0n ? signed : signed + MOD128;
+          rows.push({ shifted: BigInt(tick) + OFFSET, raw });
         }
       }
-    } else {
-      // V2 is constant-L over the whole range (one geometric grid), so ANY live drift — UP
-      // or DOWN — RE-ANCHORS the single dn frontier to the LIVE out/in spot (cl), consuming ONE
-      // continuous V2 stream matching the oracle's single from-live-spot grid (v2Segments, NO
-      // clamp). Symmetric to the V3/V4 re-anchor above. The merge SKIPS this pool's prepared
-      // brackets on ANY drift (cur != top), so the cache and live walk never double-count. No
-      // drift (cl == topV2OI): neither branch fires, prepared cache + dn seed run unchanged ⇒
-      // 0 misallocation.
-      const topV2OI = pd.topNearReal ?? 0n;
-      if (topV2OI > 0n && cl !== topV2OI) {
-        dnOn[i] = true;
-        dnNear[i] = cl; // V2 dn stores OUT/IN directly; re-anchor to the live spot
-        dnL[i] = ll;
-        dnShift[i] = 0n;
+      rows.sort((a, b) =>
+        zeroForOne
+          ? a.shifted < b.shifted ? 1 : a.shifted > b.shifted ? -1 : 0
+          : a.shifted < b.shifted ? -1 : a.shifted > b.shifted ? 1 : 0,
+      );
+      netRows[i] = rows;
+
+      // SETUP drift-down skip (ecoswap.sauce.ts ~224-246): advance the per-pool cursor PAST any
+      // cache rows that lie ABOVE the first boundary `sh` (the live spot has already moved below
+      // them, so the walk never crosses them). Swap-direction terms: zeroForOne walks DOWN, so a
+      // row above is shifted > sh; oneForZero walks UP, so a row above is shifted < sh.
+      let cur = 0;
+      const nCount = rows.length;
+      if (nCount > 0) {
+        // Mirror the solver's bounded loop (it can advance at most nCount times); a row stops
+        // skipping as soon as one is at/below the boundary (rows are sorted swap-direction).
+        for (let q = 0; q < nCount; q++) {
+          if (cur < nCount) {
+            const rt = rows[cur].shifted;
+            const above = zeroForOne ? rt > sh : rt < sh;
+            if (above) cur += 1;
+          }
+        }
       }
+      netCur[i] = cur;
     }
   }
 
   // ── MERGE ──
   let cum = 0n;
-  let bc = 0;
-  // The fee-adjusted out/in marginal at the cut — updated to the fee-adjusted FAR edge of
-  // every segment the merge consumes, so after the loop it is the deepest (last) reached
-  // marginal. Diagnostic only (the on-chain solver carries no cut value).
+  let rc = 0; // route-segment cursor
   let cutSqrtAdj = 0n;
   for (let s = 0; s < SAFETY; s++) {
     if (cum >= amountIn) break;
 
-    // STALE-BRACKET SKIP (re-anchor gate, mirrors the solver): if the cursor bracket
-    // belongs to a pool whose live price drifted away from its prepared window top, the
-    // bracket is stale — the re-seeded live dn frontier covers that region. Skip it (advance
-    // bc, consume nothing). The drifted pool re-anchors its SINGLE walk to the live spot for
-    // BOTH drift directions, so on ANY drift the whole prepare-time-anchored cache is on a
-    // different grid and must be skipped:
-    //   - V3/V4 (window top REAL sqrt → toOutIn): stale on ANY drift (cur != top).
-    //   - V2 (window top already OUT/IN → compared directly): stale on ANY drift (cur != top).
-    // Routes never skip.
-    //
-    // BUDGET SKIP (D2, mirrors the solver): a prepared window bracket is one step of its
-    // pool's single from-live-spot walk, so it counts against the SAME SHARED per-pool budget
-    // (dnSteps) as the dn frontier — window + dn together are bounded by ONE PER_POOL == the
-    // oracle's single MAX_V3_STEPS total-from-live-spot loop. A cursor bracket whose pool has
-    // already spent PER_POOL is skip-advanced (consume nothing).
-    if (bc < brackets.length) {
-      const sb = brackets[bc];
-      if (sb.kind !== EcoBracketKind.Route) {
-        const sd = pools[sb.refIdx];
-        const sTop = sd.topNearReal ?? 0n;
-        const overBudget = dnSteps[sb.refIdx] >= PER_POOL;
-        const stale =
-          sTop > 0n &&
-          (sd.isV2 ? curArr[sb.refIdx] !== sTop : curArr[sb.refIdx] !== toOutIn(sTop, zeroForOne));
-        if (overBudget || stale) {
-          bc++;
-          continue;
-        }
-      }
-    }
-
-    let bestKind = 0; // 0=none 1=prepared 3=dn
+    // 1. find the highest fee-adjusted head among {route cursor, dn[*]}. Ties on the near
+    // (entry) price break by HIGHER far (shallower step) so a coarse segment never wins ahead
+    // of a finer one — bit-identical to the optimal oracle's stable segment sort (adjNear DESC,
+    // adjFar DESC). Same key the solver uses.
+    let bestKind = 0; // 0=none 2=route 3=pool frontier
     let bestPool = 0;
     let bestPrice = 0n;
-    if (bc < brackets.length) {
-      const bb = brackets[bc];
-      // Prepared-bracket competition key (B1): the bracket integrates at hi=min(cur,near),
-      // so its TRUE head price is feeAdj(min(cur,near)), NOT the static spot sqrtAdjNear
-      // (bb.sqrtAdjNear). Routes have no live re-price. Mirrors the solver's scan key.
-      let bp = bb.sqrtAdjNear; // bb[6]
-      if (bb.kind !== EcoBracketKind.Route) {
-        const bpd = pools[bb.refIdx];
-        const bcur = curArr[bb.refIdx];
-        const bhiOI = bcur < bb.sqrtNear ? bcur : bb.sqrtNear;
-        bp = feeAdj(bhiOI, bpd.feePpm);
-      }
-      if (bp > bestPrice) {
-        bestPrice = bp;
-        bestKind = 1;
+    let bestFar = 0n;
+    if (rc < routeSegs.length) {
+      const rg = routeSegs[rc];
+      const rp = rg.sqrtAdjNear;
+      if (rp > bestPrice) {
+        bestPrice = rp;
+        bestFar = rg.sqrtAdjFar;
+        bestKind = 2;
       }
     }
     for (let j = 0; j < pools.length; j++) {
@@ -252,57 +257,41 @@ export function kwayReference(
       if (dnOn[j]) {
         const doi = jd.isV2 ? dnNear[j] : toOutIn(dnNear[j], zeroForOne);
         const dadj = feeAdj(doi, jfee);
-        if (dadj > bestPrice) {
-          bestPrice = dadj;
-          bestKind = 3;
-          bestPool = j;
+        // LAZY far-adjust (mirrors ecoswap.sauce.ts): the far price is ONLY the near-tie break,
+        // so a pool whose near is strictly below the best can never win — skip its far. RESULT-
+        // identical to an eager far (the winner is unchanged either way), and keeps this
+        // reference structurally faithful to the solver's hot loop.
+        if (dadj >= bestPrice) {
+          let dfarAdj: bigint;
+          if (jd.isV2) {
+            const v2Far = dnNear[j] - mulDiv(dnNear[j], V2_STEP_BPS, V2_STEP_DEN);
+            dfarAdj = feeAdj(v2Far, jfee);
+          } else {
+            const farReal = stepReal(dnNear[j], jd.stepRatio ?? 0n, zeroForOne);
+            dfarAdj = feeAdj(toOutIn(farReal, zeroForOne), jfee);
+          }
+          if (dadj > bestPrice || (dadj === bestPrice && dfarAdj > bestFar)) {
+            bestPrice = dadj;
+            bestFar = dfarAdj;
+            bestKind = 3;
+            bestPool = j;
+          }
         }
       }
     }
 
     if (bestKind === 0) break;
 
-    if (bestKind === 1) {
-      const bb = brackets[bc];
-      if (bb.kind === EcoBracketKind.Route) {
-        const rdx = bb.refIdx;
-        const cap = bb.capacity;
-        let rtake = cap;
-        if (cum + cap >= amountIn) rtake = amountIn - cum;
-        perRouteInput[rdx] += rtake;
-        cum += rtake;
-        if (rtake > 0n) cutSqrtAdj = bb.sqrtAdjFar;
-      } else {
-        const pidx = bb.refIdx;
-        const near = bb.sqrtNear;
-        const far = bb.sqrtFar;
-        const dp = pools[pidx];
-        const feePpm = dp.feePpm;
-        const isV2b = dp.isV2;
-        const cur = curArr[pidx];
-        const Lb = isV2b ? lArr[pidx] : bb.liquidity;
-        const hi = cur < near ? cur : near;
-        if (hi > far && Lb > 0n && far > 0n) {
-          const effIn = mulDiv(Lb, Q96, far) - mulDiv(Lb, Q96, hi);
-          if (effIn > 0n) {
-            const gross = mulDiv(effIn, FEE_DENOM, FEE_DENOM - BigInt(feePpm));
-            let take = gross;
-            if (cum + gross >= amountIn) take = amountIn - cum;
-            perPoolInput[pidx] += take;
-            cum += take;
-            if (take > 0n) cutSqrtAdj = bb.sqrtAdjFar;
-          }
-        }
-        // BUDGET (D2): a consumed window bracket is one step of this pool's single from-live-
-        // spot walk, so it counts against the SAME SHARED per-pool budget (dnSteps) as the dn
-        // frontier. At the cap deactivate the dn frontier (the budget-skip gate above skip-
-        // advances any remaining window brackets) so window+dn reach EXACTLY PER_POOL.
-        dnSteps[pidx] += 1;
-        if (dnSteps[pidx] >= PER_POOL) {
-          dnOn[pidx] = false;
-        }
-      }
-      bc++;
+    if (bestKind === 2) {
+      const rg = routeSegs[rc];
+      const rdx = rg.refIdx;
+      const cap = rg.capacity;
+      let rtake = cap;
+      if (cum + cap >= amountIn) rtake = amountIn - cum;
+      perRouteInput[rdx] += rtake;
+      cum += rtake;
+      if (rtake > 0n) cutSqrtAdj = rg.sqrtAdjFar;
+      rc++;
     } else if (bestKind === 3) {
       const dd = pools[bestPool];
       const dfee = dd.feePpm;
@@ -323,74 +312,113 @@ export function kwayReference(
         }
         dnNear[bestPool] = v2Far;
         if (v2Far <= 0n) dnOn[bestPool] = false;
-        // SHARED PER_POOL budget (B2): bound the V2 dn slice walk by the same cap as
-        // MAX_V2_SLICES, shared with the window brackets.
         dnSteps[bestPool] += 1;
-        if (dnSteps[bestPool] >= PER_POOL) {
-          dnOn[bestPool] = false;
-        }
+        if (dnSteps[bestPool] >= PER_POOL) dnOn[bestPool] = false;
       } else {
+        // V3/V4 frontier step — tick walk on the LIVE grid, net from the prepared per-pool map.
         let dL = dnL[bestPool];
-        if (dL === 0n) {
-          dnOn[bestPool] = false;
+        const dts = BigInt(dd.tickSpacing);
+        const dstep = dd.stepRatio ?? 0n;
+        let dnear = dnNear[bestPool];
+        let dsh = dnShift[bestPool];
+        const dfarReal = stepReal(dnear, dstep, zeroForOne);
+        const dnearOI = toOutIn(dnear, zeroForOne);
+        const dfarOI = toOutIn(dfarReal, zeroForOne);
+        let dlim = false;
+        if (zeroForOne) {
+          if (dfarReal <= priceLimit) dlim = true;
         } else {
-          const dts = BigInt(dd.tickSpacing);
-          const dstep = dd.adaptiveStepRatio ?? 0n;
-          let dnear = dnNear[bestPool];
-          let dsh = dnShift[bestPool];
-          const dfarReal = stepReal(dnear, dstep, zeroForOne);
-          const dnearOI = toOutIn(dnear, zeroForOne);
-          const dfarOI = toOutIn(dfarReal, zeroForOne);
-          let dlim = false;
-          if (zeroForOne) {
-            if (dfarReal <= priceLimit) dlim = true;
-          } else {
-            if (dfarReal >= priceLimit) dlim = true;
-          }
-          if (dL > 0n && dnearOI > dfarOI && dfarOI > 0n) {
-            const deff = mulDiv(dL, Q96, dfarOI) - mulDiv(dL, Q96, dnearOI);
-            if (deff > 0n) {
-              const dg = mulDiv(deff, FEE_DENOM, FEE_DENOM - BigInt(dfee));
-              let dt = dg;
-              if (cum + dg >= amountIn) dt = amountIn - cum;
-              perPoolInput[bestPool] += dt;
-              cum += dt;
-              if (dt > 0n) cutSqrtAdj = feeAdj(dfarOI, dfee);
-            }
-          }
-          const aNet = dd.adaptiveNet ?? new Map<number, bigint>();
-          const signedNet = aNet.get(Number(tickArg(dsh))) ?? 0n;
-          const raw = signedNet >= 0n ? signedNet : signedNet + MOD128;
-          const neg = raw >= HALF128;
-          if (zeroForOne) {
-            if (neg) dL = dL + (MOD128 - raw);
-            else dL = dL >= raw ? dL - raw : 0n;
-            dsh -= dts;
-          } else {
-            if (neg) {
-              const dm = MOD128 - raw;
-              dL = dL >= dm ? dL - dm : 0n;
-            } else dL = dL + raw;
-            dsh += dts;
-          }
-          dnNear[bestPool] = dfarReal;
-          dnL[bestPool] = dL;
-          dnShift[bestPool] = dsh;
-          if (dlim) dnOn[bestPool] = false;
-          // SHARED PER_POOL run-until-filled budget (B2): this dn walk is one step of the pool's
-          // single from-live-spot walk (shared with the window brackets). Deactivate dn at the
-          // cap so the pool's TOTAL reach (window+dn) is bounded by ONE PER_POOL EXACTLY as the
-          // oracle's single MAX_V3_STEPS loop — reference==oracle at the cap, every drift direction.
-          dnSteps[bestPool] += 1;
-          if (dnSteps[bestPool] >= PER_POOL) {
-            dnOn[bestPool] = false;
+          if (dfarReal >= priceLimit) dlim = true;
+        }
+        if (dL > 0n && dnearOI > dfarOI && dfarOI > 0n) {
+          const deff = mulDiv(dL, Q96, dfarOI) - mulDiv(dL, Q96, dnearOI);
+          if (deff > 0n) {
+            const dg = mulDiv(deff, FEE_DENOM, FEE_DENOM - BigInt(dfee));
+            let dt = dg;
+            if (cum + dg >= amountIn) dt = amountIn - cum;
+            perPoolInput[bestPool] += dt;
+            cum += dt;
+            if (dt > 0n) cutSqrtAdj = feeAdj(dfarOI, dfee);
           }
         }
+        // Net at the boundary — the CURSOR MECHANISM, mirrored bit-for-bit (ecoswap.sauce.ts
+        // ~355-376). IN-WINDOW (windowTop > 0 AND windowBot <= dsh <= windowTop): read the
+        // per-pool netCache cursor — a matching row (row.shifted === dsh) consumes its raw net
+        // and advances the cursor; an in-window NON-match is net 0 (an uninitialized tick — NO
+        // map read, the cursor does NOT advance). OUT-OF-WINDOW (no cache, or the boundary is
+        // outside the scanned span — the drift-up region above windowTop or a deep fill below
+        // windowBot): read the FULL `adaptiveNet` map (the TS analogue of a live ticks()/
+        // getTickLiquidity staticcall — drift-invariant, returns the SAME raw net).
+        const aNet = dd.adaptiveNet ?? new Map<number, bigint>();
+        const wTop = dd.windowTopShifted ?? 0n;
+        const wBot = dd.windowBotShifted ?? 0n;
+        // Order-agnostic window test (mirrors the solver): the bounds are the shallowest/deepest
+        // scanned boundaries in shifted-tick space, and their ORDER flips by swap direction
+        // (zeroForOne wBot <= wTop; oneForZero wBot >= wTop). Accept dsh within [min, max] so the
+        // cursor cache engages for BOTH directions.
+        const wLo = wTop <= wBot ? wTop : wBot;
+        const wHi = wTop <= wBot ? wBot : wTop;
+        const inWindow = wTop > 0n && dsh >= wLo && dsh <= wHi;
+        let raw: bigint;
+        if (inWindow) {
+          // The drift-invariant truth for THIS tick (what an out-of-window staticcall WOULD
+          // return) — the cursor-path net must equal it for every crossed in-window boundary.
+          const mapSigned = aNet.get(Number(tickArg(dsh))) ?? 0n;
+          const mapRaw = mapSigned >= 0n ? mapSigned : mapSigned + MOD128;
+          const rows = netRows[bestPool];
+          const cc = netCur[bestPool];
+          let cursorRaw = 0n;
+          if (cc < rows.length && rows[cc].shifted === dsh) {
+            cursorRaw = rows[cc].raw;
+            netCur[bestPool] = cc + 1;
+          }
+          // Cursor fidelity: the cursor-path net for this in-window boundary MUST equal the
+          // full-map net (a cached initialized row, or 0 for an in-window uninitialized tick).
+          // Record + assert inline so any vector (not only the EVM lane) catches a cursor
+          // off-by-one — the drift-down skip leaving the cursor on the wrong row, a missed
+          // advance, or an uninitialized tick wrongly consuming a row.
+          cursorChecks.push({ shifted: dsh, cursorNet: cursorRaw, mapNet: mapRaw });
+          if (cursorRaw !== mapRaw) {
+            throw new Error(
+              `cursor net mismatch at shifted=${dsh} (signedTick=${tickArg(dsh)}): cursor=${cursorRaw} map=${mapRaw}`,
+            );
+          }
+          raw = cursorRaw;
+        } else {
+          const signedNet = aNet.get(Number(tickArg(dsh))) ?? 0n;
+          raw = signedNet >= 0n ? signedNet : signedNet + MOD128;
+        }
+        const neg = raw >= HALF128;
+        if (zeroForOne) {
+          if (neg) dL = dL + (MOD128 - raw);
+          else dL = dL >= raw ? dL - raw : 0n;
+          dsh -= dts;
+        } else {
+          if (neg) {
+            const dm = MOD128 - raw;
+            dL = dL >= dm ? dL - dm : 0n;
+          } else dL = dL + raw;
+          dsh += dts;
+        }
+        dnNear[bestPool] = dfarReal;
+        dnL[bestPool] = dL;
+        dnShift[bestPool] = dsh;
+        // TERMINATE only on: price limit, OR budget cap, OR (dL==0 AND boundary PAST the
+        // deepest initialized tick). Walk THROUGH interior dL==0 gaps. extremeShifted==0 ⇒
+        // no gap gate (constant-L curve; terminates via fill / price-limit / cap).
+        if (dlim) dnOn[bestPool] = false;
+        const ext = dd.extremeShifted ?? 0n;
+        if (dL === 0n && ext > 0n) {
+          const pastExt = zeroForOne ? dsh < ext : dsh > ext;
+          if (pastExt) dnOn[bestPool] = false;
+        }
+        dnSteps[bestPool] += 1;
+        if (dnSteps[bestPool] >= PER_POOL) dnOn[bestPool] = false;
       }
     }
   }
 
   const totalInput =
     perPoolInput.reduce((a, b) => a + b, 0n) + perRouteInput.reduce((a, b) => a + b, 0n);
-  return { perPoolInput, perRouteInput, totalInput, cutSqrtAdj };
+  return { perPoolInput, perRouteInput, totalInput, cutSqrtAdj, cursorChecks };
 }

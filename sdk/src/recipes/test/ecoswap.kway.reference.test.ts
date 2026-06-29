@@ -77,12 +77,22 @@ function buildV3(
   }
   const startBoundary = zeroForOne ? base : base + ts;
   const step = zeroForOne ? -ts : ts;
+  // window: shallowest scanned tick (the spot boundary) → deepest (after nBr steps). Empty net
+  // ⇒ no initialized ticks ⇒ extremeShifted 0 (constant-L curve, no gap gate).
+  const spotBoundaryShifted = BigInt(startBoundary + Number(OFFSET));
+  const windowBotShifted = spotBoundaryShifted + BigInt(step) * BigInt(nBr > 0 ? nBr - 1 : 0);
   const pool: EcoPool = {
     poolType: SwapPoolType.UniV3, address: ZERO, fee: feePpm, tickSpacing: ts, hooks: ZERO,
     feePpm, isV2: false, inIsToken0: zeroForOne, stateView: ZERO, poolId: ZERO,
-    adaptiveStartShifted: BigInt(startBoundary + Number(OFFSET)) + BigInt(step) * BigInt(nBr),
-    adaptiveNearReal: nearReal, adaptiveStartL: L, adaptiveStepRatio: stepRatio,
-    topNearReal: spotReal, bracketCount: nBr, adaptiveNet: new Map<number, bigint>(), source: "synthetic",
+    stepRatio,
+    windowTopShifted: nBr > 0 ? spotBoundaryShifted : 0n,
+    windowBotShifted: nBr > 0 ? windowBotShifted : 0n,
+    extremeShifted: 0n,
+    spotTickShifted: spotBoundaryShifted,
+    spotNearReal: spotReal,
+    spotActiveL: L,
+    adaptiveNet: new Map<number, bigint>(),
+    source: "synthetic",
   };
   return { pool, brackets };
 }
@@ -133,12 +143,26 @@ function buildV3WithNet(
     b += step;
   }
   const startBoundary = zeroForOne ? base : base + ts;
+  const spotBoundaryShifted = BigInt(startBoundary + Number(OFFSET));
+  const windowBotShifted = spotBoundaryShifted + BigInt(step) * BigInt(nBr > 0 ? nBr - 1 : 0);
+  // extremeShifted = the DEEPEST initialized tick (shifted) in the swap direction.
+  const netKeys = [...net.keys()];
+  const extremeTick = netKeys.length
+    ? (zeroForOne ? Math.min(...netKeys) : Math.max(...netKeys))
+    : null;
+  const extremeShifted = extremeTick === null ? 0n : BigInt(extremeTick + Number(OFFSET));
   const pool: EcoPool = {
     poolType: SwapPoolType.UniV3, address: ZERO, fee: feePpm, tickSpacing: ts, hooks: ZERO,
     feePpm, isV2: false, inIsToken0: zeroForOne, stateView: ZERO, poolId: ZERO,
-    adaptiveStartShifted: BigInt(startBoundary + Number(OFFSET)) + BigInt(step) * BigInt(nBr),
-    adaptiveNearReal: nearReal, adaptiveStartL: L, adaptiveStepRatio: stepRatio,
-    topNearReal: spotReal, bracketCount: brackets.length, adaptiveNet: net, source: "synthetic",
+    stepRatio,
+    windowTopShifted: nBr > 0 ? spotBoundaryShifted : 0n,
+    windowBotShifted: nBr > 0 ? windowBotShifted : 0n,
+    extremeShifted,
+    spotTickShifted: spotBoundaryShifted,
+    spotNearReal: spotReal,
+    spotActiveL: startL,
+    adaptiveNet: net,
+    source: "synthetic",
   };
   return { pool, brackets };
 }
@@ -166,12 +190,12 @@ function buildV2(
     });
     near = far;
   }
-  const deepestFar = brackets[brackets.length - 1].sqrtFar;
   const pool: EcoPool = {
     poolType: SwapPoolType.UniV2, address: ZERO, fee, tickSpacing: 0, hooks: ZERO,
     feePpm: fee, isV2: true, inIsToken0: true, stateView: ZERO, poolId: ZERO,
-    adaptiveStartShifted: 1n, adaptiveNearReal: deepestFar, adaptiveStartL: 0n, adaptiveStepRatio: 0n,
-    topNearReal: spotOI, bracketCount: 0, source: "synthetic",
+    // V2 has no tick cache: [10..15] zero. The prepare-time spot out/in + √k seed the no-drift
+    // frontier (the reference adapter reads these when no drift override is set).
+    spotNearReal: spotOI, spotActiveL: L, source: "synthetic",
   };
   return { pool, brackets, spotOI, L };
 }
@@ -266,8 +290,9 @@ describe("k-way reference == optimal oracle (no-bracket QUOTE path, dn from spot
   const pool: EcoPool = {
     poolType: SwapPoolType.UniV3, address: ZERO, fee: 500, tickSpacing: ts, hooks: ZERO,
     feePpm: 500, isV2: false, inIsToken0: true, stateView: ZERO, poolId: ZERO,
-    adaptiveStartShifted: BigInt(0 + Number(OFFSET)), adaptiveNearReal: spotReal, adaptiveStartL: L1,
-    adaptiveStepRatio: getSqrtRatioAtTick(ts), topNearReal: spotReal, bracketCount: 0,
+    stepRatio: getSqrtRatioAtTick(ts),
+    windowTopShifted: 0n, windowBotShifted: 0n, extremeShifted: 0n, // no cache (quote path)
+    spotTickShifted: BigInt(0 + Number(OFFSET)), spotNearReal: spotReal, spotActiveL: L1,
     adaptiveNet: new Map<number, bigint>(), source: "synthetic",
   };
   const prepared: EcoSwapPrepared = {
@@ -416,8 +441,9 @@ describe("k-way reference == optimal oracle (B2 cap-binding: reach == budget on 
   const pool: EcoPool = {
     poolType: SwapPoolType.UniV3, address: ZERO, fee: 500, tickSpacing: ts, hooks: ZERO,
     feePpm: 500, isV2: false, inIsToken0: true, stateView: ZERO, poolId: ZERO,
-    adaptiveStartShifted: BigInt(0 + Number(OFFSET)), adaptiveNearReal: spotReal, adaptiveStartL: L,
-    adaptiveStepRatio: getSqrtRatioAtTick(ts), topNearReal: spotReal, bracketCount: 0,
+    stepRatio: getSqrtRatioAtTick(ts),
+    windowTopShifted: 0n, windowBotShifted: 0n, extremeShifted: 0n,
+    spotTickShifted: BigInt(0 + Number(OFFSET)), spotNearReal: spotReal, spotActiveL: L,
     adaptiveNet: new Map<number, bigint>(), source: "synthetic",
   };
   const prepared: EcoSwapPrepared = {
@@ -634,8 +660,9 @@ describe("k-way reference == optimal oracle (L-change on BOTH pools, aligned dri
       undefined,
     ];
     // Sanity: the live price IS below the deepest prepared bracket far edge (cache fully stale).
-    const deepestFar = prepared.pools[0].adaptiveNearReal!; // the post-window dn seed near == window bottom
-    assert.ok(oorReal0 < deepestFar, "OOR live price below the deepest prepared bracket (cache fully stale)");
+    // The window bottom is ≈ NBR steps below spot tick 0 (multiplicative ≈ tick -NBR*TS0).
+    const windowBottomReal = getSqrtRatioAtTick(-NBR * TS0);
+    assert.ok(oorReal0 < windowBottomReal, "OOR live price below the deepest prepared bracket (cache fully stale)");
     const kw = kwayReference(prepared, amountIn, live);
     const opt = optimalSplit({
       pools: [
@@ -976,8 +1003,10 @@ describe("k-way reference == optimal oracle (oneForZero — direction symmetry)"
     const pool: EcoPool = {
       poolType: SwapPoolType.UniV3, address: ZERO, fee: 500, tickSpacing: ts, hooks: ZERO,
       feePpm: 500, isV2: false, inIsToken0: false, stateView: ZERO, poolId: ZERO,
-      adaptiveStartShifted: BigInt(0 + Number(OFFSET)), adaptiveNearReal: spotReal, adaptiveStartL: L,
-      adaptiveStepRatio: getSqrtRatioAtTick(ts), topNearReal: spotReal, bracketCount: 0,
+      stepRatio: getSqrtRatioAtTick(ts),
+      windowTopShifted: 0n, windowBotShifted: 0n, extremeShifted: 0n,
+      // oneForZero walks UP: the spot boundary is base + ts (base 0 ⇒ ts).
+      spotTickShifted: BigInt(ts + Number(OFFSET)), spotNearReal: spotReal, spotActiveL: L,
       adaptiveNet: new Map<number, bigint>(), source: "synthetic",
     };
     const prepared: EcoSwapPrepared = {
