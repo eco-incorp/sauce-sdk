@@ -48,6 +48,11 @@ function poolTuple(p: EcoPool): bigint[] {
  * Direction is always tokenIn→tokenOut (the recipe's swap direction), so it pushes
  * the pool's price DOWN — toward (or past) the solver's cut — which is the case
  * that meaningfully changes the recipe's runtime fill for that pool.
+ *
+ * `priceLimitOverride` pins the swap's sqrt price limit (else the direction extreme).
+ * Pass the EXACT sqrtRatio at a tickSpacing-aligned target with a large `amountIn` to
+ * land the pool PRECISELY on that tick boundary — the deterministic way to drift to a
+ * ts-aligned live tick (so the up→dn handoff lands on the lattice, no per-segment seam).
  */
 export async function driftPoolPrice(
   c: HarnessClients,
@@ -58,8 +63,10 @@ export async function driftPoolPrice(
   zeroForOne: boolean,
   amountIn: bigint,
   caller: Hex,
+  priceLimitOverride?: bigint,
 ): Promise<void> {
-  const priceLimit = zeroForOne ? MIN_SQRT_RATIO + 1n : MAX_SQRT_RATIO - 1n;
+  const priceLimit =
+    priceLimitOverride ?? (zeroForOne ? MIN_SQRT_RATIO + 1n : MAX_SQRT_RATIO - 1n);
   await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn);
   await approve(c.walletClient, c.publicClient, tokenIn, sauceRouter, amountIn);
 

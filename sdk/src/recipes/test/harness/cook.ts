@@ -50,6 +50,12 @@ export async function cook(
     args: [bytecodes],
     account,
     chain: walletClient.chain,
+    // Pin a generous gas limit: viem's eth_estimateGas can undershoot the recipe's
+    // many-staticcall tick walks (the estimate's heuristic buffer is too small for
+    // the up/dn frontier reads), sending the tx with too little gas → an OOG revert
+    // even though the call itself is valid. The block gas limit is 2e9 (anvil.ts),
+    // so a fixed 1.9e9 ceiling stays under the block cap while never undershooting.
+    gas: 1_900_000_000n,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
 

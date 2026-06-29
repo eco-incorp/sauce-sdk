@@ -56,14 +56,15 @@ const brackets: bigint[][] = [
   brkt(1n, (sqrtNear * 99n) / 100n, (sqrtNear * 98n) / 100n, 5n * 10n ** 17n),
 ];
 
-// ── The single-pass (live-cut) array solver — ecoswap.sauce.ts ───────────────
-// The sole on-chain solver. Lowers new Array(n) + arr[i]=… element mutation, and
-// must compile clean on BOTH the v1 (prefix) and v12 (postfix-Huff) targets — this
-// catches array-mutation lowering regressions on either engine.
-describe("ecoswap.sauce.ts (single-pass solver)", () => {
+// ── The canonical K-WAY-LAZY merge solver — ecoswap.sauce.ts ─────────────────
+// The sole on-chain solver (one price-ordered merge over {prepared brackets, dn
+// frontiers}). Lowers new Array(n) + arr[i]=… element mutation, and must compile
+// clean on BOTH the v1 (prefix) and v12 (postfix-Huff) targets — this catches
+// array-mutation / merge / V2-dn / dn-exhaustion lowering regressions on either engine.
+describe("ecoswap.sauce.ts (K-way-lazy merge solver)", () => {
   const SINGLEPASS = join(RECIPE_DIR, "ecoswap.sauce.ts");
 
-  // Compile the single-pass solver for BOTH targets with the given fixture and
+  // Compile the canonical solver for BOTH targets with the given fixture and
   // assert each produces >=1 non-empty bytecode segment.
   function compileBoth(poolsArg: bigint[][], bracketsArg: bigint[][]) {
     const source = readFileSync(SINGLEPASS, "utf-8");
@@ -80,13 +81,13 @@ describe("ecoswap.sauce.ts (single-pass solver)", () => {
     }
   }
 
-  it("single-pass compiles a 2-V3-pool fixture (v1 + v12)", () => {
+  it("compiles a 2-V3-pool fixture (v1 + v12)", () => {
     compileBoth(pools, brackets);
   });
 
   // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1)
   // plus the V2 getReserves staticcall path in the live-price cache.
-  it("single-pass compiles a V2 + V3 mix (v1 + v12)", () => {
+  it("compiles a V2 + V3 mix (v1 + v12)", () => {
     // [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId]
     const mixedPools: bigint[][] = [
       [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n],
@@ -106,7 +107,7 @@ describe("ecoswap.sauce.ts (single-pass solver)", () => {
   });
 
   // V4 pool — guards the StateView getSlot0 read (dp[8]/dp[9]) + unified swap poolType=2.
-  it("single-pass compiles a V4 pool (v1 + v12)", () => {
+  it("compiles a V4 pool (v1 + v12)", () => {
     const STATE_VIEW = BigInt("0xA3c0c9b65baD0189c5c041BF29d8f6DCF1c8e3e1");
     const POOL_ID = BigInt("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
     const POOL_MANAGER = BigInt("0x498581fF718922c3f8e6A244956aF099B2652b2b");
