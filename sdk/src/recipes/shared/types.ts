@@ -178,17 +178,18 @@ export interface TerraSwapPrepared {
 // ── EcoSwap ──────────────────────────────────────────────────
 //
 // EcoSwap generalises GigaSwap's price-limit idea to AMMs that do NOT support
-// sqrtPriceLimitX96. Instead of relying on the pool to cap its own fill, it
-// reconstructs each pool's liquidity curve off-chain as a set of per-tick
-// "brackets", then on-chain solves the optimal split that equalises the
-// post-fee marginal execution price across every pool (water-filling), doing
+// sqrtPriceLimitX96. Instead of relying on the pool to cap its own fill, the
+// on-chain solver runs ONE price-ordered merge where every direct pool walks a
+// single frontier from its LIVE spot, one tickSpacing per step, reusing the
+// drift-invariant per-pool net cache prepare ships — and finds the split that
+// equalises the post-fee marginal execution price across every pool, doing
 // exactly ONE swap per pool (one per hop for routes).
 //
 // Unification insight: a constant-product (V2) pool is mathematically identical
-// to a single Uniswap-V3 liquidity bracket with L = sqrt(reserveIn * reserveOut).
-// So every direct pool — V3 ticks and V2 alike — is represented as brackets in a
-// common "out/in" sqrt-price space, and the on-chain solver runs ONE formula:
-//   inputForBracket = L * 2^96 * (1/sqrtFar - 1/sqrtNear)   (then grossed-up by fee)
+// to a single Uniswap-V3 liquidity range with L = sqrt(reserveIn * reserveOut).
+// So every direct pool — V3 ticks and V2 alike — is integrated in a common
+// "out/in" sqrt-price space, and the on-chain solver runs ONE formula:
+//   inputForStep = L * 2^96 * (1/sqrtFar - 1/sqrtNear)   (then grossed-up by fee)
 
 export interface EcoSwapConfig {
   tokenIn: Hex;
@@ -198,8 +199,8 @@ export interface EcoSwapConfig {
 
 /** Bracket kinds (must match the on-chain `kind` tag). */
 export enum EcoBracketKind {
-  V3 = 0, // direct concentrated-liquidity bracket (live re-anchor via slot0)
-  V2 = 1, // direct constant-product bracket (live re-anchor via getReserves)
+  V3 = 0, // direct concentrated-liquidity bracket (route legs only)
+  V2 = 1, // direct constant-product bracket (route legs only)
   Route = 2, // multi-hop route segment (static, off-chain-precomputed capacity)
 }
 
@@ -247,81 +248,63 @@ export interface EcoPool {
   stateView: Hex;
   /** V4 only: poolId = keccak256(abi.encode(PoolKey)) (0x0 for V2/V3). */
   poolId: Hex;
+  // ── Unified-walk per-pool cache (the live walk reuses the drift-invariant NET) ──
+  /** floor(sqrt(1.0001^ts)*2^96) = getSqrtRatioAtTick(ts) — the multiplicative step ratio. V3/V4. */
+  stepRatio?: bigint;
   /**
-   * Adaptive (WS4) frontier seeds for the on-chain streaming tick walk — the
-   * point where buildV3Brackets STOPPED reading the prepared window. The solver
-   * resumes a live ticks()/getTickLiquidity walk from here when a pool's brackets
-   * are exhausted while cum < amountIn. Default 0 (off) → loop never fires →
-   * behavior byte-identical to non-adaptive. V3/V4 only (V2 has one wide bracket).
+   * SHALLOWEST scanned tick (shifted; OFFSET = 888000) — the top of the cache window.
+   * 0 ⇒ NO cache (the quote / 1-RPC path) ⇒ the walk staticcalls every boundary. A boundary
+   * within [windowBotShifted, windowTopShifted] reads net from the per-pool netCache (or net
+   * 0 if uninitialized); a boundary outside reads net via a ticks()/getTickLiquidity
+   * staticcall. The net VALUE is drift-invariant either way, so the cache is a pure gas
+   * optimization — the solver is wei-exact with the oracle regardless of the window. V3/V4.
    */
-  /** (tick + OFFSET) of the first un-walked boundary; OFFSET = 888000. 0 = off. */
-  adaptiveStartShifted: bigint;
-  /** REAL sqrt (token1/token0, Q96) at the near edge = getSqrtRatioAtTick(last crossed boundary). */
-  adaptiveNearReal: bigint;
-  /** Active L entering the first un-walked step. */
-  adaptiveStartL: bigint;
-  /** floor(sqrt(1.0001^ts)*2^96) = getSqrtRatioAtTick(ts) — the multiplicative step ratio. */
-  adaptiveStepRatio: bigint;
+  windowTopShifted?: bigint;
+  /** DEEPEST scanned tick (shifted) — the bottom of the cache window. V3/V4. */
+  windowBotShifted?: bigint;
   /**
-   * WINDOW-TOP seed — pool tuple [14] = the prepare-time spot, used by the solver as the
-   * DRIFT GATE (the re-anchor trigger). DUAL MEANING by pool type:
-   *   - V3/V4: REAL sqrt (token1/token0, Q96) at the top prepared bracket's near edge =
-   *     the prepare-time spot real sqrt (spotReal). Stamped == spotReal so the seam is
-   *     exact (the top forward bracket's sqrtNear == toOutIn(spotReal)).
-   *   - V2: OUT/IN sqrt = the shallowest kept V2 bracket's sqrtNear = the prepare-time V2
-   *     spot out/in.
-   * The solver compares the LIVE out/in spot to toOutIn(this): on ANY drift (live != top,
-   * UP or DOWN) the pool RE-ANCHORS its single dn walk to the live spot and the merge
-   * STALE-SKIPS the spot-anchored prepared cache; with no drift (live == top) the prepared
-   * cache + the prepare-time dn seed run unchanged. (There is no separate up-frontier — an
-   * earlier drift-UP clamp-and-splice was replaced by this symmetric re-anchor.)
-   * 0 ⇒ no top edge known (no brackets) ⇒ no drift gate ⇒ the dn walk runs from the spot
-   * seed (the no-bracket / quote / no-cache path).
+   * DEEPEST INITIALIZED tick (shifted) — the terminate gate. The frontier deactivates on a
+   * step only when dL==0 AND the boundary is PAST this tick (in the swap direction), so an
+   * interior dL==0 gap keeps walking and resumes when net brings L back (the oracle mirror,
+   * the Issue-2 walk-through-gaps fix). 0 ⇒ no initialized ticks (a constant-L curve;
+   * terminates via fill / price-limit / the per-pool cap). V3/V4.
    */
-  topNearReal: bigint;
+  extremeShifted?: bigint;
   /**
-   * Forward-bracket count — pool tuple [15]. Number of prepared forward brackets the
-   * cache carries for this pool AFTER the trim (re-stamped from frontierByCount). 0 ⇒ NO
-   * cached window ⇒ the dn walk runs from the spot seed (the no-cache / 1-RPC quote path).
-   * >0 ⇒ the merge consumes that many cached brackets before the dn frontier (at no drift;
-   * on any drift the whole cache is stale-skipped and the live dn walk covers it). V3/V4.
+   * OFF-CHAIN-ONLY: the prepare-time SPOT boundary (shifted) — the start of the no-drift
+   * walk (zeroForOne: tickShiftedBase(spotTick); oneForZero: + ts). The reference seeds its
+   * live frontier here when no drift override is set. V3/V4.
    */
-  bracketCount: number;
+  spotTickShifted?: bigint;
+  /** OFF-CHAIN-ONLY: REAL sqrt at the prepare-time spot — the no-drift walk's near edge. V3/V4. */
+  spotNearReal?: bigint;
+  /** OFF-CHAIN-ONLY: active L at the prepare-time spot — the no-drift walk's entry L. V3/V4. */
+  spotActiveL?: bigint;
   /**
-   * OFF-CHAIN-ONLY liquidityNet map (tick → net) for the oracle's mirrored walk.
-   * Populated from the lens `net` map in buildV3Brackets. NOT in the compiler tuple
-   * (the on-chain solver reads net live via ticks()/getTickLiquidity). Undefined when
-   * not prepared adaptively.
+   * The per-pool net cache rows: [shiftedTick, rawNet] for every INITIALIZED tick in the
+   * scanned window, sorted in SWAP DIRECTION. rawNet is the raw uint128 ticks() returns
+   * (signed >= 0 ? signed : signed + 2^128). index.ts flattens these into the top-level
+   * netCache compiler arg (per-pool grouped via netStart/netCount). V3/V4.
+   */
+  netRows?: { shiftedTick: bigint; rawNet: bigint }[];
+  /**
+   * OFF-CHAIN-ONLY liquidityNet map (tick → SIGNED net) for the reference's mirrored walk.
+   * Populated from the lens `net` map. NOT in the compiler tuple (the on-chain solver reads
+   * net from the netCache or live via ticks()/getTickLiquidity). Undefined when not prepared.
    */
   adaptiveNet?: Map<number, bigint>;
   /**
-   * OFF-CHAIN-ONLY per-forward-bracket frontier snapshots (V3/V4). `frontierByCount[k]`
-   * is the dn-frontier ENTRY state AFTER `k` forward brackets were emitted — exactly the
-   * `(adaptiveStartShifted, adaptiveNearReal, adaptiveStartL)` the dn walk should resume
-   * from if the prepared cache is TRIMMED to `k` brackets for this pool. `[0]` is the spot
-   * seed (no brackets crossed); the last entry equals the full-window seed.
-   *
-   * Why it exists: buildV3Brackets stamps the dn seed at the END of the FULL lens window,
-   * but `prepareEcoSwap` then TRIMS the ladder to only the crossed brackets. After the
-   * trim a pool may keep K < window brackets, so the full-window seed sits K..window ticks
-   * PAST the last kept bracket — a gap the dn frontier would skip (the live walk resumes
-   * too deep, mis-allocating across pools under with-swap drift). prepareEcoSwap re-stamps
-   * the seed from `frontierByCount[K]` after the trim so the dn frontier is CONTIGUOUS with
-   * the kept cache. NOT in the compiler tuple (only the re-stamped scalar seeds ship).
-   */
-  frontierByCount?: { shifted: bigint; nearReal: bigint; L: bigint }[];
-  /**
-   * OFF-CHAIN-ONLY re-anchor drift model (oracle mirror, ecoswap.reference.ts). The
-   * deterministic local tests run live==prepared, so the re-anchor is a no-op unless a
-   * test deliberately models drift. When set, the oracle treats these as the modeled
-   * LIVE drifted spot and RE-ANCHORS the pool's dn walk to it, exactly as the on-chain
-   * solver does:
-   *   liveCurRealOverride — REAL sqrt of the modeled live (drifted) price.
-   *   liveTickOverride    — modeled live tick (drives the start boundary, mirroring
-   *                         the on-chain ((liveTick+OFFSET)/ts)*ts derivation).
-   *   liveLOverride       — modeled live active L (the re-anchored walk's entry liquidity).
-   * Unset ⇒ modeled live == spot (topNearReal) ⇒ no drift ⇒ the oracle re-anchor is a
-   * no-op, so every existing vector is unchanged. NOT in the compiler tuple.
+   * OFF-CHAIN-ONLY drift model (reference mirror, ecoswap.kway.reference.ts). The
+   * deterministic local tests run live==prepared spot, so these are unset unless a test
+   * deliberately models drift. When set, the reference walks the pool's single frontier
+   * FROM this modeled live spot (the cached NET is drift-invariant, so the walk stays
+   * wei-exact with the oracle regardless of the drift):
+   *   liveCurRealOverride — REAL sqrt of the modeled live (drifted) price (V2: out/in spot).
+   *   liveTickOverride    — modeled live tick (drives the start boundary, mirroring the
+   *                         on-chain tickShiftedBase derivation).
+   *   liveLOverride       — modeled live active L (the walk's entry liquidity; V2: √k).
+   * Unset ⇒ modeled live == the prepare-time spot (the spot* fields) ⇒ no drift. NOT in the
+   * compiler tuple.
    */
   liveCurRealOverride?: bigint;
   liveTickOverride?: number;
@@ -337,9 +320,10 @@ export interface EcoRoute {
 /**
  * Off-chain preparation result.
  *
- * `brackets` is the global ladder, pre-sorted DESCENDING by sqrtAdjNear — the
- * on-chain solver walks it once to find the common marginal-price cut, then
- * executes one swap per pool re-anchored to live prices.
+ * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
+ * unified walk reuses); they ship NO prepare-time sqrt edges. `brackets` now holds ROUTE
+ * segments only (kind === Route), pre-sorted DESCENDING by sqrtAdjNear, consumed by one
+ * cursor in the merge (routes are static — composed off-chain, no live re-price).
  */
 export interface EcoSwapPrepared {
   pools: EcoPool[];
@@ -348,6 +332,6 @@ export interface EcoSwapPrepared {
   zeroForOne: boolean;
   /** Real-sqrt-space extreme price limit for the swap calls (direction-dependent). */
   priceLimit: bigint;
-  /** Sum of off-chain bracket capacities consumed up to amountIn (diagnostic). */
+  /** Sum of route-segment capacities (diagnostic; direct-pool depth is read live). */
   expectedInputCovered: bigint;
 }

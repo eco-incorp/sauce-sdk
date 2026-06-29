@@ -1,11 +1,12 @@
 /**
  * EcoSwap recipe entry point.
  *
- * Off-chain:  reconstruct per-tick liquidity brackets for every pool, build a
- *             global fee-adjusted marginal-price ladder.
- * On-chain:   greedy water-fill over the ladder using LIVE prices, then one
- *             swap per pool (one per hop for routes) — equal marginal price =
- *             synchronized minimal slippage, no per-pool price-limit needed.
+ * Off-chain:  build each pool's per-pool NET CACHE (drift-invariant tick depth) +
+ *             the static route segments.
+ * On-chain:   ONE price-ordered merge where every pool walks a single frontier from
+ *             its LIVE spot (reusing the cache for net), then one swap per pool (one
+ *             per hop for routes) — equal post-fee marginal price = synchronized
+ *             minimal slippage, no per-pool price-limit needed.
  */
 
 import {
@@ -28,7 +29,8 @@ import ts from "typescript";
 
 import { prepareEcoSwap, type EcoSwapPrepareOpts } from "./prepare.js";
 import { MULTICALL3, BASE_CHAIN_POOL_CONFIG, type ChainPoolConfig } from "../shared/constants.js";
-import type { EcoSwapConfig, EcoSwapPrepared, EcoPool, EcoRoute, EcoBracket } from "../shared/types.js";
+import type { EcoSwapConfig, EcoSwapPrepared, EcoPool, EcoRoute } from "../shared/types.js";
+import { EcoBracketKind } from "../shared/types.js";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler");
@@ -56,17 +58,17 @@ export interface EcoSwapOutput {
 
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  adaptiveStartShifted, adaptiveNearReal, adaptiveStartL, adaptiveStepRatio,
- *  topNearReal, bracketCount]
- * [10..13] are the WS4 forward/frontier seeds — always populated for V3/V4 pools (the
- * streaming forward walk resumes past the prepared window when it under-fills); 0 for
- * V2 (a single wide bracket has no tick frontier → walk skipped).
- * [14..15] are the WS2 re-anchor / drift-gate seeds: topNearReal (the prepare-time spot
- * real sqrt = the drift gate / dn re-anchor trigger) and bracketCount (the kept forward-
- * bracket count — off-chain bookkeeping; the on-chain solver does NOT read [15]; 0 ⇒ no
- * window ⇒ the dn walk runs from spot for the no-bracket / 1-RPC quote path). 0 for V2.
+ *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
+ * [10..15] are the unified-walk per-pool cache descriptors (V3/V4): the multiplicative step
+ * ratio, the cache window bounds (shallowest/deepest scanned tick, shifted; windowTop=0 ⇒ no
+ * cache ⇒ staticcall every boundary, the 1-RPC quote path), the deepest INITIALIZED tick (the
+ * terminate gate — the solver walks THROUGH interior dL==0 gaps, deactivating only past this
+ * tick), and the [netStart, netStart+netCount) slice into the flat netCache. 0 for V2 (V2 reads
+ * live reserves and streams constant-L, no tick cache).
+ *
+ * `netStart` is supplied by the caller (the running offset into the assembled netCache).
  */
-function buildPoolTuple(p: EcoPool): bigint[] {
+function buildPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[] {
   return [
     BigInt(p.poolType),
     BigInt(p.address),
@@ -78,13 +80,30 @@ function buildPoolTuple(p: EcoPool): bigint[] {
     p.inIsToken0 ? 1n : 0n,
     BigInt(p.stateView), // V4 StateView lens (0 for V2/V3)
     BigInt(p.poolId), // V4 poolId (0 for V2/V3)
-    p.adaptiveStartShifted ?? 0n, // [10] adaptive frontier: next un-walked boundary, shifted
-    p.adaptiveNearReal ?? 0n, // [11] REAL sqrt at the near edge
-    p.adaptiveStartL ?? 0n, // [12] active L entering the first un-walked step
-    p.adaptiveStepRatio ?? 0n, // [13] multiplicative step ratio (getSqrtRatioAtTick(ts))
-    p.topNearReal ?? 0n, // [14] drift gate / dn re-anchor trigger = prepare-time spot real sqrt
-    BigInt(p.bracketCount ?? 0), // [15] forward bracket count (0 ⇒ no-bracket walk from spot)
+    p.stepRatio ?? 0n, // [10] multiplicative step ratio (getSqrtRatioAtTick(ts)); 0 for V2
+    p.windowTopShifted ?? 0n, // [11] shallowest scanned tick (shifted); 0 ⇒ no cache (quote path)
+    p.windowBotShifted ?? 0n, // [12] deepest scanned tick (shifted)
+    p.extremeShifted ?? 0n, // [13] deepest INITIALIZED tick (shifted) — the terminate gate
+    BigInt(netStart), // [14] start row index into the flat netCache for this pool
+    BigInt(netCount), // [15] number of initialized-tick rows for this pool (0 ⇒ none)
   ];
+}
+
+/**
+ * Assemble the per-pool tuples + the flat netCache ([shiftedTick, rawNet] rows, per-pool
+ * grouped + swap-direction-sorted) together, so each pool's [netStart, netCount) points at its
+ * own contiguous slice. V2 pools contribute no rows.
+ */
+function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netCache: bigint[][] } {
+  const netCache: bigint[][] = [];
+  const poolTuples: bigint[][] = [];
+  for (const p of pools) {
+    const rows = p.isV2 ? [] : p.netRows ?? [];
+    const netStart = netCache.length;
+    poolTuples.push(buildPoolTuple(p, netStart, rows.length));
+    for (const r of rows) netCache.push([r.shiftedTick, r.rawNet]);
+  }
+  return { poolTuples, netCache };
 }
 
 /**
@@ -108,18 +127,22 @@ function buildRouteTuple(r: EcoRoute): bigint[] {
   ];
 }
 
-/** [kind, refIdx, sqrtNear, sqrtFar, liquidity, capacity, sqrtAdjNear, sqrtAdjFar] */
-function buildBracketTuple(b: EcoBracket): bigint[] {
-  return [
-    BigInt(b.kind),
-    BigInt(b.refIdx),
-    b.sqrtNear,
-    b.sqrtFar,
-    b.liquidity,
-    b.capacity,
-    b.sqrtAdjNear,
-    b.sqrtAdjFar,
-  ];
+/**
+ * Build the flat route-segment array — [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar] for every
+ * Route bracket, sorted DESC by sqrtAdjNear (then adjFar DESC, then routeIdx ASC — the same
+ * stable order the merge tie-breaks on). Routes are STATIC (no live re-price), competing in the
+ * merge via ONE cursor. Direct-pool brackets are GONE (the solver walks each pool live).
+ */
+function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
+  return prepared.brackets
+    .filter((b) => b.kind === EcoBracketKind.Route)
+    .slice()
+    .sort((a, b) => {
+      if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
+      if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
+      return a.refIdx - b.refIdx;
+    })
+    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
 }
 
 /**
@@ -173,17 +196,17 @@ export async function ecoSwap(
     { ...(opts ?? {}), lensTarget: opts?.lensTarget ?? target, caller },
   );
 
-  // EcoSwap's on-chain solver is the canonical K-way-lazy price-ordered merge in
-  // ecoswap.sauce.ts: one merge over {prepared brackets, each pool's live dn frontier}
-  // allocates each pool/route into real mutable arrays, computes the exact tokenIn the
-  // swaps will consume, then pulls and executes (compute-then-pull, no over-pull/refund).
-  // ecoswap.unrolled.sauce.ts (register-bank variant) and ecoswap.computeonly.sauce.ts
-  // are frozen gas-comparison references, not selectable here. `opts.solverFile` lets a
-  // test point at an alternate solver source without changing the production default.
+  // EcoSwap's on-chain solver is the unified per-pool live walk in ecoswap.sauce.ts: one
+  // price-ordered merge over {each route segment, each pool's live frontier} where every
+  // direct pool walks from its LIVE spot reusing the drift-invariant per-pool net cache,
+  // computes the exact tokenIn the swaps will consume, then pulls and executes (compute-
+  // then-pull, no over-pull/refund). `opts.solverFile` lets a test point at an alternate
+  // solver source without changing the production default.
   const solverFile = opts?.solverFile ?? "ecoswap.sauce.ts";
   const source = readFileSync(join(__dirname, solverFile), "utf-8");
   const jsSource = stripTypes(source);
 
+  const { poolTuples, netCache } = buildPoolsAndNetCache(prepared.pools);
   const result = compile(jsSource, {
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
@@ -193,11 +216,11 @@ export async function ecoSwap(
       BigInt(config.tokenOut),
       config.amountIn,
       BigInt(caller),
-      prepared.zeroForOne ? 1n : 0n,
       prepared.priceLimit,
-      prepared.pools.map(buildPoolTuple),
+      poolTuples,
       prepared.routes.map(buildRouteTuple),
-      prepared.brackets.map(buildBracketTuple),
+      netCache,
+      buildRouteSegs(prepared),
     ],
   });
 
@@ -244,7 +267,7 @@ const OVERRIDE_AMOUNT = ("0x" + "0".repeat(32) + "f".repeat(32)) as Hex;
 export interface QuoteEcoSwapResult {
   /** Realized tokenOut the swap WOULD produce for `amountIn` (the quote). */
   amountOut: bigint;
-  /** The prepared state used (pools/routes/brackets). */
+  /** The prepared state used (pools + per-pool net caches, routes, route segments). */
   prepared: EcoSwapPrepared;
 }
 
@@ -260,9 +283,9 @@ export interface QuoteEcoSwapResult {
  * across the solver's many tick staticcalls → frame-base MemoryOOG). The realized output is
  * STRICTLY BETTER than the `cum` the spec's quoteOnly would have returned.
  *
- * Works with NO prepared brackets: pass `opts.brackets = []` (or a prepared with empty
- * brackets) and the solver's sweep is a no-op while the always-on forward walk fills from
- * each pool's spot seed (the no-bracket full-live-walk, 1-RPC quote).
+ * Works with NO prepared net cache: pass `opts.noBrackets = true` and each pool's window
+ * bounds clear (windowTop=0), so the unified walk staticcalls every boundary from the live
+ * spot (the no-cache full-live walk, 1-RPC quote).
  *
  * @param cookEntry  the engine cook entrypoint the QUOTE eth_call runs against (v1
  *                   SauceRouter / v12 Pot) — the swap target AND the allowance spender.
@@ -315,13 +338,22 @@ export async function quoteEcoSwap(
     poolConfig ?? BASE_CHAIN_POOL_CONFIG,
     { ...(opts ?? {}), lensTarget: opts?.lensTarget ?? target, caller },
   );
-  // No-bracket quote (1-RPC): drop the prepared brackets so the sweep is a no-op and the
-  // always-on forward walk fills from each pool's spot seed. The pools (with seeds) + routes
-  // stay; only the bracket cache is cleared.
-  const usePrepared: EcoSwapPrepared = opts?.noBrackets ? { ...prepared, brackets: [] } : prepared;
+  // No-cache quote (1-RPC): drop the per-pool net cache so the walk staticcalls every boundary
+  // from each pool's LIVE spot. Clearing the netRows + window bounds forces windowTop=0 on-chain
+  // (the all-live walk). Routes stay (they are static segments).
+  const usePrepared: EcoSwapPrepared = opts?.noBrackets
+    ? {
+        ...prepared,
+        pools: prepared.pools.map((p) =>
+          p.isV2 ? p : { ...p, netRows: [], windowTopShifted: 0n, windowBotShifted: 0n },
+        ),
+        brackets: prepared.brackets.filter((b) => b.kind === EcoBracketKind.Route),
+      }
+    : prepared;
 
   const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
+  const { poolTuples, netCache } = buildPoolsAndNetCache(usePrepared.pools);
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
@@ -330,11 +362,11 @@ export async function quoteEcoSwap(
       BigInt(config.tokenOut),
       config.amountIn,
       BigInt(caller),
-      usePrepared.zeroForOne ? 1n : 0n,
       usePrepared.priceLimit,
-      usePrepared.pools.map(buildPoolTuple),
+      poolTuples,
       usePrepared.routes.map(buildRouteTuple),
-      usePrepared.brackets.map(buildBracketTuple),
+      netCache,
+      buildRouteSegs(usePrepared),
     ],
   });
   const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;
