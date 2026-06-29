@@ -3,11 +3,11 @@
 EcoSwap is GigaSwap's successor for AMMs that **don't support `sqrtPriceLimitX96`**.
 
 GigaSwap relies on the pool to cap its own fill via a price limit — which only Uniswap-V3-style
-pools honour. EcoSwap instead reconstructs each pool's liquidity curve off-chain as **per-tick
-brackets**, then on-chain solves the optimal split that **equalises the post-fee marginal execution
-price across every pool** (classic water-filling) and does **exactly one swap per pool** (one per hop
-for routes). No step function, no per-pool price limit — so V2/constant-product pools get just as
-precise a split as concentrated-liquidity pools.
+pools honour. EcoSwap instead walks **each pool's liquidity curve LIVE on-chain** (one frontier per
+pool, from its live spot, reusing prepare's drift-invariant per-pool net cache) in ONE price-ordered
+merge that **equalises the post-fee marginal execution price across every pool** and does **exactly one
+swap per pool** (one per hop for routes). No step function, no per-pool price limit — so V2/constant-
+product pools get just as precise a split as concentrated-liquidity pools.
 
 ## The unification insight
 
@@ -30,41 +30,48 @@ they sort into one global ladder regardless of AMM type or fee tier.
    **every configured fork** — Uniswap V3, **PancakeSwap V3**, etc. — each across **its own** fee tiers
    (`FactoryConfig.feeTiers`), because forks don't share tiers: Pancake's medium tier is **2500**
    (0.25%) where Uniswap's is 3000 — a single global list would silently miss Pancake's pool.
-2. **Filter to deep pools.** Apply an absolute floor (`MIN_LIQUIDITY`) **and** a relative-depth gate:
-   drop any pool below **1% of the total discovered liquidity** (`ECO_MIN_REL_BPS`, default 100 bps; 0
-   disables). For one token pair, raw active-`L` at spot is comparable across V2 (`≡` a V3 range with
-   `L=√k`), V3 and V4, so this is a sound marginal-depth gate — a pool holding a sliver of the combined
-   depth would only ever get a dust slice, not worth a swap's gas. Dropped pools are logged (no silent
-   caps). Then keep the deepest `ECO_MAX_POOLS`.
-3. For each V3 pool: scan a window of ticks in **one Multicall3 round-trip**, reconstruct per-bracket
-   `L` from `liquidity()` + `liquidityNet`. **V4** is identical geometry read through the StateView
-   lens by `poolId` (`getSlot0`/`getTickLiquidity`). For each V2 pool: one wide bracket discretised
-   into geometric steps. For each route: sample input sizes, quote both hops, derive route segments.
-4. Fee-adjust each bracket's sqrt boundaries, compute its gross input capacity, and **sort the whole
-   ladder descending** by fee-adjusted marginal price.
+2. **Filter to deep pools** — done ON-CHAIN by the lens (the single source of truth; prepare never
+   re-filters). The relative-depth gate drops any pool below **1% of the Σ IN-RANGE capacity** across the
+   crossed ticks (`ECO_MIN_REL_BPS`, default 100 bps; 0 disables) plus a `>0` aliveness gate; the absolute
+   `MIN_LIQUIDITY` floor was dropped. In-range capacity (the gross tokenIn a pool absorbs from spot to the
+   common cut) is comparable across V2 (`≡` a V3 range with `L=√k`), V3 and V4 — a pool holding a sliver
+   would only ever get a dust slice, not worth a swap's gas. The lens reports what it dropped (no silent
+   caps); prepare then keeps the deepest `ECO_MAX_POOLS` (a calldata/loop bound, not a liquidity gate).
+3. For each V3/V4 survivor: stamp the per-pool NET cache from the lens reads (the stepRatio, the
+   scanned-window bounds, the deepest initialized tick, and one `[shiftedTick, rawNet]` row per
+   initialized tick). The on-chain solver walks the pool's frontier LIVE and reuses this drift-invariant
+   net — it ships NO prepare-time sqrt edges. V2 needs no tick cache (the solver streams constant-L from
+   live reserves). For each route: sample input sizes, quote both hops off-chain, derive route segments.
+4. Fee-adjust each ROUTE segment's sqrt and **sort the route segments descending** by fee-adjusted
+   marginal price (direct-pool depth is read live, so no off-chain ladder/cut is needed for them).
 
-**On-chain (`ecoswap.sauce.ts`)** — a **K-way-lazy price-ordered merge**: it reads each pool's live state
-once in SETUP, then runs ONE merge over two candidate streams — the off-chain-sorted prepared `brackets[]`
-(a flat cursor, the **cache**) and each pool's live `dn` frontier (its deeper region, walked
-run-until-filled). Each step picks the highest fee-adjusted out/in head among `{brackets[bc], all active
-dn[]}`, consumes its segment into `inp[pool]`, and advances ONLY that stream. The cut is **implicit** (where
-the merge stops once `cum == amountIn`), and the swaps are computed then pulled (**compute-then-pull**).
-This is the optimal equalized split: exact (global price order), lazy (only reconstructs as `cum` needs),
-and bit-for-bit with the neutral optimal oracle (`test/ecoswap.optimal.ts`).
+**On-chain (`ecoswap.sauce.ts`)** — a **unified per-pool live walk + price-ordered merge**. It reads each
+pool's live state once in SETUP, then runs ONE merge over the candidate streams — **each direct pool's single
+frontier** (walked from its LIVE spot, one tickSpacing per step, run-until-filled) plus each static route
+segment cursor. Each step picks the highest fee-adjusted out/in head among `{all active pool frontiers, the
+route cursor}`, consumes its segment into `inp[pool]`, and advances ONLY that stream. The head scan is
+**lazy-far**: it computes the near fee-adjusted price for every active pool and the far (the near-tie break)
+only for a pool that could win or tie — split-identical, the bulk of the per-pool scan arithmetic saved. The
+cut is **implicit** (where the merge stops once `cum == amountIn`), and the swaps are computed then pulled
+(**compute-then-pull**). This is the optimal equalized split: exact (global price order), lazy (only
+reconstructs as `cum` needs), and bit-for-bit with the neutral optimal oracle (`test/ecoswap.optimal.ts`).
 
-**One walk model (drift re-anchoring, both directions symmetric).** At **no drift** the merge consumes the
-prepared cache from the window top plus the prepare-time-anchored `dn` seed below it. At **any drift** (UP
-against the swap, or DOWN with it) the spot-anchored prepared brackets are stale, so the merge **skips the
-whole cache** for that pool and **re-anchors** its `dn` frontier to the LIVE read (live tick / sqrt / active
-L), walking ONE continuous tick-lattice grid from the true live spot — byte-identical to the oracle's
-continuous-from-live-spot walk. There is no separate `up` frontier: re-anchoring makes drift-UP symmetric to
-the proven-exact drift-DOWN path.
+**The unified model (one walk, no two modes).** A tick's `liquidityNet` is **drift-invariant** — the active-L
+of a tick range does not change when the spot price moves. The prepare-time sqrt edges are NOT drift-invariant
+(a multiplicative grid anchored at the prepare-time spot). So the solver ALWAYS computes sqrt/price on the
+LIVE grid (`stepReal` from the live spot — identical to the oracle's continuous-from-live-spot walk) and
+reuses only the cached NET: a per-pool cache lookup for an in-window boundary, a `ticks()`/
+`getTickLiquidity()` staticcall for an out-of-window one. Same grid, same nets ⇒ wei-exact with the oracle by
+construction, for ANY drift in either direction — no drift gate, no stale-skip, no re-anchor branch. A pool is
+**never** deactivated while liquidity is known ahead: it walks THROUGH interior `dL==0` gaps and deactivates
+only on the price limit, the per-pool budget cap, or (`dL==0` AND the boundary past the pool's deepest
+initialized tick).
 
 For each direct pool the merge does one swap (V3 → flat `swapV3`; V2/V4 → unified `swap(SwapParams)`); routes
 allocate whole segments and swap hop1 → hop2. **`prepare.ts` is a gas-optimization cache, not a correctness
-dependency** — the solver is exact from live data alone (run-until-filled past any prepared window, even fully
-out of range); a quote runs with an empty cache. Compute-then-pull pulls exactly what the swaps consume; one
-guarded terminal refund covers the limit-price edge.
+dependency** — the solver is exact from live data alone (`windowTop=0` ⇒ every boundary staticcalls, the
+1-RPC quote path with no prepared ticks). Compute-then-pull pulls exactly what the swaps consume; one guarded
+terminal refund covers the limit-price edge.
 
 Equal post-fee marginal price at the cut ⇒ synchronized minimal slippage across all venues.
 
@@ -96,29 +103,31 @@ All √ values are `Q96`, oriented **out-per-in** so price *falls* as the swap p
 ```
  off-chain (prepare.ts)                              on-chain (ecoswap.sauce.ts, via cook())
  ┌──────────────────────────────────────────┐        ┌──────────────────────────────┐
- │ 1 LENS eth_call — discover + read pools   │        │ Phase A  water-fill → cut    │
- │ 2 filter (abs / rel-depth / top-N)        │  args  │ Phase B  re-anchor to live   │
- │ 3 build brackets (V3/V4 · V2 · route)     │ ─────▶ │          1 swap per pool     │
- │ 4 fee-adjust + capacity                   │bytecode│ refund leftover, send out    │
- │ 5 sort DESC by sqrtAdjNear + trim         │        │                              │
+ │ 1 LENS eth_call — discover/read/filter    │        │ SETUP  read each pool's LIVE │
+ │ 2 top-N cap (calldata bound)              │  args  │        spot, seed 1 frontier  │
+ │ 3 stamp per-pool NET cache (V3/V4)        │ ─────▶ │ MERGE  live walk → equalized │
+ │   + V2 (no cache) + route segments        │bytecode│        split, 1 swap per pool │
+ │ 4 sort route segments DESC sqrtAdjNear    │        │ refund leftover, send out    │
  └──────────────────────────────────────────┘        └──────────────────────────────┘
 ```
 
-### 1 · Bracket formation
+### 1 · Bracket formation (ROUTE legs) + per-pool net cache (DIRECT pools)
 
-The atomic unit is the `EcoBracket` (`shared/types.ts`), flattened on-chain to `brackets[b][i]`:
+Direct pools ship NO `EcoBracket`s — they carry the per-pool net cache (§ above) and are walked LIVE. The
+`EcoBracket` (`shared/types.ts`) survives ONLY for ROUTE legs / route segments — it is composed off-chain
+and flattened on-chain to the `routeSegs[g]` tuple `[routeIdx, capacity, sqrtAdjNear, sqrtAdjFar]`:
 
 ```
- EcoBracket                          on-chain tuple index  →  brackets[b][i]
+ EcoBracket (route segments only)    used off-chain → routeSegs[g][i]
  ┌───────────────┬──────────────────────────────────────────────┬─────┐
- │ kind          │ 0=V3 direct · 1=V2 direct · 2=Route           │ [0] │
- │ refIdx        │ index into pools[] (V3/V2) or routes[] (Route) │ [1] │
- │ sqrtNear      │ spot out/in √P at near (entry) edge — HIGHER   │ [2] │
- │ sqrtFar       │ spot out/in √P at far  (exit)  edge — LOWER    │ [3] │
- │ liquidity  L  │ bracket L (V3); recomputed live for V2         │ [4] │
- │ capacity      │ gross tokenIn to traverse the whole bracket    │ [5] │ ◀─ Phase A
- │ sqrtAdjNear   │ fee-adjusted near = √near·√(1−fee)  ── SORT KEY │ [6] │ ◀─ ladder sort
- │ sqrtAdjFar    │ fee-adjusted far  = √far ·√(1−fee)             │ [7] │ ◀─ threshold
+ │ kind          │ 2=Route (direct V3/V2 kinds: route-leg build)  │     │
+ │ refIdx        │ index into routes[]                            │ [0] │
+ │ sqrtNear      │ spot out/in √P at near (entry) edge — HIGHER   │     │
+ │ sqrtFar       │ spot out/in √P at far  (exit)  edge — LOWER    │     │
+ │ liquidity  L  │ route-leg bracket L (unused for a segment)     │     │
+ │ capacity      │ gross tokenIn the route segment absorbs        │ [1] │ ◀─ merge consume
+ │ sqrtAdjNear   │ fee-adjusted near = √near·√(1−fee)  ── SORT KEY │ [2] │ ◀─ segment sort
+ │ sqrtAdjFar    │ fee-adjusted far  = √far ·√(1−fee)             │ [3] │ ◀─ near-tie break
  └───────────────┴──────────────────────────────────────────────┴─────┘
 ```
 
@@ -126,35 +135,34 @@ The atomic unit is the `EcoBracket` (`shared/types.ts`), flattened on-chain to `
 execution* price — what makes a 0.05% pool and a 0.30% pool directly comparable on one axis. That's the
 universal sort/threshold coordinate.
 
-**V3/V4 → brackets (`buildV3Brackets`).** Walk the lens's tick window outward from the live tick; at
-each initialised boundary active `L` steps by `±liquidityNet`; each constant-`L` span is one bracket.
+**Direct V3/V4 → per-pool NET cache (`stampPoolCache`).** Direct pools ship NO prepare-time brackets. The
+on-chain solver walks each pool's frontier LIVE (`stepReal` from the live spot, one tickSpacing per step)
+and at each initialised boundary steps active `L` by `±liquidityNet`. prepare ships only the
+**drift-invariant net** so that walk skips a staticcall for the scanned window:
 
 ```
  out/in √price                       (zeroForOne example: swap pushes price DOWN)
    ▲
-   │   ┌── REVERSE side (ABOVE spot) ─────────────────────────────────┐
-   │   │  capacity FORCED to 0 — invisible to the water-fill cut,      │
-   │   │  consumed ONLY by Phase B if live price drifted UP vs prepare │
-   │   │   ╎          ╎          ╎      L accrues as MIRROR of forward │
-   │   │  [rev2]    [rev1]    [rev0]    zeroForOne rev: L += net       │
-   ●───┼───────────── SPOT (live tick at prepare) ──────────────────── ●  base = ⌊tick/ts⌋·ts
-   │   │  [fwd0]    [fwd1]    [fwd2] ...                                │
-   │   │   ╎          ╎          ╎      forward: L −= net (0→1)         │
-   │   │  near=spot  bndry      bndry                                  │
-   │   └── FORWARD side (swap direction) ──────────────────────────────┘
-   ▼      walk EXACTLY scannedForward / scannedReverse boundaries — never past lens data
-          (else you'd fabricate phantom brackets where L is unknown)
+   ●───────────── SPOT (read LIVE on-chain in SETUP) ───────────────── ●  base = ⌊tick/ts⌋·ts
+   │   │  [step0]   [step1]   [step2] ...                              │
+   │   │   ╎          ╎          ╎      forward: L −= net (zeroForOne) │
+   │   │  near=live  bndry      bndry                                  │
+   │   └── swap direction — one frontier walked run-until-filled ──────┘
+   ▼      net comes from the per-pool cache IN-WINDOW (a staticcall avoided), else from a
+          live ticks()/getTickLiquidity staticcall — the same drift-invariant value either way
 ```
 
-- **Forward** brackets are the swap path: `L = zeroForOne ? L−net : L+net` per crossing.
-- **Reverse** brackets sit above spot with `capacity = 0n`. They exist only so Phase B can re-anchor a
-  pool whose live price moved *against* the swap between `prepare()` and execution. `L` accrues by the
-  *mirror* rule (`zeroForOne` reverse = price up = `L += net`). The walk is bounded by `scannedReverse`.
-- Both loops stop at the lens's `scannedForward`/`scannedReverse` counts so brackets never assume
-  liquidity the lens didn't read.
+- The cache rows are `[shiftedTick, rawNet]` for every INITIALIZED tick (sorted swap-direction); an
+  in-window uninitialized tick is net 0 with no row and no staticcall.
+- The walk computes ALL sqrt on the LIVE grid, so a runtime price drift just starts the same walk from a
+  different live spot — no separate reverse/up frontier, no re-anchor branch (`liquidityNet` is invariant).
+
+The `buildV3Brackets`/`buildV2Brackets` bracket builders below are used **only for ROUTE legs** now
+(direct pools carry the per-pool net cache and are walked live). Routes are composed off-chain via
+`localQuote`, so a route leg's liquidity curve is still materialized as brackets for that composition.
 
 **V2 → brackets (`buildV2Brackets`).** One wide constant-product range, discretised into
-`V2_BRACKETS` (16) geometric steps (~0.5% price each) so it slots into the same ladder. `L = √k` is
+`V2_BRACKETS` (16) geometric steps (~0.5% price each) so it slots into the route composition. `L = √k` is
 carried but **recomputed live on-chain** from `getReserves`.
 
 ```
@@ -178,38 +186,27 @@ Each hop's **real fee** is threaded in (no `feePpm` heuristic).
 
 ### 2 · Filtering
 
-Three gates (`prepareEcoSwap`), then a trim:
+Survivorship is decided ON-CHAIN by the lens (the single source of truth — prepare never re-filters), then
+prepare applies only a top-N calldata bound:
 
 ```
- all discovered pools (from lens)
+ all discovered alive pools (in the lens)
         │
-        ▼  ① ABSOLUTE floor       p.liquidity ≥ MIN_LIQUIDITY (1e13)
+        ▼  ① ALIVENESS gate       in-range capacity > 0
         │
-        ▼  ② RELATIVE-depth floor p.liquidity ≥ minRelBps/1e4 · Σliquidity
-        │                         (default 100 bps = 1% of combined depth;
-        │                          drops dust pools not worth a swap's gas)
-        ▼  ③ TOP-N cap            keep deepest MAX_DIRECT_POOLS (12) by L
+        ▼  ② RELATIVE-depth floor capacity ≥ minRelBps/1e4 · Σ in-range capacity
+        │                         (default 100 bps = 1% of combined IN-RANGE depth;
+        │                          drops dust pools not worth a swap's gas — the
+        │                          absolute MIN_LIQUIDITY floor was dropped)
+        │  ── lens returns survivors-only ──▶ prepare
         │
-        ▼  build brackets, fee-adjust, SORT ladder DESC by sqrtAdjNear
-        │
-        ▼  ④ OFF-CHAIN WATER-FILL PRE-RUN → trim
+        ▼  ③ TOP-N cap            keep deepest MAX_DIRECT_POOLS (12) by L (a calldata bound)
 ```
 
-The trim (④) bounds on-chain calldata/gas to the trade *size*, not the fetch window:
-
-```
- sorted ladder (DESC sqrtAdjNear):  [b0][b1][b2][b3][b4][b5][b6][b7][b8]...
-                                      └──── Σcapacity ────┘
- walk summing capacity until ≥ amountIn ───────────────▶ cutIdx ─┐
-                                                                 │
- KEEP:  every bracket ≤ cutIdx                    ◀── the crossed region
-      + SAFETY_TICKS (2) extra per crossed pool   ◀── drift headroom
-      ✗ drop brackets of pools the trade never reaches
-      (floor at MIN_BRACKETS=8 so tiny trades still split)
-```
-
-`capacity=0` reverse brackets sort to the *top* and are kept (above the cut), but add `0` to the
-running sum — so the cut index is byte-identical to a world without them.
+In-range capacity is the gross tokenIn a pool absorbs from spot to the common cut (NOT spot active-L), so it
+is comparable across V2/V3/V4 and does not over-reward a thin band of huge liquidity right at spot. There is
+NO off-chain ladder/water-fill/trim for direct pools — the on-chain solver walks each survivor's frontier
+LIVE and reuses the per-pool net cache, so on-chain gas scales with the trade size, not the fetch window.
 
 ### 3 · Passing into runtime
 
@@ -217,15 +214,18 @@ running sum — so the cut index is byte-identical to a world without them.
 `.sauce.ts` is static — data rides in as args, not string interpolation):
 
 ```
- prepare.ts ─▶ index.ts buildPoolTuple / buildRouteTuple / buildBracketTuple ─▶ compile(args)
+ prepare.ts ─▶ index.ts buildPoolsAndNetCache / buildRouteTuple / buildRouteSegs ─▶ compile(args)
 
- args = [ tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit,
-          pools[]    each: [poolType,addr,fee,tickSpacing,hooks,feePpm,isV2,inIsToken0,stateView,poolId]
+ args = [ tokenIn, tokenOut, amountIn, caller, priceLimit,
+          pools[]    each: [poolType,addr,fee,tickSpacing,hooks,feePpm,isV2,inIsToken0,stateView,poolId,
+                            stepRatio,windowTopShifted,windowBotShifted,extremeShifted,netStart,netCount]
           routes[]   each: [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks]
-          brackets[] each: [kind,refIdx,sqrtNear,sqrtFar,liquidity,capacity,sqrtAdjNear,sqrtAdjFar] ]
+          netCache[] each: [shiftedTick, rawNet]   (per-pool grouped, sorted swap-direction)
+          routeSegs[]each: [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar]   (DESC sqrtAdjNear) ]
                                                           │
                                               compile() ──▼──  Hex[] bytecodes  ──▶  cook()
 ```
+(`zeroForOne` is derived on-chain from the token sort order, not passed — keeps the solver at 9 args.)
 
 The data *into* `prepare` comes from the **lens** — one read-only `cook()` eth_call returning two raw
 byte blobs (the VM can't build runtime arrays, so it `concat`-accumulates fixed-stride words,
@@ -246,57 +246,42 @@ sign-recovered off-chain via `BigInt.asIntN`):
 
 ### 4 · Executing on-chain (`ecoswap.sauce.ts`)
 
-A single live-cut sweep, explained below as the equivalent two-phase water-fill (Phase A finds the cut,
-Phase B executes at live prices). The solver needed **zero change** for reverse-drift — the `capacity=0`
-invariant carries it.
+**SETUP — seed one frontier per pool from the LIVE spot.** Read each pool's live state
+(`slot0`/`StateView`/`getReserves`) and seed its single frontier (real sqrt + boundary + active L). Cache
+the per-pool fee factor `√(1−fee)` once (an integer sqrt) for the hot head-price comparison.
 
-**Phase A — water-fill to the common cut.**
+**MERGE — one price-ordered walk to the equalized split.** Each step, among all active pool frontiers and
+the route cursor, pick the highest fee-adjusted out/in head and advance ONLY it:
 
 ```
- √adj price                  pour amountIn left-to-right along the sorted ladder
+ √adj price                  the live walk reconstructs segments lazily as cum needs
    ▲
-   │ ███                                                  ladder is sorted so the BEST
-   │ ███ ██                                               marginal price is first
-   │ ███ ██ ███                                           (greedy = optimal here)
-   │ ███ ██ ███ ██ ▒▒  ← partial bracket: solve exact cut
- ──┼─███─██─███─██─▒▒──────────────  cutSqrtAdj  ◀═══ common post-fee marginal price
-   │ ███ ██ ███ ██ ▒▒ ░░ ░░ ░░          (every pool equalizes its marginal here)
-   │ └── cum += capacity until cum ≥ amountIn ──┘
-   ▼   (cap=0 reverse brackets add 0 → invisible to this sum)
+   │ ███   each step integrates ONE pool's next tickSpacing segment on the LIVE grid:
+   │ ███ ██   effIn = L·2^96·(1/farOI − 1/nearOI),  grossIn = effIn/(1−fee)
+   │ ███ ██ ███   the net at the crossed boundary comes from the per-pool cache
+   │ ███ ██ ███ ██ ▒▒  ← crossing clamp when cum+gross ≥ amountIn
+ ──┼─███─██─███─██─▒▒──────────────  cut  ◀═══ common post-fee marginal price
+   │ ███ ██ ███ ██ ▒▒ ░░ ░░ ░░         (every engaged pool equalizes its marginal here)
+   ▼   lazy-far head scan: a pool's far (the near-tie break) is computed only if its
+       near could win or tie — the bulk of the per-step scan arithmetic is skipped
 ```
 
-**Phase B — re-anchor to LIVE price, one swap per pool.** Read the live price
-(`slot0`/`StateView`/`getReserves`), convert the cut into that pool's spot target
-(`targetSpot = cut / √(1−fee)`), integrate input from live price *down* to the target:
+Head-price selection is on the LIVE grid, so a runtime price drift just starts the same walk from a
+different live spot — `liquidityNet` is drift-invariant, so the net at each tick (cache or staticcall) is
+the same value either way. There is no reverse/up frontier and no re-anchor branch.
+
+**One swap per pool.** After the merge, each pool's accumulated `inp[pool]` is swapped once:
 
 ```
-   pool's live curve                 hi = min(curSqrt, near)     lo = max(targetSpot, far)
-   ▲
-   │  curSqrt ●        ← live price (may differ from prepare-time spot)
-   │          ┃▓▓▓▓▓   integrate each bracket:
-   │          ┃▓▓▓▓▓     effIn += L·2^96·(1/lo − 1/hi)
-   │          ┃▓▓▓▓▓   poolInput = Σ effIn / (1−fee)
- ──┼──────────┸──────  targetSpot  (== cutSqrtAdj un-adjusted for this pool's fee)
-   │            ░░░░░   below the cut → not filled
-   ▼
    ONE swap:  V3 → flat swapV3 (positive amountSpecified)
               V2 → unified swap(SwapParams) poolType=0, L from live reserves, neg amount
               V4 → unified swap(SwapParams) poolType=2, PoolKey + poolId, neg amount
-   routes: sum static segment capacities above the cut → swapV3 hop1 → swapV3 hop2
+   routes: sum static segment capacities → swapV3 hop1 → swapV3 hop2
 ```
 
-Drift handled by clamping `hi`:
-
-```
-   price drifted WITH the swap   →  curSqrt < spot  →  hi clamps to curSqrt
-                                     (pool already partway; fill only the gap to the cut)
-
-   price drifted AGAINST swap    →  curSqrt > spot  →  hi = a REVERSE bracket's near
-                                     (cap=0 brackets supply L above spot; pool still
-                                      re-anchors to the cut — no under-fill)
-```
-
-Finally: refund any unspent `tokenIn`, forward all `tokenOut` to the caller.
+Compute-then-pull: the merge is read-only, so the solver `transferFrom`s exactly the merged `cum`, then
+executes. Finally a guarded terminal refund returns any limit-price-edge leftover, and all `tokenOut` is
+forwarded to the caller.
 
 **Why greedy = optimal, and why one swap per pool.** Because the ladder is sorted by fee-adjusted
 *marginal* price, pouring input into the best marginal first and stopping at a common level *is* the
@@ -334,7 +319,7 @@ checked-in snapshot — on a fresh local anvil, then runs EcoSwap through it. No
 | V3 | `ecoswap.prodmirror.evm.test.ts` | real `@uniswap/v3-core` + minted tick profile (391 boundaries) | `BASE_RPC_URL=<url> npx tsx src/recipes/test/harness/prod-snapshot.ts` |
 | V2 | `ecoswap.v2.prodmirror.evm.test.ts` | etched canonical pair funded to captured reserves; asserts output == exact constant-product | `… src/recipes/test/harness/v2-snapshot.ts` |
 | V4 | `ecoswap.v4.prodmirror.evm.test.ts` | etched real PoolManager+StateView; pool re-minted to captured tick profile | `… src/recipes/test/harness/v4-snapshot.ts` |
-| **V2+V3+V4** | `ecoswap.v2v3v4.prodmirror.evm.test.ts` | all three above reproduced onto ONE anvil sharing ONE token pair; one EcoSwap whose water-fill splits across every version at once | (reuses the three snapshots) |
+| **V2+V3+V4** | `ecoswap.v2v3v4.prodmirror.evm.test.ts` | all three above reproduced onto ONE anvil sharing ONE token pair; one EcoSwap whose live walk splits across every version at once | (reuses the three snapshots) |
 | **All pools** | `ecoswap.allpools.prodmirror.evm.test.ts` | Uniswap V3 ×4 tiers + **PancakeSwap V3 ×4 tiers** (genuine pancake bytecode → `pancakeV3SwapCallback`) + V2 + V4 on ONE anvil; asserts discovery breadth + the relative-depth filter + a cross-fork split | Uni: `prod-snapshot.ts <pool>`; Pancake: `prod-snapshot.ts <pool> pancake` |
 
 The V3 reproduction mints one position per initialised boundary, so it is a **heavy** test (~10 min) —
@@ -360,21 +345,21 @@ filter (1% of total liquidity) keeps only the genuinely-deep pools — on the re
 Uniswap 0.05% + 0.30% and **both** deep Pancake pools (0.01% + 0.05%), dropping the thin V2/V4 pools and
 shallow tiers; (3) ONE EcoSwap splits across **both forks** in a single `cook()` (exercising
 `uniswapV3SwapCallback` AND `pancakeV3SwapCallback`) with post-fee marginals equalized; and (4) a drift
-case re-anchors a Pancake survivor at runtime. The four survivors are fully reconstructed (real tick
+case adapts a Pancake survivor's fill to its live price at runtime. The four survivors are fully reconstructed (real tick
 profiles); the dropped pools are light-minted at their real price + active liquidity (so discovery sees
 them and the filter drops them).
 
-### Runtime re-anchoring (drift) cases
+### Runtime drift (live-walk adaptation) cases
 
-Each prod-mirror test (V2, V3, V4 and the combined one) also has a **drift** case that exercises Phase B's
-live-price re-anchoring — the part that a prepare-then-immediately-cook test never touches (there the live
+Each prod-mirror test (V2, V3, V4 and the combined one) also has a **drift** case that exercises the live
+walk's runtime adaptation — the part that a prepare-then-immediately-cook test never touches (there the live
 state equals the prepared state). The pattern: snapshot the pristine reconstructed pools, `prepare()` +
 compile, then move a pool's price with a **real swap** (`harness/drift.ts` routes one swap through the
 engine — `harness/drift.sauce.ts`), and only *then* `cook()` the pre-drift bytecodes. The drift pushes a
 pool ~⅓ of its baseline fill toward the cut; the test asserts the recipe filled only the **remaining gap**
 (`drift + recipe ≈ baseline`, because gross input from prepared-price → cut is path-additive) and the pool
-still re-anchors to the same cut — proving Phase B read the *live* price, not the stale prepared one (had it
-used the stale price it would re-spend the full baseline and overshoot the cut). In the combined test the
+still reaches the same cut — proving the solver walked from the *live* price, not the stale prepared one (had
+it used the stale price it would re-spend the full baseline and overshoot the cut). In the combined test the
 drifted pool's share shrinks while the untouched pools keep their baseline shares, so the **split adapts at
 runtime**.
 
@@ -415,28 +400,31 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   queried across its own `FactoryConfig.feeTiers`. Other AMM families (Curve, Balancer, DODO, TraderJoe
   LB, Maverick, WOOFi) and Algebra/Solidly-stable exotics are excluded in prepare for now (bespoke curve
   math) — they come later.
-- **Relative-depth filter:** beyond the absolute `MIN_LIQUIDITY` floor, pools below `ECO_MIN_REL_BPS`
-  (default 1%) of the **total** discovered liquidity are dropped so gas isn't wasted on dust pools.
-  Sound because, for one pair, raw active-`L` at spot is comparable across V2/V3/V4. Per-call
-  `{ minRelBps }` overrides it (0 disables — used by the cross-version split test).
+- **Relative-depth filter:** pools below `ECO_MIN_REL_BPS` (default 1%) of the **total IN-RANGE
+  capacity** across the crossed ticks are dropped so gas isn't wasted on dust pools (the absolute
+  `MIN_LIQUIDITY` floor was dropped; a `>0` aliveness gate remains). The filter lives in the LENS
+  (the single source of truth — prepare never re-filters). Sound because, for one pair, in-range
+  capacity is comparable across V2/V3/V4. Per-call `{ minRelBps }` overrides it (0 disables — used by
+  the cross-version split test).
 - **Per-source execution path.** V3/V4 concentrated pools are swapped via the router's flat legacy
   `swapV3(pool, tokenIn, tokenOut, amountSpecified, limit, payer, recipient)` (**positive**
   `amountSpecified` = exact input). Constant-product V2 pools go through the unified
   `swap(SwapParams)` entry (`poolType=UniV2`) with a nested `PoolKey` struct and a **negative**
   `amountSpecified` (exact input on that path). Both are self-calls (`payer = recipient = self`).
-  Note the engine's `_swapV2` hardcodes the **0.3%** constant-product fee, so every V2 bracket is
-  pinned to `feePpm=3000` off-chain to keep the ladder consistent with execution.
+  Note the engine's `_swapV2` hardcodes the **0.3%** constant-product fee, so every V2 pool is pinned
+  to `feePpm=3000` off-chain to keep its marginal consistent with execution.
 - **Multi-hop routes assume V3 hop pools** and execute one `swapV3` per hop (payer = self, so no
-  intermediate approval is needed). Route allocations use off-chain-precomputed segment capacities
-  (re-anchoring a composed two-curve path live is prohibitively expensive).
-- **Phase A uses off-chain bracket capacities** to find the cut; Phase B re-anchors each direct pool
-  to its **live** `slot0` price for the actual fill. Under drift the cut is slightly stale but each
-  pool's fill tracks its live price, and the budget cap + dust refund keep totals correct. Exact when
-  prices haven't moved since prepare.
-- **Tick window** is bounded (`V3_TICK_STEPS`, fetched in one multicall) then trimmed to crossed
-  ticks + `SAFETY_TICKS`; trades larger than the window clamp and refund unspent input.
+  intermediate approval is needed). Route allocations use off-chain-precomputed segment capacities and
+  stay STATIC (composing a two-curve path live is prohibitively expensive — routes are out of the
+  per-wei live-walk gate by design).
+- **Direct pools are exact under drift.** The solver walks each pool's frontier from its LIVE spot on
+  the live grid and reuses only the drift-invariant per-pool net cache — so a runtime price drift just
+  starts the same walk from a different spot, wei-exact with the neutral oracle either way (no stale
+  cut). The per-pool budget cap + a guarded terminal refund keep totals correct on the limit-price edge.
+- **Tick window** is bounded (`V3_TICK_STEPS`, fetched in one lens eth_call); the on-chain walk runs
+  past it via staticcalls when a trade reaches beyond the cached window (run-until-filled).
 - **Env knobs:** `ECO_MAX_POOLS` (default 12), `ECO_MAX_ROUTES` (default 2) bound the on-chain loop;
-  `ECO_MIN_REL_BPS` (default 100 = 1% of total liquidity) sets the relative-depth filter (0 disables).
+  `ECO_MIN_REL_BPS` (default 100 = 1% of total in-range capacity) sets the relative-depth filter (0 disables).
   `prepareEcoSwap` / `ecoSwap` also take a `{ minRelBps }` opt that overrides the env per call.
 
 ### SauceScript / compiler notes (hard-won)

@@ -163,17 +163,27 @@ constants, types). **The compiler must be built first** — recipes resolve it v
 `@eco-incorp/sauce-compiler` workspace dep (added to `sdk`); the fast compile tests import its built
 `dist` by relative path.
 
-**EcoSwap single-pass (this branch).** EcoSwap's on-chain solver is now a **single-pass array-mutation**
-water-fill: it allocates real arrays (`new Array`, no register banks) and sweeps brackets to a live cut.
-It is **compute-then-pull** — `transferFrom`s exactly the swept `cum` (one guarded terminal refund for
-the limit-price edge), not a pre-pull. It **always** streams a tick walk past the prepared window whenever
-that window under-fills `amountIn` (no flag — gated only by need `cum < amountIn` and data: V3/V4 carry a
-frontier seed, V2 does not; `EXTRA_TICKS=64`). The legacy two-pass solver was removed — single-pass
-is the **sole solver** (`ecoswap.sauce.ts`); `ecoswap.unrolled.sauce.ts` is frozen as the **gas reference**
-(vs the array default). The **on-chain lens is the single source of truth**: it
-emits **survivors-only** plus a header `[discoveredCount, survivorCount, totalL, liqFloor]`, and
-`prepare.ts` consumes them with **no re-filter**. The absolute `MIN_LIQUIDITY` floor was **dropped** —
-relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the sole liquidity filter.
+**EcoSwap unified per-pool live walk (this branch).** EcoSwap's on-chain solver (`ecoswap.sauce.ts`) is
+ONE price-ordered k-way merge where **every direct pool walks a single frontier from its LIVE spot**, one
+tickSpacing per step. There are **no two modes** (no cache-vs-re-anchor, no stale-skip, no drift gate): a
+tick's `liquidityNet` is **drift-invariant**, so the walk ALWAYS computes sqrt/price on the LIVE grid
+(identical to the neutral oracle `ecoswap.optimal.ts`) and reuses only the **per-pool NET cache** prepare
+ships — a cache lookup for an in-window boundary, a `ticks()`/`getTickLiquidity()` staticcall for an
+out-of-window one (same net either way ⇒ **wei-exact with the oracle by construction**, for any drift).
+The cache is a pure gas optimization (`windowTop=0` ⇒ every boundary staticcalls ⇒ the 1-RPC quote path
+with no prepared ticks). A pool is **never** deactivated while liquidity is known ahead — it walks
+THROUGH interior `dL==0` gaps and deactivates only on the price limit, the per-pool budget cap, or
+(`dL==0` AND the boundary is past the pool's deepest initialized tick). The merge's per-pool head scan is
+**lazy-far**: each step computes only the near fee-adjusted price for every active pool and computes the
+far (the near-tie break) ONLY when the near could win or tie the current best — split-identical, ~60% of
+the per-pool scan arithmetic saved. It is **compute-then-pull** — `transferFrom`s exactly the merged `cum`
+(one guarded terminal refund for the limit-price edge), not a pre-pull. The wei-exact gate vs the oracle is
+mirrored bit-for-bit by `ecoswap.kway.reference.ts`. Routes stay STATIC (composed off-chain via
+`localQuote` into route segments, competing in the merge via one cursor). The **on-chain lens is the single
+source of truth** for survivorship: it emits **survivors-only** plus a header `[discoveredCount,
+survivorCount, totalL, liqFloor]`, and `prepare.ts` consumes them with **no re-filter**. The absolute
+`MIN_LIQUIDITY` floor was **dropped** — relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the
+sole liquidity filter.
 
 ### Running recipes against a fork / RPC (in `dev-tools/`)
 
