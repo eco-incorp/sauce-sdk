@@ -2,16 +2,16 @@
  * EcoSwap K-WAY-LAZY reference — known-answer cross-check vs the neutral optimal oracle.
  *
  * The canonical on-chain k-way solver (ecoswap.sauce.ts) is mirrored bit-for-bit by
- * ecoswap.kway.reference.ts. This test proves that mirror produces the OPTIMAL split
+ * ecoswap.solver-reference.ts. This test proves that mirror produces the OPTIMAL split
  * (ecoswap.optimal.ts optimalSplit, built from TRUE live state) to the wei across the
- * scenario matrix — WITHOUT anvil. The EVM lane (ecoswap.kway.evm.test.ts) then confirms
+ * scenario matrix — WITHOUT anvil. The EVM lane (ecoswap.matrix.evm.test.ts) then confirms
  * the compiled bytecode realizes the same split on-chain.
  *
  * The synthetic prepared datasets are built with the SAME multiplicative-step geometry
  * prepare.ts now uses (buildV3Brackets stepReal edges), so the prepared region and the
  * oracle's live walk share one geometry — the load-bearing exactness alignment (spec §7).
  *
- * Run: npx tsx --test src/recipes/test/ecoswap.kway.reference.test.ts
+ * Run: npx tsx --test src/recipes/test/ecoswap.solver-reference.test.ts
  */
 
 import { describe, it } from "node:test";
@@ -29,7 +29,7 @@ import {
   V2_STEP_BPS,
   V2_STEP_DEN,
 } from "./ecoswap.math";
-import { kwayReference, type KwayLivePool } from "./ecoswap.kway.reference";
+import { kwayReference, type KwayLivePool } from "./ecoswap.solver-reference";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
 import { SwapPoolType } from "../shared/constants";

@@ -9,7 +9,7 @@
  * to `kwayReference`.
  *
  * The integer math (mulDiv truncation, the int128 sign recovery, stepReal, toOutIn, tickArg,
- * the sqrt fee-adjust) lives in `./ecoswap.kway.reference` + `./ecoswap.math`, so this
+ * the sqrt fee-adjust) lives in `./ecoswap.solver-reference` + `./ecoswap.math`, so this
  * reference is bit-for-bit with both the on-chain solver and the neutral optimal oracle.
  *
  * LIVE-PRICE MODELING
@@ -25,7 +25,7 @@
  */
 
 import { type EcoSwapPrepared } from "../shared/types";
-import { kwayReference, type KwayLivePool } from "./ecoswap.kway.reference";
+import { kwayReference, type KwayLivePool } from "./ecoswap.solver-reference";
 
 export interface EcoSwapReferenceResult {
   /** fee-adjusted out/in marginal at the cut (deepest reached) — diagnostic. */

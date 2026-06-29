@@ -126,7 +126,7 @@ export interface OptimalResult {
  *
  * This is the MEASURING-STICK side of the B2 run-until-filled budget: it MUST equal the
  * on-chain solver's PER_POOL (ecoswap.sauce.ts) and the reference's PER_POOL
- * (ecoswap.kway.reference.ts) EXACTLY, so the oracle and the solver agree to the wei EVEN
+ * (ecoswap.solver-reference.ts) EXACTLY, so the oracle and the solver agree to the wei EVEN
  * WHEN THE CAP BINDS (a price excursion deeper than the budget truncates BOTH identically).
  *
  * 2048 ts=10 steps ≈ a 7.75× price excursion per pool — far past any realistic out-of-range

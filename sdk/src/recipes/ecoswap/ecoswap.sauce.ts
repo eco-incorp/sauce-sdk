@@ -14,7 +14,7 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 // ONLY that stream. The result is the optimal equalized split — exact (global price order),
 // lazy (only reconstructs as cum needs), and bit-for-bit with the neutral optimal oracle (a
 // continuous from-live-spot water-fill) — see recipes/test/ecoswap.optimal.ts +
-// ecoswap.kway.reference.ts.
+// ecoswap.solver-reference.ts.
 //
 // THE UNIFIED MODEL (one walk, no two-mode cache-vs-re-anchor split):
 //   A tick's liquidityNet is DRIFT-INVARIANT: the absolute active-L of a tick range does not
@@ -267,7 +267,7 @@ function main(
       // 1. find the highest fee-adjusted head among {route cursor, dn[*]}. Ties on the near
       // (entry) price break by HIGHER far (shallower step) so a coarse segment never wins ahead
       // of a finer one — bit-identical to the optimal oracle's stable segment sort (adjNear
-      // DESC, adjFar DESC) and the reference (ecoswap.kway.reference.ts).
+      // DESC, adjFar DESC) and the reference (ecoswap.solver-reference.ts).
       let bestKind: Uint256 = 0; // 0=none 2=route 3=pool frontier
       let bestPool: Uint256 = 0;
       let bestPrice: Uint256 = 0;

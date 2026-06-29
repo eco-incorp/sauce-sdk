@@ -294,7 +294,7 @@ export interface EcoPool {
    */
   adaptiveNet?: Map<number, bigint>;
   /**
-   * OFF-CHAIN-ONLY drift model (reference mirror, ecoswap.kway.reference.ts). The
+   * OFF-CHAIN-ONLY drift model (reference mirror, ecoswap.solver-reference.ts). The
    * deterministic local tests run live==prepared spot, so these are unset unless a test
    * deliberately models drift. When set, the reference walks the pool's single frontier
    * FROM this modeled live spot (the cached NET is drift-invariant, so the walk stays

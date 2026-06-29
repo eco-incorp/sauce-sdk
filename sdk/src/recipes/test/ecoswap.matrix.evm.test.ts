@@ -20,11 +20,11 @@
  * Scenarios (spec §VALIDATION): A no-drift window-covers, B window under-fills (dn),
  * C drift-up (up frontier), D no-bracket quote (dn from spot), E price-limit bind,
  * F cross-version V2+V3+V4 split, G early-out (exhaustion). The k-way reference
- * (ecoswap.kway.reference.ts) is proven == optimalSplit on the math tier, so this gate
+ * (ecoswap.solver-reference.ts) is proven == optimalSplit on the math tier, so this gate
  * is the on-chain confirmation.
  *
- * Run (v12): SAUCE_ENGINE_V12=1 npx tsx --test src/recipes/test/ecoswap.kway.evm.test.ts
- * Run (v1):  ECO_ENGINE=v1     npx tsx --test src/recipes/test/ecoswap.kway.evm.test.ts
+ * Run (v12): SAUCE_ENGINE_V12=1 npx tsx --test src/recipes/test/ecoswap.matrix.evm.test.ts
+ * Run (v1):  ECO_ENGINE=v1     npx tsx --test src/recipes/test/ecoswap.matrix.evm.test.ts
  */
 
 import { describe, it, before, after } from "node:test";
@@ -2647,7 +2647,7 @@ describe("EcoSwap K-way — C2-V4 cap-binding on V4 (StateView read path, budget
 // a boundary, so the post-handoff bracket heads were mis-priced. The fix DROPS the up frontier
 // and re-anchors a drifted pool's WHOLE walk to the live spot (one continuous grid == the optimal
 // oracle's v3Segments, which never clamps), stale-skipping the prepared cache. The fast tier
-// (ecoswap.kway.reference.test.ts "drift-UP re-anchor — clamp-splice removed") proves the mirror
+// (ecoswap.solver-reference.test.ts "drift-UP re-anchor — clamp-splice removed") proves the mirror
 // is wei-exact; these cells are the on-chain confirmation across BOTH engines.
 //
 // (1) EQUAL-FEE multi-pool drift-UP (non-cap, fully fills): two equal-fee (0.05%) V3 pools on

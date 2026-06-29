@@ -178,7 +178,7 @@ THROUGH interior `dL==0` gaps and deactivates only on the price limit, the per-p
 far (the near-tie break) ONLY when the near could win or tie the current best — split-identical, ~60% of
 the per-pool scan arithmetic saved. It is **compute-then-pull** — `transferFrom`s exactly the merged `cum`
 (one guarded terminal refund for the limit-price edge), not a pre-pull. The wei-exact gate vs the oracle is
-mirrored bit-for-bit by `ecoswap.kway.reference.ts`. Routes stay STATIC (composed off-chain via
+mirrored bit-for-bit by `ecoswap.solver-reference.ts`. Routes stay STATIC (composed off-chain via
 `localQuote` into route segments, competing in the merge via one cursor). The **on-chain lens is the single
 source of truth** for survivorship: it emits **survivors-only** plus a header `[discoveredCount,
 survivorCount, totalL, liqFloor]`, and `prepare.ts` consumes them with **no re-filter**. The absolute
