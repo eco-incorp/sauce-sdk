@@ -54,9 +54,10 @@ const Q96 = 1n << 96n;
 const Q192 = 1n << 192n;
 const FEE_DENOM = 1_000_000n; // ppm
 /**
- * Tick shift used to carry signed ticks as non-negative "shifted" values for the
- * adaptive frontier seeds (matches the lens OFFSET = 888000; multiple of LCM(3000)
- * and > max|tick| 887272 so shifted stays ≥0). Only used for the adaptive seeds.
+ * Tick shift used to carry signed ticks as non-negative "shifted" values throughout the
+ * per-pool net cache (matches the lens OFFSET = 888000; multiple of LCM(3000) and >
+ * max|tick| 887272 so shifted stays ≥0). The universal shift applied to every shifted
+ * scalar prepare ships — windowTop/windowBot/extreme + the per-tick netRows.
  */
 const OFFSET_TICK = 888000;
 
@@ -75,11 +76,11 @@ const OFFSET_TICK = 888000;
  */
 const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
- * Tick boundaries scanned per V3 pool in the swap direction (fetch window).
- * Fetched generously by the lens in one eth_call; the ladder is then TRIMMED to EXACTLY
- * the ticks the trade crosses (WS2: no safety buffer — the on-chain solver reads any
- * runtime drift LIVE), so on-chain gas/calldata scale with trade size, not this window.
- * Must be wide enough to reach the cut for the largest expected trade.
+ * Tick boundaries the lens scans per V3 pool in the swap direction (the cache window).
+ * Scanned in one eth_call; the on-chain solver walks each pool's frontier from the LIVE
+ * spot and reuses the drift-invariant net for boundaries inside this window, staticcalling
+ * any boundary past it — so this only bounds how much net the cache ships, not how far the
+ * walk reaches. Must be wide enough to cover the cut for the largest expected trade.
  */
 const V3_TICK_STEPS = 96;
 /** Geometric brackets emitted per V2 pool (also trimmed to exactly the crossed range). */
@@ -195,22 +196,6 @@ function toOutIn(sqrtReal: bigint, zeroForOne: boolean): bigint {
  */
 function stepRealTs(sqrtReal: bigint, stepRatio: bigint, zeroForOne: boolean): bigint {
   return zeroForOne ? (sqrtReal * Q96) / stepRatio : (sqrtReal * stepRatio) / Q96;
-}
-
-// ── Classification ───────────────────────────────────────────
-
-function isUsableV2(p: PoolInfo): boolean {
-  // Constant-product only; Solidly *stable* pools use a different invariant.
-  return p.poolType === SwapPoolType.UniV2 && !/stable/i.test(p.source);
-}
-
-function isV3Candidate(p: PoolInfo): boolean {
-  return p.poolType === SwapPoolType.UniV3;
-}
-
-function isV4Candidate(p: PoolInfo): boolean {
-  // Only hookless V4 pools with a StateView lens + poolId are reconstructable here.
-  return p.poolType === SwapPoolType.UniV4 && !!p.poolId && !!p.stateView;
 }
 
 // ── V3 bracket construction ──────────────────────────────────

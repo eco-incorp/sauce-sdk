@@ -1,33 +1,35 @@
 /**
- * EcoSwap REVERSE-DRIFT consumption — local EVM, NO fork.
+ * EcoSwap AGAINST-SWAP DRIFT — local EVM, NO fork.
  *
- * Proves the lens's reverse-side ticks are CONSUMED by buildV3Brackets: if a
- * pool's live price drifts AGAINST the swap between prepare() and execution, the
- * recipe must still re-anchor that pool to the common cut — which requires
- * brackets covering the region ABOVE the prepare-time spot (the reverse region).
+ * Proves the unified live walk handles against-swap drift with NO special case: each
+ * pool's single frontier is ALWAYS walked from its LIVE spot on the live grid. If a
+ * pool's price drifts AGAINST the swap between prepare() and execution, the live spot
+ * simply moves, and the region above the prepare-time spot is just out-of-window — the
+ * solver staticcalls its net live (it ships no reverse brackets, no pre-fill, no
+ * re-anchor branch). The recipe still re-converges that pool to the common cut.
  *
  * Method (snapshot/revert differential against the SAME compiled bytecode):
- *   1. prepare()+compile() at spot (bytecode embeds the spot brackets, incl. the
- *      capacity-0 reverse brackets above spot).
+ *   1. prepare()+compile() at spot (the bytecode embeds the per-pool net cache).
  *   2. Run A (no drift): cook() → the deep pool's tokenIn intake B, medium pool medA.
  *   3. evm_revert to the clean snapshot.
- *   4. Run B (reverse drift): push the deep pool's price AGAINST the swap by a few
- *      ticks (a real swap through the engine — within the reverse coverage), then
- *      cook() the SAME bytecode → deep intake D, medium medB. Record the tokenIn the
- *      pool paid OUT during the drift (driftOut).
- *   5. Assertions:
- *      - PRIMARY  D > B: the recipe filled the EXTRA reverse gap. Without reverse-
- *        bracket consumption Phase B clamps at the stale spot → D == B.
+ *   4. Run B (against-swap drift): push the deep pool's price AGAINST the swap by a few
+ *      ticks (a real swap through the engine), then cook() the SAME bytecode → deep
+ *      intake D, medium medB. Record the tokenIn the pool paid OUT during the drift
+ *      (driftOut).
+ *   5. Assertions (balance-delta based — no removed prepared fields needed):
+ *      - PRIMARY  D > B: the live walk read the drifted-up live spot and filled the
+ *        EXTRA gap above the prepare-time spot. A stale-spot solver would cap at the
+ *        prepared spot → D == B.
  *      - CONSERVATION  D - B == driftOut: the pool ends both runs at the SAME cut
  *        price, so its net tokenIn intake is identical (run A: +B; run B: -driftOut
- *        +D) ⇒ the recipe re-added EXACTLY the drifted-out reverse region. (This is
- *        the rigorous re-anchoring check; a loose marginal-spread bound is dominated
- *        by the inter-pool fee difference and proves nothing.)
+ *        +D) ⇒ the walk re-added EXACTLY the drifted-out region. (This is the rigorous
+ *        re-convergence check; a loose marginal-spread bound is dominated by the
+ *        inter-pool fee difference and proves nothing.)
  *      - ADAPTATION  medB < medA: the deep pool's extra fill comes out of the
  *        medium pool's share (fixed budget, deep processed first).
  *
- * Both swap directions are exercised (zeroForOne and oneForZero — the latter walks
- * the mirror reverse boundary sequence base.. / L -= net).
+ * Both swap directions are exercised (zeroForOne and oneForZero — the latter walks the
+ * mirror boundary sequence base.. / L -= net).
  *
  * Run: pnpm --filter './sdk' exec tsx --test src/recipes/test/ecoswap.reverse-drift.evm.test.ts
  */
@@ -69,18 +71,19 @@ const HUGE = parseEther("1000000000");
 // Engine cells driven by ECO_ENGINE (default v12). See harness/engine.ts.
 const ENGINE_CELLS = engineCells();
 
-// tickSpacing 10 ⇒ reverse coverage = SAFETY_TICKS(2)*10 = 20 ticks past spot.
+// Small against-swap drift (a couple of tickSpacings) — read live by the walk, no cap.
 const DEEP_FEE = 500;
 const MEDIUM_FEE = 3000;
 const TS = 10;
 
 // Exercise BOTH swap directions. inIsToken0=true → zeroForOne (swap pushes price
-// DOWN, reverse = UP); false → oneForZero (swap UP, reverse = DOWN, mirror walk).
+// DOWN, against-swap drift = UP); false → oneForZero (swap UP, against-swap drift =
+// DOWN, mirror walk).
 for (const dir of [
   { name: "zeroForOne", inIsToken0: true },
   { name: "oneForZero", inIsToken0: false },
 ] as const) {
-  describe(`EcoSwap reverse-drift re-anchoring (${dir.name})`, () => {
+  describe(`EcoSwap against-swap drift, live walk re-converges (${dir.name})`, () => {
     let anvil: AnvilHandle;
     let c: HarnessClients;
     let stack: DeployedStack;
@@ -164,17 +167,11 @@ for (const dir of [
       );
       assert.equal(prepared.pools.length, 2, "two V3 pools prepared");
       assert.equal(prepared.pools[0].feePpm, DEEP_FEE, "deepest (fee 500) pool is processed first");
-      // WS2: against-swap drift is now handled by the on-chain LIVE PRE-FILL (it reads
-      // the live tick and water-fills the gap above the prepared window), NOT by prepared
-      // capacity-0 reverse brackets — prepare no longer emits any. Assert they're GONE,
-      // and that the deep pool carries the pre-fill seeds (topNearReal + a window) the
-      // pre-fill needs to fire.
-      assert.equal(
-        prepared.brackets.filter((b) => b.capacity === 0n).length, 0,
-        "no capacity-0 reverse brackets (WS2 reads against-swap drift live)",
-      );
-      assert.ok(prepared.pools[0].topNearReal > 0n, "deep pool carries the pre-fill stop target (topNearReal)");
-      assert.ok(prepared.pools[0].bracketCount > 0, "deep pool has a prepared window → pre-fill can fire");
+      // Unified walk: against-swap drift carries NO prepare-time seeds — each pool's
+      // frontier is walked from its LIVE spot, and the region above the prepare-time spot
+      // is just out-of-window (the solver staticcalls its net live). prepare ships only the
+      // per-pool net cache for the scanned window; there are no capacity-0 reverse brackets,
+      // no pre-fill, no re-anchor branch. The differential below is purely balance-delta.
 
       const snap = await c.testClient.snapshot();
 
@@ -192,8 +189,8 @@ for (const dir of [
       await c.testClient.revert({ id: snap });
       assert.equal((await getSlot0(c.publicClient, deepPool)).tick, 0, "deep pool back at spot after revert");
 
-      // Reverse of the swap: swap tokenOut->tokenIn (driftZeroForOne = tokenOut<tokenIn
-      // holds for BOTH recipe directions). Small enough to stay within reverse coverage.
+      // Against the swap: swap tokenOut->tokenIn (driftZeroForOne = tokenOut<tokenIn
+      // holds for BOTH recipe directions). A small drift the live walk reads directly.
       const deepInPreDrift = await balanceOf(c.publicClient, tokenIn, deepPool);
       await driftPoolPrice(
         c, stack.sauceRouter, prepared.pools[0], tokenOut, tokenIn,
@@ -203,43 +200,43 @@ for (const dir of [
       // zeroForOne reverse pushes tick UP; oneForZero reverse pushes it DOWN.
       assert.ok(
         dir.inIsToken0 ? driftedTick > 0 : driftedTick < 0,
-        `reverse drift moved the price against the swap (tick ${driftedTick})`,
+        `against-swap drift moved the price (tick ${driftedTick})`,
       );
-      assert.ok(Math.abs(driftedTick) <= 2 * TS, `drift within reverse coverage (|tick| ${Math.abs(driftedTick)} <= 20)`);
+      assert.ok(Math.abs(driftedTick) <= 2 * TS, `small against-swap drift (|tick| ${Math.abs(driftedTick)} <= 20)`);
       // tokenIn the pool paid OUT during the drift — the recipe must re-add it to
       // restore the pool to the same cut price.
       const driftOut = deepInPreDrift - (await balanceOf(c.publicClient, tokenIn, deepPool));
       assert.ok(driftOut > 0n, "drift swap pulled tokenIn out of the deep pool");
 
-      // ── Run B: same bytecode, against the reverse-drifted pool ──
+      // ── Run B: same bytecode, against the drifted pool ──
       await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
       const deepInBeforeB = await balanceOf(c.publicClient, tokenIn, deepPool); // AFTER the drift swap
       const medInBeforeB = await balanceOf(c.publicClient, tokenIn, medPool);
       const resB = await cook(c.walletClient, c.publicClient, target, bytecodes);
-      assert.equal(resB.receipt.status, "success", "reverse-drift cook() succeeds");
+      assert.equal(resB.receipt.status, "success", "against-swap-drift cook() succeeds");
       const D = (await balanceOf(c.publicClient, tokenIn, deepPool)) - deepInBeforeB;
       const medB = (await balanceOf(c.publicClient, tokenIn, medPool)) - medInBeforeB;
-      assert.ok(D > 0n, "deep pool receives input in the reverse-drift run");
+      assert.ok(D > 0n, "deep pool receives input in the against-swap-drift run");
 
-      // PRIMARY — the LIVE pre-fill filled the against-swap-drift gap. Without it the
-      // sweep would cap at the prepared spot near (hi=min(liveCur,near)=near=spot) and
-      // never integrate the (topNearOI, liveCur] gap → D == B. D > B proves the pre-fill
-      // read the live drifted-up tick and water-filled the gap before the sweep.
-      assert.ok(D > B, `reverse-drifted deep pool fills MORE (D=${D} > B=${B})`);
+      // PRIMARY — the live walk read the drifted-up live spot and filled the extra gap
+      // above the prepare-time spot. A stale-spot solver would start its frontier at the
+      // prepared spot and never integrate the (prepareSpot, liveSpot] region → D == B.
+      // D > B proves the walk anchored on the live spot.
+      assert.ok(D > B, `against-swap-drifted deep pool fills MORE (D=${D} > B=${B})`);
 
       // CONSERVATION — the pool ends both runs at the SAME cut price, so its net
       // tokenIn intake matches: +B == -driftOut + D ⇒ D - B == driftOut. This pins
-      // that the recipe re-added EXACTLY the drifted-out reverse region (to bracket
-      // granularity). Without reverse brackets gap would be 0, failing this hard.
+      // that the walk re-added EXACTLY the drifted-out region (to one-ts granularity).
+      // A stale-spot solver would leave gap == 0, failing this hard.
       const gap = D - B;
       const consErr = Number(gap > driftOut ? gap - driftOut : driftOut - gap) / Number(driftOut);
       assert.ok(
         consErr < 0.02,
-        `D-B (${gap}) must equal the drift outflow (${driftOut}) — pre-fill re-anchoring (err ${consErr})`,
+        `D-B (${gap}) must equal the drift outflow (${driftOut}) — live walk re-converges (err ${consErr})`,
       );
 
       // ADAPTATION — the deep pool's extra fill comes out of the medium pool's share.
-      assert.ok(medB < medA, `medium pool's share shrinks under reverse drift (medB=${medB} < medA=${medA})`);
+      assert.ok(medB < medA, `medium pool's share shrinks under against-swap drift (medB=${medB} < medA=${medA})`);
 
       console.log(
         `  [REV-DRIFT ${dir.name} ${engine}] B=${B} D=${D} gap=${gap} driftOut=${driftOut} consErr=${consErr}\n` +
@@ -249,7 +246,7 @@ for (const dir of [
 
     for (const { engine, skip } of ENGINE_CELLS) {
       it(
-        `a reverse-drifted deep pool fills MORE, conserving input, and the split adapts [${engine}]`,
+        `an against-swap-drifted deep pool fills MORE, conserving input, and the split adapts [${engine}]`,
         { skip },
         async () => {
           await runReverseDrift(engine);

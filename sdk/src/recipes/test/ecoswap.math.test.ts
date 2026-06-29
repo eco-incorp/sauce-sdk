@@ -147,11 +147,6 @@ function totalCapacity(brackets: EcoBracket[]): bigint {
 
 // ── new-model live fixtures (unified walk: spot fields + net + stepRatio) ──
 
-/** Multiplicative one-ts step (mirrors the solver/oracle stepReal). */
-function stepRealTs(s: bigint, ratio: bigint, zeroForOne: boolean): bigint {
-  return zeroForOne ? (s * Q96) / ratio : (s * ratio) / Q96;
-}
-
 /**
  * A constant-L V3 EcoPool walked from the prepare-time spot (empty net) + its matching neutral
  * OptimalPool, so a vector can assert ecoSwapReference == optimalSplit to the wei. zeroForOne
@@ -177,12 +172,11 @@ function buildV3Live(refIdx: number, feePpm: number, ts: number, L: bigint, prep
     isV2: false, feePpm, sqrtPriceX96: spotReal, tick: prepTick, tickSpacing: ts, liquidity: L,
     net: new Map<number, bigint>(),
   };
-  void stepRealTs;
   return { pool, opt };
 }
 
 /** A V2 EcoPool seeded with the live out/in spot + √k (new model) + its matching OptimalPool. */
-function buildV2Live(refIdx: number, reserveIn: bigint, reserveOut: bigint): { pool: EcoPool; opt: OptimalPool } {
+function buildV2Live(reserveIn: bigint, reserveOut: bigint): { pool: EcoPool; opt: OptimalPool } {
   const L = isqrt(reserveIn * reserveOut);
   const spotOI = isqrt((reserveOut * Q192) / reserveIn);
   const pool: EcoPool = {
@@ -191,7 +185,6 @@ function buildV2Live(refIdx: number, reserveIn: bigint, reserveOut: bigint): { p
     spotActiveL: L, // √k
   };
   const opt: OptimalPool = { isV2: true, feePpm: 3000, reserveIn, reserveOut };
-  void refIdx;
   return { pool, opt };
 }
 
@@ -446,7 +439,7 @@ describe("V2 constant-L stream from the live spot [ecoSwapReference == oracle]",
   const E18 = 10n ** 18n;
 
   function preparedV2(): EcoSwapPrepared {
-    const { pool } = buildV2Live(0, reserveIn, reserveOut);
+    const { pool } = buildV2Live(reserveIn, reserveOut);
     return { pools: [pool], routes: [], brackets: [], zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n };
   }
   const optPools: OptimalPool[] = [{ isV2: true, feePpm: 3000, reserveIn, reserveOut }];

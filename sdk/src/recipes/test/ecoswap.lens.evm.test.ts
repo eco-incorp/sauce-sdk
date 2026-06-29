@@ -301,7 +301,15 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
 
     assert.equal(prepared.pools.filter((p) => !p.isV2).length, 2, "2 V3 pools prepared");
     assert.equal(prepared.pools.filter((p) => p.isV2).length, 1, "1 V2 pool prepared");
-    assert.ok(prepared.brackets.length > 0, "brackets built from lazy lens reads");
+    // Unified-walk shape: direct pools ship NO prepare-time sqrt brackets (brackets holds
+    // ROUTE segments only, empty here). The lazy lens reads instead populate each V3 pool's
+    // per-pool net cache — a scanned window (windowTopShifted > 0) is the "cache populated"
+    // signal independent of whether any initialized tick fell inside it (wide single positions
+    // scan a window with 0 interior rows, served net 0 from the cache, no staticcall).
+    const cacheWindowed = prepared.pools.filter(
+      (p) => !p.isV2 && (p.windowTopShifted ?? 0n) > 0n,
+    ).length;
+    assert.ok(cacheWindowed > 0, "per-pool net cache built from lazy lens reads");
     assert.equal(prepared.routes.length, 0, "no routes");
 
     const ref = ecoSwapReference(prepared, amountIn);
@@ -312,7 +320,7 @@ describe("EcoSwap LAZY lens — local EVM, ONE eth_call discovery+state+ticks", 
     assert.ok(ref.totalInput * 2n >= amountIn, "oracle places a meaningful share of amountIn");
 
     console.log(
-      `  [LAZY-PREP] ${prepared.brackets.length} brackets, oracle split ` +
+      `  [LAZY-PREP] ${cacheWindowed} cache-windowed pools, oracle split ` +
         `${ref.perPoolInput.map((v, i) => `${prepared.pools[i].feePpm}=${v}`).join(" ")} cut=${ref.cutSqrtAdj}`,
     );
   });

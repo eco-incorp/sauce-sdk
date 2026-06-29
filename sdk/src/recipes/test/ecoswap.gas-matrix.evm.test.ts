@@ -309,10 +309,10 @@ describe("EcoSwap gas scaling matrix (pools × cache density)", () => {
     const leftover = amountIn - spent;
 
     // ── Total spend correctness ──
-    // Compute-then-pull: pulls exactly cum == oracle totalInput; no priceLimit is hit
+    // Compute-then-pull: pulls exactly cum == reference totalInput; no priceLimit is hit
     // here, so spent is exact and leftover is zero.
     const ref = ecoSwapReference(prepared, amountIn);
-    assert.equal(spent, ref.totalInput, "unified walk: spent == oracle totalInput EXACTLY");
+    assert.equal(spent, ref.totalInput, "unified walk: spent == reference totalInput EXACTLY");
     assert.equal(leftover, 0n, "unified walk: no leftover (compute-then-pull, no limit hit)");
 
     // ── Fee-adjusted marginals equalise across filled pools ──

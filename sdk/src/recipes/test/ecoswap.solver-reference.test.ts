@@ -7,9 +7,9 @@
  * scenario matrix — WITHOUT anvil. The EVM lane (ecoswap.matrix.evm.test.ts) then confirms
  * the compiled bytecode realizes the same split on-chain.
  *
- * The synthetic prepared datasets are built with the SAME multiplicative-step geometry
- * prepare.ts now uses (buildV3Brackets stepReal edges), so the prepared region and the
- * oracle's live walk share one geometry — the load-bearing exactness alignment (spec §7).
+ * The synthetic prepared datasets are built on the SAME multiplicative one-ts grid the
+ * solver and oracle walk (stepReal from the live spot), so the cached net and the live
+ * walk share one geometry — the load-bearing exactness alignment (spec §7).
  *
  * Run: npx tsx --test src/recipes/test/ecoswap.solver-reference.test.ts
  */
@@ -45,9 +45,9 @@ function stepRealTs(s: bigint, ratio: bigint, zeroForOne: boolean): bigint {
 }
 
 /**
- * Build a flat-L V3 EcoPool + its prepared brackets, mirroring prepare.ts's
- * multiplicative buildV3Brackets walk from a prepare-time spot tick. Single wide
- * position ⇒ empty net ⇒ constant L (the exact regime the EVM lane uses).
+ * Build a flat-L V3 EcoPool + synthetic route-style brackets on the multiplicative one-ts
+ * grid from a prepare-time spot tick (the solver/oracle walk grid). Single wide position ⇒
+ * empty net ⇒ constant L (the exact regime the EVM lane uses).
  */
 function buildV3(
   refIdx: number,
@@ -99,12 +99,11 @@ function buildV3(
 
 /**
  * Build a V3 EcoPool whose active L CHANGES at initialized ticks (a non-empty `net` map),
- * mirroring prepare.ts buildV3Brackets: walk forward from the prepare-time spot multipli-
- * catively, emit a bracket per step, and update L by ±net at each boundary. The dn-frontier
- * seed is stamped CONTIGUOUS with the last emitted bracket (matching prepare's post-trim
- * re-stamp — no seed/cache gap), and `adaptiveNet` carries the FULL signed-net curve for the
+ * walking forward from the prepare-time spot multiplicatively (the one-ts grid) and updating
+ * L by ±net at each boundary. The window scalars + per-pool net cache are stamped to match
+ * prepare's stampPoolCache, and `adaptiveNet` carries the FULL signed-net curve for the
  * reference's mirrored live walk. This is the regime the prior single-wide-position vectors
- * never exercised — the one that hid the B3 drift-down / L-change defect.
+ * never exercised — the one that hid the drift-down / L-change defect.
  */
 function buildV3WithNet(
   refIdx: number,
@@ -145,8 +144,10 @@ function buildV3WithNet(
   const startBoundary = zeroForOne ? base : base + ts;
   const spotBoundaryShifted = BigInt(startBoundary + Number(OFFSET));
   const windowBotShifted = spotBoundaryShifted + BigInt(step) * BigInt(nBr > 0 ? nBr - 1 : 0);
-  // extremeShifted = the DEEPEST initialized tick (shifted) in the swap direction.
-  const netKeys = [...net.keys()];
+  // extremeShifted = the DEEPEST initialized tick (shifted) in the swap direction. Only
+  // nonzero-net keys count (a zero-net key would never change L → must not extend the gate);
+  // a no-op on producible data, mirroring prepare's stampPoolCache + the oracle extremeTick.
+  const netKeys = [...net.entries()].filter(([, n]) => n !== 0n).map(([t]) => t);
   const extremeTick = netKeys.length
     ? (zeroForOne ? Math.min(...netKeys) : Math.max(...netKeys))
     : null;
@@ -167,7 +168,7 @@ function buildV3WithNet(
   return { pool, brackets };
 }
 
-/** A V2 EcoPool + prepared brackets, mirroring buildV2Brackets + the WS2 #104 seed. */
+/** A V2 EcoPool + synthetic brackets + the live out/in spot + √k seed the walk reads. */
 function buildV2(
   refIdx: number,
   reserveIn: bigint,
@@ -253,7 +254,7 @@ describe("k-way reference == optimal oracle (no-drift, window covers / dn under-
   }
 });
 
-describe("k-way reference == optimal oracle (drift-UP → drift-UP re-anchor)", () => {
+describe("k-way reference == optimal oracle (drift-up vs prepare-time spot — live-spot walk)", () => {
   const L1 = 2n * 10n ** 24n;
   const L2 = 10n ** 24n;
   // Both prepared at spot tick 0; pool0 live drifts UP to tick +600 (against the swap).
@@ -274,7 +275,7 @@ describe("k-way reference == optimal oracle (drift-UP → drift-UP re-anchor)", 
     { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: L2, net: new Map() },
   ];
   for (const amountIn of [100n * E18, 5000n * E18]) {
-    it(`drift-UP amountIn=${amountIn} — drift-UP re-anchor (spot,top] == oracle, wei-exact`, () => {
+    it(`drift-up amountIn=${amountIn} — live-spot walk fills (spot,top] == oracle, wei-exact`, () => {
       const kw = kwayReference(prepared, amountIn, live);
       const opt = optimalSplit({ pools: optPools, amountIn, zeroForOne: true, priceLimit: PRICE_LIMIT });
       assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
@@ -363,7 +364,7 @@ describe("k-way reference == optimal oracle (cross-version V2 + V3 + V4, equal-f
   }
 });
 
-describe("k-way reference == optimal oracle (V2 drift-UP → V2 drift-UP re-anchor)", () => {
+describe("k-way reference == optimal oracle (V2 drift-up vs prepare-time spot — live-spot stream)", () => {
   const resIn = 2_000_000n * E18;
   const resOut = 2_000_000n * E18;
   const v2 = buildV2(0, resIn, resOut, 16);
@@ -379,7 +380,7 @@ describe("k-way reference == optimal oracle (V2 drift-UP → V2 drift-UP re-anch
   const live: (KwayLivePool | undefined)[] = [{ curOI: driftSpotOI, liveV2L: driftL }];
   const optPools: OptimalPool[] = [{ isV2: true, feePpm: 3000, reserveIn: driftResIn, reserveOut: resOut }];
   for (const amountIn of [100n * E18, 5000n * E18]) {
-    it(`V2 drift-UP amountIn=${amountIn} — V2 drift-UP re-anchor (spot,top] == oracle, wei-exact`, () => {
+    it(`V2 drift-up amountIn=${amountIn} — live-spot stream fills (spot,top] == oracle, wei-exact`, () => {
       const kw = kwayReference(prepared, amountIn, live);
       const opt = optimalSplit({ pools: optPools, amountIn, zeroForOne: true, priceLimit: PRICE_LIMIT });
       assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
@@ -388,16 +389,14 @@ describe("k-way reference == optimal oracle (V2 drift-UP → V2 drift-UP re-anch
   }
 });
 
-// ── V2 DRIFT-DOWN re-anchor (the second remaining blocker) ────────────────
+// ── V2 drift-down vs prepare-time spot (live-spot stream) ─────────────────
 //
-// A V2 0.30% pool whose live out/in spot drifted DOWN (below the prepared window top)
-// against a deeper V3 0.05% pool at spot. BEFORE the fix the V2 dn frontier kept the
-// prepare-time deepestFar seed and competed at feeAdj(deepestFar) — ABOVE the true live
-// head feeAdj(liveSpot) — over-funding the drifted V2 pool by up to ~38% at 20% drift
-// (and its stale brackets were never skipped). The fix re-anchors the V2 dn frontier to the
-// LIVE out/in spot (V2 is constant-L) and stale-skips its prepared brackets above the live
-// spot. Continuity gate: 0% drift ⇒ 0 misallocation (cl==topV2OI ⇒ neither branch fires).
-describe("k-way reference == optimal oracle (V2 drift-DOWN → re-anchor to live spot)", () => {
+// A V2 0.30% pool whose live out/in spot drifted DOWN (below the prepare-time spot)
+// against a deeper V3 0.05% pool at spot. The unified walk streams the V2 pool's
+// constant-L geometry from its LIVE out/in spot, so the with-swap drift just lowers the
+// stream start — no separate frontier, no stale handling. Continuity gate: 0% drift ⇒ 0
+// misallocation (the live spot == the prepare-time spot, so the walk is identical).
+describe("k-way reference == optimal oracle (V2 drift-down vs prepare-time spot — live-spot stream)", () => {
   const resIn = 2_000_000n * E18;
   const resOut = 2_000_000n * E18;
   const v3 = buildV3(0, 500, 10, 3_000_000n * E18, 96, 0, true); // deep V3 0.05% at spot
@@ -409,7 +408,7 @@ describe("k-way reference == optimal oracle (V2 drift-DOWN → re-anchor to live
   const amountIn = 200_000n * E18;
   // V2 drifts DOWN: a LARGER reserveIn lowers out/in spot = sqrt(resOut/resIn).
   for (const driftPct of [0n, 10n, 20n]) {
-    it(`V2 drift-DOWN ${driftPct}% — re-anchored to live spot == oracle, wei-exact (0% ⇒ 0 misalloc)`, () => {
+    it(`V2 drift-down ${driftPct}% — live-spot stream == oracle, wei-exact (0% ⇒ 0 misalloc)`, () => {
       const driftResIn = (resIn * (100n + driftPct)) / 100n;
       const driftL = isqrt(driftResIn * resOut);
       const driftSpotOI = isqrt((resOut * Q192) / driftResIn);
@@ -478,14 +477,14 @@ describe("k-way reference == optimal oracle (B2 cap-binding: reach == budget on 
 
 // ── B1/B2/B3: NON-EMPTY net (L change) + drift-DOWN MID-GRID ──────────────
 //
-// The vectors above all use net=new Map() (constant L) and only drift UP — exactly the
-// regime that hid the blockers. These two pools instead carry a genuine initialized-tick
-// L change, and the engaged pool0 drifts DOWN to a true MID-GRID live tick (not a tickSpacing
-// multiple). With the prepared cache spot-anchored, the merge must (B3) RE-ANCHOR pool0's dn
-// frontier to the LIVE tick lattice (drift-down) instead of consuming stale spot brackets,
-// (B1) compete pool0 at its TRUE live head, and (B2) run-until-filled past the old fixed cap.
-// kwayReference must equal optimalSplit (built from the SAME post-drift live state) to the wei.
-describe("k-way reference == optimal oracle (drift-DOWN mid-grid + initialized-tick L change)", () => {
+// The vectors above all use net=new Map() (constant L) and only drift up. These two pools
+// instead carry a genuine initialized-tick L change, and the engaged pool0 drifts DOWN to a
+// true MID-GRID live tick (not a tickSpacing multiple). The unified walk anchors pool0's
+// frontier on the LIVE tick lattice (the cached net for the in-window boundaries, a
+// staticcall past it), competes pool0 at its TRUE live head, and runs until filled within
+// the per-pool budget. kwayReference must equal optimalSplit (built from the SAME post-drift
+// live state) to the wei.
+describe("k-way reference == optimal oracle (drift-down mid-grid + initialized-tick L change)", () => {
   const TS0 = 10, FEE0 = 500, TS1 = 60, FEE1 = 3000;
   const LCHANGE = -2000;
   const L0_BASE = 4n * 10n ** 24n;
@@ -543,8 +542,8 @@ describe("k-way reference == optimal oracle (drift-DOWN mid-grid + initialized-t
     });
   }
 
-  // (3) NO-drift regression guard: cut crosses LCHANGE, no drift override → constant-anchor
-  // path must still equal the oracle (guards the B1 static-key fix doesn't regress no-drift).
+  // (3) NO-drift regression guard: cut crosses LCHANGE, no drift override → the live spot
+  // equals the prepare-time spot and the walk must still equal the oracle (no-drift path).
   it("no-drift, cut crosses the L change — kwayReference == oracle, wei-exact (regression guard)", () => {
     const prepared = build();
     const amountIn = 5_000_000n * E18;
@@ -561,9 +560,8 @@ describe("k-way reference == optimal oracle (drift-DOWN mid-grid + initialized-t
   });
 
   // (5) EMPTY-cache drift-down mid-grid (the quote / no-cache path): NBR=0 ⇒ no prepared
-  // brackets AND the dn seed is the SPOT seed (exactly what prepare stamps at maxTicks:0),
-  // so the dn frontier does everything from the LIVE drifted price + spot. Must equal oracle.
-  // (Building with NBR=0 keeps the seed CONTIGUOUS with the empty cache — no seed/cache gap.)
+  // net rows AND no cache window (exactly what prepare stamps at maxTicks:0), so the walk
+  // does everything from the LIVE drifted spot, staticcalling each boundary. Must equal oracle.
   it("EMPTY cache + drift-down mid-grid — kwayReference == oracle from live alone, wei-exact", () => {
     const p0 = buildV3WithNet(0, FEE0, TS0, L0_START, NET0, 0, 0, true);
     const p1 = buildV3WithNet(1, FEE1, TS1, L1, new Map<number, bigint>(), 0, 0, true);
@@ -584,9 +582,9 @@ describe("k-way reference == optimal oracle (drift-DOWN mid-grid + initialized-t
 // The block above carries an initialized-tick L change only on the DRIFTED pool (pool0); the
 // STEADY pool (pool1) is wide constant-L. The spec wants the L-change axis covered for BOTH
 // the drifted AND the steady pool, plus an ALIGNED (tickSpacing-multiple) drift-down (the prior
-// drift cases all land mid-grid), plus a FULLY-OUT-OF-RANGE pool (live price entirely below all
-// its prepared brackets ⇒ the whole cache is stale-skipped and only the live dn-frontier
-// engages). These close the last drift × L-change × range quadrants on the fast tier.
+// drift cases all land mid-grid), plus a FULLY-OUT-OF-RANGE pool (live price entirely below its
+// cache window ⇒ every boundary is out-of-window staticcalled and the walk runs from the live
+// spot alone). These close the last drift × L-change × range quadrants on the fast tier.
 describe("k-way reference == optimal oracle (L-change on BOTH pools, aligned drift-down, OOR)", () => {
   const TS0 = 10, FEE0 = 500, TS1 = 60, FEE1 = 3000;
   // pool0 (drifted) L change at LC0; pool1 (STEADY) ALSO carries an L change at LC1 crossed
@@ -643,26 +641,26 @@ describe("k-way reference == optimal oracle (L-change on BOTH pools, aligned dri
     assert.ok(kw.perPoolInput[0] > 0n && kw.perPoolInput[1] > 0n, "both pools funded across both L changes");
   });
 
-  // (B) FULLY-OUT-OF-RANGE: pool0's live price drifts DOWN so far that it is BELOW the deepest
-  // prepared bracket (the whole cache is stale → skipped), so pool0 engages ONLY via the live
-  // dn-frontier re-anchored from the deep live spot. The steady pool1 fills the rest. This is
-  // the "fully out of range" drift case the spec calls out — the cache contributes nothing for
-  // the drifted pool and the solver must be optimal from the live frontier alone.
-  it("FULLY-OUT-OF-RANGE drifted pool (cache fully stale) → live dn-frontier only — kwayReference == oracle, wei-exact", () => {
+  // (B) FULLY-OUT-OF-RANGE: pool0's live price drifts DOWN so far that it is BELOW its whole
+  // cache window, so every boundary is out-of-window staticcalled and pool0's frontier walks
+  // from the deep live spot alone. The steady pool1 fills the rest. This is the "fully out of
+  // range" drift case the spec calls out — the cache contributes nothing for the drifted pool
+  // and the walk must be optimal from the live spot alone.
+  it("FULLY-OUT-OF-RANGE drifted pool (cache window below the live spot) → live walk only — kwayReference == oracle, wei-exact", () => {
     const prepared = build();
     const amountIn = 2_000_000n * E18;
-    // Drift pool0 WAY down — below the deepest prepared bracket far edge (≈ tick -NBR*TS0 with
-    // multiplicative geometry; -20000 is well past the 96-bracket window so the cache is stale).
+    // Drift pool0 WAY down — below the deepest scanned boundary (≈ tick -NBR*TS0 with
+    // multiplicative geometry; -20000 is well past the 96-tick window so it is fully out of window).
     const OOR_TICK = -20000;
     const oorReal0 = getSqrtRatioAtTick(OOR_TICK);
     const live: (KwayLivePool | undefined)[] = [
       { curOI: toOutIn(oorReal0, true), liveRealSqrt: oorReal0, liveTick: OOR_TICK, liveL: L0_BASE }, // L past LC0 ⇒ base only
       undefined,
     ];
-    // Sanity: the live price IS below the deepest prepared bracket far edge (cache fully stale).
-    // The window bottom is ≈ NBR steps below spot tick 0 (multiplicative ≈ tick -NBR*TS0).
+    // Sanity: the live price IS below the deepest scanned boundary (the whole cache window is
+    // out of range). The window bottom is ≈ NBR steps below spot tick 0 (multiplicative ≈ tick -NBR*TS0).
     const windowBottomReal = getSqrtRatioAtTick(-NBR * TS0);
-    assert.ok(oorReal0 < windowBottomReal, "OOR live price below the deepest prepared bracket (cache fully stale)");
+    assert.ok(oorReal0 < windowBottomReal, "OOR live price below the deepest scanned boundary (cache fully out of window)");
     const kw = kwayReference(prepared, amountIn, live);
     const opt = optimalSplit({
       pools: [
@@ -676,29 +674,23 @@ describe("k-way reference == optimal oracle (L-change on BOTH pools, aligned dri
   });
 });
 
-// ── D1: V2 DRIFT-UP COMPETING in a multi-pool merge (the grid-splice quadrant) ──────────
+// ── D1: V2 drift-up COMPETING in a multi-pool merge ──────────────────────────────────────
 //
-// The existing V2-drift-UP block above is SINGLE-POOL — the splice never mis-orders a
-// cross-pool merge because there is no competitor. The D1 defect lives in the uncovered
-// {DRIFT-UP × V2 × multi-pool} quadrant: a V2 0.30% pool prepared at spot competes with a
-// deep V3 0.05% pool, then the V2 live spot drifts UP. The OLD up-frontier clamped the
-// straddling up-slice to the prepare-time window top (topV2OI) and handed off to the
-// prepared brackets anchored at the prepare-time spot — SPLICING two geometric grids that
-// (for generic drift) do NOT share a boundary. The clamped partial slice then spanned a
-// different near→far than the oracle's single clean grid from the live spot, giving a
-// different fee-adjusted-near MERGE KEY → mis-ordered cross-pool merge → ~0.5-0.8%
-// misallocation. The FIX re-anchors the V2 single geometric grid to the LIVE spot (consume
-// it as one continuous dn stream, dropping the spliced up→prepared clamp), matching the
-// oracle's single from-live-spot grid. INVARIANT to bracket depth (NOT a shallow-window
-// artifact), 0 misallocation at 0% drift (continuity), wei-exact at every drift.
-describe("k-way reference == optimal oracle (V2 drift-UP COMPETING — re-anchor single grid)", () => {
+// The V2-drift-up block above is SINGLE-POOL — there is no competitor to mis-order. D1 covers
+// the {drift-up × V2 × multi-pool} quadrant: a V2 0.30% pool prepared at spot competes with a
+// deep V3 0.05% pool, then the V2 live spot drifts UP (against the swap). The unified walk
+// streams the V2 pool's constant-L geometry as ONE continuous run from the LIVE out/in spot —
+// the same single grid the oracle walks — so its fee-adjusted-near merge head matches the
+// oracle's and the cross-pool merge orders correctly. INVARIANT to cache depth (NOT a
+// shallow-window artifact), 0 misallocation at 0% drift (continuity), wei-exact at every drift.
+describe("k-way reference == optimal oracle (V2 drift-up COMPETING — single live-spot grid)", () => {
   const resIn = 1_000_000n * E18;
   const resOut = 1_000_000n * E18;
   const amountIn = 200_000n * E18; // large enough to push the deep V3 down to the V2 grid
   // Deep V3 0.05% at spot tick 0 (undrifted) + V2 0.30% prepared at spot, then V2 drifts UP.
   for (const driftPct of [0n, 1n, 2n, 5n, 10n, 12n, 20n]) {
     for (const nBr of [16, 64, 200]) {
-      it(`V2 drift-UP ${driftPct}% (nBr=${nBr}) competing vs deep V3 — re-anchored == oracle, wei-exact`, () => {
+      it(`V2 drift-up ${driftPct}% (nBr=${nBr}) competing vs deep V3 — live-spot grid == oracle, wei-exact`, () => {
         const v3 = buildV3(0, 500, 10, 2_000_000n * E18, 96, 0, true);
         const v2 = buildV2(1, resIn, resOut, nBr);
         const prepared: EcoSwapPrepared = {
@@ -733,16 +725,12 @@ describe("k-way reference == optimal oracle (V2 drift-UP COMPETING — re-anchor
 
 // ── D2: B2 CAP-BINDING with a NON-EMPTY cache (window + up + dn share ONE budget) ─────────
 //
-// The existing B2 cap-binding block uses an EMPTY cache (maxTicks:0), so the dn frontier
-// alone walks the whole reach — which hid the defect. With a NON-EMPTY cache the prepared
-// window brackets were consumed via the merge cursor WITHOUT counting against the per-pool
-// dnSteps budget, while the dn frontier resumed from the post-window seed and walked a FULL
-// PER_POOL more steps. So a cached pool reached (K window brackets) + (PER_POOL dn steps) =
-// DEEPER than the oracle's single from-spot loop bounded by MAX_V3_STEPS == PER_POOL → it
-// over-filled at the cap, growing with K. The FIX counts a consumed window bracket against
-// the SAME per-pool budget as dn (and skip-advances the cursor for an over-budget pool), so
-// window + up + dn together are bounded by PER_POOL == the oracle MAX_V3_STEPS — solver ==
-// oracle at the cap for BOTH empty AND non-empty cache.
+// The B2 cap-binding block uses an EMPTY cache (maxTicks:0). With a NON-EMPTY cache, the
+// unified walk consumes the in-window boundaries (net from the cache) and the out-of-window
+// boundaries (net staticcalled) on ONE per-pool frontier counted against ONE shared per-pool
+// step budget (PER_POOL == the oracle MAX_V3_STEPS). So the reach is bounded by PER_POOL from
+// the live spot REGARDLESS of how many boundaries the cache covers — the cache never deepens
+// the reach — and solver == oracle at the cap for BOTH empty AND non-empty cache.
 describe("k-way reference == optimal oracle (D2 cap-binding WITH a non-empty cache)", () => {
   const ts = 10;
   const L = 1000n * E18; // shallow/wide ⇒ the cap binds before fill at large amountIn
@@ -789,36 +777,32 @@ describe("k-way reference == optimal oracle (D2 cap-binding WITH a non-empty cac
   });
 });
 
-// ── DRIFT-UP × CAP-BINDING: the up + dn budget unification (the {drift-up × cap} quadrant) ──
+// ── drift-up × CAP-BINDING: the single shared per-pool budget (the {drift-up × cap} quadrant) ──
 //
-// The DEFECT: upSteps[] and dnSteps[] were TWO INDEPENDENT per-pool PER_POOL=2048 budgets. A
-// pool drifted UP (against the swap) burned up-steps from the LIVE spot down to the prepared
-// window top, THEN got a FRESH full PER_POOL for window+dn below — so its TOTAL reach was
-// up-steps + PER_POOL (up to ~2× budget). The optimal oracle (v3Segments) instead walks a
-// SINGLE MAX_V3_STEPS loop FROM THE LIVE (drifted) SPOT — its up+window+dn share ONE budget.
-// So at the cap the drifted pool OVER-REACHED vs the oracle by exactly the burned up-steps,
-// scrambling the cross-pool split at the cut (confirmed: +600t → +4.75%, +5000t → +44%,
-// +12000t → +128% over). The FIX unifies up+window+dn into ONE SHARED per-pool budget
-// (dnSteps), so the reach is bounded by PER_POOL from the LIVE spot == the oracle's single
-// MAX_V3_STEPS loop → solver == oracle to the wei EVEN WHEN THE CAP BINDS, for drift-UP.
+// A pool drifted UP (against the swap), with the cap binding. The unified walk runs ONE
+// per-pool frontier from the LIVE (drifted) spot, deeper, counted against ONE PER_POOL=2048
+// step budget — exactly the optimal oracle's single MAX_V3_STEPS loop from the live spot. So
+// the reach is bounded by PER_POOL from the live spot whether or not the pool drifted up (the
+// against-swap region above the prepare-time spot is just more boundaries on the same single
+// frontier), and solver == oracle to the wei EVEN WHEN THE CAP BINDS, for drift-up.
 //
 // These vectors are production-reachable: a large/out-of-range run-until-filled trade against
-// a pool that drifted up (against-swap drift), and the empty-cache QUOTE path (prepare always
-// stamps topNearReal=spotReal, so a drifted-up live spot triggers the up frontier even with
-// no cache). Both single-pool (the defect in isolation) and multi-pool (the scrambled cut).
-describe("k-way reference == optimal oracle (drift-UP × cap-binding — shared up+dn budget)", () => {
+// a pool that drifted up (against-swap drift), and the empty-cache QUOTE path (the walk starts
+// at the live spot with no cache). Both single-pool and multi-pool (the cross-pool cut).
+describe("k-way reference == optimal oracle (drift-up × cap-binding — single live-spot budget)", () => {
   const ts = 10;
   const SHALLOW_L = 1000n * E18; // shallow ⇒ a from-live-spot 2048-step walk under-fills a big trade
   // amountIn FAR exceeds what PER_POOL=2048 steps absorb from ANY spot on this L, so the cap
-  // binds for every drift. The DEFECT made the drifted pool reach up-steps + PER_POOL; the fix
-  // bounds it to PER_POOL from the live spot == the oracle. Drift ticks span the spec's repro
-  // points (+600, +5000, +12000 — where the OLD over-reach was +4.75%, +44%, +128%).
+  // binds for every drift. The single per-pool budget bounds the reach to PER_POOL from the
+  // live spot == the oracle, independent of how far the pool drifted up. Drift ticks span a
+  // wide against-swap range (+600, +5000, +12000).
   for (const driftTick of [600, 5000, 12000]) {
     const liveReal = getSqrtRatioAtTick(driftTick);
 
-    // (A) SINGLE-POOL drift-up cap-binding: the defect in isolation. The pool drifted up by
-    // driftTick; with the cap binding, the reach must be PER_POOL steps FROM THE LIVE SPOT
-    // (== the oracle), NOT up-steps + PER_POOL. Both empty-cache (quote) and a deep cache.
+    // (A) SINGLE-POOL drift-up cap-binding. The pool drifted up by driftTick; with the cap
+    // binding, the reach must be PER_POOL steps FROM THE LIVE SPOT (== the oracle), the
+    // against-swap region being just more boundaries on the one frontier. Both empty-cache
+    // (quote) and a deep cache.
     for (const nBr of [0, 96]) {
       for (const amountIn of [200_000n * E18, 1_000_000n * E18]) {
         it(`single-pool drift +${driftTick}t × cap (nBr=${nBr}) amountIn=${amountIn} — reach == PER_POOL from live spot == oracle, wei-exact`, () => {
@@ -835,19 +819,18 @@ describe("k-way reference == optimal oracle (drift-UP × cap-binding — shared 
             pools: [{ isV2: false, feePpm: 500, sqrtPriceX96: liveReal, tick: driftTick, tickSpacing: ts, liquidity: SHALLOW_L, net: new Map() }],
             amountIn, zeroForOne: true, priceLimit: PRICE_LIMIT,
           });
-          // The cap binds: the reach is the (shared) budget from the live spot, not the trade.
+          // The cap binds: the reach is the per-pool budget from the live spot, not the trade.
           assert.ok(kw.totalInput < amountIn, `drift +${driftTick}t nBr=${nBr}: cap binds`);
-          // EXACTNESS AT THE CAP under drift-up: the unified budget bounds the reach to PER_POOL
-          // from the live spot == the oracle's single MAX_V3_STEPS loop. (OLD: up-steps + PER_POOL.)
+          // EXACTNESS AT THE CAP under drift-up: the single per-pool budget bounds the reach to
+          // PER_POOL from the live spot == the oracle's single MAX_V3_STEPS loop.
           assertWeiExact(kw, opt, `drift-up +${driftTick}t cap single nBr=${nBr} A=${amountIn}`);
         });
       }
     }
 
-    // (B) MULTI-POOL drift-up cap-binding: the scrambled cross-pool cut. A drifted-up shallow
-    // pool0 competes with a deeper undrifted pool1; with pool0 capped, the OLD over-reach pushed
-    // pool0 past the oracle's cut and stole share from pool1 (the split was scrambled at the
-    // cut). The shared budget restores the exact split.
+    // (B) MULTI-POOL drift-up cap-binding: the cross-pool cut. A drifted-up shallow pool0
+    // competes with a deeper undrifted pool1; with pool0 capped at PER_POOL from its live spot
+    // == the oracle, the cross-pool split at the cut matches the oracle to the wei.
     for (const amountIn of [400_000n * E18, 2_000_000n * E18]) {
       it(`multi-pool drift +${driftTick}t × cap amountIn=${amountIn} — split at the cut == oracle, wei-exact`, () => {
         const p0 = buildV3(0, 500, ts, SHALLOW_L, 96, 0, true); // shallow, drifts up
@@ -870,7 +853,8 @@ describe("k-way reference == optimal oracle (drift-UP × cap-binding — shared 
         });
         // Both engaged: the drifted shallow pool0 caps; the deeper pool1 absorbs the rest at the cut.
         assert.ok(kw.perPoolInput[0] > 0n && kw.perPoolInput[1] > 0n, "both pools funded");
-        // The defect was a per-pool over-reach on the DRIFTED pool → wrong cross-pool split.
+        // The per-pool reach on the drifted pool is bounded to PER_POOL from its live spot,
+        // so the cross-pool split equals the oracle.
         assertWeiExact(kw, opt, `drift-up +${driftTick}t cap multi A=${amountIn}`);
       });
     }
@@ -881,15 +865,15 @@ describe("k-way reference == optimal oracle (drift-UP × cap-binding — shared 
 //
 // COVERAGE GAP (spec item 2): every block above runs zeroForOne=true. The kwayReference math
 // is direction-parametric (toOutIn = Q192/sqrt, stepReal up-direction, tickArg negatives), so
-// these mirror the representative scenarios with zeroForOne=false — no-drift multi-V3, drift-UP
-// (up frontier), drift-DOWN (dn re-anchor), V2, and cap-binding — proving the reference is
+// these mirror the representative scenarios with zeroForOne=false — no-drift multi-V3, drift-up
+// (against the swap), drift-down (with the swap), V2, and cap-binding — proving the reference is
 // wei-exact == the oracle on the oneForZero side too. (The compiled-bytecode oneForZero path is
 // the genuine unknown the EVM lane H1–H6 + C2-V4 cells close; this fast block pins the math.)
 //
-// oneForZero geometry: the swap walks ticks UP, so a pool "drifts UP" (against the swap, → up
-// frontier) when its live out/in spot is ABOVE the prepared window top, i.e. its REAL price has
-// fallen. We model that directly via the live override (lower liveRealSqrt). The oneForZero
-// price extreme is MAX_SQRT_RATIO − 1 (the dn-walk guard upper bound).
+// oneForZero geometry: the swap walks ticks UP, so a pool drifts UP against the swap when its
+// live out/in spot is ABOVE the prepare-time spot, i.e. its REAL price has fallen. We model that
+// directly via the live override (lower liveRealSqrt). The oneForZero price extreme is
+// MAX_SQRT_RATIO − 1 (the walk guard upper bound).
 describe("k-way reference == optimal oracle (oneForZero — direction symmetry)", () => {
   const PRICE_LIMIT_O4O = 1461446703485210103287273052203988822378723970341n; // MAX_SQRT_RATIO − 1
   const L1 = 2n * 10n ** 24n;
@@ -918,7 +902,7 @@ describe("k-way reference == optimal oracle (oneForZero — direction symmetry)"
     }
   }
 
-  // (2) drift-UP (up frontier): pool0's REAL price falls (live out/in spot ABOVE the window top).
+  // (2) drift-up (against the swap): pool0's REAL price falls (live out/in spot ABOVE the prepare-time spot).
   {
     const p0 = buildV3(0, 500, 10, L1, 40, 0, false);
     const p1 = buildV3(1, 3000, 60, L2, 40, 0, false);
@@ -937,7 +921,7 @@ describe("k-way reference == optimal oracle (oneForZero — direction symmetry)"
       { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: L2, net: new Map() },
     ];
     for (const amountIn of [100n * E18, 5000n * E18]) {
-      it(`oneForZero drift-UP amountIn=${amountIn} — up frontier == oracle, wei-exact`, () => {
+      it(`oneForZero drift-up amountIn=${amountIn} — live-spot walk == oracle, wei-exact`, () => {
         const kw = kwayReference(prepared, amountIn, live);
         const opt = optimalSplit({ pools: optPools, amountIn, zeroForOne: false, priceLimit: PRICE_LIMIT_O4O });
         assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
@@ -946,7 +930,7 @@ describe("k-way reference == optimal oracle (oneForZero — direction symmetry)"
     }
   }
 
-  // (3) drift-DOWN (dn re-anchor): pool0's REAL price rises (live out/in spot BELOW the window top).
+  // (3) drift-down (with the swap): pool0's REAL price rises (live out/in spot BELOW the prepare-time spot).
   {
     const p0 = buildV3(0, 500, 10, L1, 96, 0, false);
     const p1 = buildV3(1, 3000, 60, L2, 96, 0, false);
@@ -965,7 +949,7 @@ describe("k-way reference == optimal oracle (oneForZero — direction symmetry)"
       { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: L2, net: new Map() },
     ];
     for (const amountIn of [5000n * E18, 50000n * E18]) {
-      it(`oneForZero drift-DOWN amountIn=${amountIn} — dn re-anchor == oracle, wei-exact`, () => {
+      it(`oneForZero drift-down amountIn=${amountIn} — live-spot walk == oracle, wei-exact`, () => {
         const kw = kwayReference(prepared, amountIn, live);
         const opt = optimalSplit({ pools: optPools, amountIn, zeroForOne: false, priceLimit: PRICE_LIMIT_O4O });
         assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
@@ -1026,34 +1010,32 @@ describe("k-way reference == optimal oracle (oneForZero — direction symmetry)"
   }
 });
 
-// ── DRIFT-UP RE-ANCHOR (the clamp-splice fix): symmetric to drift-DOWN, both directions ──
+// ── drift-up live-spot walk: symmetric to drift-down, both directions ──────────────────────
 //
-// The old code handled a drifted-UP V3/V4 pool with a separate `up` frontier that walked the
-// live grid DOWN and then CLAMPED the final segment to the tick-aligned window top, handing off
-// to the prepared window brackets anchored at a DIFFERENT sqrt. Because the oracle walks ONE
-// continuous multiplicative grid from the live spot and NEVER clamps, that splice mis-priced the
-// handoff heads, with two production-reachable manifestations:
-//   (a) oneForZero × drift-UP × cap-binding: a Q192/sqrt inversion double-rounds the handoff →
-//       the capped reach UNDER-fills the oracle by ~0.08%.
-//   (b) EQUAL-FEE multi-pool × drift-UP (non-cap, fully fills): the mis-priced clamped up-slice
-//       wins/loses the merge tie wrong → ~0.3-0.6% of the up-region routes to the WRONG pool.
-// The FIX re-anchors a drifted-UP V3/V4 pool's WHOLE walk to the live spot (dn frontier from the
-// live tick) and stale-skips its prepared cache — EXACTLY as drift-DOWN already does — so the
-// walk is ONE continuous from-live-spot grid == the oracle, for BOTH drift directions and both
-// swap directions, cap-binding or not.
-describe("k-way reference == optimal oracle (drift-UP re-anchor — clamp-splice removed)", () => {
+// A drifted-UP V3/V4 pool is walked exactly like any other: ONE per-pool frontier from the
+// LIVE spot on the live one-ts grid (the in-window net from the cache, out-of-window net
+// staticcalled). The against-swap region above the prepare-time spot is just more out-of-window
+// boundaries on that single frontier — the same continuous multiplicative grid the oracle
+// walks, with no handoff, no clamp, no second frontier. Two production-reachable manifestations
+// the walk must get wei-exact:
+//   (a) oneForZero × drift-up × cap-binding: the capped reach must equal the oracle to the wei.
+//   (b) EQUAL-FEE multi-pool × drift-up (non-cap, fully fills): the merge tie in the against-swap
+//       region must route to the correct pool == the oracle.
+// One continuous from-live-spot grid for BOTH drift directions and both swap directions,
+// cap-binding or not.
+describe("k-way reference == optimal oracle (drift-up live-spot walk — both directions)", () => {
   const ts = 10;
   const SHALLOW_L = 1000n * E18; // shallow ⇒ a from-live-spot 2048-step walk under-fills a big trade
 
-  // (a) oneForZero × drift-UP × cap-binding — the ~0.08% under-fill quadrant. A pool whose REAL
-  // price has FALLEN (out/in spot ABOVE the window top, against the oneForZero swap), with the
-  // cap binding, must reach EXACTLY PER_POOL steps FROM THE LIVE SPOT == the oracle, wei-exact.
+  // (a) oneForZero × drift-up × cap-binding. A pool whose REAL price has FALLEN (out/in spot
+  // ABOVE the prepare-time spot, against the oneForZero swap), with the cap binding, must reach
+  // EXACTLY PER_POOL steps FROM THE LIVE SPOT == the oracle, wei-exact.
   const PRICE_LIMIT_O4O = 1461446703485210103287273052203988822378723970341n; // MAX_SQRT_RATIO − 1
   for (const driftTick of [-600, -5000]) {
     const liveReal = getSqrtRatioAtTick(driftTick); // REAL price down ⇒ out/in spot UP
     for (const nBr of [0, 96]) {
       for (const amountIn of [200_000n * E18, 500_000n * E18]) {
-        it(`(a) oneForZero drift-UP ${driftTick}t × cap (nBr=${nBr}) amountIn=${amountIn} — re-anchored == oracle, wei-exact`, () => {
+        it(`(a) oneForZero drift-up ${driftTick}t × cap (nBr=${nBr}) amountIn=${amountIn} — live-spot walk == oracle, wei-exact`, () => {
           const p = buildV3(0, 500, ts, SHALLOW_L, nBr, 0, false);
           const prepared: EcoSwapPrepared = {
             pools: [p.pool], routes: [], brackets: sortLadder(p.brackets),
@@ -1067,22 +1049,22 @@ describe("k-way reference == optimal oracle (drift-UP re-anchor — clamp-splice
             pools: [{ isV2: false, feePpm: 500, sqrtPriceX96: liveReal, tick: driftTick, tickSpacing: ts, liquidity: SHALLOW_L, net: new Map() }],
             amountIn, zeroForOne: false, priceLimit: PRICE_LIMIT_O4O,
           });
-          assert.ok(kw.totalInput < amountIn, `o4o drift-UP ${driftTick}t cap nBr=${nBr}: cap binds`);
-          assertWeiExact(kw, opt, `(a) o4o drift-UP ${driftTick}t cap nBr=${nBr} A=${amountIn}`);
+          assert.ok(kw.totalInput < amountIn, `o4o drift-up ${driftTick}t cap nBr=${nBr}: cap binds`);
+          assertWeiExact(kw, opt, `(a) o4o drift-up ${driftTick}t cap nBr=${nBr} A=${amountIn}`);
         });
       }
     }
   }
 
-  // (b) EQUAL-FEE multi-pool × drift-UP (non-cap, fully fills) — the mis-route quadrant. Two DEEP
+  // (b) EQUAL-FEE multi-pool × drift-up (non-cap, fully fills) — the merge-tie quadrant. Two DEEP
   // equal-fee (0.05%) V3 pools prepared at spot tick 0; pool0's REAL price drifts UP (against the
-  // zeroForOne swap), so its up-region competes with pool1's window at the SAME fee. The trade
-  // fully fills (non-cap) and the split must equalize marginals == the oracle to the wei — the
-  // merge tie in the up-region must route to the correct pool (the old clamp-splice did not).
+  // zeroForOne swap), so its against-swap region competes with pool1's window at the SAME fee. The
+  // trade fully fills (non-cap) and the split must equalize marginals == the oracle to the wei —
+  // the merge tie in the against-swap region must route to the correct pool.
   for (const driftTick of [600, 5000]) {
     const liveReal = getSqrtRatioAtTick(driftTick);
     for (const amountIn of [50_000n * E18, 200_000n * E18, 1_000_000n * E18]) {
-      it(`(b) equal-fee multi-pool drift-UP +${driftTick}t (non-cap) amountIn=${amountIn} — split == oracle, wei-exact`, () => {
+      it(`(b) equal-fee multi-pool drift-up +${driftTick}t (non-cap) amountIn=${amountIn} — split == oracle, wei-exact`, () => {
         const DEEP_L = 500_000n * E18;
         const p0 = buildV3(0, 500, ts, DEEP_L, 200, 0, true); // drifts up
         const p1 = buildV3(1, 500, ts, DEEP_L, 200, 0, true); // undrifted, equal fee
@@ -1102,11 +1084,10 @@ describe("k-way reference == optimal oracle (drift-UP re-anchor — clamp-splice
           ],
           amountIn, zeroForOne: true, priceLimit: PRICE_LIMIT,
         });
-        assert.equal(kw.totalInput, amountIn, `equal-fee drift-UP +${driftTick}t A=${amountIn}: fully fills (non-cap)`);
-        assertWeiExact(kw, opt, `(b) equal-fee multi drift-UP +${driftTick}t A=${amountIn}`);
-        // Where the trade is large enough to cross the up-region tie (the oracle funds both),
-        // the re-anchored split must too — this is the quadrant where the old clamp-splice
-        // mis-routed the up-region share to the wrong pool.
+        assert.equal(kw.totalInput, amountIn, `equal-fee drift-up +${driftTick}t A=${amountIn}: fully fills (non-cap)`);
+        assertWeiExact(kw, opt, `(b) equal-fee multi drift-up +${driftTick}t A=${amountIn}`);
+        // Where the trade is large enough to cross the against-swap-region tie (the oracle funds
+        // both), the live-spot walk's split must too — the merge tie must route correctly.
         if (opt.perPoolInput[1] > 0n) {
           assert.ok(kw.perPoolInput[0] > 0n && kw.perPoolInput[1] > 0n, "both equal-fee pools funded at the tie");
         }

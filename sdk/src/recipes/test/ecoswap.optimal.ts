@@ -193,7 +193,11 @@ function v3Segments(p: OptimalPool, poolIdx: number, zeroForOne: boolean, priceL
   // has gone to 0, the pool can produce no further capacity, so the walk terminates early
   // (instead of spinning out the full step cap). Empty net ⇒ no boundaries ⇒ a single
   // constant-L curve, which still terminates via the L>0 / step-cap conditions.
-  const netTicks = p.net ? [...p.net.keys()] : [];
+  // Only INITIALIZED ticks (net != 0) gate exhaustion — a deep zero-net key would never
+  // change L, so it must not extend the walk past the last real boundary. (No-op on
+  // producible data, where every net key is nonzero; hardens the gate against a fixture
+  // injecting a zero-net key.)
+  const netTicks = p.net ? [...p.net.entries()].filter(([, n]) => n !== 0n).map(([t]) => t) : [];
   const haveTicks = netTicks.length > 0;
   const extremeTick = haveTicks
     ? zeroForOne

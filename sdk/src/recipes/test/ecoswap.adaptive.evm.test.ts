@@ -57,10 +57,46 @@ import {
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
 import { ecoSwap } from "../ecoswap/index";
 import { ecoSwapReference } from "./ecoswap.reference";
-import { feeAdjust, toOutIn } from "./ecoswap.math";
+import { feeAdjust, toOutIn, getSqrtRatioAtTick } from "./ecoswap.math";
+import { optimalSplit } from "./ecoswap.optimal";
+import type { EcoSwapPrepared } from "../shared/types";
 import type { Account } from "viem";
 
 const HUGE = parseEther("1000000000");
+const OFFSET_TICK_TEST = 888000;
+
+/**
+ * Off-chain WINDOWED capacity (gross tokenIn) of the prepared cache: the input the swap
+ * would consume walking each direct pool from its prepare-time spot down to its deepest
+ * SCANNED boundary (windowBotShifted), using the pool's drift-invariant net. This is the
+ * honest "the prepared window UNDER-fills amountIn" measure under the unified-walk shape —
+ * the direct-pool depth no longer lives in prepared.brackets (which now holds route
+ * segments only), so summing bracket capacity would be vacuous. Mirrors the on-chain
+ * in-window walk (capped at the deepest scanned boundary via the optimal oracle priceLimit).
+ */
+function windowedCapacity(prepared: EcoSwapPrepared): bigint {
+  let cap = 0n;
+  for (const p of prepared.pools) {
+    if (p.isV2) continue;
+    if ((p.windowTopShifted ?? 0n) === 0n || (p.windowBotShifted ?? 0n) === 0n) continue;
+    const botTick = Number(p.windowBotShifted!) - OFFSET_TICK_TEST;
+    const limit = getSqrtRatioAtTick(botTick);
+    const net = new Map<number, bigint>();
+    for (const [t, n] of p.adaptiveNet ?? new Map<number, bigint>()) net.set(t, n);
+    const sqrtPriceX96 = p.spotNearReal ?? 0n;
+    if (sqrtPriceX96 === 0n) continue;
+    const tick = p.spotTickShifted !== undefined ? Number(p.spotTickShifted) - OFFSET_TICK_TEST : 0;
+    const liquidity = p.spotActiveL ?? 0n;
+    const opt = optimalSplit({
+      pools: [{ isV2: false, feePpm: p.feePpm, sqrtPriceX96, tick, tickSpacing: p.tickSpacing, liquidity, net }],
+      amountIn: 1n << 250n,
+      zeroForOne: prepared.zeroForOne,
+      priceLimit: limit,
+    });
+    cap += opt.totalInput;
+  }
+  return cap;
+}
 
 // Engine cells driven by ECO_ENGINE (default v12). See harness/engine.ts.
 const ENGINE_CELLS = engineCells();
@@ -154,13 +190,16 @@ describe("EcoSwap adaptive dynamic tick reads (always-on window-EXCEEDED streami
       engine,
     );
 
-    // The PREPARED brackets alone cannot cover amountIn — the narrow window is
-    // deliberately too small. (This is the precondition the always-on walk closes:
-    // without it the swap would under-fill, as the old adaptive-OFF path did.)
-    const preparedCapacity = prepared.brackets.reduce((acc, b) => acc + b.capacity, 0n);
+    // The PREPARED cache WINDOW alone cannot cover amountIn — the narrow window is
+    // deliberately too small. This is the real precondition the always-on walk closes:
+    // the windowed capacity (input consumed from the prepare-time spot down to the
+    // deepest SCANNED boundary, using the cached net) must UNDER-fill amountIn, so the
+    // solver has to staticcall past the window from the live spot to reach the cut.
+    const preparedCapacity = windowedCapacity(prepared);
+    assert.ok(preparedCapacity > 0n, "the narrow window is populated (windowed capacity > 0)");
     assert.ok(
       preparedCapacity < AMOUNT_IN,
-      `prepared window must UNDER-FILL amountIn (Σ capacity ${preparedCapacity} < ${AMOUNT_IN})`,
+      `prepared window must UNDER-FILL amountIn (windowed capacity ${preparedCapacity} < ${AMOUNT_IN})`,
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, AMOUNT_IN);
