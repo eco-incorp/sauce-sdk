@@ -146,7 +146,7 @@ export async function ecoSwap(
   cookEntry: Hex,
   caller: Hex,
   poolConfig?: ChainPoolConfig,
-  opts?: EcoSwapPrepareOpts,
+  opts?: EcoSwapPrepareOpts & { solverFile?: string },
   target: "v1" | "v12" = "v1",
 ): Promise<EcoSwapOutput> {
   const tempClient = createPublicClient({ transport: http(rpcUrl) });
@@ -172,13 +172,15 @@ export async function ecoSwap(
     { ...(opts ?? {}), lensTarget: opts?.lensTarget ?? target, caller },
   );
 
-  // EcoSwap's on-chain solver is the single-pass (live-cut) water-fill in
-  // ecoswap.sauce.ts: one sweep over the prepared bracket ladder allocates each
-  // pool/route into real mutable arrays, computes the exact tokenIn the swaps will
-  // consume, then pulls and executes (compute-then-pull, no over-pull/refund).
+  // EcoSwap's on-chain solver is the canonical K-way-lazy price-ordered merge in
+  // ecoswap.sauce.ts: one merge over {prepared brackets, each pool's live dn frontier}
+  // allocates each pool/route into real mutable arrays, computes the exact tokenIn the
+  // swaps will consume, then pulls and executes (compute-then-pull, no over-pull/refund).
   // ecoswap.unrolled.sauce.ts (register-bank variant) and ecoswap.computeonly.sauce.ts
-  // are frozen gas-comparison references, not selectable here.
-  const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");
+  // are frozen gas-comparison references, not selectable here. `opts.solverFile` lets a
+  // test point at an alternate solver source without changing the production default.
+  const solverFile = opts?.solverFile ?? "ecoswap.sauce.ts";
+  const source = readFileSync(join(__dirname, solverFile), "utf-8");
   const jsSource = stripTypes(source);
 
   const result = compile(jsSource, {

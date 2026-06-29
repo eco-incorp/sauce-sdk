@@ -43,19 +43,30 @@ they sort into one global ladder regardless of AMM type or fee tier.
 4. Fee-adjust each bracket's sqrt boundaries, compute its gross input capacity, and **sort the whole
    ladder descending** by fee-adjusted marginal price.
 
-**On-chain (`ecoswap.sauce.ts`)** — a **single-pass** (live-cut) sweep: it reads each pool's live price
-once and accumulates bracket capacity along the ladder until the input is exhausted, so the cut is
-**implicit** (where the sweep stops) and the swaps are computed then pulled (compute-then-pull). Phase A /
-Phase B below describe the equivalent water-fill outcome the one sweep realises.
-- **Phase A** — walk the pre-sorted ladder once, summing capacity until `amountIn` is reached, to find
-  the common marginal-price cut `cutSqrtAdj` (the water-fill level).
-- **Phase B** — for each direct pool, re-read its **live** price (V3 `slot0` / V4 `StateView.getSlot0`
-  by poolId / V2 `getReserves`), integrate the exact input to move from the live price down to the cut,
-  and do one swap (V3 → flat `swapV3`; V2/V4 → unified `swap(SwapParams)`). Routes allocate whole
-  segments above the cut and swap hop1 → hop2. Compute-then-pull pulls exactly what the swaps consume;
-  one guarded terminal refund covers the limit-price edge.
+**On-chain (`ecoswap.sauce.ts`)** — a **K-way-lazy price-ordered merge**: it reads each pool's live state
+once in SETUP, then runs ONE merge over two candidate streams — the off-chain-sorted prepared `brackets[]`
+(a flat cursor, the **cache**) and each pool's live `dn` frontier (its deeper region, walked
+run-until-filled). Each step picks the highest fee-adjusted out/in head among `{brackets[bc], all active
+dn[]}`, consumes its segment into `inp[pool]`, and advances ONLY that stream. The cut is **implicit** (where
+the merge stops once `cum == amountIn`), and the swaps are computed then pulled (**compute-then-pull**).
+This is the optimal equalized split: exact (global price order), lazy (only reconstructs as `cum` needs),
+and bit-for-bit with the neutral optimal oracle (`test/ecoswap.optimal.ts`).
 
-Equal marginal price at the cut ⇒ synchronized minimal slippage across all venues.
+**One walk model (drift re-anchoring, both directions symmetric).** At **no drift** the merge consumes the
+prepared cache from the window top plus the prepare-time-anchored `dn` seed below it. At **any drift** (UP
+against the swap, or DOWN with it) the spot-anchored prepared brackets are stale, so the merge **skips the
+whole cache** for that pool and **re-anchors** its `dn` frontier to the LIVE read (live tick / sqrt / active
+L), walking ONE continuous tick-lattice grid from the true live spot — byte-identical to the oracle's
+continuous-from-live-spot walk. There is no separate `up` frontier: re-anchoring makes drift-UP symmetric to
+the proven-exact drift-DOWN path.
+
+For each direct pool the merge does one swap (V3 → flat `swapV3`; V2/V4 → unified `swap(SwapParams)`); routes
+allocate whole segments and swap hop1 → hop2. **`prepare.ts` is a gas-optimization cache, not a correctness
+dependency** — the solver is exact from live data alone (run-until-filled past any prepared window, even fully
+out of range); a quote runs with an empty cache. Compute-then-pull pulls exactly what the swaps consume; one
+guarded terminal refund covers the limit-price edge.
+
+Equal post-fee marginal price at the cut ⇒ synchronized minimal slippage across all venues.
 
 ## Data format & algorithms (deep dive)
 

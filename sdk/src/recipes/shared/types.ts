@@ -263,21 +263,28 @@ export interface EcoPool {
   /** floor(sqrt(1.0001^ts)*2^96) = getSqrtRatioAtTick(ts) — the multiplicative step ratio. */
   adaptiveStepRatio: bigint;
   /**
-   * PRE-FILL (against-swap drift) seed — pool tuple [14]. REAL sqrt (token1/token0,
-   * Q96) at the TOP prepared bracket's near edge = the prepare-time spot sqrt
-   * (spotReal). The on-chain pre-fill walk's STOP target: when the LIVE price has
-   * drifted UP past the prepared window, the solver water-fills the gap
-   * (topNearOI, liveCur] DOWN to here before the sweep. Stamped == spotReal so the
-   * pre-fill/sweep seam is exact (the top forward bracket's sqrtNear == toOutIn(spotReal)).
-   * 0 ⇒ no top edge known (no brackets) ⇒ pre-fill skipped (the no-bracket forward-
-   * from-spot walk handles the pool). V3/V4 only.
+   * WINDOW-TOP seed — pool tuple [14] = the prepare-time spot, used by the solver as the
+   * DRIFT GATE (the re-anchor trigger). DUAL MEANING by pool type:
+   *   - V3/V4: REAL sqrt (token1/token0, Q96) at the top prepared bracket's near edge =
+   *     the prepare-time spot real sqrt (spotReal). Stamped == spotReal so the seam is
+   *     exact (the top forward bracket's sqrtNear == toOutIn(spotReal)).
+   *   - V2: OUT/IN sqrt = the shallowest kept V2 bracket's sqrtNear = the prepare-time V2
+   *     spot out/in.
+   * The solver compares the LIVE out/in spot to toOutIn(this): on ANY drift (live != top,
+   * UP or DOWN) the pool RE-ANCHORS its single dn walk to the live spot and the merge
+   * STALE-SKIPS the spot-anchored prepared cache; with no drift (live == top) the prepared
+   * cache + the prepare-time dn seed run unchanged. (There is no separate up-frontier — an
+   * earlier drift-UP clamp-and-splice was replaced by this symmetric re-anchor.)
+   * 0 ⇒ no top edge known (no brackets) ⇒ no drift gate ⇒ the dn walk runs from the spot
+   * seed (the no-bracket / quote / no-cache path).
    */
   topNearReal: bigint;
   /**
-   * PRE-FILL no-bracket flag — pool tuple [15]. Number of forward prepared brackets
-   * this pool got. 0 ⇒ NO window ⇒ pre-fill skipped; the forward walk runs from the
-   * spot seed (gap B', the 1-RPC quote path). >0 ⇒ has a window; pre-fill fires only
-   * if live drifted above topNearOI. V3/V4 only.
+   * Forward-bracket count — pool tuple [15]. Number of prepared forward brackets the
+   * cache carries for this pool AFTER the trim (re-stamped from frontierByCount). 0 ⇒ NO
+   * cached window ⇒ the dn walk runs from the spot seed (the no-cache / 1-RPC quote path).
+   * >0 ⇒ the merge consumes that many cached brackets before the dn frontier (at no drift;
+   * on any drift the whole cache is stale-skipped and the live dn walk covers it). V3/V4.
    */
   bracketCount: number;
   /**
@@ -287,6 +294,22 @@ export interface EcoPool {
    * not prepared adaptively.
    */
   adaptiveNet?: Map<number, bigint>;
+  /**
+   * OFF-CHAIN-ONLY per-forward-bracket frontier snapshots (V3/V4). `frontierByCount[k]`
+   * is the dn-frontier ENTRY state AFTER `k` forward brackets were emitted — exactly the
+   * `(adaptiveStartShifted, adaptiveNearReal, adaptiveStartL)` the dn walk should resume
+   * from if the prepared cache is TRIMMED to `k` brackets for this pool. `[0]` is the spot
+   * seed (no brackets crossed); the last entry equals the full-window seed.
+   *
+   * Why it exists: buildV3Brackets stamps the dn seed at the END of the FULL lens window,
+   * but `prepareEcoSwap` then TRIMS the ladder to only the crossed brackets. After the
+   * trim a pool may keep K < window brackets, so the full-window seed sits K..window ticks
+   * PAST the last kept bracket — a gap the dn frontier would skip (the live walk resumes
+   * too deep, mis-allocating across pools under with-swap drift). prepareEcoSwap re-stamps
+   * the seed from `frontierByCount[K]` after the trim so the dn frontier is CONTIGUOUS with
+   * the kept cache. NOT in the compiler tuple (only the re-stamped scalar seeds ship).
+   */
+  frontierByCount?: { shifted: bigint; nearReal: bigint; L: bigint }[];
   /**
    * OFF-CHAIN-ONLY pre-fill drift model (oracle mirror, ecoswap.reference.ts). The
    * deterministic local tests run live==prepared, so the pre-fill is a no-op unless a

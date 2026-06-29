@@ -201,6 +201,18 @@ function toOutIn(sqrtReal: bigint, zeroForOne: boolean): bigint {
   return zeroForOne ? sqrtReal : Q192 / sqrtReal;
 }
 
+/**
+ * Next REAL sqrt one tickSpacing step in the swap direction (MULTIPLICATIVE) — the
+ * exact mirror of the on-chain solver/lens `stepReal` and the oracle's `stepReal`:
+ *   zeroForOne (price down): sqrt' = mulDiv(sqrt, 2^96, stepRatio)
+ *   oneForZero (price up):   sqrt' = mulDiv(sqrt, stepRatio, 2^96)
+ * (stepRatio = getSqrtRatioAtTick(tickSpacing).) Used to build the prepared V3/V4
+ * bracket far edges so the prepared geometry == the live-walk/oracle geometry.
+ */
+function stepRealTs(sqrtReal: bigint, stepRatio: bigint, zeroForOne: boolean): bigint {
+  return zeroForOne ? (sqrtReal * Q96) / stepRatio : (sqrtReal * stepRatio) / Q96;
+}
+
 // ── Classification ───────────────────────────────────────────
 
 function isUsableV2(p: PoolInfo): boolean {
@@ -318,16 +330,33 @@ function buildV3Brackets(
   // ── Forward brackets (swap direction) ──
   // STOP at the lazy lens's scanned forward boundary — never walk past the data
   // it actually read (that would fabricate phantom brackets assuming L unchanged).
+  //
+  // EXACTNESS (k-way §7): step nearReal MULTIPLICATIVELY via stepReal(near, stepRatio)
+  // — the SAME geometry the on-chain lens MEASURE, the solver's up/dn frontiers, AND
+  // the optimal oracle (ecoswap.optimal.ts v3Segments) walk — NOT getSqrtRatioAtTick(b)
+  // per boundary. getSqrtRatioAtTick and the multiplicative step diverge by a few wei
+  // per step (growing); using stepReal here makes the prepared-region geometry identical
+  // to the live-walk/oracle geometry EVERYWHERE, so a no-drift prepared-only fill equals
+  // the oracle to the wei (and the prepared→dn seam is path-additive bit-for-bit).
+  const stepRatio = getSqrtRatioAtTick(ts);
   let L = r.activeLiquidity;
-  let nearReal = spotReal; // real sqrt at the near edge (starts live)
+  let nearReal = spotReal; // real sqrt at the near edge (starts live = spot)
   let b = zeroForOne ? base : base + ts; // first boundary tick in swap dir
   const step = zeroForOne ? -ts : ts;
   let fwdCount = 0; // forward brackets actually emitted (≤ scannedForward; pre-fill seed)
+  // Per-emitted-bracket dn-frontier ENTRY snapshots. frontier[k] is the resume state
+  // (shifted boundary, nearReal, L) AFTER k emitted forward brackets — used by
+  // prepareEcoSwap to re-stamp the dn seed CONTIGUOUS with the kept cache after the trim
+  // (see EcoPool.frontierByCount). frontier[0] is the spot seed (no brackets crossed).
+  const frontier: { shifted: bigint; nearReal: bigint; L: bigint }[] = [
+    { shifted: BigInt(b + OFFSET_TICK), nearReal, L },
+  ];
   for (let k = 0; k < r.scannedForward; k++) {
-    const farReal = getSqrtRatioAtTick(b);
+    const farReal = stepRealTs(nearReal, stepRatio, zeroForOne);
     const near = toOutIn(nearReal, zeroForOne);
     const far = toOutIn(farReal, zeroForOne);
-    if (L > 0n && far > 0n && near > far) {
+    const emitted = L > 0n && far > 0n && near > far;
+    if (emitted) {
       brackets.push(makeBracket(EcoBracketKind.V3, refIdx, near, far, L, feePpm));
       fwdCount++;
     }
@@ -336,6 +365,9 @@ function buildV3Brackets(
     if (L < 0n) L = 0n;
     nearReal = farReal;
     b += step;
+    // Snapshot the resume state AFTER this step iff it emitted a bracket — frontier[]
+    // is indexed by emitted-bracket count, so it lines up with the per-pool kept count.
+    if (emitted) frontier.push({ shifted: BigInt(b + OFFSET_TICK), nearReal, L });
   }
 
   // ── Adaptive frontier seeds (WS4) ──
@@ -349,10 +381,11 @@ function buildV3Brackets(
   // keep their spot-seed initial values — the unified derivation handles both cases.
   if (seed) {
     seed.adaptiveStartL = L; // active L entering the first un-walked step
-    seed.adaptiveNearReal = nearReal; // EXACT TickMath sqrt at the last crossed boundary (or spot)
+    seed.adaptiveNearReal = nearReal; // MULTIPLICATIVE sqrt at the last crossed edge (or spot)
     seed.adaptiveStartShifted = BigInt(b + OFFSET_TICK); // next (un-walked) boundary, shifted
-    seed.adaptiveStepRatio = getSqrtRatioAtTick(ts); // == lens stepRatioForSpacing
+    seed.adaptiveStepRatio = stepRatio; // getSqrtRatioAtTick(ts) == lens stepRatioForSpacing
     seed.adaptiveNet = r.net; // off-chain-only net map for the oracle's mirrored walk
+    seed.frontierByCount = frontier; // per-kept-count dn resume state (re-stamped post-trim)
 
     // Pre-fill (against-swap drift) seeds (WS2 §3.1): the STOP target is the prepare-
     // time spot real sqrt — stamped == spotReal so the pre-fill's topNearOI
@@ -391,12 +424,17 @@ function buildV3Brackets(
             `(base=${base} step=${step} scannedForward=${r.scannedForward})`,
         );
       }
-      // nearReal is the TickMath sqrt at the LAST crossed boundary = b - step.
-      const lastCrossed = b - step;
-      const expectNear = getSqrtRatioAtTick(lastCrossed);
+      // nearReal is spot stepped MULTIPLICATIVELY scannedForward times (the seed must
+      // equal the last prepared bracket's far edge so the on-chain dn frontier resumes
+      // path-additively). Replay the multiplicative walk and compare.
+      let expectNear = spotReal;
+      for (let kk = 0; kk < r.scannedForward; kk++) {
+        expectNear = stepRealTs(expectNear, stepRatio, zeroForOne);
+      }
       if (seed.adaptiveNearReal !== expectNear) {
         throw new Error(
-          `adaptive seed: nearReal ${seed.adaptiveNearReal} !== getSqrtRatioAtTick(${lastCrossed}) ${expectNear}`,
+          `adaptive seed: nearReal ${seed.adaptiveNearReal} !== multiplicative replay ${expectNear} ` +
+            `(scannedForward=${r.scannedForward})`,
         );
       }
     }
@@ -822,12 +860,28 @@ export async function prepareEcoSwap(
   }
   for (const set of routeBracketSets) brackets.push(...set);
 
-  if (brackets.length === 0) {
-    throw new Error(`No usable pools/brackets for ${tokenIn} -> ${tokenOut}`);
+  // The prepared brackets are a CACHE (an optimization), not a correctness dependency:
+  // the on-chain solver reconstructs everything LIVE from each pool's frontier seed even
+  // with an empty ladder (the no-cache / 1-RPC quote path, opts.maxTicks:0). So an empty
+  // bracket set is legitimate as long as some pool survived discovery — only a TRULY empty
+  // universe (no pools AND no routes) is an error.
+  if (pools.length === 0 && routes.length === 0) {
+    throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
 
   // ── Sort the global ladder DESC by fee-adjusted near price ──
-  brackets.sort((a, b) => (a.sqrtAdjNear < b.sqrtAdjNear ? 1 : a.sqrtAdjNear > b.sqrtAdjNear ? -1 : 0));
+  // Tie-break EXACTLY as the optimal oracle (ecoswap.optimal.ts): adjNear DESC, then
+  // adjFar DESC, then pool/route idx ASC. Two pools at the SAME fee-adjusted spot (e.g. a
+  // V2 0.30% and a V4 0.30% pool both at 1:1) have IDENTICAL sqrtAdjNear on their first
+  // bracket; without a deterministic secondary key the merge would consume them in an
+  // arbitrary order and over/under-shoot the cut vs the oracle (the shallower-step pool
+  // must go first — higher adjFar — so a coarse segment never overshoots). This makes the
+  // k-way merge's prepared-cursor order bit-identical to the oracle's stable segment sort.
+  brackets.sort((a, b) => {
+    if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
+    if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
+    return a.refIdx - b.refIdx;
+  });
 
   // ── Off-chain water-fill pre-run → trim to EXACTLY the crossed ticks ──
   // WS2 §3.2: drop the +SAFETY_TICKS past-cut buffer. Walk the sorted ladder
@@ -850,6 +904,37 @@ export async function prepareEcoSwap(
   const trimmed =
     kept.length >= MIN_BRACKETS ? kept : brackets.slice(0, Math.min(brackets.length, MIN_BRACKETS));
 
+  // ── Re-stamp the V3/V4 dn-frontier seed CONTIGUOUS with the kept cache ──
+  // The trim above keeps only the crossed brackets, but buildV3Brackets stamped each
+  // pool's dn seed at the END of the FULL lens window. After the trim a pool may keep K
+  // < window brackets, so the full-window seed sits PAST the last kept bracket — a gap
+  // the dn frontier would skip (it resumes too deep, mis-allocating across pools under
+  // with-swap drift, the B3 trim-vs-seed gap). A pool's kept brackets are always a
+  // price-descending PREFIX of its brackets (per-pool order is monotone; the global sort
+  // preserves it), so re-stamp the seed from frontierByCount[K] (the resume state after K
+  // emitted brackets) so the live dn walk picks up EXACTLY where the kept cache stops.
+  {
+    const keptCountByPool = new Map<number, number>();
+    for (const b of trimmed) {
+      if (b.kind === EcoBracketKind.V3) {
+        keptCountByPool.set(b.refIdx, (keptCountByPool.get(b.refIdx) ?? 0) + 1);
+      }
+    }
+    for (let pi = 0; pi < pools.length; pi++) {
+      const pool = pools[pi];
+      if (pool.isV2 || !pool.frontierByCount) continue;
+      const k = keptCountByPool.get(pi) ?? 0;
+      const snaps = pool.frontierByCount;
+      // Clamp K to the snapshot range (K == fwdCount keeps the full-window seed).
+      const idx = k < snaps.length ? k : snaps.length - 1;
+      const snap = snaps[idx];
+      pool.adaptiveStartShifted = snap.shifted;
+      pool.adaptiveNearReal = snap.nearReal;
+      pool.adaptiveStartL = snap.L;
+      pool.bracketCount = k; // forward brackets the cache actually carries for this pool
+    }
+  }
+
   // ── V2 constant-L streaming seed (WS2 #104) ──
   // A V2 pool is a single √k curve over the ENTIRE price range, so the on-chain solver
   // can stream geometric out/in slices past its prepared window at the LIVE constant L
@@ -864,15 +949,43 @@ export async function prepareEcoSwap(
   for (let pi = 0; pi < pools.length; pi++) {
     const pool = pools[pi];
     if (!pool.isV2) continue;
-    let deepestFar = 0n; // smallest out/in far among this pool's kept V2 brackets
+    let deepestFar = 0n; // smallest out/in far among this pool's kept V2 brackets (dn frontier)
+    let shallowestNear = 0n; // largest out/in near among kept V2 brackets = V2 window top
+    // The largest sqrtNear across ALL of this pool's brackets = the prepare-time V2
+    // spot out/in (the first buildV2Brackets near). Used to assert the window-top seam.
+    let spotNear = 0n;
+    for (const b of brackets) {
+      if (b.kind === EcoBracketKind.V2 && b.refIdx === pi) {
+        if (b.sqrtNear > spotNear) spotNear = b.sqrtNear;
+      }
+    }
     for (const b of trimmed) {
       if (b.kind === EcoBracketKind.V2 && b.refIdx === pi) {
         if (deepestFar === 0n || b.sqrtFar < deepestFar) deepestFar = b.sqrtFar;
+        if (b.sqrtNear > shallowestNear) shallowestNear = b.sqrtNear;
       }
     }
     if (deepestFar > 0n) {
-      pool.adaptiveStartShifted = 1n; // V2-walk enable flag
-      pool.adaptiveNearReal = deepestFar; // out/in frontier (deepest kept far)
+      pool.adaptiveStartShifted = 1n; // V2-walk enable flag (dn frontier)
+      pool.adaptiveNearReal = deepestFar; // out/in dn frontier (deepest kept far)
+      // ── V2 window top (out/in) — the prepare-time V2 spot, used as the re-anchor gate ──
+      // The shallowest kept V2 bracket's sqrtNear == the prepare-time V2 spot out/in.
+      // Stamped into topNearReal (dual meaning vs V3/V4 — see types.ts). The on-chain
+      // solver compares the LIVE V2 out/in spot to this value: on ANY drift (live != top)
+      // V2 re-anchors its SINGLE constant-L geometric grid to the live spot (one continuous
+      // dn stream) and stale-skips this spot-anchored prepared cache (D1). With no drift
+      // (live == top) the prepared cache + the deepestFar dn seed run unchanged. So the
+      // prepared region [top, deepestFar] is consumed only at the prepare-time price, and any
+      // off-spot price is served entirely by the re-anchored live grid — no overlap/gap.
+      pool.topNearReal = shallowestNear;
+      // Seam invariant (mirror of the V3 seam assert): the shallowest kept bracket's
+      // near must equal the V2 spot out/in (the first buildV2Brackets near), so the
+      // window top exactly anchors the prepared region's top edge.
+      if (spotNear > 0n && shallowestNear !== spotNear) {
+        throw new Error(
+          `V2 window-top seam: shallowestNear=${shallowestNear} !== V2 spot out/in=${spotNear} (pool ${pi})`,
+        );
+      }
     }
   }
 
