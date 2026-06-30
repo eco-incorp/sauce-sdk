@@ -48,6 +48,11 @@ import {
   buildSolidlyStableSegments,
   type SolidlyStablePool,
 } from "../shared/solidly-stable-math";
+import {
+  quotePotentialSwap,
+  buildWombatSegments,
+  type WombatPool,
+} from "../shared/wombat-math";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -1606,5 +1611,70 @@ describe("Solidly STABLE (sAMM) — getAmountOutStable known-answer + sampler", 
     // Σ effOut over the grid == getAmountOutStable(amountIn) (the sampler is a partition of the curve).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
     assert.equal(sumOut, getAmountOutStable(p, amountIn), "Σ segment effOut == getAmountOutStable(amountIn)");
+  });
+});
+
+// ── Wombat (single-sided stableswap) known-answer + segment sampler ──────────
+//
+// Pins the off-chain coverage-ratio replay (quotePotentialSwap + buildWombatSegments) BEFORE the
+// local-EVM test, so a regression in the closed-form bigint math is caught without anvil. The
+// wei-exact bound is documented in wombat-math.ts: the SPLIT is exact-on-grid vs the oracle (one
+// shared sampler) and the realized dy is exact-in-dy (the pool quotePotentialSwap view == the pool
+// swap math). These vectors are the deterministic quotePotentialSwap outputs for fixed states
+// (regenerate only on an intentional math change). cash/liability are WAD regardless of token
+// decimals; amp 0.2%, haircut 0.01% (canonical Wombat main-pool params). A near-1:1 stable swap
+// loses only the haircut + tiny coverage-ratio slippage.
+describe("Wombat (single-sided stableswap) — quotePotentialSwap known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  const AMP = 2n * 10n ** 15n; // 0.002e18 = 0.2%
+  const HC = 10n ** 14n; // 0.0001e18 = 0.01% haircut
+  function pool(
+    fromCash: bigint, fromLiability: bigint, toCash: bigint, toLiability: bigint,
+    decIn: bigint, decOut: bigint,
+  ): WombatPool {
+    return {
+      address: Z, fromCash, fromLiability, toCash, toLiability,
+      ampFactor: AMP, haircutRate: HC, decIn, decOut, tokenIn: Z, tokenOut: Z,
+      feePpm: 100, source: "kat",
+    };
+  }
+
+  it("balanced pool (cash==liability, 18-dec), amp 0.2% / haircut 0.01% — exact coverage-ratio vectors", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, E18, E18);
+    // Hand-pinned from the closed-form replay (mirrors the WombatPool fixture _quoteFrom bit-for-bit).
+    assert.equal(quotePotentialSwap(p, 1_000n * E18), 999_896_008_395_200_400_000n);
+    assert.equal(quotePotentialSwap(p, 10_000n * E18), 9_998_600_814_580_673_186_100n);
+    assert.equal(quotePotentialSwap(p, 100_000n * E18), 99_949_699_502_944_117_863_300n);
+    // Stable shape: a small trade returns ~the input net of the 0.01% haircut (≈ 0.9999·in) with
+    // sub-bps coverage slippage on top — far flatter than a constant-product pool of the same depth.
+    const out1k = quotePotentialSwap(p, 1_000n * E18);
+    assert.ok(out1k < 1_000n * E18 && out1k > 999n * E18, "near-1:1 minus haircut on the coverage-ratio curve");
+  });
+
+  it("imbalanced pool (from over-, to under-covered) — exact vector", () => {
+    const p = pool(1_200_000n * E18, 1_000_000n * E18, 800_000n * E18, 1_000_000n * E18, E18, E18);
+    assert.equal(quotePotentialSwap(p, 50_000n * E18), 49_895_364_213_513_015_209_100n);
+  });
+
+  it("decimals normalisation — 6-dec out token denormalises exactly", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, E18, 10n ** 6n);
+    // 1000 (18-dec) in → ~1000 (6-dec) out net of haircut: 999.896008 USDC-units.
+    assert.equal(quotePotentialSwap(p, 1_000n * E18), 999_896_008n);
+  });
+
+  it("buildWombatSegments — covers amountIn, descending marginals, partition of the curve", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, E18, E18);
+    const amountIn = 100_000n * E18;
+    const segs = buildWombatSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == quotePotentialSwap(amountIn) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, quotePotentialSwap(p, amountIn), "Σ segment effOut == quotePotentialSwap(amountIn)");
   });
 });

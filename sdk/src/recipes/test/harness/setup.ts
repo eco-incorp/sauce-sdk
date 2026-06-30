@@ -88,6 +88,11 @@ export const dodoV2PoolArtifact = loadArtifact(
 export const solidlyStablePoolArtifact = loadArtifact(
   join(FIXTURES, "SolidlyStablePool.sol", "SolidlyStablePool.json"),
 );
+/** Wombat (single-sided stableswap) pool — deployed normally (constructor sets tokens/decimals/
+ *  cash/liability/amp/haircut). */
+export const wombatPoolArtifact = loadArtifact(
+  join(FIXTURES, "WombatPool.sol", "WombatPool.json"),
+);
 /** Trader Joe LB pair — deployed normally (constructor sets tokens/binStep/baseFactor/activeId). */
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
@@ -811,6 +816,62 @@ export async function deploySolidlyStablePool(
   });
   await writeAndWait(walletClient, publicClient, {
     address: pool, abi: solidlyStableAbi as Abi, functionName: "sync", args: [], account: acct,
+  });
+  return pool;
+}
+
+export const wombatPoolAbi = parseAbi([
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+  "function cash0() view returns (uint256)",
+  "function liability0() view returns (uint256)",
+  "function cash1() view returns (uint256)",
+  "function liability1() view returns (uint256)",
+  "function ampFactor() view returns (uint256)",
+  "function haircutRate() view returns (uint256)",
+  "function quotePotentialSwap(address fromToken, address toToken, int256 fromAmount) view returns (uint256 potentialOutcome, uint256 haircut)",
+  "function swap(address fromToken, address toToken, uint256 fromAmount, uint256 minimumToAmount, address to, uint256 deadline) returns (uint256 actualToAmount, uint256 haircut)",
+]);
+
+/**
+ * Deploy a local Wombat (single-sided stableswap) pool and fund it with its token0/token1 out-side
+ * reserves.
+ *
+ * Mirrors the canonical wombat-exchange/v1-core CoreV2 coverage-ratio quote + Pool haircut bit-for-bit
+ * (matching the off-chain `wombat-math.ts` replay), so `quotePotentialSwap(fromToken, toToken, amount)`
+ * returns EXACTLY `quotePotentialSwap(pool, dx)` to the wei. EcoSwap executes it callback-free (approve
+ * + pool.swap; Wombat PULLS via transferFrom), so the pool must HOLD enough of each token to pay out —
+ * `minter` transfers reserve0/reserve1 (native units) in. cash/liability are passed in WAD.
+ * `token0Addr`/`token1Addr` must be the address-sorted pair (token0 < token1).
+ */
+export async function deployWombatPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  token0Addr: Hex,
+  token1Addr: Hex,
+  dec0: bigint,
+  dec1: bigint,
+  cash0: bigint,
+  liability0: bigint,
+  cash1: bigint,
+  liability1: bigint,
+  ampFactor: bigint,
+  haircutRate: bigint,
+  reserve0: bigint,
+  reserve1: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: wombatPoolArtifact.abi,
+    bytecode: wombatPoolArtifact.bytecode,
+    args: [token0Addr, token1Addr, dec0, dec1, cash0, liability0, cash1, liability1, ampFactor, haircutRate],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: token0Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
   });
   return pool;
 }

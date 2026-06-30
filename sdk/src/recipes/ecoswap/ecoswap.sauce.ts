@@ -5,6 +5,7 @@ import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IKyberPool } from "./IKyberPool.json";
 import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
+import { IWombatPool } from "./IWombatPool.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -211,6 +212,7 @@ const HAS_CURVE: boolean = true;
 const HAS_LB: boolean = true;
 const HAS_DODO: boolean = true;
 const HAS_SOLIDLY_STABLE: boolean = true;
+const HAS_WOMBAT: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -287,6 +289,8 @@ function main(
   let dven: Tuple = new Array(segs.length); // DODO venue (pool) address
   let sinp: Tuple = new Array(segs.length); // Solidly-stable per-venue Σ input
   let sven: Tuple = new Array(segs.length); // Solidly-stable venue (pool) address
+  let winp: Tuple = new Array(segs.length); // Wombat per-venue Σ input
+  let wven: Tuple = new Array(segs.length); // Wombat venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -504,7 +508,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE) && segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT) && segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -826,7 +830,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE) && bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT) && bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -852,10 +856,16 @@ function main(
                   dinp[sIdx] = dinp[sIdx] + stake;
                   dven[sIdx] = sVenue;
                 } else {
-                  // segKind 4 — Solidly STABLE (sAMM): callback-free, executed below via getAmountOut.
-                  if (HAS_SOLIDLY_STABLE) {
+                  if (HAS_SOLIDLY_STABLE && sKind === 4) {
+                    // segKind 4 — Solidly STABLE (sAMM): callback-free, executed below via getAmountOut.
                     sinp[sIdx] = sinp[sIdx] + stake;
                     sven[sIdx] = sVenue;
+                  } else {
+                    // segKind 5 — Wombat: callback-free, executed below via quotePotentialSwap + swap.
+                    if (HAS_WOMBAT) {
+                      winp[sIdx] = winp[sIdx] + stake;
+                      wven[sIdx] = sVenue;
+                    }
                   }
                 }
               }
@@ -1166,6 +1176,32 @@ function main(
         } else {
           ISolidlyStablePool.at(spool).swap(sOut, 0, address.self, sEmpty);
         }
+      }
+    }
+  }
+  }
+  // Wombat (single-sided stableswap) → CALLBACK-FREE (NO engine SwapPoolType). Wombat is a
+  // coverage-ratio stableswap (NOT xy=k), so the engine's _swapV2 would mis-price it. Execute exactly
+  // as the pool's own router would: read the EXACT actualToAmount from the pool's quotePotentialSwap
+  // view (the view IS the swap math ⇒ wei-exact-in-dy for the awarded share), APPROVE the pool to pull
+  // the awarded input (Wombat PULLS via transferFrom inside swap, unlike the transfer-first V2/Solidly
+  // path), then call swap(fromToken, toToken, fromAmount, minimumToAmount, to, deadline) with
+  // minimumToAmount == the quoted out (the realized out == the quote ⇒ the min never trips) and a
+  // far-future deadline. compute-then-pull already transferred `cum` (incl. each Wombat share) into
+  // this contract above, so the approved pull draws from this contract's balance and the out lands
+  // here (to == address.self). fromToken/toToken == tokenIn/tokenOut (the swap's own tokens).
+  if (HAS_WOMBAT) {
+  for (let w = 0; w < segs.length; w = w + 1) {
+    const wamt: Uint256 = winp[w];
+    if (wamt > 0) {
+      const wpool: Address = wven[w];
+      // Index the quote tuple INLINE (mirrors the Kyber getTradeInfo()[k] pattern) — a Tuple-var
+      // round-trip of a call result drops the descriptor and reverts INDEX on v1.
+      const wOut: Uint256 = IWombatPool.at(wpool).quotePotentialSwap(tokenIn, tokenOut, wamt)[0];
+      if (wOut > 0) {
+        const wDeadline: Uint256 = 2 ** 64;
+        token.approve(wpool, wamt);
+        IWombatPool.at(wpool).swap(tokenIn, tokenOut, wamt, wOut, address.self, wDeadline);
       }
     }
   }

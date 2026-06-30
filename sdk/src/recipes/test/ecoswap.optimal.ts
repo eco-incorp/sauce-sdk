@@ -65,6 +65,7 @@ import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
+import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -148,6 +149,15 @@ export interface OptimalPool {
    * `solidlyStable` is set.
    */
   solidlyStable?: SolidlyStablePool;
+  /**
+   * Wombat (single-sided stableswap) pool — when present this pool is a WOMBAT venue (NOT
+   * V2/V3/Curve/LB/DODO/Solidly). The oracle enumerates its segments via the SHARED closed-form
+   * coverage-ratio replay (buildWombatSegments) from the live from/to asset cash/liability + amp +
+   * haircut, so the split is exact-on-grid vs prepare's segments (one replay). The marginal is
+   * post-haircut (quotePotentialSwap nets the haircut), so it enters the descending-price merge
+   * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable` are ignored when `wombat` is set.
+   */
+  wombat?: WombatPool;
 }
 
 /**
@@ -468,6 +478,21 @@ function solidlyStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint
   return segs;
 }
 
+/**
+ * Enumerate one Wombat pool's segments via the SHARED closed-form replay (buildWombatSegments) from
+ * the live from/to asset cash/liability + amp + haircut. The amountIn caps the sampled range — the
+ * same bound prepare uses — so the oracle and prepare emit the IDENTICAL segment grid (single source),
+ * making the split exact-on-grid. The Wombat marginalOI is the post-haircut execution price
+ * (quotePotentialSwap nets the haircut); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function wombatSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildWombatSegments(p.wombat!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -692,7 +717,12 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.solidlyStable) {
+    if (p.wombat) {
+      // Wombat (single-sided stableswap) venue: sampled-segment enumeration via the shared closed-form
+      // coverage-ratio replay (capped at amountIn — the same bound prepare samples → identical grid →
+      // exact-on-grid split).
+      allSegs.push(...wombatSegments(p, i, amountIn));
+    } else if (p.solidlyStable) {
       // Solidly STABLE (sAMM) venue: sampled-segment enumeration via the shared x3y+y3x replay (capped
       // at amountIn — the same bound prepare samples → identical grid → exact-on-grid split).
       allSegs.push(...solidlyStableSegments(p, i, amountIn));

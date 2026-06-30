@@ -45,11 +45,13 @@ import {
   discoverTraderJoeLBPoolsTyped,
   discoverDodoV2PoolsTyped,
   discoverSolidlyStablePoolsTyped,
+  discoverWombatPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
+import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import {
   MIN_SQRT_RATIO,
   MAX_SQRT_RATIO,
@@ -71,6 +73,7 @@ import {
   type EcoLb,
   type EcoDodo,
   type EcoSolidlyStable,
+  type EcoWombat,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -532,6 +535,33 @@ function buildSolidlyStableBrackets(pool: SolidlyStablePool, refIdx: number, amo
   return brackets;
 }
 
+/**
+ * Build Wombat segments for one pool by sampling the closed-form coverage-ratio replay (NO extra RPC —
+ * pure bigint on the read from/to asset cash/liability + amp + haircut). Each sampled (Δinput, Δoutput)
+ * increment becomes a STATIC segment (kind Wombat) in unified out/in space, refIdx → the Wombat venue
+ * index. The marginal is the POST-HAIRCUT execution price (quotePotentialSwap already nets the
+ * haircut), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The
+ * Wombat curve is OFF-CHAIN ONLY for the split; the on-chain solver executes CALLBACK-FREE
+ * (quotePotentialSwap staticcall + approve + pool.swap — Wombat PULLS via transferFrom).
+ */
+function buildWombatBrackets(pool: WombatPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildWombatSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.Wombat,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Wombat haircut (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
 // ── Main preparation ─────────────────────────────────────────
 
 /** Tuning knobs for off-chain preparation (overridable per call; mainly for tests). */
@@ -790,6 +820,27 @@ export async function prepareEcoSwap(
   }
   for (const set of solidlyBracketSets) brackets.push(...set);
 
+  const wombats: EcoWombat[] = [];
+  const wombatBracketSets: EcoBracket[][] = [];
+  const wombatPools = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Wombat);
+  if (wombatPools.length > 0) {
+    const wombatRaw = await discoverWombatPoolsTyped(tokenIn, tokenOut, client, wombatPools);
+    for (const wp of wombatRaw) {
+      const refIdx = wombats.length;
+      const wb = buildWombatBrackets(wp, refIdx, amountIn);
+      if (wb.length === 0) continue;
+      wombats.push({
+        address: wp.address,
+        fromToken: wp.tokenIn,
+        toToken: wp.tokenOut,
+        feePpm: wp.feePpm,
+        source: wp.source,
+      });
+      wombatBracketSets.push(wb);
+    }
+  }
+  for (const set of wombatBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -933,7 +984,8 @@ export async function prepareEcoSwap(
     curves.length === 0 &&
     lbs.length === 0 &&
     dodos.length === 0 &&
-    solidlyStables.length === 0
+    solidlyStables.length === 0 &&
+    wombats.length === 0
   ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
@@ -948,12 +1000,14 @@ export async function prepareEcoSwap(
   const nLbSegs = brackets.filter((b) => b.kind === EcoBracketKind.LB).length;
   const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
   const nSolidlySegs = brackets.filter((b) => b.kind === EcoBracketKind.SolidlyStable).length;
+  const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
+      `${wombats.length} Wombat, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
-      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable)`,
+      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat)`,
   );
 
   return {
@@ -968,6 +1022,7 @@ export async function prepareEcoSwap(
     lbs,
     dodos,
     solidlyStables,
+    wombats,
     brackets,
     zeroForOne,
     priceLimit,

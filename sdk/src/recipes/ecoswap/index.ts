@@ -214,13 +214,15 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const lbs = prepared.lbs ?? [];
   const dodos = prepared.dodos ?? [];
   const solidlyStables = prepared.solidlyStables ?? [];
+  const wombats = prepared.wombats ?? [];
   return prepared.brackets
     .filter(
       (b) =>
         b.kind === EcoBracketKind.Curve ||
         b.kind === EcoBracketKind.LB ||
         b.kind === EcoBracketKind.DODO ||
-        b.kind === EcoBracketKind.SolidlyStable,
+        b.kind === EcoBracketKind.SolidlyStable ||
+        b.kind === EcoBracketKind.Wombat,
     )
     .slice()
     .sort((a, b) => {
@@ -233,8 +235,11 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isLb = b.kind === EcoBracketKind.LB;
       const isDodo = b.kind === EcoBracketKind.DODO;
       const isSolidly = b.kind === EcoBracketKind.SolidlyStable;
-      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable (callback-free getAmountOut + pool.swap).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : 0n;
+      const isWombat = b.kind === EcoBracketKind.Wombat;
+      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat — kinds 4/5 are callback-free
+      // (the pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap +
+      // approve + pool.swap (Wombat PULLS via transferFrom).
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -243,7 +248,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
             ? BigInt(dodos[b.refIdx].address)
             : isSolidly
               ? BigInt(solidlyStables[b.refIdx].address)
-              : 0n;
+              : isWombat
+                ? BigInt(wombats[b.refIdx].address)
+                : 0n;
       return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
     });
 }
@@ -282,6 +289,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_LB = (prepared.lbs?.length ?? 0) > 0;
   const HAS_DODO = (prepared.dodos?.length ?? 0) > 0;
   const HAS_SOLIDLY_STABLE = (prepared.solidlyStables?.length ?? 0) > 0;
+  const HAS_WOMBAT = (prepared.wombats?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -292,6 +300,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_LB,
     HAS_DODO,
     HAS_SOLIDLY_STABLE,
+    HAS_WOMBAT,
   };
 }
 

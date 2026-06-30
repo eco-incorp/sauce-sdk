@@ -28,6 +28,7 @@ import { A_PRECISION_DEFAULT, type CurvePool } from "./curve-math.js";
 import type { LbPool } from "./lb-math.js";
 import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 import type { SolidlyStablePool } from "./solidly-stable-math.js";
+import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 
 // ── ABIs ──────────────────────────────────────────────────────
 
@@ -1529,6 +1530,124 @@ export async function discoverKyberClassicPools(
     });
   }
   return pools;
+}
+
+// ── Wombat Exchange (single-sided stableswap) discovery ─────────────────────
+
+// Wombat Pool (multi-asset singleton) + Asset surface. The pool resolves each token's Asset via
+// addressOfAsset(token); the asset exposes cash()/liability() in WAD (18.18 fixed point, regardless
+// of the underlying token's decimals). ampFactor()/haircutRate() are pool-wide WAD getters. The
+// underlying token's decimals come from erc20 decimals() (the WAD↔native scaling).
+const wombatPoolAbi = parseAbi([
+  "function addressOfAsset(address token) external view returns (address)",
+  "function ampFactor() external view returns (uint256)",
+  "function haircutRate() external view returns (uint256)",
+  "function quotePotentialSwap(address fromToken, address toToken, int256 fromAmount) external view returns (uint256 potentialOutcome, uint256 haircut)",
+]);
+
+const wombatAssetAbi = parseAbi([
+  "function cash() external view returns (uint120)",
+  "function liability() external view returns (uint120)",
+]);
+
+/** Round a Wombat haircutRate (WAD, e.g. 1e14 = 0.01%) to a ppm fee (the price-ordering coordinate). */
+function wombatHaircutToPpm(haircutRate: bigint): number {
+  return Number((haircutRate * 1_000_000n + WOMBAT_WAD / 2n) / WOMBAT_WAD);
+}
+
+/**
+ * Discover Wombat pools for the pair AS TYPED `WombatPool` descriptors (the EcoSwap path). Wombat is
+ * a single-sided MULTI-ASSET stableswap singleton: each FactoryConfig.address is ONE Wombat Pool, and
+ * a (tokenIn,tokenOut) swap is valid iff BOTH tokens are assets of that pool (addressOfAsset(token) !=
+ * 0). The curve math is OFF-CHAIN ONLY: this reads the live from/to asset (cash, liability) — both
+ * WAD — plus the pool-wide ampFactor + haircutRate (WAD) and the two tokens' native decimals, so
+ * prepare's `buildWombatSegments` can replay quotePotentialSwap with NO further RPC, and the on-chain
+ * solver consumes the sampled segments statically + executes CALLBACK-FREE (quotePotentialSwap
+ * staticcall + approve + pool.swap — NO engine SwapPoolType, since Wombat is NOT xy=k).
+ *
+ * Mirrors `discoverSolidlyStablePoolsTyped` / `discoverCurvePoolsTyped`: off-chain discovery + state
+ * reads, returning the venue descriptor EcoSwap prepare consumes directly (the on-chain lens does not
+ * understand Wombat). Pool path: addressOfAsset(tokenIn)/addressOfAsset(tokenOut) (both must be
+ * non-zero) → per-asset cash()/liability() + pool ampFactor()/haircutRate(). Decimals are read via
+ * erc20 `decimals()` (cash/liability are already WAD, so decimals only scale the swap amount in/out).
+ */
+export async function discoverWombatPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  pools: FactoryConfig[],
+): Promise<WombatPool[]> {
+  if (pools.length === 0) return [];
+
+  // Resolve each pool's from/to Asset addresses (both must exist for the pair to trade).
+  const assetCalls = pools.flatMap((p) => [
+    { address: p.address, abi: wombatPoolAbi, functionName: "addressOfAsset" as const, args: [tokenIn] as const },
+    { address: p.address, abi: wombatPoolAbi, functionName: "addressOfAsset" as const, args: [tokenOut] as const },
+  ]);
+  const assetResults = await client.multicall({ contracts: assetCalls, allowFailure: true });
+
+  const valid: { pool: FactoryConfig; fromAsset: Hex; toAsset: Hex }[] = [];
+  for (let i = 0; i < pools.length; i++) {
+    const fr = assetResults[2 * i];
+    const to = assetResults[2 * i + 1];
+    if (fr.status !== "success" || to.status !== "success") continue;
+    const fromAsset = fr.result as Hex;
+    const toAsset = to.result as Hex;
+    if (!fromAsset || fromAsset === ZERO_ADDRESS || !toAsset || toAsset === ZERO_ADDRESS) continue;
+    valid.push({ pool: pools[i], fromAsset, toAsset });
+  }
+  if (valid.length === 0) return [];
+
+  // Pool-wide amp + haircut, and per-asset cash/liability (WAD).
+  const [ampResults, haircutResults, fromCashResults, fromLiabResults, toCashResults, toLiabResults] =
+    await Promise.all([
+      client.multicall({ contracts: valid.map((v) => ({ address: v.pool.address, abi: wombatPoolAbi, functionName: "ampFactor" as const })), allowFailure: true }),
+      client.multicall({ contracts: valid.map((v) => ({ address: v.pool.address, abi: wombatPoolAbi, functionName: "haircutRate" as const })), allowFailure: true }),
+      client.multicall({ contracts: valid.map((v) => ({ address: v.fromAsset, abi: wombatAssetAbi, functionName: "cash" as const })), allowFailure: true }),
+      client.multicall({ contracts: valid.map((v) => ({ address: v.fromAsset, abi: wombatAssetAbi, functionName: "liability" as const })), allowFailure: true }),
+      client.multicall({ contracts: valid.map((v) => ({ address: v.toAsset, abi: wombatAssetAbi, functionName: "cash" as const })), allowFailure: true }),
+      client.multicall({ contracts: valid.map((v) => ({ address: v.toAsset, abi: wombatAssetAbi, functionName: "liability" as const })), allowFailure: true }),
+    ]);
+
+  // Decimals: read the two tokens once (tokenIn + tokenOut).
+  const [decInRaw, decOutRaw] = await Promise.all([
+    client.readContract({ address: tokenIn, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+    client.readContract({ address: tokenOut, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+  ]);
+  const decIn = 10n ** BigInt(decInRaw);
+  const decOut = 10n ** BigInt(decOutRaw);
+
+  const out: WombatPool[] = [];
+  for (let i = 0; i < valid.length; i++) {
+    if (
+      ampResults[i].status !== "success" || haircutResults[i].status !== "success" ||
+      fromCashResults[i].status !== "success" || fromLiabResults[i].status !== "success" ||
+      toCashResults[i].status !== "success" || toLiabResults[i].status !== "success"
+    ) continue;
+    const fromCash = fromCashResults[i].result as bigint;
+    const fromLiability = fromLiabResults[i].result as bigint;
+    const toCash = toCashResults[i].result as bigint;
+    const toLiability = toLiabResults[i].result as bigint;
+    // A pool with no from-cash to sell into or no to-cash to pay out cannot trade.
+    if (fromLiability <= 0n || toLiability <= 0n || toCash <= 0n) continue;
+    const haircutRate = haircutResults[i].result as bigint;
+    out.push({
+      address: valid[i].pool.address,
+      fromCash,
+      fromLiability,
+      toCash,
+      toLiability,
+      ampFactor: ampResults[i].result as bigint,
+      haircutRate,
+      decIn,
+      decOut,
+      tokenIn,
+      tokenOut,
+      feePpm: wombatHaircutToPpm(haircutRate),
+      source: `${valid[i].pool.label} (Wombat)`,
+    });
+  }
+  return out;
 }
 
 /** Integer square root (babylonian method) */

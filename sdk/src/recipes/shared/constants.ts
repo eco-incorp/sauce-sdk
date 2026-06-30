@@ -101,6 +101,16 @@ export enum FactoryType {
    * read (getTradeInfo vs getReserves) and the per-virtual-reserve output formula.
    */
   KyberClassic = "kyber-classic",
+  /**
+   * Wombat Exchange (single-sided stableswap). Discovery: the FactoryConfig `address` is a Wombat
+   * Pool (multi-asset singleton); both tokens must be assets of the pool (addressOfAsset(token) !=
+   * 0). State: per-asset cash()/liability() (WAD) + pool-wide ampFactor()/haircutRate() (WAD). The
+   * curve is the coverage-ratio closed-form quote (CoreV2._swapQuoteFunc); priced OFF-CHAIN into
+   * sampled segments. Callback-free: executed in SauceScript (approve + pool.swap(fromToken,
+   * toToken, amount, minToAmount, to, deadline); Wombat PULLS via transferFrom), so no engine
+   * change. Distinct from a stable pool only in the per-asset state read + the quote formula.
+   */
+  Wombat = "wombat",
 }
 
 /**

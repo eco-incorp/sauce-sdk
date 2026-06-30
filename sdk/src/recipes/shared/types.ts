@@ -219,6 +219,7 @@ export enum EcoBracketKind {
   LB = 4, // Trader Joe Liquidity Book segment (static, off-chain EXACT one-flat-per-bin)
   DODO = 5, // DODO V2 PMM segment (static, off-chain-sampled via the closed-form querySell* replay)
   SolidlyStable = 6, // Solidly STABLE (sAMM) segment (static, off-chain-sampled via the x3y+y3x replay)
+  Wombat = 7, // Wombat single-sided stableswap segment (static, off-chain-sampled via the coverage-ratio replay)
 }
 
 /**
@@ -446,6 +447,31 @@ export interface EcoSolidlyStable {
 }
 
 /**
+ * One Wombat venue to execute, indexed by an EcoBracket.refIdx (kind === Wombat). Wombat is a
+ * single-sided MULTI-ASSET stableswap singleton (coverage-ratio quote, NOT xy=k), so it must NOT be
+ * routed through the V2 (_swapV2) path. prepare samples the curve OFF-CHAIN into static segments
+ * (kind Wombat) via the closed-form coverage-ratio replay; the on-chain solver consumes those
+ * through the static-segment cursor and EXECUTES the awarded Σ share CALLBACK-FREE: an on-chain
+ * `pool.quotePotentialSwap(fromToken, toToken, Σ)` staticcall yields the EXACT out, the pool is
+ * approved for the awarded input (Wombat PULLS via transferFrom), and
+ * `pool.swap(fromToken, toToken, Σ, minToAmount, to, deadline)` lands it. NO engine SwapPoolType —
+ * the pool view IS the swap math, so it is wei-exact-in-dy. `address` is the pool;
+ * `fromToken`/`toToken` are the swap call's token args; feePpm (haircut) is the price-ordering
+ * coordinate / diagnostic.
+ */
+export interface EcoWombat {
+  /** Pool address — the quotePotentialSwap/swap/approve target. */
+  address: Hex;
+  /** The pool's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The pool's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Rounded ppm haircut fee (the price-ordering coordinate; the on-chain out is the pool view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -490,6 +516,15 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   solidlyStables?: EcoSolidlyStable[];
+  /**
+   * Wombat venues (kind === Wombat brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share CALLBACK-FREE (quotePotentialSwap staticcall + approve + pool.swap
+   * — NO engine SwapPoolType); the Wombat marginal is supplied entirely as the static sampled
+   * segments in `brackets` (the coverage-ratio replay). Optional/empty when no Wombat pools were
+   * discovered (omitted ⇒ no Wombat venue, so existing test-side `EcoSwapPrepared` literals stay
+   * additive-compatible).
+   */
+  wombats?: EcoWombat[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;
