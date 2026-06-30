@@ -506,12 +506,12 @@ export async function prepareEcoSwap(
   // pool, and a path is tokenIn → (interior base tokens) → tokenOut of length 2..MAX_HOPS legs. The
   // path's token set is the DFS visited set, so no token repeats within a path (no cycles). Each
   // edge is read via the LENS with driftTicks:0 (like direct pools — the solver reads drift live),
-  // keeping ALL V3 survivors per leg, stamping each with the LEG's hop direction zHop so its
-  // on-chain inIsToken0 / net-row sort / window math are leg-oriented. runLens is MEMOIZED per
-  // UNORDERED token pair so a shared edge (e.g. WETH↔X used by several paths) reads ONCE. V3-only
-  // legs for this landing — V2/V4 legs need per-hop type dispatch in the on-chain route exec (a
-  // documented follow-up); stamping stays type-agnostic so flipping that on is purely an on-chain
-  // change. MAX_HOPS=2 reproduces the prior 2-hop behavior exactly (single interior base token).
+  // keeping ALL survivors per leg (V2, V3 and hookless V4 alike), stamping each with the LEG's hop
+  // direction zHop so its on-chain inIsToken0 / net-row sort / window math are leg-oriented. runLens
+  // is MEMOIZED per UNORDERED token pair so a shared edge (e.g. WETH↔X used by several paths) reads
+  // ONCE. The on-chain route execution dispatches per leg pool by type (swapV3 / swap(poolType:0) /
+  // swap(poolType:2)) exactly like the direct-pool execution. MAX_HOPS=2 reproduces the prior 2-hop
+  // behavior exactly (single interior base token).
   const edgeCache = new Map<string, Promise<LensResult>>();
   const edgeKey = (a: Hex, b: Hex): string => {
     const al = a.toLowerCase();
@@ -542,17 +542,37 @@ export async function prepareEcoSwap(
     return pending;
   };
 
-  /** Build a V3-only leg from a memoized edge read; returns null if the edge has no V3 survivor. */
+  /**
+   * Build a leg from a memoized edge read, keeping EVERY survivor pool the lens returned for the
+   * edge — V2, V3 and hookless V4 alike (the leg-internal merge + N-hop chain are type-agnostic).
+   * Each leg pool is stamped with the LEG's hop direction zHop exactly like a direct pool of its
+   * type (V2 via the live-reserves seed, V3/V4 via the net cache). Returns null if the edge has no
+   * survivor. A V4 survivor WITH hooks is excluded (the unified swap path is hookless-V4 only).
+   */
   const buildLeg = async (hopIn: Hex, hopOut: Hex): Promise<EcoLeg | null> => {
     const zHop = hopIn.toLowerCase() < hopOut.toLowerCase(); // THIS leg's hop direction
     const lens = await readEdge(hopIn, hopOut);
-    const v3 = lens.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
-    if (v3.length === 0) return null;
+    const legPools: EcoPool[] = [];
+    for (const p of lens.pools) {
+      if (p.poolType === SwapPoolType.UniV2) {
+        // V2 leg pool: constant-L stream from the live reserves; its own reserve orientation is the
+        // lens-reported inIsToken0 (hopIn-is-token0 for this leg), NOT the leg's address-sort zHop.
+        legPools.push(lensToEcoPool(p, p.inIsToken0, "lens route leg V2"));
+      } else if (p.poolType === SwapPoolType.UniV3) {
+        legPools.push(lensToEcoPool(p, zHop, "lens route leg V3"));
+      } else if (p.poolType === SwapPoolType.UniV4) {
+        // Hookless V4 only — the unified swap(SwapParams) leg execution builds a hookless PoolKey.
+        const hooks = p.hooks ?? ZERO_ADDRESS;
+        if (hooks.toLowerCase() !== ZERO_ADDRESS.toLowerCase()) continue;
+        legPools.push(lensToEcoPool(p, zHop, "lens route leg V4"));
+      }
+    }
+    if (legPools.length === 0) return null;
     return {
       hopIn,
       hopOut,
       zeroForOne: zHop,
-      pools: v3.map((p) => lensToEcoPool(p, zHop, "lens route leg V3")),
+      pools: legPools,
     };
   };
 

@@ -23,7 +23,8 @@
  *       but BEFORE cook(), cook the pre-drift bytecodes, and assert the recipe
  *       re-anchored to the live grid (drift + recipe ≈ baseline).
  *
- * A V2/V4-leg test is shipped {skip:true} + TODO (V3-only legs land first).
+ * V2-leg and V4-leg routes are exercised by their own describe blocks below (the leg
+ * execution dispatches per pool type — swapV3 / swap(poolType:0) / swap(poolType:2)).
  *
  * Run: ECO_ENGINE=v1 pnpm --filter './sdk' exec tsx --test src/recipes/test/ecoswap.routes.evm.test.ts
  */
@@ -45,7 +46,15 @@ import {
   approve,
   balanceOf,
   getSlot0,
+  getV4Slot0,
+  getV4Liquidity,
   mintPosition,
+  deployV2Factory,
+  setupEtchedV2Pool,
+  etchV4Singletons,
+  deployV4Helper,
+  setupV4Pool,
+  v2PairAbi,
   SQRT_PRICE_1_1,
   type DeployedStack,
   type DeployedV12Stack,
@@ -110,7 +119,39 @@ function buildUniverse(prepared: EcoSwapPrepared): {
   return { pools, inputToken, directCount };
 }
 
-/** Build the oracle OptimalRoute legs from the prepared route's LIVE leg-pool state. */
+/**
+ * Read the LIVE OptimalPool fields for a single leg/direct pool, dispatching by type — V3 via
+ * slot0, V4 via StateView (poolId), V2 via getReserves (mapped to in/out by the pool's reserve
+ * orientation `inIsToken0`). The oracle reads a V4 leg on the SAME path as a V3 leg (isV2:false,
+ * sqrt/tick/net); a V2 leg uses isV2:true + live reserveIn/reserveOut.
+ */
+async function liveOptimalPool(c: HarnessClients, lp: EcoPool): Promise<OptimalPool> {
+  if (lp.isV2) {
+    const r = (await c.publicClient.readContract({
+      address: lp.address, abi: v2PairAbi, functionName: "getReserves", args: [],
+    })) as readonly [bigint, bigint, number];
+    const [r0, r1] = [r[0], r[1]];
+    // inIsToken0 = the hop's in token is token0 ⇒ reserveIn = r0, reserveOut = r1.
+    const reserveIn = lp.inIsToken0 ? r0 : r1;
+    const reserveOut = lp.inIsToken0 ? r1 : r0;
+    return { isV2: true, feePpm: lp.feePpm, reserveIn, reserveOut };
+  }
+  if (lp.poolType === SwapPoolType.UniV4) {
+    const { sqrtPriceX96, tick } = await getV4Slot0(c.publicClient, lp.stateView, lp.poolId);
+    const liquidity = await getV4Liquidity(c.publicClient, lp.stateView, lp.poolId);
+    return {
+      isV2: false, feePpm: lp.feePpm, sqrtPriceX96, tick, tickSpacing: lp.tickSpacing,
+      liquidity, net: lp.adaptiveNet ?? new Map<number, bigint>(),
+    };
+  }
+  const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, lp.address);
+  return {
+    isV2: false, feePpm: lp.feePpm, sqrtPriceX96, tick, tickSpacing: lp.tickSpacing,
+    liquidity: lp.spotActiveL ?? 0n, net: lp.adaptiveNet ?? new Map<number, bigint>(),
+  };
+}
+
+/** Build the oracle OptimalRoute legs from the prepared route's LIVE leg-pool state (any type). */
 async function liveOptimalRoutes(
   c: HarnessClients,
   prepared: EcoSwapPrepared,
@@ -124,16 +165,7 @@ async function liveOptimalRoutes(
     for (const leg of route.legs) {
       const legOpts: OptimalPool[] = [];
       for (const lp of leg.pools) {
-        const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, lp.address);
-        legOpts.push({
-          isV2: false,
-          feePpm: lp.feePpm,
-          sqrtPriceX96,
-          tick,
-          tickSpacing: lp.tickSpacing,
-          liquidity: lp.spotActiveL ?? 0n,
-          net: lp.adaptiveNet ?? new Map<number, bigint>(),
-        });
+        legOpts.push(await liveOptimalPool(c, lp));
       }
       const next: OptimalPool[][] = [];
       for (const prefix of combos) {
@@ -148,23 +180,14 @@ async function liveOptimalRoutes(
   return routes;
 }
 
-/** Build the oracle's OptimalPool list for the prepared DIRECT pools (live state). */
+/** Build the oracle's OptimalPool list for the prepared DIRECT pools (live state, any type). */
 async function liveOptimalDirect(
   c: HarnessClients,
   prepared: EcoSwapPrepared,
 ): Promise<OptimalPool[]> {
   const out: OptimalPool[] = [];
   for (const p of prepared.pools) {
-    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, p.address);
-    out.push({
-      isV2: false,
-      feePpm: p.feePpm,
-      sqrtPriceX96,
-      tick,
-      tickSpacing: p.tickSpacing,
-      liquidity: p.spotActiveL ?? 0n,
-      net: p.adaptiveNet ?? new Map<number, bigint>(),
-    });
+    out.push(await liveOptimalPool(c, p));
   }
   return out;
 }
@@ -502,16 +525,385 @@ describe("EcoSwap multi-hop route — WEI-EXACT (direct A->B + 2-hop A->X->B, mu
     });
   }
 
-  // ── V2/V4-leg route — FOLLOW-UP (V3-only legs land first) ──
-  // TODO: the on-chain route execution dispatches every hop as a flat swapV3. V2/V4 legs need
-  // per-hop type dispatch in the route exec (V2 transfer+pool.swap / V4 swap(SwapParams) with the
-  // nested PoolKey), plus the leg-pool stamping already being type-agnostic (it is). When that
-  // lands, this exercises a 2-hop route whose first leg is a V2 pool and second leg a V3 pool,
-  // asserting the same wei-exact split. Skipped until the route-exec type dispatch is implemented.
-  it("WEI-EXACT V2-leg + V3-leg route split == optimal", { skip: true }, async () => {
-    // TODO(N-hop / V2-V4 legs follow-up): build a V2 A->X leg + V3 X->B leg, prepare+cook,
-    // assert per-leg-pool deltas == optimalSplit (OptimalRouteLeg with isV2:true on leg0).
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V2-LEG route — a 2-hop route whose FIRST leg is a Uniswap-V2 constant-product pool
+// and second leg a V3 pool, run alongside a competing direct A->B V3 pool. The V2 leg
+// is DEEP (so it only ever PARTIAL-fills the constant-L geometric stream — it never
+// becomes the tick-crossing binding leg, which the unified route event still resolves
+// on V3/V4 grid math); the V3 second leg is the finite binding leg. Asserts the same
+// WEI-EXACT gate as the V3-leg routes: the cooked per-leg-pool input deltas equal the
+// neutral oracle's split (OptimalRouteLeg with isV2:true on leg0) to the wei, both legs
+// move, marginals equalize at the cut. The leg0 V2 execution dispatches via the unified
+// swap(SwapParams{poolType:0}) exactly like a direct V2 pool.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap multi-hop route — WEI-EXACT V2-leg (direct A->B + 2-hop V2(A->X)->V3(X->B))", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let base: Hex;
+  let tokenOut: Hex;
+  let directPool: Hex;
+  let leg0v2: Hex; // V2 A->X (etched pair)
+  let leg1v3: Hex; // V3 X->B (deep)
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+  // Deterministic etch address for the V2 pair (well above precompiles, never a CREATE target).
+  const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec02ec02" as Hex;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const v2Factory = await deployV2Factory(c.walletClient, c.publicClient);
+
+    tokenIn = await deployToken(c.walletClient, c.publicClient, "In", "IN");
+    base = await deployToken(c.walletClient, c.publicClient, "Base", "BASE");
+    tokenOut = await deployToken(c.walletClient, c.publicClient, "Out", "OUT");
+
+    const minter = c.account0;
+    for (const t of [tokenIn, base, tokenOut]) {
+      await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+      await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+    }
+
+    // DIRECT A->B pool: SHALLOW (fills first, then overflows into the route at the cut).
+    directPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, directPool, minter, -12000, 12000, parseEther("8000"),
+    );
+
+    // leg0: ETCHED V2 pair (A<->X) at 1:1, DEEP reserves so it only partial-fills (never binds).
+    // setupEtchedV2Pool needs token0<token1; sort A/X by address.
+    const [v2t0, v2t1] = BigInt(tokenIn) < BigInt(base) ? [tokenIn, base] : [base, tokenIn];
+    leg0v2 = await setupEtchedV2Pool(
+      c.walletClient, c.publicClient, c.testClient, v2Factory, V2_PAIR_ADDR,
+      v2t0, v2t1, parseEther("200000000"), parseEther("200000000"), minter,
+    );
+    // leg1: V3 X->B, EXTREMELY deep so the route depth is governed by the V2 leg's geometric
+    // stream and the single-route oracle identity is wei-exact (the binding leg is leg1's tick).
+    leg1v3 = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, base, tokenOut, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, leg1v3, minter, -12000, 12000, parseEther("400000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: v2Factory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Local UniV2" },
+      ],
+      feeTiers: [HOP_FEE_A, HOP_FEE_B],
+      baseTokens: [base],
+    };
+
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("1000000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
   });
+
+  after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
+
+  async function readInputBalances(
+    pools: EcoPool[],
+    inputToken: Hex[],
+    directCount: number,
+  ): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const tk = i < directCount ? tokenIn : inputToken[i];
+      out.push(await balanceOf(c.publicClient, tk, pools[i].address));
+    }
+    return out;
+  }
+
+  async function runV2Leg(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const amountIn = parseEther("20000");
+    const caller = c.account0;
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+    );
+
+    // Topology: one direct A->B pool + one 2-hop route; leg0 is a V2 pool, leg1 a V3 pool.
+    assert.equal(prepared.pools.length, 1, "exactly one direct A->B pool");
+    assert.equal(prepared.routes.length, 1, "exactly one route (through base)");
+    const route = prepared.routes[0];
+    assert.equal(route.legs.length, 2, "2-hop route");
+    assert.equal(route.legs[0].pools.length, 1, "leg0 is one V2 pool");
+    assert.ok(route.legs[0].pools[0].isV2, "leg0 pool is V2");
+    assert.equal(route.legs[1].pools.length, 1, "leg1 is one V3 pool");
+    assert.ok(!route.legs[1].pools[0].isV2, "leg1 pool is V3");
+
+    const { pools, inputToken, directCount } = buildUniverse(prepared);
+    const ref = kwayReference(prepared, amountIn);
+    const optDirect = await liveOptimalDirect(c, prepared);
+    const optRoutes = await liveOptimalRoutes(c, prepared);
+    assert.equal(optRoutes.length, 1, "one single-pool-per-leg oracle route");
+    const opt = optimalSplit({
+      pools: optDirect, routes: optRoutes, amountIn,
+      zeroForOne: prepared.zeroForOne, priceLimit: prepared.priceLimit,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
+    const oracleRouteSum = opt.perRouteInput.reduce((a, b) => a + b, 0n);
+    assert.equal(ref.perRouteInput[0], oracleRouteSum, "reference route input == oracle (wei-exact)");
+    assert.equal(ref.perPoolInput[0], opt.perPoolInput[0], "reference direct input == oracle direct (wei-exact)");
+
+    const inBefore = await readInputBalances(pools, inputToken, directCount);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "V2-leg route cook() must succeed");
+
+    const inAfter = await readInputBalances(pools, inputToken, directCount);
+    const delta: bigint[] = inAfter.map((a, i) => a - inBefore[i]);
+    const idxByAddr = new Map<string, number>();
+    pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
+
+    // WEI-EXACT — direct pool + leg0 (V2) tokenIn delta.
+    for (let i = 0; i < directCount; i++) {
+      assert.equal(delta[i], opt.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != oracle (wei)`);
+      assert.equal(delta[i], ref.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != reference (wei)`);
+    }
+    const leg0Idx = idxByAddr.get(route.legs[0].pools[0].address.toLowerCase())!;
+    assert.equal(
+      delta[leg0Idx], opt.perRouteInput[0],
+      `[${engine}] V2 leg0 tokenIn delta != oracle route input (on-chain ${delta[leg0Idx]} vs oracle ${opt.perRouteInput[0]})`,
+    );
+    // leg1 (V3) receives the realized intermediate X.
+    const leg1Idx = idxByAddr.get(route.legs[1].pools[0].address.toLowerCase())!;
+    assert.ok(delta[leg1Idx] > 0n, `[${engine}] V3 leg1 received the intermediate token`);
+    assert.equal(delta[leg0Idx], ref.perRouteInput[0], `[${engine}] on-chain route input (V2 leg0 tokenIn) != reference (wei)`);
+
+    // Both venues engaged.
+    assert.ok(delta[0] > 0n, `[${engine}] direct pool engaged`);
+    assert.ok(ref.perRouteInput[0] > 0n, `[${engine}] V2-leg route engaged`);
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (compute-then-pull)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+
+    console.log(
+      `  [ROUTE-V2LEG ${engine}] direct=${delta[0]} routeIn(V2 leg0)=${delta[leg0Idx]} leg1In=${delta[leg1Idx]} spent=${spent} received=${received}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`WEI-EXACT direct + V2-leg route split == optimal [${engine}]`, { skip }, async () => {
+      await runV2Leg(engine);
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V4-LEG route — a 2-hop route whose FIRST leg is a Uniswap-V4 pool (etched PoolManager
+// + StateView at canonical addresses) and second leg a V3 pool, alongside a competing
+// direct A->B V3 pool. The V4 leg is the FINITE binding leg (V4 reads/crosses identically
+// to V3 via StateView, so it can bind); the V3 second leg is DEEP. Same WEI-EXACT gate.
+// The leg0 V4 execution dispatches via the unified swap(SwapParams{poolType:2}) with the
+// nested PoolKey built from the leg tokens, exactly like a direct V4 pool.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap multi-hop route — WEI-EXACT V4-leg (direct A->B + 2-hop V4(A->X)->V3(X->B))", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let base: Hex;
+  let tokenOut: Hex;
+  let directPool: Hex;
+  let poolManager: Hex;
+  let stateView: Hex;
+  let leg0v4Id: Hex; // V4 A->X poolId
+  let leg1v3: Hex; // V3 X->B (deep)
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const v4 = await etchV4Singletons(c.publicClient, c.testClient);
+    poolManager = v4.poolManager;
+    stateView = v4.stateView;
+    const v4Helper = await deployV4Helper(c.walletClient, c.publicClient, poolManager);
+
+    tokenIn = await deployToken(c.walletClient, c.publicClient, "In", "IN");
+    base = await deployToken(c.walletClient, c.publicClient, "Base", "BASE");
+    tokenOut = await deployToken(c.walletClient, c.publicClient, "Out", "OUT");
+
+    const minter = c.account0;
+    for (const t of [tokenIn, base, tokenOut]) {
+      await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+      await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+    }
+
+    // DIRECT A->B pool: SHALLOW (fills first, then overflows into the route at the cut).
+    directPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, directPool, minter, -12000, 12000, parseEther("8000"),
+    );
+
+    // leg0: V4 pool A->X (finite binding leg). setupV4Pool needs sorted currencies.
+    const [v4t0, v4t1] = BigInt(tokenIn) < BigInt(base) ? [tokenIn, base] : [base, tokenIn];
+    leg0v4Id = await setupV4Pool(
+      c.walletClient, c.publicClient, v4Helper, v4t0, v4t1,
+      HOP_FEE_A, 10, SQRT_PRICE_1_1, -12000, 12000, parseEther("400000"), parseEther("50000000"),
+    );
+    // leg1: V3 X->B, EXTREMELY deep so the route depth is governed by the V4 leg.
+    leg1v3 = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, base, tokenOut, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, leg1v3, minter, -12000, 12000, parseEther("100000000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: poolManager, stateView, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Local UniV4" },
+      ],
+      feeTiers: [HOP_FEE_A, HOP_FEE_B],
+      baseTokens: [base],
+    };
+
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("1000000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
+
+  // For a V4 leg pool the on-chain "input balance" lands on the PoolManager singleton, NOT the
+  // pool address (V4 has no per-pool address). Read the input-token balance at the right venue.
+  async function readInputBalances(
+    pools: EcoPool[],
+    inputToken: Hex[],
+    directCount: number,
+  ): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const tk = i < directCount ? tokenIn : inputToken[i];
+      out.push(await balanceOf(c.publicClient, tk, pools[i].address));
+    }
+    return out;
+  }
+
+  async function runV4Leg(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const amountIn = parseEther("20000");
+    const caller = c.account0;
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+    );
+
+    // Topology: one direct A->B pool + one 2-hop route; leg0 is a V4 pool, leg1 a V3 pool.
+    assert.equal(prepared.pools.length, 1, "exactly one direct A->B pool");
+    assert.equal(prepared.routes.length, 1, "exactly one route (through base)");
+    const route = prepared.routes[0];
+    assert.equal(route.legs.length, 2, "2-hop route");
+    assert.equal(route.legs[0].pools.length, 1, "leg0 is one V4 pool");
+    assert.equal(route.legs[0].pools[0].poolType, SwapPoolType.UniV4, "leg0 pool is V4");
+    assert.equal(route.legs[1].pools.length, 1, "leg1 is one V3 pool");
+    assert.equal(route.legs[1].pools[0].poolType, SwapPoolType.UniV3, "leg1 pool is V3");
+
+    const { pools, inputToken, directCount } = buildUniverse(prepared);
+    const ref = kwayReference(prepared, amountIn);
+    const optDirect = await liveOptimalDirect(c, prepared);
+    const optRoutes = await liveOptimalRoutes(c, prepared);
+    assert.equal(optRoutes.length, 1, "one single-pool-per-leg oracle route");
+    const opt = optimalSplit({
+      pools: optDirect, routes: optRoutes, amountIn,
+      zeroForOne: prepared.zeroForOne, priceLimit: prepared.priceLimit,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
+    const oracleRouteSum = opt.perRouteInput.reduce((a, b) => a + b, 0n);
+    assert.equal(ref.perRouteInput[0], oracleRouteSum, "reference route input == oracle (wei-exact)");
+    assert.equal(ref.perPoolInput[0], opt.perPoolInput[0], "reference direct input == oracle direct (wei-exact)");
+
+    const inBefore = await readInputBalances(pools, inputToken, directCount);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "V4-leg route cook() must succeed");
+
+    const inAfter = await readInputBalances(pools, inputToken, directCount);
+    const delta: bigint[] = inAfter.map((a, i) => a - inBefore[i]);
+    const idxByAddr = new Map<string, number>();
+    pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
+
+    for (let i = 0; i < directCount; i++) {
+      assert.equal(delta[i], opt.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != oracle (wei)`);
+      assert.equal(delta[i], ref.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != reference (wei)`);
+    }
+    // leg0 is V4 — its tokenIn lands on the PoolManager singleton (== leg0 pool address in the
+    // universe, which prepare set to the PoolManager). Its delta == the oracle route input.
+    const leg0Idx = idxByAddr.get(route.legs[0].pools[0].address.toLowerCase())!;
+    assert.equal(
+      delta[leg0Idx], opt.perRouteInput[0],
+      `[${engine}] V4 leg0 tokenIn delta != oracle route input (on-chain ${delta[leg0Idx]} vs oracle ${opt.perRouteInput[0]})`,
+    );
+    const leg1Idx = idxByAddr.get(route.legs[1].pools[0].address.toLowerCase())!;
+    assert.ok(delta[leg1Idx] > 0n, `[${engine}] V3 leg1 received the intermediate token`);
+    assert.equal(delta[leg0Idx], ref.perRouteInput[0], `[${engine}] on-chain route input (V4 leg0 tokenIn) != reference (wei)`);
+
+    assert.ok(delta[0] > 0n, `[${engine}] direct pool engaged`);
+    assert.ok(ref.perRouteInput[0] > 0n, `[${engine}] V4-leg route engaged`);
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (compute-then-pull)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+
+    console.log(
+      `  [ROUTE-V4LEG ${engine}] direct=${delta[0]} routeIn(V4 leg0)=${delta[leg0Idx]} leg1In=${delta[leg1Idx]} spent=${spent} received=${received}  (poolId ${leg0v4Id.slice(0, 10)}…)`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`WEI-EXACT direct + V4-leg route split == optimal [${engine}]`, { skip }, async () => {
+      await runV4Leg(engine);
+    });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -190,11 +190,14 @@ function seedFrontier(pd: EcoPool, lp: KwayLivePool | undefined): Frontier {
   };
 
   if (pd.isV2) {
-    const ll = lp?.liveV2L ?? 0n;
+    // V2 frontier seed: a drift override (liveV2L/curOI), else the prepare-time spot the pool ships
+    // (spotActiveL = √k, spotNearReal = out/in spot) — symmetric with the V3/V4 fallback below, and
+    // matching the on-chain SETUP, which reads live reserves for EVERY V2 pool (direct or leg).
+    const ll = lp?.liveV2L ?? pd.spotActiveL ?? 0n;
     f.v2L = ll;
     f.L = ll;
     f.on = ll > 0n;
-    f.near = lp?.curOI ?? 0n; // V2 frontier stores out/in directly
+    f.near = lp?.curOI ?? pd.spotNearReal ?? 0n; // V2 frontier stores out/in directly
     return f;
   }
 

@@ -367,11 +367,21 @@ function main(
               const ad: Tuple = pools[a];
               const az: Uint256 = zArr[a];
               const asf: Uint256 = sfArr[a];
-              const aoi: Uint256 = toOutIn(dnNear[a], az);
+              // V2 leg pool stores dnNear as out/in directly + steps a constant-L geometric slice;
+              // V3/V4 store the real sqrt + step the tick grid via stepReal. Mirror the reference's
+              // frontierNearOI/frontierFarOI per type so a V2 leg competes with the right geometry.
+              let aoi: Uint256 = 0;
+              let afarOI: Uint256 = 0;
+              if (ad[6] === 1) {
+                aoi = dnNear[a];
+                afarOI = dnNear[a] - Math.mulDiv(dnNear[a], V2_STEP_BPS, V2_STEP_DEN);
+              } else {
+                aoi = toOutIn(dnNear[a], az);
+                afarOI = toOutIn(stepReal(dnNear[a], ad[10], az), az);
+              }
               const aadj: Uint256 = Math.mulDiv(aoi, asf, FEE_DENOM);
               if (aadj >= lAdj) {
-                const afar: Uint256 = stepReal(dnNear[a], ad[10], az);
-                const afarAdj: Uint256 = Math.mulDiv(toOutIn(afar, az), asf, FEE_DENOM);
+                const afarAdj: Uint256 = Math.mulDiv(afarOI, asf, FEE_DENOM);
                 let w0: Uint256 = 0;
                 if (aadj > lAdj) { w0 = 1; }
                 if (aadj === lAdj) { if (afarAdj > lFarAdj) { w0 = 1; } }
@@ -500,7 +510,10 @@ function main(
           // legs' current constant-L brackets), advance its winning pool ONE bracket (the existing
           // per-pool tick step), and PARTIAL-fill every other leg via the constant-L inversion with
           // conservation at every intermediate. 2-hop and 3-hop are the SAME loop. The per-leg
-          // scratch (lgP/lgN/lgF/lgFR/lgL/lgFee/lgNF) is reused — written fresh each event. V3 legs.
+          // scratch (lgP/lgN/lgF/lgFR/lgL/lgFee/lgNF) is reused — written fresh each event. A leg
+          // pool of any type participates: V2 legs use the constant-L geometric step (out/in near,
+          // no real-sqrt grid) while V3/V4 step the tick grid; a V2 leg partial-fills but is sized
+          // deep enough never to be the binding (tick-crossing) leg.
           const rt: Tuple = routing[bestRoute];
           const legCount: Uint256 = rt[0];
 
@@ -514,7 +527,9 @@ function main(
             let pAdj: Uint256 = 0;
             for (let a = baseL; a < eL; a = a + 1) {
               if (dnOn[a] === 1) {
-                const aoi: Uint256 = toOutIn(dnNear[a], zArr[a]);
+                let aoi: Uint256 = 0;
+                if (pools[a][6] === 1) { aoi = dnNear[a]; }
+                else { aoi = toOutIn(dnNear[a], zArr[a]); }
                 const aadj: Uint256 = Math.mulDiv(aoi, sfArr[a], FEE_DENOM);
                 if (aadj > pAdj) { pAdj = aadj; pBest = a; }
               }
@@ -524,11 +539,21 @@ function main(
             lgP[L] = pBest;
             lgL[L] = dnL[pBest];
             lgFee[L] = db[5];
-            lgN[L] = toOutIn(dnNear[pBest], zb);
-            let fReal: Uint256 = stepReal(dnNear[pBest], db[10], zb);
-            if (brFar[pBest] > 0) { fReal = brFar[pBest]; }
-            lgFR[L] = fReal;
-            lgF[L] = toOutIn(fReal, zb);
+            // V2 leg pool: near is out/in directly + the far is a constant-L geometric slice (no real
+            // sqrt grid; brFar latch is unused — V2 always recomputes from the current near). V3/V4:
+            // near = toOutIn(real), far = one stepReal ahead (or the latched bracket far brFar).
+            if (db[6] === 1) {
+              lgN[L] = dnNear[pBest];
+              const v2far: Uint256 = dnNear[pBest] - Math.mulDiv(dnNear[pBest], V2_STEP_BPS, V2_STEP_DEN);
+              lgF[L] = v2far;
+              lgFR[L] = v2far; // unused for a non-binding V2 leg (V2 never crosses a tick)
+            } else {
+              lgN[L] = toOutIn(dnNear[pBest], zb);
+              let fReal: Uint256 = stepReal(dnNear[pBest], db[10], zb);
+              if (brFar[pBest] > 0) { fReal = brFar[pBest]; }
+              lgFR[L] = fReal;
+              lgF[L] = toOutIn(fReal, zb);
+            }
           }
 
           // Phase B: binding leg = argmin over REACHABLE legs of the token-A input to FULLY cross
@@ -603,8 +628,14 @@ function main(
             for (let L = 0; L < legCount; L = L + 1) {
               const pI: Uint256 = lgP[L];
               const farL: Uint256 = invertFarFromGrossIn(lgL[L], lgN[L], pflow, lgFee[L]);
-              dnNear[pI] = toOutIn(farL, zArr[pI]);
-              if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
+              // V2 leg pool stores near as out/in directly (no real-sqrt grid, no brFar latch);
+              // V3/V4 convert the out/in partial far back to a real sqrt + latch the bracket far.
+              if (pools[pI][6] === 1) {
+                dnNear[pI] = farL;
+              } else {
+                dnNear[pI] = toOutIn(farL, zArr[pI]);
+                if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
+              }
               const inAmt: Uint256 = L === 0 ? rtake : pflow;
               inp[pI] = inp[pI] + inAmt; // leg L's flow-in share (tokenIn for leg0, intermediate else)
               pflow = bracketOut(lgL[L], lgN[L], farL); // this leg's output → next leg's gross-in
@@ -670,8 +701,13 @@ function main(
                 } }
               } else {
                 // Partial leg: near → lgNF[L] (interior, no cross), keep the bracket far fixed.
-                dnNear[pI] = toOutIn(lgNF[L], zArr[pI]);
-                if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
+                // V2 leg pool stores near as out/in directly (no real-sqrt grid, no brFar latch).
+                if (pools[pI][6] === 1) {
+                  dnNear[pI] = lgNF[L];
+                } else {
+                  dnNear[pI] = toOutIn(lgNF[L], zArr[pI]);
+                  if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
+                }
               }
             }
           }
@@ -722,12 +758,14 @@ function main(
     }
   }
   // Routes: chain-order leg execution reading the REALIZED intermediate balance between legs.
-  // N-hop V3-leg: walk the route's legCount legs in order. Leg L's INPUT token is tokenIn (L==0)
-  // else the previous intermediate (rt[3*L]); its OUTPUT token is tokenOut (final leg) else this
-  // leg's intermediate (rt[3+3L]). Leg 0 swaps the route's COMPUTED tokenIn shares (inp[a]); every
-  // later leg feeds the REALIZED input-token balance, distributed proportional to inp[] across the
-  // leg's pools (the last funded pool takes the remainder to absorb multi-pool-leg dust). 2-hop and
-  // 3-hop are the same loop.
+  // N-hop, ANY leg-pool type: walk the route's legCount legs in order. Leg L's INPUT token is
+  // tokenIn (L==0) else the previous intermediate (rt[3*L]); its OUTPUT token is tokenOut (final
+  // leg) else this leg's intermediate (rt[3+3L]). Leg 0 swaps the route's COMPUTED tokenIn shares
+  // (inp[a]); every later leg feeds the REALIZED input-token balance, distributed proportional to
+  // inp[] across the leg's pools (the last funded pool takes the remainder to absorb multi-pool-leg
+  // dust). Each leg pool is dispatched by type (pd[0]/pd[6]) — swapV3 for V3, swap(poolType:0) for
+  // V2, swap(poolType:2) for V4 with the leg PoolKey — MIRRORING the direct-pool execution block.
+  // 2-hop and 3-hop are the same loop.
   for (let r = 0; r < routing.length; r = r + 1) {
     const ramt: Uint256 = rinp[r];
     if (ramt > 0) {
@@ -747,7 +785,33 @@ function main(
           for (let a = baseL; a < eL; a = a + 1) {
             const a0: Uint256 = inp[a];
             if (a0 > 0) {
-              router.swapV3(pools[a][1], legIn, legOut, a0, 0, address.self, address.self);
+              const lp: Tuple = pools[a];
+              const lIsV2: Uint256 = lp[6];
+              const lType: Uint256 = lp[0];
+              const lz: Uint256 = lp[7]; // leg pool's inIsToken0 (legIn-is-currency0 when 1)
+              if (lIsV2 === 1) {
+                const c0: Address = lz === 1 ? legIn : legOut;
+                const c1: Address = lz === 1 ? legOut : legIn;
+                router.swap({
+                  poolType: 0, pool: lp[1],
+                  poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
+                  tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(a0),
+                  sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+                });
+              } else {
+                if (lType === 2) {
+                  const k0: Address = lz === 1 ? legIn : legOut;
+                  const k1: Address = lz === 1 ? legOut : legIn;
+                  router.swap({
+                    poolType: 2, pool: lp[1],
+                    poolKey: { currency0: k0, currency1: k1, fee: lp[2], tickSpacing: lp[3], hooks: lp[4] },
+                    tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(a0),
+                    sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+                  });
+                } else {
+                  router.swapV3(lp[1], legIn, legOut, a0, 0, address.self, address.self);
+                }
+              }
             }
           }
         } else {
@@ -768,7 +832,33 @@ function main(
                   let share: Uint256 = Math.mulDiv(inBal, w, lTotal);
                   if (b === lastIdx) { share = inBal - spent; }
                   if (share > 0) {
-                    router.swapV3(pools[b][1], legIn, legOut, share, 0, address.self, address.self);
+                    const lp: Tuple = pools[b];
+                    const lIsV2: Uint256 = lp[6];
+                    const lType: Uint256 = lp[0];
+                    const lz: Uint256 = lp[7];
+                    if (lIsV2 === 1) {
+                      const c0: Address = lz === 1 ? legIn : legOut;
+                      const c1: Address = lz === 1 ? legOut : legIn;
+                      router.swap({
+                        poolType: 0, pool: lp[1],
+                        poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
+                        tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(share),
+                        sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+                      });
+                    } else {
+                      if (lType === 2) {
+                        const k0: Address = lz === 1 ? legIn : legOut;
+                        const k1: Address = lz === 1 ? legOut : legIn;
+                        router.swap({
+                          poolType: 2, pool: lp[1],
+                          poolKey: { currency0: k0, currency1: k1, fee: lp[2], tickSpacing: lp[3], hooks: lp[4] },
+                          tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(share),
+                          sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+                        });
+                      } else {
+                        router.swapV3(lp[1], legIn, legOut, share, 0, address.self, address.self);
+                      }
+                    }
                     spent = spent + share;
                   }
                 }
