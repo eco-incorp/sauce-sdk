@@ -43,6 +43,11 @@ import { ecoSwapReference } from "./ecoswap.reference";
 import { optimalSplit, type OptimalPool, type OptimalRoute } from "./ecoswap.optimal";
 import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
 import { SwapPoolType } from "../shared/constants";
+import {
+  getAmountOutStable,
+  buildSolidlyStableSegments,
+  type SolidlyStablePool,
+} from "../shared/solidly-stable-math";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -1546,5 +1551,60 @@ describe("optimalSplit — multi-fee competition + opposite-direction route hops
     // Conservation holds across the direction flip (Σ venues == total).
     const sum = res.perPoolInput.reduce((a, b) => a + b, 0n) + res.perRouteInput.reduce((a, b) => a + b, 0n);
     assert.equal(sum, res.totalInput, "Σ venues == total across the direction flip");
+  });
+});
+
+// ── Solidly STABLE (sAMM) known-answer + segment sampler ─────────────────────
+//
+// Pins the off-chain x3y+y3x replay (getAmountOutStable + buildSolidlyStableSegments) BEFORE the
+// local-EVM test, so a regression in the bigint math is caught without anvil. The wei-exact bound is
+// documented in solidly-stable-math.ts: the SPLIT is exact-on-grid vs the oracle (one shared sampler)
+// and the realized dy is exact-in-dy (the pool getAmountOut view == the pool swap math). These vectors
+// are the deterministic getAmountOutStable outputs for fixed states (regenerate only on an intentional
+// math change). A near-1:1 stable swap loses only the fee + tiny curvature slippage — the assertions
+// pin the EXACT wei and the qualitative stable shape (out ≈ in net of fee, monotone, descending grid).
+describe("Solidly STABLE (sAMM) — getAmountOutStable known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  function pool(resIn: bigint, resOut: bigint, decIn: bigint, decOut: bigint, feePpm: number): SolidlyStablePool {
+    return { address: Z, reserveIn: resIn, reserveOut: resOut, decIn, decOut, token0: Z, inIsToken0: true, feePpm, source: "kat" };
+  }
+
+  it("balanced 1:1 18-dec pool, fee 0.01% — exact get_y vectors", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, E18, E18, 100);
+    // Hand-pinned from the bounded-Newton replay (mirrors the fixture's _getY bit-for-bit).
+    assert.equal(getAmountOutStable(p, 1_000n * E18), 999_899_999_500_199_970_501n);
+    assert.equal(getAmountOutStable(p, 10_000n * E18), 9_998_995_002_004_715_249_130n);
+    assert.equal(getAmountOutStable(p, 100_000n * E18), 99_940_071_761_225_519_228_641n);
+    // Stable shape: a small trade returns ~the input net of the 0.01% fee (≈ 0.9999·in) with sub-bps
+    // curvature slippage on top — far flatter than a constant-product pool of the same depth.
+    const out1k = getAmountOutStable(p, 1_000n * E18);
+    assert.ok(out1k < 1_000n * E18 && out1k > 999n * E18, "near-1:1 minus fee on a stable curve");
+  });
+
+  it("imbalanced 1:1.2 pool — exact vector", () => {
+    const p = pool(1_000_000n * E18, 1_200_000n * E18, E18, E18, 100);
+    assert.equal(getAmountOutStable(p, 50_000n * E18), 50_030_221_094_822_880_188_807n);
+  });
+
+  it("decimals normalisation — 6-dec out token denormalises exactly", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * (10n ** 6n), E18, 10n ** 6n, 100);
+    // 1000 (18-dec) in → ~1000 (6-dec) out net of fee: 999.899999 USDC-units.
+    assert.equal(getAmountOutStable(p, 1_000n * E18), 999_899_999n);
+  });
+
+  it("buildSolidlyStableSegments — covers amountIn, strictly descending marginals", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, E18, E18, 100);
+    const amountIn = 100_000n * E18;
+    const segs = buildSolidlyStableSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals strictly descending");
+    }
+    // Σ effOut over the grid == getAmountOutStable(amountIn) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, getAmountOutStable(p, amountIn), "Σ segment effOut == getAmountOutStable(amountIn)");
   });
 });

@@ -1,0 +1,246 @@
+/**
+ * Solidly STABLE (sAMM) — VERBATIM bigint replay + off-chain segment sampler.
+ *
+ * THE SINGLE SOURCE for Solidly stable-pool math. Imported by BOTH:
+ *   - the production `prepare.ts` (buildSolidlyStableSegments), and
+ *   - the neutral oracle `ecoswap.optimal.ts` (solidlyStableSegments),
+ * so the split is exact-on-grid vs the oracle by construction (one replay), and the per-pool
+ * executed output == getAmountOut(awarded share) to the wei (one atomic pool.swap).
+ *
+ * THE STABLE MATH IS OFF-CHAIN ONLY (for the SPLIT). The on-chain solver does NOT recompute the
+ * x3y+y3x invariant or the bounded Newton — it samples the curve OFF-CHAIN into (capacity, effOut,
+ * marginalOI) SEGMENTS via this exact replay, consumes them as STATIC segments through the existing
+ * static-segment cursor (the same machinery the merge uses for route / Curve / LB / DODO segments),
+ * and EXECUTES each stable pool CALLBACK-FREE: an on-chain `pool.getAmountOut(awardedShare, tokenIn)`
+ * staticcall yields the EXACT amountOut (the pool view == the pool swap math), the awarded input is
+ * transferred to the pool, and `pool.swap(amount0Out, amount1Out, to, "")` lands the swap. No engine
+ * SwapPoolType is needed (stable pools are NOT xy=k, so the V2/UniV2 _swapV2 path mis-prices them).
+ *
+ * SOURCE MIRRORED — the canonical Velodrome / Aerodrome / Thena / Ramses `Pair.sol` STABLE branch
+ * (the `stable == true` sAMM). Reproduced bit-for-bit:
+ *   - reserves normalised to 1e18 via token decimals: x = reserve0·1e18/dec0, y = reserve1·1e18/dec1
+ *     (dec = 10**decimals).
+ *   - the invariant k(x,y) = (x·y/1e18)·(x·x/1e18 + y·y/1e18)/1e18   (= x3y + y3x scaled).
+ *   - getAmountOut: amountIn -= amountIn·feePpm/1e6 (the pool/factory fee), then normalise the
+ *     net amountIn and the reserves, compute xy = k(x0n,y0n) with (reserveA,reserveB) oriented by
+ *     tokenIn, set y = reserveB − get_y(amountInN + reserveA, xy, reserveB), and DENORMALISE y back
+ *     to tokenOut decimals.
+ *   - get_y(x0, xy, y): BOUNDED Newton (≤255 iterations, exactly the pool loop bound) with ±1
+ *     convergence (the first f term divides the (y·y/1e18·y)/1e18 cube BEFORE the x0 multiply, then
+ *     /1e18 — the exact `Pair.sol` / fixture `SolidlyStablePool.sol` grouping):
+ *       f(x0,y) = x0·((y·y/1e18·y)/1e18)/1e18 + (x0·x0/1e18·x0/1e18)·y/1e18
+ *       d(x0,y) = 3·x0·(y·y/1e18)/1e18 + (x0·x0/1e18·x0/1e18)
+ *       if f < xy: y += (xy − f)·1e18/d   else: y −= (f − xy)·1e18/d ; break when |dy| <= 1.
+ *
+ * The replay is BOUNDED (255-iteration Newton, exactly the pool's loop bound) — no unbounded loops.
+ * It runs purely on the read pool state (reserves / decimals / fee); buildSolidlyStableSegments makes
+ * NO extra RPC.
+ *
+ * WEI-EXACT BOUND. The SPLIT (per-pool awarded input) is EXACT-ON-GRID vs the oracle (both replay the
+ * SAME buildSolidlyStableSegments grid — one source — so the awarded share matches the oracle
+ * bit-for-bit). The realized dy is EXACT-IN-DY: the per-pool out for the awarded slice is
+ * re-evaluated wei-exact by ONE atomic pool.getAmountOut(Σ share) at execution, because the pool's
+ * `getAmountOut` view IS the math its `swap` enforces. So awarded-input == oracle (exact-on-grid) and
+ * received-dy == getAmountOut(awarded) (exact-in-dy) — the same standard as Curve/DODO.
+ *
+ * Sources:
+ *   https://github.com/velodrome-finance/contracts/blob/main/contracts/Pool.sol  (_k / _get_y / getAmountOut)
+ *   https://github.com/aerodrome-finance/contracts (sAMM Pool.sol — identical math)
+ */
+
+/** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / dodo-math / ecoswap.math Q192). */
+export const Q192 = 1n << 192n;
+
+/** Solidly DecimalMath ONE — 1e18 fixed point (the reserve-normalisation unit). */
+export const SOLIDLY_ONE = 10n ** 18n;
+
+/** ppm fee denominator (the pool/factory fee is in ppm — e.g. 100 = 0.01%, the canonical sAMM tier). */
+export const FEE_DENOM_PPM = 1_000_000n;
+
+/** Integer square root (Babylonian) — bit-identical to curve-math / dodo-math / ecoswap.math `isqrt`. */
+export function isqrt(x: bigint): bigint {
+  if (x <= 0n) return 0n;
+  let z = x;
+  let y = (z + 1n) / 2n;
+  while (y < z) {
+    z = y;
+    y = (x / y + y) / 2n;
+  }
+  return z;
+}
+
+/**
+ * One discovered Solidly STABLE pool, oriented for a tokenIn → tokenOut swap.
+ *
+ * The on-chain execution is CALLBACK-FREE (getAmountOut staticcall + transfer + pool.swap), so the
+ * fields here are OFF-CHAIN ONLY — they feed buildSolidlyStableSegments (the price/capacity replay).
+ * `reserveIn`/`reserveOut` are the RAW (native-decimals) reserves oriented by tokenIn; `decIn`/`decOut`
+ * are 10**decimals for the respective token (the normalisation factors). `token0` + `inIsToken0` orient
+ * the pool's swap output slot at execution. `feePpm` is the pool/factory stable swap fee (ppm).
+ */
+export interface SolidlyStablePool {
+  /** Pool address — the getAmountOut/swap target. */
+  address: `0x${string}`;
+  /** RAW tokenIn-side reserve (native decimals). */
+  reserveIn: bigint;
+  /** RAW tokenOut-side reserve (native decimals). */
+  reserveOut: bigint;
+  /** 10**decimals of tokenIn (the normalisation factor for the IN reserve). */
+  decIn: bigint;
+  /** 10**decimals of tokenOut. */
+  decOut: bigint;
+  /** The pool's token0 (lower-sorted token) — orients the swap output slot. */
+  token0: `0x${string}`;
+  /** true => tokenIn is token0 (output is amount1Out); false => tokenIn is token1 (output is amount0Out). */
+  inIsToken0: boolean;
+  /** Stable swap fee in ppm (e.g. 100 = 0.01%). */
+  feePpm: number;
+  /** Discovery source label. */
+  source: string;
+}
+
+/** k(x,y) = (x·y/1e18)·(x·x/1e18 + y·y/1e18)/1e18 — the sAMM invariant (x3y + y3x), 1e18-scaled. */
+function k(x: bigint, y: bigint): bigint {
+  const a = (x * y) / SOLIDLY_ONE; // xy
+  const b = (x * x) / SOLIDLY_ONE + (y * y) / SOLIDLY_ONE; // x2 + y2
+  return (a * b) / SOLIDLY_ONE;
+}
+
+/**
+ * get_y(x0, xy, y) — bounded Newton (≤255 iterations, exactly the Velodrome/Aerodrome loop bound)
+ * solving for the new y-reserve that holds the invariant xy constant after x0 moves to `x0`. The
+ * first f term groups as the canonical `Pair.sol` / fixture `SolidlyStablePool.sol` (the y-cube
+ * reduced to 1e18 BEFORE the x0 multiply, then /1e18 once more) — bit-for-bit with the fixture.
+ *   f(x0,y) = x0·((y·y/1e18·y)/1e18)/1e18 + (x0·x0/1e18·x0/1e18)·y/1e18
+ *   d(x0,y) = 3·x0·(y·y/1e18)/1e18 + (x0·x0/1e18·x0/1e18)
+ *   if f < xy: y += (xy − f)·1e18/d   else: y −= (f − xy)·1e18/d ; break when |dy| <= 1.
+ */
+function getYNewton(x0: bigint, xy: bigint, y0: bigint): bigint {
+  let y = y0;
+  for (let it = 0; it < 255; it++) {
+    const yPrev = y;
+    // f(x0,y)
+    const f =
+      (x0 * ((((y * y) / SOLIDLY_ONE) * y) / SOLIDLY_ONE)) / SOLIDLY_ONE +
+      (((x0 * x0) / SOLIDLY_ONE) * x0) / SOLIDLY_ONE * y / SOLIDLY_ONE;
+    // d(x0,y)
+    const d =
+      (3n * x0 * ((y * y) / SOLIDLY_ONE)) / SOLIDLY_ONE + (((x0 * x0) / SOLIDLY_ONE) * x0) / SOLIDLY_ONE;
+    if (d === 0n) break;
+    if (f < xy) {
+      const dy = ((xy - f) * SOLIDLY_ONE) / d;
+      y = y + dy;
+    } else {
+      const dy = ((f - xy) * SOLIDLY_ONE) / d;
+      y = y - dy;
+    }
+    if (y > yPrev) {
+      if (y - yPrev <= 1n) break;
+    } else {
+      if (yPrev - y <= 1n) break;
+    }
+  }
+  return y;
+}
+
+/**
+ * getAmountOut(amountIn, tokenIn) — the exact tokens-out for `dx` tokenIn, INCLUDING the swap fee.
+ * Mirrors the canonical Velodrome/Aerodrome sAMM `getAmountOut` bit-for-bit:
+ *   amountIn -= amountIn·feePpm/1e6                                # net fee off the input
+ *   xy = k(x0n, y0n)                                               # the invariant on NORMALISED reserves
+ *   (reserveA, reserveB) oriented by tokenIn (in-side, out-side)   # both normalised to 1e18
+ *   amountInN = amountIn·1e18/decIn                                # net input normalised
+ *   y = reserveB − get_y(amountInN + reserveA, xy, reserveB)       # new out-reserve drop, normalised
+ *   return y·decOut/1e18                                           # denormalised to tokenOut decimals
+ */
+export function getAmountOutStable(pool: SolidlyStablePool, dx: bigint): bigint {
+  if (dx <= 0n) return 0n;
+  // net the fee off the input (the pool charges fee on the INPUT side).
+  const amountIn = dx - (dx * BigInt(pool.feePpm)) / FEE_DENOM_PPM;
+  if (amountIn <= 0n) return 0n;
+
+  // normalise both reserves to 1e18.
+  const x0n = (pool.reserveIn * SOLIDLY_ONE) / pool.decIn; // in-side (reserveA)
+  const y0n = (pool.reserveOut * SOLIDLY_ONE) / pool.decOut; // out-side (reserveB)
+  if (x0n <= 0n || y0n <= 0n) return 0n;
+
+  const xy = k(x0n, y0n);
+  const amountInN = (amountIn * SOLIDLY_ONE) / pool.decIn; // net input normalised
+  const yNew = getYNewton(amountInN + x0n, xy, y0n);
+  if (yNew >= y0n) return 0n;
+  const dyN = y0n - yNew; // normalised out-reserve drop
+  // denormalise back to tokenOut native decimals.
+  return (dyN * pool.decOut) / SOLIDLY_ONE;
+}
+
+/**
+ * One sampled Solidly-stable segment in unified out/in price space — identical shape to a Curve / LB
+ * / DODO / route segment (a flat [capacity, marginalOI] slice). `capacity` is the Δinput (tokenIn) for
+ * this slice, `effOut` the Δoutput, and `marginalOI` the unified out/in sqrt = isqrt(effOut·2^192/capacity)
+ * — the price-ordering coordinate. Segments are emitted in DESCENDING `marginalOI` order (the natural
+ * order of a convex stable curve: the first marginal slice is the best-priced).
+ *
+ * fee-adjust: marginalOI is computed from the POST-FEE dy (getAmountOutStable already nets the fee), so
+ * it is ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly
+ * (no extra sqrtOneMinusFee multiply, the fee is baked into dy), exactly like Curve / LB / DODO segments.
+ */
+export interface SolidlyStableSegment {
+  /** Δinput (tokenIn) to traverse this slice. */
+  capacity: bigint;
+  /** Δoutput (tokenOut) over this slice. */
+  effOut: bigint;
+  /** Unified out/in marginal price for this slice = isqrt(effOut * 2^192 / capacity). */
+  marginalOI: bigint;
+}
+
+/** Default sample count per stable pool (M). Tunable; M≈24 tightens the grid bound. */
+export const SOLIDLY_STABLE_SAMPLES = Number(process.env.ECO_SOLIDLY_SAMPLES ?? 24);
+
+/**
+ * Sample a Solidly STABLE pool into M descending-marginal segments over [0, amountIn].
+ *
+ * Geometric-ish cumulative inputs (∝ s^2 — denser near 0 where the stable curve is flattest then
+ * bends), each replayed through getAmountOutStable on the READ state (NO extra RPC — pure bigint,
+ * bounded Newton). Each increment becomes a (capacity=Δin, effOut=Δout, marginalOI) segment. The
+ * samples are monotone in input so the marginals are naturally descending (a convex out(in)); a
+ * non-decreasing marginal (rounding noise near saturation, or past the pool's effective depth) is
+ * dropped so the merge stays strictly price-ordered.
+ *
+ * Exact-on-grid: the split equalizes marginals on THIS sampled grid; the per-pool out for the awarded
+ * Σ share is re-evaluated wei-exact by one atomic on-chain getAmountOut(Σ share) at execution. M≈24
+ * (default) keeps the grid bound `O(curvature·maxSlice)` negligible near peg. Mirrors
+ * `buildCurveSegments` / `buildDodoSegments` (same squared-index geometric grid + strictly-descending
+ * guard).
+ */
+export function buildSolidlyStableSegments(
+  pool: SolidlyStablePool,
+  amountIn: bigint,
+  samples: number = SOLIDLY_STABLE_SAMPLES,
+): SolidlyStableSegment[] {
+  if (amountIn <= 0n) return [];
+  const M = BigInt(samples);
+  const segs: SolidlyStableSegment[] = [];
+  let prevIn = 0n;
+  let prevOut = 0n;
+  for (let s = 1; s <= samples; s++) {
+    // cumulative input ∝ s^2 (fine slices near 0, coarse near amountIn).
+    const ss = BigInt(s);
+    const input = (amountIn * ss * ss) / (M * M);
+    if (input <= prevIn) continue;
+    const out = getAmountOutStable(pool, input);
+    if (out <= 0n) continue;
+    const dIn = input - prevIn;
+    const dOut = out - prevOut;
+    if (dIn > 0n && dOut > 0n) {
+      const marginalOI = isqrt((dOut * Q192) / dIn);
+      // Strictly-descending guard — drop a slice whose marginal did not improve on the prior
+      // (rounding noise near saturation) so the merge stays monotone price-ordered.
+      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
+        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
+      }
+    }
+    prevIn = input;
+    prevOut = out;
+  }
+  return segs;
+}

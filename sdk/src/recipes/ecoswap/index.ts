@@ -208,12 +208,14 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const curves = prepared.curves ?? [];
   const lbs = prepared.lbs ?? [];
   const dodos = prepared.dodos ?? [];
+  const solidlyStables = prepared.solidlyStables ?? [];
   return prepared.brackets
     .filter(
       (b) =>
         b.kind === EcoBracketKind.Curve ||
         b.kind === EcoBracketKind.LB ||
-        b.kind === EcoBracketKind.DODO,
+        b.kind === EcoBracketKind.DODO ||
+        b.kind === EcoBracketKind.SolidlyStable,
     )
     .slice()
     .sort((a, b) => {
@@ -225,12 +227,18 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isCurve = b.kind === EcoBracketKind.Curve;
       const isLb = b.kind === EcoBracketKind.LB;
       const isDodo = b.kind === EcoBracketKind.DODO;
-      const segKind = isCurve ? 1n : isLb ? 2n : 3n;
+      const isSolidly = b.kind === EcoBracketKind.SolidlyStable;
+      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable (callback-free getAmountOut + pool.swap).
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
           ? BigInt(lbs[b.refIdx].address)
-          : BigInt(dodos[b.refIdx].address);
+          : isDodo
+            ? BigInt(dodos[b.refIdx].address)
+            : isSolidly
+              ? BigInt(solidlyStables[b.refIdx].address)
+              : 0n;
       return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
     });
 }

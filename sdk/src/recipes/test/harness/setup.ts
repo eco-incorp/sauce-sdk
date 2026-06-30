@@ -84,6 +84,10 @@ export const curveStableSwapArtifact = loadArtifact(
 export const dodoV2PoolArtifact = loadArtifact(
   join(FIXTURES, "DodoV2Pool.sol", "DodoV2Pool.json"),
 );
+/** Solidly STABLE (sAMM) pool — deployed normally (constructor sets tokens/decimals/fee). */
+export const solidlyStablePoolArtifact = loadArtifact(
+  join(FIXTURES, "SolidlyStablePool.sol", "SolidlyStablePool.json"),
+);
 /** Trader Joe LB pair — deployed normally (constructor sets tokens/binStep/baseFactor/activeId). */
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
@@ -756,6 +760,57 @@ export async function deployDodoV2Pool(
     functionName: "transfer",
     args: [pool, p.Q],
     account: acct,
+  });
+  return pool;
+}
+
+export const solidlyStableAbi = parseAbi([
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+  "function stable() view returns (bool)",
+  "function getReserves() view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast)",
+  "function decimals0() view returns (uint256)",
+  "function decimals1() view returns (uint256)",
+  "function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)",
+  "function sync()",
+  "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
+]);
+
+/**
+ * Deploy a local Solidly STABLE (sAMM) pool and fund it with its token0/token1 reserves.
+ *
+ * Mirrors the canonical Velodrome/Aerodrome stable Pair math bit-for-bit (matching the off-chain
+ * `solidly-stable-math.ts` replay), so `getAmountOut(amountIn, tokenIn)` returns EXACTLY
+ * `getAmountOutStable(pool, dx)` to the wei. EcoSwap executes it callback-free (transfer + swap), so
+ * the pool must HOLD both reserves — `minter` transfers reserve0/reserve1 in, then `sync()` snaps them.
+ * `token0Addr`/`token1Addr` must be the address-sorted pair (token0 < token1).
+ */
+export async function deploySolidlyStablePool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  token0Addr: Hex,
+  token1Addr: Hex,
+  dec0: bigint,
+  dec1: bigint,
+  feePpm: bigint,
+  reserve0: bigint,
+  reserve1: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: solidlyStablePoolArtifact.abi,
+    bytecode: solidlyStablePoolArtifact.bytecode,
+    args: [token0Addr, token1Addr, dec0, dec1, feePpm],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: token0Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: pool, abi: solidlyStableAbi as Abi, functionName: "sync", args: [], account: acct,
   });
   return pool;
 }

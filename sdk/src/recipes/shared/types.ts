@@ -35,6 +35,13 @@ export interface PoolInfo {
   tickSpacing?: number;
   /** V4 hooks address (address(0) for hookless pools). */
   hooks?: Hex;
+  /**
+   * Solidly STABLE (sAMM) only: true ⇒ this is a Solidly stable pool (x3y+y3x invariant), NOT a
+   * constant-product xy=k pool — so it must NOT be priced/executed as V2. The legacy
+   * `discoverPools` aggregator tags it here (and pins `poolType` to UniV2 only for shape
+   * compatibility); the EcoSwap recipe uses the typed `SolidlyStablePool` path instead.
+   */
+  solidlyStable?: boolean;
 }
 
 // ── Quoting ──────────────────────────────────────────────────
@@ -211,6 +218,7 @@ export enum EcoBracketKind {
   Curve = 3, // Curve StableSwap segment (static, off-chain-sampled via the bigint replay)
   LB = 4, // Trader Joe Liquidity Book segment (static, off-chain EXACT one-flat-per-bin)
   DODO = 5, // DODO V2 PMM segment (static, off-chain-sampled via the closed-form querySell* replay)
+  SolidlyStable = 6, // Solidly STABLE (sAMM) segment (static, off-chain-sampled via the x3y+y3x replay)
 }
 
 /**
@@ -416,6 +424,28 @@ export interface EcoDodo {
 }
 
 /**
+ * One Solidly STABLE (sAMM) venue to execute, indexed by an EcoBracket.refIdx (kind === SolidlyStable).
+ * Solidly stable pools (Aerodrome/Velodrome/Thena/Ramses sAMM) are NOT xy=k — they trade on the
+ * x3y+y3x invariant — so they must NOT be routed through the V2 (_swapV2) path. prepare samples the
+ * curve OFF-CHAIN into static segments (kind SolidlyStable) via the bigint replay; the on-chain solver
+ * consumes those through the static-segment cursor and EXECUTES the awarded Σ share CALLBACK-FREE: an
+ * on-chain `pool.getAmountOut(Σ, tokenIn)` staticcall yields the EXACT out, the awarded input is
+ * transferred to the pool, and `pool.swap(amount0Out, amount1Out, to, "")` lands it (output slot
+ * oriented by `inIsToken0`). NO engine SwapPoolType — the pool view IS the swap math, so it is
+ * wei-exact-in-dy. `address` is the pool; `inIsToken0` orients the output slot; feePpm is the
+ * price-ordering coordinate / diagnostic.
+ */
+export interface EcoSolidlyStable {
+  /** Pool address — the getAmountOut/swap target. */
+  address: Hex;
+  /** true => tokenIn is the pool's token0 (output is amount1Out); false => output is amount0Out. */
+  inIsToken0: boolean;
+  /** Rounded ppm stable swap fee (the price-ordering coordinate; the on-chain out is the pool view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -451,6 +481,15 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   dodos?: EcoDodo[];
+  /**
+   * Solidly STABLE (sAMM) venues (kind === SolidlyStable brackets reference these by refIdx). The
+   * on-chain solver executes the awarded Σ share CALLBACK-FREE (getAmountOut staticcall + transfer +
+   * pool.swap — NO engine SwapPoolType); the stable marginal is supplied entirely as the static
+   * sampled segments in `brackets` (the x3y+y3x replay). Optional/empty when no Solidly stable pools
+   * were discovered (omitted ⇒ no stable venue, so existing test-side `EcoSwapPrepared` literals stay
+   * additive-compatible).
+   */
+  solidlyStables?: EcoSolidlyStable[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

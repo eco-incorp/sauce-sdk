@@ -4,6 +4,7 @@ import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
 import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IKyberPool } from "./IKyberPool.json";
+import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -75,9 +76,13 @@ import { IKyberPool } from "./IKyberPool.json";
 //                 (bestKind===1), accumulates the awarded Σ per venue (keyed by the row's venue
 //                 address), and dispatches on segKind at execution: 1 = Curve (swap(poolType:3) →
 //                 _swapCurve), 2 = LB (swap(poolType:6) → _swapTraderJoeLB), 3 = DODO (swap(poolType:5)
-//                 → _swapDODOV2). The engine resolves coin indices / swapForY / base-quote orientation
-//                 on-chain, so the SwapParams carry NO curve data — the segment merge already used it.
-//                 Curve/DODO are exact-on-grid; LB is EXACT (a bin is a flat constant-sum slice).
+//                 → _swapDODOV2), 4 = Solidly STABLE (sAMM) — CALLBACK-FREE, NO engine SwapPoolType:
+//                 read the EXACT out from the pool's getAmountOut view (the view IS the swap math),
+//                 transfer the awarded input + pool.swap(a0Out, a1Out, to, "") (a stable pool is
+//                 x3y+y3x, NOT xy=k, so it must NOT go through _swapV2). The engine resolves coin
+//                 indices / swapForY / base-quote orientation on-chain for kinds 1-3, so the SwapParams
+//                 carry NO curve data — the segment merge already used it. Curve/DODO/Solidly are
+//                 exact-on-grid; LB is EXACT (a bin is a flat constant-sum slice).
 // All sqrt values are unified out/in Q96.
 
 
@@ -263,6 +268,8 @@ function main(
   let lven: Tuple = new Array(segs.length); // LB venue (pair) address
   let dinp: Tuple = new Array(segs.length); // DODO per-venue Σ input
   let dven: Tuple = new Array(segs.length); // DODO venue (pool) address
+  let sinp: Tuple = new Array(segs.length); // Solidly-stable per-venue Σ input
+  let sven: Tuple = new Array(segs.length); // Solidly-stable venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -822,8 +829,14 @@ function main(
                 linp[sIdx] = linp[sIdx] + stake;
                 lven[sIdx] = sVenue;
               } else {
-                dinp[sIdx] = dinp[sIdx] + stake;
-                dven[sIdx] = sVenue;
+                if (sKind === 3) {
+                  dinp[sIdx] = dinp[sIdx] + stake;
+                  dven[sIdx] = sVenue;
+                } else {
+                  // segKind 4 — Solidly STABLE (sAMM): callback-free, executed below via getAmountOut.
+                  sinp[sIdx] = sinp[sIdx] + stake;
+                  sven[sIdx] = sVenue;
+                }
               }
             }
             cum = cum + stake;
@@ -1100,6 +1113,30 @@ function main(
         tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(damt),
         sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
       });
+    }
+  }
+  // Solidly STABLE (sAMM) → CALLBACK-FREE (NO engine SwapPoolType). Solidly stable pools trade on
+  // the x3y+y3x invariant (NOT xy=k), so the engine's _swapV2 would mis-price them. Execute exactly
+  // as the pool's own router would: read the EXACT amountOut from the pool's getAmountOut view (the
+  // view IS the swap math ⇒ wei-exact-in-dy for the awarded share), transfer the awarded input to
+  // the pool, then call pool.swap(amount0Out, amount1Out, to, "") with the output in the OUT-token
+  // slot (tokenIn==token0 ⇒ out is amount1Out; tokenIn==token1 ⇒ out is amount0Out). compute-then-
+  // pull already transferred `cum` (incl. each stable share) into this contract above.
+  for (let q = 0; q < segs.length; q = q + 1) {
+    const samt: Uint256 = sinp[q];
+    if (samt > 0) {
+      const spool: Address = sven[q];
+      const sOut: Uint256 = ISolidlyStablePool.at(spool).getAmountOut(samt, tokenIn);
+      if (sOut > 0) {
+        const sT0: Address = ISolidlyStablePool.at(spool).token0();
+        token.transfer(spool, samt);
+        const sEmpty: bytes = abi.encode(tokenIn).slice(0, 0);
+        if (sT0 === tokenIn) {
+          ISolidlyStablePool.at(spool).swap(0, sOut, address.self, sEmpty);
+        } else {
+          ISolidlyStablePool.at(spool).swap(sOut, 0, address.self, sEmpty);
+        }
+      }
     }
   }
   const leftover: Uint256 = token.balanceOf(address.self);

@@ -27,6 +27,7 @@ import type { PoolInfo } from "./types.js";
 import { A_PRECISION_DEFAULT, type CurvePool } from "./curve-math.js";
 import type { LbPool } from "./lb-math.js";
 import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
+import type { SolidlyStablePool } from "./solidly-stable-math.js";
 
 // ── ABIs ──────────────────────────────────────────────────────
 
@@ -44,7 +45,33 @@ const v2FactoryAbi = parseAbi([
 
 const solidlyFactoryAbi = parseAbi([
   "function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool)",
+  "function getFee(address pool, bool stable) external view returns (uint256)",
 ]);
+
+// Solidly STABLE (sAMM) pool surface — the Velodrome/Aerodrome stable Pair: token0/getReserves for
+// the off-chain replay, decimals0/decimals1 for the 1e18 normalisation, stable() to confirm the
+// branch, and getAmountOut(amountIn, tokenIn) for the on-chain (and cross-check) exact view.
+const solidlyStablePoolAbi = parseAbi([
+  "function token0() external view returns (address)",
+  "function token1() external view returns (address)",
+  "function stable() external view returns (bool)",
+  "function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast)",
+  "function decimals0() external view returns (uint256)",
+  "function decimals1() external view returns (uint256)",
+  "function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256)",
+]);
+
+const erc20DecimalsAbi = parseAbi([
+  "function decimals() external view returns (uint8)",
+]);
+
+/**
+ * Default Solidly STABLE swap fee (ppm) when the factory `getFee` read is unavailable. The canonical
+ * sAMM tier (Velodrome/Aerodrome stable) is 0.01% = 100 ppm. Velodrome `getFee` returns the fee in
+ * bps×... fork-dependent — we treat a successful `getFee(pool,true)` as already ppm if it is large
+ * enough, else as bps (×100). When the read fails entirely we fall back to this default.
+ */
+const SOLIDLY_STABLE_DEFAULT_FEE_PPM = 100;
 
 const v3PoolAbi = parseAbi([
   "function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint32 feeProtocol, bool unlocked)",
@@ -448,28 +475,126 @@ async function discoverSolidlyV2Pools(
   const validPairs: { address: Hex; factory: FactoryConfig }[] = [];
   for (let i = 0; i < poolAddresses.length; i++) {
     const result = poolAddresses[i];
-    if (
-      result.status === "success" &&
-      result.result &&
-      result.result !== ZERO_ADDRESS
-    ) {
+    if (result.status === "success" && result.result && result.result !== ZERO_ADDRESS) {
       const addr = (result.result as string).toLowerCase();
       if (!seen.has(addr)) {
         seen.add(addr);
-        const label = calls[i].stable
-          ? `${calls[i].factory.label} (stable)`
-          : calls[i].factory.label;
-        validPairs.push({
-          address: result.result as Hex,
-          factory: { ...calls[i].factory, label },
-        });
+        const label = calls[i].stable ? `${calls[i].factory.label} (stable)` : calls[i].factory.label;
+        validPairs.push({ address: result.result as Hex, factory: { ...calls[i].factory, label } });
       }
     }
   }
 
   if (validPairs.length === 0) return [];
 
+  // The legacy aggregator models BOTH Solidly volatile AND stable pools as xy=k V2 — the pre-existing
+  // behaviour the other recipes (megaswap/alphaswap/gigaswap/terraswap) were tuned against; left
+  // untouched so adding the stable source does not silently shift their routing. EcoSwap does NOT use
+  // this path for stable pools — it discovers them precisely as typed SolidlyStablePool descriptors via
+  // discoverSolidlyStablePoolsTyped (x3y+y3x sampled segments), so stable-curve fidelity lives there.
   return readV2PoolState(tokenIn, tokenOut, client, validPairs);
+}
+
+/** Interpret a Solidly factory `getFee` result as ppm (heuristic: a small value is bps → ×100). */
+function solidlyFeeToPpm(fee: bigint | undefined): number {
+  if (fee === undefined) return SOLIDLY_STABLE_DEFAULT_FEE_PPM;
+  const n = Number(fee);
+  if (n === 0) return SOLIDLY_STABLE_DEFAULT_FEE_PPM;
+  // Velodrome/Aerodrome `getFee` returns bps (e.g. 1 = 0.01%); a value < 1000 is bps → ppm = bps×100.
+  // A larger value is already ppm.
+  return n < 1000 ? n * 100 : n;
+}
+
+/**
+ * Discover Solidly STABLE (sAMM) pools for the pair AS TYPED `SolidlyStablePool` descriptors (the
+ * EcoSwap path — distinct from the V2-tagged PoolInfo aggregator). Solidly stable pools (Aerodrome/
+ * Velodrome/Thena/Ramses sAMM) trade on the x3y+y3x invariant, NOT xy=k, so they must NOT be priced
+ * through the V2 synthetic-sqrt path. This reads token0/decimals/reserves + the per-pool fee so
+ * prepare's `buildSolidlyStableSegments` can replay the curve with NO further RPC, and the on-chain
+ * solver consumes the sampled segments statically + executes CALLBACK-FREE (getAmountOut staticcall +
+ * transfer + pool.swap — NO engine SwapPoolType).
+ *
+ * Mirrors `discoverCurvePoolsTyped` / `discoverDodoV2PoolsTyped`: off-chain discovery + state reads,
+ * returning the venue descriptor EcoSwap prepare consumes directly (the on-chain lens does not
+ * understand Solidly stable pools). Factory path: getPool(tokenA, tokenB, true) per SolidlyV2 factory.
+ * Decimals are read via erc20 `decimals()` (the normalisation factor); the fee via the factory
+ * `getFee(pool, true)` (fork-default 0.01% on failure).
+ */
+export async function discoverSolidlyStablePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<SolidlyStablePool[]> {
+  if (factories.length === 0) return [];
+
+  const addrResults = await client.multicall({
+    contracts: factories.map((f) => ({
+      address: f.address,
+      abi: solidlyFactoryAbi,
+      functionName: "getPool" as const,
+      args: [tokenIn, tokenOut, true] as const, // stable
+    })),
+    allowFailure: true,
+  });
+
+  const seen = new Set<string>();
+  const valid: { address: Hex; factory: FactoryConfig }[] = [];
+  for (let i = 0; i < addrResults.length; i++) {
+    const r = addrResults[i];
+    if (r.status !== "success" || !r.result || r.result === ZERO_ADDRESS) continue;
+    const key = (r.result as string).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    valid.push({ address: r.result as Hex, factory: factories[i] });
+  }
+  if (valid.length === 0) return [];
+
+  const [token0Results, reserveResults, feeResults] = await Promise.all([
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.address, abi: solidlyStablePoolAbi, functionName: "token0" as const })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.address, abi: solidlyStablePoolAbi, functionName: "getReserves" as const })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.factory.address, abi: solidlyFactoryAbi, functionName: "getFee" as const, args: [p.address, true] as const })),
+      allowFailure: true,
+    }),
+  ]);
+
+  // Decimals: read the two tokens once (tokenIn + tokenOut).
+  const [decInRaw, decOutRaw] = await Promise.all([
+    client.readContract({ address: tokenIn, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+    client.readContract({ address: tokenOut, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+  ]);
+  const decIn = 10n ** BigInt(decInRaw);
+  const decOut = 10n ** BigInt(decOutRaw);
+
+  const pools: SolidlyStablePool[] = [];
+  for (let i = 0; i < valid.length; i++) {
+    const t0 = token0Results[i];
+    const reserves = reserveResults[i];
+    if (t0.status !== "success" || reserves.status !== "success") continue;
+    const [reserve0, reserve1] = reserves.result as [bigint, bigint, bigint];
+    if (reserve0 === 0n || reserve1 === 0n) continue;
+    const token0 = (t0.result as Hex);
+    const inIsToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
+    pools.push({
+      address: valid[i].address,
+      reserveIn: inIsToken0 ? reserve0 : reserve1,
+      reserveOut: inIsToken0 ? reserve1 : reserve0,
+      decIn,
+      decOut,
+      token0,
+      inIsToken0,
+      feePpm: solidlyFeeToPpm(feeResults[i].status === "success" ? (feeResults[i].result as bigint) : undefined),
+      source: `${valid[i].factory.label} (Solidly stable)`,
+    });
+  }
+  return pools;
 }
 
 // ── Shared V2 pool state reader ─────────────────────────────
