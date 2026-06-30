@@ -195,6 +195,23 @@ function invertFarFromOut(L: Uint256, nearOI: Uint256, outAmt: Uint256): Uint256
   return nearOI - Math.mulDiv(outAmt, Q96, L);
 }
 
+// ── Compile-time protocol-presence flags (conditional compilation) ──
+// Each guards the per-protocol-SEPARABLE on-chain code below. index.ts derives each from the
+// prepared universe and passes them as compiler `defines` (with treeshake on) so a cook carries
+// ONLY the protocols its prepared data actually contains — an all-UniV3 swap drops the Curve /
+// Solidly / DODO / LB / Kyber / route bytecode (and any helper reachable only from a dropped
+// branch). A caller-provided define OVERRIDES these defaults; absent any define (the legacy /
+// compile-test path) every flag stays `true` ⇒ output is byte-identical to the all-protocols cook.
+// The type-agnostic k-way merge core + the live V3/V4 frontier walk are unguarded (always on).
+const HAS_V2: boolean = true;
+const HAS_V4: boolean = true;
+const HAS_KYBER: boolean = true;
+const HAS_ROUTES: boolean = true;
+const HAS_CURVE: boolean = true;
+const HAS_LB: boolean = true;
+const HAS_DODO: boolean = true;
+const HAS_SOLIDLY_STABLE: boolean = true;
+
 function main(
   cfg: Tuple,
   pools: Tuple, netCache: Tuple, routing: Tuple, segs: Tuple
@@ -303,13 +320,13 @@ function main(
     // sf = sqrt((FEE_DENOM - feePpm)*FEE_DENOM) depends only on the constant pool fee — compute the
     // integer sqrt ONCE here and reuse it in the hot merge loop (feeAdj = mulDiv(oi, sf, FEE_DENOM)).
     sfArr[i] = Math.sqrt((FEE_DENOM - pd[5]) * FEE_DENOM);
-    if (isV2 === 1) {
+    if ((HAS_V2 || HAS_KYBER) && isV2 === 1) {
       // V2 reads getReserves; Kyber Classic (pd[16]==1) reads getTradeInfo's VIRTUAL reserves
       // (the curve geometry trades on vReserve*, NOT the real reserves). Both seed an identical
       // constant-L stream from the LIVE out/in spot — only the reserve source differs.
       let r0: Uint256 = 0;
       let r1: Uint256 = 0;
-      if (pd[16] === 1) {
+      if (HAS_KYBER && pd[16] === 1) {
         r0 = IKyberPool.at(pd[1]).getTradeInfo()[2]; // vReserve0
         r1 = IKyberPool.at(pd[1]).getTradeInfo()[3]; // vReserve1
       } else {
@@ -329,7 +346,7 @@ function main(
       let srReal: Uint256 = 0;
       let liveTick: Uint256 = 0;
       let liveL: Uint256 = 0;
-      if (pType === 2) {
+      if (HAS_V4 && pType === 2) {
         srReal = IStateViewFull.at(pd[8]).getSlot0(pd[9])[0];
         liveTick = IStateViewFull.at(pd[8]).getSlot0(pd[9])[1];
         liveL = IStateViewFull.at(pd[8]).getLiquidity(pd[9]);
@@ -393,7 +410,7 @@ function main(
             const jz: Uint256 = zArr[j];
             const jsf: Uint256 = sfArr[j];
             let doi: Uint256 = 0;
-            if (jd[6] === 1) {
+            if ((HAS_V2 || HAS_KYBER) && jd[6] === 1) {
               doi = dnNear[j];
             } else {
               doi = toOutIn(dnNear[j], jz);
@@ -403,7 +420,7 @@ function main(
             // strictly below the best can never win — skip its far. Bit-identical to an eager far.
             if (dadj >= bestPrice) {
               let dfarAdj: Uint256 = 0;
-              if (jd[6] === 1) {
+              if ((HAS_V2 || HAS_KYBER) && jd[6] === 1) {
                 const v2Far: Uint256 = dnNear[j] - Math.mulDiv(dnNear[j], V2_STEP_BPS, V2_STEP_DEN);
                 dfarAdj = Math.mulDiv(v2Far, jsf, FEE_DENOM);
               } else {
@@ -424,6 +441,7 @@ function main(
       // rt[2+3L]) compute its internal best ACTIVE pool near/far adj, fold near→routeNear and
       // far→routeFar via composeStep. A route is dead if ANY leg has no active pool. N-leg loop
       // over legCount (rt[0]) — 2-hop and 3-hop are the same code.
+      if (HAS_ROUTES) {
       for (let r = 0; r < routing.length; r = r + 1) {
         const rt: Tuple = routing[r];
         const legCount: Uint256 = rt[0];
@@ -480,12 +498,13 @@ function main(
           }
         }
       }
+      }
 
       // 1c. sampled segments (Curve/LB/DODO) — ONE cursor over the pre-sorted (DESC adjNear, adjFar)
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if (segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE) && segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -506,7 +525,7 @@ function main(
         const dd: Tuple = pools[bestPool];
         const dfee: Uint256 = dd[5];
         const ddz: Uint256 = zArr[bestPool];
-        if (dd[6] === 1) {
+        if ((HAS_V2 || HAS_KYBER) && dd[6] === 1) {
           // V2 frontier step (constant-L geometric slice from the live spot).
           let v2L: Uint256 = lArr[bestPool];
           let v2Near: Uint256 = dnNear[bestPool];
@@ -569,7 +588,7 @@ function main(
             }
           } else {
             const darg: Uint256 = tickArg(dsh, OFFSET);
-            if (dd[0] === 2) { dnet = IStateViewFull.at(dd[8]).getTickLiquidity(dd[9], darg)[1]; }
+            if (HAS_V4 && dd[0] === 2) { dnet = IStateViewFull.at(dd[8]).getTickLiquidity(dd[9], darg)[1]; }
             else { dnet = IUniswapV3PoolFull.at(dd[1]).ticks(darg)[1]; }
           }
           const dneg: Uint256 = dnet >= HALF128 ? 1 : 0;
@@ -596,7 +615,7 @@ function main(
           if (dnSteps[bestPool] >= PER_POOL) { dnOn[bestPool] = 0; }
         }
       } else {
-        if (bestKind === 2) {
+        if (HAS_ROUTES && bestKind === 2) {
           // ── route event (N-leg, routeEventN/routePartialN inlined; helpers can't call helpers) ──
           // Resolve ONE route event across legCount legs: find the BINDING leg (the one whose full
           // tick-cross maps to the SMALLEST token-A input when back-propagated through the upstream
@@ -807,7 +826,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if (bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE) && bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -821,21 +840,23 @@ function main(
             const sVenue: Address = sg[5];
             let stake: Uint256 = sCap;
             if (cum + sCap >= amountIn) { stake = amountIn - cum; }
-            if (sKind === 1) {
+            if (HAS_CURVE && sKind === 1) {
               cinp[sIdx] = cinp[sIdx] + stake;
               cven[sIdx] = sVenue;
             } else {
-              if (sKind === 2) {
+              if (HAS_LB && sKind === 2) {
                 linp[sIdx] = linp[sIdx] + stake;
                 lven[sIdx] = sVenue;
               } else {
-                if (sKind === 3) {
+                if (HAS_DODO && sKind === 3) {
                   dinp[sIdx] = dinp[sIdx] + stake;
                   dven[sIdx] = sVenue;
                 } else {
                   // segKind 4 — Solidly STABLE (sAMM): callback-free, executed below via getAmountOut.
-                  sinp[sIdx] = sinp[sIdx] + stake;
-                  sven[sIdx] = sVenue;
+                  if (HAS_SOLIDLY_STABLE) {
+                    sinp[sIdx] = sinp[sIdx] + stake;
+                    sven[sIdx] = sVenue;
+                  }
                 }
               }
             }
@@ -860,7 +881,7 @@ function main(
         const isV2: Uint256 = dp[6];
         const pType: Uint256 = dp[0];
         const pz: Uint256 = dp[7];
-        if (dp[16] === 1) {
+        if (HAS_KYBER && dp[16] === 1) {
           // KyberSwap Classic / DMM — callback-free, output computed on the VIRTUAL reserves with
           // the LIVE feeInPrecision (the genuine Kyber getAmountOut), so the realized swap lands +
           // conserves on the amplified curve. The merge already grossed by the rounded ppm, so the
@@ -886,7 +907,7 @@ function main(
             }
           }
         } else {
-        if (isV2 === 1) {
+        if (HAS_V2 && isV2 === 1) {
           const v2fee: Uint256 = dp[5];
           if (v2fee === V2_DEFAULT_FEE) {
             // 0.30% pool — the engine's _swapV2 honors exactly this fee, so use the
@@ -932,7 +953,7 @@ function main(
             }
           }
         } else {
-          if (pType === 2) {
+          if (HAS_V4 && pType === 2) {
             const k0: Address = pz === 1 ? tokenIn : tokenOut;
             const k1: Address = pz === 1 ? tokenOut : tokenIn;
             router.swap({
@@ -958,6 +979,7 @@ function main(
   // dust). Each leg pool is dispatched by type (pd[0]/pd[6]) — swapV3 for V3, swap(poolType:0) for
   // V2, swap(poolType:2) for V4 with the leg PoolKey — MIRRORING the direct-pool execution block.
   // 2-hop and 3-hop are the same loop.
+  if (HAS_ROUTES) {
   for (let r = 0; r < routing.length; r = r + 1) {
     const ramt: Uint256 = rinp[r];
     if (ramt > 0) {
@@ -1063,6 +1085,7 @@ function main(
       }
     }
   }
+  }
   // ── Sampled-segment venue execution (Curve / LB / DODO) ──
   // Each engaged venue executes its merged Σ share via ONE atomic engine swap. The curve math is
   // OFF-CHAIN, so the SwapParams carry NO curve data — the engine resolves everything on-chain:
@@ -1077,6 +1100,7 @@ function main(
   // match the V2-path SwapParams shape. One loop per kind over the segment-stream-sized accumulator.
 
   // Curve StableSwap → poolType 3 (SwapPoolType.Curve) → _swapCurve → exchange(i, j, dx, 0).
+  if (HAS_CURVE) {
   for (let c = 0; c < segs.length; c = c + 1) {
     const camt: Uint256 = cinp[c];
     if (camt > 0) {
@@ -1089,7 +1113,9 @@ function main(
       });
     }
   }
+  }
   // Trader Joe LB → poolType 6 (SwapPoolType.TraderJoeLB) → _swapTraderJoeLB → pair.swap(swapForY, to).
+  if (HAS_LB) {
   for (let l = 0; l < segs.length; l = l + 1) {
     const lamt: Uint256 = linp[l];
     if (lamt > 0) {
@@ -1102,7 +1128,9 @@ function main(
       });
     }
   }
+  }
   // DODO V2 PMM → poolType 5 (SwapPoolType.DODOV2) → _swapDODOV2 → sellBase|sellQuote(to).
+  if (HAS_DODO) {
   for (let d = 0; d < segs.length; d = d + 1) {
     const damt: Uint256 = dinp[d];
     if (damt > 0) {
@@ -1115,6 +1143,7 @@ function main(
       });
     }
   }
+  }
   // Solidly STABLE (sAMM) → CALLBACK-FREE (NO engine SwapPoolType). Solidly stable pools trade on
   // the x3y+y3x invariant (NOT xy=k), so the engine's _swapV2 would mis-price them. Execute exactly
   // as the pool's own router would: read the EXACT amountOut from the pool's getAmountOut view (the
@@ -1122,6 +1151,7 @@ function main(
   // the pool, then call pool.swap(amount0Out, amount1Out, to, "") with the output in the OUT-token
   // slot (tokenIn==token0 ⇒ out is amount1Out; tokenIn==token1 ⇒ out is amount0Out). compute-then-
   // pull already transferred `cum` (incl. each stable share) into this contract above.
+  if (HAS_SOLIDLY_STABLE) {
   for (let q = 0; q < segs.length; q = q + 1) {
     const samt: Uint256 = sinp[q];
     if (samt > 0) {
@@ -1138,6 +1168,7 @@ function main(
         }
       }
     }
+  }
   }
   const leftover: Uint256 = token.balanceOf(address.self);
   if (leftover > 0) {

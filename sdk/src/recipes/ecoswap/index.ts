@@ -28,7 +28,12 @@ import { readFileSync } from "fs";
 import ts from "typescript";
 
 import { prepareEcoSwap, type EcoSwapPrepareOpts } from "./prepare.js";
-import { MULTICALL3, BASE_CHAIN_POOL_CONFIG, type ChainPoolConfig } from "../shared/constants.js";
+import {
+  MULTICALL3,
+  BASE_CHAIN_POOL_CONFIG,
+  SwapPoolType,
+  type ChainPoolConfig,
+} from "../shared/constants.js";
 import { EcoBracketKind, type EcoSwapConfig, type EcoSwapPrepared, type EcoPool } from "../shared/types.js";
 
 const require = createRequire(import.meta.url);
@@ -244,6 +249,53 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
 }
 
 /**
+ * Compile-time protocol-presence defines for ecoswap.sauce.ts conditional compilation.
+ *
+ * Each HAS_* flag gates the per-protocol-SEPARABLE on-chain code (Curve/LB/DODO/Solidly/Kyber/
+ * V2/V4/routes). Passed as `defines` with `treeshake:true` so a cook carries ONLY the protocols
+ * its prepared universe actually contains — an all-UniV3 swap drops the Curve/Solidly/DODO/LB/
+ * Kyber/route bytecode (and any helper reachable only from a dropped branch). The type-agnostic
+ * k-way merge core + the live V3/V4 frontier walk are unguarded (always on), so there is no
+ * HAS_V3 guard — V3 is the merge-core default path (HAS_V3 is still emitted for symmetry/clarity).
+ *
+ * SAFETY: a flag is `true` whenever the prepared data carries that protocol's pools/segments, so
+ * live code is NEVER dropped. The `||`-over-legs/universe reductions default a flag to `true` if
+ * the corresponding prepared field is present.
+ */
+function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
+  // Every pool in the executable universe: direct pools PLUS every route-leg pool (a leg pool is
+  // itself an EcoPool the solver walks/executes, so its type must light the matching HAS_* flag).
+  const allPools: EcoPool[] = [
+    ...prepared.pools,
+    ...prepared.routes.flatMap((route) => route.legs.flatMap((leg) => leg.pools)),
+  ];
+  // isKyber pools are isV2-shaped; HAS_V2 covers a plain (non-Kyber) V2 pool, HAS_KYBER the Kyber
+  // setup/exec path. A Kyber pool needs HAS_KYBER (its read + callback-free exec) — and the V2
+  // SETUP/merge branches are shared, gated by (HAS_V2 || HAS_KYBER) on-chain, so a Kyber-only
+  // universe still lights its shared V2-shaped frontier code.
+  const HAS_KYBER = allPools.some((p) => p.isKyber === true);
+  const HAS_V2 = allPools.some((p) => p.isV2 && p.isKyber !== true);
+  const HAS_V4 = allPools.some((p) => p.poolType === SwapPoolType.UniV4);
+  const HAS_V3 = allPools.some((p) => !p.isV2 && p.poolType !== SwapPoolType.UniV4);
+  const HAS_ROUTES = prepared.routes.length > 0;
+  const HAS_CURVE = (prepared.curves?.length ?? 0) > 0;
+  const HAS_LB = (prepared.lbs?.length ?? 0) > 0;
+  const HAS_DODO = (prepared.dodos?.length ?? 0) > 0;
+  const HAS_SOLIDLY_STABLE = (prepared.solidlyStables?.length ?? 0) > 0;
+  return {
+    HAS_V2,
+    HAS_V3,
+    HAS_V4,
+    HAS_KYBER,
+    HAS_ROUTES,
+    HAS_CURVE,
+    HAS_LB,
+    HAS_DODO,
+    HAS_SOLIDLY_STABLE,
+  };
+}
+
+/**
  * Prepare and compile an EcoSwap.
  *
  * @param config - Swap configuration (tokenIn, tokenOut, amountIn)
@@ -310,6 +362,12 @@ export async function ecoSwap(
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
     target,
+    // Conditional compilation: emit ONLY the per-protocol code the prepared universe contains
+    // (treeshake drops branches + helpers reachable only from a folded-away protocol). Every
+    // present protocol gets HAS_X=true, so the awarded split + executed swaps are byte-identical
+    // to the all-protocols cook (the guards are transparent when true).
+    treeshake: true,
+    defines: protocolDefines(prepared),
     // cfg-bundle the SCALARS into ONE tuple (the lens's proven trick — keeps the scalar
     // count out of the arg-prologue SDUP window); the big nested tuples (pools/netCache/
     // routing/segs) stay SEPARATE top-level params so pool/route/segment field reads stay
@@ -471,6 +529,10 @@ export async function quoteEcoSwap(
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
+    // Same conditional compilation as ecoSwap — quote == cook (the quote runs the SAME compiled
+    // solver), so derive the defines from the SAME prepared universe the quote executes.
+    treeshake: true,
+    defines: protocolDefines(usePrepared),
     args: [
       [
         BigInt(config.tokenIn),

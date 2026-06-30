@@ -227,6 +227,44 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     ];
     compileBoth(directOnly, directNet, routing, 1, mixedSegs);
   });
+
+  // CONDITIONAL COMPILATION (the size win) — compile the SAME solver twice: once with every
+  // HAS_* flag true (the all-protocols cook), once with only HAS_V3 true (the rest false). With
+  // treeshake the V3-only build DROPS every per-protocol-separable block (Curve/LB/DODO/Solidly/
+  // Kyber/V2/V4/routes) and every helper reachable only from a dropped branch, so its bytecode is
+  // STRICTLY SMALLER on BOTH engines. The all-true build must also be byte-identical to the
+  // no-defines legacy compile (the guards are transparent when their flag is true).
+  it("conditional compilation: V3-only is strictly smaller than all-protocols (v1 + v12)", () => {
+    const source = readFileSync(SINGLEPASS, "utf-8");
+    const stripped = stripTypes(source);
+    const args = [cfgTuple(1), pools.slice(0, 1), [netCache[0]], routing, segs];
+    const ALL = {
+      HAS_V2: true, HAS_V3: true, HAS_V4: true, HAS_KYBER: true, HAS_ROUTES: true,
+      HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true,
+    };
+    const V3_ONLY = {
+      HAS_V2: false, HAS_V3: true, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
+      HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false,
+    };
+    const size = (r: any): number =>
+      (r.bytecode ?? r.bytecodes).reduce((a: number, b: Uint8Array) => a + b.length, 0);
+
+    for (const target of ["v1", "v12"] as const) {
+      const baseDirs = [REPO_ROOT, RECIPE_DIR];
+      const legacy = compile(stripped, { baseDirs, target, args });
+      const all = compile(stripped, { baseDirs, target, args, treeshake: true, defines: ALL });
+      const v3 = compile(stripped, { baseDirs, target, args, treeshake: true, defines: V3_ONLY });
+      // Transparency: all-flags-true folds to the same bytecode as the no-defines legacy compile.
+      assert.equal(size(all), size(legacy), `${target}: all-protocols defines must be byte-identical to legacy`);
+      // Size win: V3-only drops every other protocol's block + its dead helpers.
+      assert.ok(
+        size(v3) < size(all),
+        `${target}: V3-only (${size(v3)}) must be strictly smaller than all-protocols (${size(all)})`,
+      );
+      // eslint-disable-next-line no-console
+      console.log(`  [${target}] all-protocols=${size(all)}B  V3-only=${size(v3)}B  dropped=${size(all) - size(v3)}B`);
+    }
+  });
 });
 
 // ── The on-chain PREPARE LENS (read-only discovery+state+ticks) ───────────────
