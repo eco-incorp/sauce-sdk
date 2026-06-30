@@ -55,6 +55,12 @@ const netCache: bigint[][] = [
   [OFFSET - 180n, 5n * 10n ** 16n],
 ];
 const routing: bigint[][] = [];
+// Sampled-segment venue rows: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue].
+// One representative Curve segment so the compiler infers the 6-col `segs` row shape (the
+// solver reads segs[i][0..5]); kind 1 = Curve. Used as the default `segs` arg in compileBoth so
+// every fixture compiles the bestKind===1 cursor + the Curve/LB/DODO execution loops.
+const SEG_VENUE = BigInt("0xc0c0000000000000000000000000000000000001");
+const segs: bigint[][] = [[0n, 10n ** 17n, 1n << 96n, 1n << 96n, 1n, SEG_VENUE]];
 
 /**
  * Build the `cfg` scalar tuple index.ts emits:
@@ -83,10 +89,11 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     netCacheArg: bigint[][],
     routingArg: bigint[][],
     directCount: number,
+    segsArg: bigint[][] = segs,
   ) {
     const source = readFileSync(SINGLEPASS, "utf-8");
     const stripped = stripTypes(source);
-    const args = [cfgTuple(directCount), poolsArg, netCacheArg, routingArg];
+    const args = [cfgTuple(directCount), poolsArg, netCacheArg, routingArg, segsArg];
 
     const v1: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args });
     const v12: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args, target: "v12" });
@@ -196,6 +203,29 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       [3n, 1n, 1n, X_TOKEN, 2n, 1n, Y_TOKEN, 3n, 1n, 0n],
     ];
     compileBoth(routePools, routeNetCache, routeRouting, 1);
+  });
+
+  // SAMPLED-SEGMENT venues (Curve / LB / DODO) — guards the bestKind===1 static-segment cursor +
+  // the per-venue accumulators + the three execution loops (swap poolType 3/6/5). ONE direct V3
+  // pool plus a mixed segs stream carrying a Curve (kind 1), an LB (kind 2) and a DODO (kind 3)
+  // segment, each at a distinct venue address. The merge competes them against the live pool; the
+  // execution loops dispatch on segKind. Compiles on BOTH engines.
+  it("compiles sampled-segment venues: Curve + LB + DODO (v1 + v12)", () => {
+    const directOnly: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 0n, 1n],
+    ];
+    const directNet: bigint[][] = [[OFFSET - 180n, 10n ** 17n]];
+    const CURVE = BigInt("0xc0c0000000000000000000000000000000000001");
+    const LB = BigInt("0x1b1b000000000000000000000000000000000002");
+    const DODO = BigInt("0xd0d0000000000000000000000000000000000003");
+    // [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue], DESC sqrtAdjNear.
+    const mixedSegs: bigint[][] = [
+      [0n, 4n * 10n ** 17n, (1n << 96n) + 30n, (1n << 96n) + 30n, 1n, CURVE], // Curve
+      [0n, 3n * 10n ** 17n, (1n << 96n) + 20n, (1n << 96n) + 20n, 2n, LB], // LB
+      [0n, 2n * 10n ** 17n, (1n << 96n) + 10n, (1n << 96n) + 10n, 3n, DODO], // DODO
+    ];
+    compileBoth(directOnly, directNet, routing, 1, mixedSegs);
   });
 });
 

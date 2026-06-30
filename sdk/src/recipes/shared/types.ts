@@ -208,6 +208,9 @@ export enum EcoBracketKind {
   V3 = 0, // direct concentrated-liquidity bracket (test fixtures)
   V2 = 1, // direct constant-product bracket (test fixtures)
   Route = 2, // UNUSED by EcoSwap (routes are live-walk venues, no static segments)
+  Curve = 3, // Curve StableSwap segment (static, off-chain-sampled via the bigint replay)
+  LB = 4, // Trader Joe Liquidity Book segment (static, off-chain EXACT one-flat-per-bin)
+  DODO = 5, // DODO V2 PMM segment (static, off-chain-sampled via the closed-form querySell* replay)
 }
 
 /**
@@ -248,6 +251,14 @@ export interface EcoPool {
   feePpm: number;
   /** true => constant-product (read getReserves); false => V3/V4 (read slot0). */
   isV2: boolean;
+  /**
+   * true => KyberSwap Classic / DMM: a V2-shaped pool (isV2 also true) whose curve geometry
+   * is on VIRTUAL reserves and whose live read is getTradeInfo() (NOT getReserves()). The
+   * merge/oracle/reference treat it identically to a V2 pool seeded from the virtual reserves
+   * (L = isqrt(vIn·vOut)); only the on-chain SETUP read and the execution output formula
+   * differ (getAmountOut on virtual reserves). false ⇒ a plain UniswapV2-style pool.
+   */
+  isKyber?: boolean;
   /** For V2 live reserve orientation: is tokenIn the pool's token0? */
   inIsToken0: boolean;
   /** V4 only: StateView lens address (0x0 for V2/V3). */
@@ -347,6 +358,64 @@ export interface EcoRoute {
 }
 
 /**
+ * One Curve StableSwap venue to execute, indexed by an EcoBracket.refIdx (kind === Curve).
+ * The curve math is OFF-CHAIN: prepare samples it into static segments (kind Curve) via the
+ * bigint replay; the on-chain solver consumes those through the static-segment cursor and
+ * EXECUTES the awarded share via swap(SwapParams{poolType:3, …}) → live _swapCurve. The
+ * int128 coin indices i/j are the engine ABI; address is the exchange(i,j,dx,min_dy) target.
+ */
+export interface EcoCurve {
+  /** Pool address — the swap(SwapParams{poolType:3, pool}) target / exchange() contract. */
+  address: Hex;
+  /** int128 coin index of tokenIn. */
+  i: number;
+  /** int128 coin index of tokenOut. */
+  j: number;
+  /** Rounded ppm fee (the price-ordering coordinate; the on-chain dy is computed by _swapCurve). */
+  feePpm: number;
+  source: string;
+}
+
+/**
+ * One Trader Joe LB venue to execute, indexed by an EcoBracket.refIdx (kind === LB). LB is a
+ * DISCRETE-BIN constant-sum AMM: prepare enumerates it into EXACT static segments (one flat
+ * segment per bin, kind LB) via the off-chain `buildLbSegments`; the on-chain solver consumes
+ * those through the static-segment cursor and EXECUTES the awarded share via
+ * swap(SwapParams{poolType:6, pool}) → live _swapTraderJoeLB (one atomic pool.swap(swapForY,
+ * to); the engine resolves swapForY on-chain from getTokenX(), so NO bin/price data is passed
+ * to the engine). `address` is the pair (the swap target). binStep/feePpm are diagnostics.
+ */
+export interface EcoLb {
+  /** Pair address — the swap(SwapParams{poolType:6, pool}) target. */
+  address: Hex;
+  /** Bin step in bps (the per-bin price ratio; diagnostic). */
+  binStep: number;
+  /** Rounded ppm base fee (the price-ordering coordinate; the on-chain out is computed by the pair). */
+  feePpm: number;
+  source: string;
+}
+
+/**
+ * One DODO V2 PMM venue to execute, indexed by an EcoBracket.refIdx (kind === DODO). DODO V2 is a
+ * Proactive Market Maker: prepare samples its closed-form curve into static segments (kind DODO)
+ * via the off-chain `buildDodoSegments` (querySell* replay; the guide price `i` is POOL STATE, not
+ * an exogenous feed — so the curve is wei-exact-on-grid). The on-chain solver consumes those through
+ * the static-segment cursor and EXECUTES the awarded Σ share via swap(SwapParams{poolType:5, pool})
+ * → live _swapDODOV2 (it resolves base/quote orientation on-chain from `_BASE_TOKEN_()`, so NO
+ * curve/orientation data is passed to the engine). `address` is the pool (the swap target). feePpm
+ * (combined LP+MT) is the price-ordering coordinate / diagnostic.
+ */
+export interface EcoDodo {
+  /** Pool address — the swap(SwapParams{poolType:5, pool}) target. */
+  address: Hex;
+  /** true => tokenIn is the pool's base token (sell base → quote); diagnostic (engine resolves on-chain). */
+  sellBase: boolean;
+  /** Rounded ppm combined fee (LP+MT; the price-ordering coordinate; the on-chain out is computed by _swapDODOV2). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -357,6 +426,31 @@ export interface EcoRoute {
 export interface EcoSwapPrepared {
   pools: EcoPool[];
   routes: EcoRoute[];
+  /**
+   * Curve venues (kind === Curve brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share via swap(SwapParams{poolType:3, pool:curves[refIdx].address,
+   * i, j}); the curve marginal is supplied entirely as the static sampled segments in
+   * `brackets`. Optional/empty when no Curve pools were discovered (omitted ⇒ no Curve venue,
+   * so the many test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  curves?: EcoCurve[];
+  /**
+   * Trader Joe LB venues (kind === LB brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share via swap(SwapParams{poolType:6, pool:lbs[refIdx].address}) →
+   * live _swapTraderJoeLB; the LB marginal is supplied entirely as the EXACT per-bin static
+   * segments in `brackets`. Optional/empty when no LB pairs were discovered (omitted ⇒ no LB
+   * venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  lbs?: EcoLb[];
+  /**
+   * DODO V2 PMM venues (kind === DODO brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share via swap(SwapParams{poolType:5, pool:dodos[refIdx].address}) →
+   * live _swapDODOV2; the PMM marginal is supplied entirely as the static sampled segments in
+   * `brackets` (the closed-form querySell* replay). Optional/empty when no DODO pools were
+   * discovered (omitted ⇒ no DODO venue, so existing test-side `EcoSwapPrepared` literals stay
+   * additive-compatible).
+   */
+  dodos?: EcoDodo[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

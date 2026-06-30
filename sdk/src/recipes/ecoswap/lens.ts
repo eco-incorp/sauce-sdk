@@ -50,6 +50,7 @@ import {
 import {
   SwapPoolType,
   FactoryType,
+  V2_DEFAULT_FEE_PPM,
   type ChainPoolConfig,
   type FactoryConfig,
 } from "../shared/constants.js";
@@ -274,10 +275,30 @@ export async function runLens(
   const target = params.target ?? "v12";
   const account = params.account ?? DEFAULT_LENS_ACCOUNT;
 
-  // Group factories the same way discoverPools does, but only the three families
-  // the lens understands (V2/V3/V4). Others are not collapsed in v1.
+  // Group factories the same way discoverPools does, but only the families the lens
+  // understands (V2/V3/V4/Algebra). Others are not collapsed.
+  //
+  // Algebra dynamic-fee forks (Camelot/QuickSwap V3, Ramses V2) are V3-SHAPED, so they
+  // ride the SAME v3Factories param as standard V3: each row is tagged [factoryAddr,
+  // isAlgebra]. An Algebra factory exposes ONE pool per pair via `poolByPair` (no fee
+  // tiers) and reads `globalState()` (price/tick + the DYNAMIC fee) in place of `slot0()`;
+  // the lens consumes that tag and branches the discovery/state read while reusing the V3
+  // tick walk verbatim. Folding Algebra into v3Factories (rather than a new top-level
+  // param) keeps main() at 7 params — a NEW param risks the v12 SDUP16 reference window.
+  // Zero-address factories (documented placeholders for chains with no Algebra deployment)
+  // are dropped so the lens never emits a dead poolByPair/getPool staticcall.
+  const NON_FACTORY = "0x0000000000000000000000000000000000000000";
+  // v3Factories carries BOTH standard V3 and Algebra factories, tagged with `isAlgebra`.
+  // The order is the config order (so the per-pool ordinal the lens counts is stable across
+  // its four passes). Standard V3 factories loop over the shared fee-tier list; an Algebra
+  // factory discovers exactly ONE pool (at tier ordinal 0, poolByPair) and IGNORES the rest
+  // of the tier list — the lens skips tiers>0 for an Algebra factory so its pool is counted
+  // once. Zero-address (placeholder) factories are dropped here so no dead staticcall fires.
   const v3Factories: FactoryConfig[] = poolConfig.factories.filter(
-    (f) => f.factoryType === FactoryType.V3Standard,
+    (f) =>
+      (f.factoryType === FactoryType.V3Standard ||
+        f.factoryType === FactoryType.AlgebraV3) &&
+      f.address.toLowerCase() !== NON_FACTORY,
   );
   const v2Factories: FactoryConfig[] = poolConfig.factories.filter(
     (f) => f.factoryType === FactoryType.V2Standard,
@@ -288,11 +309,22 @@ export async function runLens(
 
   // For per-factory fee tiers, the lens currently uses ONE global v3FeeTiers list.
   // To honor per-factory tiers (Pancake 2500 ≠ Uni 3000) we expand the V3 list as
-  // ONE flat fee-tier list = union of each factory's tiers; getPool returns 0 for
-  // tiers a factory doesn't have, so over-querying is harmless (just discovered as
-  // absent). Keep it bounded to the configured tiers.
+  // ONE flat fee-tier list = union of each STANDARD-V3 factory's tiers; getPool returns 0
+  // for tiers a factory doesn't have, so over-querying is harmless (just discovered as
+  // absent). Algebra factories contribute no tiers (they read globalState's dynamic fee),
+  // but the list MUST be non-empty so the lens's `ti===0` Algebra branch runs at least once
+  // — fall back to the chain feeTiers (or a single sentinel) when only Algebra is present.
   const v3FeeSet = new Set<number>();
-  for (const f of v3Factories) for (const fee of f.feeTiers ?? poolConfig.feeTiers) v3FeeSet.add(fee);
+  for (const f of v3Factories) {
+    if (f.factoryType === FactoryType.AlgebraV3) continue;
+    for (const fee of f.feeTiers ?? poolConfig.feeTiers) v3FeeSet.add(fee);
+  }
+  if (v3FeeSet.size === 0 && v3Factories.length > 0) {
+    // Only Algebra factories present — seed one tier so the inner loop (and its ti===0
+    // Algebra branch) executes. The fee value is irrelevant for Algebra (its fee comes
+    // from globalState); pick the chain's first tier or 3000.
+    v3FeeSet.add(poolConfig.feeTiers[0] ?? 3000);
+  }
   const v3FeeTiers = [...v3FeeSet];
 
   // V4: sorted currencies + precomputed poolIds per (factory × spec).
@@ -337,9 +369,29 @@ export async function runLens(
         BigInt(minRelBps),
         BigInt(maxTicks),
       ],
-      v3Factories.map((f) => [BigInt(f.address)]),
+      // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep] — isAlgebra=1 ⇒ the
+      // lens discovers via poolByPair + reads globalState() (price/tick + dynamic fee) instead
+      // of getPool + slot0(); 0 ⇒ standard Uniswap-V3 path. Both reuse the V3 tick walk.
+      // algebraTs/algebraStep are the Algebra factory's fixed per-pool tickSpacing and its
+      // precomputed multiplicative step ratio (getSqrtRatioAtTick(ts)) — the lens steps √price
+      // by THIS ratio (it has no on-chain TickMath). Algebra v1 forks (Camelot/QuickSwap/Ramses)
+      // use a fixed per-factory tickSpacing; configure it via FactoryConfig.algebraTickSpacing
+      // (default 60). Standard-V3 rows carry 0 for both (unused — they read the tier's step).
+      v3Factories.map((f) => {
+        const isAlgebra = f.factoryType === FactoryType.AlgebraV3;
+        const aTs = isAlgebra ? f.algebraTickSpacing ?? 60 : 0;
+        return [
+          BigInt(f.address),
+          isAlgebra ? 1n : 0n,
+          BigInt(aTs),
+          isAlgebra ? stepRatioForSpacing(aTs) : 0n,
+        ];
+      }),
       v3FeeTiers.map((fee) => [BigInt(fee), stepRatioForSpacing(feeToTickSpacing(fee))]),
-      v2Factories.map((f) => [BigInt(f.address)]),
+      // v2Factories[i] = [factoryAddr, feePpm] — the per-pool constant-product fee
+      // (V2_DEFAULT_FEE_PPM=3000 for canonical UniswapV2). Threaded so the lens grosses
+      // V2 capacity/floor by the REAL fee, not a hardcoded 0.30%.
+      v2Factories.map((f) => [BigInt(f.address), BigInt(f.v2FeePpm ?? V2_DEFAULT_FEE_PPM)]),
       v4Factories.map((f) => [BigInt(f.address), BigInt(f.stateView as Hex)]),
       v4Specs.map((s) => [BigInt(s.fee), BigInt(s.tickSpacing), s.stepRatio]),
       v4PoolIds.map((id) => [BigInt(id)]),

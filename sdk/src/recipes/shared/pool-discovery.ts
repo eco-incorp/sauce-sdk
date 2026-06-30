@@ -17,11 +17,16 @@ import {
   SwapPoolType,
   FactoryType,
   TRADER_JOE_BIN_STEPS,
+  TRADER_JOE_BIN_WINDOW,
+  TRADER_JOE_DEFAULT_BASE_FACTOR,
   hasPriceLimit,
   type ChainPoolConfig,
   type FactoryConfig,
 } from "./constants.js";
 import type { PoolInfo } from "./types.js";
+import { A_PRECISION_DEFAULT, type CurvePool } from "./curve-math.js";
+import type { LbPool } from "./lb-math.js";
+import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 
 // ── ABIs ──────────────────────────────────────────────────────
 
@@ -87,10 +92,16 @@ function computeV4PoolId(
 
 const curveRegistryAbi = parseAbi([
   "function find_pool_for_coins(address from, address to) external view returns (address pool)",
+  "function get_coin_indices(address pool, address from, address to) external view returns (int128 i, int128 j, bool underlying)",
+  "function get_n_coins(address pool) external view returns (uint256)",
+  "function get_decimals(address pool) external view returns (uint256[8] decimals)",
 ]);
 
 const curvePoolAbi = parseAbi([
   "function balances(uint256 i) external view returns (uint256)",
+  "function A() external view returns (uint256)",
+  "function fee() external view returns (uint256)",
+  "function coins(uint256 i) external view returns (address)",
 ]);
 
 const balancerPoolAbi = parseAbi([
@@ -108,6 +119,25 @@ const dodoPoolAbi = parseAbi([
   "function _QUOTE_RESERVE_() external view returns (uint256)",
 ]);
 
+// DODO V2 PMM state + fee readers (the EcoSwap typed path — distinct from the legacy
+// reserve-only dodoPoolAbi). `getPMMStateForCall()` returns the full PMM curve state
+// (i, K, B, Q, B0, Q0, R) so the off-chain closed-form replay needs NO further RPC; the
+// LP/MT fee rates net the gross receive amount as querySell* does.
+const dodoPmmAbi = parseAbi([
+  "function getPMMStateForCall() external view returns (uint256 i, uint256 K, uint256 B, uint256 Q, uint256 B0, uint256 Q0, uint256 R)",
+  "function _BASE_TOKEN_() external view returns (address)",
+  "function _QUOTE_TOKEN_() external view returns (address)",
+  "function _LP_FEE_RATE_() external view returns (uint256)",
+  "function _MT_FEE_RATE_MODEL_() external view returns (address)",
+]);
+
+// The MT fee-rate model resolves the maintainer fee for a given trader; the per-trader
+// `getFeeRate(trader)` is the canonical reader (a flat-rate model ignores the argument).
+const dodoMtFeeModelAbi = parseAbi([
+  "function getFeeRate(address trader) external view returns (uint256)",
+  "function _FEE_RATE_() external view returns (uint256)",
+]);
+
 const traderJoeLBFactoryAbi = parseAbi([
   "function getLBPairInformation(address tokenX, address tokenY, uint256 binStep) external view returns (uint256 binStep2, address LBPair, bool createdByOwner, bool ignoredForRouting)",
 ]);
@@ -115,6 +145,12 @@ const traderJoeLBFactoryAbi = parseAbi([
 const traderJoeLBPairAbi = parseAbi([
   "function getReserves() external view returns (uint128 reserveX, uint128 reserveY)",
   "function getTokenX() external view returns (address)",
+  "function getTokenY() external view returns (address)",
+  "function getActiveId() external view returns (uint24 activeId)",
+  "function getBinStep() external view returns (uint16 binStep)",
+  "function getBin(uint24 id) external view returns (uint128 binReserveX, uint128 binReserveY)",
+  "function getNextNonEmptyBin(bool swapForY, uint24 id) external view returns (uint24 nextId)",
+  "function getStaticFeeParameters() external view returns (uint16 baseFactor, uint16 filterPeriod, uint16 decayPeriod, uint16 reductionFactor, uint24 variableFeeControl, uint16 protocolShare, uint24 maxVolatilityAccumulator)",
 ]);
 
 const maverickFactoryAbi = parseAbi([
@@ -128,6 +164,16 @@ const maverickPoolAbi = parseAbi([
 
 const woofiAbi = parseAbi([
   "function query(address fromToken, address toToken, uint256 fromAmount) external view returns (uint256 toAmount)",
+]);
+
+// ── KyberSwap Classic / DMM ──────────────────────────────────
+const kyberFactoryAbi = parseAbi([
+  "function getPools(address token0, address token1) external view returns (address[] _pools)",
+]);
+
+const kyberPoolAbi = parseAbi([
+  "function token0() external view returns (address)",
+  "function getTradeInfo() external view returns (uint256 _reserve0, uint256 _reserve1, uint256 _vReserve0, uint256 _vReserve1, uint256 feeInPrecision)",
 ]);
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -535,6 +581,140 @@ async function discoverCurvePools(
   return pools;
 }
 
+/**
+ * Discover a Curve StableSwap plain pool for the pair AS A TYPED `CurvePool` descriptor
+ * (the EcoSwap path — distinct from the legacy `discoverCurvePools` PoolInfo aggregator,
+ * which mis-models a stable pool as a synthetic V2 sqrt). The curve math is OFF-CHAIN ONLY:
+ * this reads the live invariant state (A, balances[], decimals→rates[], fee, coin indices)
+ * so prepare's `buildCurveSegments` can replay get_dy with NO further RPC, and the on-chain
+ * solver consumes the sampled segments statically + executes via swap(SwapParams{poolType:3}).
+ *
+ * Mirrors `discoverKyberClassicPools`: off-chain discovery + state reads, returns the venue
+ * descriptor the EcoSwap prepare consumes directly (the on-chain lens does not understand
+ * Curve). Registry path: find_pool_for_coins → get_coin_indices (int128 i,j) → get_n_coins /
+ * get_decimals; pool path: A(), fee(), balances(k). rates[k] = 1e18 * 10**(18 - decimals[k]).
+ *
+ * SCOPE: StableSwap plain pools (int128 indices = the engine ABI). CryptoSwap / uint256-index
+ * pools are OUT of scope (deferred). `aPrecision` defaults to the modern/NG A_PRECISION=100;
+ * a legacy pre-A_PRECISION pool needs `aPrecision: 1n` (configured per registry if needed).
+ */
+export async function discoverCurvePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  registries: FactoryConfig[],
+): Promise<CurvePool[]> {
+  if (registries.length === 0) return [];
+
+  const pools: CurvePool[] = [];
+  for (const registry of registries) {
+    try {
+      const poolAddr = (await client.readContract({
+        address: registry.address,
+        abi: curveRegistryAbi,
+        functionName: "find_pool_for_coins",
+        args: [tokenIn, tokenOut],
+      })) as Hex;
+      if (!poolAddr || poolAddr === ZERO_ADDRESS) continue;
+
+      // Coin indices + coin count + decimals from the registry (int128 i,j = engine ABI).
+      const [indices, nCoinsRaw, decimalsRaw] = await Promise.all([
+        client.readContract({
+          address: registry.address,
+          abi: curveRegistryAbi,
+          functionName: "get_coin_indices",
+          args: [poolAddr, tokenIn, tokenOut],
+        }) as Promise<readonly [bigint, bigint, boolean]>,
+        client.readContract({
+          address: registry.address,
+          abi: curveRegistryAbi,
+          functionName: "get_n_coins",
+          args: [poolAddr],
+        }).catch(() => 2n) as Promise<bigint>,
+        client.readContract({
+          address: registry.address,
+          abi: curveRegistryAbi,
+          functionName: "get_decimals",
+          args: [poolAddr],
+        }).catch(() => null) as Promise<readonly bigint[] | null>,
+      ]);
+
+      const i = Number(indices[0]);
+      const j = Number(indices[1]);
+      const underlying = indices[2];
+      // Underlying (meta-pool lending) coins need a different exchange path; plain only.
+      if (underlying) continue;
+      const N = Number(nCoinsRaw) || 2;
+      if (i < 0 || j < 0 || i >= N || j >= N) continue;
+
+      // Pool state: A, fee, and the full balances array.
+      const [A, feeRaw] = await Promise.all([
+        client.readContract({ address: poolAddr, abi: curvePoolAbi, functionName: "A" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: curvePoolAbi, functionName: "fee" }) as Promise<bigint>,
+      ]);
+      const balances: bigint[] = await Promise.all(
+        Array.from({ length: N }, (_, k) =>
+          client.readContract({
+            address: poolAddr,
+            abi: curvePoolAbi,
+            functionName: "balances",
+            args: [BigInt(k)],
+          }) as Promise<bigint>,
+        ),
+      );
+      if (balances.some((b) => b <= 0n)) continue;
+
+      // rates[k] = 1e18 * 10**(18 - decimals[k]) — scale each coin into the common 1e18 unit.
+      // Registry get_decimals returns a uint256[8]; fall back to per-coin decimals() reads.
+      let decimals: number[];
+      if (decimalsRaw && decimalsRaw.length >= N) {
+        decimals = Array.from({ length: N }, (_, k) => Number(decimalsRaw[k]));
+      } else {
+        const coinAddrs = await Promise.all(
+          Array.from({ length: N }, (_, k) =>
+            client.readContract({
+              address: poolAddr,
+              abi: curvePoolAbi,
+              functionName: "coins",
+              args: [BigInt(k)],
+            }) as Promise<Hex>,
+          ),
+        );
+        decimals = await Promise.all(
+          coinAddrs.map((addr) =>
+            client
+              .readContract({
+                address: addr,
+                abi: parseAbi(["function decimals() view returns (uint8)"]),
+                functionName: "decimals",
+              })
+              .then((d) => Number(d))
+              .catch(() => 18),
+          ),
+        );
+      }
+      const rates = decimals.map((d) => 10n ** 18n * 10n ** BigInt(18 - d));
+
+      pools.push({
+        poolType: SwapPoolType.Curve,
+        address: poolAddr,
+        i,
+        j,
+        A,
+        aPrecision: A_PRECISION_DEFAULT,
+        balances,
+        rates,
+        feePpm10: feeRaw,
+        source: registry.label,
+      });
+    } catch {
+      // Registry / pool read failed — skip this registry.
+    }
+  }
+
+  return pools;
+}
+
 // ── Balancer V2 discovery ───────────────────────────────────
 
 async function discoverBalancerV2Pools(
@@ -624,6 +804,147 @@ async function discoverDODOPools(
     seen.add(key);
     return true;
   });
+}
+
+/**
+ * Discover DODO V2 PMM pools for the pair AS TYPED `DodoPool` descriptors (the EcoSwap path —
+ * distinct from the legacy `discoverDODOPools` PoolInfo aggregator, which mis-models a PMM pool
+ * as ONE synthetic V2 sqrt from raw reserves). DODO V2 is a Proactive Market Maker: the curve is a
+ * closed-form integral parameterised by a GUIDE PRICE `i` (1e18-scaled), a slippage coefficient
+ * `K`, the live reserves B/Q, the target reserves B0/Q0 and the R-state — ALL of which are POOL
+ * STATE read live from `getPMMStateForCall()` (the guide price is NOT an exogenous oracle feed,
+ * unlike WOOFi/Fermi — so DODO is wei-exact-on-grid under the charter). The curve math is OFF-CHAIN
+ * ONLY: this reads the live PMM state so prepare's `buildDodoSegments` can replay querySell* with NO
+ * further RPC, and the on-chain solver consumes the sampled segments statically + executes the
+ * awarded Σ share via swap(SwapParams{poolType:5}) → live _swapDODOV2 (it resolves base/quote
+ * orientation on-chain from `_BASE_TOKEN_()`).
+ *
+ * Mirrors `discoverCurvePoolsTyped`: off-chain discovery + state reads, returning the venue
+ * descriptor EcoSwap prepare consumes directly (the on-chain lens does not understand DODO). Zoo
+ * path: getDODO(base, quote) over BOTH orderings (DODO pools are base/quote-oriented, so the pair
+ * may be registered either way); pool path: getPMMStateForCall() + _BASE_TOKEN_()/_QUOTE_TOKEN_() +
+ * _LP_FEE_RATE_() + the MT fee-rate model getFeeRate(caller). The DODO registry/factory address is
+ * the `DODOZoo` FactoryConfig entry (documented placeholders per chain in constants.ts).
+ *
+ * SCOPE: DVM/DSP/DPP pools exposing getPMMStateForCall (the standard V2 PMM surface). The caller's
+ * MT fee rate is read once at quote time and treated as fixed over the trade (the snapshot
+ * assumption the recipe makes for V3 tiers / Curve fee / LB base fee).
+ */
+export async function discoverDodoV2PoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  zoos: FactoryConfig[],
+  caller: Hex = ZERO_ADDRESS,
+): Promise<DodoPool[]> {
+  if (zoos.length === 0) return [];
+
+  const pools: DodoPool[] = [];
+  const seen = new Set<string>();
+  const inLower = tokenIn.toLowerCase();
+
+  for (const zoo of zoos) {
+    // DODO is base/quote-oriented — query both orderings; the pool's own _BASE_TOKEN_() is the
+    // authoritative orientation (sellBase = tokenIn is the base).
+    for (const [base, quote] of [
+      [tokenIn, tokenOut],
+      [tokenOut, tokenIn],
+    ] as [Hex, Hex][]) {
+      let addresses: string[];
+      try {
+        addresses = (await client.readContract({
+          address: zoo.address,
+          abi: dodoZooAbi,
+          functionName: "getDODO",
+          args: [base, quote],
+        })) as string[];
+      } catch {
+        continue;
+      }
+
+      for (const addr of addresses) {
+        if (!addr || addr === ZERO_ADDRESS) continue;
+        const key = addr.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        try {
+          const pool = addr as Hex;
+          const [stateRaw, baseTokenRaw, quoteTokenRaw, lpFeeRaw, mtModelRaw] = await Promise.all([
+            client.readContract({
+              address: pool,
+              abi: dodoPmmAbi,
+              functionName: "getPMMStateForCall",
+            }) as Promise<readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint]>,
+            client.readContract({ address: pool, abi: dodoPmmAbi, functionName: "_BASE_TOKEN_" }) as Promise<Hex>,
+            client.readContract({ address: pool, abi: dodoPmmAbi, functionName: "_QUOTE_TOKEN_" }) as Promise<Hex>,
+            client
+              .readContract({ address: pool, abi: dodoPmmAbi, functionName: "_LP_FEE_RATE_" })
+              .catch(() => 0n) as Promise<bigint>,
+            client
+              .readContract({ address: pool, abi: dodoPmmAbi, functionName: "_MT_FEE_RATE_MODEL_" })
+              .catch(() => ZERO_ADDRESS as Hex) as Promise<Hex>,
+          ]);
+
+          const [i, K, B, Q, B0, Q0, Rraw] = stateRaw;
+          // i is the guide price; a zero guide price / empty curve cannot trade.
+          if (i <= 0n) continue;
+
+          // Resolve the MT (maintainer) fee for the caller from the fee-rate model (a flat-rate
+          // model ignores the trader; getFeeRate is the canonical per-trader reader).
+          let mtFeeRate = 0n;
+          if (mtModelRaw && mtModelRaw !== ZERO_ADDRESS) {
+            mtFeeRate = (await client
+              .readContract({
+                address: mtModelRaw,
+                abi: dodoMtFeeModelAbi,
+                functionName: "getFeeRate",
+                args: [caller],
+              })
+              .catch(async () =>
+                client
+                  .readContract({ address: mtModelRaw, abi: dodoMtFeeModelAbi, functionName: "_FEE_RATE_" })
+                  .catch(() => 0n),
+              )) as bigint;
+          }
+
+          const baseToken = baseTokenRaw;
+          const quoteToken = quoteTokenRaw;
+          const sellBase = inLower === baseToken.toLowerCase();
+          // tokenIn must be one of the pool's two tokens.
+          if (!sellBase && inLower !== quoteToken.toLowerCase()) continue;
+          // An empty pool on the side being sold has no depth.
+          if (sellBase ? Q <= 0n : B <= 0n) continue;
+
+          const R =
+            Number(Rraw) === 1 ? RState.ABOVE_ONE : Number(Rraw) === 2 ? RState.BELOW_ONE : RState.ONE;
+
+          pools.push({
+            poolType: SwapPoolType.DODOV2,
+            address: pool,
+            baseToken,
+            quoteToken,
+            sellBase,
+            i,
+            K,
+            B,
+            Q,
+            B0,
+            Q0,
+            R,
+            lpFeeRate: lpFeeRaw,
+            mtFeeRate,
+            feePpm: dodoFeeToPpm(lpFeeRaw, mtFeeRate),
+            source: zoo.label,
+          });
+        } catch {
+          // Pool state read failed (non-PMM surface / partial pool) — skip.
+        }
+      }
+    }
+  }
+
+  return pools;
 }
 
 // ── Trader Joe LB discovery ─────────────────────────────────
@@ -719,6 +1040,128 @@ async function discoverTraderJoeLBPools(
         liquidity: syntheticLiquidity,
         source: `${factory.label} (bin ${validPairs[i].binStep})`,
       });
+    }
+  }
+
+  return pools;
+}
+
+/**
+ * Discover Trader Joe LB pairs for the swap AS TYPED `LbPool` descriptors (the EcoSwap path —
+ * distinct from the legacy `discoverTraderJoeLBPools` PoolInfo aggregator, which mis-models an
+ * LB pair as ONE synthetic V2 sqrt). LB is a DISCRETE-BIN constant-sum AMM: this reads the live
+ * per-bin reserves around the active bin so prepare's `buildLbSegments` can emit ONE EXACT flat
+ * segment per bin with NO sampling, and the on-chain solver consumes the segments statically +
+ * executes the awarded Σ share via swap(SwapParams{poolType:6}) → live _swapTraderJoeLB (one
+ * atomic `pool.swap(swapForY, to)`; the engine resolves swapForY on-chain from getTokenX()).
+ *
+ * Mirrors `discoverCurvePoolsTyped`: off-chain discovery + state reads, returning the venue
+ * descriptor EcoSwap prepare consumes directly (the on-chain lens does not understand LB).
+ * Factory path: getLBPairInformation(tokenX, tokenY, binStep) per known bin step → pair; pair
+ * path: getActiveId / getBinStep / getStaticFeeParameters().baseFactor + getBin(id) over a
+ * window of `TRADER_JOE_BIN_WINDOW` bins on each side of the active id (the swap walks outward
+ * from active, so only bins in the swap direction matter — both sides are read so either swap
+ * direction is covered without re-discovery).
+ *
+ * SCOPE: LB v2.1/v2.2 pairs (the getActiveId/getBin/getStaticFeeParameters surface). The base
+ * fee (baseFactor·binStep) is the snapshot fee; the transient variable/volatility fee is omitted.
+ */
+export async function discoverTraderJoeLBPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<LbPool[]> {
+  if (factories.length === 0) return [];
+
+  const pools: LbPool[] = [];
+  const inLower = tokenIn.toLowerCase();
+  for (const factory of factories) {
+    // Find the pair for each known bin step (both token orderings resolve the same pair —
+    // getLBPairInformation is order-independent on (tokenX, tokenY) within a binStep).
+    const infoCalls = TRADER_JOE_BIN_STEPS.map((binStep) => ({
+      address: factory.address,
+      abi: traderJoeLBFactoryAbi,
+      functionName: "getLBPairInformation" as const,
+      args: [tokenIn, tokenOut, BigInt(binStep)] as const,
+    }));
+    let infos;
+    try {
+      infos = await client.multicall({ contracts: infoCalls, allowFailure: true });
+    } catch {
+      continue;
+    }
+
+    const validPairs: { address: Hex; binStep: number }[] = [];
+    for (let i = 0; i < infos.length; i++) {
+      const r = infos[i];
+      if (r.status !== "success") continue;
+      const [, pairAddr, , ignoredForRouting] = r.result as [bigint, string, boolean, boolean];
+      if (pairAddr && pairAddr !== ZERO_ADDRESS && !ignoredForRouting) {
+        validPairs.push({ address: pairAddr as Hex, binStep: TRADER_JOE_BIN_STEPS[i] });
+      }
+    }
+    if (validPairs.length === 0) continue;
+
+    for (const vp of validPairs) {
+      try {
+        // Pair-level state: tokenX (direction), active id, bin step, base-fee factor.
+        const [tokenXRaw, activeIdRaw, binStepRaw, feeParamsRaw] = await Promise.all([
+          client.readContract({ address: vp.address, abi: traderJoeLBPairAbi, functionName: "getTokenX" }) as Promise<string>,
+          client.readContract({ address: vp.address, abi: traderJoeLBPairAbi, functionName: "getActiveId" }) as Promise<number>,
+          client.readContract({ address: vp.address, abi: traderJoeLBPairAbi, functionName: "getBinStep" }) as Promise<number>,
+          client
+            .readContract({ address: vp.address, abi: traderJoeLBPairAbi, functionName: "getStaticFeeParameters" })
+            .catch(() => null) as Promise<readonly [number, number, number, number, number, number, number] | null>,
+        ]);
+
+        const tokenX = tokenXRaw.toLowerCase();
+        const swapForY = inLower === tokenX;
+        const activeId = Number(activeIdRaw);
+        const binStep = Number(binStepRaw) || vp.binStep;
+        const baseFactor = feeParamsRaw ? Number(feeParamsRaw[0]) : TRADER_JOE_DEFAULT_BASE_FACTOR;
+
+        // Read bins over the window on BOTH sides of the active id (one getBin per id).
+        // Only bins in the swap direction are ever consumed, but reading both sides lets a
+        // re-orientation reuse the descriptor; empty bins are dropped below.
+        const lo = activeId - TRADER_JOE_BIN_WINDOW;
+        const hi = activeId + TRADER_JOE_BIN_WINDOW;
+        const ids: number[] = [];
+        for (let id = lo; id <= hi; id++) if (id >= 0) ids.push(id);
+
+        const binResults = await client.multicall({
+          contracts: ids.map((id) => ({
+            address: vp.address,
+            abi: traderJoeLBPairAbi,
+            functionName: "getBin" as const,
+            args: [id] as const,
+          })),
+          allowFailure: true,
+        });
+
+        const bins: { id: number; reserveX: bigint; reserveY: bigint }[] = [];
+        for (let i = 0; i < ids.length; i++) {
+          const r = binResults[i];
+          if (r.status !== "success") continue;
+          const [reserveX, reserveY] = r.result as [bigint, bigint];
+          if (reserveX === 0n && reserveY === 0n) continue; // uninitialized / empty bin
+          bins.push({ id: ids[i], reserveX, reserveY });
+        }
+        if (bins.length === 0) continue;
+
+        pools.push({
+          poolType: SwapPoolType.TraderJoeLB,
+          address: vp.address,
+          binStep,
+          baseFactor,
+          activeId,
+          swapForY,
+          bins,
+          source: `${factory.label} (bin ${binStep})`,
+        });
+      } catch {
+        // Pair read failed (non-LB-v2.1 surface) — skip.
+      }
     }
   }
 
@@ -835,6 +1278,121 @@ async function discoverWOOFiPools(
     }
   }
 
+  return pools;
+}
+
+// ── KyberSwap Classic / DMM discovery ───────────────────────
+
+/**
+ * One discovered KyberSwap Classic / DMM pool. Kyber is an amplified constant-product
+ * AMM trading on VIRTUAL reserves: the curve geometry (sqrt/L) is keyed off vReserve*,
+ * NOT the real reserves. A Kyber pool is mathematically a V2 range with
+ * L = isqrt(vReserveIn·vReserveOut). The fee is per-pool and live (feeInPrecision, 1e18-scaled).
+ * Execution is callback-free (transfer + pool.swap(a0, a1, to, "")), so no engine change.
+ */
+export interface KyberClassicPool {
+  address: Hex;
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** Real tokenIn-side reserve (used by execution's balance check, not the curve). */
+  reserveIn: bigint;
+  /** Real tokenOut-side reserve. */
+  reserveOut: bigint;
+  /** VIRTUAL tokenIn-side reserve — seeds the constant-L curve geometry. */
+  vReserveIn: bigint;
+  /** VIRTUAL tokenOut-side reserve. */
+  vReserveOut: bigint;
+  /** Live per-pool fee, scaled by 1e18 (PRECISION). */
+  feeInPrecision: bigint;
+  /** Is tokenIn the pool's token0 (orientation for getTradeInfo / swap output slot)? */
+  inIsToken0: boolean;
+  source: string;
+}
+
+/**
+ * Discover KyberSwap Classic / DMM pools for the pair. getPools(token0, token1) returns
+ * EVERY DMM pool for the unordered pair (one per amplification factor); per-pool
+ * getTradeInfo() yields (reserve0, reserve1, vReserve0, vReserve1, feeInPrecision). The
+ * virtual reserves seed the V2-shaped curve; the real reserves + fee are carried for
+ * the callback-free execution.
+ */
+export async function discoverKyberClassicPools(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<KyberClassicPool[]> {
+  if (factories.length === 0) return [];
+
+  // getPools is order-insensitive in the DMM factory, but query each factory once.
+  const listResults = await client.multicall({
+    contracts: factories.map((f) => ({
+      address: f.address,
+      abi: kyberFactoryAbi,
+      functionName: "getPools" as const,
+      args: [tokenIn, tokenOut] as const,
+    })),
+    allowFailure: true,
+  });
+
+  const validPools: { address: Hex; factory: FactoryConfig }[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < listResults.length; i++) {
+    const r = listResults[i];
+    if (r.status !== "success" || !r.result) continue;
+    for (const addr of r.result as readonly Hex[]) {
+      if (!addr || addr === ZERO_ADDRESS) continue;
+      const key = addr.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      validPools.push({ address: addr, factory: factories[i] });
+    }
+  }
+  if (validPools.length === 0) return [];
+
+  const [tradeInfoResults, token0Results] = await Promise.all([
+    client.multicall({
+      contracts: validPools.map((p) => ({
+        address: p.address,
+        abi: kyberPoolAbi,
+        functionName: "getTradeInfo" as const,
+      })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: validPools.map((p) => ({
+        address: p.address,
+        abi: kyberPoolAbi,
+        functionName: "token0" as const,
+      })),
+      allowFailure: true,
+    }),
+  ]);
+
+  const pools: KyberClassicPool[] = [];
+  for (let i = 0; i < validPools.length; i++) {
+    const ti = tradeInfoResults[i];
+    const t0 = token0Results[i];
+    if (ti.status !== "success" || t0.status !== "success") continue;
+
+    const [reserve0, reserve1, vReserve0, vReserve1, feeInPrecision] =
+      ti.result as readonly [bigint, bigint, bigint, bigint, bigint];
+    if (vReserve0 === 0n || vReserve1 === 0n) continue;
+
+    const inIsToken0 = tokenIn.toLowerCase() === (t0.result as string).toLowerCase();
+    pools.push({
+      address: validPools[i].address,
+      tokenIn,
+      tokenOut,
+      reserveIn: inIsToken0 ? reserve0 : reserve1,
+      reserveOut: inIsToken0 ? reserve1 : reserve0,
+      vReserveIn: inIsToken0 ? vReserve0 : vReserve1,
+      vReserveOut: inIsToken0 ? vReserve1 : vReserve0,
+      feeInPrecision,
+      inIsToken0,
+      source: validPools[i].factory.label,
+    });
+  }
   return pools;
 }
 

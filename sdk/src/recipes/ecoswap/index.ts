@@ -29,7 +29,7 @@ import ts from "typescript";
 
 import { prepareEcoSwap, type EcoSwapPrepareOpts } from "./prepare.js";
 import { MULTICALL3, BASE_CHAIN_POOL_CONFIG, type ChainPoolConfig } from "../shared/constants.js";
-import type { EcoSwapConfig, EcoSwapPrepared, EcoPool } from "../shared/types.js";
+import { EcoBracketKind, type EcoSwapConfig, type EcoSwapPrepared, type EcoPool } from "../shared/types.js";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler");
@@ -57,7 +57,7 @@ export interface EcoSwapOutput {
 
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
+ *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber]
  * [10..15] are the unified-walk per-pool cache descriptors (V3/V4): the multiplicative step
  * ratio, the cache window bounds (shallowest/deepest scanned tick, shifted; windowTop=0 ⇒ no
  * cache ⇒ staticcall every boundary, the 1-RPC quote path), the deepest INITIALIZED tick (the
@@ -85,6 +85,7 @@ function buildPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[
     p.extremeShifted ?? 0n, // [13] deepest INITIALIZED tick (shifted) — the terminate gate
     BigInt(netStart), // [14] start row index into the flat netCache for this pool
     BigInt(netCount), // [15] number of initialized-tick rows for this pool (0 ⇒ none)
+    p.isKyber ? 1n : 0n, // [16] KyberSwap Classic / DMM (V2-shaped on VIRTUAL reserves); 0 ⇒ plain V2
   ];
 }
 
@@ -184,6 +185,57 @@ function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
 }
 
 /**
+ * Build the SAMPLED-SEGMENT array — `[refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue]`
+ * for every Curve / LB / DODO bracket, sorted DESC by sqrtAdjNear (then adjFar DESC, then refIdx
+ * ASC — the same stable order the on-chain merge tie-breaks on). These are the STATIC
+ * sampled-segment venues (Curve/LB/DODO — their curve math is off-chain only) that compete in the
+ * merge via ONE cursor (the on-chain `bestKind===1` static-segment path) ALONGSIDE the live direct
+ * pools (bestKind===3) and the live multi-hop routes (bestKind===2). The solver does NOT recompute
+ * either curve; it consumes the rows by sqrtAdjNear, accumulates the awarded Σ per venue (keyed by
+ * the row's `venue` address), and dispatches on `segKind` at execution.
+ *
+ * segKind: 1 = Curve (refIdx → prepared.curves[]; venue = exchange() pool → swap(poolType:3) →
+ * _swapCurve), 2 = Trader Joe LB (refIdx → prepared.lbs[]; venue = the pair → swap(poolType:6) →
+ * _swapTraderJoeLB), 3 = DODO V2 (refIdx → prepared.dodos[]; venue = the pool → swap(poolType:5) →
+ * _swapDODOV2). Each row carries its venue address inline, so the solver shares ONE per-segment
+ * accumulator keyed by the static-segment index and resolves the venue from the row.
+ *
+ * Carried as a SEPARATE top-level compiler param (the 5th, after routing) so the row reads stay at
+ * nesting depth ≤ 2 (segs[i] then segs[i][col]); the scalars stay bundled in `cfg`, so main() adds
+ * only ONE nested tuple param — the v12 arg-prologue SDUP window stays small.
+ */
+function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
+  const curves = prepared.curves ?? [];
+  const lbs = prepared.lbs ?? [];
+  const dodos = prepared.dodos ?? [];
+  return prepared.brackets
+    .filter(
+      (b) =>
+        b.kind === EcoBracketKind.Curve ||
+        b.kind === EcoBracketKind.LB ||
+        b.kind === EcoBracketKind.DODO,
+    )
+    .slice()
+    .sort((a, b) => {
+      if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
+      if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
+      return a.refIdx - b.refIdx;
+    })
+    .map((b) => {
+      const isCurve = b.kind === EcoBracketKind.Curve;
+      const isLb = b.kind === EcoBracketKind.LB;
+      const isDodo = b.kind === EcoBracketKind.DODO;
+      const segKind = isCurve ? 1n : isLb ? 2n : 3n;
+      const venue = isCurve
+        ? BigInt(curves[b.refIdx].address)
+        : isLb
+          ? BigInt(lbs[b.refIdx].address)
+          : BigInt(dodos[b.refIdx].address);
+      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
+    });
+}
+
+/**
  * Prepare and compile an EcoSwap.
  *
  * @param config - Swap configuration (tokenIn, tokenOut, amountIn)
@@ -245,14 +297,16 @@ export async function ecoSwap(
   const jsSource = stripTypes(source);
 
   const { poolTuples, netCache, routing, directCount } = buildPoolUniverseAndRouting(prepared);
+  const segs = buildSegs(prepared);
   const result = compile(jsSource, {
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
     target,
-    // cfg-bundle the SCALARS into ONE tuple (the lens's proven trick — keeps main() at 4
-    // params, so the arg-prologue SDUP window stays small); the big nested tuples
-    // (pools/netCache/routing) stay SEPARATE top-level params so pool/route field reads
-    // stay at nesting depth ≤ 2 (folding them in => depth-3 read => v1 INDEX revert).
+    // cfg-bundle the SCALARS into ONE tuple (the lens's proven trick — keeps the scalar
+    // count out of the arg-prologue SDUP window); the big nested tuples (pools/netCache/
+    // routing/segs) stay SEPARATE top-level params so pool/route/segment field reads stay
+    // at nesting depth ≤ 2 (folding them in => depth-3 read => v1 INDEX revert). `segs` is the
+    // sampled-segment venue stream (Curve/LB/DODO) the merge competes via bestKind===1.
     args: [
       [
         BigInt(config.tokenIn),
@@ -265,6 +319,7 @@ export async function ecoSwap(
       poolTuples,
       netCache,
       routing,
+      segs,
     ],
   });
 
@@ -404,6 +459,7 @@ export async function quoteEcoSwap(
   const jsSource = stripTypes(source);
   const { poolTuples, netCache, routing, directCount } =
     buildPoolUniverseAndRouting(usePrepared);
+  const segs = buildSegs(usePrepared);
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
@@ -419,6 +475,7 @@ export async function quoteEcoSwap(
       poolTuples,
       netCache,
       routing,
+      segs,
     ],
   });
   const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;

@@ -3,6 +3,7 @@ import { IERC20 } from "./artifacts/IERC20.json";
 import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
 import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
+import { IKyberPool } from "./IKyberPool.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -51,9 +52,14 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 //                 DIRECT venues (== prepared.pools.length); entries [directCount, …) are leg-only.
 //   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0,
 //                  stateView, poolId, stepRatio, windowTopShifted, windowBotShifted,
-//                  extremeShifted, netStart, netCount] — the FLAT POOL UNIVERSE
+//                  extremeShifted, netStart, netCount, isKyber] — the FLAT POOL UNIVERSE
 //                 ([...prepared.pools, ...legPools], leg pools deduped). pd[7] inIsToken0 IS that
 //                 pool's zeroForOne (leg pools carry the LEG's zHop). V2: [10..15]=0.
+//                 [16] isKyber = 1 ⇒ KyberSwap Classic / DMM (V2-shaped on VIRTUAL reserves: SETUP
+//                 reads getTradeInfo() vReserves for the curve, and the callback-free swap computes
+//                 the output on the virtual reserves with the live feeInPrecision). 0 ⇒ plain UniswapV2
+//                 (or, for a leg pool, a canonical 0.30% V2). A DIRECT V2 pool whose feePpm != 3000
+//                 executes callback-free at its REAL fee; route-leg V2 pools stay canonical 0.30%.
 //   netCache[n] = [shiftedTick, rawNet] — per-pool grouped [netStart, netStart+netCount), sorted
 //                 in SWAP DIRECTION; rawNet is the raw uint128 ticks() returns.
 //   routing[r]  = [legCount, base0,count0,inter0, base1,count1,inter1, …] — one flat SCALAR tuple
@@ -61,6 +67,17 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 //                 Leg L pools = universe indices [baseL, baseL+countL); interL = intermediate token
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
+//   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue] — the SAMPLED-SEGMENT
+//                 venue stream (Curve / Trader Joe LB / DODO V2 interleaved), sorted DESC sqrtAdjNear.
+//                 These are STATIC venues: their curve math is OFF-CHAIN ONLY (prepare samples — LB
+//                 EXACTLY enumerates — each into post-fee flat segments), so the solver does NOT
+//                 recompute either curve. It consumes the rows in price order through ONE cursor
+//                 (bestKind===1), accumulates the awarded Σ per venue (keyed by the row's venue
+//                 address), and dispatches on segKind at execution: 1 = Curve (swap(poolType:3) →
+//                 _swapCurve), 2 = LB (swap(poolType:6) → _swapTraderJoeLB), 3 = DODO (swap(poolType:5)
+//                 → _swapDODOV2). The engine resolves coin indices / swapForY / base-quote orientation
+//                 on-chain, so the SwapParams carry NO curve data — the segment merge already used it.
+//                 Curve/DODO are exact-on-grid; LB is EXACT (a bin is a flat constant-sum slice).
 // All sqrt values are unified out/in Q96.
 
 
@@ -96,6 +113,20 @@ function tickShiftedBase(tickRaw: Uint256, OFFSET: Uint256, ts: Uint256): Uint25
     shifted = tickRaw + OFFSET - INT24_MOD;
   }
   return (shifted / ts) * ts;
+}
+
+// KyberSwap Classic / DMM getAmountOut on the VIRTUAL reserves (the genuine on-curve output):
+//   amountInWithFee = amt*(PRECISION - feeInPrecision)/PRECISION
+//   amountOut       = amountInWithFee*vReserveOut / (vReserveIn + amountInWithFee)
+// Extracted so the per-pool execution-dispatch branch stays under the compiler's 255-byte
+// branch-body limit (the inline read + transfer + swap pushed it over).
+function kyberOut(amt: Uint256, kfee: Uint256, kVin: Uint256, kVout: Uint256, PRECISION: Uint256): Uint256 {
+  const inWithFee: Uint256 = Math.mulDiv(amt, PRECISION - kfee, PRECISION);
+  const denom: Uint256 = kVin + inWithFee;
+  if (denom > 0) {
+    return Math.mulDiv(inWithFee, kVout, denom);
+  }
+  return 0;
 }
 
 function toOutIn(sqrtReal: Uint256, zeroForOne: Uint256): Uint256 {
@@ -161,7 +192,7 @@ function invertFarFromOut(L: Uint256, nearOI: Uint256, outAmt: Uint256): Uint256
 
 function main(
   cfg: Tuple,
-  pools: Tuple, netCache: Tuple, routing: Tuple
+  pools: Tuple, netCache: Tuple, routing: Tuple, segs: Tuple
 ): Uint256 {
   // cfg = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount]
   const tokenIn: Address = cfg[0];
@@ -182,13 +213,26 @@ function main(
   const MOD128: Uint256 = 2 ** 128;
   const V2_STEP_BPS: Uint256 = 25;
   const V2_STEP_DEN: Uint256 = 10000;
+  // Canonical UniswapV2 fee (ppm). The engine's _swapV2 hardcodes this (997/1000), so a V2
+  // pool charging EXACTLY this fee executes via the unified router swap(poolType:0). A V2
+  // pool at any OTHER fee can't use _swapV2 — it executes callback-free (transfer to the
+  // pair + pair.swap(amount0Out, amount1Out, recipient, "")), computing the output with the
+  // pool's REAL fee so the executed dy matches the fee the merge/oracle grossed by (wei-exact).
+  const V2_DEFAULT_FEE: Uint256 = 3000;
+  // KyberSwap Classic / DMM fee precision (feeInPrecision is 1e18-scaled). The merge prices a
+  // Kyber pool on its ROUNDED ppm (pd[5], wei-exact with the oracle), but the callback-free
+  // execution computes the realized output on the VIRTUAL reserves with the LIVE feeInPrecision
+  // at full 1e18 precision (the genuine Kyber getAmountOut), so the swap lands + conserves.
+  const KYBER_PRECISION: Uint256 = 10 ** 18;
   // Run-until-filled budget. PER_POOL bounds each pool's single from-live-spot walk (it MUST equal
   // the optimal oracle's MAX_V3_STEPS and the reference's PER_POOL EXACTLY, so the split is
   // wei-exact EVEN WHEN THE CAP BINDS). SAFETY dominates the SUM of all per-pool reaches plus the
   // route events (routing.length*PER_POOL extra) so the outer merge loop never itself truncates a
   // fill the per-pool caps would complete.
   const PER_POOL: Uint256 = 2048;
-  const SAFETY: Uint256 = pools.length * PER_POOL * 2 + routing.length * PER_POOL;
+  // SAFETY dominates every per-pool reach + the route events + ONE merge step per sampled segment
+  // (each static segment is consumed in exactly one step, so + segs.length covers the cursor).
+  const SAFETY: Uint256 = pools.length * PER_POOL * 2 + routing.length * PER_POOL + segs.length;
 
   // Per-universe-pool accumulators + the single live frontier state (walked from the live spot).
   let inp: Tuple = new Array(pools.length);
@@ -207,6 +251,22 @@ function main(
   // This mirrors the oracle's routeSegments, which holds b[i].farOI fixed across partial events.
   let brFar: Tuple = new Array(pools.length);
   let rinp: Tuple = new Array(routing.length);
+
+  // Per-venue input accumulators for the SAMPLED-SEGMENT venues (Curve / LB / DODO), each keyed
+  // by the static-segment INDEX (multiple segments can share one venue ⇒ accumulate; the venue
+  // address is stamped from the row). Sized by the segment-stream length (an upper bound on
+  // distinct venues per kind). The three kinds keep SEPARATE arrays (their refIdx counters are
+  // independent). cven/lven/dven stay 0 for an unused slot; a >0 input marks a venue to execute.
+  let cinp: Tuple = new Array(segs.length); // Curve per-venue Σ input
+  let cven: Tuple = new Array(segs.length); // Curve venue (exchange() pool) address
+  let linp: Tuple = new Array(segs.length); // LB per-venue Σ input
+  let lven: Tuple = new Array(segs.length); // LB venue (pair) address
+  let dinp: Tuple = new Array(segs.length); // DODO per-venue Σ input
+  let dven: Tuple = new Array(segs.length); // DODO venue (pool) address
+  // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
+  // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
+  // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
+  let segCur: Uint256 = 0;
 
   // Per-leg scratch for the N-leg route event (sized to the universe — legCount <= pools.length
   // since route legs are disjoint pool slices). Reused across every route + step (allocated ONCE
@@ -237,8 +297,18 @@ function main(
     // integer sqrt ONCE here and reuse it in the hot merge loop (feeAdj = mulDiv(oi, sf, FEE_DENOM)).
     sfArr[i] = Math.sqrt((FEE_DENOM - pd[5]) * FEE_DENOM);
     if (isV2 === 1) {
-      const r0: Uint256 = IUniswapV2Pair.at(pd[1]).getReserves()[0];
-      const r1: Uint256 = IUniswapV2Pair.at(pd[1]).getReserves()[1];
+      // V2 reads getReserves; Kyber Classic (pd[16]==1) reads getTradeInfo's VIRTUAL reserves
+      // (the curve geometry trades on vReserve*, NOT the real reserves). Both seed an identical
+      // constant-L stream from the LIVE out/in spot — only the reserve source differs.
+      let r0: Uint256 = 0;
+      let r1: Uint256 = 0;
+      if (pd[16] === 1) {
+        r0 = IKyberPool.at(pd[1]).getTradeInfo()[2]; // vReserve0
+        r1 = IKyberPool.at(pd[1]).getTradeInfo()[3]; // vReserve1
+      } else {
+        r0 = IUniswapV2Pair.at(pd[1]).getReserves()[0];
+        r1 = IUniswapV2Pair.at(pd[1]).getReserves()[1];
+      }
       const resIn: Uint256 = zfo === 1 ? r0 : r1;
       const resOut: Uint256 = zfo === 1 ? r1 : r0;
       ll = Math.sqrt(resIn * resOut);
@@ -302,7 +372,7 @@ function main(
       // 1. find the highest fee-adjusted head among {each direct pool frontier, each route}. Ties on
       // the near (entry) price break by HIGHER far (shallower step). Bit-identical to the oracle's
       // segment sort (adjNear DESC, adjFar DESC) and the reference.
-      let bestKind: Uint256 = 0; // 0=none 2=route 3=direct pool frontier
+      let bestKind: Uint256 = 0; // 0=none 1=sampled segment 2=route 3=direct pool frontier
       let bestPool: Uint256 = 0;
       let bestRoute: Uint256 = 0;
       let bestPrice: Uint256 = 0;
@@ -401,6 +471,22 @@ function main(
             if (rNear === bestPrice) { if (rFar > bestFar) { rw = 1; } }
             if (rw === 1) { bestPrice = rNear; bestFar = rFar; bestKind = 2; bestRoute = r; }
           }
+        }
+      }
+
+      // 1c. sampled segments (Curve/LB/DODO) — ONE cursor over the pre-sorted (DESC adjNear, adjFar)
+      // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
+      // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
+      // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
+      if (segCur < segs.length) {
+        const sg: Tuple = segs[segCur];
+        const sNear: Uint256 = sg[2];
+        const sFar: Uint256 = sg[3];
+        if (sNear >= bestPrice) {
+          let sw: Uint256 = 0;
+          if (sNear > bestPrice) { sw = 1; }
+          if (sNear === bestPrice) { if (sFar > bestFar) { sw = 1; } }
+          if (sw === 1) { bestPrice = sNear; bestFar = sFar; bestKind = 1; }
         }
       }
 
@@ -713,6 +799,36 @@ function main(
           }
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
+        } else {
+          if (bestKind === 1) {
+            // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
+            // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
+            // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
+            // 2 LB → linp/lven, 3 DODO → dinp/dven), stamping the venue address from the row. The
+            // curve math is OFF-CHAIN — this is a pure data-driven slice; the awarded Σ executes
+            // below via the engine swap. Advance the cursor past this segment.
+            const sg: Tuple = segs[segCur];
+            const sIdx: Uint256 = sg[0];
+            const sCap: Uint256 = sg[1];
+            const sKind: Uint256 = sg[4];
+            const sVenue: Address = sg[5];
+            let stake: Uint256 = sCap;
+            if (cum + sCap >= amountIn) { stake = amountIn - cum; }
+            if (sKind === 1) {
+              cinp[sIdx] = cinp[sIdx] + stake;
+              cven[sIdx] = sVenue;
+            } else {
+              if (sKind === 2) {
+                linp[sIdx] = linp[sIdx] + stake;
+                lven[sIdx] = sVenue;
+              } else {
+                dinp[sIdx] = dinp[sIdx] + stake;
+                dven[sIdx] = sVenue;
+              }
+            }
+            cum = cum + stake;
+            segCur = segCur + 1;
+          }
         }
       }
     }
@@ -731,15 +847,77 @@ function main(
         const isV2: Uint256 = dp[6];
         const pType: Uint256 = dp[0];
         const pz: Uint256 = dp[7];
+        if (dp[16] === 1) {
+          // KyberSwap Classic / DMM — callback-free, output computed on the VIRTUAL reserves with
+          // the LIVE feeInPrecision (the genuine Kyber getAmountOut), so the realized swap lands +
+          // conserves on the amplified curve. The merge already grossed by the rounded ppm, so the
+          // allocated `amt` matches the oracle to the wei; the executed dy is the true on-curve out.
+          //   amountInWithFee = amt*(PRECISION - feeInPrecision)/PRECISION
+          //   amountOut       = amountInWithFee*vReserveOut / (vReserveIn + amountInWithFee)
+          const kpool: Address = dp[1];
+          const kvr0: Uint256 = IKyberPool.at(kpool).getTradeInfo()[2]; // vReserve0
+          const kvr1: Uint256 = IKyberPool.at(kpool).getTradeInfo()[3]; // vReserve1
+          const kfee: Uint256 = IKyberPool.at(kpool).getTradeInfo()[4]; // feeInPrecision (1e18)
+          const kIsT0: Uint256 = dp[7];
+          const kVin: Uint256 = kIsT0 === 1 ? kvr0 : kvr1;
+          const kVout: Uint256 = kIsT0 === 1 ? kvr1 : kvr0;
+          const kOut: Uint256 = kyberOut(amt, kfee, kVin, kVout, KYBER_PRECISION);
+          if (kOut > 0) {
+            token.transfer(kpool, amt);
+            const kEmpty: bytes = abi.encode(tokenIn).slice(0, 0);
+            // Output sits in the pool's OUT-token slot (mirrors the V2 callback-free path).
+            if (kIsT0 === 1) {
+              IKyberPool.at(kpool).swap(0, kOut, address.self, kEmpty);
+            } else {
+              IKyberPool.at(kpool).swap(kOut, 0, address.self, kEmpty);
+            }
+          }
+        } else {
         if (isV2 === 1) {
-          const cc0: Address = pz === 1 ? tokenIn : tokenOut;
-          const cc1: Address = pz === 1 ? tokenOut : tokenIn;
-          router.swap({
-            poolType: 0, pool: dp[1],
-            poolKey: { currency0: cc0, currency1: cc1, fee: 0, tickSpacing: 0, hooks: 0 },
-            tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(amt),
-            sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
-          });
+          const v2fee: Uint256 = dp[5];
+          if (v2fee === V2_DEFAULT_FEE) {
+            // 0.30% pool — the engine's _swapV2 honors exactly this fee, so use the
+            // unified router swap (it pulls input + computes output at 997/1000).
+            const cc0: Address = pz === 1 ? tokenIn : tokenOut;
+            const cc1: Address = pz === 1 ? tokenOut : tokenIn;
+            router.swap({
+              poolType: 0, pool: dp[1],
+              poolKey: { currency0: cc0, currency1: cc1, fee: 0, tickSpacing: 0, hooks: 0 },
+              tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(amt),
+              sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+            });
+          } else {
+            // Non-0.30% V2-class pool — the engine's _swapV2 would mis-fee it, so execute
+            // CALLBACK-FREE in SauceScript with the pool's REAL fee: read live reserves,
+            // compute the constant-product output grossing by feePpm EXACTLY as the merge/
+            // oracle did, transfer the input to the pair, then call pair.swap(...) with the
+            // computed output and empty data. No router, no callback, no engine change.
+            //   amountInWithFee = amt*(FEE_DENOM - feePpm)
+            //   amountOut = amountInWithFee*resOut / (resIn*FEE_DENOM + amountInWithFee)
+            const pair: Address = dp[1];
+            const r0v: Uint256 = IUniswapV2Pair.at(pair).getReserves()[0];
+            const r1v: Uint256 = IUniswapV2Pair.at(pair).getReserves()[1];
+            const inIsT0: Uint256 = dp[7];
+            const resIn: Uint256 = inIsT0 === 1 ? r0v : r1v;
+            const resOut: Uint256 = inIsT0 === 1 ? r1v : r0v;
+            const amtInWithFee: Uint256 = amt * (FEE_DENOM - v2fee);
+            const denom: Uint256 = resIn * FEE_DENOM + amtInWithFee;
+            let amountOut: Uint256 = 0;
+            if (denom > 0) {
+              amountOut = Math.mulDiv(amtInWithFee, resOut, denom);
+            }
+            if (amountOut > 0) {
+              token.transfer(pair, amt);
+              const empty: bytes = abi.encode(tokenIn).slice(0, 0);
+              // Output sits in the pool's OUT-token slot: tokenIn==token0 ⇒ out is token1
+              // (amount1Out); tokenIn==token1 ⇒ out is token0 (amount0Out).
+              if (inIsT0 === 1) {
+                IUniswapV2Pair.at(pair).swap(0, amountOut, address.self, empty);
+              } else {
+                IUniswapV2Pair.at(pair).swap(amountOut, 0, address.self, empty);
+              }
+            }
+          }
         } else {
           if (pType === 2) {
             const k0: Address = pz === 1 ? tokenIn : tokenOut;
@@ -753,6 +931,7 @@ function main(
           } else {
             router.swapV3(dp[1], tokenIn, tokenOut, amt, priceLimit, address.self, address.self);
           }
+        }
         }
       }
     }
@@ -869,6 +1048,58 @@ function main(
           }
         }
       }
+    }
+  }
+  // ── Sampled-segment venue execution (Curve / LB / DODO) ──
+  // Each engaged venue executes its merged Σ share via ONE atomic engine swap. The curve math is
+  // OFF-CHAIN, so the SwapParams carry NO curve data — the engine resolves everything on-chain:
+  // _swapCurve iterates coins() against tokenIn/tokenOut for the int128 i/j; _swapTraderJoeLB
+  // resolves swapForY from getTokenX(); _swapDODOV2 resolves base/quote from _BASE_TOKEN_().
+  // amountSpecified is NEGATIVE (the unified-swap exact-in convention; each _swapX takes abs()).
+  // payer == address.self because compute-then-pull already transferred `cum` (incl. every venue
+  // share) above, so each _swapX pulls from this contract and forwards the out back here
+  // (recipient). The realized out is wei-exact for the share (one atomic exchange / pair.swap /
+  // sellBase|sellQuote); the SPLIT equalizes post-fee marginals on the sampled grid (exact-on-grid
+  // for Curve/DODO, EXACT for LB). The poolKey is unused for these poolTypes (V4 only) — zeroed to
+  // match the V2-path SwapParams shape. One loop per kind over the segment-stream-sized accumulator.
+
+  // Curve StableSwap → poolType 3 (SwapPoolType.Curve) → _swapCurve → exchange(i, j, dx, 0).
+  for (let c = 0; c < segs.length; c = c + 1) {
+    const camt: Uint256 = cinp[c];
+    if (camt > 0) {
+      const cpool: Address = cven[c];
+      router.swap({
+        poolType: 3, pool: cpool,
+        poolKey: { currency0: 0, currency1: 0, fee: 0, tickSpacing: 0, hooks: 0 },
+        tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(camt),
+        sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+      });
+    }
+  }
+  // Trader Joe LB → poolType 6 (SwapPoolType.TraderJoeLB) → _swapTraderJoeLB → pair.swap(swapForY, to).
+  for (let l = 0; l < segs.length; l = l + 1) {
+    const lamt: Uint256 = linp[l];
+    if (lamt > 0) {
+      const lpool: Address = lven[l];
+      router.swap({
+        poolType: 6, pool: lpool,
+        poolKey: { currency0: 0, currency1: 0, fee: 0, tickSpacing: 0, hooks: 0 },
+        tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(lamt),
+        sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+      });
+    }
+  }
+  // DODO V2 PMM → poolType 5 (SwapPoolType.DODOV2) → _swapDODOV2 → sellBase|sellQuote(to).
+  for (let d = 0; d < segs.length; d = d + 1) {
+    const damt: Uint256 = dinp[d];
+    if (damt > 0) {
+      const dpool: Address = dven[d];
+      router.swap({
+        poolType: 5, pool: dpool,
+        poolKey: { currency0: 0, currency1: 0, fee: 0, tickSpacing: 0, hooks: 0 },
+        tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(damt),
+        sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+      });
     }
   }
   const leftover: Uint256 = token.balanceOf(address.self);

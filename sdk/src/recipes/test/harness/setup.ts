@@ -68,6 +68,22 @@ export const v2FactoryArtifact = loadArtifact(
 export const v2PairRuntime = loadDeployedBytecode(
   join(FIXTURES, "V2Pair.sol", "V2Pair.json"),
 );
+/** KyberSwap Classic factory (getPools registry) — deployed normally. */
+export const kyberFactoryArtifact = loadArtifact(
+  join(FIXTURES, "KyberClassicPool.sol", "KyberClassicFactory.json"),
+);
+/** Runtime bytecode of the Kyber Classic pool — etched at a chosen address (no constructor). */
+export const kyberPoolRuntime = loadDeployedBytecode(
+  join(FIXTURES, "KyberClassicPool.sol", "KyberClassicPool.json"),
+);
+/** Curve StableSwap plain-pool — deployed normally (constructor sets coins/balances/rates/A/fee). */
+export const curveStableSwapArtifact = loadArtifact(
+  join(FIXTURES, "CurveStableSwap.sol", "CurveStableSwap.json"),
+);
+/** DODO V2 PMM pool — deployed normally (constructor sets base/quote + i/K/B/Q/B0/Q0 + fees). */
+export const dodoV2PoolArtifact = loadArtifact(
+  join(FIXTURES, "DodoV2Pool.sol", "DodoV2Pool.json"),
+);
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
 );
@@ -157,9 +173,22 @@ export const pancakeDeployerAbi = parseAbi([
 
 export const v2PairAbi = parseAbi([
   "function initialize(address t0, address t1)",
+  "function initializeWithFee(address t0, address t1, uint256 fee)",
   "function sync()",
   "function token0() view returns (address)",
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
+]);
+
+export const kyberFactoryAbi = parseAbi([
+  "function addPool(address tokenA, address tokenB, address pool)",
+  "function getPools(address tokenA, address tokenB) view returns (address[])",
+]);
+
+export const kyberPoolAbi = parseAbi([
+  "function initialize(address t0, address t1, uint256 feeInPrec, uint256 vBoost0, uint256 vBoost1)",
+  "function sync()",
+  "function token0() view returns (address)",
+  "function getTradeInfo() view returns (uint256 reserve0, uint256 reserve1, uint256 vReserve0, uint256 vReserve1, uint256 feeInPrecision)",
 ]);
 
 export const v4HelperAbi = parseAbi([
@@ -592,6 +621,116 @@ export async function deployV2Factory(
   });
 }
 
+/** Minimal Curve StableSwap fixture ABI (coins/exchange/get_dy + state reads). */
+export const curveAbi = parseAbi([
+  "function coins(uint256 k) view returns (address)",
+  "function nCoins() view returns (uint256)",
+  "function balances(uint256 k) view returns (uint256)",
+  "function get_dy(int128 i, int128 j, uint256 dx) view returns (uint256)",
+  "function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) returns (uint256)",
+]);
+
+/**
+ * Deploy a local Curve StableSwap plain-pool and fund it with its coin balances.
+ *
+ * Mirrors the canonical StableSwap get_D/get_y/get_dy bit-for-bit (matching the off-chain
+ * `curve-math.ts` replay), so `exchange(i,j,dx,0)` returns EXACTLY `getDy(pool, dx)` to the
+ * wei. The engine `_swapCurve` resolves i/j via `coins(k)` and calls `exchange`. The pool
+ * pulls coin i from the router and transfers coin j out (callback-free), so it must HOLD the
+ * tokenOut-side balance — `minter` transfers each coin's full `balances[k]` into the pool.
+ */
+export async function deployCurveStableSwap(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  coins: Hex[],
+  balances: bigint[],
+  rates: bigint[],
+  a: bigint,
+  fee: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: curveStableSwapArtifact.abi,
+    bytecode: curveStableSwapArtifact.bytecode,
+    args: [coins, balances, rates, a, fee],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  // Fund the pool with its full coin balances (it transfers tokenOut out on exchange).
+  for (let k = 0; k < coins.length; k++) {
+    await writeAndWait(walletClient, publicClient, {
+      address: coins[k],
+      abi: erc20Abi as Abi,
+      functionName: "transfer",
+      args: [pool, balances[k]],
+      account: acct,
+    });
+  }
+  return pool;
+}
+
+export const dodoAbi = parseAbi([
+  "function _BASE_TOKEN_() view returns (address)",
+  "function _QUOTE_TOKEN_() view returns (address)",
+  "function getPMMStateForCall() view returns (uint256 i, uint256 K, uint256 B, uint256 Q, uint256 B0, uint256 Q0, uint256 R)",
+  "function querySellBase(uint256 payBase) view returns (uint256)",
+  "function querySellQuote(uint256 payQuote) view returns (uint256)",
+  "function sellBase(address to) returns (uint256)",
+  "function sellQuote(address to) returns (uint256)",
+]);
+
+/** Constructor args for a DODO V2 PMM pool fixture (mirrors the off-chain DodoPool state). */
+export interface DodoDeployParams {
+  base: Hex;
+  quote: Hex;
+  i: bigint;
+  K: bigint;
+  B: bigint;
+  Q: bigint;
+  B0: bigint;
+  Q0: bigint;
+  lpFeeRate: bigint;
+  mtFeeRate: bigint;
+}
+
+/**
+ * Deploy a local DODO V2 PMM pool and fund it with its base + quote reserves.
+ *
+ * Mirrors the canonical DODO PMMPricing/DODOMath/DecimalMath integer math bit-for-bit (matching
+ * the off-chain `dodo-math.ts` replay), so `sellBase`/`sellQuote` send EXACTLY the off-chain
+ * `getDy(pool, amountIn)` to the wei. The engine `_swapDODOV2` is transfer-first: it transfers
+ * tokenIn to the pool then calls sellBase/sellQuote, so the pool must HOLD the reserve it pays out
+ * — `minter` transfers B base + Q quote into the pool.
+ */
+export async function deployDodoV2Pool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  p: DodoDeployParams,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: dodoV2PoolArtifact.abi,
+    bytecode: dodoV2PoolArtifact.bytecode,
+    args: [p.base, p.quote, p.i, p.K, p.B, p.Q, p.B0, p.Q0, p.lpFeeRate, p.mtFeeRate],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  // Fund the pool with its base + quote reserves (it pays the opposite side out on a swap).
+  await writeAndWait(walletClient, publicClient, {
+    address: p.base,
+    abi: erc20Abi as Abi,
+    functionName: "transfer",
+    args: [pool, p.B],
+    account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: p.quote,
+    abi: erc20Abi as Abi,
+    functionName: "transfer",
+    args: [pool, p.Q],
+    account: acct,
+  });
+  return pool;
+}
+
 /**
  * Stand up a constant-product V2 pool by ETCHING the V2Pair runtime bytecode at
  * `pairAddr`, then initialise it, register it on the factory, fund it with both
@@ -612,18 +751,34 @@ export async function setupEtchedV2Pool(
   reserve0: bigint,
   reserve1: bigint,
   minter?: Account,
+  /**
+   * Per-pool constant-product fee in ppm. Omitted / 3000 ⇒ the canonical 0.30% pair
+   * (executed through the engine's _swapV2). Any other value stands up a V2-class pair
+   * at that fee (executed via EcoSwap's callback-free transfer + pair.swap path).
+   */
+  feePpm?: number,
 ): Promise<Hex> {
   await testClient.setCode({ address: pairAddr, bytecode: v2PairRuntime });
   const code = await publicClient.getCode({ address: pairAddr });
   if (!code || code === "0x") throw new Error("failed to etch V2Pair runtime");
 
-  await writeAndWait(walletClient, publicClient, {
-    address: pairAddr,
-    abi: v2PairAbi as Abi,
-    functionName: "initialize",
-    args: [token0, token1],
-    account: minter,
-  });
+  if (feePpm !== undefined && feePpm !== 3000) {
+    await writeAndWait(walletClient, publicClient, {
+      address: pairAddr,
+      abi: v2PairAbi as Abi,
+      functionName: "initializeWithFee",
+      args: [token0, token1, BigInt(feePpm)],
+      account: minter,
+    });
+  } else {
+    await writeAndWait(walletClient, publicClient, {
+      address: pairAddr,
+      abi: v2PairAbi as Abi,
+      functionName: "initialize",
+      args: [token0, token1],
+      account: minter,
+    });
+  }
   await writeAndWait(walletClient, publicClient, {
     address: factory,
     abi: v2FactoryAbi as Abi,
@@ -642,6 +797,75 @@ export async function setupEtchedV2Pool(
     address: pairAddr, abi: v2PairAbi as Abi, functionName: "sync", args: [], account: minter,
   });
   return pairAddr;
+}
+
+// ── KyberSwap Classic / DMM (etched pool + factory registry) ──
+
+/** Deploy the Kyber Classic factory (getPools registry; discovery resolves pools via it). */
+export async function deployKyberFactory(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: kyberFactoryArtifact.abi,
+    bytecode: kyberFactoryArtifact.bytecode,
+  });
+}
+
+/**
+ * Stand up a KyberSwap Classic / DMM pool by ETCHING the pool runtime at `poolAddr`, then
+ * initialise it (token pair + feeInPrecision + the virtual-reserve BOOSTs = (amp-1)·reserve),
+ * register it on the factory, fund it with the REAL reserves, and sync() (which sets virtual =
+ * real + boost). The amplified curve then trades on the virtual reserves
+ * (vReserve = reserve + boost). Mirrors setupEtchedV2Pool.
+ *
+ * `feeInPrecision` is 1e18-scaled (e.g. 0.30% = 3e15). `vBoost0/1` are the EXTRA virtual
+ * reserve per token (set both > 0 to make the pool deeper than its real reserves, exercising
+ * the virtual-reserve geometry).
+ */
+export async function setupEtchedKyberPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+  factory: Hex,
+  poolAddr: Hex,
+  token0: Hex,
+  token1: Hex,
+  reserve0: bigint,
+  reserve1: bigint,
+  feeInPrecision: bigint,
+  vBoost0: bigint,
+  vBoost1: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  await testClient.setCode({ address: poolAddr, bytecode: kyberPoolRuntime });
+  const code = await publicClient.getCode({ address: poolAddr });
+  if (!code || code === "0x") throw new Error("failed to etch KyberClassicPool runtime");
+
+  await writeAndWait(walletClient, publicClient, {
+    address: poolAddr,
+    abi: kyberPoolAbi as Abi,
+    functionName: "initialize",
+    args: [token0, token1, feeInPrecision, vBoost0, vBoost1],
+    account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: factory,
+    abi: kyberFactoryAbi as Abi,
+    functionName: "addPool",
+    args: [token0, token1, poolAddr],
+    account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token0, abi: erc20Abi as Abi, functionName: "transfer", args: [poolAddr, reserve0], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [poolAddr, reserve1], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: poolAddr, abi: kyberPoolAbi as Abi, functionName: "sync", args: [], account: minter,
+  });
+  return poolAddr;
 }
 
 // ── Uniswap V4 (etched singletons) ───────────────────────────

@@ -58,6 +58,12 @@ import {
   routeEventN,
   type RouteLeg,
 } from "./ecoswap.math";
+// Curve / LB / DODO segment enumeration — the SINGLE source shared with prepare.ts
+// (buildCurve/Lb/DodoBrackets). The oracle enumerates the SAME segments from true live state, so
+// the split is exact-on-grid (EXACT for LB — a bin is a flat constant-sum slice).
+import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
+import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
+import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -95,6 +101,43 @@ export interface OptimalPool {
   reserveIn?: bigint;
   /** Live tokenOut-side reserve. Required for V2. */
   reserveOut?: bigint;
+  /**
+   * KyberSwap Classic / DMM only: the VIRTUAL reserves the amplified constant-product curve
+   * trades on. When present they OVERRIDE reserveIn/reserveOut for the V2 segment geometry
+   * (L = isqrt(vReserveIn·vReserveOut), spot out/in = sqrt(vReserveOut/vReserveIn)) — a Kyber
+   * pool is a V2 range on the virtual reserves. The per-pool `feePpm` is the rounded Kyber
+   * fee, the SAME ppm the on-chain merge grosses by, so the split stays wei-exact. (This is
+   * the "thin v2Segments variant carrying the virtual reserves" — it reuses the V2 stream
+   * verbatim with the virtual reserves substituted in.)
+   */
+  vReserveIn?: bigint;
+  /** KyberSwap Classic / DMM only: the tokenOut-side VIRTUAL reserve. */
+  vReserveOut?: bigint;
+
+  // ── Sampled-segment venue live state (Curve / LB / DODO) ──
+  /**
+   * Curve StableSwap pool — when present this pool is a CURVE venue (NOT V2/V3). The oracle
+   * enumerates its segments via the SHARED bigint replay (buildCurveSegments) from the live
+   * invariant state, so the split is exact-on-grid vs prepare's segments (one replay). The
+   * marginal is post-fee (get_dy nets the fee), so it enters the descending-price merge directly.
+   * `isV2` is ignored when `curve` is set.
+   */
+  curve?: CurvePool;
+  /**
+   * Trader Joe LB pair — when present this pool is an LB venue (NOT V2/V3/Curve). The oracle
+   * enumerates its segments via the SHARED exact per-bin enumerator (buildLbSegments) from the
+   * live bin reserves, so the split is EXACT (no grid error — a bin is a flat constant-sum slice).
+   * The marginal is post-fee. `isV2`/`curve` are ignored when `lb` is set.
+   */
+  lb?: LbPool;
+  /**
+   * DODO V2 PMM pool — when present this pool is a DODO venue (NOT V2/V3/Curve/LB). The oracle
+   * enumerates its segments via the SHARED closed-form replay (buildDodoSegments) from the live PMM
+   * state, so the split is exact-on-grid vs prepare's segments. The guide price `i` is POOL STATE
+   * (read live), so the curve is deterministic. The marginal is post-fee. `isV2`/`curve`/`lb` are
+   * ignored when `dodo` is set.
+   */
+  dodo?: DodoPool;
 }
 
 /**
@@ -320,8 +363,12 @@ function v3Segments(p: OptimalPool, poolIdx: number, zeroForOne: boolean, priceL
  */
 function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
   const segs: Segment[] = [];
-  const reserveIn = p.reserveIn!;
-  const reserveOut = p.reserveOut!;
+  // KyberSwap Classic / DMM trades on VIRTUAL reserves: when present they replace the real
+  // reserves for the constant-L geometry (L = √(vIn·vOut), spot out/in = √(vOut/vIn)). The
+  // step, fee-grossup and integration are byte-identical to a plain V2 pool — only the
+  // reserves seeding L and the spot differ.
+  const reserveIn = p.vReserveIn ?? p.reserveIn!;
+  const reserveOut = p.vReserveOut ?? p.reserveOut!;
   if (reserveIn <= 0n || reserveOut <= 0n) return segs;
   const L = isqrt(reserveIn * reserveOut);
   const feePpm = p.feePpm;
@@ -345,6 +392,53 @@ function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
       }
     }
     near = far;
+  }
+  return segs;
+}
+
+/**
+ * Enumerate one Curve StableSwap pool's segments via the SHARED bigint replay (buildCurveSegments)
+ * from the live invariant state. The amountIn caps the sampled range — the same bound prepare uses
+ * — so the oracle and prepare emit the IDENTICAL segment grid (single source), making the split
+ * exact-on-grid. The Curve marginalOI is ALREADY the post-fee execution price (get_dy nets the
+ * fee), so adjNear == adjFar == marginalOI: it enters the descending-price merge directly with no
+ * extra fee-adjust multiply. Awarded as a "pool" venue (perPoolInput[poolIdx]).
+ */
+function curveSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildCurveSegments(p.curve!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
+ * Enumerate one Trader Joe LB pair's segments via the SHARED exact per-bin enumerator
+ * (buildLbSegments) from the live bin reserves. The amountIn bounds the outward bin walk — the same
+ * bound prepare uses — so the oracle and prepare emit the IDENTICAL segment set, making the split
+ * EXACT (a bin is a flat constant-sum slice, so the segment IS the curve). marginalOI is the
+ * post-fee bin price; adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function lbSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildLbSegments(p.lb!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
+ * Enumerate one DODO V2 PMM pool's segments via the SHARED closed-form replay (buildDodoSegments)
+ * from the live PMM state. The amountIn caps the sampled range — the same bound prepare uses — so
+ * the oracle and prepare emit the IDENTICAL segment grid, making the split exact-on-grid. The DODO
+ * marginalOI is the post-fee execution price (querySell* nets the LP+MT fee); adjNear == adjFar ==
+ * marginalOI. The guide price `i` is read pool state (not an exogenous feed), which is what makes
+ * this oracle well-defined. Awarded as a "pool" venue.
+ */
+function dodoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildDodoSegments(p.dodo!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
 }
@@ -573,7 +667,19 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.isV2) {
+    if (p.dodo) {
+      // DODO V2 PMM venue: sampled-segment enumeration via the shared closed-form replay (capped at
+      // amountIn — the same bound prepare samples → identical grid → exact-on-grid split).
+      allSegs.push(...dodoSegments(p, i, amountIn));
+    } else if (p.lb) {
+      // LB venue: EXACT per-bin enumeration via the shared enumerator (capped at amountIn — the same
+      // bound prepare uses → identical segment set → EXACT split, no grid error).
+      allSegs.push(...lbSegments(p, i, amountIn));
+    } else if (p.curve) {
+      // Curve venue: sampled-segment enumeration via the shared bigint replay (capped at amountIn —
+      // the same bound prepare samples → identical grid → exact-on-grid split).
+      allSegs.push(...curveSegments(p, i, amountIn));
+    } else if (p.isV2) {
       allSegs.push(...v2Segments(p, i));
     } else {
       allSegs.push(...v3Segments(p, i, zeroForOne, priceLimit));
