@@ -398,8 +398,13 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
 - **Sources:** Uniswap **V2** (constant-product), **V3** (concentrated), and **V4** (singleton), plus any
   V3-style **fork** (e.g. **PancakeSwap V3**) registered as a `V3Standard`/`V2Standard` factory — each
   queried across its own `FactoryConfig.feeTiers`. Other AMM families (Curve, Balancer, DODO, TraderJoe
-  LB, Maverick, WOOFi) and Algebra/Solidly-stable exotics are excluded in prepare for now (bespoke curve
-  math) — they come later.
+  LB, Maverick, WOOFi) and Solidly-stable are excluded in prepare for now (bespoke curve math) — they come
+  later. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is DISCOVER + PRICE ONLY: its curve is V3-identical
+  (so it prices wei-exact via the V3 oracle), but the engine cannot EXECUTE it — an Algebra pool re-enters
+  via `algebraSwapCallback`, a selector the Router does not service (only `uniswapV3SwapCallback`/
+  `pancakeV3SwapCallback`, no fallback) — so it is gated out of the executable set (discovery drops it; the
+  lens defaults `includeAlgebra=false`) until an engine `algebraSwapCallback` handler lands. See
+  `../../../LIQUIDITY_SOURCES_FEASIBILITY.md` §3.
 - **Relative-depth filter:** pools below `ECO_MIN_REL_BPS` (default 1%) of the **total IN-RANGE
   capacity** across the crossed ticks are dropped so gas isn't wasted on dust pools (the absolute
   `MIN_LIQUIDITY` floor was dropped; a `>0` aliveness gate remains). The filter lives in the LENS

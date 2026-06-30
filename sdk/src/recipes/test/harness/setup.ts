@@ -84,6 +84,10 @@ export const curveStableSwapArtifact = loadArtifact(
 export const dodoV2PoolArtifact = loadArtifact(
   join(FIXTURES, "DodoV2Pool.sol", "DodoV2Pool.json"),
 );
+/** Trader Joe LB pair — deployed normally (constructor sets tokens/binStep/baseFactor/activeId). */
+export const traderJoeLBPairArtifact = loadArtifact(
+  join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
+);
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
 );
@@ -729,6 +733,82 @@ export async function deployDodoV2Pool(
     account: acct,
   });
   return pool;
+}
+
+export const lbPairAbi = parseAbi([
+  "function getTokenX() view returns (address)",
+  "function getTokenY() view returns (address)",
+  "function getActiveId() view returns (uint24)",
+  "function getBinStep() view returns (uint16)",
+  "function getBin(uint24 id) view returns (uint128 binReserveX, uint128 binReserveY)",
+  "function getReserves() view returns (uint128 reserveX, uint128 reserveY)",
+  "function getStaticFeeParameters() view returns (uint16 baseFactor, uint16 filterPeriod, uint16 decayPeriod, uint16 reductionFactor, uint24 variableFeeControl, uint16 protocolShare, uint24 maxVolatilityAccumulator)",
+  "function getSwapOut(uint256 amountIn, bool swapForY) view returns (uint256)",
+  "function setBin(uint24 id, uint256 reserveX, uint256 reserveY)",
+  "function swap(bool swapForY, address to) returns (bytes32 amountsOut)",
+]);
+
+/** One initialized bin: id + both token-side reserves (native units). */
+export interface LbBinSeed {
+  id: number;
+  reserveX: bigint;
+  reserveY: bigint;
+}
+
+/**
+ * Deploy a local Trader Joe LB pair and seed its bins + reserves.
+ *
+ * Mirrors the canonical LB v2.1/v2.2 `getPriceFromId` 128.128 pow + constant-sum per-bin drain +
+ * static base fee bit-for-bit (matching the off-chain `lb-math.ts` replay), so
+ * `swap(swapForY, to)` sends EXACTLY the off-chain `getSwapOut(amountIn)` to the wei. The engine
+ * `_swapTraderJoeLB` is transfer-first: it transfers tokenIn to the pair then calls
+ * `swap(swapForY, recipient)`, so the pair must HOLD the out-token reserve it pays out — `minter`
+ * transfers each bin's reserveX of tokenX + reserveY of tokenY into the pair. `tokenX`/`tokenY`
+ * are the LB pair's canonical token sides (swapForY trades tokenX → tokenY).
+ */
+export async function deployLBPair(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  tokenX: Hex,
+  tokenY: Hex,
+  binStep: number,
+  baseFactor: number,
+  activeId: number,
+  bins: LbBinSeed[],
+  minter?: Account,
+): Promise<Hex> {
+  const pair = await deployContract(walletClient, publicClient, {
+    abi: traderJoeLBPairArtifact.abi,
+    bytecode: traderJoeLBPairArtifact.bytecode,
+    args: [tokenX, tokenY, binStep, baseFactor, activeId],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+
+  let totalX = 0n;
+  let totalY = 0n;
+  for (const b of bins) {
+    await writeAndWait(walletClient, publicClient, {
+      address: pair,
+      abi: lbPairAbi as Abi,
+      functionName: "setBin",
+      args: [b.id, b.reserveX, b.reserveY],
+      account: acct,
+    });
+    totalX += b.reserveX;
+    totalY += b.reserveY;
+  }
+  // Fund the pair with the full book it pays out (both sides, per the seeded bin reserves).
+  if (totalX > 0n) {
+    await writeAndWait(walletClient, publicClient, {
+      address: tokenX, abi: erc20Abi as Abi, functionName: "transfer", args: [pair, totalX], account: acct,
+    });
+  }
+  if (totalY > 0n) {
+    await writeAndWait(walletClient, publicClient, {
+      address: tokenY, abi: erc20Abi as Abi, functionName: "transfer", args: [pair, totalY], account: acct,
+    });
+  }
+  return pair;
 }
 
 /**

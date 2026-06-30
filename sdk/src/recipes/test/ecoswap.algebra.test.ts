@@ -1,24 +1,25 @@
 /**
  * EcoSwap Algebra dynamic-fee integration — known-answer / decode units (EVM-free).
  *
- * Algebra forks (Camelot V3, QuickSwap V3, Ramses V2) are V3-SHAPED concentrated-liquidity
- * pools that map to poolType=UniV3 and EXECUTE on the existing V3 router path, REUSING the
- * V3 oracle/solver/walk unchanged. The only Algebra-specific work is in the on-chain prepare
- * LENS: an Algebra pool exposes price/tick via `globalState()` (NOT slot0()) and carries a
- * DYNAMIC fee (feeZto for zeroForOne, feeOtz for oneForZero) read once at quote time and
- * treated as fixed over the trade — the same snapshot assumption the recipe already makes for
- * fixed V3 tiers, so it stays wei-exact against that snapshot.
+ * SCOPE: Algebra is DISCOVER + PRICE ONLY. Algebra forks (Camelot V3, QuickSwap V3, Ramses V2)
+ * are V3-SHAPED concentrated-liquidity pools, so their STATE reads map onto a UniV3 row and they
+ * PRICE wei-exact against the V3 oracle. But the CURRENT engine cannot EXECUTE an Algebra swap —
+ * see the §4 finding below — so the discovery + lens layers DROP Algebra pools from the executable
+ * set (this is a deliberate gate, NOT a missing fork RPC). The only Algebra-specific work that is
+ * supported lives in the read path: an Algebra pool exposes price/tick via `globalState()` (NOT
+ * slot0()) and carries a DYNAMIC fee (feeZto for zeroForOne, feeOtz for oneForZero) read once at
+ * quote time and treated as fixed over the trade — the same snapshot assumption the recipe makes
+ * for fixed V3 tiers — so a PRICE/split computed against it stays wei-exact against that snapshot.
  *
- * This file proves, WITHOUT a fork (a local Algebra pool runtime is infeasible — Algebra ships
- * no easily-deployable factory/pool source), the two things the integration adds:
- *   (1) the lens surfaces an Algebra pool's globalState price + its DYNAMIC fee as a V3 row
- *       whose `fee` is that dynamic fee (the decode unit), and the off-chain factory grouping
- *       tags Algebra factories (isAlgebra=1 + the precomputed tickSpacing/step);
- *   (2) once that dynamic fee is threaded into feePpm, an Algebra pool at fee F splits
- *       WEI-EXACT against the neutral V3 oracle at fee F — i.e. the dynamic fee genuinely
- *       steers the allocation exactly like a fixed-fee V3 pool (the v3Segments reuse).
- *
- * The on-chain EVM round-trip against a REAL Algebra pool is gated as a fork/skip with a TODO.
+ * This file proves, WITHOUT a fork, the two things the discover+price integration adds:
+ *   (1) the lens DECODES an Algebra pool's globalState price + its DYNAMIC fee as a V3 row whose
+ *       `fee` is that dynamic fee (the decode unit), and the factory grouping tags Algebra
+ *       factories (isAlgebra=1 + the precomputed tickSpacing/step);
+ *   (2) once that dynamic fee is threaded into feePpm, an Algebra pool at fee F splits WEI-EXACT
+ *       against the neutral V3 oracle at fee F — i.e. the dynamic fee genuinely steers the
+ *       allocation exactly like a fixed-fee V3 pool (the v3Segments reuse).
+ * None of these vectors cook through the engine — they exercise the off-chain decode + solver,
+ * which is exactly the supported (discover+price) surface.
  *
  * Run: npx tsx --test src/recipes/test/ecoswap.algebra.test.ts
  */
@@ -102,7 +103,7 @@ describe("Algebra lens decode — globalState price + dynamic fee surface as a V
     assert.equal(survivorCount, 2, "both rows surface as survivors");
     const alg = pools.find((p) => p.address.toLowerCase() === ALG_POOL.toLowerCase());
     assert.ok(alg, "Algebra pool decoded");
-    assert.equal(alg!.poolType, SwapPoolType.UniV3, "Algebra maps to UniV3 (executes on the V3 path)");
+    assert.equal(alg!.poolType, SwapPoolType.UniV3, "Algebra decodes as a UniV3-shaped row (for discover+price; not executable — see §4)");
     assert.equal(alg!.fee, DYN_FEE, "the DYNAMIC fee (137 ppm) surfaces as the pool's fee — NOT a fixed tier");
     assert.equal(alg!.sqrtPriceX96, SQRT_ALG, "globalState price surfaces as sqrtPriceX96");
     assert.equal(alg!.tick, -100, "globalState tick surfaces (int24-decoded)");
@@ -137,9 +138,10 @@ describe("Algebra factory config — type + grouping", () => {
     const poly = CHAIN_POOL_CONFIGS.polygon.factories.filter((f) => f.factoryType === FactoryType.AlgebraV3);
     assert.ok(arb.length >= 2, "arbitrum has Camelot V3 + Ramses V2 Algebra factories");
     assert.ok(poly.length >= 1, "polygon has QuickSwap V3 Algebra factory");
-    // Every Algebra factory maps to UniV3 (V3-shaped execution).
+    // Every Algebra factory maps to UniV3 (V3-shaped state read — discover+price only;
+    // execution is gated out of the recipe until an engine algebraSwapCallback lands).
     for (const f of [...arb, ...poly]) {
-      assert.equal(f.poolType, SwapPoolType.UniV3, `${f.label} executes on the V3 path`);
+      assert.equal(f.poolType, SwapPoolType.UniV3, `${f.label} reads on the V3-shaped path`);
     }
   });
 
@@ -259,24 +261,55 @@ describe("Algebra dynamic-fee split — wei-exact vs the V3 oracle [ref == oracl
 });
 
 // ─────────────────────────────────────────────────────────────
-// 4. EVM round-trip against a REAL Algebra pool — fork-gated (skipped).
+// 4. EXECUTION — NOT SUPPORTED BY THE CURRENT ENGINE (the honest finding).
 // ─────────────────────────────────────────────────────────────
 //
-// A LOCAL Algebra pool fixture is infeasible: Algebra ships no easily-deployable factory/pool
-// source (unlike Uniswap V3, whose @uniswap/v3-core Factory the EVM tests deploy), and the
-// dynamic-fee plugin pulls in the full Algebra stack. The globalState read + dynamic-fee
-// threading is proven above against the wei-exact oracle (the v3Segments reuse is verbatim).
+// There is intentionally NO EVM round-trip that COOKS an Algebra pool, and the reason is not a
+// missing fork RPC or an infeasible local fixture — it is that the engine CANNOT EXECUTE an
+// Algebra swap as-is:
 //
-// TODO(algebra-evm): when an Algebra fork RPC (Camelot/QuickSwap V3 on Arbitrum/Polygon) is
-// available in CI, add a prod-mirror that (a) runs the lens against a real Algebra pool and
-// asserts the decoded row carries globalState's sqrtPrice + the live dynamic fee, and (b)
-// cooks an EcoSwap splitting across the Algebra pool + a Uniswap V3 tier, asserting fee-adjusted
-// marginals equalize at the cut. Reproducing an Algebra pool onto a local anvil (its tick
-// profile + globalState) the way reproducePool does for V3 is the alternative if no fork RPC.
-describe("Algebra EVM round-trip (real pool)", () => {
-  it.skip("lens reads a real Algebra globalState + cooks a split — needs an Algebra fork RPC (TODO)", () => {
-    // Intentionally skipped — see the block comment. The math/decode units above carry the
-    // wei-exact guarantee in the meantime.
+//   • Algebra's pool `swap()` has the SAME ABI/selector as Uniswap V3 — swap(address recipient,
+//     bool zeroToOne, int256 amountRequired, uint160 limitSqrtPrice, bytes data) — so the Router's
+//     `IUniswapV3Pool(pool).swap(...)` call in `_swapV3` DISPATCHES fine to an Algebra pool.
+//   • BUT mid-swap the Algebra pool re-enters the caller to pull input via
+//     `algebraSwapCallback(int256,int256,bytes)` — a DIFFERENT selector than the
+//     `uniswapV3SwapCallback`/`pancakeV3SwapCallback` the Router implements. The Router has NO
+//     `algebraSwapCallback` handler and NO `fallback()` (only a payable `receive()`), so the
+//     re-entry lands on an unknown selector and the whole `cook()` reverts.
+//
+// Evidence (pinned `sauce` engine, engine/src/Router.sol):
+//   - callbacks implemented: uniswapV3SwapCallback (L328), pancakeV3SwapCallback (L338),
+//     unlockCallback (L487, V4), maverickV2SwapCallback (L1168) — and `algebraSwapCallback` is
+//     absent from the whole engine; only `receive() external payable {}` (L71), no fallback.
+//   - `_swapV3` (L271) calls `v3Pool.swap(address(this), zeroForOne, amountSpecified, limit, "")`
+//     via the Uniswap `swap` ABI (interfaces/IUniswapV3Pool.sol).
+//   - Algebra's callback/swap surface: https://docs.algebra.finance (IAlgebraSwapCallback,
+//     IAlgebraPoolActions#swap with `limitSqrtPrice`).
+//
+// So Algebra is in the SAME bucket as KyberSwap Elastic (see LIQUIDITY_SOURCES_FEASIBILITY.md §3):
+// DISCOVER + PRICE are tractable now (proven wei-exact above), EXECUTION needs an engine PR adding
+// an `algebraSwapCallback` external that reuses the transient-context pull logic. Until then the
+// recipe must never route a slice into an Algebra pool — so the discovery + lens layers GATE
+// Algebra out of the executable set: `discoverPools` drops Algebra pools, and `runLens` defaults
+// `includeAlgebra=false` (Algebra factories are not fed to the lens program). The vectors in §1–§3
+// validate the supported (discover+price) surface and do not cook.
+describe("Algebra EXECUTION is engine-gated (discover+price only)", () => {
+  it("FactoryType.AlgebraV3 is wired for discover+price but maps to a V3-shaped row (no exec branch)", () => {
+    // The integration deliberately exposes Algebra only via the V3-shaped state read. There is
+    // no Algebra-specific execution poolType — execution would route as UniV3/swapV3 and revert
+    // on the unserviced algebraSwapCallback. This pins that Algebra carries the V3-read poolType
+    // (so it PRICES), while the discovery/lens gates (documented above) keep it un-cookable.
+    const algebraFactories = CHAIN_POOL_CONFIGS.arbitrum.factories.filter(
+      (f) => f.factoryType === FactoryType.AlgebraV3,
+    );
+    assert.ok(algebraFactories.length > 0, "real Algebra factories are configured (for price reads)");
+    for (const f of algebraFactories) {
+      assert.equal(
+        f.poolType,
+        SwapPoolType.UniV3,
+        `${f.label} reads V3-shaped (priceable); execution is gated out until an engine algebraSwapCallback handler lands`,
+      );
+    }
   });
 });
 

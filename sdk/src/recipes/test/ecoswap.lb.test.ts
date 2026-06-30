@@ -17,8 +17,10 @@
  *   (2) once those segments enter the merge, an LB pair splits via the neutral oracle exactly
  *       (an LB-vs-LB and an LB-vs-V3 mix), the cheaper-priced venue drawing strictly more.
  *
- * The on-chain EVM round-trip against a REAL LB pair (engine _swapTraderJoeLB) is gated as a
- * fork/skip with a TODO (no deployable LB fixture here).
+ * The on-chain EVM round-trip against a REAL LB pair (engine _swapTraderJoeLB) lives in
+ * `ecoswap.lb.evm.test.ts` — a local TraderJoeLBPair.sol fixture (constant-sum per-bin drain
+ * mirroring getSwapOut bit-for-bit) cooked through the engine on v1 + v12, asserting received ==
+ * getSwapOut(share) to the wei.
  *
  * Run: npx tsx --test src/recipes/test/ecoswap.lb.test.ts
  */
@@ -245,19 +247,4 @@ describe("LB split via the neutral oracle [exact]", () => {
     assert.ok(res.perPoolInput[0] > 0n, "LB funded");
     assert.ok(res.perPoolInput[1] > 0n, "V3 funded");
   });
-});
-
-// ─────────────────────────────────────────────────────────────
-// 4. EVM round-trip against a REAL LB pair — fork-gated TODO
-// ─────────────────────────────────────────────────────────────
-
-describe("LB EVM round-trip (engine _swapTraderJoeLB)", () => {
-  // TODO(lb-evm): a local LB-pair fixture is infeasible here (Trader Joe ships no deployable
-  // factory/pair source in this repo). Cover the on-chain leg as a FORK test against a real LB
-  // pair on Arbitrum/Avalanche (BASE_RPC_URL-style), asserting: the engine _swapTraderJoeLB
-  // (poolType=6 SwapParams) transfers `amountIn` and pool.swap(swapForY, recipient) forwards the
-  // out to the recipient, and the realized out == getSwapOut(awarded share) to the wei (LB bins
-  // are constant-sum at fixed prices, so the on-chain output is EXACT for the share). Until a
-  // fixture/fork is wired, this is a documented skip.
-  it.skip("real LB pair: received == getSwapOut(share) wei-exact [TODO(lb-evm)]", () => {});
 });
