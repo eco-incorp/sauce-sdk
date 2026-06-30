@@ -1154,11 +1154,29 @@ function legPool(addr: Hex, feePpm: number, ts: number, L: bigint, nBr: number, 
   };
 }
 
-/** The oracle leg (OptimalRoute) mirror of `legPool` — true live state, same direction. */
+/**
+ * The oracle leg (OptimalRoute) mirror of `legPool` — true live state, same direction. A leg is a
+ * SET of pools; this single-pool helper wraps one OptimalPool. For a MULTI-POOL leg use
+ * `optLegMulti` (the leg-internal water-fill the oracle models, NOT parallel routes).
+ */
 function optLeg(feePpm: number, ts: number, L: bigint, prepTick: number, zHop: boolean): OptimalRoute["legs"][number] {
   return {
-    isV2: false, feePpm, sqrtPriceX96: getSqrtRatioAtTick(prepTick), tick: prepTick,
-    tickSpacing: ts, liquidity: L, net: new Map(), zeroForOne: zHop,
+    zeroForOne: zHop,
+    pools: [{ isV2: false, feePpm, sqrtPriceX96: getSqrtRatioAtTick(prepTick), tick: prepTick, tickSpacing: ts, liquidity: L, net: new Map() }],
+  };
+}
+
+/** A MULTI-POOL oracle leg: the leg splits across all `pools` via the leg-internal merge. */
+function optLegMulti(
+  zHop: boolean,
+  pools: { feePpm: number; ts: number; L: bigint; prepTick: number }[],
+): OptimalRoute["legs"][number] {
+  return {
+    zeroForOne: zHop,
+    pools: pools.map((p) => ({
+      isV2: false, feePpm: p.feePpm, sqrtPriceX96: getSqrtRatioAtTick(p.prepTick), tick: p.prepTick,
+      tickSpacing: p.ts, liquidity: p.L, net: new Map<number, bigint>(),
+    })),
   };
 }
 
@@ -1273,10 +1291,11 @@ describe("k-way reference == optimal oracle (equalization: direct pool + route s
 describe("k-way reference == optimal oracle (MULTI-POOL LEG — a leg splits across two pools)", () => {
   // A 2-hop route whose FIRST leg has TWO pools (different fees) the leg splits across, second leg
   // one pool. The reference's leg-internal merge picks the best pool per event; the route head folds
-  // the leg-internal best with leg2. The oracle models the multi-pool leg as the SAME parallel
-  // single-pool routes through the shared intermediate, so the reference's ONE perRouteInput equals
-  // the SUM over the oracle's per-combination routes. Both legs deep ⇒ a clean interior split.
-  it("first-leg two-pool split — Σ route input == oracle parallel-route sum, conservation holds", () => {
+  // the leg-internal best with leg2. The oracle models the multi-pool leg as a SINGLE route with a
+  // leg-internal water-fill (NOT parallel routes) — so the reference's ONE perRouteInput equals the
+  // oracle's ONE route input to the WEI, and the per-leg-pool split agrees too. Both legs deep ⇒ a
+  // clean interior split.
+  it("first-leg two-pool split — route input + per-leg-pool split == oracle (wei-exact)", () => {
     const DEEP = 10n ** 26n;
     const TS = 60;
     // Leg1 pools: same spot, fees 0.05% and 0.30% (the leg-internal merge orders by fee-adjusted head).
@@ -1297,16 +1316,18 @@ describe("k-way reference == optimal oracle (MULTI-POOL LEG — a leg splits acr
     const prepared: EcoSwapPrepared = {
       pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
     };
-    // Oracle: the multi-pool leg = two parallel single-pool routes sharing the intermediate
-    // (leg1-pool-a→leg2) and (leg1-pool-b→leg2). The reference's single route input == their sum.
-    const optRouteA: OptimalRoute = { legs: [optLeg(500, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true)] };
-    const optRouteB: OptimalRoute = { legs: [optLeg(3000, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true)] };
+    // Oracle: ONE route, leg0 = the leg-internal water-fill over the two pools (NOT parallel routes).
+    const optRoute: OptimalRoute = {
+      legs: [
+        optLegMulti(true, [{ feePpm: 500, ts: TS, L: DEEP, prepTick: 0 }, { feePpm: 3000, ts: TS, L: DEEP, prepTick: 0 }]),
+        optLeg(3000, TS, DEEP, 0, true),
+      ],
+    };
     const kw = kwayReference(prepared, amountIn);
-    const opt = optimalSplit({ pools: [], routes: [optRouteA, optRouteB], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
     assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
     assert.ok(kw.perRouteInput[0] > 0n, "multi-pool-leg route engaged");
-    // The single route's input == the sum over the oracle's parallel single-pool routes.
-    assert.equal(kw.perRouteInput[0], opt.perRouteInput[0] + opt.perRouteInput[1], "Σ route input == oracle parallel sum");
+    assert.equal(kw.perRouteInput[0], opt.perRouteInput[0], "route input == oracle (wei-exact)");
     assert.equal(kw.perRouteInput[0], amountIn, "all input via the (deep) multi-pool-leg route");
   });
 });
@@ -1411,5 +1432,101 @@ describe("k-way reference == optimal oracle (3-HOP route — N-leg event, wei-ex
     assert.ok(kw.perPoolInput[0] > 0n, "direct pool engaged");
     assert.ok(kw.perRouteInput[0] > 0n, "3-hop route engaged");
     assertRouteExact(kw, opt, "direct + 3-hop route");
+  });
+});
+
+describe("k-way reference == optimal oracle (k>=3 route with a MULTI-POOL MIDDLE leg — wei-exact)", () => {
+  // THE k>=3 multi-pool-leg gate. A 3-hop route A→X→Y→B whose MIDDLE leg (leg1, X→Y) splits across
+  // TWO pools (cheap-fee SHALLOW + dear-fee DEEP), leg0/leg2 single deep pools. This is the case the
+  // OLD parallel-route oracle got WRONG (decomposing the multi-pool middle leg into parallel routes
+  // over-credits the shared downstream leg2 depth at k>=3). The fixed oracle models the leg as an
+  // INTERNAL water-fill (the leg-internal merge: the cheap pool drains, then the dear pool engages),
+  // and its aggregate throughput feeds the chain — so it agrees with the cursor-faithful reference
+  // (which advances the leg's best pool per event) to the WEI, and BOTH leg1 pools engage.
+  const TS = 60;
+  const DEEP = 10n ** 26n;
+  const MIDA = 2n * 10n ** 22n; // leg1 pool A: cheap fee (0.05%) but SHALLOW ⇒ drains, then B engages
+  const MIDB = 10n ** 26n; //       leg1 pool B: dear fee (0.30%), DEEP
+  for (const amountIn of [1000n * E18, 8000n * E18]) {
+    it(`3-hop multi-pool middle leg amountIn=${amountIn} — leg-internal split, wei-exact == oracle`, () => {
+      const a0 = nextAddr();
+      const m1 = nextAddr();
+      const m2 = nextAddr();
+      const a3 = nextAddr();
+      const route: EcoRoute = {
+        legs: [
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a0, 500, TS, DEEP, 400, 0, true)] },
+          {
+            hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true,
+            pools: [legPool(m1, 500, TS, MIDA, 400, 0, true), legPool(m2, 3000, TS, MIDB, 400, 0, true)],
+          },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a3, 500, TS, DEEP, 400, 0, true)] },
+        ],
+        intermediateTokens: [nextAddr(), nextAddr()],
+      };
+      const prepared: EcoSwapPrepared = {
+        pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+      };
+      // The fixed oracle: ONE route, leg1 the leg-internal water-fill over its two pools (NOT
+      // parallel routes through the shared leg0/leg2).
+      const optRoute: OptimalRoute = {
+        legs: [
+          optLeg(500, TS, DEEP, 0, true),
+          optLegMulti(true, [{ feePpm: 500, ts: TS, L: MIDA, prepTick: 0 }, { feePpm: 3000, ts: TS, L: MIDB, prepTick: 0 }]),
+          optLeg(500, TS, DEEP, 0, true),
+        ],
+      };
+      const kw = kwayReference(prepared, amountIn);
+      const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+      assert.equal(kw.totalInput, amountIn, "spends amountIn exactly through the 3-hop route");
+      assert.equal(kw.perRouteInput[0], opt.perRouteInput[0], "route input == oracle (wei-exact)");
+      assert.equal(kw.perRouteInput[0], amountIn, "all input via the (deep) multi-pool-middle-leg route");
+      // The leg-internal split engaged BOTH leg1 pools (universe indices: 0=leg0, 1=leg1-A, 2=leg1-B,
+      // 3=leg2). The SHALLOW cheap pool A drains, the DEEP dear pool B picks up the remainder.
+      const u = kw.perUniversePoolInput;
+      assert.ok(u[1] > 0n, "leg1 pool A engaged (leg-internal split)");
+      assert.ok(u[2] > 0n, "leg1 pool B engaged (leg-internal split)");
+      assert.ok(u[1] < u[2], "the SHALLOW cheap pool A took less than the DEEP dear pool B");
+    });
+  }
+
+  // KNOWN-ANSWER: at the small trade the leg-internal split + chain output is a fixed bigint, pinned
+  // exactly so a regression in either the oracle OR the reference (they share the leg primitives) is
+  // caught without the EVM lane. Recomputed from the leg-internal merge; both engines must hit it.
+  it("known-answer: small-trade leg-internal split is wei-stable (oracle ≡ reference)", () => {
+    const a0 = nextAddr();
+    const m1 = nextAddr();
+    const m2 = nextAddr();
+    const a3 = nextAddr();
+    const amountIn = 1000n * E18;
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a0, 500, TS, DEEP, 400, 0, true)] },
+        {
+          hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true,
+          pools: [legPool(m1, 500, TS, MIDA, 400, 0, true), legPool(m2, 3000, TS, MIDB, 400, 0, true)],
+        },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a3, 500, TS, DEEP, 400, 0, true)] },
+      ],
+      intermediateTokens: [nextAddr(), nextAddr()],
+    };
+    const prepared: EcoSwapPrepared = {
+      pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optRoute: OptimalRoute = {
+      legs: [
+        optLeg(500, TS, DEEP, 0, true),
+        optLegMulti(true, [{ feePpm: 500, ts: TS, L: MIDA, prepTick: 0 }, { feePpm: 3000, ts: TS, L: MIDB, prepTick: 0 }]),
+        optLeg(500, TS, DEEP, 0, true),
+      ],
+    };
+    const kw = kwayReference(prepared, amountIn);
+    const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    // Wei-stable leg1 split (computed by the leg-internal merge; the cheap SHALLOW pool A drains to
+    // its leg-internal cut, the dear DEEP pool B absorbs the rest). Pins the leg-internal arithmetic.
+    assert.equal(kw.perUniversePoolInput[1], 60117139824750888523n, "leg1 pool A input wei-stable");
+    assert.equal(kw.perUniversePoolInput[2], 939372870272598188472n, "leg1 pool B input wei-stable");
+    assert.equal(kw.perRouteInput[0], opt.perRouteInput[0], "route input == oracle (wei-exact)");
+    assert.equal(kw.perRouteInput[0], amountIn, "full route input");
   });
 });

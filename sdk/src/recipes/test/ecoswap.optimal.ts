@@ -98,25 +98,41 @@ export interface OptimalPool {
 }
 
 /**
- * A multi-hop route leg — ONE hop of a route, as TRUE live state. A leg is (for the
- * foundation) ONE pool of either kind; the leg's own swap direction is `zeroForOne`
- * (a route can change direction per hop). N-leg-internal-split is a later workflow; the
- * shape already carries a single pool but the route walk treats each leg as a frontier of
- * constant-L brackets, so adding an internal merge later only changes how the leg's
- * bracket list is produced, not the route event loop.
+ * A multi-hop route leg — ONE hop of a route, as TRUE live state. A leg is a SET of pools the
+ * leg SPLITS ACROSS (the leg-internal water-fill), each of either kind; the leg's own swap
+ * direction is `zeroForOne` (a route can change direction per hop). A SINGLE-pool leg
+ * (`pools.length === 1`) reduces bit-identically to the old one-pool-per-leg model.
+ *
+ * THE LEG-INTERNAL WATER-FILL (the k>=3 multi-pool fix). A multi-pool leg is NOT a set of
+ * parallel routes sharing the downstream chain (that decomposition over-credits the shared
+ * downstream depth and is correct only at k=2). It is an INTERNAL water-fill: the leg's pools
+ * split so the LEG-INTERNAL post-fee marginal equalizes, and the leg's AGGREGATE throughput
+ * feeds the chain. The oracle models this exactly the way the global merge models direct pools:
+ * each leg pool walks its OWN constant-L bracket frontier from its true live spot, and the leg's
+ * CURRENT bracket each event is its leg-internal BEST pool (highest fee-adjusted out/in near; tie
+ * → higher far) — a leg-internal price-ordered merge nested inside the route event. As the cut
+ * descends the leg's best pool rotates (a cheaper-fee pool drains first, a dearer one engages when
+ * the cut reaches its fee-adjusted near), so over the trade the leg's liquidity is split across
+ * all its pools at a common leg-internal marginal. This is INDEPENDENT of the cursor-faithful
+ * reference (it derives every bracket from true live state) yet wei-exact with it BY CONSTRUCTION
+ * — both share the per-step integer math AND the identical leg-internal best-pool selection +
+ * `routeEventN`.
  */
-export interface OptimalRouteLeg extends OptimalPool {
+export interface OptimalRouteLeg {
   /** This hop's swap direction (leg input → leg output). May differ per hop. */
   zeroForOne: boolean;
+  /** The leg's pools (the leg splits across all of them via the leg-internal merge). */
+  pools: OptimalPool[];
 }
 
 /**
  * A multi-hop route as a chain of LEGS, built from TRUE LIVE leg state — the oracle's
  * own route input, INDEPENDENT of EcoSwapPrepared. The route competes in the global merge
  * as ONE venue whose head is the LEFT-TO-RIGHT product fold (`routeHeadFold`) of its legs'
- * fee-adjusted out/in heads; advancing the route binds whichever leg crosses its tick first
- * (conservation: leg i output == leg i+1 input). N legs (k >= 2); the event loop (`routeSegments`)
- * is arbitrary-k via `routeEventN` (3-hop lands concretely, 2-hop bit-identical).
+ * leg-internal-best fee-adjusted out/in heads; advancing the route binds whichever leg crosses
+ * its tick first (conservation: leg i output == leg i+1 input), and a multi-pool leg splits
+ * INTERNALLY (leg-internal merge, NOT parallel routes). N legs (k >= 2); the event loop
+ * (`routeSegments`) is arbitrary-k via `routeEventN`.
  */
 export interface OptimalRoute {
   legs: OptimalRouteLeg[];
@@ -341,11 +357,10 @@ function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
 // Segments, because the route composes brackets across legs before pricing. legBrackets is the
 // leg-level analogue of v3Segments/v2Segments and shares their loop structure verbatim.
 
-/** Enumerate one route leg's constant-L brackets (out/in space) from its TRUE live spot. */
-function legBrackets(leg: OptimalRouteLeg, priceLimit: bigint): RouteLeg[] {
+/** Enumerate one leg POOL's constant-L brackets (out/in space) from its TRUE live spot. */
+function legBrackets(leg: OptimalPool, z: boolean, priceLimit: bigint): RouteLeg[] {
   const out: RouteLeg[] = [];
   const feePpm = BigInt(leg.feePpm);
-  const z = leg.zeroForOne;
 
   if (leg.isV2) {
     const reserveIn = leg.reserveIn!;
@@ -433,63 +448,106 @@ function routeSegments(route: OptimalRoute, routeIdx: number): Segment[] {
   const k = route.legs.length;
   if (k < 2) return segs; // a route is at least 2 hops
 
-  // Per-leg fixed bracket lists (walked once from each leg's true live spot), fees, and the
-  // fee-adjusted out/in coordinate map. All indexed by leg.
+  // ── Per-leg-POOL fixed bracket lists (walked once from each leg pool's true live spot) + a
+  // per-leg-pool cursor + current bracket near (a partial leg pool carries an advanced near after
+  // an event). A leg is a SET of pools; the leg's CURRENT bracket each event is its leg-internal
+  // BEST pool (the leg-internal merge), so a multi-pool leg splits internally rather than
+  // decomposing into parallel routes. A single-pool leg reduces bit-identically (one pool always
+  // wins its own leg merge, so the per-leg bracket is exactly the old single-pool bracket). ──
   //
-  // NO per-leg priceLimit: the swap's REAL-sqrt priceLimit is a bound on the OVERALL swap (it
-  // gates the DIRECT pools via v3Segments). A route's legs are NOT individually limited by it —
-  // the on-chain solver's route advance (ecoswap.sauce.ts Phase D) crosses a binding leg's tick
-  // with NO dlim check; a route is bounded only by conservation + its participation in the global
-  // merge cut (the route stops winning once its product head dips below the cut). Threading the
-  // overall limit into a per-leg break would (a) wrongly truncate a same-direction leg the solver
-  // walks unbounded and (b) for an opposite-direction leg (zHop != overall) compare against a
-  // value in the wrong half-space, killing its bracket list. Pass 0n (no per-leg limit) to gate
-  // the oracle bit-identically to the solver/reference.
-  const brks = route.legs.map((leg) => legBrackets(leg, 0n));
-  const fees = route.legs.map((leg) => BigInt(leg.feePpm));
-  const adj = route.legs.map((leg) => (oi: bigint) => feeAdjOI(oi, leg.feePpm));
+  // NO per-leg priceLimit: the swap's REAL-sqrt priceLimit is a bound on the OVERALL swap (it gates
+  // the DIRECT pools via v3Segments). A route's legs are NOT individually limited by it — the
+  // on-chain solver's route advance crosses a binding leg's tick with NO dlim check; a route is
+  // bounded only by conservation + its participation in the global merge cut. Pass 0n (no per-leg
+  // limit) to gate the oracle bit-identically to the solver/reference.
+  const legPoolBrks: RouteLeg[][][] = route.legs.map((leg) =>
+    leg.pools.map((p) => legBrackets(p, leg.zeroForOne, 0n)),
+  );
+  const legPoolFees: number[][] = route.legs.map((leg) => leg.pools.map((p) => p.feePpm));
+  // per-leg-pool cursor into its bracket list + current near (advanced on a partial fill).
+  const cur: number[][] = legPoolBrks.map((legBr) => legBr.map(() => 0));
+  const near: bigint[][] = legPoolBrks.map((legBr) =>
+    legBr.map((b) => (b.length ? b[0].nearOI : 0n)),
+  );
 
-  // Per-leg cursor + CURRENT bracket near (a partial leg carries an advanced near after an event).
-  const cur: number[] = new Array(k).fill(0);
-  const near: bigint[] = brks.map((b) => (b.length ? b[0].nearOI : 0n));
+  // A leg pool is exhausted when its cursor runs off its bracket list; a leg is dead when ALL its
+  // pools are exhausted (no active pool). The route is dead when any leg is dead.
+  const poolActive = (i: number, j: number): boolean => cur[i][j] < legPoolBrks[i][j].length;
+  const legDead = (i: number): boolean => !legPoolBrks[i].some((_, j) => poolActive(i, j));
 
-  const anyExhausted = () => cur.some((c, i) => c >= brks[i].length);
+  // The leg-internal BEST pool: highest fee-adjusted out/in near among the leg's ACTIVE pools, ties
+  // → higher fee-adjusted far (mirrors the global merge sort + the reference's routeLegBest). The
+  // leg's current bracket [near, far, L, fee] is that pool's current bracket. Returns -1 if none.
+  function legBestPool(i: number): number {
+    let best = -1;
+    let bestAdj = 0n;
+    let bestFarAdj = 0n;
+    for (let j = 0; j < legPoolBrks[i].length; j++) {
+      if (!poolActive(i, j)) continue;
+      const fee = legPoolFees[i][j];
+      const nAdj = feeAdjOI(near[i][j], fee);
+      if (nAdj >= bestAdj) {
+        const fAdj = feeAdjOI(legPoolBrks[i][j][cur[i][j]].farOI, fee);
+        if (best < 0 || nAdj > bestAdj || (nAdj === bestAdj && fAdj > bestFarAdj)) {
+          bestAdj = nAdj;
+          bestFarAdj = fAdj;
+          best = j;
+        }
+      }
+    }
+    return best;
+  }
 
-  for (let step = 0; step < MAX_V3_STEPS && !anyExhausted(); step++) {
-    // Build each leg's current RouteLeg [near, far, L, fee] on the FIXED live grid.
+  for (let step = 0; step < MAX_V3_STEPS; step++) {
+    if (route.legs.some((_, i) => legDead(i))) break;
+
+    // Build each leg's current RouteLeg from its leg-internal BEST pool on the FIXED live grid.
+    const legBestIdx: number[] = new Array(k);
     const legs: RouteLeg[] = new Array(k);
+    const adjFns: ((oi: bigint) => bigint)[] = new Array(k);
     let degenerate = false;
     for (let i = 0; i < k; i++) {
-      const b = brks[i][cur[i]];
-      legs[i] = { nearOI: near[i], farOI: b.farOI, L: b.L, feePpm: fees[i] };
+      const j = legBestPool(i);
+      if (j < 0) {
+        degenerate = true;
+        break;
+      }
+      const fee = legPoolFees[i][j];
+      const b = legPoolBrks[i][j][cur[i][j]];
+      legBestIdx[i] = j;
+      legs[i] = { nearOI: near[i][j], farOI: b.farOI, L: b.L, feePpm: BigInt(fee) };
+      adjFns[i] = (oi: bigint) => feeAdjOI(oi, fee);
       if (legs[i].nearOI <= legs[i].farOI) degenerate = true;
     }
     if (degenerate) break;
 
-    // Route head at the segment edges: product fold of the per-leg fee-adjusted out/in heads.
-    const adjNear = routeHeadFold(legs.map((l, i) => adj[i](l.nearOI)));
+    // Route head at the segment edges: product fold of the per-leg leg-internal-best fee-adjusted
+    // out/in heads.
+    const adjNear = routeHeadFold(legs.map((l, i) => adjFns[i](l.nearOI)));
     const ev = routeEventN(legs);
-    const adjFar = routeHeadFold(ev.newFars.map((f, i) => adj[i](f)));
+    const adjFar = routeHeadFold(ev.newFars.map((f, i) => adjFns[i](f)));
 
     if (ev.routeIn > 0n && adjNear > 0n) {
       segs.push({ venue: "route", idx: routeIdx, adjNear, adjFar, gross: ev.routeIn });
     }
 
-    // Advance: the BOUND leg crosses its tick (next bracket); every OTHER leg's near moves to its
-    // event new far. routeEventN guarantees the partial fill fits WITHIN each partial leg's current
-    // bracket, so the partial near lands inside [farOI, nearOI]. But once it reaches that bracket's
-    // far it has crossed the bracket entirely — advance the partial leg's cursor past every bracket
-    // whose far the new near has reached, so its NEXT event sits on the bracket that actually
-    // contains the near (its far stays strictly below the near). Without this a partial leg
-    // re-processes a degenerate sliver of an already-crossed bracket while the bound leg marches on,
-    // mis-pricing the route. (At k=2 this is the old `i1++ / partial-near = newF / skip` advance.)
+    // Advance: in the BOUND leg the leg-internal best pool crosses its tick (next bracket); in every
+    // OTHER leg the leg-internal best pool's near moves to its event new far. routeEventN guarantees
+    // the partial fill fits WITHIN the bracket, so the partial near lands inside [farOI, nearOI];
+    // once it reaches the far it has crossed the bracket entirely — advance that pool's cursor past
+    // every bracket whose far the new near has reached, so its NEXT event sits on the bracket that
+    // actually contains the near. Only the leg-internal best pool moves per event; the leg's OTHER
+    // pools stay put until the cut descends to engage them (the leg-internal merge).
     for (let i = 0; i < k; i++) {
+      const j = legBestIdx[i];
       if (i === ev.bindLeg) {
-        cur[i]++;
-        near[i] = cur[i] < brks[i].length ? brks[i][cur[i]].nearOI : 0n;
+        cur[i][j]++;
+        near[i][j] = cur[i][j] < legPoolBrks[i][j].length ? legPoolBrks[i][j][cur[i][j]].nearOI : 0n;
       } else {
-        near[i] = ev.newFars[i];
-        while (cur[i] < brks[i].length && near[i] <= brks[i][cur[i]].farOI) cur[i]++;
+        near[i][j] = ev.newFars[i];
+        while (cur[i][j] < legPoolBrks[i][j].length && near[i][j] <= legPoolBrks[i][j][cur[i][j]].farOI) {
+          cur[i][j]++;
+        }
       }
     }
   }

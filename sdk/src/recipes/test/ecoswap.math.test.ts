@@ -980,8 +980,8 @@ describe("oracle route modeling — 2-hop route as a venue [optimalSplit]", () =
     const spot = getSqrtRatioAtTick(0);
     return {
       legs: [
-        { isV2: false, feePpm: fee, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: L1, net: new Map(), zeroForOne: true },
-        { isV2: false, feePpm: fee, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: L2, net: new Map(), zeroForOne: true },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: fee, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: L1, net: new Map() }] },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: fee, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: L2, net: new Map() }] },
       ],
     };
   }
@@ -1181,8 +1181,8 @@ describe("route composition vs INDEPENDENT ground truth", () => {
     const routeLegL = 10n ** 22n;
     const route: OptimalRoute = {
       legs: [
-        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: routeLegL, net: new Map(), zeroForOne: true },
-        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: routeLegL, net: new Map(), zeroForOne: true },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: routeLegL, net: new Map() }] },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: routeLegL, net: new Map() }] },
       ],
     };
     const directPool: OptimalPool = { isV2: false, feePpm: Number(directFee), sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: directL, net: new Map() };
@@ -1446,8 +1446,8 @@ describe("optimalSplit equalization — direct pool + 2-hop route share a common
     const directPool: OptimalPool = { isV2: false, feePpm: directFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: directL, net: new Map() };
     const route: OptimalRoute = {
       legs: [
-        { isV2: false, feePpm: legFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: legL, net: new Map(), zeroForOne: true },
-        { isV2: false, feePpm: legFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: legL, net: new Map(), zeroForOne: true },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: legFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: legL, net: new Map() }] },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: legFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: legL, net: new Map() }] },
       ],
     };
     // Size the trade so BOTH venues engage and land at an interior cut (not exhausting either).
@@ -1509,8 +1509,8 @@ describe("optimalSplit — multi-fee competition + opposite-direction route hops
     const p1: OptimalPool = { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 24n, net: new Map() };
     const route: OptimalRoute = {
       legs: [
-        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: true },
-        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: true },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map() }] },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map() }] },
       ],
     };
     const amountIn = 10000n * E18;
@@ -1534,8 +1534,8 @@ describe("optimalSplit — multi-fee competition + opposite-direction route hops
     const spotLeg2Real = getSqrtRatioAtTick(0); // pool2 real sqrt; oneForZero ⇒ out/in = Q192/spot
     const route: OptimalRoute = {
       legs: [
-        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: true },
-        { isV2: false, feePpm: 3000, sqrtPriceX96: spotLeg2Real, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: false },
+        { zeroForOne: true, pools: [{ isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map() }] },
+        { zeroForOne: false, pools: [{ isV2: false, feePpm: 3000, sqrtPriceX96: spotLeg2Real, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map() }] },
       ],
     };
     const directPool: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: spot, tick: 0, tickSpacing: 10, liquidity: 10n ** 24n, net: new Map() };

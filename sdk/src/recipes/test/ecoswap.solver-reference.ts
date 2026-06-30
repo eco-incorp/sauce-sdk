@@ -113,6 +113,27 @@ export interface KwayReferenceResult {
    * that the cursor path was actually exercised (length > 0).
    */
   cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[];
+  /**
+   * Per-UNIVERSE-pool INPUT (the `inp[pI]` the on-chain solver accrues): the direct prefix
+   * [0, directCount) mirrors `perPoolInput`; the leg-pool tail [directCount, …) is the tokenIn
+   * (leg 0) or realized intermediate (deeper legs) each leg pool absorbs — bit-identical to the
+   * solver's per-pool `inp` writes (Phase C/D). The EVM lane asserts each on-chain per-leg-pool
+   * delta == this array, giving a WEI-EXACT per-leg-pool gate now that a multi-pool leg splits
+   * INTERNALLY (the oracle exposes only the route TOTAL; this exposes the leg-internal split the
+   * solver realizes). For a single-pool leg this equals the leg's whole route throughput.
+   *
+   * EXACT-ON-GRID for a DEEPER multi-pool leg (documented bound). This array is the solver's
+   * COMPUTED inp[] (wei-exact with the oracle). The on-chain EXECUTED split of a DEEPER leg (L>0)
+   * distributes the REALIZED intermediate balance proportionally with the last funded pool taking
+   * the remainder (ecoswap.sauce.ts leg L>0 execution), so a non-last pool's executed delta can sit
+   * ≤1 wei below its computed inp[] (the proportional-mulDiv truncation moves to the remainder
+   * pool), and the realized intermediate the leg receives can itself sit ≤1 wei below the computed
+   * intermediate (conservation truncation across the token). The leg's FIRST (binding) leg — leg0,
+   * whose split is the computed inp[] directly — and every route-level total stay WEI-EXACT; only a
+   * deeper leg's per-pool realized split carries the ≤1-wei-per-pool dust. The wei-exact gate is the
+   * COMPUTED split (this array == the oracle), per-wei.
+   */
+  perUniversePoolInput: bigint[];
 }
 
 /** fee-adjusted out/in head price (sqrt(1-fee) scaling) — matches the solver feeAdj. */
@@ -432,6 +453,7 @@ function advanceRoute(
   head: bigint,
   prevRouteHead: bigint[],
   routeIdx: number,
+  perUniverse: bigint[],
 ): { routeIn: bigint } {
   // Strictly-descending route head invariant: each consumed route segment's near must be <= the
   // previous (a price-ordered merge emits descending segments). Allow the first (prev 0).
@@ -471,8 +493,11 @@ function advanceRoute(
   if (cap < ev.routeIn) {
     // The route is the crossing venue: take exactly the remainder via a forward partial fill, NOT
     // advancing past the cut. The binding test guarantees each leg's partial lands within its
-    // bracket; assert it per leg, then advance every leg's near to its partial far (interior).
+    // bracket; assert it per leg, then advance every leg's near to its partial far (interior). Per
+    // leg pool accrue the FLOW INTO that leg (leg 0 = cap, deeper = the upstream leg's output) —
+    // bit-identical to the solver's clamped Phase D `inp[pI] += inAmt` (inAmt = L===0 ? rtake : pflow).
     const part = routePartialN(legBr, cap);
+    let pflow = cap;
     for (let i = 0; i < k; i++) {
       const f = part.newFars[i];
       if (f < legBr[i].farOI || f > legBr[i].nearOI) {
@@ -480,14 +505,21 @@ function advanceRoute(
           `route ${routeIdx} leg ${i} partial out of bracket: f=${f} not in [${legBr[i].farOI}, ${legBr[i].nearOI}]`,
         );
       }
+      perUniverse[iLeg[i]] += i === 0 ? cap : pflow;
       advanceFrontierNearTo(fr[iLeg[i]], f);
+      pflow = bracketOut(legBr[i].L, legBr[i].nearOI, f); // this leg's output → next leg's gross-in
     }
     return { routeIn: cap };
   }
 
   // Full event: the BINDING leg crosses its bracket (its frontier steps the tick); every OTHER leg's
   // near advances to the event's new far (interior — no cross). NO priceLimit on the binding cross.
+  // Per leg pool accrue the leg's flow-in this event (leg 0 = routeIn; deeper = the gross input it
+  // absorbs over its current bracket to newFars[i]) — bit-identical to the solver's full-event
+  // `inp[pI] += inAmt` (inAmt = L===0 ? routeIn : bracketGross(lgL,lgN,lgNF,lgFee)).
   for (let i = 0; i < k; i++) {
+    perUniverse[iLeg[i]] +=
+      i === 0 ? ev.routeIn : bracketGross(legBr[i].L, legBr[i].nearOI, ev.newFars[i], legBr[i].feePpm);
     if (i === ev.bindLeg) {
       crossV3Boundary(fr[iLeg[i]], 0n, cursorChecks);
     } else {
@@ -542,6 +574,9 @@ export function kwayReference(
 
   const perPoolInput: bigint[] = new Array(directCount).fill(0n);
   const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
+  // Per-UNIVERSE-pool input (the solver's `inp[pI]`): direct prefix + leg-pool tail, written by the
+  // direct-pool advance (mirrors perPoolInput) and the route advance (per-leg-pool, see advanceRoute).
+  const perUniversePoolInput: bigint[] = new Array(universe.length).fill(0n);
   const cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[] = [];
 
   // Outer bound: dominate the SUM of every frontier's reach + the route events so the cap never
@@ -622,6 +657,7 @@ export function kwayReference(
             let v2t = v2g;
             if (cum + v2g >= amountIn) v2t = amountIn - cum;
             perPoolInput[bestRef] += v2t;
+            perUniversePoolInput[bestRef] += v2t;
             cum += v2t;
             if (v2t > 0n) cutSqrtAdj = feeAdj(v2Far, dfee);
           }
@@ -640,6 +676,7 @@ export function kwayReference(
             let dt = dg;
             if (cum + dg >= amountIn) dt = amountIn - cum;
             perPoolInput[bestRef] += dt;
+            perUniversePoolInput[bestRef] += dt;
             cum += dt;
             if (dt > 0n) cutSqrtAdj = feeAdj(dfarOI, dfee);
           }
@@ -650,7 +687,7 @@ export function kwayReference(
       // ── advance a ROUTE by one event ──
       const r = bestRef;
       const cap = amountIn - cum;
-      const taken = advanceRoute(routeLegs[r], fr, cap, cursorChecks, bestPrice, prevRouteHead, r);
+      const taken = advanceRoute(routeLegs[r], fr, cap, cursorChecks, bestPrice, prevRouteHead, r, perUniversePoolInput);
       perRouteInput[r] += taken.routeIn;
       cum += taken.routeIn;
       if (taken.routeIn > 0n) cutSqrtAdj = bestFar;
@@ -659,5 +696,5 @@ export function kwayReference(
 
   const totalInput =
     perPoolInput.reduce((a, b) => a + b, 0n) + perRouteInput.reduce((a, b) => a + b, 0n);
-  return { perPoolInput, perRouteInput, totalInput, cutSqrtAdj, cursorChecks };
+  return { perPoolInput, perRouteInput, totalInput, cutSqrtAdj, cursorChecks, perUniversePoolInput };
 }

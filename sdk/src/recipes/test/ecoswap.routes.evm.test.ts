@@ -151,31 +151,27 @@ async function liveOptimalPool(c: HarnessClients, lp: EcoPool): Promise<OptimalP
   };
 }
 
-/** Build the oracle OptimalRoute legs from the prepared route's LIVE leg-pool state (any type). */
+/**
+ * Build the oracle OptimalRoute(s) from the prepared route's LIVE leg-pool state (any type). Each
+ * prepared route maps to ONE OptimalRoute whose legs carry the FULL set of leg pools — the oracle
+ * models a multi-pool leg as an INTERNAL water-fill (the leg-internal merge), NOT parallel routes.
+ * This is the k>=3 fix: a multi-pool MIDDLE leg's pools share the downstream chain, so the parallel
+ * decomposition (one route per leg-pool combination) over-credits the shared downstream depth and
+ * is wrong at k>=3 — the single route with leg-internal split is the true optimum.
+ */
 async function liveOptimalRoutes(
   c: HarnessClients,
   prepared: EcoSwapPrepared,
 ): Promise<OptimalRoute[]> {
   const routes: OptimalRoute[] = [];
   for (const route of prepared.routes) {
-    // The oracle leg is ONE pool; a multi-pool leg expands to the cartesian product of
-    // leg-pool choices as PARALLEL routes (each a single-pool-per-leg path through the
-    // shared intermediate). The reference's ONE perRouteInput equals the SUM over these.
-    let combos: OptimalPool[][] = [[]];
+    const legs: OptimalRoute["legs"] = [];
     for (const leg of route.legs) {
-      const legOpts: OptimalPool[] = [];
-      for (const lp of leg.pools) {
-        legOpts.push(await liveOptimalPool(c, lp));
-      }
-      const next: OptimalPool[][] = [];
-      for (const prefix of combos) {
-        for (const opt of legOpts) next.push([...prefix, opt]);
-      }
-      combos = next;
+      const pools: OptimalPool[] = [];
+      for (const lp of leg.pools) pools.push(await liveOptimalPool(c, lp));
+      legs.push({ zeroForOne: leg.zeroForOne, pools });
     }
-    for (const combo of combos) {
-      routes.push({ legs: combo.map((p, i) => ({ ...p, zeroForOne: route.legs[i].zeroForOne })) });
-    }
+    routes.push({ legs });
   }
   return routes;
 }
@@ -329,20 +325,22 @@ describe("EcoSwap multi-hop route — WEI-EXACT (direct A->B + 2-hop A->X->B, mu
     assert.equal(route.intermediateTokens.length, 1, "one intermediate");
     assert.equal(route.intermediateTokens[0].toLowerCase(), base.toLowerCase(), "intermediate is base");
     assert.ok(route.legs[0].pools.length >= 2, "leg0 splits across >=2 pools (multi-pool leg)");
-    assert.equal(route.legs[1].pools.length, 1, "leg1 is one deep pool (parallel-route oracle identity)");
+    assert.equal(route.legs[1].pools.length, 1, "leg1 is one deep pool");
 
     const { pools, inputToken, directCount } = buildUniverse(prepared);
 
     // ── The wei-exact expectation: kwayReference mirrors the on-chain solver bit-for-bit
     // (and is gated wei-exact vs the oracle in the fast tier). Its perPoolInput is indexed
-    // by UNIVERSE pool, perRouteInput by route. ──
+    // by UNIVERSE pool, perRouteInput by route, and perUniversePoolInput by universe pool
+    // (the leg-pool tail carries the leg-internal split). ──
     const ref = kwayReference(prepared, amountIn);
 
-    // ── Independent oracle (optimalSplit, built from LOCAL LIVE leg state). The reference
-    // must equal it on totalInput + route input (the multi-pool leg expands to parallel
-    // single-pool routes; the reference's ONE route == the Σ of those). ──
+    // ── Independent oracle (optimalSplit, built from LOCAL LIVE leg state). The multi-pool leg is
+    // modeled as ONE route with an INTERNAL water-fill (NOT parallel routes), so the reference's
+    // ONE route input equals the oracle's ONE route input to the wei. ──
     const optDirect = await liveOptimalDirect(c, prepared);
     const optRoutes = await liveOptimalRoutes(c, prepared);
+    assert.equal(optRoutes.length, 1, "one oracle route (the multi-pool leg is internal, not parallel)");
     const opt = optimalSplit({
       pools: optDirect,
       routes: optRoutes,
@@ -351,9 +349,8 @@ describe("EcoSwap multi-hop route — WEI-EXACT (direct A->B + 2-hop A->X->B, mu
       priceLimit: prepared.priceLimit,
     });
     assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
-    // The reference's single route input == the Σ over the oracle's parallel single-pool routes.
-    const oracleRouteSum = opt.perRouteInput.reduce((a, b) => a + b, 0n);
-    assert.equal(ref.perRouteInput[0], oracleRouteSum, "reference route input == oracle parallel sum (wei-exact)");
+    // The reference's single route input == the oracle's single route input (leg-internal split).
+    assert.equal(ref.perRouteInput[0], opt.perRouteInput[0], "reference route input == oracle (wei-exact)");
     // Direct-pool input matches the oracle's direct pool to the wei.
     assert.equal(ref.perPoolInput[0], opt.perPoolInput[0], "reference direct input == oracle direct (wei-exact)");
 
@@ -380,17 +377,14 @@ describe("EcoSwap multi-hop route — WEI-EXACT (direct A->B + 2-hop A->X->B, mu
       assert.equal(delta[i], ref.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != reference (wei)`);
     }
 
-    // (1b) WEI-EXACT — PER-LEG-POOL: the multi-pool leg0 / single-pool leg1 route decomposes into
-    // the oracle's PARALLEL single-pool routes {leg0.pools[k] -> leg1}. liveOptimalRoutes built
-    // them in leg0-pool order (leg0 first in the cartesian fold, leg1 the single tail), so
-    // opt.perRouteInput[k] is the tokenIn through leg0.pools[k]. The on-chain leg0-pool tokenIn
-    // delta must equal it to the WEI.
+    // (1b) WEI-EXACT — PER-LEG-POOL: a multi-pool leg splits INTERNALLY (the leg-internal merge),
+    // so the per-leg-pool wei expectation is the reference's perUniversePoolInput (the solver's
+    // `inp[pI]`, bit-identical to the on-chain accrual). The leg0-pool tokenIn delta must equal it.
     const leg0Idxs: number[] = route.legs[0].pools.map((lp) => idxByAddr.get(lp.address.toLowerCase())!);
-    assert.equal(optRoutes.length, route.legs[0].pools.length, "one parallel oracle route per leg0 pool");
     for (let k = 0; k < leg0Idxs.length; k++) {
       assert.equal(
-        delta[leg0Idxs[k]], opt.perRouteInput[k],
-        `[${engine}] leg0 pool[${k}] tokenIn delta != oracle parallel-route input (on-chain ${delta[leg0Idxs[k]]} vs oracle ${opt.perRouteInput[k]})`,
+        delta[leg0Idxs[k]], ref.perUniversePoolInput[leg0Idxs[k]],
+        `[${engine}] leg0 pool[${k}] tokenIn delta != reference leg-internal split (on-chain ${delta[leg0Idxs[k]]} vs reference ${ref.perUniversePoolInput[leg0Idxs[k]]})`,
       );
     }
 
@@ -919,14 +913,11 @@ describe("EcoSwap multi-hop route — WEI-EXACT V4-leg (direct A->B + 2-hop V4(A
 // single-pool-per-leg OptimalRoute) and the cursor-faithful kwayReference. Same gate as
 // the 2-hop test, one more leg, with both intermediates' conservation exercised.
 //
-// SINGLE pool per leg here (the wei-exact N-hop landing). A MULTI-POOL leg inside a
-// k>=3 route is a documented follow-up: the oracle models a multi-pool leg as parallel
-// single-pool routes that SHARE the downstream legs, and that parallel decomposition is
-// wei-exact with the single-route leg-internal split only at k=2 (proven by the 2-hop
-// test above + the fast tier). At k>=3 the shared-downstream-leg conservation diverges
-// (the on-chain solver under-engages the second leg pool) — the multi-route /
-// shared-intermediate delta read in the plan's later stage. The 2-hop test covers the
-// multi-pool-leg split; this 3-hop test covers the N-leg conservation chain.
+// SINGLE pool per leg here. A MULTI-POOL leg inside a k>=3 route (the leg-internal
+// water-fill) is covered WEI-EXACT by its own describe block below: the oracle now models a
+// multi-pool leg as ONE route with an INTERNAL water-fill (NOT parallel routes), so it is
+// wei-exact with the cursor-faithful reference at any k. This 3-hop test covers the N-leg
+// conservation chain with one pool per leg.
 // ─────────────────────────────────────────────────────────────────────────────
 describe("EcoSwap multi-hop route — WEI-EXACT 3-HOP (direct A->B + 3-hop A->X->Y->B, rotating binding leg)", () => {
   let anvil: AnvilHandle;
@@ -1184,6 +1175,246 @@ describe("EcoSwap multi-hop route — WEI-EXACT 3-HOP (direct A->B + 3-hop A->X-
       const dirs = prepared.routes[0].legs.map((l) => l.zeroForOne);
       console.log(`  [ROUTE3-DIR ${engine}] per-leg zeroForOne = [${dirs.join(", ")}]`);
       await run3Hop(engine);
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// k>=3 route with a MULTI-POOL MIDDLE leg — WEI-EXACT leg-internal water-fill.
+//
+// A 4-token universe A->X->Y->B where the MIDDLE leg (leg1, X->Y) splits across TWO pools
+// (a cheap-fee SHALLOW pool that drains + a dear-fee DEEP pool that picks up the rest);
+// leg0 (A->X) and leg2 (Y->B) are single DEEP pools. This is the case the OLD parallel-route
+// oracle got WRONG at k>=3 (decomposing the multi-pool middle leg into parallel routes
+// over-credits the shared downstream leg2 depth). The fixed oracle models the leg as an
+// INTERNAL water-fill — its pools split to equalize the leg-internal marginal and the
+// aggregate throughput feeds the chain — so the cook is WEI-EXACT vs both the oracle (ONE
+// route, leg-internal split) and the cursor-faithful reference (perUniversePoolInput, the
+// solver's per-leg-pool inp[] accrual). BOTH leg1 pools engage.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap multi-hop route — WEI-EXACT k>=3 MULTI-POOL MIDDLE leg (A->X->Y->B)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let xTok: Hex;
+  let yTok: Hex;
+  let tokenOut: Hex;
+  let directPool: Hex;
+  let leg0: Hex; // A->X (single deep)
+  let leg1a: Hex; // X->Y cheap-fee SHALLOW (drains first)
+  let leg1b: Hex; // X->Y dear-fee DEEP (picks up the rest)
+  let leg2: Hex; // Y->B (single deep)
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+
+    tokenIn = await deployToken(c.walletClient, c.publicClient, "In", "IN");
+    xTok = await deployToken(c.walletClient, c.publicClient, "MidX", "MIDX");
+    yTok = await deployToken(c.walletClient, c.publicClient, "MidY", "MIDY");
+    tokenOut = await deployToken(c.walletClient, c.publicClient, "Out", "OUT");
+
+    const minter = c.account0;
+    for (const t of [tokenIn, xTok, yTok, tokenOut]) {
+      await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+      await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+    }
+
+    // DIRECT A->B pool: SHALLOW (fills first, then overflows into the 3-hop route at the cut).
+    directPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, directPool, minter, -12000, 12000, parseEther("8000"),
+    );
+
+    // leg0 (A->X) + leg2 (Y->B): single DEEP pools. leg1 (X->Y): TWO pools — leg1a cheap-fee
+    // (0.05%) SHALLOW (drains to its leg-internal cut), leg1b dear-fee (0.30%) DEEP (picks up the
+    // rest). The leg-internal water-fill splits the X->Y throughput across both.
+    leg0 = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, xTok, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    leg1a = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, xTok, yTok, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    leg1b = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, xTok, yTok, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    leg2 = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, yTok, tokenOut, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    for (const deep of [leg0, leg2, leg1b]) {
+      await mintPosition(
+        c.walletClient, c.publicClient, stack.helper, deep, minter, -12000, 12000, parseEther("100000000"),
+      );
+    }
+    // leg1a SHALLOW (cheap fee): it drains to its leg-internal cut, then leg1b engages.
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, leg1a, minter, -12000, 12000, parseEther("60000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+      ],
+      feeTiers: [HOP_FEE_A, HOP_FEE_B],
+      baseTokens: [xTok, yTok],
+    };
+
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("1000000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
+
+  async function readInputBalances(
+    pools: EcoPool[],
+    inputToken: Hex[],
+    directCount: number,
+  ): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const tk = i < directCount ? tokenIn : inputToken[i];
+      out.push(await balanceOf(c.publicClient, tk, pools[i].address));
+    }
+    return out;
+  }
+
+  async function runMultiMiddle(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const amountIn = parseEther("20000");
+    const caller = c.account0;
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+    );
+
+    // Topology: one direct A->B pool + one 3-hop route whose MIDDLE leg has TWO pools.
+    assert.equal(prepared.pools.length, 1, "exactly one direct A->B pool");
+    assert.equal(prepared.routes.length, 1, "exactly one route (the 3-hop chain)");
+    const route = prepared.routes[0];
+    assert.equal(route.legs.length, 3, "3-hop route");
+    assert.equal(route.legs[0].pools.length, 1, "leg0 single pool");
+    assert.ok(route.legs[1].pools.length >= 2, "leg1 (MIDDLE) splits across >=2 pools");
+    assert.equal(route.legs[2].pools.length, 1, "leg2 single pool");
+
+    const { pools, inputToken, directCount } = buildUniverse(prepared);
+
+    // Wei-exact expectation: kwayReference mirrors the on-chain solver bit-for-bit.
+    const ref = kwayReference(prepared, amountIn);
+
+    // Independent oracle: ONE route, the middle leg an INTERNAL water-fill (NOT parallel routes).
+    const optDirect = await liveOptimalDirect(c, prepared);
+    const optRoutes = await liveOptimalRoutes(c, prepared);
+    assert.equal(optRoutes.length, 1, "one oracle route (multi-pool middle leg is internal)");
+    const opt = optimalSplit({
+      pools: optDirect, routes: optRoutes, amountIn, zeroForOne: prepared.zeroForOne, priceLimit: prepared.priceLimit,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
+    assert.equal(ref.perRouteInput[0], opt.perRouteInput[0], "reference route input == oracle (wei-exact)");
+    assert.equal(ref.perPoolInput[0], opt.perPoolInput[0], "reference direct input == oracle direct (wei-exact)");
+
+    const inBefore = await readInputBalances(pools, inputToken, directCount);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "multi-pool-middle-leg cook() must succeed");
+
+    const inAfter = await readInputBalances(pools, inputToken, directCount);
+    const delta: bigint[] = inAfter.map((a, i) => a - inBefore[i]);
+
+    const idxByAddr = new Map<string, number>();
+    pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
+
+    // (1a) DIRECT pool wei-exact.
+    for (let i = 0; i < directCount; i++) {
+      assert.equal(delta[i], opt.perPoolInput[i], `[${engine}] direct pool[${i}] != oracle (wei)`);
+      assert.equal(delta[i], ref.perPoolInput[i], `[${engine}] direct pool[${i}] != reference (wei)`);
+    }
+
+    // (1b) The MIDDLE leg splits internally. The solver's COMPUTED leg-internal split (the
+    // reference's perUniversePoolInput, the inp[] accrual) is wei-exact with the oracle (gated in
+    // the fast tier). The on-chain X-side (intermediate) delta is the EXECUTED split: a DEEPER leg
+    // (L>0) distributes the REALIZED intermediate balance proportionally with the last funded pool
+    // taking the remainder (ecoswap.sauce.ts leg L>0 execution), so a non-last pool's executed
+    // delta can sit ≤1 wei below its computed inp[] (the mulDiv proportional truncation moves to
+    // the remainder pool). This is the DOCUMENTED EXACT-ON-GRID bound for a multi-pool DEEPER-leg
+    // execution: per-pool ≤1 wei, with the leg TOTAL (Σ) and the route input (leg0, the binding
+    // first leg) BOTH wei-exact. (leg0's tokenIn split is the computed inp[] directly ⇒ wei-exact;
+    // only a deeper leg's REALIZED-balance proportional re-split carries the ≤1-wei dust.)
+    const leg1Idxs: number[] = route.legs[1].pools.map((lp) => idxByAddr.get(lp.address.toLowerCase())!);
+    const LEG_EXEC_TOL = 1n; // documented exact-on-grid bound: deeper-leg proportional split ≤1 wei/pool
+    for (let k = 0; k < leg1Idxs.length; k++) {
+      const onchain = delta[leg1Idxs[k]];
+      const computed = ref.perUniversePoolInput[leg1Idxs[k]];
+      const d = onchain > computed ? onchain - computed : computed - onchain;
+      assert.ok(
+        d <= LEG_EXEC_TOL,
+        `[${engine}] leg1 pool[${k}] X delta off-grid: on-chain ${onchain} vs computed ${computed} (|Δ|=${d} > ${LEG_EXEC_TOL})`,
+      );
+    }
+    // The leg's AGGREGATE realized X throughput tracks the computed leg total within the same
+    // documented exact-on-grid bound (≤1 wei): the realized leg0 OUTPUT — the X balance leg1
+    // actually receives — can sit ≤1 wei below the computed intermediate (the conservation
+    // truncation across the intermediate token), and the proportional split conserves that realized
+    // balance exactly (last pool takes the remainder). The route-level gates (route input, total
+    // spent) stay wei-exact; only the realized-intermediate throughput carries the dust.
+    const leg1OnchainTotal = leg1Idxs.reduce((s, i) => s + delta[i], 0n);
+    const leg1ComputedTotal = leg1Idxs.reduce((s, i) => s + ref.perUniversePoolInput[i], 0n);
+    const legTotalDiff = leg1OnchainTotal > leg1ComputedTotal ? leg1OnchainTotal - leg1ComputedTotal : leg1ComputedTotal - leg1OnchainTotal;
+    assert.ok(
+      legTotalDiff <= BigInt(leg1Idxs.length),
+      `[${engine}] middle-leg aggregate realized X off-grid: ${leg1OnchainTotal} vs computed ${leg1ComputedTotal} (|Δ|=${legTotalDiff})`,
+    );
+    const leg1Moved = leg1Idxs.filter((i) => delta[i] > 0n).length;
+    assert.ok(leg1Moved >= 2, `[${engine}] middle leg must split across >=2 pools (moved ${leg1Moved})`);
+
+    // leg0 tokenIn delta == route input == reference route input (wei).
+    const leg0Idx = idxByAddr.get(route.legs[0].pools[0].address.toLowerCase())!;
+    assert.equal(delta[leg0Idx], ref.perRouteInput[0], `[${engine}] leg0 tokenIn != reference route input (wei)`);
+    assert.equal(delta[leg0Idx], opt.perRouteInput[0], `[${engine}] leg0 tokenIn != oracle route input (wei)`);
+
+    // leg2 (Y->B) received the Y intermediate; direct + route both engaged.
+    const leg2Idx = idxByAddr.get(route.legs[2].pools[0].address.toLowerCase())!;
+    assert.ok(delta[leg2Idx] > 0n, `[${engine}] leg2 (Y->B) received the Y intermediate`);
+    assert.ok(delta[0] > 0n, `[${engine}] direct pool engaged`);
+    assert.ok(ref.perRouteInput[0] > 0n, `[${engine}] route engaged`);
+
+    // Full amountIn spent + caller received tokenOut.
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (compute-then-pull)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+
+    console.log(
+      `  [ROUTE-MID3 ${engine}] direct=${delta[0]} routeIn=${ref.perRouteInput[0]} spent=${spent} received=${received}\n` +
+        `       leg1 split: ${leg1Idxs.map((i) => delta[i]).join(", ")}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`WEI-EXACT k>=3 multi-pool MIDDLE leg split == optimal [${engine}]`, { skip }, async () => {
+      await runMultiMiddle(engine);
     });
   }
 });
