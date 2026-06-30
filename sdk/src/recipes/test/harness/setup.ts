@@ -33,6 +33,7 @@ import {
   MULTICALL3,
   UNISWAP_V4_POOL_MANAGER,
   UNISWAP_V4_STATE_VIEW,
+  BALANCER_V2_VAULT,
 } from "../../shared/constants";
 import { keccak256, encodeAbiParameters } from "viem";
 
@@ -99,6 +100,14 @@ export const traderJoeLBPairArtifact = loadArtifact(
 );
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
+);
+/** Balancer V2 ComposableStable pool — deployed normally (constructor sets tokens/scaling/bpt/amp/fee). */
+export const balancerStablePoolArtifact = loadArtifact(
+  join(FIXTURES, "BalancerComposableStable.sol", "BalancerComposableStable.json"),
+);
+/** Balancer V2 Vault runtime — ETCHED at the canonical 0xBA12… (the engine hardcodes that address). */
+export const balancerVaultRuntime = loadDeployedBytecode(
+  join(FIXTURES, "BalancerComposableStable.sol", "BalancerVault.json"),
 );
 /** Algebra-fork (Camelot/QuickSwap V3) pool ADAPTER — wraps a genuine V3 pool, exposes the
  *  Algebra read surface + algebraSwapCallback re-entry. Deployed normally (init binds the inner). */
@@ -701,6 +710,95 @@ export async function deployCurveStableSwap(
       functionName: "transfer",
       args: [pool, balances[k]],
       account: acct,
+    });
+  }
+  return pool;
+}
+
+/** Minimal Balancer ComposableStable pool + Vault fixture ABI (reads + onSwap + register). */
+export const balancerStablePoolAbi = parseAbi([
+  "function getPoolId() view returns (bytes32)",
+  "function getAmplificationParameter() view returns (uint256 value, bool isUpdating, uint256 precision)",
+  "function getScalingFactors() view returns (uint256[] scalingFactors)",
+  "function getSwapFeePercentage() view returns (uint256)",
+  "function getBptIndex() view returns (uint256)",
+  "function tokens() view returns (address[])",
+  "function balances() view returns (uint256[])",
+  "function setBalance(uint256 k, uint256 bal)",
+  "function onSwapGivenIn(uint256 amountIn, address tokenIn, address tokenOut) view returns (uint256)",
+]);
+
+export const balancerVaultAbi = parseAbi([
+  "function registerPool(bytes32 poolId, address pool)",
+  "function poolAddress(bytes32 poolId) view returns (address)",
+  "function getPoolTokens(bytes32 poolId) view returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock)",
+]);
+
+/**
+ * Stand up a local Balancer V2 ComposableStable pool + the canonical Vault for the engine
+ * `_swapBalancerV2` path.
+ *
+ * Etches the BalancerVault runtime at the HARDCODED 0xBA12… address (the engine constant) on first call,
+ * deploys a ComposableStable pool whose StableMath mirrors `balancer-stable-math.ts` bit-for-bit,
+ * registers the pool on the Vault (poolId → pool), seeds the registered balances, and funds the VAULT
+ * with both swap tokens (the Vault pays assetOut out of its own balance — like the real Vault holding
+ * pooled assets). So `Vault.swap(SingleSwap{GIVEN_IN})` returns EXACTLY the off-chain `getDy(pool, dx)`
+ * to the wei — the wei-exact-in-dy gate. The engine's `_swapBalancerV2` reads pool.getPoolId() then
+ * calls the etched Vault.
+ *
+ * `tokens` includes the BPT at `bptIndex` (the pool's own address is the BPT); `scaling` is aligned
+ * with `tokens` (BPT slot ignored). `bals` are the registered balances (BPT slot a sentinel). `vaultFund`
+ * is the amount of each NON-BPT token transferred into the Vault so it can pay swaps. Returns the pool
+ * address (the swap(SwapParams{poolType:4, pool}) target). Idempotent on the Vault etch.
+ */
+export async function deployBalancerComposableStable(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+  tokens: Hex[],
+  scaling: bigint[],
+  bptIndex: number,
+  amp: bigint,
+  swapFeeWad: bigint,
+  bals: bigint[],
+  vaultFund: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  // Etch the Vault at the canonical address (once — re-etching is harmless but skip if present).
+  const existing = await publicClient.getCode({ address: BALANCER_V2_VAULT });
+  if (!existing || existing === "0x") {
+    await testClient.setCode({ address: BALANCER_V2_VAULT, bytecode: balancerVaultRuntime });
+    const code = await publicClient.getCode({ address: BALANCER_V2_VAULT });
+    if (!code || code === "0x") throw new Error("failed to etch BalancerVault at canonical address");
+  }
+  const acct = (minter ?? walletClient.account) as Account;
+
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: balancerStablePoolArtifact.abi,
+    bytecode: balancerStablePoolArtifact.bytecode,
+    args: [tokens, scaling, BigInt(bptIndex), amp, swapFeeWad],
+  });
+  const poolId = (await publicClient.readContract({
+    address: pool, abi: balancerStablePoolAbi as Abi, functionName: "getPoolId",
+  })) as Hex;
+  // Register the pool on the Vault.
+  await writeAndWait(walletClient, publicClient, {
+    address: BALANCER_V2_VAULT, abi: balancerVaultAbi as Abi, functionName: "registerPool",
+    args: [poolId, pool], account: acct,
+  });
+  // Seed the registered balances.
+  for (let k = 0; k < bals.length; k++) {
+    await writeAndWait(walletClient, publicClient, {
+      address: pool, abi: balancerStablePoolAbi as Abi, functionName: "setBalance",
+      args: [BigInt(k), bals[k]], account: acct,
+    });
+  }
+  // Fund the Vault with each NON-BPT token so it can pay swap outputs.
+  for (let k = 0; k < tokens.length; k++) {
+    if (k === bptIndex) continue;
+    await writeAndWait(walletClient, publicClient, {
+      address: tokens[k], abi: erc20Abi as Abi, functionName: "transfer",
+      args: [BALANCER_V2_VAULT, vaultFund], account: acct,
     });
   }
   return pool;

@@ -215,6 +215,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const dodos = prepared.dodos ?? [];
   const solidlyStables = prepared.solidlyStables ?? [];
   const wombats = prepared.wombats ?? [];
+  const balancerStables = prepared.balancerStables ?? [];
   return prepared.brackets
     .filter(
       (b) =>
@@ -222,7 +223,8 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.LB ||
         b.kind === EcoBracketKind.DODO ||
         b.kind === EcoBracketKind.SolidlyStable ||
-        b.kind === EcoBracketKind.Wombat,
+        b.kind === EcoBracketKind.Wombat ||
+        b.kind === EcoBracketKind.BalancerStable,
     )
     .slice()
     .sort((a, b) => {
@@ -236,10 +238,12 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isDodo = b.kind === EcoBracketKind.DODO;
       const isSolidly = b.kind === EcoBracketKind.SolidlyStable;
       const isWombat = b.kind === EcoBracketKind.Wombat;
-      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat — kinds 4/5 are callback-free
-      // (the pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap +
-      // approve + pool.swap (Wombat PULLS via transferFrom).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : 0n;
+      const isBalancer = b.kind === EcoBracketKind.BalancerStable;
+      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable —
+      // kinds 4/5 are callback-free (the pool view IS the swap math); 4 = getAmountOut + pool.swap,
+      // 5 = quotePotentialSwap + approve + pool.swap (Wombat PULLS via transferFrom). Kinds 1/3/6 go
+      // through the engine (1 = swap poolType 3 Curve, 3 = poolType 5 DODO, 6 = poolType 4 BalancerV2).
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -250,7 +254,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
               ? BigInt(solidlyStables[b.refIdx].address)
               : isWombat
                 ? BigInt(wombats[b.refIdx].address)
-                : 0n;
+                : isBalancer
+                  ? BigInt(balancerStables[b.refIdx].address)
+                  : 0n;
       return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
     });
 }
@@ -290,6 +296,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_DODO = (prepared.dodos?.length ?? 0) > 0;
   const HAS_SOLIDLY_STABLE = (prepared.solidlyStables?.length ?? 0) > 0;
   const HAS_WOMBAT = (prepared.wombats?.length ?? 0) > 0;
+  const HAS_BALANCER = (prepared.balancerStables?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -301,6 +308,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_DODO,
     HAS_SOLIDLY_STABLE,
     HAS_WOMBAT,
+    HAS_BALANCER,
   };
 }
 

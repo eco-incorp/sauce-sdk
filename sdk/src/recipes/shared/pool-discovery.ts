@@ -25,6 +25,7 @@ import {
 } from "./constants.js";
 import type { PoolInfo } from "./types.js";
 import { A_PRECISION_DEFAULT, type CurvePool } from "./curve-math.js";
+import type { BalancerStablePool } from "./balancer-stable-math.js";
 import type { LbPool } from "./lb-math.js";
 import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 import type { SolidlyStablePool } from "./solidly-stable-math.js";
@@ -137,6 +138,25 @@ const balancerPoolAbi = parseAbi([
   "function totalSupply() external view returns (uint256)",
 ]);
 
+// Balancer V2 ComposableStable pool + Vault read surface (the EcoSwap typed path). The pool exposes
+// getPoolId (32-byte id; first 20 bytes == pool address), the amplification (A·AMP_PRECISION via
+// getAmplificationParameter), the per-token scaling factors (decimals + rate-provider rates folded,
+// all 1e18-WAD), the swap fee (1e18-WAD) and the BPT index (the pool token's own slot in the registered
+// token list — excluded from StableMath). The Vault.getPoolTokens(poolId) returns the registered tokens
+// + balances (INCLUDING the BPT). discoverBalancerStablePoolsTyped reads all of this so prepare's
+// buildBalancerStableSegments replays the StableMath off-chain with NO further RPC.
+const balancerStablePoolAbi = parseAbi([
+  "function getPoolId() external view returns (bytes32)",
+  "function getAmplificationParameter() external view returns (uint256 value, bool isUpdating, uint256 precision)",
+  "function getScalingFactors() external view returns (uint256[] scalingFactors)",
+  "function getSwapFeePercentage() external view returns (uint256)",
+  "function getBptIndex() external view returns (uint256)",
+]);
+
+const balancerVaultAbi = parseAbi([
+  "function getPoolTokens(bytes32 poolId) external view returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock)",
+]);
+
 const dodoZooAbi = parseAbi([
   "function getDODO(address baseToken, address quoteToken) external view returns (address[] pools)",
 ]);
@@ -205,6 +225,9 @@ const kyberPoolAbi = parseAbi([
 ]);
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+/** 1e18 WAD — default Balancer scaling factor (a missing factor falls back to no scale). */
+const WAD_BAL = 10n ** 18n;
 
 // ── V3 Standard discovery ───────────────────────────────────
 
@@ -870,6 +893,115 @@ async function discoverBalancerV2Pools(
   // The Vault at factories[0].address supports the swap, but pool discovery
   // requires getPoolTokens() with known poolIds.
   return [];
+}
+
+/**
+ * Discover Balancer V2 ComposableStable pools for the pair AS TYPED `BalancerStablePool` descriptors
+ * (the EcoSwap path — distinct from the legacy `discoverBalancerV2Pools` stub, which never surfaced a
+ * pool). Balancer stable pools (bb-a-USD class — USDC/USDT/DAI depth on Ethereum/Arbitrum/Polygon)
+ * trade on the StableMath A-invariant (NOT xy=k), so they must NOT be priced through the V2 synthetic-
+ * sqrt path. The stable math is OFF-CHAIN ONLY: this reads the live invariant state (amp, the NON-BPT
+ * balances + scaling factors, fee, token indices) so prepare's `buildBalancerStableSegments` can replay
+ * StableMath getDy with NO further RPC, and the on-chain solver consumes the sampled segments statically
+ * + executes via the EXISTING engine BalancerV2 dispatch swap(SwapParams{poolType:4, pool}) →
+ * _swapBalancerV2 (it derives poolId via pool.getPoolId() and calls Vault.swap(GIVEN_IN) — NO engine
+ * change).
+ *
+ * DISCOVERY IS KNOWN-POOL-ADDRESS BASED — Balancer has NO pair→pool getter. The `FactoryConfig.address`
+ * for a BalancerV2 entry is the VAULT (shared on all EVM chains); the per-config `balancerStablePools`
+ * carries the candidate ComposableStable pool addresses. For each known pool: read getPoolId →
+ * Vault.getPoolTokens(poolId) → getAmplificationParameter / getScalingFactors / getSwapFeePercentage /
+ * getBptIndex; EXCLUDE the BPT (the pool's own token at bptIndex) from the StableMath balances/scaling/
+ * indices; keep the pool when BOTH tokenIn and tokenOut are non-BPT registered tokens. PRODUCTION needs
+ * a known-poolId list / the Balancer subgraph to populate `balancerStablePools` (the standard Balancer
+ * integration); the EVM test injects the locally-deployed fixture pool address.
+ *
+ * Mirrors `discoverCurvePoolsTyped`: off-chain discovery + state reads, returning the venue descriptor
+ * EcoSwap prepare consumes directly (the on-chain lens does not understand Balancer). `amp` is the raw
+ * getAmplificationParameter()[0] (= A·AMP_PRECISION — the StableMath replay uses it directly). The
+ * scaling factors fold decimals + rate-provider rates (all 1e18-WAD), so a rate-bearing stable pool
+ * (e.g. bb-a-USD with aToken rates) is priced exactly.
+ */
+export async function discoverBalancerStablePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<BalancerStablePool[]> {
+  if (factories.length === 0) return [];
+  const inLower = tokenIn.toLowerCase();
+  const outLower = tokenOut.toLowerCase();
+
+  const pools: BalancerStablePool[] = [];
+  const seen = new Set<string>();
+  for (const vault of factories) {
+    const knownPools = vault.balancerStablePools ?? [];
+    if (knownPools.length === 0) continue;
+    for (const poolAddr of knownPools) {
+      const key = poolAddr.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try {
+        // Pool id + the live StableMath state. getBptIndex reverts on a non-composable (legacy
+        // MetaStable) pool — caught below; such a pool has no BPT to exclude (handled as bptIndex = -1).
+        const [poolId, ampRaw, scalingRaw, feeRaw] = await Promise.all([
+          client.readContract({ address: poolAddr, abi: balancerStablePoolAbi, functionName: "getPoolId" }) as Promise<Hex>,
+          client.readContract({ address: poolAddr, abi: balancerStablePoolAbi, functionName: "getAmplificationParameter" }) as Promise<readonly [bigint, boolean, bigint]>,
+          client.readContract({ address: poolAddr, abi: balancerStablePoolAbi, functionName: "getScalingFactors" }) as Promise<readonly bigint[]>,
+          client.readContract({ address: poolAddr, abi: balancerStablePoolAbi, functionName: "getSwapFeePercentage" }) as Promise<bigint>,
+        ]);
+        if (!poolId || poolId === ZERO_BYTES32) continue;
+        let bptIndex = -1;
+        try {
+          bptIndex = Number(
+            (await client.readContract({ address: poolAddr, abi: balancerStablePoolAbi, functionName: "getBptIndex" })) as bigint,
+          );
+        } catch {
+          bptIndex = -1; // non-composable (no BPT in the token list)
+        }
+
+        // Registered tokens + balances (INCLUDING the BPT) from the Vault.
+        const [tokens, balances] = (await client.readContract({
+          address: vault.address,
+          abi: balancerVaultAbi,
+          functionName: "getPoolTokens",
+          args: [poolId],
+        })) as readonly [readonly Hex[], readonly bigint[], bigint];
+
+        // Exclude the BPT from the StableMath token set; build the NON-BPT balances/scaling arrays and
+        // map tokenIn/tokenOut to their NON-BPT indices.
+        const tks: Hex[] = [];
+        const bals: bigint[] = [];
+        const scals: bigint[] = [];
+        for (let k = 0; k < tokens.length; k++) {
+          if (k === bptIndex) continue;
+          tks.push(tokens[k]);
+          bals.push(balances[k]);
+          // scalingFactors is aligned with the FULL registered token list (incl. BPT), so index it by k.
+          scals.push(scalingRaw[k] ?? WAD_BAL);
+        }
+        const i = tks.findIndex((t) => t.toLowerCase() === inLower);
+        const j = tks.findIndex((t) => t.toLowerCase() === outLower);
+        if (i < 0 || j < 0) continue; // pool does not hold BOTH non-BPT tokens
+        if (bals[i] <= 0n || bals[j] <= 0n) continue;
+
+        pools.push({
+          poolType: SwapPoolType.BalancerV2,
+          address: poolAddr,
+          i,
+          j,
+          amp: ampRaw[0],
+          balances: bals,
+          scalingFactors: scals,
+          swapFeeWad: feeRaw,
+          source: `${vault.label} (Balancer ComposableStable)`,
+        });
+      } catch {
+        // Pool / Vault read failed (not a stable pool, paused, or unregistered) — skip.
+      }
+    }
+  }
+  return pools;
 }
 
 // ── DODO V2 discovery ───────────────────────────────────────

@@ -220,6 +220,7 @@ export enum EcoBracketKind {
   DODO = 5, // DODO V2 PMM segment (static, off-chain-sampled via the closed-form querySell* replay)
   SolidlyStable = 6, // Solidly STABLE (sAMM) segment (static, off-chain-sampled via the x3y+y3x replay)
   Wombat = 7, // Wombat single-sided stableswap segment (static, off-chain-sampled via the coverage-ratio replay)
+  BalancerStable = 8, // Balancer V2 ComposableStable segment (static, off-chain-sampled via the StableMath A-invariant replay)
 }
 
 /**
@@ -472,6 +473,31 @@ export interface EcoWombat {
 }
 
 /**
+ * One Balancer V2 ComposableStable venue to execute, indexed by an EcoBracket.refIdx (kind ===
+ * BalancerStable). Balancer stable pools (bb-a-USD class — USDC/USDT/DAI depth on
+ * Ethereum/Arbitrum/Polygon) trade on the StableMath A-invariant (NOT xy=k), so prepare samples the
+ * curve OFF-CHAIN into static segments (kind BalancerStable) via the bigint replay; the on-chain solver
+ * consumes those through the static-segment cursor and EXECUTES the awarded Σ share via the EXISTING
+ * engine BalancerV2 dispatch: swap(SwapParams{poolType:4=BalancerV2, pool, tokenIn, tokenOut,
+ * amountSpecified: -Σ}) → _swapBalancerV2, which derives poolId via pool.getPoolId() and calls
+ * Vault.swap(SingleSwap{GIVEN_IN, assetIn:tokenIn, assetOut:tokenOut}). The Vault handles the BPT
+ * exclusion / scaling-factor up-downscale / fee internally, so the SwapParams carry NO curve data —
+ * the segment merge already used it. `address` is the POOL (the getPoolId/swap target — NOT the
+ * poolId, NOT the Vault). feePpm (the swap fee, rounded) is the price-ordering coordinate / diagnostic.
+ */
+export interface EcoBalancerStable {
+  /** Pool address — the swap(SwapParams{poolType:4, pool}) target (engine derives poolId). */
+  address: Hex;
+  /** int index of tokenIn into the pool's NON-BPT token set (diagnostic; engine resolves on-chain). */
+  i: number;
+  /** int index of tokenOut into the pool's NON-BPT token set (diagnostic; engine resolves on-chain). */
+  j: number;
+  /** Rounded ppm swap fee (the price-ordering coordinate; the on-chain out is computed by the Vault). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -525,6 +551,16 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   wombats?: EcoWombat[];
+  /**
+   * Balancer V2 ComposableStable venues (kind === BalancerStable brackets reference these by refIdx).
+   * The on-chain solver executes the awarded Σ share via the EXISTING engine BalancerV2 dispatch
+   * swap(SwapParams{poolType:4, pool:balancerStables[refIdx].address}) → _swapBalancerV2; the
+   * stable-math marginal is supplied entirely as the static sampled segments in `brackets` (the
+   * StableMath A-invariant replay). Optional/empty when no Balancer stable pools were discovered
+   * (omitted ⇒ no Balancer venue, so existing test-side `EcoSwapPrepared` literals stay
+   * additive-compatible).
+   */
+  balancerStables?: EcoBalancerStable[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

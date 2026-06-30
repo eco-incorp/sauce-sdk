@@ -46,12 +46,14 @@ import {
   discoverDodoV2PoolsTyped,
   discoverSolidlyStablePoolsTyped,
   discoverWombatPoolsTyped,
+  discoverBalancerStablePoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
+import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import {
   MIN_SQRT_RATIO,
   MAX_SQRT_RATIO,
@@ -74,6 +76,7 @@ import {
   type EcoDodo,
   type EcoSolidlyStable,
   type EcoWombat,
+  type EcoBalancerStable,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -562,6 +565,38 @@ function buildWombatBrackets(pool: WombatPool, refIdx: number, amountIn: bigint)
   return brackets;
 }
 
+/**
+ * Build Balancer V2 ComposableStable segments for one pool by sampling the bigint StableMath replay (NO
+ * extra RPC — pure bigint on the read invariant state). Each sampled (Δinput, Δoutput) increment becomes
+ * a STATIC segment (kind BalancerStable) in unified out/in space, refIdx → the Balancer venue index. The
+ * marginal is the POST-FEE execution price (getDy nets the swap fee), so it enters the descending-price
+ * merge directly as both sqrtAdjNear and sqrtAdjFar. The stable math (A-invariant + BPT exclusion +
+ * scaling factors) is OFF-CHAIN ONLY for the split; the on-chain solver executes via the EXISTING engine
+ * BalancerV2 dispatch swap(SwapParams{poolType:4}) → _swapBalancerV2 → Vault.swap(GIVEN_IN).
+ */
+function buildBalancerStableBrackets(pool: BalancerStablePool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildBalancerStableSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.BalancerStable,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Balancer swap fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/** Round a Balancer swap fee (1e18-WAD) to ppm (the price-ordering coordinate / diagnostics). */
+function balancerFeeToPpm(swapFeeWad: bigint): number {
+  return Number((swapFeeWad * 1_000_000n + 5n * 10n ** 17n) / 10n ** 18n);
+}
+
 // ── Main preparation ─────────────────────────────────────────
 
 /** Tuning knobs for off-chain preparation (overridable per call; mainly for tests). */
@@ -841,6 +876,30 @@ export async function prepareEcoSwap(
   }
   for (const set of wombatBracketSets) brackets.push(...set);
 
+  const balancerStables: EcoBalancerStable[] = [];
+  const balancerBracketSets: EcoBracket[][] = [];
+  // Balancer V2 — known-pool-address discovery (the FactoryConfig.address is the Vault; the per-config
+  // balancerStablePools carries the candidate ComposableStable pools). Sampled like Curve; executed via
+  // the EXISTING engine BalancerV2 dispatch (poolType 4 → _swapBalancerV2 → Vault.swap). NO engine change.
+  const balancerVaults = poolConfig.factories.filter((f) => f.factoryType === FactoryType.BalancerV2);
+  if (balancerVaults.length > 0) {
+    const balRaw = await discoverBalancerStablePoolsTyped(tokenIn, tokenOut, client, balancerVaults);
+    for (const bp of balRaw) {
+      const refIdx = balancerStables.length;
+      const bb = buildBalancerStableBrackets(bp, refIdx, amountIn);
+      if (bb.length === 0) continue;
+      balancerStables.push({
+        address: bp.address,
+        i: bp.i,
+        j: bp.j,
+        feePpm: balancerFeeToPpm(bp.swapFeeWad),
+        source: bp.source,
+      });
+      balancerBracketSets.push(bb);
+    }
+  }
+  for (const set of balancerBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -985,7 +1044,8 @@ export async function prepareEcoSwap(
     lbs.length === 0 &&
     dodos.length === 0 &&
     solidlyStables.length === 0 &&
-    wombats.length === 0
+    wombats.length === 0 &&
+    balancerStables.length === 0
   ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
@@ -1001,13 +1061,14 @@ export async function prepareEcoSwap(
   const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
   const nSolidlySegs = brackets.filter((b) => b.kind === EcoBracketKind.SolidlyStable).length;
   const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
+  const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
-      `${wombats.length} Wombat, ` +
+      `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
-      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat)`,
+      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable)`,
   );
 
   return {
@@ -1023,6 +1084,7 @@ export async function prepareEcoSwap(
     dodos,
     solidlyStables,
     wombats,
+    balancerStables,
     brackets,
     zeroForOne,
     priceLimit,

@@ -160,6 +160,18 @@ export interface FactoryConfig {
    * precompute their step ratio. Defaults to 60 when omitted. Ignored for non-Algebra factories.
    */
   algebraTickSpacing?: number;
+  /**
+   * Balancer V2 (BalancerV2 factory type) only: a KNOWN list of ComposableStable pool addresses to
+   * probe for the pair. Balancer has NO pair→pool getter (the `address` here is the Vault, shared on
+   * all chains), so discovery is known-pool-address based — `discoverBalancerStablePoolsTyped` reads
+   * each pool's getPoolId / Vault.getPoolTokens / getAmplificationParameter / getScalingFactors /
+   * getSwapFeePercentage / bptIndex and keeps the pools containing BOTH tokenIn and tokenOut (non-BPT).
+   * PRODUCTION needs this populated from a known-poolId list / the Balancer subgraph (the standard
+   * Balancer integration); the EVM test injects the locally-deployed fixture pool address here. Omitted
+   * / empty ⇒ no Balancer pools surfaced (the prior behavior — the discovery gap is filled by config,
+   * no engine change).
+   */
+  balancerStablePools?: Hex[];
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */

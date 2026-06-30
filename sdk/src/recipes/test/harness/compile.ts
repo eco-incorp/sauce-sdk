@@ -18,7 +18,13 @@ const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler") as {
   compile: (
     src: string,
-    opts: { baseDirs: string[]; args?: unknown[]; target?: "v1" | "v12" },
+    opts: {
+      baseDirs: string[];
+      args?: unknown[];
+      target?: "v1" | "v12";
+      treeshake?: boolean;
+      defines?: Record<string, boolean>;
+    },
   ) => {
     bytecode?: Uint8Array[];
     bytecodes?: Uint8Array[];
@@ -47,15 +53,22 @@ function toHex(bytes: Uint8Array): Hex {
  * minimal gate script only imports from ./artifacts so either works.
  * `target` selects the bytecode surface: "v1" (prefix, Solidity Router) or "v12"
  * (postfix, Huff runtime). Both produce a `bytes[]` blob that cook() accepts.
+ * `opts.defines` + `opts.treeshake` exercise the PRODUCTION compile path (index.ts
+ * passes protocolDefines(prepared) with treeshake:true); pass them to compile the
+ * treeshaken define set a real cook carries, not the un-treeshaken all-true default.
  */
 export function compileSauce(
   tsSource: string,
   args: unknown[],
   recipeDir: string = ECOSWAP_DIR,
   target: "v1" | "v12" = "v1",
+  opts: { treeshake?: boolean; defines?: Record<string, boolean> } = {},
 ): { bytecodes: Hex[]; warnings: unknown[] } {
   const jsSource = stripTypes(tsSource);
-  const result = compile(jsSource, { baseDirs: [SRC_ROOT, recipeDir], args, target });
+  const result = compile(jsSource, {
+    baseDirs: [SRC_ROOT, recipeDir], args, target,
+    treeshake: opts.treeshake, defines: opts.defines,
+  });
   const segments = result.bytecode ?? result.bytecodes ?? [];
   return { bytecodes: segments.map(toHex), warnings: result.warnings ?? [] };
 }

@@ -80,10 +80,14 @@ import { IWombatPool } from "./IWombatPool.json";
 //                 → _swapDODOV2), 4 = Solidly STABLE (sAMM) — CALLBACK-FREE, NO engine SwapPoolType:
 //                 read the EXACT out from the pool's getAmountOut view (the view IS the swap math),
 //                 transfer the awarded input + pool.swap(a0Out, a1Out, to, "") (a stable pool is
-//                 x3y+y3x, NOT xy=k, so it must NOT go through _swapV2). The engine resolves coin
-//                 indices / swapForY / base-quote orientation on-chain for kinds 1-3, so the SwapParams
-//                 carry NO curve data — the segment merge already used it. Curve/DODO/Solidly are
-//                 exact-on-grid; LB is EXACT (a bin is a flat constant-sum slice).
+//                 x3y+y3x, NOT xy=k, so it must NOT go through _swapV2). 5 = Wombat (CALLBACK-FREE:
+//                 quotePotentialSwap + approve + pool.swap; Wombat PULLS via transferFrom). 6 =
+//                 Balancer V2 ComposableStable (swap poolType:4 → _swapBalancerV2 → it derives poolId
+//                 via getPoolId() and calls Vault.swap(GIVEN_IN); the StableMath A-invariant + BPT
+//                 exclusion + scaling + fee run INSIDE the Vault). The engine resolves coin indices /
+//                 swapForY / base-quote orientation / poolId on-chain for kinds 1/3/6, so the
+//                 SwapParams carry NO curve data — the segment merge already used it. Curve / DODO /
+//                 Solidly / Balancer are exact-on-grid; LB is EXACT (a bin is a flat constant-sum slice).
 // All sqrt values are unified out/in Q96.
 
 
@@ -213,6 +217,7 @@ const HAS_LB: boolean = true;
 const HAS_DODO: boolean = true;
 const HAS_SOLIDLY_STABLE: boolean = true;
 const HAS_WOMBAT: boolean = true;
+const HAS_BALANCER: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -291,6 +296,8 @@ function main(
   let sven: Tuple = new Array(segs.length); // Solidly-stable venue (pool) address
   let winp: Tuple = new Array(segs.length); // Wombat per-venue Σ input
   let wven: Tuple = new Array(segs.length); // Wombat venue (pool) address
+  let binp: Tuple = new Array(segs.length); // Balancer-stable per-venue Σ input
+  let bven: Tuple = new Array(segs.length); // Balancer-stable venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -508,7 +515,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT) && segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER) && segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -830,7 +837,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT) && bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER) && bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -861,10 +868,17 @@ function main(
                     sinp[sIdx] = sinp[sIdx] + stake;
                     sven[sIdx] = sVenue;
                   } else {
-                    // segKind 5 — Wombat: callback-free, executed below via quotePotentialSwap + swap.
-                    if (HAS_WOMBAT) {
+                    if (HAS_WOMBAT && sKind === 5) {
+                      // segKind 5 — Wombat: callback-free, executed below via quotePotentialSwap + swap.
                       winp[sIdx] = winp[sIdx] + stake;
                       wven[sIdx] = sVenue;
+                    } else {
+                      // segKind 6 — Balancer V2 ComposableStable: executed below via the engine
+                      // BalancerV2 dispatch (swap poolType:4 → _swapBalancerV2 → Vault.swap).
+                      if (HAS_BALANCER) {
+                        binp[sIdx] = binp[sIdx] + stake;
+                        bven[sIdx] = sVenue;
+                      }
                     }
                   }
                 }
@@ -1203,6 +1217,29 @@ function main(
         token.approve(wpool, wamt);
         IWombatPool.at(wpool).swap(tokenIn, tokenOut, wamt, wOut, address.self, wDeadline);
       }
+    }
+  }
+  }
+  // Balancer V2 ComposableStable → poolType 4 (SwapPoolType.BalancerV2) → _swapBalancerV2 → it derives
+  // poolId via pool.getPoolId() and calls Vault.swap(SingleSwap{GIVEN_IN, assetIn:tokenIn,
+  // assetOut:tokenOut, amount, userData:0x}). The StableMath (A-invariant + BPT exclusion + scaling-
+  // factor up/downscale + the swap fee) runs INSIDE the Vault, so the SwapParams carry NO curve data —
+  // the segment merge already used it (exact-on-grid), and the realized out is wei-exact for the share
+  // (one atomic Vault.swap). amountSpecified is NEGATIVE (the unified exact-in convention; _swapBalancerV2
+  // takes abs()). payer == address.self (compute-then-pull transferred `cum`, incl. each Balancer share,
+  // above) and recipient == address.self. The poolKey is unused for poolType 4 (V4 only) — zeroed to
+  // match the V2-path SwapParams shape.
+  if (HAS_BALANCER) {
+  for (let b = 0; b < segs.length; b = b + 1) {
+    const bamt: Uint256 = binp[b];
+    if (bamt > 0) {
+      const bpool: Address = bven[b];
+      router.swap({
+        poolType: 4, pool: bpool,
+        poolKey: { currency0: 0, currency1: 0, fee: 0, tickSpacing: 0, hooks: 0 },
+        tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(bamt),
+        sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+      });
     }
   }
   }

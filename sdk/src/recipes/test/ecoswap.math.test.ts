@@ -53,6 +53,11 @@ import {
   buildWombatSegments,
   type WombatPool,
 } from "../shared/wombat-math";
+import {
+  getDy as balancerGetDy,
+  buildBalancerStableSegments,
+  type BalancerStablePool,
+} from "../shared/balancer-stable-math";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -1676,5 +1681,71 @@ describe("Wombat (single-sided stableswap) — quotePotentialSwap known-answer +
     // Σ effOut over the grid == quotePotentialSwap(amountIn) (the sampler is a partition of the curve).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
     assert.equal(sumOut, quotePotentialSwap(p, amountIn), "Σ segment effOut == quotePotentialSwap(amountIn)");
+  });
+});
+
+// ── Balancer V2 ComposableStable known-answer + segment sampler ──────────────
+//
+// Pins the off-chain StableMath A-invariant replay (getDy + buildBalancerStableSegments) BEFORE the
+// local-EVM test, so a regression in the bounded-Newton bigint math (or the BPT-index exclusion / the
+// scaling-factor up-downscale) is caught without anvil. The wei-exact bound is documented in
+// balancer-stable-math.ts: the SPLIT is exact-on-grid vs the oracle (one shared sampler) and the
+// realized dy is exact-in-dy (the Vault.swap GIVEN_IN StableMath == this replay). These vectors are the
+// deterministic getDy outputs for fixed states (regenerate only on an intentional math change). amp =
+// A·AMP_PRECISION (A=1000 → 1e6); the swap fee is 1e18-WAD (0.04% = 4e14). 18-dec tokens carry a 1e18
+// scaling factor; a 6-dec token carries 1e30 (= 1e18·10**(18-6)). The BPT exclusion is verified
+// implicitly — these descriptors hold the NON-BPT token set the discovery builds, so getDy operates on
+// exactly the StableMath balances. A near-1:1 stable swap loses only the fee + tiny invariant slippage.
+describe("Balancer V2 ComposableStable — StableMath getDy known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  const AMP = 1_000_000n; // A=1000 → A·AMP_PRECISION
+  const FEE = 4n * 10n ** 14n; // 0.04% in 1e18-WAD
+  function pool(
+    bIn: bigint, bOut: bigint, scalIn: bigint, scalOut: bigint, feeWad = FEE, amp = AMP,
+  ): BalancerStablePool {
+    return {
+      poolType: 4, address: Z, i: 0, j: 1, amp,
+      balances: [bIn, bOut], scalingFactors: [scalIn, scalOut], swapFeeWad: feeWad, source: "kat",
+    };
+  }
+
+  it("balanced 1:1 18-dec pool, A=1000 fee 0.04% — exact StableMath vectors", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, E18, E18);
+    // Hand-pinned from the bounded-Newton replay (mirrors the Vault StableMath bit-for-bit).
+    assert.equal(balancerGetDy(p, 1_000n * E18), 999_599_001_798_043_352_188n);
+    assert.equal(balancerGetDy(p, 10_000n * E18), 9_995_900_170_846_180_872_076n);
+    assert.equal(balancerGetDy(p, 100_000n * E18), 99_949_918_464_766_332_805_060n);
+    // Stable shape: a small trade returns ~the input net of the 0.04% fee (≈ 0.9996·in) with sub-bps
+    // invariant slippage on top — far flatter than a constant-product pool of the same depth.
+    const out1k = balancerGetDy(p, 1_000n * E18);
+    assert.ok(out1k < 1_000n * E18 && out1k > 999n * E18, "near-1:1 minus fee on the A-invariant curve");
+  });
+
+  it("imbalanced 1:1.2 pool — exact vector", () => {
+    const p = pool(1_000_000n * E18, 1_200_000n * E18, E18, E18);
+    assert.equal(balancerGetDy(p, 50_000n * E18), 49_986_880_726_818_263_404_131n);
+  });
+
+  it("scaling-factor normalisation — 6-dec out token (scaling 1e30) downscales exactly", () => {
+    // A 6-dec out token: scaling factor folds the decimal scale (10**(18-6)) into the 1e18 WAD → 1e30.
+    const p = pool(1_000_000n * E18, 1_000_000n * (10n ** 6n), E18, 10n ** 30n);
+    // 1000 (18-dec) in → ~1000 (6-dec) out net of fee: 999.599001 USDC-units.
+    assert.equal(balancerGetDy(p, 1_000n * E18), 999_599_001n);
+  });
+
+  it("buildBalancerStableSegments — covers amountIn, descending marginals, partition of the curve", () => {
+    const p = pool(1_000_000n * E18, 1_000_000n * E18, E18, E18);
+    const amountIn = 100_000n * E18;
+    const segs = buildBalancerStableSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == getDy(amountIn) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, balancerGetDy(p, amountIn), "Σ segment effOut == getDy(amountIn)");
   });
 });

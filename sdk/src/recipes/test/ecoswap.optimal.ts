@@ -66,6 +66,7 @@ import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
+import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -158,6 +159,15 @@ export interface OptimalPool {
    * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable` are ignored when `wombat` is set.
    */
   wombat?: WombatPool;
+  /**
+   * Balancer V2 ComposableStable pool — when present this pool is a BALANCER-STABLE venue (NOT
+   * V2/V3/Curve/LB/DODO/Solidly/Wombat). The oracle enumerates its segments via the SHARED bigint
+   * StableMath replay (buildBalancerStableSegments) from the live invariant state (amp, NON-BPT
+   * balances + scaling factors, fee), so the split is exact-on-grid vs prepare's segments (one replay).
+   * The marginal is post-fee (getDy nets the swap fee), so it enters the descending-price merge
+   * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat` are ignored when `balancer` is set.
+   */
+  balancer?: BalancerStablePool;
 }
 
 /**
@@ -493,6 +503,21 @@ function wombatSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segm
   return segs;
 }
 
+/**
+ * Enumerate one Balancer V2 ComposableStable pool's segments via the SHARED bigint StableMath replay
+ * (buildBalancerStableSegments) from the live invariant state. The amountIn caps the sampled range —
+ * the same bound prepare uses — so the oracle and prepare emit the IDENTICAL segment grid (single
+ * source), making the split exact-on-grid. The Balancer marginalOI is the post-fee execution price
+ * (getDy nets the swap fee); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function balancerStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildBalancerStableSegments(p.balancer!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -717,7 +742,11 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.wombat) {
+    if (p.balancer) {
+      // Balancer V2 ComposableStable venue: sampled-segment enumeration via the shared StableMath replay
+      // (capped at amountIn — the same bound prepare samples → identical grid → exact-on-grid split).
+      allSegs.push(...balancerStableSegments(p, i, amountIn));
+    } else if (p.wombat) {
       // Wombat (single-sided stableswap) venue: sampled-segment enumeration via the shared closed-form
       // coverage-ratio replay (capped at amountIn — the same bound prepare samples → identical grid →
       // exact-on-grid split).
