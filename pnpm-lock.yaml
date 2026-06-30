@@ -75,8 +75,8 @@ importers:
         specifier: ^3.8.1
         version: 3.8.3
       sauce:
-        specifier: github:eco-incorp/sauce#fix/v12-signed-intn-return-decode
-        version: git+https://git@github.com:eco-incorp/sauce.git#beed86005fd2547cb5e26a4f31a89587e4767db6
+        specifier: github:eco-incorp/sauce#feat/engine-algebra-swap-callback
+        version: git+https://git@github.com:eco-incorp/sauce.git#e8a4c6e900f653399e5f09dd8f7b170e33106b29
       ts-jest:
         specifier: ^29.4.6
         version: 29.4.11(@babel/core@7.29.7)(@jest/transform@30.4.1)(@jest/types@30.4.1)(babel-jest@30.4.1(@babel/core@7.29.7))(jest-util@30.4.1)(jest@30.4.2(@types/node@25.9.1))(typescript@5.9.3)
@@ -2613,8 +2613,8 @@ packages:
   safer-buffer@2.1.2:
     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
 
-  sauce@git+https://git@github.com:eco-incorp/sauce.git#beed86005fd2547cb5e26a4f31a89587e4767db6:
-    resolution: {commit: beed86005fd2547cb5e26a4f31a89587e4767db6, repo: git@github.com:eco-incorp/sauce.git, type: git}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#e8a4c6e900f653399e5f09dd8f7b170e33106b29:
+    resolution: {commit: e8a4c6e900f653399e5f09dd8f7b170e33106b29, repo: git@github.com:eco-incorp/sauce.git, type: git}
     version: 0.0.0
 
   semver@5.7.2:
@@ -6116,7 +6116,7 @@ snapshots:
 
   safer-buffer@2.1.2: {}
 
-  sauce@git+https://git@github.com:eco-incorp/sauce.git#beed86005fd2547cb5e26a4f31a89587e4767db6: {}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#e8a4c6e900f653399e5f09dd8f7b170e33106b29: {}
 
   semver@5.7.2: {}
 
