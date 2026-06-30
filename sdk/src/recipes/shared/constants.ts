@@ -508,6 +508,62 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     ],
     feeTiers: [100, 500, 3000, 10000],
   },
+
+  // Unichain (chainId 130). Uniswap-native OP-stack L2. WETH is the OP-stack predeploy
+  // 0x4200...0006 (routing hub; Eco routes only stablecoins). Unichain uses the non-canonical
+  // 0x1f9840000...0002/0003/0004 deterministic factory scheme (NOT the usual 0x1F98431c... V3
+  // factory). Standard Uniswap fee tiers (100/500/3000/10000) — V3 feeAmountTickSpacing is the
+  // canonical set, NOT Pancake's 2500. All addresses verified from the Uniswap official developer
+  // docs (developers.uniswap.org/docs/unichain/technical-information/contract-addresses) + the V4
+  // deployments page. Stablecoins verified: USDC native (Circle), USDT0 (Tether OFT, 6 dec),
+  // oUSDT (OpenUSDT Superchain ERC20, 6 dec). DROPPED (could not verify on Unichain mainnet,
+  // under-adding): USDT (no separate bridged USDT — USDT0 IS canonical Tether), USDG (Paxos docs
+  // list only Ethereum/Solana/Ink/X Layer), USDC.e (Unichain USDC is native, no bridged variant),
+  // USDbC (Base-specific).
+  unichain: {
+    factories: [
+      // V3 concentrated liquidity (has price limit). Standard Uniswap V3 fee tiers.
+      { address: "0x1F98400000000000000000000000000000000003" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
+      // V4 singleton (PoolManager + StateView lens).
+      { address: "0x1F98400000000000000000000000000000000004" as Hex, stateView: "0x86e8631A016F9068C3f085fAF484Ee3F5fDee8f2" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
+      // V2 constant-product (no price limit). Canonical 0.30% fee.
+      { address: "0x1F98400000000000000000000000000000000002" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Uniswap V2" },
+    ],
+    baseTokens: [
+      "0x4200000000000000000000000000000000000006" as Hex, // WETH (OP-stack predeploy, routing hub)
+      "0x078D782b760474a361dDA0AF3839290b0EF57AD6" as Hex, // USDC (Circle native, 6 dec)
+      "0x9151434b16b9763660705744891fA906F660EcC5" as Hex, // USDT0 (Tether OFT, 6 dec)
+      "0x1217BfE6c773EEC6cc4A38b5Dc45B92292B6E189" as Hex, // oUSDT (OpenUSDT, 6 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
+
+  // Ronin (chainId 2020). Gaming chain — stablecoin depth is THIN. WRON (wrapped native) is the
+  // routing hub, not a stablecoin. Katana is a Uniswap V2 + V3 fork (Katana V3 uses the standard
+  // uniswapV3SwapCallback shape). Factories verified via the official ronin-chain/katana-operation-
+  // contracts mainnet deploy script + live RPC. CRITICAL: Katana V3 enabled fee tiers are
+  // NON-STANDARD = [100, 3000, 10000] (feeAmountTickSpacing: 100->1, 3000->60, 10000->200; the
+  // 0.05%/500 tier is DISABLED) — per-factory feeTiers set on the V3 row, chain-level feeTiers
+  // also omit 500. Only USDC is a verifiable stablecoin with DEX liquidity (a scan of all 665
+  // Katana V2 pairs found ZERO USDT/USDT0/USDC.e/USDG/oUSDT/DAI/USDe pairs). DROPPED (under-add):
+  // USDT (no canonical Ronin address confirmable), oUSDT (OpenUSDT docs list Ronin but OKLink shows
+  // zero balance / no contract — likely not active), USDG/USDC.e/USDT0/USDbC (no authoritative
+  // Ronin deployment found). baseTokens deliberately holds only WRON + USDC; add others later only
+  // after confirming canonical Ronin addresses on the explorer.
+  ronin: {
+    factories: [
+      // V2 constant-product (no price limit). Katana V2 — UniswapV2 fork, canonical 0.30% fee.
+      { address: "0xB255D6A720BB7c39fee173cE22113397119cB930" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Katana V2" },
+      // V3 concentrated liquidity (has price limit). Katana V3 — NON-STANDARD enabled fee tiers
+      // (0.05%/500 disabled); per-factory feeTiers required.
+      { address: "0x1f0B70d9A137e3cAEF0ceAcD312BC5f81Da0cC0c" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Katana V3", feeTiers: [100, 3000, 10000] },
+    ],
+    baseTokens: [
+      "0xe514d9DEB7966c8BE0ca922de8a064264eA6bcd4" as Hex, // WRON (wrapped native, routing hub, 18 dec)
+      "0x0B7007c13325C48911F73A2daD5FA5dCBf808aDc" as Hex, // USDC (6 dec)
+    ],
+    feeTiers: [100, 3000, 10000],
+  },
 };
 
 // ── Infrastructure ───────────────────────────────────────────
