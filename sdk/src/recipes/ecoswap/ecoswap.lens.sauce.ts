@@ -3,6 +3,8 @@ import { IUniswapV2Factory } from "./IUniswapV2Factory.json";
 import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IStateViewFull } from "./IStateViewFull.json";
+import { IAlgebraFactory } from "./IAlgebraFactory.json";
+import { IAlgebraPool } from "./IAlgebraPool.json";
 
 // EcoSwap on-chain PREPARE LENS (v2, LAZY / dynamic tick reading).
 //
@@ -75,9 +77,23 @@ import { IStateViewFull } from "./IStateViewFull.json";
 //   cfg[4]  driftTicks : Uint256 (extra boundaries past the stop, each side)
 //   cfg[5]  minRelBps  : Uint256 (survivor floor in bps of Σ in-range capacity)
 //   cfg[6]  maxTicks   : Uint256 (hard cap on forward tick reads per pool)
-//   v3Factories[i] = [factoryAddr]
+//   v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep]
+//                    isAlgebra=1 ⇒ Algebra dynamic-fee fork (Camelot/QuickSwap V3, Ramses V2):
+//                    discover via poolByPair(tokenIn,tokenOut) and read globalState() for
+//                    (price, tick) + the DYNAMIC fee (feeZto for zeroForOne, feeOtz for
+//                    oneForZero) in place of getPool/slot0(). algebraTs/algebraStep are the
+//                    factory's fixed per-pool tickSpacing + its precomputed step ratio (the
+//                    lens has no on-chain TickMath). For isAlgebra=1 the inner v3FeeTiers loop
+//                    runs ONCE (ti===0) — Algebra has one pool per pair, no fee tiers. The tick
+//                    walk (ticks()[1]=liquidityDelta shares the V3 selector + int128 layout),
+//                    the capacity/floor math and the emitted V3 pool row are reused verbatim
+//                    (poolType=1=UniV3; the dynamic fee rides the row's `fee` field).
+//                    Standard-V3 rows carry isAlgebra=0, algebraTs=0, algebraStep=0.
 //   v3FeeTiers[j]  = [fee, stepRatio]        stepRatio=floor(sqrt(1.0001^ts)*2^96)
-//   v2Factories[i] = [factoryAddr]
+//   v2Factories[i] = [factoryAddr, feePpm]   feePpm = the pool's constant-product fee
+//                                            (3000 for canonical UniswapV2); the engine
+//                                            _swapV2 hardcodes 0.30%, so a non-3000 pool
+//                                            executes via the callback-free Sauce path.
 //   v4Factories[i] = [poolManager, stateView]
 //   v4Specs[j]     = [fee, tickSpacing, stepRatio]
 //   v4PoolIds[i*J+j] = [poolId]
@@ -209,16 +225,39 @@ function main(
   for (let fi = 0; fi < v3Factories.length; fi = fi + 1) {
     const vf: Tuple = v3Factories[fi];
     const factory: Address = vf[0];
+    const isAlg: Uint256 = vf[1]; // 1 ⇒ Algebra dynamic-fee fork (poolByPair + globalState)
     for (let ti = 0; ti < v3FeeTiers.length; ti = ti + 1) {
       const ft: Tuple = v3FeeTiers[ti];
       const fee: Uint256 = ft[0];
-      const poolAddr: Address = IUniswapV3Factory.at(factory).getPool(tokenIn, tokenOut, fee);
-      if (poolAddr !== 0) {
-        const sqrtP: Uint256 = IUniswapV3PoolFull.at(poolAddr).slot0()[0];
-        const liq: Uint256 = IUniswapV3PoolFull.at(poolAddr).liquidity();
-        if (sqrtP > 0) {
-          if (liq > 0) {
-            discovered = discovered + 1;
+      // Algebra factories yield ONE pool per pair (no fee tiers) — only act at ti===0 so the
+      // pool is discovered/counted exactly once. Standard V3 loops every configured tier.
+      let runIt: Uint256 = 1;
+      if (isAlg === 1) {
+        if (ti !== 0) {
+          runIt = 0;
+        }
+      }
+      if (runIt === 1) {
+        let poolAddr: Address = 0;
+        let sqrtP: Uint256 = 0;
+        if (isAlg === 1) {
+          poolAddr = IAlgebraFactory.at(factory).poolByPair(tokenIn, tokenOut);
+          if (poolAddr !== 0) {
+            sqrtP = IAlgebraPool.at(poolAddr).globalState()[0]; // price (== sqrtPriceX96)
+          }
+        } else {
+          poolAddr = IUniswapV3Factory.at(factory).getPool(tokenIn, tokenOut, fee);
+          if (poolAddr !== 0) {
+            sqrtP = IUniswapV3PoolFull.at(poolAddr).slot0()[0];
+          }
+        }
+        if (poolAddr !== 0) {
+          // liquidity() shares a selector across Uniswap V3 and Algebra, so the V3 binding works.
+          const liq: Uint256 = IUniswapV3PoolFull.at(poolAddr).liquidity();
+          if (sqrtP > 0) {
+            if (liq > 0) {
+              discovered = discovered + 1;
+            }
           }
         }
       }
@@ -277,22 +316,57 @@ function main(
   // stepReal/toOutIn/feeAdj/tickArg).
   let floorAdj: Uint256 = 0;
 
-  // — V3 solo walks —
+  // — V3 + Algebra solo walks —
+  // Algebra branches ONLY the discovery + the (sqrt,tick,fee,ts,step) resolve; the walk body
+  // below is byte-identical to standard V3 (ticks()[1] = liquidityDelta shares the V3 selector
+  // + int128 layout, so the V3 binding reads the net). For Algebra the fee is the DYNAMIC fee
+  // from globalState (feeZto for zeroForOne, feeOtz for oneForZero) and the step/ts come from
+  // the factory row (precomputed; the lens has no on-chain TickMath).
   for (let fa3 = 0; fa3 < v3Factories.length; fa3 = fa3 + 1) {
     const vfa3: Tuple = v3Factories[fa3];
     const factoryA3: Address = vfa3[0];
+    const isAlgA3: Uint256 = vfa3[1];
+    const algTsA3: Uint256 = vfa3[2];
+    const algStepA3: Uint256 = vfa3[3];
     for (let ta3 = 0; ta3 < v3FeeTiers.length; ta3 = ta3 + 1) {
       const fta3: Tuple = v3FeeTiers[ta3];
-      const feeA3: Uint256 = fta3[0];
-      const stepA3: Uint256 = fta3[1];
-      const poolA3: Address = IUniswapV3Factory.at(factoryA3).getPool(tokenIn, tokenOut, feeA3);
+      let runA3: Uint256 = 1;
+      if (isAlgA3 === 1) {
+        if (ta3 !== 0) {
+          runA3 = 0;
+        }
+      }
+      if (runA3 === 1) {
+        let poolA3: Address = 0;
+        let sqrtA3: Uint256 = 0;
+        let feeA3: Uint256 = fta3[0];
+        let stepA3: Uint256 = fta3[1];
+        if (isAlgA3 === 1) {
+          poolA3 = IAlgebraFactory.at(factoryA3).poolByPair(tokenIn, tokenOut);
+          if (poolA3 !== 0) {
+            const gsA3: Tuple = IAlgebraPool.at(poolA3).globalState();
+            sqrtA3 = gsA3[0];
+            feeA3 = zeroForOne === 1 ? gsA3[2] : gsA3[3];
+            stepA3 = algStepA3;
+          }
+        } else {
+          poolA3 = IUniswapV3Factory.at(factoryA3).getPool(tokenIn, tokenOut, feeA3);
+          if (poolA3 !== 0) {
+            sqrtA3 = IUniswapV3PoolFull.at(poolA3).slot0()[0];
+          }
+        }
       if (poolA3 !== 0) {
-        const sqrtA3: Uint256 = IUniswapV3PoolFull.at(poolA3).slot0()[0];
         const liqA3: Uint256 = IUniswapV3PoolFull.at(poolA3).liquidity();
         if (sqrtA3 > 0) {
           if (liqA3 > 0) {
-            const tsA3: Uint256 = IUniswapV3PoolFull.at(poolA3).tickSpacing();
-            const tickA3: Uint256 = IUniswapV3PoolFull.at(poolA3).slot0()[1];
+            let tsA3: Uint256 = IUniswapV3PoolFull.at(poolA3).tickSpacing();
+            if (isAlgA3 === 1) {
+              tsA3 = algTsA3;
+            }
+            let tickA3: Uint256 = IUniswapV3PoolFull.at(poolA3).slot0()[1];
+            if (isAlgA3 === 1) {
+              tickA3 = IAlgebraPool.at(poolA3).globalState()[1];
+            }
             const baseA3: Uint256 = ((tickA3 + OFFSET) / tsA3) * tsA3;
             let curA3: Uint256 = baseA3;
             if (zeroForOne === 0) {
@@ -345,16 +419,19 @@ function main(
           }
         }
       }
+      }
     }
   }
 
-  // — V2 solo floor (closed form; V2 fee pinned to 3000). V2 has infinite range, so
-  // it ALWAYS solo-covers amountIn: invert the constant-product gross-in equation for
-  // the out/in sqrt s where grossIn(near→s)=amountIn, then soloFloor=feeAdj(s,3000).
+  // — V2 solo floor (closed form; per-pool fee feeV2 from v2Factories[va][1]). V2 has
+  // infinite range, so it ALWAYS solo-covers amountIn: invert the constant-product
+  // gross-in equation for the out/in sqrt s where grossIn(near→s)=amountIn, then
+  // soloFloor=feeAdj(s,feeV2).
   //   effIn = amountIn*(1-fee);  L*Q96/s = L*Q96/near + effIn;  s = L*Q96/(that). —
   for (let va = 0; va < v2Factories.length; va = va + 1) {
     const vfa2: Tuple = v2Factories[va];
     const factoryA2: Address = vfa2[0];
+    const feeV2A: Uint256 = vfa2[1];
     const pairA: Address = IUniswapV2Factory.at(factoryA2).getPair(tokenIn, tokenOut);
     if (pairA !== 0) {
       const ar0: Uint256 = IUniswapV2Pair.at(pairA).getReserves()[0];
@@ -368,12 +445,12 @@ function main(
           const synthLA: Uint256 = Math.sqrt(rInA * rOutA);
           if (synthLA > 0) {
             const nearA: Uint256 = Math.sqrt(Math.mulDiv(rOutA, Q192, rInA));
-            const effA2: Uint256 = Math.mulDiv(amountIn, 1000000 - 3000, 1000000);
+            const effA2: Uint256 = Math.mulDiv(amountIn, 1000000 - feeV2A, 1000000);
             const invNearA: Uint256 = Math.mulDiv(synthLA, Q96, nearA);
             const invLowA: Uint256 = invNearA + effA2;
             if (invLowA > 0) {
               const sLowA: Uint256 = Math.mulDiv(synthLA, Q96, invLowA);
-              const sf2A: Uint256 = Math.sqrt((1000000 - 3000) * 1000000);
+              const sf2A: Uint256 = Math.sqrt((1000000 - feeV2A) * 1000000);
               const soloA2: Uint256 = Math.mulDiv(sLowA, sf2A, 1000000);
               if (soloA2 > floorAdj) {
                 floorAdj = soloA2;
@@ -475,18 +552,48 @@ function main(
   for (let fm = 0; fm < v3Factories.length; fm = fm + 1) {
     const vfm: Tuple = v3Factories[fm];
     const factoryM: Address = vfm[0];
+    const isAlgM: Uint256 = vfm[1];
+    const algTsM: Uint256 = vfm[2];
+    const algStepM: Uint256 = vfm[3];
     for (let tm = 0; tm < v3FeeTiers.length; tm = tm + 1) {
       const ftm: Tuple = v3FeeTiers[tm];
-      const feeM: Uint256 = ftm[0];
-      const stepM: Uint256 = ftm[1];
-      const poolM: Address = IUniswapV3Factory.at(factoryM).getPool(tokenIn, tokenOut, feeM);
+      let runM: Uint256 = 1;
+      if (isAlgM === 1) {
+        if (tm !== 0) {
+          runM = 0;
+        }
+      }
+      if (runM === 1) {
+      let poolM: Address = 0;
+      let sqrtM: Uint256 = 0;
+      let feeM: Uint256 = ftm[0];
+      let stepM: Uint256 = ftm[1];
+      if (isAlgM === 1) {
+        poolM = IAlgebraFactory.at(factoryM).poolByPair(tokenIn, tokenOut);
+        if (poolM !== 0) {
+          const gsM: Tuple = IAlgebraPool.at(poolM).globalState();
+          sqrtM = gsM[0];
+          feeM = zeroForOne === 1 ? gsM[2] : gsM[3];
+          stepM = algStepM;
+        }
+      } else {
+        poolM = IUniswapV3Factory.at(factoryM).getPool(tokenIn, tokenOut, feeM);
+        if (poolM !== 0) {
+          sqrtM = IUniswapV3PoolFull.at(poolM).slot0()[0];
+        }
+      }
       if (poolM !== 0) {
-        const sqrtM: Uint256 = IUniswapV3PoolFull.at(poolM).slot0()[0];
         const liqM: Uint256 = IUniswapV3PoolFull.at(poolM).liquidity();
         if (sqrtM > 0) {
           if (liqM > 0) {
-            const tsM: Uint256 = IUniswapV3PoolFull.at(poolM).tickSpacing();
-            const tickM: Uint256 = IUniswapV3PoolFull.at(poolM).slot0()[1];
+            let tsM: Uint256 = IUniswapV3PoolFull.at(poolM).tickSpacing();
+            if (isAlgM === 1) {
+              tsM = algTsM;
+            }
+            let tickM: Uint256 = IUniswapV3PoolFull.at(poolM).slot0()[1];
+            if (isAlgM === 1) {
+              tickM = IAlgebraPool.at(poolM).globalState()[1];
+            }
             // IN-RANGE capacity walk — byte-for-byte the PASS-2 floor / PASS-3
             // forward walk body (same stepReal/toOutIn/feeAdj, same int128 sign
             // recovery, same L update, same mulDiv gross-in), but emits NOTHING and
@@ -555,12 +662,14 @@ function main(
           }
         }
       }
+      }
     }
   }
 
   for (let vm = 0; vm < v2Factories.length; vm = vm + 1) {
     const vfm2: Tuple = v2Factories[vm];
     const factoryM2: Address = vfm2[0];
+    const feeV2M: Uint256 = vfm2[1];
     const pairM: Address = IUniswapV2Factory.at(factoryM2).getPair(tokenIn, tokenOut);
     if (pairM !== 0) {
       const mr0: Uint256 = IUniswapV2Pair.at(pairM).getReserves()[0];
@@ -573,18 +682,18 @@ function main(
           const rOutM: Uint256 = inIsT0M === 1 ? mr1 : mr0;
           const synthLM: Uint256 = Math.sqrt(rInM * rOutM);
           if (synthLM > 0) {
-            // V2 windowed capacity (closed form; engine pins V2 fee to 3000). near
-            // = synthetic out/in sqrt. Invert the fee-adjusted floor out of adjusted
-            // space, then capacity = gross-in to walk near→farThr (V2 analogue of
-            // prepare.ts bracketCapacity), clamped at amountIn.
+            // V2 windowed capacity (closed form; per-pool fee feeV2M). near = synthetic
+            // out/in sqrt. Invert the fee-adjusted floor out of adjusted space, then
+            // capacity = gross-in to walk near→farThr (V2 analogue of prepare.ts
+            // bracketCapacity), clamped at amountIn.
             const nearM: Uint256 = Math.sqrt(Math.mulDiv(rOutM, Q192, rInM));
-            const sf2: Uint256 = Math.sqrt((1000000 - 3000) * 1000000);
+            const sf2: Uint256 = Math.sqrt((1000000 - feeV2M) * 1000000);
             const farThr: Uint256 = Math.mulDiv(floorAdj, 1000000, sf2);
             let capV2: Uint256 = 0;
             if (farThr > 0) {
               if (farThr < nearM) {
                 const effIn2: Uint256 = Math.mulDiv(synthLM, Q96, farThr) - Math.mulDiv(synthLM, Q96, nearM);
-                capV2 = Math.mulDiv(effIn2, 1000000, 1000000 - 3000);
+                capV2 = Math.mulDiv(effIn2, 1000000, 1000000 - feeV2M);
               }
             }
             let capM2: Uint256 = capV2;
@@ -702,13 +811,39 @@ function main(
   for (let fi3 = 0; fi3 < v3Factories.length; fi3 = fi3 + 1) {
     const vf3: Tuple = v3Factories[fi3];
     const factory3: Address = vf3[0];
+    const isAlg3: Uint256 = vf3[1];
+    const algTs3: Uint256 = vf3[2];
+    const algStep3: Uint256 = vf3[3];
     for (let ti3 = 0; ti3 < v3FeeTiers.length; ti3 = ti3 + 1) {
       const ft3: Tuple = v3FeeTiers[ti3];
-      const fee3: Uint256 = ft3[0];
-      const step3: Uint256 = ft3[1];
-      const poolAddr3: Address = IUniswapV3Factory.at(factory3).getPool(tokenIn, tokenOut, fee3);
+      let runE3: Uint256 = 1;
+      if (isAlg3 === 1) {
+        if (ti3 !== 0) {
+          runE3 = 0;
+        }
+      }
+      if (runE3 === 1) {
+      // Resolve discovery + (sqrt,tick,fee,step,ts) per family. Algebra: poolByPair +
+      // globalState's DYNAMIC fee (feeZto/feeOtz by direction); standard V3: getPool + slot0.
+      let poolAddr3: Address = 0;
+      let sqrt3: Uint256 = 0;
+      let fee3: Uint256 = ft3[0];
+      let step3: Uint256 = ft3[1];
+      if (isAlg3 === 1) {
+        poolAddr3 = IAlgebraFactory.at(factory3).poolByPair(tokenIn, tokenOut);
+        if (poolAddr3 !== 0) {
+          const gs3: Tuple = IAlgebraPool.at(poolAddr3).globalState();
+          sqrt3 = gs3[0];
+          fee3 = zeroForOne === 1 ? gs3[2] : gs3[3];
+          step3 = algStep3;
+        }
+      } else {
+        poolAddr3 = IUniswapV3Factory.at(factory3).getPool(tokenIn, tokenOut, fee3);
+        if (poolAddr3 !== 0) {
+          sqrt3 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
+        }
+      }
       if (poolAddr3 !== 0) {
-        const sqrt3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
         const liq3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).liquidity();
         // ALIVE (sqrt>0 && L>0) is the ordinal gate — IDENTICAL to the measure
         // pass — so capArr[ord3] is THIS pool's in-range capacity. SURVIVOR iff
@@ -728,8 +863,14 @@ function main(
         }
         if (sqrt3 > 0) {
           if (surv3 === 1) {
-            const ts3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).tickSpacing();
-            const tick3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[1];
+            let ts3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).tickSpacing();
+            if (isAlg3 === 1) {
+              ts3 = algTs3;
+            }
+            let tick3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[1];
+            if (isAlg3 === 1) {
+              tick3 = IAlgebraPool.at(poolAddr3).globalState()[1];
+            }
             const idx3: Uint256 = poolCount;
 
             // ── Reverse-side drift reads (opposite direction), survivors only ──
@@ -833,6 +974,7 @@ function main(
           }
         }
       }
+      }
     }
   }
 
@@ -840,6 +982,7 @@ function main(
   for (let vi = 0; vi < v2Factories.length; vi = vi + 1) {
     const vf2: Tuple = v2Factories[vi];
     const factory2: Address = vf2[0];
+    const feeV2: Uint256 = vf2[1];
     const pairAddr: Address = IUniswapV2Factory.at(factory2).getPair(tokenIn, tokenOut);
     if (pairAddr !== 0) {
       const r0: Uint256 = IUniswapV2Pair.at(pairAddr).getReserves()[0];
@@ -868,7 +1011,7 @@ function main(
             if (survV2 === 1) {
               const synthSqrt: Uint256 = Math.sqrt(Math.mulDiv(reserveOut, Q192, reserveIn));
               poolBlob = poolBlob.concat(
-                abi.encode(0, pairAddr, 3000, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
+                abi.encode(0, pairAddr, feeV2, 0, 0, synthSqrt, synthL, 0, inIsT0, 0, 0, 0, 0)
               );
               poolCount = poolCount + 1;
             }

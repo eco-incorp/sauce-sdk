@@ -35,15 +35,15 @@ const CALLER = BigInt("0x1111111111111111111111111111111111111111");
 const PRICE_LIMIT = 4295128740n; // MIN_SQRT_RATIO + 1
 
 // [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
-//  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
+//  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber]
 const OFFSET = 888000n;
 const STEP_10 = 79232123823359799118286999567n; // sqrt(1.0001^10)*2^96 (ts 10)
 const STEP_60 = 79426470787362580746886972461n; // sqrt(1.0001^60)*2^96 (ts 60)
 const pools: bigint[][] = [
   [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
-   STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n],
+   STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
   [1n, BigInt("0xbbbb000000000000000000000000000000000002"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
-   STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 1n, 1n],
+   STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 1n, 1n, 0n],
 ];
 const routes: bigint[][] = [];
 // netCache: [shiftedTick, rawNet] rows — one initialized tick per pool (netStart 0 then 1).
@@ -62,7 +62,7 @@ const routeSegs: bigint[][] = [];
 describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   const SINGLEPASS = join(RECIPE_DIR, "ecoswap.sauce.ts");
 
-  // Compile the solver for BOTH targets with the given fixture (16-field pool tuples + the flat
+  // Compile the solver for BOTH targets with the given fixture (17-field pool tuples + the flat
   // netCache + routeSegs) and assert each produces >=1 non-empty bytecode segment.
   function compileBoth(poolsArg: bigint[][], netCacheArg: bigint[][], routeSegsArg: bigint[][]) {
     const source = readFileSync(SINGLEPASS, "utf-8");
@@ -88,12 +88,105 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   it("compiles a V2 + V3 mix (v1 + v12)", () => {
     const mixedPools: bigint[][] = [
       [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
-       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n],
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
       [0n, BigInt("0xcccc000000000000000000000000000000000003"), 3000n, 0n, 0n, 3000n, 1n, 1n, 0n, 0n,
-       0n, 0n, 0n, 0n, 0n, 0n],
+       0n, 0n, 0n, 0n, 0n, 0n, 0n],
     ];
     const mixedNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
     compileBoth(mixedPools, mixedNetCache, routeSegs);
+  });
+
+  // Kyber Classic / DMM pool (isKyber=1, pd[16]) — guards the getTradeInfo virtual-reserve
+  // SETUP read + the callback-free Kyber execution (getAmountOut on virtual reserves). It is
+  // V2-shaped (isV2=1) but reads getTradeInfo, not getReserves. netCount 0 (no tick cache).
+  it("compiles a Kyber Classic + V3 mix (v1 + v12)", () => {
+    const kyberPools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
+      [0n, BigInt("0xdddd000000000000000000000000000000000004"), 3000n, 0n, 0n, 3000n, 1n, 1n, 0n, 0n,
+       0n, 0n, 0n, 0n, 0n, 0n, 1n],
+    ];
+    const kyberNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
+    compileBoth(kyberPools, kyberNetCache, routeSegs);
+  });
+
+  // Curve StableSwap static segment — guards the unified static-segment cursor's Curve branch
+  // (rg[4]=segKind, rg[5]=venue) + the Curve execution swap(SwapParams{poolType:3}). The
+  // segment competes in the merge by its post-fee marginalOI; the awarded share executes via
+  // the engine _swapCurve (curve math is off-chain — this is a pure data-driven slice). One V3
+  // pool + two Curve segments sharing one venue (refIdx 0).
+  it("compiles a Curve segment + V3 mix (v1 + v12)", () => {
+    const curvePools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
+    ];
+    const curveNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
+    const CURVE_VENUE = BigInt("0xeeee000000000000000000000000000000000005");
+    // routeSegs row: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind(1=Curve), venue]
+    const curveSegs: bigint[][] = [
+      [0n, 5n * 10n ** 17n, 79228162514264337593543950336n, 79228162514264337593543950336n, 1n, CURVE_VENUE],
+      [0n, 3n * 10n ** 17n, 79000000000000000000000000000n, 79000000000000000000000000000n, 1n, CURVE_VENUE],
+    ];
+    compileBoth(curvePools, curveNetCache, curveSegs);
+  });
+
+  // Trader Joe LB static segment — guards the unified static-segment cursor's LB branch
+  // (rg[4]=segKind(2=LB), rg[5]=venue) + the LB execution swap(SwapParams{poolType:6}). Each
+  // bin is ONE flat constant-sum segment; the awarded share executes via the engine
+  // _swapTraderJoeLB (one atomic pool.swap(swapForY, to) — bin math is off-chain, a pure
+  // data-driven slice). One V3 pool + two LB segments sharing one pair (refIdx 0).
+  it("compiles a Trader Joe LB segment + V3 mix (v1 + v12)", () => {
+    const lbPools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
+    ];
+    const lbNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
+    const LB_VENUE = BigInt("0xdddd000000000000000000000000000000000006");
+    // routeSegs row: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind(2=LB), venue]
+    const lbSegs: bigint[][] = [
+      [0n, 5n * 10n ** 17n, 79228162514264337593543950336n, 79228162514264337593543950336n, 2n, LB_VENUE],
+      [0n, 3n * 10n ** 17n, 79000000000000000000000000000n, 79000000000000000000000000000n, 2n, LB_VENUE],
+    ];
+    compileBoth(lbPools, lbNetCache, lbSegs);
+  });
+
+  // Curve + LB mix — guards that both static-segment venue families (segKind 1 and 2) coexist
+  // with independent per-venue accumulators (cinp/cven for Curve, linp/lven for LB) at the SAME
+  // refIdx 0 without colliding, and that both execution loops emit.
+  it("compiles a Curve + LB + V3 mix (v1 + v12)", () => {
+    const mixPools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
+    ];
+    const mixNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
+    const CURVE_VENUE = BigInt("0xeeee000000000000000000000000000000000005");
+    const LB_VENUE = BigInt("0xdddd000000000000000000000000000000000006");
+    const mixSegs: bigint[][] = [
+      [0n, 5n * 10n ** 17n, 79228162514264337593543950336n, 79228162514264337593543950336n, 1n, CURVE_VENUE],
+      [0n, 4n * 10n ** 17n, 79100000000000000000000000000n, 79100000000000000000000000000n, 2n, LB_VENUE],
+      [0n, 3n * 10n ** 17n, 79000000000000000000000000000n, 79000000000000000000000000000n, 1n, CURVE_VENUE],
+    ];
+    compileBoth(mixPools, mixNetCache, mixSegs);
+  });
+
+  // DODO V2 PMM static segment — guards the unified static-segment cursor's DODO branch
+  // (rg[4]=segKind(3=DODO), rg[5]=venue) + the DODO execution swap(SwapParams{poolType:5}). Each
+  // sampled grid slice is ONE flat post-fee segment; the awarded share executes via the engine
+  // _swapDODOV2 (one atomic sellBase/sellQuote — PMM math is off-chain, a pure data-driven slice).
+  // One V3 pool + two DODO segments sharing one pool (refIdx 0).
+  it("compiles a DODO V2 segment + V3 mix (v1 + v12)", () => {
+    const dodoPools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 0n, 1n, 0n],
+    ];
+    const dodoNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
+    const DODO_VENUE = BigInt("0xcccc000000000000000000000000000000000005");
+    // routeSegs row: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind(3=DODO), venue]
+    const dodoSegs: bigint[][] = [
+      [0n, 5n * 10n ** 17n, 79228162514264337593543950336n, 79228162514264337593543950336n, 3n, DODO_VENUE],
+      [0n, 3n * 10n ** 17n, 79000000000000000000000000000n, 79000000000000000000000000000n, 3n, DODO_VENUE],
+    ];
+    compileBoth(dodoPools, dodoNetCache, dodoSegs);
   });
 
   // V4 pool — guards the StateView getSlot0 read (dp[8]/dp[9]) + unified swap poolType=2.
@@ -104,7 +197,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     // poolType=2 (V4), tickSpacing=60, stateView + poolId populated.
     const v4Pools: bigint[][] = [
       [2n, POOL_MANAGER, 3000n, 60n, 0n, 3000n, 0n, 1n, STATE_VIEW, POOL_ID,
-       STEP_60, OFFSET, OFFSET - 120n, OFFSET - 60n, 0n, 1n],
+       STEP_60, OFFSET, OFFSET - 120n, OFFSET - 60n, 0n, 1n, 0n],
     ];
     const v4NetCache: bigint[][] = [[OFFSET - 60n, 10n ** 17n]];
     compileBoth(v4Pools, v4NetCache, routeSegs);
@@ -135,6 +228,11 @@ describe("ecoswap.lens.sauce.ts", () => {
   // the tuple params at the depth-2 access that round-trips on BOTH engines (folding
   // them into cfg would make a depth-3 nested-arg var read that reverts INDEX on v1).
   // Compile both targets.
+  // Algebra dynamic-fee factory (Camelot/QuickSwap V3 style). The row carries isAlgebra=1
+  // and a precomputed (tickSpacing, stepRatio); the lens reads it via poolByPair/globalState.
+  const ALGEBRA_FACTORY = BigInt("0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B"); // Camelot V3
+  const ALGEBRA_TS = 60n;
+
   function compileLens(zeroForOne: bigint, target: "v1" | "v12") {
     const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
     const result: any = compile(stripTypes(source), {
@@ -146,9 +244,12 @@ describe("ecoswap.lens.sauce.ts", () => {
       //   v4Specs[fee,ts,stepRatio],v4PoolIds as separate tuple params.
       args: [
         [TOKEN_IN, TOKEN_OUT, zeroForOne, 1000n, 2n, 100n, 96n],
-        [[FACTORY]],                       // v3Factories
+        // v3Factories [factoryAddr, isAlgebra, algebraTs, algebraStep] — standard V3 row
+        // (isAlgebra=0; the algebraTs/algebraStep are unused). An Algebra fixture row is
+        // compiled separately in the Algebra-specific case below.
+        [[FACTORY, 0n, 0n, 0n]],           // v3Factories
         [[500n, STEP_10], [3000n, STEP_60]], // v3FeeTiers [fee, stepRatio]
-        [[V2_FACTORY]],                    // v2Factories
+        [[V2_FACTORY, 3000n]],             // v2Factories [factoryAddr, feePpm]
         [[POOL_MANAGER, STATE_VIEW]],      // v4Factories
         [[3000n, 60n, STEP_60]],           // v4Specs [fee, tickSpacing, stepRatio]
         [[POOL_ID]],                       // v4PoolIds (1 factory × 1 spec)
@@ -169,5 +270,41 @@ describe("ecoswap.lens.sauce.ts", () => {
       assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
       for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
     });
+  }
+
+  // Compile the lens with an ALGEBRA factory mixed in alongside standard V3 — guards the
+  // poolByPair / globalState read branch + the dynamic-fee threading lowering (a tagged
+  // v3Factories row) on both engines and both swap directions. The walk body is shared with
+  // V3, so this exercises the discovery/state-resolve branch the Algebra integration adds.
+  function compileLensAlgebra(zeroForOne: bigint, target: "v1" | "v12") {
+    const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
+    const result: any = compile(stripTypes(source), {
+      baseDirs: [REPO_ROOT, RECIPE_DIR],
+      target,
+      args: [
+        [TOKEN_IN, TOKEN_OUT, zeroForOne, 1000n, 2n, 100n, 96n],
+        // One standard V3 factory + one Algebra factory (isAlgebra=1, ts=60, precomputed step).
+        [
+          [FACTORY, 0n, 0n, 0n],
+          [ALGEBRA_FACTORY, 1n, ALGEBRA_TS, STEP_60],
+        ],
+        [[500n, STEP_10], [3000n, STEP_60]],
+        [[V2_FACTORY, 3000n]],
+        [[POOL_MANAGER, STATE_VIEW]],
+        [[3000n, 60n, STEP_60]],
+        [[POOL_ID]],
+      ],
+    });
+    return result.bytecode ?? result.bytecodes;
+  }
+
+  for (const target of ["v1", "v12"] as const) {
+    for (const [dir, z] of [["zeroForOne", 1n], ["oneForZero", 0n]] as const) {
+      it(`compiles the lens with an Algebra dynamic-fee factory (${dir}) [${target}]`, () => {
+        const segments: Uint8Array[] = compileLensAlgebra(z, target);
+        assert.ok(Array.isArray(segments) && segments.length >= 1, "should produce >=1 segment");
+        for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
+      });
+    }
   }
 });

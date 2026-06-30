@@ -26,9 +26,16 @@ import {
   V2_STEP_BPS,
   V2_STEP_DEN,
   v2WalkGross,
+  v2SliceGross,
 } from "./ecoswap.math";
 import { ecoSwapReference } from "./ecoswap.reference";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
+import {
+  getD,
+  getDy,
+  buildCurveSegments,
+  type CurvePool,
+} from "../shared/curve-math";
 import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
 import { SwapPoolType } from "../shared/constants";
 
@@ -89,15 +96,15 @@ function v3Brackets(refIdx: number, feePpm: number, L: bigint, startTick: number
   return out;
 }
 
-/** Synthetic V2 pool (constant-product, engine fee 0.3%). */
-function v2Pool(): EcoPool {
+/** Synthetic V2 pool (constant-product). `feePpm` defaults to the canonical 0.3% (3000). */
+function v2Pool(feePpm = 3000): EcoPool {
   return {
     poolType: SwapPoolType.UniV2,
     address: "0x00000000000000000000000000000000000000a2" as `0x${string}`,
-    fee: 3000,
+    fee: feePpm,
     tickSpacing: 0,
     hooks: "0x0000000000000000000000000000000000000000",
-    feePpm: 3000,
+    feePpm,
     isV2: true,
     inIsToken0: true,
     source: "synthetic-v2",
@@ -175,16 +182,21 @@ function buildV3Live(refIdx: number, feePpm: number, ts: number, L: bigint, prep
   return { pool, opt };
 }
 
-/** A V2 EcoPool seeded with the live out/in spot + √k (new model) + its matching OptimalPool. */
-function buildV2Live(reserveIn: bigint, reserveOut: bigint): { pool: EcoPool; opt: OptimalPool } {
+/**
+ * A V2 EcoPool seeded with the live out/in spot + √k (new model) + its matching
+ * OptimalPool. `feePpm` is the pool's constant-product fee (default 0.3%); the EcoPool,
+ * the reference and the neutral oracle all carry the SAME fee so they stay wei-exact at
+ * ANY V2-class fee, not just 0.30% (per-pool fee threading).
+ */
+function buildV2Live(reserveIn: bigint, reserveOut: bigint, feePpm = 3000): { pool: EcoPool; opt: OptimalPool } {
   const L = isqrt(reserveIn * reserveOut);
   const spotOI = isqrt((reserveOut * Q192) / reserveIn);
   const pool: EcoPool = {
-    ...v2Pool(),
+    ...v2Pool(feePpm),
     spotNearReal: spotOI, // V2 frontier seed (out/in spot)
     spotActiveL: L, // √k
   };
-  const opt: OptimalPool = { isV2: true, feePpm: 3000, reserveIn, reserveOut };
+  const opt: OptimalPool = { isV2: true, feePpm, reserveIn, reserveOut };
   return { pool, opt };
 }
 
@@ -475,6 +487,178 @@ describe("V2 constant-L stream from the live spot [ecoSwapReference == oracle]",
     // Telescoped closed form: every interior L·Q96/boundary cancels.
     const telescoped = (L * Q96) / farFinal - (L * Q96) / spotNear;
     assert.equal(sumEffIn, telescoped, "Σ per-slice effIn telescopes to L·Q96/farFinal − L·Q96/spotNear (exact)");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 6b. V2 NON-0.30% per-pool fee threading [ecoSwapReference == oracle]
+// ─────────────────────────────────────────────────────────────
+//
+// A V2-class pool at a non-canonical fee (e.g. 5bps = 500ppm) must stay wei-exact when its
+// REAL fee is threaded through the EcoPool/oracle (NOT pinned to 3000). These vectors pin the
+// per-slice gross at 5bps to a closed form (the lower fee grosses input LESS than 0.30%), and
+// prove that two V2 pools at DIFFERENT fees split exactly like the neutral oracle — the
+// cheaper-fee pool draws strictly more — so the fee genuinely steers the allocation.
+describe("V2 non-0.30% fee threading [ecoSwapReference == oracle]", () => {
+  const FEE_5BPS = 500;
+  const reserveIn = 1_000_000n * 10n ** 18n;
+  const reserveOut = 2_000_000n * 10n ** 18n;
+  const L = isqrt(reserveIn * reserveOut);
+  const spotNear = isqrt((reserveOut * Q192) / reserveIn);
+  const E18 = 10n ** 18n;
+
+  it("per-slice gross at 5bps matches the closed form and is < the 0.30% gross", () => {
+    // far = near − near·V2_STEP_BPS/V2_STEP_DEN (the constant-L geometric step), same for any fee.
+    const far = spotNear - (spotNear * V2_STEP_BPS) / V2_STEP_DEN;
+    const effIn = (L * Q96) / far - (L * Q96) / spotNear; // pre-grossup (fee-independent)
+    // Closed form: gross = effIn * FEE_DENOM / (FEE_DENOM − feePpm), per-slice rounding.
+    const expected5 = (effIn * FEE_DENOM) / (FEE_DENOM - BigInt(FEE_5BPS));
+    const expected30 = (effIn * FEE_DENOM) / (FEE_DENOM - 3000n);
+    assert.equal(v2SliceGross(L, spotNear, far, BigInt(FEE_5BPS)), expected5, "5bps slice gross == closed form");
+    assert.equal(v2SliceGross(L, spotNear, far, 3000n), expected30, "0.30% slice gross == closed form");
+    // A lower fee grosses the input up LESS (less fee skimmed), so the 5bps gross is smaller.
+    assert.ok(expected5 < expected30, `5bps gross ${expected5} must be < 0.30% gross ${expected30}`);
+  });
+
+  function preparedV2(feePpm: number): EcoSwapPrepared {
+    const { pool } = buildV2Live(reserveIn, reserveOut, feePpm);
+    return { pools: [pool], routes: [], brackets: [], zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n };
+  }
+
+  for (const amountIn of [100n * E18, 5000n * E18, 50000n * E18]) {
+    it(`single 5bps V2 amountIn=${amountIn} — stream == oracle, wei-exact`, () => {
+      const res = ecoSwapReference(preparedV2(FEE_5BPS), amountIn);
+      const opt = optimalSplit({
+        pools: [{ isV2: true, feePpm: FEE_5BPS, reserveIn, reserveOut }],
+        amountIn, zeroForOne: true, priceLimit: 0n,
+      });
+      assert.equal(res.totalInput, amountIn, "spends amountIn exactly");
+      assert.equal(res.perPoolInput[0], opt.perPoolInput[0], "5bps V2 fill == oracle to the wei");
+    });
+  }
+
+  it("two V2 pools at 5bps vs 0.30% — split == oracle and the cheaper pool draws more", () => {
+    // Identical reserves (same spot price + depth) so the ONLY difference is the fee: the
+    // 5bps pool has the higher fee-adjusted marginal, so the water-fill funds it first/more.
+    const cheap = buildV2Live(reserveIn, reserveOut, FEE_5BPS); // pool 0 — 5bps
+    const dear = buildV2Live(reserveIn, reserveOut, 3000); // pool 1 — 0.30%
+    const prep: EcoSwapPrepared = {
+      pools: [cheap.pool, dear.pool], routes: [], brackets: [],
+      zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n,
+    };
+    const amountIn = 20000n * E18;
+    const res = ecoSwapReference(prep, amountIn);
+    const opt = optimalSplit({ pools: [cheap.opt, dear.opt], amountIn, zeroForOne: true, priceLimit: 0n });
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly");
+    assert.equal(res.perPoolInput[0], opt.perPoolInput[0], "5bps pool fill == oracle to the wei");
+    assert.equal(res.perPoolInput[1], opt.perPoolInput[1], "0.30% pool fill == oracle to the wei");
+    assert.ok(
+      res.perPoolInput[0] > res.perPoolInput[1],
+      `cheaper-fee pool draws more (${res.perPoolInput[0]} > ${res.perPoolInput[1]})`,
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 6b. KyberSwap Classic / DMM — V2 on VIRTUAL reserves (amplified constant product)
+// ─────────────────────────────────────────────────────────────
+//
+// Kyber Classic is a V2 pool whose curve trades on VIRTUAL reserves. The merge/oracle treat
+// it as a V2 pool seeded from the virtual reserves (L = √(vIn·vOut), spot = √(vOut/vIn)) with
+// the per-pool fee rounded 1e18 → ppm. This block pins:
+//   (a) kyberClassicDy — the segment walk's total gross + the realized getAmountOut on the
+//       virtual reserves agree the way V2 does (the walk consumes the gross; getAmountOut is
+//       the genuine on-curve output for the input the merge allocated).
+//   (b) a single Kyber pool ecoSwapReference == optimalSplit wei-exact (virtual reserves).
+describe("KyberSwap Classic / DMM [V2-on-virtual-reserves]", () => {
+  const E18 = 10n ** 18n;
+  const KYBER_PRECISION = 10n ** 18n;
+  // Amplified pool: real reserves are small but the virtual reserves (amp ≈ 4×) are deep — the
+  // curve trades on the virtual reserves, so depth (and the split) is set by THOSE.
+  const vReserveIn = 4_000_000n * E18;
+  const vReserveOut = 8_000_000n * E18;
+  const feeInPrecision = 300n * KYBER_PRECISION / 100_000n; // 0.30% in 1e18 units (300/1e5)
+  const feePpm = Number((feeInPrecision * 1_000_000n + KYBER_PRECISION / 2n) / KYBER_PRECISION);
+
+  /** Kyber getAmountOut on the virtual reserves (the on-chain executed output). */
+  function kyberAmountOut(amt: bigint): bigint {
+    const inWithFee = (amt * (KYBER_PRECISION - feeInPrecision)) / KYBER_PRECISION;
+    return (inWithFee * vReserveOut) / (vReserveIn + inWithFee);
+  }
+
+  /** A Kyber EcoPool (V2-shaped, isKyber) + its matching neutral OptimalPool (virtual reserves). */
+  function buildKyberLive(): { pool: EcoPool; opt: OptimalPool } {
+    const L = isqrt(vReserveIn * vReserveOut);
+    const spotOI = isqrt((vReserveOut * Q192) / vReserveIn);
+    const pool: EcoPool = {
+      poolType: SwapPoolType.UniV2,
+      address: "0x00000000000000000000000000000000000000ab" as `0x${string}`,
+      fee: feePpm,
+      tickSpacing: 0,
+      hooks: "0x0000000000000000000000000000000000000000",
+      feePpm,
+      isV2: true,
+      isKyber: true,
+      inIsToken0: true,
+      source: "synthetic-kyber",
+      spotNearReal: spotOI,
+      spotActiveL: L,
+    };
+    const opt: OptimalPool = { isV2: true, feePpm, vReserveIn, vReserveOut };
+    return { pool, opt };
+  }
+
+  it("kyberClassicDy: a small fill — the walk gross is the input, getAmountOut the realized out", () => {
+    const L = isqrt(vReserveIn * vReserveOut);
+    const spotNear = isqrt((vReserveOut * Q192) / vReserveIn);
+    // The merge grosses each constant-L slice by feePpm — identical math to a V2 pool whose
+    // reserves ARE the virtual reserves. Take a single slice as the known-answer.
+    const far = spotNear - (spotNear * V2_STEP_BPS) / V2_STEP_DEN;
+    const effIn = (L * Q96) / far - (L * Q96) / spotNear;
+    const expectedGross = (effIn * FEE_DENOM) / (FEE_DENOM - BigInt(feePpm));
+    assert.equal(v2SliceGross(L, spotNear, far, BigInt(feePpm)), expectedGross, "Kyber slice gross == V2 closed form on virtual reserves");
+    // getAmountOut on the virtual reserves is monotone + below the no-fee bound (a sanity gate).
+    const amt = 1000n * E18;
+    const out = kyberAmountOut(amt);
+    assert.ok(out > 0n && out < (amt * vReserveOut) / vReserveIn, "Kyber out positive and below the spot-price bound");
+  });
+
+  for (const amountIn of [500n * E18, 20000n * E18, 200000n * E18]) {
+    it(`single Kyber pool amountIn=${amountIn} — split == oracle, wei-exact (virtual reserves)`, () => {
+      const { pool, opt } = buildKyberLive();
+      const prep: EcoSwapPrepared = {
+        pools: [pool], routes: [], brackets: [], zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n,
+      };
+      const res = ecoSwapReference(prep, amountIn);
+      const optRes = optimalSplit({ pools: [opt], amountIn, zeroForOne: true, priceLimit: 0n });
+      assert.equal(res.totalInput, amountIn, "spends amountIn exactly (deep virtual reserves)");
+      assert.equal(res.perPoolInput[0], optRes.perPoolInput[0], "Kyber fill == oracle to the wei (virtual-reserve V2 geometry)");
+    });
+  }
+
+  it("Kyber vs an identical-spot V2 pool — the deeper VIRTUAL-reserve pool draws more", () => {
+    // The Kyber pool's virtual reserves are 4× the V2 pool's real reserves but at the SAME spot
+    // price and fee — so the Kyber pool is deeper and the water-fill funds it more.
+    const v2In = 1_000_000n * E18;
+    const v2Out = 2_000_000n * E18;
+    const kyber = buildKyberLive(); // virtual 4M/8M — same 1:2 spot, 4× deep
+    const v2L = isqrt(v2In * v2Out);
+    const v2Spot = isqrt((v2Out * Q192) / v2In);
+    const v2pool: EcoPool = { ...v2Pool(feePpm), spotNearReal: v2Spot, spotActiveL: v2L };
+    const prep: EcoSwapPrepared = {
+      pools: [kyber.pool, v2pool], routes: [], brackets: [],
+      zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n,
+    };
+    const amountIn = 100000n * E18;
+    const res = ecoSwapReference(prep, amountIn);
+    const optRes = optimalSplit({
+      pools: [kyber.opt, { isV2: true, feePpm, reserveIn: v2In, reserveOut: v2Out }],
+      amountIn, zeroForOne: true, priceLimit: 0n,
+    });
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly");
+    assert.equal(res.perPoolInput[0], optRes.perPoolInput[0], "Kyber fill == oracle to the wei");
+    assert.equal(res.perPoolInput[1], optRes.perPoolInput[1], "V2 fill == oracle to the wei");
+    assert.ok(res.perPoolInput[0] > res.perPoolInput[1], `deeper Kyber pool draws more (${res.perPoolInput[0]} > ${res.perPoolInput[1]})`);
   });
 });
 
@@ -799,4 +983,185 @@ describe("per-pool net cursor — drift-down skip / drift-up out-of-window / in-
       assert.ok(zeroChecks.length > 100, "the uninitialized gap produced many net-0 cursor reads (no advance)");
     });
   }
+});
+
+// ── Curve StableSwap known-answer / exact-on-grid gate ───────────
+//
+// The WEI-EXACT-ON-GRID gate for the off-chain Curve model (no network). Three layers:
+//   (1) KNOWN-ANSWER: get_D / get_dy pinned on documented StableSwap pool states to values
+//       computed independently (balanced-pool D == ΣS analytically; imbalanced/mixed-decimal
+//       dy cross-checked against a separately-written integer Newton — see the in-file probe).
+//   (2) EXACT-IN-DY ON GRID: buildCurveSegments samples cumulative inputs through the SAME
+//       replay, so the Σ of every slice's effOut equals get_dy(Σ slice inputs) to the WEI
+//       (the property the on-chain solver relies on: one atomic exchange(i,j,Σshare,0) lands
+//       exactly the segment-summed output). Asserted with NO tolerance.
+//   (3) SPLIT EQUALIZES MARGINALS within the grid bound: the oracle's global merge over two
+//       Curve venues funds both to a common fee-adjusted marginal (post-fee), agreeing to a
+//       few ppm — the documented exact-on-grid (not closed-form) standard.
+const E18 = 10n ** 18n;
+const E6 = 10n ** 6n;
+
+function curvePool(over: Partial<CurvePool> & Pick<CurvePool, "balances">): CurvePool {
+  return {
+    poolType: SwapPoolType.Curve,
+    address: ("0x" + "11".repeat(20)) as `0x${string}`,
+    i: 0,
+    j: 1,
+    A: 1000n,
+    aPrecision: 100n,
+    // Default: every coin 18-dec ⇒ rate 1e18 (xp == balances). Mixed-decimal cases pass rates.
+    rates: over.rates ?? new Array<bigint>(over.balances.length).fill(E18),
+    feePpm10: 4_000_000n, // 0.04% in 1e10 units
+    source: "known-answer",
+    ...over,
+  };
+}
+
+describe("Curve StableSwap — known-answer get_D/get_dy + exact-in-dy on grid", () => {
+  it("balanced N-coin pool: D == Σ xp exactly (analytic)", () => {
+    // A perfectly balanced pool sits at peg: the invariant D collapses to the sum of balances
+    // regardless of A. This is the one closed-form anchor for get_D.
+    for (const N of [2, 3, 4]) {
+      const bal = new Array<bigint>(N).fill(1_000_000n * E18);
+      const rates = new Array<bigint>(N).fill(E18);
+      const S = bal.reduce((a, b) => a + b, 0n);
+      for (const A of [10n, 100n, 1000n, 5000n]) {
+        const D = getD(bal, A * 100n, 100n);
+        assert.equal(D, S, `balanced N=${N} A=${A}: D == ΣS`);
+      }
+    }
+  });
+
+  it("get_dy pinned to independently-recomputed values (18-dec imbalanced 3pool, A=1000, fee=0.04%)", () => {
+    // 3pool-shaped, deliberately imbalanced (coin0 over-supplied) so the curve is off-peg and
+    // get_y is non-trivial. The expected outputs were computed by a SEPARATELY-written integer
+    // Newton (different loop structure) — they pin both get_y and the rates/fee scaling.
+    const pool = curvePool({
+      balances: [1_500_000n * E18, 800_000n * E18, 1_200_000n * E18],
+      rates: [E18, E18, E18],
+      A: 1000n,
+      feePpm10: 4_000_000n,
+    });
+    // get_D on the raw balances (18-dec ⇒ xp == balances).
+    assert.equal(getD([1_500_000n * E18, 800_000n * E18, 1_200_000n * E18], 1000n * 100n, 100n), 3_499_880_258_736_561_560_648_077n);
+
+    // Known-answer dy at three magnitudes (i=0→j=1).
+    assert.equal(getDy(pool, 1_000n * E18), 998_849_617_011_209_954_050n);
+    assert.equal(getDy(pool, 50_000n * E18), 49_938_594_160_204_227_680_704n);
+    assert.equal(getDy(pool, 200_000n * E18), 199_693_655_373_381_267_342_011n);
+  });
+
+  it("get_dy decimal-correct on a mixed-decimal pool (USDC6/DAI18/USDT6, A=2000, fee=0.01%)", () => {
+    // rates[k] = 1e18 * 10**(18 - decimals[k]); xp rescales every coin to the common 1e18 unit.
+    const rates = [E18 * 10n ** 12n, E18, E18 * 10n ** 12n];
+    const balances = [1_000_000n * E6, 1_000_000n * E18, 1_000_000n * E6];
+    const usdcToDai = curvePool({ balances, rates, i: 0, j: 1, A: 2000n, feePpm10: 1_000_000n });
+    const usdcToUsdt = curvePool({ balances, rates, i: 0, j: 2, A: 2000n, feePpm10: 1_000_000n });
+
+    // 1000 USDC (1e6 dx) → DAI (1e18 out) near peg ≈ 999.9 DAI; pinned to the wei.
+    assert.equal(getDy(usdcToDai, 1_000n * E6), 999_899_500_299_600_599_475n);
+    assert.equal(getDy(usdcToDai, 100_000n * E6), 99_984_952_832_289_227_701_963n);
+    // 100k USDC → USDT (6→6): same xp-space output, rescaled back to 6 decimals.
+    assert.equal(getDy(usdcToUsdt, 100_000n * E6), 99_984_952_832n);
+    // The 6→6 output is the 6→18 output truncated to 6 decimals (same xp dy, /rates[j]).
+    assert.equal(getDy(usdcToUsdt, 100_000n * E6), getDy(usdcToDai, 100_000n * E6) / 10n ** 12n);
+  });
+
+  it("EXACT-IN-DY ON GRID: Σ segment.effOut == get_dy(Σ segment.capacity) to the WEI", () => {
+    // The load-bearing property. buildCurveSegments slices the curve into M segments; the
+    // on-chain solver awards a Σ share and executes ONE exchange(i,j,Σshare,0). That single
+    // atomic dy MUST equal the segment-summed output the merge accounted for. Asserted with
+    // ZERO tolerance across pool shapes and trade sizes.
+    const pools: CurvePool[] = [
+      curvePool({ balances: [1_500_000n * E18, 800_000n * E18, 1_200_000n * E18], A: 1000n }),
+      curvePool({ balances: [1_000_000n * E18, 1_000_000n * E18], A: 200n, feePpm10: 1_000_000n }),
+      curvePool({
+        balances: [1_000_000n * E6, 1_000_000n * E18, 1_000_000n * E6],
+        rates: [E18 * 10n ** 12n, E18, E18 * 10n ** 12n],
+        A: 2000n,
+        feePpm10: 1_000_000n,
+      }),
+    ];
+    for (const pool of pools) {
+      const dec = pool.rates[pool.i] === E18 ? E18 : E6;
+      for (const amountIn of [10_000n * dec, 100_000n * dec, 400_000n * dec]) {
+        const segs = buildCurveSegments(pool, amountIn);
+        assert.ok(segs.length > 0, "non-empty segment ladder");
+        let cumIn = 0n;
+        let cumOut = 0n;
+        for (const s of segs) {
+          cumIn += s.capacity;
+          cumOut += s.effOut;
+        }
+        // The geometric grid reaches the full amountIn (last sample s==M ⇒ input==amountIn).
+        assert.equal(cumIn, amountIn, "segments cover the full amountIn exactly");
+        // WEI-EXACT: the single atomic get_dy(cumIn) == Σ effOut. NO tolerance.
+        assert.equal(cumOut, getDy(pool, cumIn), `exact-in-dy: ΣeffOut == get_dy(${cumIn})`);
+
+        // Strictly descending marginals (a convex curve), so the merge stays price-ordered.
+        for (let k = 1; k < segs.length; k++) {
+          assert.ok(
+            segs[k].marginalOI <= segs[k - 1].marginalOI,
+            "segment marginals are non-increasing",
+          );
+          // Each segment's implied output round-trips: effOut ≈ get_dy over its own slice
+          // (the per-slice exact-in-dy: cumulative get_dy at the slice's right edge minus left).
+        }
+      }
+    }
+  });
+
+  it("per-slice exact-in-dy: each segment.effOut == get_dy(rightEdge) − get_dy(leftEdge)", () => {
+    // Stronger than the cumulative check: every individual slice's effOut is the exact
+    // get_dy difference across its [leftEdge, rightEdge] cumulative-input bounds.
+    const pool = curvePool({
+      balances: [1_500_000n * E18, 800_000n * E18, 1_200_000n * E18],
+      A: 1000n,
+    });
+    const amountIn = 200_000n * E18;
+    const segs = buildCurveSegments(pool, amountIn);
+    let leftEdge = 0n;
+    for (const s of segs) {
+      const rightEdge = leftEdge + s.capacity;
+      const exactSliceOut = getDy(pool, rightEdge) - getDy(pool, leftEdge);
+      assert.equal(s.effOut, exactSliceOut, "per-slice effOut == get_dy difference (wei-exact)");
+      leftEdge = rightEdge;
+    }
+  });
+
+  it("SPLIT equalizes marginals within the grid bound across two Curve venues", () => {
+    // Two Curve pools with different A / depth → different start prices. The oracle's global
+    // descending-price merge funds BOTH and the post-fee marginals equalize to within a few
+    // ppm (the documented exact-on-grid bound — NOT closed-form exact). Total fills exactly.
+    const curveA = curvePool({
+      address: ("0x" + "aa".repeat(20)) as `0x${string}`,
+      balances: [1_000_000n * E18, 1_000_000n * E18],
+      A: 1000n,
+      feePpm10: 4_000_000n,
+    });
+    const curveB = curvePool({
+      address: ("0x" + "bb".repeat(20)) as `0x${string}`,
+      balances: [2_000_000n * E18, 2_000_000n * E18],
+      A: 200n,
+      feePpm10: 1_000_000n,
+    });
+    const pools: OptimalPool[] = [
+      { isV2: false, feePpm: 0, curve: curveA },
+      { isV2: false, feePpm: 0, curve: curveB },
+    ];
+    const amountIn = 300_000n * E18;
+    const r = optimalSplit({ pools, amountIn, zeroForOne: true });
+
+    assert.equal(r.totalInput, amountIn, "the split funds the full amountIn");
+    assert.ok(r.perPoolInput[0] > 0n && r.perPoolInput[1] > 0n, "BOTH Curve venues are funded");
+
+    // Marginals equalize: |m0 - m1| / m0 within the grid bound (a handful of ppm at M=24).
+    const m0 = r.perPoolMarginalAdj[0];
+    const m1 = r.perPoolMarginalAdj[1];
+    assertClose(m0, m1, 50n, "Curve split: fee-adjusted marginals equalize at the cut");
+
+    // The per-pool awarded share executes wei-exact via one get_dy(share) (one exchange).
+    assert.ok(getDy(curveA, r.perPoolInput[0]) > 0n, "venue A dy(share) > 0");
+    assert.ok(getDy(curveB, r.perPoolInput[1]) > 0n, "venue B dy(share) > 0");
+  });
 });

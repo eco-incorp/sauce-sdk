@@ -86,14 +86,14 @@ const VARIANTS: Variant[] = [
 
 // ── UNIFIED-WALK shape (production ecoswap.sauce.ts) ──
 /** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *   stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount] */
+ *   stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber] */
 function buildUnifiedPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[] {
   return [
     BigInt(p.poolType), BigInt(p.address), BigInt(p.fee), BigInt(p.tickSpacing),
     BigInt(p.hooks), BigInt(p.feePpm), p.isV2 ? 1n : 0n, p.inIsToken0 ? 1n : 0n,
     BigInt(p.stateView), BigInt(p.poolId),
     p.stepRatio ?? 0n, p.windowTopShifted ?? 0n, p.windowBotShifted ?? 0n,
-    p.extremeShifted ?? 0n, BigInt(netStart), BigInt(netCount),
+    p.extremeShifted ?? 0n, BigInt(netStart), BigInt(netCount), p.isKyber ? 1n : 0n,
   ];
 }
 
@@ -109,16 +109,23 @@ function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netC
   return { poolTuples, netCache };
 }
 
+// Unified static-segment stream (route + Curve), 6-col [refIdx, cap, adjNear, adjFar, segKind,
+// venue] — mirrors index.ts buildRouteSegs (the solver reads rg[4]/rg[5]).
 function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
+  const curves = prepared.curves ?? [];
   return prepared.brackets
-    .filter((b) => b.kind === EcoBracketKind.Route)
+    .filter((b) => b.kind === EcoBracketKind.Route || b.kind === EcoBracketKind.Curve)
     .slice()
     .sort((a, b) => {
       if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
       if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
       return a.refIdx - b.refIdx;
     })
-    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
+    .map((b) => {
+      const isCurve = b.kind === EcoBracketKind.Curve;
+      const venue = isCurve ? BigInt(curves[b.refIdx].address) : 0n;
+      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, isCurve ? 1n : 0n, venue];
+    });
 }
 
 function buildRouteTuple(r: EcoRoute): bigint[] {

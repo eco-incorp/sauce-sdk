@@ -120,7 +120,7 @@ const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
 
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
+ *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber]
  */
 function buildUnifiedPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[] {
   return [
@@ -140,6 +140,7 @@ function buildUnifiedPoolTuple(p: EcoPool, netStart: number, netCount: number): 
     p.extremeShifted ?? 0n,
     BigInt(netStart),
     BigInt(netCount),
+    p.isKyber ? 1n : 0n,
   ];
 }
 
@@ -156,17 +157,26 @@ function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netC
   return { poolTuples, netCache };
 }
 
-/** [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar] for every Route bracket, sorted DESC sqrtAdjNear. */
+/**
+ * Unified static-segment stream (route + Curve): [refIdx, capacity, sqrtAdjNear, sqrtAdjFar,
+ * segKind, venue] for every Route AND Curve bracket, sorted DESC sqrtAdjNear — mirrors index.ts
+ * buildRouteSegs (the production solver reads rg[4]=segKind / rg[5]=curve venue).
+ */
 function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
+  const curves = prepared.curves ?? [];
   return prepared.brackets
-    .filter((b) => b.kind === EcoBracketKind.Route)
+    .filter((b) => b.kind === EcoBracketKind.Route || b.kind === EcoBracketKind.Curve)
     .slice()
     .sort((a, b) => {
       if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
       if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
       return a.refIdx - b.refIdx;
     })
-    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
+    .map((b) => {
+      const isCurve = b.kind === EcoBracketKind.Curve;
+      const venue = isCurve ? BigInt(curves[b.refIdx].address) : 0n;
+      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, isCurve ? 1n : 0n, venue];
+    });
 }
 
 /** [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks] (both shapes). */

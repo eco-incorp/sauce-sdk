@@ -10,26 +10,39 @@ interface IERC20Min {
 ///
 /// The harness ETCHES this contract's runtime bytecode at a chosen address (it has
 /// no constructor logic — all state is set via `initialize`/`sync`), then drives it
-/// through the engine's real `_swapV2` path. It implements EXACTLY what the engine
-/// touches — `token0`/`token1`/`getReserves`/`swap` — and enforces the canonical
-/// 0.3% (997/1000) K-invariant, matching the engine's hardcoded V2 fee.
+/// through the engine's real `_swapV2` path (for the canonical 0.3% fee) OR EcoSwap's
+/// callback-free path (for any other fee). It implements EXACTLY what each touches —
+/// `token0`/`token1`/`getReserves`/`swap` — and enforces a per-pool `feePpm`
+/// K-invariant: balances net of the fee must not shrink k. With feePpm = 3000 this is
+/// the canonical 997/1000 invariant the engine's hardcoded V2 fee matches.
 ///
 /// Storage layout (deliberately simple + unpacked):
-///   slot 0: token0   slot 1: token1   slot 2: reserve0   slot 3: reserve1
+///   slot 0: token0  slot 1: token1  slot 2: reserve0  slot 3: reserve1  slot 4: feePpm
 contract V2Pair {
     address public token0; // slot 0
     address public token1; // slot 1
     uint256 private _reserve0; // slot 2
     uint256 private _reserve1; // slot 3
+    uint256 public feePpm; // slot 4 — constant-product fee in ppm (0 ⇒ canonical 3000)
 
     event Swap(address indexed sender, uint256 amount0Out, uint256 amount1Out, address indexed to);
     event Sync(uint112 reserve0, uint112 reserve1);
 
-    /// @notice Set the token pair. Callable once on the freshly-etched address.
+    /// @notice Set the token pair (canonical 0.3% fee). Callable once on the etched address.
     function initialize(address t0, address t1) external {
         require(token0 == address(0) && token1 == address(0), "INITIALIZED");
         token0 = t0;
         token1 = t1;
+    }
+
+    /// @notice Set the token pair AND a per-pool fee (ppm). Lets a test stand up a
+    ///         V2-class pair at a non-0.30% fee (e.g. 500 = 0.05%), exercising EcoSwap's
+    ///         callback-free V2 execution path that honors the discovered per-pool fee.
+    function initializeWithFee(address t0, address t1, uint256 fee) external {
+        require(token0 == address(0) && token1 == address(0), "INITIALIZED");
+        token0 = t0;
+        token1 = t1;
+        feePpm = fee;
     }
 
     function getReserves() external view returns (uint112, uint112, uint32) {
@@ -63,10 +76,12 @@ contract V2Pair {
             uint256 amount0In = bal0 > r0 - amount0Out ? bal0 - (r0 - amount0Out) : 0;
             uint256 amount1In = bal1 > r1 - amount1Out ? bal1 - (r1 - amount1Out) : 0;
             require(amount0In > 0 || amount1In > 0, "INSUFFICIENT_INPUT_AMOUNT");
-            // 0.3% fee K-invariant: balances net of fee must not shrink k.
-            uint256 bal0Adj = bal0 * 1000 - amount0In * 3;
-            uint256 bal1Adj = bal1 * 1000 - amount1In * 3;
-            require(bal0Adj * bal1Adj >= r0 * r1 * 1_000_000, "K");
+            // Per-pool fee K-invariant (ppm): balances net of the fee must not shrink k.
+            // feePpm = 0 ⇒ the canonical 0.30% (3000ppm) the engine's _swapV2 matches.
+            uint256 fee = feePpm == 0 ? 3000 : feePpm;
+            uint256 bal0Adj = bal0 * 1_000_000 - amount0In * fee;
+            uint256 bal1Adj = bal1 * 1_000_000 - amount1In * fee;
+            require(bal0Adj * bal1Adj >= r0 * r1 * 1_000_000 * 1_000_000, "K");
         }
 
         _reserve0 = bal0;

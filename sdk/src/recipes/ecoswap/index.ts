@@ -58,7 +58,7 @@ export interface EcoSwapOutput {
 
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
+ *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber]
  * [10..15] are the unified-walk per-pool cache descriptors (V3/V4): the multiplicative step
  * ratio, the cache window bounds (shallowest/deepest scanned tick, shifted; windowTop=0 ⇒ no
  * cache ⇒ staticcall every boundary, the 1-RPC quote path), the deepest INITIALIZED tick (the
@@ -86,6 +86,7 @@ function buildPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[
     p.extremeShifted ?? 0n, // [13] deepest INITIALIZED tick (shifted) — the terminate gate
     BigInt(netStart), // [14] start row index into the flat netCache for this pool
     BigInt(netCount), // [15] number of initialized-tick rows for this pool (0 ⇒ none)
+    p.isKyber ? 1n : 0n, // [16] Kyber Classic / DMM: V2-shaped on VIRTUAL reserves (getTradeInfo + per-virtual-reserve output)
   ];
 }
 
@@ -128,21 +129,57 @@ function buildRouteTuple(r: EcoRoute): bigint[] {
 }
 
 /**
- * Build the flat route-segment array — [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar] for every
- * Route bracket, sorted DESC by sqrtAdjNear (then adjFar DESC, then routeIdx ASC — the same
- * stable order the merge tie-breaks on). Routes are STATIC (no live re-price), competing in the
- * merge via ONE cursor. Direct-pool brackets are GONE (the solver walks each pool live).
+ * Build the UNIFIED static-segment array — [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind,
+ * venue] for every Route AND Curve bracket, interleaved and sorted DESC by sqrtAdjNear (then
+ * adjFar DESC, then refIdx ASC — the same stable order the merge tie-breaks on). Both compete
+ * in the merge via ONE cursor (the on-chain `bestKind===2` static-segment path); the solver
+ * does NOT recompute either curve (routes are composed off-chain via localQuote; Curve is
+ * sampled off-chain via the bigint replay). Direct-pool brackets are GONE (the solver walks
+ * each pool live).
+ *
+ * Carrying Curve/LB inline in routeSegs (rather than separate compiler args) keeps the solver at
+ * 9 params — a 10th overflows the v12 arg-prologue SDUP16 window. segKind: 0 = multi-hop route
+ * (refIdx → routes[]), 1 = Curve (refIdx → a per-curve accumulator; venue = the exchange() pool
+ * address from prepared.curves[refIdx] → SwapParams.pool, poolType 3 → _swapCurve), 2 = Trader
+ * Joe LB (refIdx → a per-LB accumulator; venue = the pair address from prepared.lbs[refIdx] →
+ * SwapParams.pool, poolType 6 → _swapTraderJoeLB), 3 = DODO V2 (refIdx → a per-DODO accumulator;
+ * venue = the pool address from prepared.dodos[refIdx] → SwapParams.pool, poolType 5 →
+ * _swapDODOV2). Route rows carry venue 0. Curve, LB and DODO each carry their venue address in
+ * the row, so the solver shares ONE per-segment-venue accumulator keyed by the static-segment
+ * index (cinp/cven) and dispatches on segKind at execution.
  */
 function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
+  const curves = prepared.curves ?? [];
+  const lbs = prepared.lbs ?? [];
+  const dodos = prepared.dodos ?? [];
   return prepared.brackets
-    .filter((b) => b.kind === EcoBracketKind.Route)
+    .filter(
+      (b) =>
+        b.kind === EcoBracketKind.Route ||
+        b.kind === EcoBracketKind.Curve ||
+        b.kind === EcoBracketKind.LB ||
+        b.kind === EcoBracketKind.DODO,
+    )
     .slice()
     .sort((a, b) => {
       if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
       if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
       return a.refIdx - b.refIdx;
     })
-    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
+    .map((b) => {
+      const isCurve = b.kind === EcoBracketKind.Curve;
+      const isLb = b.kind === EcoBracketKind.LB;
+      const isDodo = b.kind === EcoBracketKind.DODO;
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : 0n;
+      const venue = isCurve
+        ? BigInt(curves[b.refIdx].address)
+        : isLb
+          ? BigInt(lbs[b.refIdx].address)
+          : isDodo
+            ? BigInt(dodos[b.refIdx].address)
+            : 0n;
+      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
+    });
 }
 
 /**

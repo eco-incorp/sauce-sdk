@@ -44,6 +44,8 @@ import {
   getTickLiquidityNet,
   deployV2Factory,
   setupEtchedV2Pool,
+  deployKyberFactory,
+  setupEtchedKyberPool,
   etchV4Singletons,
   deployV4Helper,
   setupV4Pool,
@@ -905,6 +907,281 @@ describe("EcoSwap V3 + V4 mixed split", () => {
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`Phase 6 [${engine}] — splits across a V3 pool and a V4 pool`, { skip }, async () => {
       await runPhase6(engine);
+    });
+  }
+});
+
+// ── Phase 4b: V2 (NON-0.30% fee) + V3 split via the callback-free path ─────
+//
+// A V2-class pair charging 0.05% (500ppm) — NOT the canonical 0.30% the engine's
+// _swapV2 hardcodes — split against a 0.30% V3 pool. The engine cannot fee this pair,
+// so EcoSwap executes it CALLBACK-FREE in SauceScript (transfer to the pair + pair.swap
+// with the output computed at the REAL 0.05% fee). The lens, the oracle and the on-chain
+// stream all gross by 500ppm, so the split stays wei-exact and — with identical spot +
+// depth — the cheaper-fee V2 pair draws MORE than the dearer V3 pool. Asserts both venues
+// fill, the per-venue deltas sum to spent input, and the cook succeeds on both engines.
+describe("EcoSwap V2 (non-0.30% fee) + V3 split (callback-free V2 path)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let tokenOut: Hex;
+  let v3Pool: Hex;
+  let v2Pair: Hex;
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  const V2_FEE_PPM = 500; // 0.05% — NOT the engine's hardcoded 0.30%
+  // Deterministic, unused address to etch the V2 pair at.
+  const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec05be05" as Hex;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const v2Factory = await deployV2Factory(c.walletClient, c.publicClient);
+    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+    tokenIn = tk.token0;
+    tokenOut = tk.token1;
+
+    const minter = c.account0;
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("50000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, minter, parseEther("50000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, HUGE);
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, HUGE);
+
+    // V3 pool (fee 3000) at 1:1, wide deep position.
+    v3Pool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, 3000, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, v3Pool, minter, -12000, 12000, parseEther("300000"),
+    );
+
+    // Etched V2 pair at 1:1 with comparable depth but a 0.05% fee — its fee-adjusted
+    // marginal is HIGHER (less fee), so the water-fill funds it first/more.
+    v2Pair = await setupEtchedV2Pool(
+      c.walletClient, c.publicClient, c.testClient, v2Factory, V2_PAIR_ADDR,
+      tokenIn, tokenOut, parseEther("300000"), parseEther("300000"), minter, V2_FEE_PPM,
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: v2Factory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Local UniV2 (5bps)", v2FeePpm: V2_FEE_PPM },
+      ],
+      feeTiers: [3000],
+      baseTokens: [tokenIn, tokenOut],
+    };
+
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => {
+    anvil?.stop();
+  });
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+  }
+
+  async function runPhase4b(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const amountIn = parseEther("2000");
+    const caller = c.account0;
+
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3Pool);
+    const v2InBefore = await balanceOf(c.publicClient, tokenIn, v2Pair);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
+      caller, poolConfig, undefined, engine,
+    );
+
+    // The lens must surface the V2 pair carrying its REAL 0.05% fee, not 0.30%.
+    const v2 = prepared.pools.find((p) => p.isV2);
+    const v3Count = prepared.pools.filter((p) => !p.isV2).length;
+    assert.ok(v2, "should discover the etched V2 pair");
+    assert.equal(v2!.feePpm, V2_FEE_PPM, "V2 pool must carry the real per-pool fee (500), not 3000");
+    assert.equal(v3Count, 1, "should discover the V3 pool");
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "non-0.30% V2 + V3 cook() must succeed (callback-free V2)");
+
+    const v3Delta = (await balanceOf(c.publicClient, tokenIn, v3Pool)) - v3InBefore;
+    const v2Delta = (await balanceOf(c.publicClient, tokenIn, v2Pair)) - v2InBefore;
+    assert.ok(v3Delta > 0n, "V3 pool should receive input");
+    assert.ok(v2Delta > 0n, "5bps V2 pair should receive input (callback-free path)");
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.ok(received > 0n, "caller received tokenOut");
+    const leftover = amountIn - spent;
+    assert.ok(leftover * 100n <= amountIn, `should spend ~all amountIn (leftover ${leftover})`);
+    assert.equal(v2Delta + v3Delta, spent, "per-venue tokenIn deltas must sum to spent input");
+    // Same spot + depth, lower V2 fee ⇒ the V2 pair draws strictly more than the V3 pool.
+    assert.ok(v2Delta > v3Delta, `cheaper 5bps V2 pair should draw more than the 0.30% V3 pool (V2 ${v2Delta} > V3 ${v3Delta})`);
+
+    console.log(
+      `  [P4b:${engine}] V2(5bps)+V3 split: spent=${spent} received=${received} leftover=${leftover}\n` +
+        `       V3 in=${v3Delta}  V2(5bps) in=${v2Delta}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`Phase 4b [${engine}] — splits across a 5bps V2 pair (callback-free) and a V3 pool`, { skip }, async () => {
+      await runPhase4b(engine);
+    });
+  }
+});
+
+// ── Phase 4c: KyberSwap Classic / DMM (virtual reserves) + V3 split ────────
+//
+// A KyberSwap Classic / DMM pool — an amplified constant-product AMM trading on VIRTUAL
+// reserves — split against a 0.30% V3 pool. Kyber is discovered OFF-CHAIN (getPools →
+// getTradeInfo, NOT the lens), seeded from the virtual reserves (the merge/oracle treat it
+// as a V2 pool on those reserves), and executed CALLBACK-FREE (transfer + pool.swap with the
+// output computed on the virtual reserves at the live feeInPrecision) — no engine change. The
+// Kyber pool's virtual reserves are deep AND its fee is lower (0.10%), so its fee-adjusted
+// marginal is higher and the water-fill funds it more. Asserts both venues fill, the per-venue
+// deltas sum to spent input, the discovered Kyber fee is the rounded ppm, and the cook succeeds
+// on both engines.
+describe("EcoSwap Kyber Classic (virtual reserves) + V3 split (callback-free)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let tokenOut: Hex;
+  let v3Pool: Hex;
+  let kyberPool: Hex;
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  // 0.10% in 1e18 precision (100/1e5) → rounds to 1000 ppm.
+  const KYBER_FEE_IN_PRECISION = (10n ** 18n * 100n) / 100_000n;
+  const KYBER_FEE_PPM = 1000;
+  const KYBER_POOL_ADDR = "0x000000000000000000000000000000000bbe1111" as Hex;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const kyberFactory = await deployKyberFactory(c.walletClient, c.publicClient);
+    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
+    tokenIn = tk.token0;
+    tokenOut = tk.token1;
+
+    const minter = c.account0;
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("50000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, minter, parseEther("50000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, HUGE);
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, HUGE);
+
+    // V3 pool (fee 3000) at 1:1, deep position.
+    v3Pool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, 3000, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, v3Pool, minter, -12000, 12000, parseEther("300000"),
+    );
+
+    // Kyber Classic pool at 1:1 spot. Real reserves modest (300k each); virtual boosts add
+    // (amp-1)·reserve so the VIRTUAL reserves are ~900k each — the pool the curve trades on is
+    // ~3× deeper than its held balances, exercising the virtual-reserve geometry. Lower 0.10% fee.
+    kyberPool = await setupEtchedKyberPool(
+      c.walletClient, c.publicClient, c.testClient, kyberFactory, KYBER_POOL_ADDR,
+      tokenIn, tokenOut, parseEther("300000"), parseEther("300000"),
+      KYBER_FEE_IN_PRECISION, parseEther("600000"), parseEther("600000"), minter,
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: kyberFactory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.KyberClassic, label: "Local Kyber Classic" },
+      ],
+      feeTiers: [3000],
+      baseTokens: [tokenIn, tokenOut],
+    };
+
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => {
+    anvil?.stop();
+  });
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+  }
+
+  async function runPhase4c(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    // Large enough that the deep+cheap Kyber pool's marginal falls to the V3 pool's level and the
+    // water-fill engages BOTH venues (a smaller trade would land entirely in Kyber).
+    const amountIn = parseEther("60000");
+    const caller = c.account0;
+
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3Pool);
+    const kyberInBefore = await balanceOf(c.publicClient, tokenIn, kyberPool);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12),
+      caller, poolConfig, undefined, engine,
+    );
+
+    // Discovery must surface the Kyber pool (isKyber) with the rounded ppm fee + a V3 pool.
+    const kyber = prepared.pools.find((p) => p.isKyber);
+    const v3Count = prepared.pools.filter((p) => !p.isV2).length;
+    assert.ok(kyber, "should discover the etched Kyber Classic pool");
+    assert.equal(kyber!.feePpm, KYBER_FEE_PPM, "Kyber pool must carry the rounded per-pool fee (1000)");
+    assert.equal(v3Count, 1, "should discover the V3 pool");
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "Kyber + V3 cook() must succeed (callback-free Kyber)");
+
+    const v3Delta = (await balanceOf(c.publicClient, tokenIn, v3Pool)) - v3InBefore;
+    const kyberDelta = (await balanceOf(c.publicClient, tokenIn, kyberPool)) - kyberInBefore;
+    assert.ok(v3Delta > 0n, "V3 pool should receive input");
+    assert.ok(kyberDelta > 0n, "Kyber pool should receive input (callback-free path)");
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.ok(received > 0n, "caller received tokenOut");
+    const leftover = amountIn - spent;
+    assert.ok(leftover * 100n <= amountIn, `should spend ~all amountIn (leftover ${leftover})`);
+    assert.equal(kyberDelta + v3Delta, spent, "per-venue tokenIn deltas must sum to spent input");
+    // Deeper virtual reserves + lower fee ⇒ the Kyber pool draws strictly more than the V3 pool.
+    assert.ok(kyberDelta > v3Delta, `deeper/cheaper Kyber pool should draw more than the V3 pool (Kyber ${kyberDelta} > V3 ${v3Delta})`);
+
+    console.log(
+      `  [P4c:${engine}] Kyber+V3 split: spent=${spent} received=${received} leftover=${leftover}\n` +
+        `       V3 in=${v3Delta}  Kyber in=${kyberDelta}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`Phase 4c [${engine}] — splits across a Kyber Classic pool (virtual reserves, callback-free) and a V3 pool`, { skip }, async () => {
+      await runPhase4c(engine);
     });
   }
 });

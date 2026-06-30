@@ -44,7 +44,23 @@ export enum FactoryType {
   V3Standard = "v3",
   /** Uniswap V4 singleton: poolId = keccak256(PoolKey), StateView.getSlot0(poolId) for state */
   UniswapV4 = "v4",
-  /** Algebra style (Camelot, QuickSwap): poolByPair(tokenA, tokenB), globalState() for state */
+  /**
+   * Algebra dynamic-fee style (Camelot V3, QuickSwap V3, Ramses V2): ONE pool per pair
+   * (no fee tiers) discovered via `poolByPair(tokenA, tokenB)`. State is read from
+   * `globalState()` (NOT slot0()): `price` (= sqrtPriceX96), `tick`, and the DYNAMIC fee
+   * (`feeZto` for a zeroForOne swap, `feeOtz` for oneForZero). Algebra pools are V3-shaped
+   * concentrated liquidity, so they map to `poolType = UniV3` and execute on the EXISTING
+   * V3 router path; the tick walk (`ticks()[1]` = liquidityDelta = liquidityNet), the
+   * v3Segments oracle and the on-chain per-pool frontier are reused VERBATIM. The only
+   * Algebra-specific work is the state read (globalState in place of slot0) and threading
+   * the per-pool dynamic fee through to `feePpm`. The fee is read once at quote time and
+   * treated as fixed over the trade — the SAME snapshot assumption the recipe already makes
+   * for fixed V3 tiers — so the split stays wei-exact against that snapshot. The on-chain
+   * LENS understands this family directly (see ecoswap.lens.sauce.ts `algebraFactories`).
+   *
+   * NOTE: `Algebra` is a backward-compatible alias of this value (`= AlgebraV3`); both refer
+   * to the same dynamic-fee globalState reader.
+   */
   AlgebraV3 = "algebra",
   /** Uniswap V2 style: getPair(tokenA, tokenB), getReserves() for state */
   V2Standard = "v2",
@@ -62,7 +78,26 @@ export enum FactoryType {
   MaverickV2Factory = "maverick-v2",
   /** WOOFi: single pool per chain, query() for verification */
   WOOFi = "woofi",
+  /**
+   * KyberSwap Classic / DMM: amplified constant-product on VIRTUAL reserves.
+   * Discovery: getPools(tokenA, tokenB) → per-pool getTradeInfo()
+   * (reserve0, reserve1, vReserve0, vReserve1, feeInPrecision). The curve geometry
+   * (sqrt/L) is keyed off the VIRTUAL reserves — a Kyber pool is mathematically a V2
+   * range with L = isqrt(vReserveIn·vReserveOut) — and the per-pool fee is read live
+   * (feeInPrecision is 1e18-scaled; rounded to ppm). Callback-free: executed in
+   * SauceScript (transfer + pool.swap(a0, a1, to, "")) with the output computed on the
+   * virtual reserves, so no engine change. Distinct from V2Standard only in the live
+   * read (getTradeInfo vs getReserves) and the per-virtual-reserve output formula.
+   */
+  KyberClassic = "kyber-classic",
 }
+
+/**
+ * Backward-compatible alias for the Algebra dynamic-fee factory type. `FactoryType.Algebra`
+ * and `FactoryType.AlgebraV3` are the SAME value (the globalState/poolByPair reader) — use
+ * either. Exposed so callers can write the shorter `FactoryType.Algebra`.
+ */
+export const ALGEBRA_FACTORY_TYPE = FactoryType.AlgebraV3;
 
 // ── Per-chain pool discovery config ──────────────────────────
 
@@ -84,6 +119,43 @@ export interface FactoryConfig {
    * back to the chain-level `feeTiers`.
    */
   feeTiers?: number[];
+  /**
+   * V2-class only: the pool's constant-product swap fee in ppm (e.g. 3000 = 0.30%,
+   * 500 = 0.05%). UniswapV2-clones at the canonical 0.30% omit this (defaults to
+   * V2_DEFAULT_FEE_PPM = 3000). Set it for a fork whose V2-class pools charge a
+   * different fee (Solidly volatile, some Sushi tiers) so the lens, the off-chain
+   * oracle and the on-chain execution all use the SAME per-pool fee (wei-exact).
+   *
+   * The engine `_swapV2` hardcodes 0.30% (997/1000), so a pool with v2FeePpm != 3000
+   * is executed via the callback-free SauceScript path (transfer + pool.swap) instead
+   * of the unified router swap — no engine change. 3000-fee pools keep the router path.
+   */
+  v2FeePpm?: number;
+  /**
+   * Algebra (AlgebraV3) only: the factory's fixed per-pool `tickSpacing`. Algebra v1 forks
+   * (Camelot/QuickSwap V3, Ramses V2) carry the same spacing across all their pools (commonly
+   * 60). The on-chain LENS has no TickMath, so it steps √price by a PRECOMPUTED step ratio
+   * (getSqrtRatioAtTick(tickSpacing)) derived off-chain from this value — the same way V4 specs
+   * precompute their step ratio. Defaults to 60 when omitted. Ignored for non-Algebra factories.
+   */
+  algebraTickSpacing?: number;
+}
+
+/** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */
+export const V2_DEFAULT_FEE_PPM = 3000;
+
+/**
+ * KyberSwap Classic / DMM fee precision: feeInPrecision (from getTradeInfo) is scaled by
+ * 1e18 (PRECISION). The recipe rounds it to ppm — feePpm = round(feeInPrecision·1e6/1e18) —
+ * and uses the SAME rounded ppm in the off-chain oracle/reference AND the on-chain merge, so
+ * the split stays wei-exact-by-construction. (The realized swap output is computed on-chain
+ * from the live feeInPrecision at full 1e18 precision; the ppm rounding only affects the
+ * price-ordering coordinate, which both sides share.)
+ */
+export const KYBER_FEE_PRECISION = 10n ** 18n;
+/** Round a Kyber feeInPrecision (1e18-scaled) to a ppm fee. */
+export function kyberFeeToPpm(feeInPrecision: bigint): number {
+  return Number((feeInPrecision * 1_000_000n + KYBER_FEE_PRECISION / 2n) / KYBER_FEE_PRECISION);
 }
 
 export interface ChainPoolConfig {
@@ -121,6 +193,11 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Aerodrome CL" },
     { address: "0x71524B4f93c58fcbF659783284E38825f0622859" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
     { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+    // Algebra dynamic-fee (V3-shaped; poolByPair + globalState). PLACEHOLDER address — Base
+    // had no canonical Algebra deployment at authoring; the TYPE + reader are wired so a
+    // real Base Algebra fork drops in by address alone. The arbitrum (Camelot V3, Ramses V2)
+    // and polygon (QuickSwap V3) configs below carry REAL Algebra factories on this same type.
+    { address: "0x0000000000000000000000000000000000000000" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Algebra (placeholder)" },
     // V4 singleton (PoolManager + StateView lens)
     { address: UNISWAP_V4_POOL_MANAGER, stateView: UNISWAP_V4_STATE_VIEW, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4" },
     // V2 constant-product (no price limit)
@@ -162,6 +239,9 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x72d220cE168C4f361dD4deE5D826a01AD8598f6C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // Maverick V2
       { address: "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e" as Hex, poolType: SwapPoolType.MaverickV2, factoryType: FactoryType.MaverickV2Factory, label: "Maverick V2" },
+      // KyberSwap Classic / DMM (amplified constant-product on virtual reserves; V2-shaped,
+      // callback-free). Ethereum DMMFactory — getPools(a,b) → per-pool getTradeInfo().
+      { address: "0x833e4083B7ae46CeA85695c4f7ed25CDAd8886dE" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.KyberClassic, label: "KyberSwap Classic" },
     ],
     baseTokens: [
       "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as Hex, // WETH
@@ -288,3 +368,19 @@ export const BALANCER_V2_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as
 
 /** Trader Joe LB bin steps to query per factory */
 export const TRADER_JOE_BIN_STEPS = [1, 5, 10, 15, 20, 25] as const;
+
+/**
+ * Trader Joe LB default static base-fee factor (`getStaticFeeParameters().baseFactor`). LB v2.1
+ * pools commonly use 5000 (→ baseFee = 0.5·binStep%); read live per-pair where available, falls
+ * back to this. The base fee is the FIXED snapshot fee the segment math grosses by (the variable
+ * volatility fee is transient and omitted — the same per-block snapshot assumption used for V3).
+ */
+export const TRADER_JOE_DEFAULT_BASE_FACTOR = 5000;
+
+/**
+ * Trader Joe LB bin-scan window (bins on EACH side of the active bin) the typed discovery reads
+ * into the off-chain segment enumerator. LB walks bins outward from the active id one per step;
+ * a window of N bins covers a price excursion of (1+binStep/1e4)^N — at binStep 10 (0.1%), 256
+ * bins ≈ a 13× excursion, far past any realistic split. Bounds the per-pair getBin multicall.
+ */
+export const TRADER_JOE_BIN_WINDOW = Number(process.env.ECO_LB_BIN_WINDOW ?? 256);

@@ -32,10 +32,21 @@
 import type { PublicClient, Hex } from "viem";
 import { runLens, type LensPool } from "./lens.js";
 import {
+  discoverKyberClassicPools,
+  discoverCurvePoolsTyped,
+  discoverTraderJoeLBPoolsTyped,
+  discoverDodoV2PoolsTyped,
+} from "../shared/pool-discovery.js";
+import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
+import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
+import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
+import {
   MIN_SQRT_RATIO,
   MAX_SQRT_RATIO,
   SwapPoolType,
+  FactoryType,
   BASE_CHAIN_POOL_CONFIG,
+  kyberFeeToPpm,
   type ChainPoolConfig,
 } from "../shared/constants.js";
 import {
@@ -45,6 +56,9 @@ import {
   type EcoBracket,
   type EcoPool,
   type EcoRoute,
+  type EcoCurve,
+  type EcoLb,
+  type EcoDodo,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -101,9 +115,10 @@ const ROUTE_SAMPLES = 6;
 /** Keep at most this many routes (bytecode/gas bound). */
 const MAX_ROUTES = Number(process.env.ECO_MAX_ROUTES ?? 2);
 /**
- * Engine `_swapV2` hardcodes the constant-product fee at 0.3% (997/1000) for
- * EVERY V2 pool, ignoring the discovered fee tier. So all V2 brackets are pinned
- * to this fee so the off-chain capacity/marginal ladder matches what executes.
+ * Fallback constant-product fee (ppm) for a route-leg V2 pool whose lens row predates
+ * the per-pool fee field (always set today). Direct V2 pools carry the REAL lens-reported
+ * fee through to the oracle / reference / on-chain stream; the engine's hardcoded-0.30%
+ * _swapV2 is bypassed (callback-free path) for any pool whose fee != this default.
  */
 const V2_FEE_PPM = 3000;
 
@@ -434,7 +449,7 @@ function lensPoolBrackets(p: LensPool, zeroForOne: boolean, refIdx: number): Eco
     return buildV2Brackets(
       { sqrtPriceX96: p.sqrtPriceX96, liquidity: p.liquidity } as PoolInfo,
       refIdx,
-      V2_FEE_PPM,
+      p.fee || V2_FEE_PPM,
     );
   }
   return buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne);
@@ -446,7 +461,7 @@ function lensPoolToInfo(p: LensPool, tokenIn: Hex, tokenOut: Hex): PoolInfo {
     address: p.address,
     tokenIn,
     tokenOut,
-    fee: p.poolType === SwapPoolType.UniV2 ? V2_FEE_PPM : p.fee,
+    fee: p.poolType === SwapPoolType.UniV2 ? p.fee || V2_FEE_PPM : p.fee,
     poolType: p.poolType,
     priceLimited: p.poolType !== SwapPoolType.UniV2,
     sqrtPriceX96: p.sqrtPriceX96,
@@ -544,6 +559,101 @@ function buildRouteBracketsLocal(
     }
     prevIn = sm.input;
     prevOut = sm.out;
+  }
+  return brackets;
+}
+
+/**
+ * Build Curve StableSwap segments for one pool by sampling the bigint replay (NO extra RPC —
+ * pure bigint on the read pool state). Each sampled (Δinput, Δoutput) increment becomes a
+ * STATIC segment (kind Curve) in unified out/in space, refIdx → the curve venue index. The
+ * marginal is the POST-FEE execution price (get_dy already nets the fee), so it enters the
+ * descending-price merge directly as both sqrtAdjNear and sqrtAdjFar (a flat segment, like a
+ * route segment). Mirrors `buildRouteBracketsLocal` — the on-chain solver's static-segment
+ * handling is unchanged.
+ *
+ * Exact-on-grid: the split equalizes marginals on this sampled grid; the per-pool dy for the
+ * awarded Σ share is re-evaluated wei-exact by ONE atomic exchange() at execution time.
+ */
+function buildCurveBrackets(pool: CurvePool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildCurveSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.Curve,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Curve fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/** Round a Curve 1e10-scaled fee to ppm (the price-ordering coordinate / diagnostics). */
+function curveFeeToPpm(feePpm10: bigint): number {
+  return Number((feePpm10 * 1_000_000n + 5_000_000_000n) / 10_000_000_000n);
+}
+
+/**
+ * Build Trader Joe LB segments for one pair by EXACT per-bin enumeration (NO sampling — LB is a
+ * discrete-bin constant-sum AMM, so each bin is ONE flat segment at its fixed price). Each bin
+ * becomes a STATIC segment (kind LB) in unified out/in space, refIdx → the LB venue index. The
+ * marginal is the POST-FEE bin price (buildLbSegments nets the base fee), so it enters the
+ * descending-price merge directly as both sqrtAdjNear and sqrtAdjFar (a flat segment, like a
+ * Curve / route segment). Mirrors `buildCurveBrackets` — the on-chain solver's static-segment
+ * handling is unchanged; the difference is LB segments are EXACT (no grid error), so the split
+ * is wei-exact vs the oracle (not merely exact-on-grid).
+ */
+function buildLbBrackets(pool: LbPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildLbSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.LB,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the LB base fee (post-fee out/in)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
+ * Build DODO V2 PMM segments for one pool by sampling the closed-form replay (NO extra RPC — pure
+ * bigint querySell* on the read PMM state). Each sampled (Δinput, Δoutput) increment becomes a
+ * STATIC segment (kind DODO) in unified out/in space, refIdx → the DODO venue index. The marginal
+ * is the POST-FEE execution price (buildDodoSegments nets the LP+MT fee), so it enters the
+ * descending-price merge directly as both sqrtAdjNear and sqrtAdjFar (a flat segment, like a
+ * Curve / LB / route segment). Mirrors `buildCurveBrackets` — the on-chain solver's static-segment
+ * handling is unchanged; DODO's curve math is OFF-CHAIN ONLY (the on-chain solver does NOT recompute
+ * the PMM integral).
+ *
+ * Exact-on-grid: the split equalizes marginals on this sampled grid; the per-pool dy for the awarded
+ * Σ share is re-evaluated wei-exact by ONE atomic querySell*() at execution time (the engine
+ * `_swapDODOV2`).
+ */
+function buildDodoBrackets(pool: DodoPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildDodoSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.DODO,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the DODO LP+MT fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
   }
   return brackets;
 }
@@ -756,17 +866,22 @@ export async function prepareEcoSwap(
     pools.push(pool);
   }
 
-  // V2 (lens returned synthetic out/in sqrt + synthetic L + inIsToken0). No tick cache: the
-  // solver streams constant-L geometric slices from the LIVE out/in spot. The spot fields seed
-  // the no-drift walk (off-chain reference); on-chain reads getReserves live.
+  // V2 (lens returned synthetic out/in sqrt + synthetic L + inIsToken0 + the REAL per-pool
+  // fee). No tick cache: the solver streams constant-L geometric slices from the LIVE out/in
+  // spot. The spot fields seed the no-drift walk (off-chain reference); on-chain reads
+  // getReserves live. feePpm is the lens-reported fee (3000 for canonical UniswapV2; a
+  // configured non-3000 V2-class fee otherwise) — the oracle, the reference and the on-chain
+  // stream all gross by THIS fee, so they stay wei-exact for any V2-class fee. A pool whose
+  // fee != V2_DEFAULT_FEE_PPM cannot use the engine's hardcoded-0.30% _swapV2, so the solver
+  // executes it via the callback-free path (transfer + pair.swap) — see ecoswap.sauce.ts.
   for (const p of v2Raw) {
     pools.push({
       poolType: p.poolType,
       address: p.address,
-      fee: V2_FEE_PPM, // engine _swapV2 uses 0.3% regardless of discovered tier
+      fee: p.fee,
       tickSpacing: 0,
       hooks: ZERO_ADDRESS,
-      feePpm: V2_FEE_PPM,
+      feePpm: p.fee,
       isV2: true,
       inIsToken0: p.inIsToken0,
       stateView: ZERO_ADDRESS,
@@ -776,6 +891,136 @@ export async function prepareEcoSwap(
       source: "lens V2",
     });
   }
+
+  // ── KyberSwap Classic / DMM (off-chain discovery — NOT in the lens) ──
+  // Kyber is a V2-shaped pool on VIRTUAL reserves; the lens only understands V2/V3/V4
+  // getReserves/slot0/StateView, so Kyber is discovered separately via getPools →
+  // getTradeInfo and appended to the survivor set. Each Kyber pool seeds the SAME
+  // constant-L V2 stream the solver/oracle/reference walk — but from the VIRTUAL reserves
+  // (L = √(vIn·vOut), spot out/in = √(vOut/vIn)) — and carries the rounded per-pool fee
+  // (the same ppm the oracle grosses by). It executes callback-free (transfer + pool.swap),
+  // computing the output on the virtual reserves with the live feeInPrecision. The relative-
+  // depth survivor filter is applied ON-CHAIN by the lens for V2/V3/V4 only; Kyber pools
+  // survive on the `>0` aliveness gate (virtual reserves present) and the shared top-N cap.
+  const kyberFactories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.KyberClassic,
+  );
+  if (kyberFactories.length > 0) {
+    const kyberRaw = await discoverKyberClassicPools(tokenIn, tokenOut, client, kyberFactories);
+    for (const k of kyberRaw) {
+      if (k.vReserveIn <= 0n || k.vReserveOut <= 0n) continue;
+      const feePpm = kyberFeeToPpm(k.feeInPrecision);
+      const synthL = isqrt(k.vReserveIn * k.vReserveOut); // √(vIn·vOut)
+      const spotOI = isqrt((k.vReserveOut * Q192) / k.vReserveIn); // out/in spot from VIRTUAL reserves
+      pools.push({
+        poolType: SwapPoolType.UniV2,
+        address: k.address,
+        fee: feePpm,
+        tickSpacing: 0,
+        hooks: ZERO_ADDRESS,
+        feePpm,
+        isV2: true,
+        isKyber: true,
+        inIsToken0: k.inIsToken0,
+        stateView: ZERO_ADDRESS,
+        poolId: ZERO_BYTES32,
+        spotNearReal: spotOI, // out/in spot (virtual-reserve frontier seed)
+        spotActiveL: synthL, // √(vIn·vOut)
+        source: `${k.source} (Kyber Classic)`,
+      });
+    }
+  }
+
+  // ── Curve StableSwap (off-chain discovery + bigint replay — NOT in the lens) ──
+  // Curve is a static segment venue: the curve math is OFF-CHAIN ONLY (no Newton in
+  // SauceScript). discoverCurvePoolsTyped reads the live invariant state (A, balances[],
+  // rates[], fee, int128 i/j); buildCurveSegments samples get_dy at M geometric cumulative
+  // inputs (no extra RPC) into (capacity, marginalOI) segments in descending-price order;
+  // the on-chain solver consumes those through the EXISTING static-segment cursor and
+  // executes the awarded Σ share via swap(SwapParams{poolType:3}) → live _swapCurve. The
+  // marginal is post-fee (get_dy nets the fee), so it competes in the merge directly.
+  const curves: EcoCurve[] = [];
+  const curveBracketSets: EcoBracket[][] = [];
+  const curveRegistries = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.CurveRegistry,
+  );
+  if (curveRegistries.length > 0) {
+    const curveRaw = await discoverCurvePoolsTyped(tokenIn, tokenOut, client, curveRegistries);
+    for (const c of curveRaw) {
+      const refIdx = curves.length;
+      const cb = buildCurveBrackets(c, refIdx, amountIn);
+      if (cb.length === 0) continue;
+      curves.push({
+        address: c.address,
+        i: c.i,
+        j: c.j,
+        feePpm: curveFeeToPpm(c.feePpm10),
+        source: `${c.source} (Curve)`,
+      });
+      curveBracketSets.push(cb);
+    }
+  }
+  for (const set of curveBracketSets) brackets.push(...set);
+
+  // ── Trader Joe LB (off-chain discovery + EXACT per-bin enumeration — NOT in the lens) ──
+  // LB is a static-segment venue: each active bin is a CONSTANT-SUM slice at a FIXED price, so
+  // discovery reads the live per-bin reserves around the active bin and buildLbSegments emits
+  // ONE EXACT flat segment per bin (no sampling, no grid error). The on-chain solver consumes
+  // those through the EXISTING static-segment cursor and executes the awarded Σ share via
+  // swap(SwapParams{poolType:6, pool}) → live _swapTraderJoeLB (one atomic pool.swap(swapForY,
+  // to); the engine resolves swapForY on-chain from getTokenX()). The marginal is post-fee
+  // (buildLbSegments nets the base fee), so it competes in the merge directly.
+  const lbs: EcoLb[] = [];
+  const lbBracketSets: EcoBracket[][] = [];
+  const lbFactories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.TraderJoeLB,
+  );
+  if (lbFactories.length > 0) {
+    const lbRaw = await discoverTraderJoeLBPoolsTyped(tokenIn, tokenOut, client, lbFactories);
+    for (const lb of lbRaw) {
+      const refIdx = lbs.length;
+      const lbb = buildLbBrackets(lb, refIdx, amountIn);
+      if (lbb.length === 0) continue;
+      lbs.push({
+        address: lb.address,
+        binStep: lb.binStep,
+        feePpm: lbFeeToPpm(lb.binStep, lb.baseFactor),
+        source: lb.source,
+      });
+      lbBracketSets.push(lbb);
+    }
+  }
+  for (const set of lbBracketSets) brackets.push(...set);
+
+  // ── DODO V2 PMM (off-chain discovery + closed-form replay — NOT in the lens) ──
+  // DODO V2 is a static-segment venue: the PMM curve is a CLOSED-FORM integral parameterised by a
+  // GUIDE PRICE `i` that is POOL STATE (read live from getPMMStateForCall), not an exogenous oracle
+  // feed — so it is wei-exact-on-grid under the charter (unlike WOOFi/Fermi). discoverDodoV2PoolsTyped
+  // reads the live PMM state (i, K, B, Q, B0, Q0, R + LP/MT fee); buildDodoSegments samples querySell*
+  // at M geometric cumulative inputs (no extra RPC) into (capacity, marginalOI) segments in
+  // descending-price order; the on-chain solver consumes those through the EXISTING static-segment
+  // cursor and executes the awarded Σ share via swap(SwapParams{poolType:5}) → live _swapDODOV2 (it
+  // resolves base/quote orientation on-chain from _BASE_TOKEN_()). The marginal is post-fee
+  // (buildDodoSegments nets the LP+MT fee), so it competes in the merge directly.
+  const dodos: EcoDodo[] = [];
+  const dodoBracketSets: EcoBracket[][] = [];
+  const dodoZoos = poolConfig.factories.filter((f) => f.factoryType === FactoryType.DODOZoo);
+  if (dodoZoos.length > 0) {
+    const dodoRaw = await discoverDodoV2PoolsTyped(tokenIn, tokenOut, client, dodoZoos, caller);
+    for (const d of dodoRaw) {
+      const refIdx = dodos.length;
+      const db = buildDodoBrackets(d, refIdx, amountIn);
+      if (db.length === 0) continue;
+      dodos.push({
+        address: d.address,
+        sellBase: d.sellBase,
+        feePpm: d.feePpm,
+        source: `${d.source} (DODO V2)`,
+      });
+      dodoBracketSets.push(db);
+    }
+  }
+  for (const set of dodoBracketSets) brackets.push(...set);
 
   // Routes (sampled). Keep the deepest few. Segments composed via localQuote.
   const routes: EcoRoute[] = [];
@@ -801,7 +1046,13 @@ export async function prepareEcoSwap(
   // solver reconstructs everything LIVE from each pool's spot read even with no cache (the
   // 1-RPC quote path, opts.maxTicks:0). So an empty universe (no pools AND no routes) is the
   // only error.
-  if (pools.length === 0 && routes.length === 0) {
+  if (
+    pools.length === 0 &&
+    routes.length === 0 &&
+    curves.length === 0 &&
+    lbs.length === 0 &&
+    dodos.length === 0
+  ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
 
@@ -821,16 +1072,25 @@ export async function prepareEcoSwap(
 
   const nV4 = pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
   const nV3 = pools.filter((p) => p.poolType === SwapPoolType.UniV3).length;
-  const nV2 = pools.filter((p) => p.isV2).length;
+  const nKyber = pools.filter((p) => p.isKyber).length;
+  const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const netRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
+  const nCurveSegs = brackets.filter((b) => b.kind === EcoBracketKind.Curve).length;
+  const nLbSegs = brackets.filter((b) => b.kind === EcoBracketKind.LB).length;
+  const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
   console.log(
-    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2, ${routes.length} routes, ` +
-      `${netRows} net-cache rows (direct pools walked live), ${brackets.length} route segments`,
+    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2, ${nKyber} Kyber, ${curves.length} Curve, ` +
+      `${lbs.length} LB, ${dodos.length} DODO, ${routes.length} routes, ${netRows} net-cache rows ` +
+      `(direct pools walked live), ${brackets.length} static segments ` +
+      `(${nCurveSegs} Curve, ${nLbSegs} LB, ${nDodoSegs} DODO)`,
   );
 
   return {
     pools,
     routes,
+    curves,
+    lbs,
+    dodos,
     brackets,
     zeroForOne,
     priceLimit,

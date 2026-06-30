@@ -1,0 +1,50 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "globalState",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        { "name": "price", "type": "uint160" },
+        { "name": "tick", "type": "int24" },
+        { "name": "feeZto", "type": "uint16" },
+        { "name": "feeOtz", "type": "uint16" },
+        { "name": "timepointIndex", "type": "uint16" },
+        { "name": "communityFeeToken0", "type": "uint8" },
+        { "name": "communityFeeToken1", "type": "uint8" },
+        { "name": "unlocked", "type": "bool" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "liquidity",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "uint128" }]
+    },
+    {
+      "type": "function",
+      "name": "tickSpacing",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "int24" }]
+    },
+    {
+      "type": "function",
+      "name": "ticks",
+      "stateMutability": "view",
+      "inputs": [{ "name": "tick", "type": "int24" }],
+      "outputs": [
+        { "name": "liquidityTotal", "type": "uint128" },
+        { "name": "liquidityDelta", "type": "int128" },
+        { "name": "outerFeeGrowth0Token", "type": "uint256" },
+        { "name": "outerFeeGrowth1Token", "type": "uint256" },
+        { "name": "outerTickCumulative", "type": "int56" },
+        { "name": "outerSecondsPerLiquidity", "type": "uint160" },
+        { "name": "outerSecondsSpent", "type": "uint32" },
+        { "name": "initialized", "type": "bool" }
+      ]
+    }
+  ]
+}
