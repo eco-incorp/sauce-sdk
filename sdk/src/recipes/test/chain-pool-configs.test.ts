@@ -5,7 +5,8 @@
  * checksummed 20-byte 0x string, poolType/factoryType are valid enum members,
  * any stateView is a checksummed 20-byte 0x string, baseTokens is non-empty and
  * all checksummed, and feeTiers is a non-empty list of positive ints. Guards the
- * newly-added chains (bsc, sonic) against silent address/enum drift.
+ * newly-added chains (bsc, sonic, celo, ink, plasma, hyperevm) against silent
+ * address/enum drift.
  *
  * Run: npx tsx --test src/recipes/test/chain-pool-configs.test.ts
  */
@@ -26,7 +27,9 @@ const FACTORY_TYPE_VALUES = new Set(Object.values(FactoryType));
 // Chains added/owned by this test — enforce strict EIP-55 checksums here. The older
 // pre-existing chains carry some non-checksummed (but valid) addresses, so for those we
 // only assert the 20-byte 0x format.
-const STRICT_CHECKSUM_CHAINS = new Set(["bsc", "sonic"]);
+const STRICT_CHECKSUM_CHAINS = new Set([
+  "bsc", "sonic", "celo", "ink", "plasma", "hyperevm",
+]);
 
 function assertAddrFormat(addr: Hex, where: string): void {
   assert.match(addr, /^0x[0-9a-fA-F]{40}$/, `${where}: not a 20-byte 0x address (${addr})`);
@@ -83,5 +86,9 @@ describe("CHAIN_POOL_CONFIGS shape", () => {
   it("includes the newly-added chains", () => {
     assert.ok(CHAIN_POOL_CONFIGS.bsc, "bsc config present");
     assert.ok(CHAIN_POOL_CONFIGS.sonic, "sonic config present");
+    assert.ok(CHAIN_POOL_CONFIGS.celo, "celo config present");
+    assert.ok(CHAIN_POOL_CONFIGS.ink, "ink config present");
+    assert.ok(CHAIN_POOL_CONFIGS.plasma, "plasma config present");
+    assert.ok(CHAIN_POOL_CONFIGS.hyperevm, "hyperevm config present");
   });
 });

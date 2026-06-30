@@ -425,6 +425,89 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     ],
     feeTiers: [100, 500, 3000, 10000],
   },
+
+  // Celo (chainId 42220). CELO (native ERC20, 18 dec) is the routing hub, not a tradeable stable.
+  celo: {
+    factories: [
+      // V3 concentrated liquidity (has price limit). Standard Uniswap V3 fee tiers.
+      { address: "0xAfE208a311B21f13EF87E33A90049fC17A7acDEc" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
+      // V4 singleton (PoolManager + StateView lens). V4 is dynamic-fee/tickSpacing-keyed.
+      { address: "0x288dc841A52FCA2707c6947B3A777c5E56cd87BC" as Hex, stateView: "0xbc21f8720BABf4b20d195eE5C6e99c52b76F2bfb" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
+      // Velodrome V2 (Solidly volatile + stable pools). Canonical Superchain Leaf PoolFactory.
+      { address: "0x31832f2a97Fd20664D76Cc421207669b55CE4BC0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Velodrome V2" },
+      // NOTE: Velodrome CL (concentrated-liquidity) factory 0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F
+      // is NOT added — it keys getPool by TICK SPACING, not fee, so the V3Standard fee-tier discovery
+      // would not enumerate its pools (same latent gap as the arbitrum Ramses / Sonic Shadow CL entries).
+    ],
+    baseTokens: [
+      "0x471EcE3750Da237f93B8E339c536989b8978a438" as Hex, // CELO (native ERC20, routing hub, 18 dec)
+      "0xcebA9300f2b948710d2653dD7B07f33A8B32118C" as Hex, // USDC (Circle native, 6 dec)
+      "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e" as Hex, // USDT (Tether native)
+      "0x765DE816845861e75A25fCA122bb6898B8B1282a" as Hex, // cUSD (Mento Dollar)
+      "0x1217BfE6c773EEC6cc4A38b5Dc45B92292B6E189" as Hex, // oUSDT (OpenUSDT)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
+
+  // Ink (OP-stack L2, chainId 57073). WETH (wrapped native) is the routing hub.
+  ink: {
+    factories: [
+      // V3 concentrated liquidity (has price limit). Ink uses a distinct V3 factory deployer.
+      { address: "0x640887A9ba3A9C53Ed27D0F7e8246A4F933f3424" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
+      // Velodrome V2 (Solidly volatile + stable pools).
+      { address: "0x31832f2a97Fd20664D76Cc421207669b55CE4BC0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Velodrome V2 (Solidly)" },
+      // Velodrome Slipstream CL (Ramses V3 / UniV3-style) — slot0 state. NOTE: this Slipstream CL
+      // factory keys getPool by TICK SPACING, not fee, so V3Standard fee-tier discovery will not find
+      // its pools (same latent gap as the arbitrum Ramses / Sonic Shadow CL entries). Kept for the
+      // pattern; a future tickSpacing-keyed discovery fix lights it up.
+      { address: "0x718E46d0962A66942E233760a8bd6038Ce54EdCD" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Velodrome Slipstream CL", feeTiers: [100, 500, 3000, 10000] },
+    ],
+    baseTokens: [
+      "0x4200000000000000000000000000000000000006" as Hex, // WETH (OP-stack predeploy, routing hub)
+      "0x2D270e6886d130D724215A266106e6832161EAEd" as Hex, // USDC (canonical native, 6 dec)
+      "0xF1815bd50389c46847f0Bda824eC8da914045D14" as Hex, // USDC.e (Stargate bridged, 6 dec)
+      "0x0200C29006150606B650577BBE7B6248F58470c1" as Hex, // USDT0 (LayerZero OFT USDT, 6 dec)
+      "0xe343167631d89B6Ffc58B88d6b7fB0228795491D" as Hex, // USDG (Global Dollar, 6 dec)
+      "0x1217BfE6c773EEC6cc4A38b5Dc45B92292B6E189" as Hex, // oUSDT (OpenUSDT, 6 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
+
+  // Plasma (chainId 9745). WXPL (wrapped native) is the routing hub. No Uniswap V4 deployment.
+  plasma: {
+    factories: [
+      // V3 concentrated liquidity (has price limit). Standard Uniswap V3 fee tiers.
+      { address: "0xcb2436774C3e191c85056d248EF4260ce5f27A9D" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
+      // Curve — discovery via the Metaregistry (find_pool_for_coins / get_coin_indices / get_n_coins),
+      // NOT the StableSwap Factory 0x8271e06E... (which implements a different interface the
+      // CurveRegistry reader does not call). Stable-stable pools (USDT0/USDe verified).
+      { address: "0xe6dA14500f0b5783E2325F9C5a7eE5d99DA0fB42" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
+    ],
+    baseTokens: [
+      "0x6100E367285b01F48D07953803A2d8dCA5D19873" as Hex, // WXPL (wrapped native, routing hub, 18 dec)
+      "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb" as Hex, // USDT0 (primary stablecoin, 6 dec)
+      "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34" as Hex, // USDe (Ethena synthetic dollar, 18 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
+
+  // HyperEVM (chainId 999). WHYPE (wrapped native) is the routing hub. No V4 / no verified Curve registry.
+  hyperevm: {
+    factories: [
+      // HyperSwap V3 concentrated liquidity (has price limit). Standard Uniswap V3 fee tiers
+      // (NOT Pancake's 2500 — feeAmountTickSpacing(2500)=0).
+      { address: "0xB1c0fa0B789320044A6F623cFe5eBda9562602E3" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "HyperSwap V3", feeTiers: [100, 500, 3000, 10000] },
+      // HyperSwap V2 constant-product (canonical 0.30% fee, UniswapV2 fork — no v2FeePpm override).
+      { address: "0x724412C00059bf7d6ee7d4a1d0D5cd4de3ea1C48" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "HyperSwap V2" },
+    ],
+    baseTokens: [
+      "0x5555555555555555555555555555555555555555" as Hex, // WHYPE (wrapped native, routing hub, 18 dec)
+      "0xb88339CB7199b77E23DB6E890353E22632Ba630f" as Hex, // USDC (Circle native, 6 dec)
+      "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb" as Hex, // USDT0 (Tether OFT, 6 dec)
+      "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34" as Hex, // USDe (Ethena, 18 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
 };
 
 // ── Infrastructure ───────────────────────────────────────────
