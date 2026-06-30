@@ -372,6 +372,59 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     ],
     feeTiers: [100, 500, 3000, 10000],
   },
+
+  // BSC (chainId 56). Note: BSC USDC/USDT are 18 decimals (Binance-Peg), not 6.
+  bsc: {
+    factories: [
+      // V3 concentrated liquidity. Pancake's medium tier is 2500 (0.25%) on BSC, not 3000.
+      { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
+      // V2 constant-product. Pancake V2 charges 0.20% (2000 ppm), not the 0.30% default.
+      { address: "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2", v2FeePpm: 2000 },
+      // Solidly V2 (volatile + stable pools)
+      { address: "0x27DfD2D7b85e0010542da35C6EBcD59E45fc949D" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Thena (Solidly fork)" },
+      // PancakeSwap StableSwap (Curve-like A-invariant). NOTE: discovery interface is
+      // getPairInfo/getThreePoolPairInfo, NOT Curve's find_pool_for_coins — the CurveRegistry
+      // reader in pool-discovery.ts needs a Pancake-StableSwap branch before it enumerates pools,
+      // and execution is not in the engine's _swapCurve dispatch. Authoritatively verified address;
+      // included but NOT drop-in (needs-integration-work).
+      { address: "0x25a55f9f2279A54951133D503490342b50E5cd15" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "PancakeSwap StableSwap" },
+      // Wombat Exchange (single-sided stableswap, callback-free). Discovered via the TYPED
+      // FactoryType.Wombat path (addressOfAsset + per-asset cash/liability + ampFactor/haircutRate),
+      // so poolType is unused here — UniV2 is a benign placeholder. Address is the Wombat Main Pool.
+      { address: "0x312Bc7eAAF93f1C60Dc5AfC115FcCDE161055fb0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Wombat, label: "Wombat" },
+    ],
+    baseTokens: [
+      "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Hex, // WBNB
+      "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d" as Hex, // USDC (Binance-Peg, 18 dec)
+      "0x55d398326f99059fF775485246999027B3197955" as Hex, // USDT (BSC-USD, 18 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
+
+  // Sonic (chainId 146). wS (wrapped native) included as a routing hub, not a stablecoin.
+  sonic: {
+    factories: [
+      // SwapX (Algebra Integral CL) — dynamic fee, poolByPair + globalState.
+      { address: "0x8121a3F8c4176E9765deEa0B95FA2BDfD3016794" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "SwapX (Algebra Integral CL)" },
+      // Shadow Exchange CL (Ramses V3 / UniV3-style) — slot0 state. NOTE: this Ramses/Shadow-family
+      // factory keys getPool by TICK SPACING, not fee, so V3Standard fee-tier discovery will not find
+      // its pools (same latent gap as the arbitrum Ramses V3 / Chronos entries). Kept for the pattern;
+      // a future tickSpacing-keyed discovery fix lights it up.
+      { address: "0xcD2d0637c94fe77C2896BbCBB174cefFb08DE6d7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Shadow Exchange CL (Ramses V3)" },
+      // SwapX Classic (Solidly ve(3,3), stable + volatile)
+      { address: "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "SwapX Classic (Solidly)" },
+      // Shadow Exchange Legacy (Solidly PairFactory, stable + volatile)
+      { address: "0x2dA25E7446A70D7be65fd4c053948BEcAA6374c8" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Shadow Exchange Legacy (Solidly)" },
+      // Beets (Beethoven X) — canonical cross-chain Balancer V2 Vault.
+      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Beets (Balancer V2 Vault)" },
+    ],
+    baseTokens: [
+      "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38" as Hex, // wS (wrapped Sonic, native)
+      "0x29219dd400f2Bf60E5a23d13Be72B486D4038894" as Hex, // USDC.e / USDC (bridged, 6 dec; one address)
+      "0x6047828dc181963ba44974801FF68e538dA5eaF9" as Hex, // USDT (bridged, 6 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
 };
 
 // ── Infrastructure ───────────────────────────────────────────

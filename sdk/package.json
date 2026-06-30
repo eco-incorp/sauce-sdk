@@ -48,7 +48,7 @@
     "build": "tsc && node scripts/copy-recipe-assets.mjs",
     "typecheck": "tsc --noEmit",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.config.cjs",
-    "test:recipes": "tsx --test src/recipes/test/compile.test.ts src/recipes/test/ecoswap.compile.test.ts src/recipes/test/ecoswap.math.test.ts src/recipes/test/ecoswap.optimal.test.ts src/recipes/test/ecoswap.solver-reference.test.ts src/recipes/test/ecoswap.algebra.test.ts src/recipes/test/ecoswap.lb.test.ts src/recipes/test/ecoswap.dodo.test.ts",
+    "test:recipes": "tsx --test src/recipes/test/compile.test.ts src/recipes/test/ecoswap.compile.test.ts src/recipes/test/ecoswap.math.test.ts src/recipes/test/ecoswap.optimal.test.ts src/recipes/test/ecoswap.solver-reference.test.ts src/recipes/test/ecoswap.algebra.test.ts src/recipes/test/ecoswap.lb.test.ts src/recipes/test/ecoswap.dodo.test.ts src/recipes/test/chain-pool-configs.test.ts",
     "test:recipes:evm": "bash src/recipes/test/fixtures/build.sh && tsx --test --test-concurrency=1 src/recipes/test/*.evm.test.ts"
   },
   "dependencies": {
