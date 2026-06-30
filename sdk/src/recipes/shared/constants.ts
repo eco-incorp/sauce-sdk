@@ -58,20 +58,16 @@ export enum FactoryType {
    * so a PRICE/split computed against an Algebra pool is wei-exact vs the V3 oracle at that fee.
    * The on-chain LENS reads this family directly (see ecoswap.lens.sauce.ts `algebraFactories`).
    *
-   * EXECUTION IS NOT SUPPORTED BY THE CURRENT ENGINE. An Algebra pool's `swap()` has the
-   * Uniswap-V3 selector (same 5 params: recipient, zeroToOne, amountRequired, limitSqrtPrice,
-   * data), so the Router's `v3Pool.swap(...)` call dispatches — but mid-swap the pool re-enters
-   * the caller via `algebraSwapCallback(int256,int256,bytes)`, a DIFFERENT selector than the
-   * `uniswapV3SwapCallback`/`pancakeV3SwapCallback` the engine implements. The Router has no
-   * `algebraSwapCallback` handler and no `fallback()` (only a payable `receive()`), so the
-   * re-entry hits an unknown selector and the whole `cook()` reverts. (Evidence: the pinned
-   * `sauce` engine Router.sol — callbacks at uniswapV3SwapCallback / pancakeV3SwapCallback /
-   * unlockCallback / maverickV2SwapCallback only; `_swapV3` calls the Uniswap `swap` ABI.)
-   * Executing Algebra needs an engine PR adding an `algebraSwapCallback` external that reuses
-   * the transient-context pull logic — the SAME bucket as KyberSwap Elastic. Until then Algebra
-   * is DISCOVER + PRICE ONLY: the discovery/lens layers DROP Algebra pools from the executable
-   * set so the recipe never tries to swap a pool it cannot (see `discoverAlgebraPools` and
-   * `runLens`'s `includeAlgebra` gate). See LIQUIDITY_SOURCES_FEASIBILITY.md §3.
+   * EXECUTION IS SUPPORTED. An Algebra pool's `swap()` has the Uniswap-V3 selector (same 5
+   * params: recipient, zeroToOne, amountRequired, limitSqrtPrice, data), so the Router's
+   * `v3Pool.swap(...)` call in `_swapV3` dispatches; mid-swap the pool re-enters the caller via
+   * `algebraSwapCallback(int256,int256,bytes)`, and the engine NOW implements that selector — a
+   * mirror of `uniswapV3SwapCallback`/`pancakeV3SwapCallback` that routes to `_handleV3Callback`
+   * (sauce#186; the SDK engine pin was bumped to `feat/engine-algebra-swap-callback`). So an
+   * Algebra pool routes as UniV3 / `swapV3` and the mid-swap input pull is serviced exactly like
+   * a Uniswap-V3 swap. The discovery/lens layers INCLUDE Algebra pools in the executable set (see
+   * `discoverAlgebraPools` and `runLens`'s `includeAlgebra`, default on).
+   * See LIQUIDITY_SOURCES_FEASIBILITY.md §3.
    *
    * NOTE: `Algebra` is a backward-compatible alias of this value (`= AlgebraV3`); both refer
    * to the same dynamic-fee globalState reader.
@@ -208,13 +204,13 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Aerodrome CL" },
     { address: "0x71524B4f93c58fcbF659783284E38825f0622859" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
     { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
-    // Algebra dynamic-fee (V3-shaped; poolByPair + globalState). DISCOVER + PRICE ONLY — the
-    // engine cannot EXECUTE an Algebra swap (it calls algebraSwapCallback, which the Router does
-    // not implement; see FactoryType.AlgebraV3). PLACEHOLDER address — Base had no canonical
-    // Algebra deployment at authoring; the TYPE + globalState reader are wired so a real Base
-    // Algebra fork drops in by address alone (it will still be DROPPED from the executable set
-    // until an engine algebraSwapCallback handler lands). The arbitrum (Camelot V3, Ramses V2)
-    // and polygon (QuickSwap V3) configs below carry REAL Algebra factories on this same type.
+    // Algebra dynamic-fee (V3-shaped; poolByPair + globalState). EXECUTABLE — the engine now
+    // implements algebraSwapCallback (sauce#186), so an Algebra pool routes as UniV3 / swapV3 and
+    // the mid-swap input pull is serviced (see FactoryType.AlgebraV3). PLACEHOLDER address — Base
+    // had no canonical Algebra deployment at authoring; the TYPE + globalState reader are wired so
+    // a real Base Algebra fork drops in by address alone (it will then be discovered, priced AND
+    // executed). The arbitrum (Camelot V3, Ramses V2) and polygon (QuickSwap V3) configs below
+    // carry REAL Algebra factories on this same type.
     { address: "0x0000000000000000000000000000000000000000" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Algebra (placeholder)" },
     // V4 singleton (PoolManager + StateView lens)
     { address: UNISWAP_V4_POOL_MANAGER, stateView: UNISWAP_V4_STATE_VIEW, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4" },

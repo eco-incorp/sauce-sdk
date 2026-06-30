@@ -277,17 +277,17 @@ async function discoverV3Pools(
   return pools;
 }
 
-// ── Algebra V3 discovery (DISCOVER + PRICE ONLY — see discoverPools gate) ──────
+// ── Algebra V3 discovery (EXECUTABLE) ─────────────────────────────────────────
 //
 // Algebra forks (Camelot/QuickSwap V3, Ramses V2) are V3-shaped, so their state reads
 // (globalState() → price/tick/dynamic-fee) map cleanly onto a UniV3 PoolInfo and PRICE
-// wei-exact against the V3 oracle. But the CURRENT engine cannot EXECUTE an Algebra swap:
-// the pool re-enters via algebraSwapCallback(int256,int256,bytes), a selector the Router
-// does not implement (it has only uniswapV3SwapCallback/pancakeV3SwapCallback + no
-// fallback), so a cook() that routes a slice into an Algebra pool reverts. This reader is
-// therefore PRICE-ONLY and is intentionally NOT wired into discoverPools (which feeds the
-// executable set); see the gate there + FactoryType.AlgebraV3 + LIQUIDITY_SOURCES_FEASIBILITY.md
-// §3. Retained for a future price-only consumer / when an engine algebraSwapCallback lands.
+// wei-exact against the V3 oracle. The engine now EXECUTES an Algebra swap as well: the
+// pool re-enters via algebraSwapCallback(int256,int256,bytes), and the Router implements
+// that selector (a mirror of uniswapV3/pancakeV3 callbacks → _handleV3Callback) as of
+// sauce#186. An Algebra pool's swap() is selector-identical to Uniswap V3, so _swapV3
+// drives it and the new callback services the mid-swap input pull — so Algebra pools are
+// INCLUDED in the executable set returned by discoverPools. See FactoryType.AlgebraV3 +
+// LIQUIDITY_SOURCES_FEASIBILITY.md §3.
 
 async function discoverAlgebraPools(
   tokenIn: Hex,
@@ -1552,22 +1552,12 @@ export async function discoverPools(
     discoverWOOFiPools(tokenIn, tokenOut, client, woofiConfigs),
   ]);
 
-  // EXECUTION GATE — Algebra is DISCOVER + PRICE ONLY (not cookable on the current engine):
-  // the pool re-enters via algebraSwapCallback, which the Router does not service, so any
-  // route that lands a slice in an Algebra pool reverts. `algebraPools` is read (for the
-  // discovery diagnostic below) but DELIBERATELY EXCLUDED from the executable set returned
-  // to the recipes. See discoverAlgebraPools' header + FactoryType.AlgebraV3 +
-  // LIQUIDITY_SOURCES_FEASIBILITY.md §3. Remove this exclusion once an engine
-  // algebraSwapCallback handler ships.
-  if (algebraPools.length > 0) {
-    console.log(
-      `  discovery: ${algebraPools.length} Algebra pool(s) found but NOT executable on the ` +
-        `current engine (no algebraSwapCallback handler) — excluded from routing`,
-    );
-  }
-
+  // Algebra pools are EXECUTABLE: the engine implements algebraSwapCallback (sauce#186), so
+  // a pool surfaced as a UniV3 row is cooked via swapV3 and the mid-swap input pull is
+  // serviced. They are INCLUDED in the executable set returned to the recipes. See
+  // discoverAlgebraPools' header + FactoryType.AlgebraV3 + LIQUIDITY_SOURCES_FEASIBILITY.md §3.
   return [
-    ...v3Pools, ...v4Pools, ...v2Pools, ...solidlyV2Pools,
+    ...v3Pools, ...v4Pools, ...algebraPools, ...v2Pools, ...solidlyV2Pools,
     ...curvePools, ...balancerPools, ...dodoPools, ...traderJoePools,
     ...maverickPools, ...woofiPools,
   ];

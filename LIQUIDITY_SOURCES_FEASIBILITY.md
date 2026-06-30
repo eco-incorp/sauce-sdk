@@ -24,8 +24,8 @@ EcoSwap's core machinery this report repeatedly reuses:
 | **Uniswap V3 family** (Uni/Pancake V3, Aerodrome/Velodrome CL, Sushi V3, Ramses/Chronos CL) | tractable-now | callback (router) | dispatched + verified | yes (in `ecoswap.sauce.ts`) | yes (`v3Segments`) | S |
 | **Uniswap V2 family @ 0.30%** (Uni/Pancake/BaseSwap V2, Solidly volatile @ 30bps) | tractable-now | callback-free | dispatched + verified | yes (in `ecoswap.sauce.ts`) | yes (`v2Segments`) | S |
 | **Uniswap V4** | tractable-now | callback (router) | dispatched + verified | yes | yes | S |
-| **Algebra forks** (Camelot/QuickSwap V3, Ramses V2) — *discover+price* | tractable-now | callback (`algebraSwapCallback`) | price only (`globalState()` read) | n/a (price path reuses V3 read) | yes (V3 oracle + dynamic-fee source) | M |
-| **Algebra forks** — *execution* | needs-engine-change | callback (`algebraSwapCallback`, NOT serviced) | NOT dispatched (revert on callback) | no | n/a (cannot land a swap) | L |
+| **Algebra forks** (Camelot/QuickSwap V3, Ramses V2) — *discover+price* | tractable-now | callback (`algebraSwapCallback`) | priced (`globalState()` read) | n/a (price path reuses V3 read) | yes (V3 oracle + dynamic-fee source) | M |
+| **Algebra forks** — *execution* | tractable-now | callback (`algebraSwapCallback`, serviced as of sauce#186) | dispatched (`_swapV3` + `algebraSwapCallback` → `_handleV3Callback`) | yes (routes as UniV3 / `swapV3`) | yes (V3 oracle at the dynamic fee) | S |
 | **V2-class @ non-0.30% fee** (Solidly volatile, some Sushi tiers) | tractable-now | callback-free | `_swapV2` hardcodes 0.30% — bypass in SauceScript | yes | yes (per-pool fee threaded) | M |
 | **KyberSwap Classic (DMM)** | tractable-now | callback-free | `_swapV2` unusable (virtual reserves + per-pool fee); do in SauceScript | yes (V2 on virtual reserves) | yes (constant-L on vReserves) | S–M |
 | **Curve StableSwap + StableSwap-NG (plain)** | tractable-now | callback-free | dispatched (`_swapCurve`, int128) | execute via engine; do NOT recompute on-chain | exact-in-`dy`, split exact-on-grid (bounded, tunable) | M |
@@ -88,18 +88,23 @@ one EVM mix + a `kyberClassicDy` known-answer block.
 
 ### Tier B — M-effort add-ons (reuse the sampled-segment / route machinery)
 
-**4. Algebra dynamic-fee forks — DISCOVER + PRICE only (M).** Camelot/QuickSwap V3, Ramses V2 are V3-shaped,
-so their state reads map onto a `poolType=UniV3` row, but they read `globalState()` (not `slot0()`) and carry
-a **dynamic fee**. **Integration (price)**: a state-reader variant in the lens for `globalState()` + a fee
-source; the V3 oracle is otherwise reused unchanged. The fee is read once at quote time and treated as fixed
-over the trade (same snapshot assumption the recipe already makes for V3 tiers), so a PRICE/split computed
-against an Algebra pool stays wei-exact against that snapshot. This half is done and pinned by
-`ecoswap.algebra.test.ts` (decode + oracle vectors). **EXECUTION is a separate, engine-blocked item** — see
-§3 "Algebra forks — execution". Because the lens emits Algebra as a `poolType=UniV3` row that prepare would
-otherwise cook via `swapV3` (→ revert on the unserviced `algebraSwapCallback`), the discovery + lens layers
-**gate Algebra out of the executable set**: `discoverPools` drops Algebra pools, and `runLens` defaults
-`includeAlgebra=false` (Algebra factories are not fed to the lens program). Flip the gate once the engine PR
-below lands.
+**4. Algebra dynamic-fee forks — SUPPORTED (discover + price + execute) (M).** Camelot/QuickSwap V3, Ramses V2
+are V3-shaped, so their state reads map onto a `poolType=UniV3` row, but they read `globalState()` (not
+`slot0()`) and carry a **dynamic fee**. **Integration (price)**: a state-reader variant in the lens for
+`globalState()` + a fee source; the V3 oracle is otherwise reused unchanged. The fee is read once at quote time
+and treated as fixed over the trade (same snapshot assumption the recipe already makes for V3 tiers), so a
+PRICE/split computed against an Algebra pool stays wei-exact against that snapshot — pinned by
+`ecoswap.algebra.test.ts` (decode + oracle vectors). **EXECUTION is now also supported** (see §3 "Algebra forks
+— execution"): the engine implements `algebraSwapCallback` (sauce#186), so the lens emits Algebra as a
+`poolType=UniV3` row, prepare cooks it via `swapV3`, and the mid-swap re-entry is serviced. The discovery + lens
+layers therefore **include Algebra in the executable set**: `discoverPools` returns Algebra pools, and `runLens`
+defaults `includeAlgebra=true` (Algebra factories ARE fed to the lens program). The end-to-end wei-exact
+round-trip — a local `AlgebraPool.sol` fixture (an adapter over a genuine Uniswap V3 pool that exposes
+`globalState()`/`liquidity()`/`tickSpacing()`/`ticks()` and re-enters via `algebraSwapCallback`) discovered,
+priced, and COOKED through the engine on BOTH v1 and v12, with per-pool input wei-exact against the V3 oracle at
+the dynamic fee — is `ecoswap.algebra.evm.test.ts`. (Surfacing this also fixed a latent lens bug: the per-pool
+tick read called `slot0()` unconditionally — which reverts on a real `slot0()`-less Algebra pool — and indexed
+`globalState()` through a stored variable, which reverts on v1; both are now branched/inlined.)
 
 **5. Curve StableSwap + StableSwap-NG, plain pools (M).** `_swapCurve` is live (int128 indices). **Do NOT
 recompute the curve on-chain** (two nested Newton loops are fragile under the compiler/v12 budget). Execute
@@ -135,25 +140,17 @@ Each item here needs work in the **private `../sauce` engine repo** (a new dispa
 `SwapPoolType` enum value added in lockstep with `shared/constants.ts`), or has a structural property that
 defeats the wei-exact charter.
 
-**Algebra forks — execution needs an engine `algebraSwapCallback` handler.**
-- *Discover + price is tractable now* (§2.4, done). Only EXECUTION is blocked.
-- Engine: Algebra's pool `swap(address recipient, bool zeroToOne, int256 amountRequired, uint160
-  limitSqrtPrice, bytes data)` is **selector-identical to Uniswap V3**, so `_swapV3`'s
-  `IUniswapV3Pool(pool).swap(...)` dispatches fine to an Algebra pool. The blocker is the **callback**: mid-swap
-  the pool re-enters the caller via `algebraSwapCallback(int256,int256,bytes)` to pull input — a *different
-  selector* than the `uniswapV3SwapCallback`/`pancakeV3SwapCallback` the Router implements. The Router has **no
-  `algebraSwapCallback` handler and no `fallback()`** (only `receive() external payable {}`), so the re-entry
-  reverts and the whole `cook()` reverts. (Evidence: pinned `sauce` engine `engine/src/Router.sol` — callbacks
-  at `uniswapV3SwapCallback` L328 / `pancakeV3SwapCallback` L338 / `unlockCallback` L487 / `maverickV2SwapCallback`
-  L1168 only; `receive()` L71, no fallback; `_swapV3` L271 uses the Uniswap `swap` ABI.)
-- Fix: a one-line engine addition — `function algebraSwapCallback(int256 a0, int256 a1, bytes calldata)
-  external { _handleV3Callback(a0, a1); }` (the transient-context auth + pull logic is already factored into
-  `_handleV3Callback`, identical to the Uniswap/Pancake callbacks). No new `SwapPoolType`, no curve work — Algebra
-  reuses the V3 dispatch and walk verbatim. This is the SAME shape as the Kyber Elastic callback gap, but far
-  smaller (Kyber also needs a from-scratch reinvestment curve + a non-Uniswap swap ABI; Algebra needs only the
-  callback selector).
-- This-repo gate until then: `discoverPools` excludes Algebra; `runLens` defaults `includeAlgebra=false` — so the
-  recipe never routes a slice into an Algebra pool it cannot land. Flip both once the engine handler ships.
+**Algebra forks — RESOLVED (execution now supported, moved out of this section).**
+- Discover + price + EXECUTE are all tractable now (see §2.4). Algebra's pool `swap(address recipient, bool
+  zeroToOne, int256 amountRequired, uint160 limitSqrtPrice, bytes data)` is **selector-identical to Uniswap V3**,
+  so `_swapV3`'s `IUniswapV3Pool(pool).swap(...)` dispatches fine to an Algebra pool. The mid-swap re-entry via
+  `algebraSwapCallback(int256,int256,bytes)` is now serviced: the engine implements that external as a mirror of
+  `uniswapV3SwapCallback`/`pancakeV3SwapCallback`, routing to the shared `_handleV3Callback` (transient-context
+  auth + input pull) — shipped in sauce#186 (`feat/engine-algebra-swap-callback`, the SDK's pinned engine). No new
+  `SwapPoolType`, no curve work — Algebra reuses the V3 dispatch and walk verbatim.
+- This-repo state: `discoverPools` INCLUDES Algebra in the executable set; `runLens` defaults
+  `includeAlgebra=true` (Algebra factories are fed to the lens program). The recipe routes an Algebra slice as
+  UniV3 / `swapV3`.
 
 **KyberSwap Elastic — needs engine PR + a from-scratch wei-exact curve.**
 - Engine: no `swapCallback(int256 deltaQty0, int256 deltaQty1, bytes)` handler (Router only has

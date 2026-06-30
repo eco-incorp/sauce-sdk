@@ -344,9 +344,14 @@ function main(
         if (isAlgA3 === 1) {
           poolA3 = IAlgebraFactory.at(factoryA3).poolByPair(tokenIn, tokenOut);
           if (poolA3 !== 0) {
-            const gsA3: Tuple = IAlgebraPool.at(poolA3).globalState();
-            sqrtA3 = gsA3[0];
-            feeA3 = zeroForOne === 1 ? gsA3[2] : gsA3[3];
+            // Index globalState() DIRECTLY on each call (NOT via a stored Tuple var): the v1
+            // engine reverts SauceInvalidOperationArgs(INDEX) when a contract-return tuple is
+            // round-tripped through a variable and then indexed (the descriptor is lost). The
+            // standard-V3 path already indexes slot0() inline; mirror that for Algebra.
+            sqrtA3 = IAlgebraPool.at(poolA3).globalState()[0];
+            feeA3 = zeroForOne === 1
+              ? IAlgebraPool.at(poolA3).globalState()[2]
+              : IAlgebraPool.at(poolA3).globalState()[3];
             stepA3 = algStepA3;
           }
         } else {
@@ -363,9 +368,14 @@ function main(
             if (isAlgA3 === 1) {
               tsA3 = algTsA3;
             }
-            let tickA3: Uint256 = IUniswapV3PoolFull.at(poolA3).slot0()[1];
+            // Tick from globalState (Algebra) or slot0 (standard V3). A real Algebra pool has NO
+            // slot0(), so the read MUST branch on isAlg — calling slot0() on an Algebra pool would
+            // revert the whole lens. (Standard V3 keeps its slot0()[1] read verbatim.)
+            let tickA3: Uint256 = 0;
             if (isAlgA3 === 1) {
               tickA3 = IAlgebraPool.at(poolA3).globalState()[1];
+            } else {
+              tickA3 = IUniswapV3PoolFull.at(poolA3).slot0()[1];
             }
             const baseA3: Uint256 = ((tickA3 + OFFSET) / tsA3) * tsA3;
             let curA3: Uint256 = baseA3;
@@ -571,9 +581,12 @@ function main(
       if (isAlgM === 1) {
         poolM = IAlgebraFactory.at(factoryM).poolByPair(tokenIn, tokenOut);
         if (poolM !== 0) {
-          const gsM: Tuple = IAlgebraPool.at(poolM).globalState();
-          sqrtM = gsM[0];
-          feeM = zeroForOne === 1 ? gsM[2] : gsM[3];
+          // Index globalState() DIRECTLY (NOT via a stored Tuple var) — the v1 engine reverts
+          // INDEX on a variable-round-tripped contract-return tuple (see the discovery pass).
+          sqrtM = IAlgebraPool.at(poolM).globalState()[0];
+          feeM = zeroForOne === 1
+            ? IAlgebraPool.at(poolM).globalState()[2]
+            : IAlgebraPool.at(poolM).globalState()[3];
           stepM = algStepM;
         }
       } else {
@@ -590,9 +603,13 @@ function main(
             if (isAlgM === 1) {
               tsM = algTsM;
             }
-            let tickM: Uint256 = IUniswapV3PoolFull.at(poolM).slot0()[1];
+            // Tick from globalState (Algebra) or slot0 (standard V3) — a real Algebra pool has no
+            // slot0(), so branch on isAlg (calling slot0() on Algebra would revert the lens).
+            let tickM: Uint256 = 0;
             if (isAlgM === 1) {
               tickM = IAlgebraPool.at(poolM).globalState()[1];
+            } else {
+              tickM = IUniswapV3PoolFull.at(poolM).slot0()[1];
             }
             // IN-RANGE capacity walk — byte-for-byte the PASS-2 floor / PASS-3
             // forward walk body (same stepReal/toOutIn/feeAdj, same int128 sign
@@ -832,9 +849,12 @@ function main(
       if (isAlg3 === 1) {
         poolAddr3 = IAlgebraFactory.at(factory3).poolByPair(tokenIn, tokenOut);
         if (poolAddr3 !== 0) {
-          const gs3: Tuple = IAlgebraPool.at(poolAddr3).globalState();
-          sqrt3 = gs3[0];
-          fee3 = zeroForOne === 1 ? gs3[2] : gs3[3];
+          // Index globalState() DIRECTLY (NOT via a stored Tuple var) — the v1 engine reverts
+          // INDEX on a variable-round-tripped contract-return tuple (see the discovery pass).
+          sqrt3 = IAlgebraPool.at(poolAddr3).globalState()[0];
+          fee3 = zeroForOne === 1
+            ? IAlgebraPool.at(poolAddr3).globalState()[2]
+            : IAlgebraPool.at(poolAddr3).globalState()[3];
           step3 = algStep3;
         }
       } else {
@@ -867,9 +887,13 @@ function main(
             if (isAlg3 === 1) {
               ts3 = algTs3;
             }
-            let tick3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).slot0()[1];
+            // Tick from globalState (Algebra) or slot0 (standard V3) — a real Algebra pool has no
+            // slot0(), so branch on isAlg (calling slot0() on Algebra would revert the lens).
+            let tick3: Uint256 = 0;
             if (isAlg3 === 1) {
               tick3 = IAlgebraPool.at(poolAddr3).globalState()[1];
+            } else {
+              tick3 = IUniswapV3PoolFull.at(poolAddr3).slot0()[1];
             }
             const idx3: Uint256 = poolCount;
 

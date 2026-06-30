@@ -399,11 +399,14 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   V3-style **fork** (e.g. **PancakeSwap V3**) registered as a `V3Standard`/`V2Standard` factory — each
   queried across its own `FactoryConfig.feeTiers`. Other AMM families (Curve, Balancer, DODO, TraderJoe
   LB, Maverick, WOOFi) and Solidly-stable are excluded in prepare for now (bespoke curve math) — they come
-  later. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is DISCOVER + PRICE ONLY: its curve is V3-identical
-  (so it prices wei-exact via the V3 oracle), but the engine cannot EXECUTE it — an Algebra pool re-enters
-  via `algebraSwapCallback`, a selector the Router does not service (only `uniswapV3SwapCallback`/
-  `pancakeV3SwapCallback`, no fallback) — so it is gated out of the executable set (discovery drops it; the
-  lens defaults `includeAlgebra=false`) until an engine `algebraSwapCallback` handler lands. See
+  later. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is SUPPORTED (discover + price + execute): its curve
+  is V3-identical (so it prices wei-exact via the V3 oracle), and the engine now EXECUTES it — an Algebra
+  pool re-enters via `algebraSwapCallback`, a selector the Router services (a mirror of
+  `uniswapV3SwapCallback`/`pancakeV3SwapCallback` → `_handleV3Callback`, sauce#186). It routes as
+  UniV3 / `swapV3`; discovery includes it and the lens defaults `includeAlgebra=true`. The wei-exact
+  local-EVM round-trip (discover → price → cook through `algebraSwapCallback` on v1 + v12) is
+  `test/ecoswap.algebra.evm.test.ts` (a local `AlgebraPool.sol` adapter over a genuine V3 pool); the
+  off-chain decode/oracle vectors are `test/ecoswap.algebra.test.ts`. See
   `../../../LIQUIDITY_SOURCES_FEASIBILITY.md` §3.
 - **Relative-depth filter:** pools below `ECO_MIN_REL_BPS` (default 1%) of the **total IN-RANGE
   capacity** across the crossed ticks are dropped so gas isn't wasted on dust pools (the absolute

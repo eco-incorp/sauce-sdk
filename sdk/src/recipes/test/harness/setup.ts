@@ -91,6 +91,15 @@ export const traderJoeLBPairArtifact = loadArtifact(
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
 );
+/** Algebra-fork (Camelot/QuickSwap V3) pool ADAPTER — wraps a genuine V3 pool, exposes the
+ *  Algebra read surface + algebraSwapCallback re-entry. Deployed normally (init binds the inner). */
+export const algebraPoolArtifact = loadArtifact(
+  join(FIXTURES, "AlgebraPool.sol", "AlgebraPool.json"),
+);
+/** Algebra factory (poolByPair registry) — deployed normally; discovery/lens resolve via poolByPair. */
+export const algebraFactoryArtifact = loadArtifact(
+  join(FIXTURES, "AlgebraPool.sol", "AlgebraFactory.json"),
+);
 /** Captured Base mainnet runtime for the V4 PoolManager + StateView singletons. */
 const V4_BYTECODE = JSON.parse(
   readFileSync(join(__dirname, "..", "fixtures", "snapshots", "v4-bytecode.json"), "utf-8"),
@@ -193,6 +202,22 @@ export const kyberPoolAbi = parseAbi([
   "function sync()",
   "function token0() view returns (address)",
   "function getTradeInfo() view returns (uint256 reserve0, uint256 reserve1, uint256 vReserve0, uint256 vReserve1, uint256 feeInPrecision)",
+]);
+
+export const algebraFactoryAbi = parseAbi([
+  "function setPool(address tokenA, address tokenB, address pool)",
+  "function poolByPair(address tokenA, address tokenB) view returns (address pool)",
+]);
+
+export const algebraPoolAbi = parseAbi([
+  "function initialize(address innerPool, uint16 dynFeeZto, uint16 dynFeeOtz)",
+  "function inner() view returns (address)",
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+  "function globalState() view returns (uint160 price, int24 tick, uint16 feeZto, uint16 feeOtz, uint16 timepointIndex, uint8 communityFeeToken0, uint8 communityFeeToken1, bool unlocked)",
+  "function liquidity() view returns (uint128)",
+  "function tickSpacing() view returns (int24)",
+  "function ticks(int24 tick) view returns (uint128 liquidityTotal, int128 liquidityDelta, uint256 outerFeeGrowth0Token, uint256 outerFeeGrowth1Token, int56 outerTickCumulative, uint160 outerSecondsPerLiquidity, uint32 outerSecondsSpent, bool initialized)",
 ]);
 
 export const v4HelperAbi = parseAbi([
@@ -946,6 +971,105 @@ export async function setupEtchedKyberPool(
     address: poolAddr, abi: kyberPoolAbi as Abi, functionName: "sync", args: [], account: minter,
   });
   return poolAddr;
+}
+
+// ── Algebra fork (Camelot/QuickSwap V3) — adapter over a genuine V3 pool ──
+
+/** Deploy the Algebra factory (poolByPair registry; discovery + lens resolve pools via it). */
+export async function deployAlgebraFactory(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: algebraFactoryArtifact.abi,
+    bytecode: algebraFactoryArtifact.bytecode,
+  });
+}
+
+/** Enable a (possibly non-standard) fee tier on the Uniswap V3 factory so an inner pool can be
+ *  created at the Algebra pool's dynamic fee. Idempotent-ish: only call for a tier not already
+ *  enabled (re-enabling a tier reverts in v3-core). */
+export async function enableV3FeeAmount(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  factory: Hex,
+  fee: number,
+  tickSpacing: number,
+): Promise<void> {
+  await writeAndWait(walletClient, publicClient, {
+    address: factory,
+    abi: v3FactoryAbi as Abi,
+    functionName: "enableFeeAmount",
+    args: [fee, tickSpacing],
+  });
+}
+
+/**
+ * Stand up an Algebra-fork pool for the EVM tests as an ADAPTER over a GENUINE Uniswap V3 pool.
+ *
+ * The inner V3 pool (created via the real factory at `innerFee`, minted with `positions`) supplies
+ * the EXACT V3 swap math; the deployed AlgebraPool adapter wraps it, exposing the Algebra read
+ * surface (globalState/liquidity/tickSpacing/ticks) and the algebraSwapCallback re-entry the engine
+ * services (sauce#186). The dynamic fee the lens reads (`dynFee`) equals `innerFee` so the off-chain
+ * oracle prices at the SAME fee the inner pool charges — keeping the split wei-exact. The adapter is
+ * registered on the Algebra factory's poolByPair so discovery + the lens find it.
+ *
+ * `innerFee` must already be an enabled tier on `factory` (call enableV3FeeAmount first for a
+ * non-standard fee). The minter must hold + have approved `helper` for both tokens. Returns
+ * `{ pool, inner }` — `pool` is the adapter address discovery surfaces.
+ */
+export async function setupAlgebraPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  factory: Hex,
+  algebraFactory: Hex,
+  helper: Hex,
+  token0: Hex,
+  token1: Hex,
+  innerFee: number,
+  dynFee: number,
+  sqrtPriceX96: bigint,
+  positions: [number, number, bigint][],
+  minter?: Account,
+): Promise<{ pool: Hex; inner: Hex }> {
+  const inner = await createAndInitPool(walletClient, publicClient, factory, token0, token1, innerFee, sqrtPriceX96);
+  for (const [lo, hi, L] of positions) {
+    await mintPosition(walletClient, publicClient, helper, inner, (minter ?? walletClient.account!).address as Hex, lo, hi, L, minter);
+  }
+  // Deploy the adapter and bind it to the inner pool.
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: algebraPoolArtifact.abi,
+    bytecode: algebraPoolArtifact.bytecode,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: pool,
+    abi: algebraPoolAbi as Abi,
+    functionName: "initialize",
+    args: [inner, dynFee, dynFee],
+    account: minter,
+  });
+  // Register on the Algebra factory (poolByPair).
+  await writeAndWait(walletClient, publicClient, {
+    address: algebraFactory,
+    abi: algebraFactoryAbi as Abi,
+    functionName: "setPool",
+    args: [token0, token1, pool],
+    account: minter,
+  });
+  return { pool, inner };
+}
+
+/** Read the Algebra adapter's globalState (price/tick + dynamic fee per direction). */
+export async function getAlgebraGlobalState(
+  publicClient: PublicClient,
+  pool: Hex,
+): Promise<{ sqrtPriceX96: bigint; tick: number; feeZto: number; feeOtz: number }> {
+  const r = (await publicClient.readContract({
+    address: pool,
+    abi: algebraPoolAbi as Abi,
+    functionName: "globalState",
+  })) as readonly [bigint, number, number, number, ...unknown[]];
+  return { sqrtPriceX96: r[0], tick: Number(r[1]), feeZto: Number(r[2]), feeOtz: Number(r[3]) };
 }
 
 // ── Uniswap V4 (etched singletons) ───────────────────────────

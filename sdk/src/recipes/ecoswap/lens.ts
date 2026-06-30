@@ -249,17 +249,16 @@ export interface LensCallParams {
    */
   account?: Hex;
   /**
-   * Whether to feed Algebra factories into the lens. DEFAULT false — EXECUTION GATE.
+   * Whether to feed Algebra factories into the lens. DEFAULT true — Algebra is EXECUTABLE.
    * The lens emits an Algebra pool as a `poolType=UniV3` row, indistinguishable downstream
    * from a real Uniswap-V3 pool, and prepare puts every UniV3 survivor into the EXECUTABLE
-   * direct-pool set (cooked via swapV3). But the current engine cannot execute an Algebra
-   * swap — the pool re-enters via algebraSwapCallback, a selector the Router does not service
-   * (only uniswapV3SwapCallback/pancakeV3SwapCallback + no fallback) — so a cook() routing a
-   * slice into it reverts. Excluding Algebra factories from the lens config here guarantees no
-   * unfillable Algebra pool ever reaches the solver. The lens's Algebra globalState reader stays
-   * intact (and pinned by ecoswap.algebra.test.ts); set true ONLY for a price-only read, or once
-   * an engine algebraSwapCallback handler lands. See FactoryType.AlgebraV3 +
-   * LIQUIDITY_SOURCES_FEASIBILITY.md §3.
+   * direct-pool set (cooked via swapV3). The engine now services the Algebra swap: the pool
+   * re-enters via algebraSwapCallback, and the Router implements that selector (a mirror of
+   * uniswapV3SwapCallback/pancakeV3SwapCallback → _handleV3Callback) as of sauce#186. An
+   * Algebra pool's swap() is selector-identical to Uniswap V3, so _swapV3 drives it. Set false
+   * only to suppress Algebra (e.g. a chain whose Algebra fork you don't want routed). The
+   * lens's Algebra globalState reader is pinned by ecoswap.algebra.test.ts. See
+   * FactoryType.AlgebraV3 + LIQUIDITY_SOURCES_FEASIBILITY.md §3.
    */
   includeAlgebra?: boolean;
 }
@@ -288,11 +287,11 @@ export async function runLens(
   const maxTicks = params.maxTicks ?? 96;
   const target = params.target ?? "v12";
   const account = params.account ?? DEFAULT_LENS_ACCOUNT;
-  // EXECUTION GATE (default off): Algebra is discover+price only — the engine has no
-  // algebraSwapCallback handler, so an Algebra pool surfaced as a UniV3 row would be
-  // cooked via swapV3 and revert. Exclude Algebra factories from the lens config unless
-  // a caller explicitly opts in for a price-only read. See LensCallParams.includeAlgebra.
-  const includeAlgebra = params.includeAlgebra ?? false;
+  // Algebra is EXECUTABLE (default on): the engine implements algebraSwapCallback (sauce#186),
+  // so an Algebra pool surfaced as a UniV3 row is cooked via swapV3 and the mid-swap input
+  // pull is serviced. Feed Algebra factories into the lens config by default; pass false to
+  // suppress Algebra on a given read. See LensCallParams.includeAlgebra.
+  const includeAlgebra = params.includeAlgebra ?? true;
 
   // Group factories the same way discoverPools does, but only the families the lens
   // understands (V2/V3/V4/Algebra). Others are not collapsed.
@@ -316,9 +315,9 @@ export async function runLens(
   const v3Factories: FactoryConfig[] = poolConfig.factories.filter(
     (f) =>
       (f.factoryType === FactoryType.V3Standard ||
-        // Algebra rides the v3Factories param (tagged isAlgebra) but is EXECUTION-GATED:
-        // only included when the caller opts in for a price-only read (default off), since
-        // the engine cannot cook an Algebra swap. See includeAlgebra.
+        // Algebra rides the v3Factories param (tagged isAlgebra) and is EXECUTABLE (default on):
+        // the engine services algebraSwapCallback (sauce#186), so a cooked Algebra swap lands.
+        // includeAlgebra defaults true; pass false to suppress Algebra on a read.
         (includeAlgebra && f.factoryType === FactoryType.AlgebraV3)) &&
       f.address.toLowerCase() !== NON_FACTORY,
   );

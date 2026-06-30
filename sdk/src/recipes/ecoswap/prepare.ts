@@ -574,6 +574,7 @@ export async function prepareEcoSwap(
     maxTicks,
     target,
     account: caller,
+    includeAlgebra: true, // Algebra is executable (engine services algebraSwapCallback, sauce#186).
   });
 
   // The LENS is the single source of truth for survivorship: it already applied
@@ -775,6 +776,7 @@ export async function prepareEcoSwap(
         maxTicks: V3_TICK_STEPS,
         target,
         account: caller,
+        includeAlgebra: true, // Algebra is executable (engine services algebraSwapCallback, sauce#186).
       });
       edgeCache.set(key, pending);
     }
