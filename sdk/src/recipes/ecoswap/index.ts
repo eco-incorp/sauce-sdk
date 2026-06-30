@@ -29,8 +29,7 @@ import ts from "typescript";
 
 import { prepareEcoSwap, type EcoSwapPrepareOpts } from "./prepare.js";
 import { MULTICALL3, BASE_CHAIN_POOL_CONFIG, type ChainPoolConfig } from "../shared/constants.js";
-import type { EcoSwapConfig, EcoSwapPrepared, EcoPool, EcoRoute } from "../shared/types.js";
-import { EcoBracketKind } from "../shared/types.js";
+import type { EcoSwapConfig, EcoSwapPrepared, EcoPool } from "../shared/types.js";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler");
@@ -107,42 +106,81 @@ function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netC
 }
 
 /**
- * [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks]
- * (tickSpacing/hooks default to 0 — routes use V3/V2 pools discovered with V3 keys).
+ * Build the FLAT POOL UNIVERSE + the SCALAR ROUTING layout.
+ *
+ * The universe is `[...prepared.pools, ...legPools]`: every route-leg pool is APPENDED after
+ * the direct pools, with each leg's pools laid CONTIGUOUSLY so a leg is a `[base, base+count)`
+ * slice of universe indices. A pool that is ALSO a direct pool (same address) is DEDUPED to its
+ * single direct-pool universe index (one shared frontier, seeded/stepped once) rather than
+ * appended again — so a leg pool's universe index can point back into the direct-pool prefix.
+ *
+ * `buildPoolsAndNetCache` is reused VERBATIM over the assembled universe (a leg pool is
+ * byte-identical to a direct pool on-chain), producing the `poolTuples`/`netCache` args.
+ *
+ * `routing` is one flat SCALAR tuple per route, depth-2 read on-chain:
+ *   routing[r] = [legCount, base0,count0,inter0, base1,count1,inter1, …]
+ * where for leg L: pools are universe indices `[baseL, baseL+countL)` and `interL` is the
+ * INTERMEDIATE token AFTER leg L (== legL.hopOut). The FINAL leg's `interL` is 0 (unused — its
+ * out is tokenOut). Stride is a uniform 3 scalars per leg, so N-hop needs no shape change.
+ *
+ * `directCount` = `prepared.pools.length` — how many leading universe entries are DIRECT venues
+ * (the on-chain merge scans `[0, directCount)` as direct pools; entries `[directCount, …)` are
+ * leg-only pools reached solely via `routing`). It is carried in the `cfg` bundle.
+ *
+ * Per-pool swap direction is derived on-chain from each pool tuple's `inIsToken0` field [7]
+ * (== that pool's `zeroForOne`). A leg pool whose leg direction `zHop` differs from the route's
+ * overall direction therefore needs [7] stamped with the LEG's `zHop` — done in prepare when the
+ * leg pool's `EcoPool.inIsToken0` is set; the universe build does not re-derive it.
  */
-function buildRouteTuple(r: EcoRoute): bigint[] {
-  const { hop1Pool, hop2Pool, intermediateToken } = r.route;
-  return [
-    BigInt(intermediateToken),
-    BigInt(hop1Pool.poolType),
-    BigInt(hop1Pool.address),
-    BigInt(hop1Pool.fee),
-    0n,
-    0n,
-    BigInt(hop2Pool.poolType),
-    BigInt(hop2Pool.address),
-    BigInt(hop2Pool.fee),
-    0n,
-    0n,
-  ];
-}
+function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
+  poolTuples: bigint[][];
+  netCache: bigint[][];
+  routing: bigint[][];
+  directCount: number;
+} {
+  const directCount = prepared.pools.length;
+  const universe: EcoPool[] = [...prepared.pools];
+  // Map a pool's address (lowercased) → its universe index, for dedupe against direct pools and
+  // against earlier leg pools. Seeded with the direct prefix so a leg pool that is also direct
+  // points back at the direct index.
+  const indexByAddr = new Map<string, number>();
+  prepared.pools.forEach((p, i) => indexByAddr.set(p.address.toLowerCase(), i));
 
-/**
- * Build the flat route-segment array — [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar] for every
- * Route bracket, sorted DESC by sqrtAdjNear (then adjFar DESC, then routeIdx ASC — the same
- * stable order the merge tie-breaks on). Routes are STATIC (no live re-price), competing in the
- * merge via ONE cursor. Direct-pool brackets are GONE (the solver walks each pool live).
- */
-function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
-  return prepared.brackets
-    .filter((b) => b.kind === EcoBracketKind.Route)
-    .slice()
-    .sort((a, b) => {
-      if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
-      if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
-      return a.refIdx - b.refIdx;
-    })
-    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
+  const routing: bigint[][] = [];
+  for (const route of prepared.routes) {
+    const rt: bigint[] = [BigInt(route.legs.length)];
+    route.legs.forEach((leg, legIdx) => {
+      // Append this leg's pools contiguously, deduping any already in the universe.
+      const idxs: number[] = [];
+      for (const lp of leg.pools) {
+        const key = lp.address.toLowerCase();
+        let idx = indexByAddr.get(key);
+        if (idx === undefined) {
+          idx = universe.length;
+          universe.push(lp);
+          indexByAddr.set(key, idx);
+        }
+        idxs.push(idx);
+      }
+      // Leg pools occupy a contiguous slice ONLY when freshly appended in order; if any were
+      // deduped the slice is not contiguous, so emit the explicit [min, count) span and rely on
+      // the contiguous append for the common (no-dedupe) case. For the 2-hop V3-leg landing the
+      // intermediate's pools never collide with the direct set, so the slice is contiguous.
+      const base = idxs.length > 0 ? Math.min(...idxs) : 0;
+      const count = idxs.length;
+      // interL: the intermediate token AFTER this leg (legL.hopOut). Final leg → 0 (its out is
+      // tokenOut). intermediateTokens[legIdx] is the token between leg legIdx and legIdx+1.
+      const inter =
+        legIdx < route.intermediateTokens.length
+          ? BigInt(route.intermediateTokens[legIdx])
+          : 0n;
+      rt.push(BigInt(base), BigInt(count), inter);
+    });
+    routing.push(rt);
+  }
+
+  const { poolTuples, netCache } = buildPoolsAndNetCache(universe);
+  return { poolTuples, netCache, routing, directCount };
 }
 
 /**
@@ -206,21 +244,27 @@ export async function ecoSwap(
   const source = readFileSync(join(__dirname, solverFile), "utf-8");
   const jsSource = stripTypes(source);
 
-  const { poolTuples, netCache } = buildPoolsAndNetCache(prepared.pools);
+  const { poolTuples, netCache, routing, directCount } = buildPoolUniverseAndRouting(prepared);
   const result = compile(jsSource, {
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
     target,
+    // cfg-bundle the SCALARS into ONE tuple (the lens's proven trick — keeps main() at 4
+    // params, so the arg-prologue SDUP window stays small); the big nested tuples
+    // (pools/netCache/routing) stay SEPARATE top-level params so pool/route field reads
+    // stay at nesting depth ≤ 2 (folding them in => depth-3 read => v1 INDEX revert).
     args: [
-      BigInt(config.tokenIn),
-      BigInt(config.tokenOut),
-      config.amountIn,
-      BigInt(caller),
-      prepared.priceLimit,
+      [
+        BigInt(config.tokenIn),
+        BigInt(config.tokenOut),
+        config.amountIn,
+        BigInt(caller),
+        prepared.priceLimit,
+        BigInt(directCount),
+      ],
       poolTuples,
-      prepared.routes.map(buildRouteTuple),
       netCache,
-      buildRouteSegs(prepared),
+      routing,
     ],
   });
 
@@ -340,33 +384,41 @@ export async function quoteEcoSwap(
   );
   // No-cache quote (1-RPC): drop the per-pool net cache so the walk staticcalls every boundary
   // from each pool's LIVE spot. Clearing the netRows + window bounds forces windowTop=0 on-chain
-  // (the all-live walk). Routes stay (they are static segments).
+  // (the all-live walk). This must clear EVERY pool in the universe — the direct pools AND every
+  // route LEG pool (each leg pool is itself an EcoPool walked live), or a stale leg cache would
+  // survive the no-cache quote.
+  const clearCache = (p: EcoPool): EcoPool =>
+    p.isV2 ? p : { ...p, netRows: [], windowTopShifted: 0n, windowBotShifted: 0n };
   const usePrepared: EcoSwapPrepared = opts?.noBrackets
     ? {
         ...prepared,
-        pools: prepared.pools.map((p) =>
-          p.isV2 ? p : { ...p, netRows: [], windowTopShifted: 0n, windowBotShifted: 0n },
-        ),
-        brackets: prepared.brackets.filter((b) => b.kind === EcoBracketKind.Route),
+        pools: prepared.pools.map(clearCache),
+        routes: prepared.routes.map((route) => ({
+          ...route,
+          legs: route.legs.map((leg) => ({ ...leg, pools: leg.pools.map(clearCache) })),
+        })),
       }
     : prepared;
 
   const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
-  const { poolTuples, netCache } = buildPoolsAndNetCache(usePrepared.pools);
+  const { poolTuples, netCache, routing, directCount } =
+    buildPoolUniverseAndRouting(usePrepared);
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
     args: [
-      BigInt(config.tokenIn),
-      BigInt(config.tokenOut),
-      config.amountIn,
-      BigInt(caller),
-      usePrepared.priceLimit,
+      [
+        BigInt(config.tokenIn),
+        BigInt(config.tokenOut),
+        config.amountIn,
+        BigInt(caller),
+        usePrepared.priceLimit,
+        BigInt(directCount),
+      ],
       poolTuples,
-      usePrepared.routes.map(buildRouteTuple),
       netCache,
-      buildRouteSegs(usePrepared),
+      routing,
     ],
   });
   const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;

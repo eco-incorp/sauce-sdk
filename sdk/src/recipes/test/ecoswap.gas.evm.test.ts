@@ -156,38 +156,48 @@ function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netC
   return { poolTuples, netCache };
 }
 
-/** [routeIdx, capacity, sqrtAdjNear, sqrtAdjFar] for every Route bracket, sorted DESC sqrtAdjNear. */
-function buildRouteSegs(prepared: EcoSwapPrepared): bigint[][] {
-  return prepared.brackets
-    .filter((b) => b.kind === EcoBracketKind.Route)
-    .slice()
-    .sort((a, b) => {
-      if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
-      if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
-      return a.refIdx - b.refIdx;
-    })
-    .map((b) => [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar]);
+/**
+ * Build the FLAT POOL UNIVERSE + the scalar ROUTING layout — mirrors index.ts
+ * buildPoolUniverseAndRouting (the gas fixtures use baseTokens == the swap pair ⇒ zero routes,
+ * so routing is empty here, but the shape is kept faithful so a future route fixture lights up).
+ */
+function buildUniverseAndRouting(prepared: EcoSwapPrepared): {
+  poolTuples: bigint[][];
+  netCache: bigint[][];
+  routing: bigint[][];
+  directCount: number;
+} {
+  const directCount = prepared.pools.length;
+  const universe: EcoPool[] = [...prepared.pools];
+  const idxByAddr = new Map<string, number>();
+  prepared.pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
+  const routing: bigint[][] = [];
+  for (const route of prepared.routes) {
+    const rt: bigint[] = [BigInt(route.legs.length)];
+    route.legs.forEach((leg, legIdx) => {
+      const idxs: number[] = [];
+      for (const lp of leg.pools) {
+        const key = lp.address.toLowerCase();
+        let idx = idxByAddr.get(key);
+        if (idx === undefined) {
+          idx = universe.length;
+          universe.push(lp);
+          idxByAddr.set(key, idx);
+        }
+        idxs.push(idx);
+      }
+      const base = idxs.length > 0 ? Math.min(...idxs) : 0;
+      const inter =
+        legIdx < route.intermediateTokens.length ? BigInt(route.intermediateTokens[legIdx]) : 0n;
+      rt.push(BigInt(base), BigInt(idxs.length), inter);
+    });
+    routing.push(rt);
+  }
+  const { poolTuples, netCache } = buildPoolsAndNetCache(universe);
+  return { poolTuples, netCache, routing, directCount };
 }
 
-/** [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks] (both shapes). */
-function buildRouteTuple(r: EcoRoute): bigint[] {
-  const { hop1Pool, hop2Pool, intermediateToken } = r.route;
-  return [
-    BigInt(intermediateToken),
-    BigInt(hop1Pool.poolType),
-    BigInt(hop1Pool.address),
-    BigInt(hop1Pool.fee),
-    0n,
-    0n,
-    BigInt(hop2Pool.poolType),
-    BigInt(hop2Pool.address),
-    BigInt(hop2Pool.fee),
-    0n,
-    0n,
-  ];
-}
-
-/** Production unified-walk arg array (9 args; no zeroForOne — derived on-chain). */
+/** Production unified-walk arg array (cfg-bundle 4-arg shape: [cfg, pools, netCache, routing]). */
 function buildUnifiedArgs(
   tokenIn: Hex,
   tokenOut: Hex,
@@ -195,17 +205,12 @@ function buildUnifiedArgs(
   caller: Hex,
   prepared: EcoSwapPrepared,
 ): unknown[] {
-  const { poolTuples, netCache } = buildPoolsAndNetCache(prepared.pools);
+  const { poolTuples, netCache, routing, directCount } = buildUniverseAndRouting(prepared);
   return [
-    BigInt(tokenIn),
-    BigInt(tokenOut),
-    amountIn,
-    BigInt(caller),
-    prepared.priceLimit,
+    [BigInt(tokenIn), BigInt(tokenOut), amountIn, BigInt(caller), prepared.priceLimit, BigInt(directCount)],
     poolTuples,
-    prepared.routes.map(buildRouteTuple),
     netCache,
-    buildRouteSegs(prepared),
+    routing,
   ];
 }
 
@@ -246,6 +251,23 @@ function buildBracketTuple(b: EcoBracket): bigint[] {
   ];
 }
 
+/**
+ * [inter, h1Type,h1Pool,h1Fee,h1TS,h1Hooks, h2Type,h2Pool,h2Fee,h2TS,h2Hooks] — the FROZEN
+ * unrolled reference's legacy route tuple. The new EcoRoute is `{legs, intermediateTokens}`; map
+ * the two hops to each leg's FIRST pool (the frozen reference predates multi-pool legs and the
+ * gas fixtures prepare zero routes, so this is only for shape/typecheck — never invoked at runtime).
+ */
+function buildLegacyRouteTuple(r: EcoRoute): bigint[] {
+  const h1 = r.legs[0].pools[0];
+  const h2 = r.legs[r.legs.length - 1].pools[0];
+  const inter = r.intermediateTokens[0] ?? ("0x0" as Hex);
+  return [
+    BigInt(inter),
+    BigInt(h1.poolType), BigInt(h1.address), BigInt(h1.fee), 0n, 0n,
+    BigInt(h2.poolType), BigInt(h2.address), BigInt(h2.fee), 0n, 0n,
+  ];
+}
+
 /** Frozen unrolled-reference arg array (9 args; zeroForOne + bracket ladder). */
 function buildLegacyArgs(
   tokenIn: Hex,
@@ -262,7 +284,7 @@ function buildLegacyArgs(
     prepared.zeroForOne ? 1n : 0n,
     prepared.priceLimit,
     prepared.pools.map(buildLegacyPoolTuple),
-    prepared.routes.map(buildRouteTuple),
+    prepared.routes.map(buildLegacyRouteTuple),
     prepared.brackets.map(buildBracketTuple),
   ];
 }

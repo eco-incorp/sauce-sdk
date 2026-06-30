@@ -197,11 +197,17 @@ export interface EcoSwapConfig {
   amountIn: bigint;
 }
 
-/** Bracket kinds (must match the on-chain `kind` tag). */
+/**
+ * Bracket kinds (must match the on-chain `kind` tag).
+ *
+ * `EcoSwapPrepared.brackets` is now always `[]` (routes are first-class live-walk venues,
+ * not static off-chain-composed segments), so `Route` is UNUSED by EcoSwap. `V3`/`V2` still
+ * tag direct-pool brackets in the test fixtures' bracket builders.
+ */
 export enum EcoBracketKind {
-  V3 = 0, // direct concentrated-liquidity bracket (route legs only)
-  V2 = 1, // direct constant-product bracket (route legs only)
-  Route = 2, // multi-hop route segment (static, off-chain-precomputed capacity)
+  V3 = 0, // direct concentrated-liquidity bracket (test fixtures)
+  V2 = 1, // direct constant-product bracket (test fixtures)
+  Route = 2, // UNUSED by EcoSwap (routes are live-walk venues, no static segments)
 }
 
 /**
@@ -312,22 +318,46 @@ export interface EcoPool {
   source: string;
 }
 
-/** Multi-hop route descriptor (two hops through an intermediate base token). */
+/**
+ * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
+ * leg splits across. Each pool is a full `EcoPool` (the same live-walk descriptor a direct
+ * pool carries), so a leg pool is byte-identical on-chain to a direct pool and reuses the
+ * per-pool frontier walk verbatim. `zeroForOne` is the LEG's swap direction (hopIn is token0
+ * iff hopIn's address is lower than hopOut's) — it can differ from the route's overall
+ * direction, so each leg pool's on-chain `inIsToken0` field is stamped with THIS leg's
+ * `zeroForOne` (see prepare).
+ */
+export interface EcoLeg {
+  hopIn: Hex;
+  hopOut: Hex;
+  zeroForOne: boolean;
+  pools: EcoPool[];
+}
+
+/**
+ * A multi-hop route is a composite live-walk venue: an ordered list of legs (A→T1→…→B) plus
+ * the intermediate tokens between consecutive legs (the final leg's `hopOut` == tokenOut, so
+ * `intermediateTokens.length === legs.length - 1`). Each leg splits across all its pools; the
+ * route advances by stepping the binding leg's next bracket with conservation at every
+ * intermediate. 2-hop V3-leg first; the shape extends to N-hop.
+ */
 export interface EcoRoute {
-  route: DiscoveredMultiHopRoute;
+  legs: EcoLeg[];
+  intermediateTokens: Hex[];
 }
 
 /**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
- * unified walk reuses); they ship NO prepare-time sqrt edges. `brackets` now holds ROUTE
- * segments only (kind === Route), pre-sorted DESCENDING by sqrtAdjNear, consumed by one
- * cursor in the merge (routes are static — composed off-chain, no live re-price).
+ * unified walk reuses); they ship NO prepare-time sqrt edges. Routes are first-class live-walk
+ * venues (each leg = a set of leg pools, themselves `EcoPool`s with their own net caches); the
+ * solver walks them live, so there are NO static route segments — `brackets` is always `[]`.
  */
 export interface EcoSwapPrepared {
   pools: EcoPool[];
   routes: EcoRoute[];
+  /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;
   /** Real-sqrt-space extreme price limit for the swap calls (direction-dependent). */

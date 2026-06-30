@@ -2,42 +2,62 @@
  * EcoSwap UNIFIED-WALK reference (pure TypeScript bigint math, EVM-free).
  *
  * Mirrors the on-chain unified solver in `recipes/ecoswap/ecoswap.sauce.ts` bit-for-bit:
- * ONE price-ordered k-way merge where every direct pool has ONE frontier walked from its
- * LIVE spot, deeper, one tickSpacing per step. Each step picks the highest fee-adjusted
- * out/in head among {each active pool's walk head, each route segment head}, consumes its
- * segment into the pool/route, and advances ONLY that stream.
+ * ONE price-ordered k-way merge where every DIRECT pool has ONE frontier walked from its
+ * LIVE spot, deeper, one tickSpacing per step, AND every multi-hop ROUTE is a first-class
+ * live-walk venue (NO static segments). Each step picks the highest fee-adjusted out/in head
+ * among {each active direct pool's walk head, each active route's composed product head},
+ * consumes its segment into the pool/route, and advances ONLY that stream.
  *
- * THE UNIFIED MODEL — no two-mode cache-vs-re-anchor split. liquidityNet is drift-invariant,
- * so the walk ALWAYS computes sqrt/price on the LIVE grid (stepReal from the live spot,
- * identical to the neutral oracle ecoswap.optimal.ts v3Segments) and reuses the cached NET
- * only. This reference is CURSOR-MECHANISM-FAITHFUL: it builds the SAME per-pool netCache rows
- * the on-chain pool tuple carries ([shiftedTick, rawNet], only INITIALIZED ticks, sorted in
- * SWAP DIRECTION — exactly prepare.ts's stampPoolCache), runs the SAME SETUP drift-down skip
- * (advance the per-pool cursor past cache rows ABOVE the first boundary), and in the walk reads
- * an IN-WINDOW boundary via that cursor (matching tick ⇒ cached net + advance; in-window
- * non-match ⇒ net 0, NO map read) and an OUT-OF-WINDOW boundary via the FULL `adaptiveNet` map
- * (the TS analogue of a live ticks()/getTickLiquidity staticcall — drift-invariant, returns the
- * same value). So the reference is STRUCTURALLY identical to the solver, not just value-
- * equivalent: an off-by-one in the cursor (drift-down skip, in-window consume/advance, in-window
- * uninitialized net=0, out-of-window read) is caught here, not only in the EVM lane. Because the
- * grid is the live grid and the nets are the drift-invariant nets, this reference is wei-exact
- * with the neutral oracle BY CONSTRUCTION — same grid, same nets.
+ * THE UNIFIED MODEL — no two-mode cache-vs-re-anchor split, NO static route segments.
+ * liquidityNet is drift-invariant, so the walk ALWAYS computes sqrt/price on the LIVE grid
+ * (stepReal from the live spot, identical to the neutral oracle ecoswap.optimal.ts v3Segments/
+ * legBrackets) and reuses the cached NET only. This reference is CURSOR-MECHANISM-FAITHFUL: it
+ * builds the SAME per-pool netCache rows the on-chain pool tuple carries ([shiftedTick, rawNet],
+ * only INITIALIZED ticks, sorted in SWAP DIRECTION — exactly prepare.ts's stampPoolCache), runs
+ * the SAME SETUP drift-down skip, and reads an in-window boundary via that cursor (matching tick ⇒
+ * cached net + advance; in-window non-match ⇒ net 0, NO map read) and an out-of-window boundary
+ * via the FULL `adaptiveNet` map (the TS analogue of a live ticks()/getTickLiquidity staticcall).
+ * Because the grid is the live grid and the nets are the drift-invariant nets, this reference is
+ * wei-exact with the neutral oracle BY CONSTRUCTION — same grid, same nets.
  *
- * WALK-THROUGH GAPS: a frontier deactivates only on the price limit, the per-pool budget cap,
- * or (dL==0 AND the boundary is PAST the pool's deepest initialized tick extremeShifted) — so
- * an interior dL==0 gap keeps walking and resumes when net brings L back (the Issue-2 fix).
+ * PER-POOL DIRECTION (flat universe). Direction is NOT a top-level constant: every pool — direct
+ * or leg — drives toOutIn/stepReal/tickArg/SETUP from ITS OWN `inIsToken0` field (== that pool's
+ * `zeroForOne`). A route's leg can swap in the opposite direction from the overall trade; its leg
+ * pools carry the LEG's zHop in `inIsToken0`, so the per-pool walk code is reused unchanged. The
+ * direct pools' `inIsToken0` equals the overall swap direction (token0 is the lower address).
  *
- * It takes the SAME prepared dataset the on-chain solver reads (the EcoPool unified-walk
- * fields stepRatio/windowTop/windowBot/extremeShifted/spotTickShifted/spotActiveL + the
- * off-chain adaptiveNet map + routeSegs) plus the modeled LIVE state per pool (the on-chain
- * SETUP read). In the deterministic no-drift case the modeled live == the prepare-time spot.
+ * ROUTES = LIVE WALK (this branch). A route is a composite venue: an ordered list of LEGS, each a
+ * SET of leg pools. Each leg pool gets its OWN live frontier (the same dn* state + net cursor a
+ * direct pool gets, seeded by the same SETUP using the leg's zHop). A leg's CURRENT bracket is the
+ * leg-internal best (the highest fee-adjusted out/in near among the leg's active pools — a
+ * leg-internal price-ordered merge). The route's HEAD is the LEFT-TO-RIGHT product fold
+ * (routeHeadFold) of the per-leg internal-best fee-adjusted heads — directly comparable to a direct
+ * pool's head, so the route competes in the SAME global merge. Advancing a route resolves ONE event
+ * via routeEventN / routePartialN (IMPORTED from ecoswap.math.ts, the single source the oracle uses
+ * too — so the reference agrees with the oracle BY CONSTRUCTION): the BINDING leg's binding pool
+ * crosses its tick (advances its frontier), every other leg partially fills (conservation at every
+ * intermediate: leg i out == leg i+1 in). N-hop (k >= 2), V3 legs; the leg loop spans `legCount`
+ * (3-hop concrete, 2-hop bit-identical).
  *
- * The integer math (mulDiv truncation, the int128 sign recovery, stepReal, toOutIn, tickArg,
- * the sqrt fee-adjust) is the shared copies in ./ecoswap.math, so this reference is bit-for-
- * bit with both the on-chain solver and the neutral optimal oracle (ecoswap.optimal).
+ * NO route price limit. The swap's REAL-sqrt priceLimit gates the DIRECT pools only (it is a bound
+ * in the OVERALL swap direction). A route's legs are NOT individually limited by it — the on-chain
+ * solver's route advance (ecoswap.sauce.ts Phase D) crosses a binding leg's tick with NO dlim
+ * check; a route is bounded only by conservation + its participation in the global merge cut. This
+ * also avoids comparing an opposite-direction leg's far against an overall-direction limit value.
+ *
+ * INLINE INVARIANTS (throw on violation): per-leg-pool cursor fidelity (cursorNet == mapNet for
+ * every crossed in-window boundary), conservation ≤ 1 wei per route event (|leg i out − leg i+1
+ * in|), strictly-descending route head (each consumed route segment's near ≤ the previous), and the
+ * binding-leg partial landing within its current bracket. Any vector — not only the EVM lane —
+ * catches a cursor off-by-one, a conservation slip, a non-monotone head, or an out-of-bracket
+ * partial.
+ *
+ * The integer math (mulDiv truncation, the int128 sign recovery, stepReal, toOutIn, tickArg, the
+ * sqrt fee-adjust, the route event/partial helpers) is the shared copies in ./ecoswap.math, so this
+ * reference is bit-for-bit with both the on-chain solver and the neutral optimal oracle.
  */
 
-import { EcoBracketKind, type EcoSwapPrepared } from "../shared/types";
+import type { EcoPool, EcoRoute, EcoSwapPrepared } from "../shared/types";
 import {
   Q96,
   FEE_DENOM,
@@ -51,6 +71,12 @@ import {
   sqrtOneMinusFeeScaled,
   V2_STEP_BPS,
   V2_STEP_DEN,
+  type RouteLeg,
+  routeHeadFold,
+  routeEventN,
+  routePartialN,
+  bracketGross,
+  bracketOut,
 } from "./ecoswap.math";
 
 /** Modeled LIVE state for one pool (what the on-chain SETUP reads). */
@@ -66,7 +92,9 @@ export interface KwayLivePool {
 }
 
 export interface KwayReferenceResult {
+  /** Gross input per DIRECT pool — indexed by prepared.pools (the universe's direct prefix). */
   perPoolInput: bigint[];
+  /** Gross token-A input per route — indexed by prepared.routes. */
   perRouteInput: bigint[];
   totalInput: bigint;
   /**
@@ -80,11 +108,9 @@ export interface KwayReferenceResult {
    * CURSOR-FIDELITY diagnostic: for EVERY in-window boundary the walk crossed, the net the
    * per-pool cursor produced MUST equal the net the full `adaptiveNet` map carries for that
    * tick (a cached initialized row, or 0 for an in-window uninitialized tick). Each crossing
-   * appends `{ shifted, cursorNet, mapNet }`; a non-zero count of rows where cursorNet !=
-   * mapNet is a cursor off-by-one (drift-down skip overshoot/undershoot, a missed advance, or
-   * an in-window uninitialized tick that wrongly consumed a row). The reference itself asserts
-   * equality inline (throws on mismatch) so any vector catches it; this list lets a dedicated
-   * test assert the count and that the cursor path was actually exercised (length > 0).
+   * appends `{ shifted, cursorNet, mapNet }`; the reference asserts equality inline (throws on
+   * mismatch) so any vector catches it; this list lets a dedicated test assert the count and
+   * that the cursor path was actually exercised (length > 0).
    */
   cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[];
 }
@@ -95,13 +121,10 @@ function feeAdj(oi: bigint, feePpm: number): bigint {
 }
 
 /**
- * Per-pool frontier walk budget — MUST match the on-chain solver's PER_POOL
- * (ecoswap.sauce.ts) AND the optimal oracle's MAX_V3_STEPS (ecoswap.optimal.ts) EXACTLY, so
- * the reference and the oracle agree to the wei EVEN WHEN THE CAP BINDS (both bound the SINGLE
- * from-live-spot walk by the same cap). The outer merge bound is routeSegs.length +
- * pools.length*PER_POOL*2 (generous slack), which dominates the SUM of per-pool reaches so it
- * never itself truncates a fill the per-pool caps would complete. See the on-chain solver for
- * the gas-budget justification of 2048.
+ * Per-pool frontier walk budget — MUST match the on-chain solver's PER_POOL (ecoswap.sauce.ts)
+ * AND the optimal oracle's MAX_V3_STEPS (ecoswap.optimal.ts) EXACTLY, so the reference and the
+ * oracle agree to the wei EVEN WHEN THE CAP BINDS. See the on-chain solver for the gas-budget
+ * justification of 2048.
  */
 const PER_POOL = 2048;
 
@@ -111,10 +134,372 @@ function tickShiftedBaseTS(tick: number, ts: bigint): bigint {
   return (shifted / ts) * ts;
 }
 
+/** Per-universe-pool live frontier state (the on-chain dn/lArr/netCur/zArr/brFar bundle). */
+interface Frontier {
+  isV2: boolean;
+  pType: number; // 1=V2 2=V4 else V3
+  zeroForOne: boolean; // == the pool's inIsToken0 (the leg's zHop for a leg pool)
+  feePpm: number;
+  ts: bigint;
+  stepRatio: bigint;
+  on: boolean;
+  near: bigint; // V3/V4 real sqrt; V2 out/in
+  farReal: bigint; // V3/V4 bracket far real sqrt (re-anchored each cross / partial-latched)
+  L: bigint;
+  v2L: bigint; // V2 sqrt(resIn*resOut)
+  shift: bigint; // next boundary (shifted tick)
+  tsShift: bigint; // signed-magnitude tick step (== ts; advance is shift -= ts / += ts by dir)
+  steps: number;
+  // net cursor (the on-chain netCache mechanism):
+  netRows: { shifted: bigint; raw: bigint }[];
+  netCur: number;
+  adaptiveNet: Map<number, bigint>;
+  windowTop: bigint;
+  windowBot: bigint;
+  extreme: bigint;
+  // route partial latch: the FIXED bracket far real sqrt while a leg partial-fills (0 ⇒ derive
+  // one stepReal ahead). Mirrors the solver's brFar.
+  brFar: bigint;
+}
+
+/** Seed one universe pool's frontier from its modeled LIVE spot (drift override or prepared spot). */
+function seedFrontier(pd: EcoPool, lp: KwayLivePool | undefined): Frontier {
+  const z = pd.inIsToken0;
+  const f: Frontier = {
+    isV2: pd.isV2,
+    pType: pd.poolType,
+    zeroForOne: z,
+    feePpm: pd.feePpm,
+    ts: BigInt(pd.tickSpacing),
+    stepRatio: pd.stepRatio ?? 0n,
+    on: false,
+    near: 0n,
+    farReal: 0n,
+    L: 0n,
+    v2L: 0n,
+    shift: 0n,
+    tsShift: BigInt(pd.tickSpacing),
+    steps: 0,
+    netRows: [],
+    netCur: 0,
+    adaptiveNet: pd.adaptiveNet ?? new Map<number, bigint>(),
+    windowTop: pd.windowTopShifted ?? 0n,
+    windowBot: pd.windowBotShifted ?? 0n,
+    extreme: pd.extremeShifted ?? 0n,
+    brFar: 0n,
+  };
+
+  if (pd.isV2) {
+    const ll = lp?.liveV2L ?? 0n;
+    f.v2L = ll;
+    f.L = ll;
+    f.on = ll > 0n;
+    f.near = lp?.curOI ?? 0n; // V2 frontier stores out/in directly
+    return f;
+  }
+
+  // V3/V4: live near sqrt + boundary + active L (a drift override, else the prepare-time spot).
+  let near: bigint;
+  let sh: bigint;
+  let L: bigint;
+  if (lp?.liveRealSqrt !== undefined) {
+    near = lp.liveRealSqrt;
+    const base = tickShiftedBaseTS(lp.liveTick ?? 0, f.ts);
+    sh = z ? base : base + f.ts;
+    L = lp.liveL ?? 0n;
+  } else {
+    near = pd.spotNearReal ?? 0n;
+    sh = pd.spotTickShifted ?? 0n;
+    L = pd.spotActiveL ?? 0n;
+  }
+  f.near = near;
+  f.shift = sh;
+  f.L = L;
+  f.on = true;
+
+  // netCache rows EXACTLY as prepare.ts's stampPoolCache: every INITIALIZED tick (signed net != 0),
+  // shifted (tick + OFFSET) + RAW uint128, sorted in SWAP DIRECTION (zeroForOne descending shifted,
+  // oneForZero ascending). Prefer the pool's prepared netRows; else derive from adaptiveNet.
+  const rows: { shifted: bigint; raw: bigint }[] = [];
+  if (pd.netRows && pd.netRows.length > 0) {
+    for (const r of pd.netRows) rows.push({ shifted: r.shiftedTick, raw: r.rawNet });
+  } else {
+    for (const [tick, signed] of f.adaptiveNet) {
+      if (signed === 0n) continue;
+      const raw = signed >= 0n ? signed : signed + MOD128;
+      rows.push({ shifted: BigInt(tick) + OFFSET, raw });
+    }
+  }
+  rows.sort((a, b) =>
+    z
+      ? a.shifted < b.shifted ? 1 : a.shifted > b.shifted ? -1 : 0
+      : a.shifted < b.shifted ? -1 : a.shifted > b.shifted ? 1 : 0,
+  );
+  f.netRows = rows;
+
+  // SETUP drift-down skip: advance the cursor PAST any cache rows ABOVE the first boundary `sh`
+  // (zeroForOne walks DOWN ⇒ a row above is shifted > sh; oneForZero walks UP ⇒ shifted < sh).
+  let cur = 0;
+  const nCount = rows.length;
+  for (let q = 0; q < nCount; q++) {
+    if (cur < nCount) {
+      const rt = rows[cur].shifted;
+      const above = z ? rt > sh : rt < sh;
+      if (above) cur += 1;
+    }
+  }
+  f.netCur = cur;
+  return f;
+}
+
+/** This frontier's current out/in NEAR head (V3/V4 toOutIn; V2 stores out/in directly). */
+function frontierNearOI(f: Frontier): bigint {
+  return f.isV2 ? f.near : toOutIn(f.near, f.zeroForOne);
+}
+
+/** This frontier's current out/in FAR head (one stepReal ahead, or the latched bracket far). */
+function frontierFarOI(f: Frontier): bigint {
+  if (f.isV2) return f.near - mulDiv(f.near, V2_STEP_BPS, V2_STEP_DEN);
+  const far = f.brFar > 0n ? f.brFar : stepReal(f.near, f.stepRatio, f.zeroForOne);
+  return toOutIn(far, f.zeroForOne);
+}
+
+/** Build a RouteLeg [near, far, L, fee] for a leg pool's CURRENT bracket on the fixed live grid. */
+function frontierBracket(f: Frontier): RouteLeg {
+  return {
+    nearOI: frontierNearOI(f),
+    farOI: frontierFarOI(f),
+    L: f.L,
+    feePpm: BigInt(f.feePpm),
+  };
+}
+
 /**
- * Unified-walk reference. `live[i]` is the modeled live state for pools[i]; default (omitted)
- * uses the prepare-time spot (no drift): V3/V4 from spotTickShifted/topReal/spotActiveL, V2
- * curOI from the prepared spot out/in. `priceLimit` is the swap's real-sqrt price limit.
+ * Cross ONE boundary on a V3/V4 frontier (update L by ±net, advance near/shift) reusing the cursor
+ * mechanism + the gap-terminate gate. `cursorChecks` records every in-window crossing for the
+ * cursor-fidelity invariant; `priceLimit > 0` deactivates the frontier on a binding limit (direct
+ * pools only — a route binding cross passes 0n). Used by a direct-pool advance and a route bind.
+ */
+function crossV3Boundary(
+  f: Frontier,
+  priceLimit: bigint,
+  cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[],
+): void {
+  const z = f.zeroForOne;
+  // The bracket far is the anchored boundary on the fixed live grid (the price the cross lands at).
+  const farReal = f.brFar > 0n ? f.brFar : stepReal(f.near, f.stepRatio, z);
+  let dlim = false;
+  if (priceLimit > 0n) {
+    if (z) {
+      if (farReal <= priceLimit) dlim = true;
+    } else {
+      if (farReal >= priceLimit) dlim = true;
+    }
+  }
+
+  // Net at the boundary — the CURSOR MECHANISM (in-window cursor / out-of-window map).
+  const aNet = f.adaptiveNet;
+  const wTop = f.windowTop;
+  const wBot = f.windowBot;
+  const wLo = wTop <= wBot ? wTop : wBot;
+  const wHi = wTop <= wBot ? wBot : wTop;
+  const inWindow = wTop > 0n && f.shift >= wLo && f.shift <= wHi;
+  let raw: bigint;
+  if (inWindow) {
+    const mapSigned = aNet.get(Number(tickArg(f.shift))) ?? 0n;
+    const mapRaw = mapSigned >= 0n ? mapSigned : mapSigned + MOD128;
+    const rows = f.netRows;
+    const cc = f.netCur;
+    let cursorRaw = 0n;
+    if (cc < rows.length && rows[cc].shifted === f.shift) {
+      cursorRaw = rows[cc].raw;
+      f.netCur = cc + 1;
+    }
+    cursorChecks.push({ shifted: f.shift, cursorNet: cursorRaw, mapNet: mapRaw });
+    if (cursorRaw !== mapRaw) {
+      throw new Error(
+        `cursor net mismatch at shifted=${f.shift} (signedTick=${tickArg(f.shift)}): cursor=${cursorRaw} map=${mapRaw}`,
+      );
+    }
+    raw = cursorRaw;
+  } else {
+    const signedNet = aNet.get(Number(tickArg(f.shift))) ?? 0n;
+    raw = signedNet >= 0n ? signedNet : signedNet + MOD128;
+  }
+
+  const ts = f.tsShift;
+  const neg = raw >= HALF128;
+  let L = f.L;
+  if (z) {
+    if (neg) L = L + (MOD128 - raw);
+    else L = L >= raw ? L - raw : 0n;
+    f.shift -= ts;
+  } else {
+    if (neg) {
+      const dm = MOD128 - raw;
+      L = L >= dm ? L - dm : 0n;
+    } else L = L + raw;
+    f.shift += ts;
+  }
+  f.near = farReal;
+  f.L = L;
+  f.brFar = 0n; // crossed fully ⇒ next bracket re-derives its far one stepReal ahead
+
+  if (dlim) f.on = false;
+  if (L === 0n && f.extreme > 0n) {
+    const pastExt = z ? f.shift < f.extreme : f.shift > f.extreme;
+    if (pastExt) f.on = false;
+  }
+  f.steps += 1;
+  if (f.steps >= PER_POOL) f.on = false;
+}
+
+/**
+ * Move a V3/V4 frontier's NEAR to a partial far OI WITHOUT crossing a tick (the cut/partial-fill
+ * lands interior to the current bracket). Convert the out/in far back to a real sqrt so the next
+ * stepReal continues from the partial price (toOutIn is an involution). Latch the bracket far so a
+ * later step measures the SAME fixed bracket (mirrors the solver's brFar). V2 stores out/in.
+ */
+function advanceFrontierNearTo(f: Frontier, partialFarOI: bigint): void {
+  const farReal = f.brFar > 0n ? f.brFar : stepReal(f.near, f.stepRatio, f.zeroForOne);
+  if (f.isV2) {
+    f.near = partialFarOI;
+  } else {
+    f.near = toOutIn(partialFarOI, f.zeroForOne);
+    if (f.brFar === 0n) f.brFar = farReal;
+  }
+}
+
+interface LegSlice {
+  idxs: number[]; // universe pool indices of this leg's pools
+  zeroForOne: boolean; // the leg's hop direction
+}
+
+/**
+ * The leg-internal best per leg: for each leg, the active pool with the HIGHEST fee-adjusted out/in
+ * near (the leg-internal price-ordered merge — ties broken by higher far, mirroring the global
+ * merge). Returns the binding-pool index per leg + the per-leg fee-adjusted near/far heads (the fold
+ * inputs). null if any leg has no usable active pool (the route is inactive this step).
+ */
+function routeLegBest(
+  legs: LegSlice[],
+  fr: Frontier[],
+): { poolIdx: number[]; nearAdjs: bigint[]; farAdjs: bigint[] } | null {
+  const poolIdx: number[] = [];
+  const nearAdjs: bigint[] = [];
+  const farAdjs: bigint[] = [];
+  for (const leg of legs) {
+    let best = -1;
+    let bestAdj = 0n;
+    let bestFarAdj = 0n;
+    for (const idx of leg.idxs) {
+      const f = fr[idx];
+      if (!f.on) continue;
+      const oi = frontierNearOI(f);
+      const adj = feeAdj(oi, f.feePpm);
+      if (adj >= bestAdj) {
+        const farAdj = feeAdj(frontierFarOI(f), f.feePpm);
+        if (best < 0 || adj > bestAdj || (adj === bestAdj && farAdj > bestFarAdj)) {
+          bestAdj = adj;
+          bestFarAdj = farAdj;
+          best = idx;
+        }
+      }
+    }
+    if (best < 0) return null;
+    poolIdx.push(best);
+    nearAdjs.push(bestAdj);
+    farAdjs.push(bestFarAdj);
+  }
+  return { poolIdx, nearAdjs, farAdjs };
+}
+
+/**
+ * Advance one ROUTE by ONE event (or partial fill if it is the crossing venue). Mirrors the solver's
+ * route Phase A–D: per-leg binding pool + current bracket; routeEventN; conservation assert at every
+ * intermediate; if the remaining budget caps the event, routePartialN fills interior (no cross);
+ * else the binding leg crosses its bracket and its frontier steps, every other leg's near advances
+ * to the event's new far. NO priceLimit on a route cross (see file header). Returns route token-A in.
+ */
+function advanceRoute(
+  legs: LegSlice[],
+  fr: Frontier[],
+  cap: bigint,
+  cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[],
+  head: bigint,
+  prevRouteHead: bigint[],
+  routeIdx: number,
+): { routeIn: bigint } {
+  // Strictly-descending route head invariant: each consumed route segment's near must be <= the
+  // previous (a price-ordered merge emits descending segments). Allow the first (prev 0).
+  if (prevRouteHead[routeIdx] !== 0n && head > prevRouteHead[routeIdx]) {
+    throw new Error(
+      `route ${routeIdx} head not descending: ${head} > prev ${prevRouteHead[routeIdx]}`,
+    );
+  }
+  prevRouteHead[routeIdx] = head;
+
+  const best = routeLegBest(legs, fr);
+  if (best === null) return { routeIn: 0n };
+  const k = best.poolIdx.length;
+  const iLeg = best.poolIdx;
+  const legBr: RouteLeg[] = iLeg.map((idx) => frontierBracket(fr[idx]));
+
+  const ev = routeEventN(legBr);
+
+  // Conservation at EVERY intermediate: token X_i leg i PRODUCES == gross X_i leg i+1 PULLS for the
+  // bound event (leg i out == leg i+1 in). Compute both from the event's new fars and bound the
+  // residue. The forward/back inversion round-trips an integer truncation per leg boundary (the fee
+  // divide in invertFarFromGrossIn then the multiply in bracketGross), so a k-leg chain accumulates
+  // at most ~1 wei per upstream boundary of leg i+1 — bound it by `k` wei (slack-bounded, NOT a
+  // wei-exact gate; the wei-exact gate is reference == oracle, asserted by the caller).
+  const consTol = BigInt(k);
+  for (let i = 0; i + 1 < k; i++) {
+    const xOut = bracketOut(legBr[i].L, legBr[i].nearOI, ev.newFars[i]);
+    const xIn = bracketGross(legBr[i + 1].L, legBr[i + 1].nearOI, ev.newFars[i + 1], legBr[i + 1].feePpm);
+    const cons = xOut > xIn ? xOut - xIn : xIn - xOut;
+    if (cons > consTol) {
+      throw new Error(
+        `route ${routeIdx} conservation slip at intermediate ${i}: |${xOut} - ${xIn}| = ${cons} > ${consTol}`,
+      );
+    }
+  }
+
+  if (cap < ev.routeIn) {
+    // The route is the crossing venue: take exactly the remainder via a forward partial fill, NOT
+    // advancing past the cut. The binding test guarantees each leg's partial lands within its
+    // bracket; assert it per leg, then advance every leg's near to its partial far (interior).
+    const part = routePartialN(legBr, cap);
+    for (let i = 0; i < k; i++) {
+      const f = part.newFars[i];
+      if (f < legBr[i].farOI || f > legBr[i].nearOI) {
+        throw new Error(
+          `route ${routeIdx} leg ${i} partial out of bracket: f=${f} not in [${legBr[i].farOI}, ${legBr[i].nearOI}]`,
+        );
+      }
+      advanceFrontierNearTo(fr[iLeg[i]], f);
+    }
+    return { routeIn: cap };
+  }
+
+  // Full event: the BINDING leg crosses its bracket (its frontier steps the tick); every OTHER leg's
+  // near advances to the event's new far (interior — no cross). NO priceLimit on the binding cross.
+  for (let i = 0; i < k; i++) {
+    if (i === ev.bindLeg) {
+      crossV3Boundary(fr[iLeg[i]], 0n, cursorChecks);
+    } else {
+      advanceFrontierNearTo(fr[iLeg[i]], ev.newFars[i]);
+    }
+  }
+  return { routeIn: ev.routeIn };
+}
+
+/**
+ * Unified-walk reference. `live[i]` is the modeled live state for the i-th UNIVERSE pool (the flat
+ * `[...directPools, ...legPools]` order index.ts builds); default (omitted) uses the prepare-time
+ * spot (no drift). `directCount` = prepared.pools.length leading entries are DIRECT venues; the rest
+ * are leg pools reached solely via `prepared.routes`. Per-pool direction comes from each pool's
+ * `inIsToken0`. `priceLimit` is the swap's real-sqrt price limit (DIRECT pools only).
  */
 export function kwayReference(
   prepared: EcoSwapPrepared,
@@ -122,299 +507,150 @@ export function kwayReference(
   live?: (KwayLivePool | undefined)[],
 ): KwayReferenceResult {
   const { pools, routes } = prepared;
-  const zeroForOne = prepared.zeroForOne;
   const priceLimit = prepared.priceLimit;
-  // The flat route segments (sorted DESC sqrtAdjNear), competing via one cursor. Held as a
-  // thin slice of the prepared brackets (kind === Route) to keep the existing prepared shape.
-  const routeSegs = (prepared.brackets ?? []).filter((b) => b.kind === EcoBracketKind.Route);
-  // Run-until-filled bound: dominate the oracle's total reach so the cap can never truncate a
-  // trade the oracle fully fills.
-  const SAFETY = routeSegs.length + pools.length * PER_POOL * 2;
-  const perPoolInput: bigint[] = new Array(pools.length).fill(0n);
-  const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
 
-  // ── SETUP: seed the single frontier from the modeled LIVE spot ──
-  const lArr: bigint[] = new Array(pools.length).fill(0n);
-  const dnOn: boolean[] = new Array(pools.length).fill(false);
-  const dnNear: bigint[] = new Array(pools.length).fill(0n); // V3/V4 real sqrt; V2 out/in
-  const dnL: bigint[] = new Array(pools.length).fill(0n);
-  const dnShift: bigint[] = new Array(pools.length).fill(0n);
-  const dnSteps: number[] = new Array(pools.length).fill(0);
-  // Per-pool net cursor state — the on-chain netCache mechanism, mirrored EXACTLY. Each pool
-  // gets its [shiftedTick, rawNet] rows (only INITIALIZED ticks, sorted SWAP DIRECTION — the
-  // identical build prepare.ts's stampPoolCache flattens into the compiler netCache arg), a
-  // cursor (netCur) positioned by the SETUP drift-down skip, and the window bounds.
-  const netRows: { shifted: bigint; raw: bigint }[][] = new Array(pools.length);
-  const netCur: number[] = new Array(pools.length).fill(0);
+  // ── Build the FLAT POOL UNIVERSE exactly as index.ts buildPoolUniverseAndRouting: the direct
+  // pools, then each route leg's pools appended contiguously, DEDUPED by lowercased address. The
+  // routing metadata records, per route, the per-leg universe-index slices + the leg direction. ──
+  const directCount = pools.length;
+  const universe: EcoPool[] = [...pools];
+  const indexByAddr = new Map<string, number>();
+  pools.forEach((p, i) => indexByAddr.set(p.address.toLowerCase(), i));
+
+  const routeLegs: LegSlice[][] = [];
+  for (const route of routes as EcoRoute[]) {
+    const legs: LegSlice[] = [];
+    for (const leg of route.legs) {
+      const idxs: number[] = [];
+      for (const lp of leg.pools) {
+        const key = lp.address.toLowerCase();
+        let idx = indexByAddr.get(key);
+        if (idx === undefined) {
+          idx = universe.length;
+          universe.push(lp);
+          indexByAddr.set(key, idx);
+        }
+        idxs.push(idx);
+      }
+      legs.push({ idxs, zeroForOne: leg.zeroForOne });
+    }
+    routeLegs.push(legs);
+  }
+
+  const perPoolInput: bigint[] = new Array(directCount).fill(0n);
+  const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
   const cursorChecks: { shifted: bigint; cursorNet: bigint; mapNet: bigint }[] = [];
 
-  for (let i = 0; i < pools.length; i++) {
-    const pd = pools[i];
-    const lp = live?.[i];
-    netRows[i] = [];
-    if (pd.isV2) {
-      // V2: constant-L stream from the LIVE out/in spot (no ticks, no cache). The deterministic
-      // caller supplies liveV2L (+ curOI); default no-drift derives nothing (caller always sets).
-      const ll = lp?.liveV2L ?? 0n;
-      lArr[i] = ll;
-      dnOn[i] = ll > 0n;
-      dnNear[i] = lp?.curOI ?? 0n; // V2 frontier stores OUT/IN directly
-      dnL[i] = ll;
-      dnShift[i] = 0n;
-    } else {
-      const ts = BigInt(pd.tickSpacing);
-      // Live near sqrt + boundary + active L: a drift override, else the prepare-time spot.
-      let near: bigint;
-      let sh: bigint;
-      let L: bigint;
-      if (lp?.liveRealSqrt !== undefined) {
-        near = lp.liveRealSqrt;
-        const base = tickShiftedBaseTS(lp.liveTick ?? 0, ts);
-        sh = zeroForOne ? base : base + ts;
-        L = lp.liveL ?? 0n;
-      } else {
-        near = pd.spotNearReal ?? 0n;
-        sh = pd.spotTickShifted ?? 0n;
-        L = pd.spotActiveL ?? 0n;
-      }
-      dnNear[i] = near;
-      dnShift[i] = sh;
-      dnL[i] = L;
-      dnOn[i] = true;
+  // Outer bound: dominate the SUM of every frontier's reach + the route events so the cap never
+  // truncates a fill the per-pool / per-route caps would complete (mirrors the solver's SAFETY).
+  const SAFETY = universe.length * PER_POOL * 2 + routes.length * PER_POOL + 16;
 
-      // Build this pool's netCache rows EXACTLY as prepare.ts's stampPoolCache does: every
-      // INITIALIZED tick (signed net != 0), shifted (tick + OFFSET) + RAW uint128 (signed >= 0 ?
-      // signed : signed + 2^128), sorted in SWAP DIRECTION (zeroForOne descending shifted tick,
-      // oneForZero ascending). Prefer the pool's prepared netRows when present (the exact rows the
-      // solver ships); else derive from adaptiveNet so a fixture that only sets the map still
-      // exercises the cursor (the two builds are identical by construction).
-      const rows: { shifted: bigint; raw: bigint }[] = [];
-      if (pd.netRows && pd.netRows.length > 0) {
-        for (const r of pd.netRows) rows.push({ shifted: r.shiftedTick, raw: r.rawNet });
-      } else {
-        const aNet = pd.adaptiveNet ?? new Map<number, bigint>();
-        for (const [tick, signed] of aNet) {
-          if (signed === 0n) continue;
-          const raw = signed >= 0n ? signed : signed + MOD128;
-          rows.push({ shifted: BigInt(tick) + OFFSET, raw });
-        }
-      }
-      rows.sort((a, b) =>
-        zeroForOne
-          ? a.shifted < b.shifted ? 1 : a.shifted > b.shifted ? -1 : 0
-          : a.shifted < b.shifted ? -1 : a.shifted > b.shifted ? 1 : 0,
-      );
-      netRows[i] = rows;
-
-      // SETUP drift-down skip (ecoswap.sauce.ts ~224-246): advance the per-pool cursor PAST any
-      // cache rows that lie ABOVE the first boundary `sh` (the live spot has already moved below
-      // them, so the walk never crosses them). Swap-direction terms: zeroForOne walks DOWN, so a
-      // row above is shifted > sh; oneForZero walks UP, so a row above is shifted < sh.
-      let cur = 0;
-      const nCount = rows.length;
-      if (nCount > 0) {
-        // Mirror the solver's bounded loop (it can advance at most nCount times); a row stops
-        // skipping as soon as one is at/below the boundary (rows are sorted swap-direction).
-        for (let q = 0; q < nCount; q++) {
-          if (cur < nCount) {
-            const rt = rows[cur].shifted;
-            const above = zeroForOne ? rt > sh : rt < sh;
-            if (above) cur += 1;
-          }
-        }
-      }
-      netCur[i] = cur;
-    }
+  // ── SETUP: seed every universe pool's single frontier from its modeled LIVE spot ──
+  const fr: Frontier[] = new Array(universe.length);
+  for (let i = 0; i < universe.length; i++) {
+    fr[i] = seedFrontier(universe[i], live?.[i]);
   }
 
   // ── MERGE ──
   let cum = 0n;
-  let rc = 0; // route-segment cursor
   let cutSqrtAdj = 0n;
+  const prevRouteHead: bigint[] = new Array(routes.length).fill(0n);
+
   for (let s = 0; s < SAFETY; s++) {
     if (cum >= amountIn) break;
 
-    // 1. find the highest fee-adjusted head among {route cursor, dn[*]}. Ties on the near
-    // (entry) price break by HIGHER far (shallower step) so a coarse segment never wins ahead
-    // of a finer one — bit-identical to the optimal oracle's stable segment sort (adjNear DESC,
-    // adjFar DESC). Same key the solver uses.
-    let bestKind = 0; // 0=none 2=route 3=pool frontier
-    let bestPool = 0;
+    // 1. Find the highest fee-adjusted head among {each active direct pool, each active route}. Ties
+    // on the near (entry) price break by HIGHER far (shallower step) — bit-identical to the oracle's
+    // segment sort (adjNear DESC, adjFar DESC) and the solver's hot loop.
+    let bestKind = 0; // 0=none 2=route 3=direct pool frontier
+    let bestRef = 0; // route index OR direct-pool index
     let bestPrice = 0n;
     let bestFar = 0n;
-    if (rc < routeSegs.length) {
-      const rg = routeSegs[rc];
-      const rp = rg.sqrtAdjNear;
-      if (rp > bestPrice) {
-        bestPrice = rp;
-        bestFar = rg.sqrtAdjFar;
-        bestKind = 2;
+
+    // 1a. direct pools (universe [0, directCount)).
+    for (let j = 0; j < directCount; j++) {
+      const f = fr[j];
+      if (!f.on) continue;
+      const doi = frontierNearOI(f);
+      const dadj = feeAdj(doi, f.feePpm);
+      // LAZY far-adjust (mirrors the solver): the far is only the near-tie break, so a pool whose
+      // near is strictly below the best can never win — skip its far. Result-identical to eager.
+      if (dadj >= bestPrice) {
+        const dfarAdj = feeAdj(frontierFarOI(f), f.feePpm);
+        if (dadj > bestPrice || (dadj === bestPrice && dfarAdj > bestFar)) {
+          bestPrice = dadj;
+          bestFar = dfarAdj;
+          bestKind = 3;
+          bestRef = j;
+        }
       }
     }
-    for (let j = 0; j < pools.length; j++) {
-      const jd = pools[j];
-      const jfee = jd.feePpm;
-      if (dnOn[j]) {
-        const doi = jd.isV2 ? dnNear[j] : toOutIn(dnNear[j], zeroForOne);
-        const dadj = feeAdj(doi, jfee);
-        // LAZY far-adjust (mirrors ecoswap.sauce.ts): the far price is ONLY the near-tie break,
-        // so a pool whose near is strictly below the best can never win — skip its far. RESULT-
-        // identical to an eager far (the winner is unchanged either way), and keeps this
-        // reference structurally faithful to the solver's hot loop.
-        if (dadj >= bestPrice) {
-          let dfarAdj: bigint;
-          if (jd.isV2) {
-            const v2Far = dnNear[j] - mulDiv(dnNear[j], V2_STEP_BPS, V2_STEP_DEN);
-            dfarAdj = feeAdj(v2Far, jfee);
-          } else {
-            const farReal = stepReal(dnNear[j], jd.stepRatio ?? 0n, zeroForOne);
-            dfarAdj = feeAdj(toOutIn(farReal, zeroForOne), jfee);
-          }
-          if (dadj > bestPrice || (dadj === bestPrice && dfarAdj > bestFar)) {
-            bestPrice = dadj;
-            bestFar = dfarAdj;
-            bestKind = 3;
-            bestPool = j;
-          }
+
+    // 1b. routes: head = product fold of each leg's internal-best fee-adjusted near. A route is
+    // active only if EVERY leg has at least one active pool with a usable bracket.
+    for (let r = 0; r < routes.length; r++) {
+      const legBest = routeLegBest(routeLegs[r], fr);
+      if (legBest === null) continue;
+      const head = routeHeadFold(legBest.nearAdjs);
+      if (head >= bestPrice) {
+        const farHead = routeHeadFold(legBest.farAdjs);
+        if (head > bestPrice || (head === bestPrice && farHead > bestFar)) {
+          bestPrice = head;
+          bestFar = farHead;
+          bestKind = 2;
+          bestRef = r;
         }
       }
     }
 
     if (bestKind === 0) break;
 
-    if (bestKind === 2) {
-      const rg = routeSegs[rc];
-      const rdx = rg.refIdx;
-      const cap = rg.capacity;
-      let rtake = cap;
-      if (cum + cap >= amountIn) rtake = amountIn - cum;
-      perRouteInput[rdx] += rtake;
-      cum += rtake;
-      if (rtake > 0n) cutSqrtAdj = rg.sqrtAdjFar;
-      rc++;
-    } else if (bestKind === 3) {
-      const dd = pools[bestPool];
-      const dfee = dd.feePpm;
-      if (dd.isV2) {
-        const v2L = lArr[bestPool];
-        const v2Near = dnNear[bestPool];
+    if (bestKind === 3) {
+      // ── advance a DIRECT pool by one bracket ──
+      const f = fr[bestRef];
+      const dfee = f.feePpm;
+      if (f.isV2) {
+        const v2Near = f.near;
         const v2Far = v2Near - mulDiv(v2Near, V2_STEP_BPS, V2_STEP_DEN);
-        if (v2L > 0n && v2Near > v2Far && v2Far > 0n) {
-          const v2eff = mulDiv(v2L, Q96, v2Far) - mulDiv(v2L, Q96, v2Near);
+        if (f.v2L > 0n && v2Near > v2Far && v2Far > 0n) {
+          const v2eff = mulDiv(f.v2L, Q96, v2Far) - mulDiv(f.v2L, Q96, v2Near);
           if (v2eff > 0n) {
             const v2g = mulDiv(v2eff, FEE_DENOM, FEE_DENOM - BigInt(dfee));
             let v2t = v2g;
             if (cum + v2g >= amountIn) v2t = amountIn - cum;
-            perPoolInput[bestPool] += v2t;
+            perPoolInput[bestRef] += v2t;
             cum += v2t;
             if (v2t > 0n) cutSqrtAdj = feeAdj(v2Far, dfee);
           }
         }
-        dnNear[bestPool] = v2Far;
-        if (v2Far <= 0n) dnOn[bestPool] = false;
-        dnSteps[bestPool] += 1;
-        if (dnSteps[bestPool] >= PER_POOL) dnOn[bestPool] = false;
+        f.near = v2Far;
+        if (v2Far <= 0n) f.on = false;
+        f.steps += 1;
+        if (f.steps >= PER_POOL) f.on = false;
       } else {
-        // V3/V4 frontier step — tick walk on the LIVE grid, net from the prepared per-pool map.
-        let dL = dnL[bestPool];
-        const dts = BigInt(dd.tickSpacing);
-        const dstep = dd.stepRatio ?? 0n;
-        let dnear = dnNear[bestPool];
-        let dsh = dnShift[bestPool];
-        const dfarReal = stepReal(dnear, dstep, zeroForOne);
-        const dnearOI = toOutIn(dnear, zeroForOne);
-        const dfarOI = toOutIn(dfarReal, zeroForOne);
-        let dlim = false;
-        if (zeroForOne) {
-          if (dfarReal <= priceLimit) dlim = true;
-        } else {
-          if (dfarReal >= priceLimit) dlim = true;
-        }
-        if (dL > 0n && dnearOI > dfarOI && dfarOI > 0n) {
-          const deff = mulDiv(dL, Q96, dfarOI) - mulDiv(dL, Q96, dnearOI);
+        const dnearOI = frontierNearOI(f);
+        const dfarOI = frontierFarOI(f);
+        if (f.L > 0n && dnearOI > dfarOI && dfarOI > 0n) {
+          const deff = mulDiv(f.L, Q96, dfarOI) - mulDiv(f.L, Q96, dnearOI);
           if (deff > 0n) {
             const dg = mulDiv(deff, FEE_DENOM, FEE_DENOM - BigInt(dfee));
             let dt = dg;
             if (cum + dg >= amountIn) dt = amountIn - cum;
-            perPoolInput[bestPool] += dt;
+            perPoolInput[bestRef] += dt;
             cum += dt;
             if (dt > 0n) cutSqrtAdj = feeAdj(dfarOI, dfee);
           }
         }
-        // Net at the boundary — the CURSOR MECHANISM, mirrored bit-for-bit (ecoswap.sauce.ts
-        // ~355-376). IN-WINDOW (windowTop > 0 AND windowBot <= dsh <= windowTop): read the
-        // per-pool netCache cursor — a matching row (row.shifted === dsh) consumes its raw net
-        // and advances the cursor; an in-window NON-match is net 0 (an uninitialized tick — NO
-        // map read, the cursor does NOT advance). OUT-OF-WINDOW (no cache, or the boundary is
-        // outside the scanned span — the drift-up region above windowTop or a deep fill below
-        // windowBot): read the FULL `adaptiveNet` map (the TS analogue of a live ticks()/
-        // getTickLiquidity staticcall — drift-invariant, returns the SAME raw net).
-        const aNet = dd.adaptiveNet ?? new Map<number, bigint>();
-        const wTop = dd.windowTopShifted ?? 0n;
-        const wBot = dd.windowBotShifted ?? 0n;
-        // Order-agnostic window test (mirrors the solver): the bounds are the shallowest/deepest
-        // scanned boundaries in shifted-tick space, and their ORDER flips by swap direction
-        // (zeroForOne wBot <= wTop; oneForZero wBot >= wTop). Accept dsh within [min, max] so the
-        // cursor cache engages for BOTH directions.
-        const wLo = wTop <= wBot ? wTop : wBot;
-        const wHi = wTop <= wBot ? wBot : wTop;
-        const inWindow = wTop > 0n && dsh >= wLo && dsh <= wHi;
-        let raw: bigint;
-        if (inWindow) {
-          // The drift-invariant truth for THIS tick (what an out-of-window staticcall WOULD
-          // return) — the cursor-path net must equal it for every crossed in-window boundary.
-          const mapSigned = aNet.get(Number(tickArg(dsh))) ?? 0n;
-          const mapRaw = mapSigned >= 0n ? mapSigned : mapSigned + MOD128;
-          const rows = netRows[bestPool];
-          const cc = netCur[bestPool];
-          let cursorRaw = 0n;
-          if (cc < rows.length && rows[cc].shifted === dsh) {
-            cursorRaw = rows[cc].raw;
-            netCur[bestPool] = cc + 1;
-          }
-          // Cursor fidelity: the cursor-path net for this in-window boundary MUST equal the
-          // full-map net (a cached initialized row, or 0 for an in-window uninitialized tick).
-          // Record + assert inline so any vector (not only the EVM lane) catches a cursor
-          // off-by-one — the drift-down skip leaving the cursor on the wrong row, a missed
-          // advance, or an uninitialized tick wrongly consuming a row.
-          cursorChecks.push({ shifted: dsh, cursorNet: cursorRaw, mapNet: mapRaw });
-          if (cursorRaw !== mapRaw) {
-            throw new Error(
-              `cursor net mismatch at shifted=${dsh} (signedTick=${tickArg(dsh)}): cursor=${cursorRaw} map=${mapRaw}`,
-            );
-          }
-          raw = cursorRaw;
-        } else {
-          const signedNet = aNet.get(Number(tickArg(dsh))) ?? 0n;
-          raw = signedNet >= 0n ? signedNet : signedNet + MOD128;
-        }
-        const neg = raw >= HALF128;
-        if (zeroForOne) {
-          if (neg) dL = dL + (MOD128 - raw);
-          else dL = dL >= raw ? dL - raw : 0n;
-          dsh -= dts;
-        } else {
-          if (neg) {
-            const dm = MOD128 - raw;
-            dL = dL >= dm ? dL - dm : 0n;
-          } else dL = dL + raw;
-          dsh += dts;
-        }
-        dnNear[bestPool] = dfarReal;
-        dnL[bestPool] = dL;
-        dnShift[bestPool] = dsh;
-        // TERMINATE only on: price limit, OR budget cap, OR (dL==0 AND boundary PAST the
-        // deepest initialized tick). Walk THROUGH interior dL==0 gaps. extremeShifted==0 ⇒
-        // no gap gate (constant-L curve; terminates via fill / price-limit / cap).
-        if (dlim) dnOn[bestPool] = false;
-        const ext = dd.extremeShifted ?? 0n;
-        if (dL === 0n && ext > 0n) {
-          const pastExt = zeroForOne ? dsh < ext : dsh > ext;
-          if (pastExt) dnOn[bestPool] = false;
-        }
-        dnSteps[bestPool] += 1;
-        if (dnSteps[bestPool] >= PER_POOL) dnOn[bestPool] = false;
+        crossV3Boundary(f, priceLimit, cursorChecks);
       }
+    } else {
+      // ── advance a ROUTE by one event ──
+      const r = bestRef;
+      const cap = amountIn - cum;
+      const taken = advanceRoute(routeLegs[r], fr, cap, cursorChecks, bestPrice, prevRouteHead, r);
+      perRouteInput[r] += taken.routeIn;
+      cum += taken.routeIn;
+      if (taken.routeIn > 0n) cutSqrtAdj = bestFar;
     }
   }
 

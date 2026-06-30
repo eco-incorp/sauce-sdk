@@ -1,10 +1,13 @@
 /**
  * EcoSwap COMPILE-ONLY unit test (no fork, no RPC).
  *
- * Builds a minimal hand-rolled "prepared" dataset — the simplest real case:
- * TWO Uniswap V3 pools, a few brackets, no routes — and runs it through the
- * real compiler exactly the way index.ts does. This deterministically catches
- * compiler errors in ecoswap.sauce.ts (and arg-tuple encoding) without a fork.
+ * Builds minimal hand-rolled compiler-arg datasets in the SAME shape index.ts
+ * builds (the cfg-bundle 4-arg shape: `main(cfg, pools, netCache, routing)`) and
+ * runs them through the real compiler exactly the way index.ts does. This
+ * deterministically catches compiler errors in ecoswap.sauce.ts (and arg-tuple
+ * encoding) without a fork — direct-pool fixtures AND a multi-hop route fixture
+ * (a 2-hop route with multi-pool legs, exercising the flat-universe routing
+ * scalar tuples + the route-walk codegen).
  *
  * Run: npx tsx --test src/recipes/test/ecoswap.compile.test.ts
  */
@@ -28,9 +31,10 @@ function stripTypes(source: string): string {
   }).outputText;
 }
 
-// ── Minimal fixture: 2 V3 pools, no routes ───────────────────
+// ── Fixture scalars ──────────────────────────────────────────
 const WETH = BigInt("0x4200000000000000000000000000000000000006");
 const USDC = BigInt("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+const BASE_TOKEN = BigInt("0x2222222222222222222222222222222222222222"); // route intermediate
 const CALLER = BigInt("0x1111111111111111111111111111111111111111");
 const PRICE_LIMIT = 4295128740n; // MIN_SQRT_RATIO + 1
 
@@ -45,29 +49,44 @@ const pools: bigint[][] = [
   [1n, BigInt("0xbbbb000000000000000000000000000000000002"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
    STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 1n, 1n],
 ];
-const routes: bigint[][] = [];
 // netCache: [shiftedTick, rawNet] rows — one initialized tick per pool (netStart 0 then 1).
 const netCache: bigint[][] = [
   [OFFSET - 30n, 10n ** 17n],
   [OFFSET - 180n, 5n * 10n ** 16n],
 ];
-const routeSegs: bigint[][] = [];
+const routing: bigint[][] = [];
+
+/**
+ * Build the `cfg` scalar tuple index.ts emits:
+ *   cfg = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount].
+ */
+function cfgTuple(directCount: number): bigint[] {
+  return [WETH, USDC, 10n ** 18n, CALLER, PRICE_LIMIT, BigInt(directCount)];
+}
 
 // ── The unified-walk merge solver — ecoswap.sauce.ts ─────────────────
-// The sole on-chain solver (one price-ordered merge over {each pool's live frontier, route
-// segments}). Lowers new Array(n) + arr[i]=… element mutation, the per-pool net-cache cursor,
-// and the V2/V3/V4 live reads, and must compile clean on BOTH the v1 (prefix) and v12
-// (postfix-Huff) targets — this catches array-mutation / merge / net-cursor lowering regressions
-// on either engine.
+// The sole on-chain solver (one price-ordered merge over {each direct pool's live frontier, each
+// route's composed live walk}). Lowers new Array(n) + arr[i]=… element mutation, the per-pool
+// net-cache cursor, the V2/V3/V4 live reads, AND the flat-universe route loop, and must compile
+// clean on BOTH the v1 (prefix) and v12 (postfix-Huff) targets — this catches array-mutation /
+// merge / net-cursor / route-walk lowering regressions on either engine. The compile args are the
+// cfg-bundle 4-arg shape `[cfg, pools, netCache, routing]` index.ts builds (cfg + each routing[r]
+// are actual bigint arrays; pools/netCache are bigint[][]).
 describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   const SINGLEPASS = join(RECIPE_DIR, "ecoswap.sauce.ts");
 
-  // Compile the solver for BOTH targets with the given fixture (16-field pool tuples + the flat
-  // netCache + routeSegs) and assert each produces >=1 non-empty bytecode segment.
-  function compileBoth(poolsArg: bigint[][], netCacheArg: bigint[][], routeSegsArg: bigint[][]) {
+  // Compile the solver for BOTH targets with the given universe (16-field pool tuples), flat
+  // netCache, and routing scalar tuples + directCount, and assert each produces >=1 non-empty
+  // bytecode segment.
+  function compileBoth(
+    poolsArg: bigint[][],
+    netCacheArg: bigint[][],
+    routingArg: bigint[][],
+    directCount: number,
+  ) {
     const source = readFileSync(SINGLEPASS, "utf-8");
     const stripped = stripTypes(source);
-    const args = [WETH, USDC, 10n ** 18n, CALLER, PRICE_LIMIT, poolsArg, routes, netCacheArg, routeSegsArg];
+    const args = [cfgTuple(directCount), poolsArg, netCacheArg, routingArg];
 
     const v1: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args });
     const v12: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args, target: "v12" });
@@ -80,7 +99,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   }
 
   it("compiles a 2-V3-pool fixture (v1 + v12)", () => {
-    compileBoth(pools, netCache, routeSegs);
+    compileBoth(pools, netCache, routing, 2);
   });
 
   // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1) plus the
@@ -93,7 +112,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
        0n, 0n, 0n, 0n, 0n, 0n],
     ];
     const mixedNetCache: bigint[][] = [[OFFSET - 30n, 10n ** 17n]];
-    compileBoth(mixedPools, mixedNetCache, routeSegs);
+    compileBoth(mixedPools, mixedNetCache, routing, 2);
   });
 
   // V4 pool — guards the StateView getSlot0 read (dp[8]/dp[9]) + unified swap poolType=2.
@@ -107,7 +126,76 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
        STEP_60, OFFSET, OFFSET - 120n, OFFSET - 60n, 0n, 1n],
     ];
     const v4NetCache: bigint[][] = [[OFFSET - 60n, 10n ** 17n]];
-    compileBoth(v4Pools, v4NetCache, routeSegs);
+    compileBoth(v4Pools, v4NetCache, routing, 1);
+  });
+
+  // MULTI-HOP ROUTE fixture — guards the flat-universe route loop: ONE direct A->B pool +
+  // a 2-hop route A->X->B whose FIRST leg splits across TWO pools (multi-pool leg) and second
+  // leg has one pool. The universe is [direct, leg0a, leg0b, leg1] (directCount=1), and routing
+  // carries the per-leg [base,count,inter] scalar strides:
+  //   routing[0] = [2 (legCount), 1,2,BASE_TOKEN (leg0: pools [1,3), inter=X), 3,1,0 (leg1: pool [3,4), final inter 0)]
+  // This exercises composeStep/routeEvent2/routePartial2 codegen + the routing depth-2 reads.
+  it("compiles a 2-hop route with a multi-pool leg (v1 + v12)", () => {
+    const routePools: bigint[][] = [
+      // [0] direct A->B (V3 0.30%)
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 0n, 1n],
+      // [1] leg0 pool a (A->X, V3 0.05%, zHop=1)
+      [1n, BigInt("0xdddd000000000000000000000000000000000004"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 1n, 1n],
+      // [2] leg0 pool b (A->X, V3 0.30%, zHop=1)
+      [1n, BigInt("0xeeee000000000000000000000000000000000005"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 2n, 1n],
+      // [3] leg1 pool (X->B, V3 0.30%, zHop=1)
+      [1n, BigInt("0xffff000000000000000000000000000000000006"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 3n, 1n],
+    ];
+    const routeNetCache: bigint[][] = [
+      [OFFSET - 180n, 10n ** 17n], // direct [0]
+      [OFFSET - 30n, 10n ** 17n], // leg0a [1]
+      [OFFSET - 180n, 10n ** 17n], // leg0b [2]
+      [OFFSET - 180n, 10n ** 17n], // leg1 [3]
+    ];
+    const routeRouting: bigint[][] = [
+      [2n, 1n, 2n, BASE_TOKEN, 3n, 1n, 0n],
+    ];
+    compileBoth(routePools, routeNetCache, routeRouting, 1);
+  });
+
+  // 3-HOP ROUTE fixture — guards the N-leg route loop (legCount=3): ONE direct A->B pool + a
+  // 3-hop route A->X->Y->B (one V3 pool per leg). The universe is [direct, leg0, leg1, leg2]
+  // (directCount=1); routing carries the uniform [base,count,inter] stride for THREE legs:
+  //   routing[0] = [3, 1,1,X, 2,1,Y, 3,1,0]
+  // (leg0 pool [1,2) inter=X; leg1 pool [2,3) inter=Y; leg2 pool [3,4) final inter 0). This is the
+  // structural variant the 2-hop path can't cover: the route-event back/forward propagation runs
+  // an actual upstream+downstream chain (the middle leg has BOTH an upstream and a downstream leg).
+  it("compiles a 3-hop route (v1 + v12)", () => {
+    const X_TOKEN = BigInt("0x3333333333333333333333333333333333333333");
+    const Y_TOKEN = BigInt("0x4444444444444444444444444444444444444444");
+    const routePools: bigint[][] = [
+      // [0] direct A->B (V3 0.30%)
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 0n, 1n],
+      // [1] leg0 pool (A->X, V3 0.05%, zHop=1)
+      [1n, BigInt("0xdddd000000000000000000000000000000000004"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 1n, 1n],
+      // [2] leg1 pool (X->Y, V3 0.30%, zHop=1)
+      [1n, BigInt("0xeeee000000000000000000000000000000000005"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 2n, 1n],
+      // [3] leg2 pool (Y->B, V3 0.05%, zHop=1)
+      [1n, BigInt("0xffff000000000000000000000000000000000006"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 3n, 1n],
+    ];
+    const routeNetCache: bigint[][] = [
+      [OFFSET - 180n, 10n ** 17n], // direct [0]
+      [OFFSET - 30n, 10n ** 17n], // leg0 [1]
+      [OFFSET - 180n, 10n ** 17n], // leg1 [2]
+      [OFFSET - 30n, 10n ** 17n], // leg2 [3]
+    ];
+    const routeRouting: bigint[][] = [
+      [3n, 1n, 1n, X_TOKEN, 2n, 1n, Y_TOKEN, 3n, 1n, 0n],
+    ];
+    compileBoth(routePools, routeNetCache, routeRouting, 1);
   });
 });
 

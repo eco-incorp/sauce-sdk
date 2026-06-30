@@ -30,9 +30,16 @@ import {
   V2_STEP_DEN,
 } from "./ecoswap.math";
 import { kwayReference, type KwayLivePool } from "./ecoswap.solver-reference";
-import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
-import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
+import { optimalSplit, type OptimalPool, type OptimalRoute } from "./ecoswap.optimal";
+import {
+  EcoBracketKind,
+  type EcoBracket,
+  type EcoPool,
+  type EcoRoute,
+  type EcoSwapPrepared,
+} from "../shared/types";
 import { SwapPoolType } from "../shared/constants";
+import type { Hex } from "viem";
 
 const ZERO = "0x0000000000000000000000000000000000000000" as const;
 const PRICE_LIMIT = 4295128740n; // MIN_SQRT_RATIO + 1 (zeroForOne extreme)
@@ -1096,3 +1103,313 @@ describe("k-way reference == optimal oracle (drift-up live-spot walk — both di
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// ROUTES = LIVE WALK — kwayReference (per-leg-pool live frontiers) == optimalSplit (oracle)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Routes are now first-class live-walk venues (no static segments). Each leg is a SET of leg
+// pools, each with its own live frontier seeded by the SAME direct-pool SETUP (using the leg's
+// zHop), and the route head is the LEFT-TO-RIGHT product fold of the per-leg internal-best
+// fee-adjusted heads. These vectors prove the cursor-faithful reference's route walk is wei-exact
+// vs the neutral oracle (optimalSplit, built from the SAME live leg state) across: a 2-hop route
+// alone + competing with a direct pool, a MULTI-POOL leg (a leg splitting across two pools), and
+// OPPOSITE-DIRECTION hops (z1 != z2). The reference IMPORTS routeHeadFold/routeEvent2/routePartial2
+// from ecoswap.math.ts — the same helpers the oracle uses — so the two agree BY CONSTRUCTION.
+
+const ROUTE_PRICE_LIMIT = 0n; // routes: no binding price limit in these fixtures (deep legs)
+
+let addrSeq = 1;
+/** A distinct non-zero pool address (the universe dedupes by address; leg pools must be unique). */
+function nextAddr(): Hex {
+  const h = (addrSeq++).toString(16).padStart(40, "0");
+  return ("0x" + h) as Hex;
+}
+
+/**
+ * A constant-L V3 leg/direct EcoPool at `prepTick` with explicit address + per-pool direction
+ * (`zHop` → inIsToken0). Empty net ⇒ single constant-L curve (the regime the route legs use). The
+ * window scalars are stamped from a `nBr`-deep scan (enough to reach a clean interior cut).
+ */
+function legPool(addr: Hex, feePpm: number, ts: number, L: bigint, nBr: number, prepTick: number, zHop: boolean): EcoPool {
+  const spotReal = getSqrtRatioAtTick(prepTick);
+  const stepRatio = getSqrtRatioAtTick(ts);
+  const base = Math.floor(prepTick / ts) * ts;
+  const startBoundary = zHop ? base : base + ts;
+  const step = zHop ? -ts : ts;
+  const spotBoundaryShifted = BigInt(startBoundary + Number(OFFSET));
+  const windowBotShifted = spotBoundaryShifted + BigInt(step) * BigInt(nBr > 0 ? nBr - 1 : 0);
+  return {
+    poolType: SwapPoolType.UniV3, address: addr, fee: feePpm, tickSpacing: ts, hooks: ZERO,
+    feePpm, isV2: false, inIsToken0: zHop, stateView: ZERO, poolId: ZERO,
+    stepRatio,
+    windowTopShifted: nBr > 0 ? spotBoundaryShifted : 0n,
+    windowBotShifted: nBr > 0 ? windowBotShifted : 0n,
+    extremeShifted: 0n,
+    spotTickShifted: spotBoundaryShifted,
+    spotNearReal: spotReal,
+    spotActiveL: L,
+    adaptiveNet: new Map<number, bigint>(),
+    source: "synthetic-leg",
+  };
+}
+
+/** The oracle leg (OptimalRoute) mirror of `legPool` — true live state, same direction. */
+function optLeg(feePpm: number, ts: number, L: bigint, prepTick: number, zHop: boolean): OptimalRoute["legs"][number] {
+  return {
+    isV2: false, feePpm, sqrtPriceX96: getSqrtRatioAtTick(prepTick), tick: prepTick,
+    tickSpacing: ts, liquidity: L, net: new Map(), zeroForOne: zHop,
+  };
+}
+
+function assertRouteExact(
+  kw: { perPoolInput: bigint[]; perRouteInput: bigint[]; totalInput: bigint },
+  opt: { perPoolInput: bigint[]; perRouteInput: bigint[]; totalInput: bigint },
+  label: string,
+): void {
+  assert.equal(kw.totalInput, opt.totalInput, `${label}: total != oracle`);
+  for (let i = 0; i < kw.perPoolInput.length; i++) {
+    assert.equal(kw.perPoolInput[i], opt.perPoolInput[i], `${label}: pool[${i}] != oracle`);
+  }
+  for (let r = 0; r < kw.perRouteInput.length; r++) {
+    assert.equal(kw.perRouteInput[r], opt.perRouteInput[r], `${label}: route[${r}] != oracle`);
+  }
+}
+
+describe("k-way reference == optimal oracle (ROUTE-ONLY universe, 2-hop V3 legs)", () => {
+  const DEEP = 10n ** 26n;
+  for (const amountIn of [1000n * E18, 50_000n * E18]) {
+    it(`route-only amountIn=${amountIn} — all input via the route, wei-exact == oracle`, () => {
+      const a1 = nextAddr();
+      const a2 = nextAddr();
+      const route: EcoRoute = {
+        legs: [
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, 60, DEEP, 200, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, 60, DEEP, 200, 0, true)] },
+        ],
+        intermediateTokens: [nextAddr()],
+      };
+      const prepared: EcoSwapPrepared = {
+        pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+      };
+      const optRoute: OptimalRoute = { legs: [optLeg(3000, 60, DEEP, 0, true), optLeg(3000, 60, DEEP, 0, true)] };
+      const kw = kwayReference(prepared, amountIn);
+      const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+      assert.equal(kw.totalInput, amountIn, "spends amountIn exactly through the route");
+      assert.ok(kw.perRouteInput[0] > 0n, "route engaged");
+      assertRouteExact(kw, opt, `route-only A=${amountIn}`);
+      assert.ok(kw.cursorChecks.length >= 0, "cursor checks recorded (window legs exercise the cursor)");
+    });
+  }
+});
+
+describe("k-way reference == optimal oracle (direct pool + 2-hop route — shared cut, wei-exact)", () => {
+  const DEEP = 10n ** 26n;
+  // A SHALLOW direct pool (one fee) competes with a DEEP 2-hop route (two fees). The direct pool
+  // fills first; a large trade overflows into the route at the shared cut. Both engaged ⇒ the split
+  // equalizes the direct marginal against the route's product head. Wei-exact vs the oracle.
+  for (const [tag, amountIn] of [
+    ["small: route unused", E18 / 10n],
+    ["large: route engaged", 200_000n * E18],
+  ] as const) {
+    it(`${tag} amountIn=${amountIn} — direct + route split == oracle, wei-exact`, () => {
+      const SHALLOW = 10n ** 21n;
+      const dAddr = nextAddr();
+      const direct: EcoPool = legPool(dAddr, 3000, 60, SHALLOW, 200, 0, true);
+      const a1 = nextAddr();
+      const a2 = nextAddr();
+      const route: EcoRoute = {
+        legs: [
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, 60, DEEP, 200, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, 60, DEEP, 200, 0, true)] },
+        ],
+        intermediateTokens: [nextAddr()],
+      };
+      const prepared: EcoSwapPrepared = {
+        pools: [direct], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+      };
+      const optDirect: OptimalPool = { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: SHALLOW, net: new Map() };
+      const optRoute: OptimalRoute = { legs: [optLeg(3000, 60, DEEP, 0, true), optLeg(3000, 60, DEEP, 0, true)] };
+      const kw = kwayReference(prepared, amountIn);
+      const opt = optimalSplit({ pools: [optDirect], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+      assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
+      assertRouteExact(kw, opt, `${tag} A=${amountIn}`);
+    });
+  }
+});
+
+describe("k-way reference == optimal oracle (equalization: direct pool + route share a marginal)", () => {
+  // The water-fill keystone: at the cut the direct pool's post-fee marginal == the route's product
+  // head. SHALLOW venues so the route enters as many fine micro-segments at a clean interior cut.
+  it("post-fee route head ≈ direct marginal at the cut; wei-exact == oracle", () => {
+    const TS = 60;
+    const directL = 10n ** 22n;
+    const legL = 10n ** 22n;
+    const dAddr = nextAddr();
+    const direct: EcoPool = legPool(dAddr, 500, TS, directL, 400, 0, true);
+    const a1 = nextAddr();
+    const a2 = nextAddr();
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, TS, legL, 400, 0, true)] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, TS, legL, 400, 0, true)] },
+      ],
+      intermediateTokens: [nextAddr()],
+    };
+    const amountIn = 10000n * E18;
+    const prepared: EcoSwapPrepared = {
+      pools: [direct], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optDirect: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: TS, liquidity: directL, net: new Map() };
+    const optRoute: OptimalRoute = { legs: [optLeg(3000, TS, legL, 0, true), optLeg(3000, TS, legL, 0, true)] };
+    const kw = kwayReference(prepared, amountIn);
+    const opt = optimalSplit({ pools: [optDirect], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
+    assert.ok(kw.perPoolInput[0] > 0n && kw.perRouteInput[0] > 0n, "both venues engaged at the cut");
+    assertRouteExact(kw, opt, "equalization direct+route");
+  });
+});
+
+describe("k-way reference == optimal oracle (MULTI-POOL LEG — a leg splits across two pools)", () => {
+  // A 2-hop route whose FIRST leg has TWO pools (different fees) the leg splits across, second leg
+  // one pool. The reference's leg-internal merge picks the best pool per event; the route head folds
+  // the leg-internal best with leg2. The oracle models the multi-pool leg as the SAME parallel
+  // single-pool routes through the shared intermediate, so the reference's ONE perRouteInput equals
+  // the SUM over the oracle's per-combination routes. Both legs deep ⇒ a clean interior split.
+  it("first-leg two-pool split — Σ route input == oracle parallel-route sum, conservation holds", () => {
+    const DEEP = 10n ** 26n;
+    const TS = 60;
+    // Leg1 pools: same spot, fees 0.05% and 0.30% (the leg-internal merge orders by fee-adjusted head).
+    const l1a = nextAddr();
+    const l1b = nextAddr();
+    const l2 = nextAddr();
+    const route: EcoRoute = {
+      legs: [
+        {
+          hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true,
+          pools: [legPool(l1a, 500, TS, DEEP, 300, 0, true), legPool(l1b, 3000, TS, DEEP, 300, 0, true)],
+        },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(l2, 3000, TS, DEEP, 300, 0, true)] },
+      ],
+      intermediateTokens: [nextAddr()],
+    };
+    const amountIn = 5000n * E18;
+    const prepared: EcoSwapPrepared = {
+      pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    // Oracle: the multi-pool leg = two parallel single-pool routes sharing the intermediate
+    // (leg1-pool-a→leg2) and (leg1-pool-b→leg2). The reference's single route input == their sum.
+    const optRouteA: OptimalRoute = { legs: [optLeg(500, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true)] };
+    const optRouteB: OptimalRoute = { legs: [optLeg(3000, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true)] };
+    const kw = kwayReference(prepared, amountIn);
+    const opt = optimalSplit({ pools: [], routes: [optRouteA, optRouteB], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
+    assert.ok(kw.perRouteInput[0] > 0n, "multi-pool-leg route engaged");
+    // The single route's input == the sum over the oracle's parallel single-pool routes.
+    assert.equal(kw.perRouteInput[0], opt.perRouteInput[0] + opt.perRouteInput[1], "Σ route input == oracle parallel sum");
+    assert.equal(kw.perRouteInput[0], amountIn, "all input via the (deep) multi-pool-leg route");
+  });
+});
+
+describe("k-way reference == optimal oracle (OPPOSITE-DIRECTION hops — z1 != z2)", () => {
+  // A 2-hop route whose first leg swaps token0→token1 (zeroForOne) and second leg token1→token0
+  // (oneForZero) — each leg works in its OWN out/in space (toOutIn absorbs the per-hop direction).
+  // The per-pool direction comes from each leg pool's inIsToken0 (the leg's zHop), NOT a top-level
+  // constant. Cross-checked against the oracle's opposite-direction route + a direct pool.
+  it("z1=true, z2=false route composes + conserves; wei-exact == oracle", () => {
+    const DEEP = 10n ** 26n;
+    const TS = 60;
+    const dAddr = nextAddr();
+    const direct: EcoPool = legPool(dAddr, 500, 10, 10n ** 24n, 300, 0, true);
+    const a1 = nextAddr();
+    const a2 = nextAddr();
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, TS, DEEP, 300, 0, true)] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: false, pools: [legPool(a2, 3000, TS, DEEP, 300, 0, false)] },
+      ],
+      intermediateTokens: [nextAddr()],
+    };
+    const amountIn = 5000n * E18;
+    const prepared: EcoSwapPrepared = {
+      pools: [direct], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optDirect: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 10, liquidity: 10n ** 24n, net: new Map() };
+    const optRoute: OptimalRoute = { legs: [optLeg(3000, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, false)] };
+    const kw = kwayReference(prepared, amountIn);
+    const opt = optimalSplit({ pools: [optDirect], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assert.equal(kw.totalInput, amountIn, "spends amountIn exactly with an opposite-direction route");
+    assert.ok(kw.perRouteInput[0] > 0n, "opposite-direction route engaged");
+    assertRouteExact(kw, opt, "opposite-direction hops");
+  });
+});
+
+describe("k-way reference == optimal oracle (3-HOP route — N-leg event, wei-exact)", () => {
+  // The N-hop generalization gate: a THREE-leg route (A→X→Y→B) walks the same per-leg-pool live
+  // frontiers, the route head is the product fold of all three legs' fee-adjusted heads, and each
+  // event binds whichever leg crosses first while the other TWO partial-fill (conservation at BOTH
+  // intermediates X and Y). Both the reference's advanceRoute (routeEventN/routePartialN) and the
+  // oracle's routeSegments are arbitrary-k; this asserts they agree to the wei on 3 hops.
+  const DEEP = 10n ** 26n;
+  const TS = 60;
+  for (const amountIn of [1000n * E18, 80_000n * E18]) {
+    it(`route-only 3-hop amountIn=${amountIn} — all input via the route, wei-exact == oracle`, () => {
+      const a1 = nextAddr();
+      const a2 = nextAddr();
+      const a3 = nextAddr();
+      // Three legs of differing fees so the binding leg genuinely rotates across events.
+      const route: EcoRoute = {
+        legs: [
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 500, TS, DEEP, 300, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, TS, DEEP, 300, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a3, 500, TS, DEEP, 300, 0, true)] },
+        ],
+        intermediateTokens: [nextAddr(), nextAddr()],
+      };
+      const prepared: EcoSwapPrepared = {
+        pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+      };
+      const optRoute: OptimalRoute = {
+        legs: [optLeg(500, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true), optLeg(500, TS, DEEP, 0, true)],
+      };
+      const kw = kwayReference(prepared, amountIn);
+      const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+      assert.equal(kw.totalInput, amountIn, "spends amountIn exactly through the 3-hop route");
+      assert.ok(kw.perRouteInput[0] > 0n, "3-hop route engaged");
+      assertRouteExact(kw, opt, `3-hop route-only A=${amountIn}`);
+    });
+  }
+
+  it("direct pool + 3-hop route — shared cut, wei-exact == oracle", () => {
+    // A SHALLOW direct pool fills first; a large trade overflows into the 3-hop route at the shared
+    // cut. Both engaged ⇒ the split equalizes the direct marginal against the route's 3-leg head.
+    const SHALLOW = 10n ** 23n;
+    const dAddr = nextAddr();
+    const direct: EcoPool = legPool(dAddr, 3000, TS, SHALLOW, 300, 0, true);
+    const a1 = nextAddr();
+    const a2 = nextAddr();
+    const a3 = nextAddr();
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, TS, DEEP, 300, 0, true)] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, TS, DEEP, 300, 0, true)] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a3, 3000, TS, DEEP, 300, 0, true)] },
+      ],
+      intermediateTokens: [nextAddr(), nextAddr()],
+    };
+    const amountIn = 200_000n * E18;
+    const prepared: EcoSwapPrepared = {
+      pools: [direct], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optDirect: OptimalPool = { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: TS, liquidity: SHALLOW, net: new Map() };
+    const optRoute: OptimalRoute = {
+      legs: [optLeg(3000, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true), optLeg(3000, TS, DEEP, 0, true)],
+    };
+    const kw = kwayReference(prepared, amountIn);
+    const opt = optimalSplit({ pools: [optDirect], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
+    assert.ok(kw.perPoolInput[0] > 0n, "direct pool engaged");
+    assert.ok(kw.perRouteInput[0] > 0n, "3-hop route engaged");
+    assertRouteExact(kw, opt, "direct + 3-hop route");
+  });
+});

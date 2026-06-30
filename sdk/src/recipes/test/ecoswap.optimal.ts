@@ -54,6 +54,9 @@ import {
   getSqrtRatioAtTick,
   V2_STEP_BPS,
   V2_STEP_DEN,
+  routeHeadFold,
+  routeEventN,
+  type RouteLeg,
 } from "./ecoswap.math";
 
 // ── Input: the TRUE live pool state ──────────────────────────
@@ -94,8 +97,35 @@ export interface OptimalPool {
   reserveOut?: bigint;
 }
 
+/**
+ * A multi-hop route leg — ONE hop of a route, as TRUE live state. A leg is (for the
+ * foundation) ONE pool of either kind; the leg's own swap direction is `zeroForOne`
+ * (a route can change direction per hop). N-leg-internal-split is a later workflow; the
+ * shape already carries a single pool but the route walk treats each leg as a frontier of
+ * constant-L brackets, so adding an internal merge later only changes how the leg's
+ * bracket list is produced, not the route event loop.
+ */
+export interface OptimalRouteLeg extends OptimalPool {
+  /** This hop's swap direction (leg input → leg output). May differ per hop. */
+  zeroForOne: boolean;
+}
+
+/**
+ * A multi-hop route as a chain of LEGS, built from TRUE LIVE leg state — the oracle's
+ * own route input, INDEPENDENT of EcoSwapPrepared. The route competes in the global merge
+ * as ONE venue whose head is the LEFT-TO-RIGHT product fold (`routeHeadFold`) of its legs'
+ * fee-adjusted out/in heads; advancing the route binds whichever leg crosses its tick first
+ * (conservation: leg i output == leg i+1 input). N legs (k >= 2); the event loop (`routeSegments`)
+ * is arbitrary-k via `routeEventN` (3-hop lands concretely, 2-hop bit-identical).
+ */
+export interface OptimalRoute {
+  legs: OptimalRouteLeg[];
+}
+
 export interface OptimalInput {
   pools: OptimalPool[];
+  /** Multi-hop routes — extra venues composed from TRUE live leg state. Optional. */
+  routes?: OptimalRoute[];
   amountIn: bigint;
   zeroForOne: boolean;
   /**
@@ -108,7 +138,9 @@ export interface OptimalInput {
 export interface OptimalResult {
   /** Gross tokenIn assigned to pools[i] (same indexing as input.pools). */
   perPoolInput: bigint[];
-  /** Σ perPoolInput (≤ amountIn; == amountIn when liquidity allows). */
+  /** Gross route input (leg-1 input) assigned to routes[i] (same indexing as input.routes). */
+  perRouteInput: bigint[];
+  /** Σ perPoolInput + Σ perRouteInput (≤ amountIn; == amountIn when liquidity allows). */
   totalInput: bigint;
   /**
    * The common fee-adjusted out/in marginal price at the cut — the price below which no
@@ -157,12 +189,17 @@ function feeAdjOI(oi: bigint, feePpm: number): bigint {
 // near price — the sort key. Segments are produced in each pool's natural descending-price
 // order, so the per-pool list is already sorted; the global merge interleaves pools.
 interface Segment {
-  pool: number;
+  /** "pool" ⇒ index into perPoolInput; "route" ⇒ index into perRouteInput. */
+  venue: "pool" | "route";
+  idx: number;
   /** fee-adjusted out/in price at the near (entry) edge — DESC sort key. */
   adjNear: bigint;
   /** fee-adjusted out/in price at the far (exit) edge — the marginal if fully consumed. */
   adjFar: bigint;
-  /** gross tokenIn (incl. fee) to traverse the whole segment. */
+  /**
+   * gross tokenIn (incl. fee) to traverse the whole segment. For a route this is the
+   * route-level input (leg-1 gross input) over the event — what the merge consumes.
+   */
   gross: bigint;
 }
 
@@ -228,7 +265,8 @@ function v3Segments(p: OptimalPool, poolIdx: number, zeroForOne: boolean, priceL
         const gross = mulDiv(effIn, FEE_DENOM, FEE_DENOM - BigInt(feePpm));
         if (gross > 0n) {
           segs.push({
-            pool: poolIdx,
+            venue: "pool",
+            idx: poolIdx,
             adjNear: feeAdjOI(nearOI, feePpm),
             adjFar: feeAdjOI(farOI, feePpm),
             gross,
@@ -281,7 +319,8 @@ function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
         const gross = mulDiv(effIn, FEE_DENOM, FEE_DENOM - BigInt(feePpm));
         if (gross > 0n) {
           segs.push({
-            pool: poolIdx,
+            venue: "pool",
+            idx: poolIdx,
             adjNear: feeAdjOI(near, feePpm),
             adjFar: feeAdjOI(far, feePpm),
             gross,
@@ -294,6 +333,169 @@ function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
   return segs;
 }
 
+// ── Route-leg frontier enumeration + route event walk ────────
+//
+// A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
+// the exact per-step integer math (stepReal / toOutIn / ±liquidityNet for V3-V4, the geometric
+// V2 step), but emit the RAW [nearOI, farOI, L, feePpm] brackets (RouteLeg) instead of priced
+// Segments, because the route composes brackets across legs before pricing. legBrackets is the
+// leg-level analogue of v3Segments/v2Segments and shares their loop structure verbatim.
+
+/** Enumerate one route leg's constant-L brackets (out/in space) from its TRUE live spot. */
+function legBrackets(leg: OptimalRouteLeg, priceLimit: bigint): RouteLeg[] {
+  const out: RouteLeg[] = [];
+  const feePpm = BigInt(leg.feePpm);
+  const z = leg.zeroForOne;
+
+  if (leg.isV2) {
+    const reserveIn = leg.reserveIn!;
+    const reserveOut = leg.reserveOut!;
+    if (reserveIn <= 0n || reserveOut <= 0n) return out;
+    const L = isqrt(reserveIn * reserveOut);
+    let near = isqrt((reserveOut * Q192) / reserveIn); // out/in spot sqrt
+    for (let i = 0; i < MAX_V2_SLICES; i++) {
+      const far = near - mulDiv(near, V2_STEP_BPS, V2_STEP_DEN);
+      if (far <= 0n || far >= near) break;
+      if (L > 0n) out.push({ nearOI: near, farOI: far, L, feePpm });
+      near = far;
+    }
+    return out;
+  }
+
+  // V3/V4 leg — identical walk to v3Segments, emitting raw brackets.
+  const stepRatio = getSqrtRatioAtTick(leg.tickSpacing!);
+  let L = leg.liquidity!;
+  let nearReal = leg.sqrtPriceX96!;
+  const base = Math.floor(leg.tick! / leg.tickSpacing!) * leg.tickSpacing!;
+  let boundary = z ? base : base + leg.tickSpacing!;
+  const netTicks = leg.net ? [...leg.net.entries()].filter(([, n]) => n !== 0n).map(([t]) => t) : [];
+  const haveTicks = netTicks.length > 0;
+  const extremeTick = haveTicks ? (z ? Math.min(...netTicks) : Math.max(...netTicks)) : 0;
+
+  for (let k = 0; k < MAX_V3_STEPS; k++) {
+    if (L === 0n && haveTicks) {
+      const past = z ? boundary < extremeTick : boundary > extremeTick;
+      if (past) break;
+    }
+    const farReal = stepReal(nearReal, stepRatio, z);
+    if (priceLimit > 0n) {
+      if (z) {
+        if (farReal <= priceLimit) break;
+      } else {
+        if (farReal >= priceLimit) break;
+      }
+    }
+    const nearOI = toOutIn(nearReal, z);
+    const farOI = toOutIn(farReal, z);
+    if (L > 0n && nearOI > farOI && farOI > 0n) {
+      out.push({ nearOI, farOI, L, feePpm });
+    }
+    const signedNet = leg.net?.get(boundary) ?? 0n;
+    const raw = signedNet >= 0n ? signedNet : signedNet + MOD128;
+    const neg = raw >= HALF128;
+    if (z) {
+      if (neg) L = L + (MOD128 - raw);
+      else L = L >= raw ? L - raw : 0n;
+      boundary -= leg.tickSpacing!;
+    } else {
+      if (neg) {
+        const mag = MOD128 - raw;
+        L = L >= mag ? L - mag : 0n;
+      } else {
+        L = L + raw;
+      }
+      boundary += leg.tickSpacing!;
+    }
+    nearReal = farReal;
+  }
+  return out;
+}
+
+/**
+ * Enumerate one ROUTE's price-monotone segments by walking a price-ordered k-way merge across
+ * its legs' frontiers (`legBrackets`). N-LEG (k >= 2, `routeEventN`): at each event every leg sits
+ * on its current constant-L bracket; the BINDING leg (the one whose full tick-cross maps to the
+ * smallest token-A input when back-propagated through the chain) crosses its own tick first, every
+ * other leg partially fills (conservation: leg i out == leg i+1 in at every intermediate). The
+ * bound leg advances to its next bracket; each partial leg's near becomes its event new far. The
+ * route's segment carries the route-level input as `gross` and the fee-adjusted route head
+ * (LEFT-TO-RIGHT product fold of the legs' fee-adjusted near / far heads via routeHeadFold) as
+ * adjNear / adjFar — directly comparable to a direct pool's adjNear, so the route competes in the
+ * SAME global merge.
+ *
+ * Reduces EXACTLY to the prior 2-hop walk at k=2 (routeEventN is a bit-identical superset of
+ * routeEvent2; the per-leg cursor advance below specializes to the old `i1/i2` advance for two
+ * legs — the binding leg's cursor steps, every other leg's near moves to its new far and its
+ * cursor advances past any fully-crossed bracket). 3-hop lands concretely; the loop is arbitrary-k.
+ */
+function routeSegments(route: OptimalRoute, routeIdx: number): Segment[] {
+  const segs: Segment[] = [];
+  const k = route.legs.length;
+  if (k < 2) return segs; // a route is at least 2 hops
+
+  // Per-leg fixed bracket lists (walked once from each leg's true live spot), fees, and the
+  // fee-adjusted out/in coordinate map. All indexed by leg.
+  //
+  // NO per-leg priceLimit: the swap's REAL-sqrt priceLimit is a bound on the OVERALL swap (it
+  // gates the DIRECT pools via v3Segments). A route's legs are NOT individually limited by it —
+  // the on-chain solver's route advance (ecoswap.sauce.ts Phase D) crosses a binding leg's tick
+  // with NO dlim check; a route is bounded only by conservation + its participation in the global
+  // merge cut (the route stops winning once its product head dips below the cut). Threading the
+  // overall limit into a per-leg break would (a) wrongly truncate a same-direction leg the solver
+  // walks unbounded and (b) for an opposite-direction leg (zHop != overall) compare against a
+  // value in the wrong half-space, killing its bracket list. Pass 0n (no per-leg limit) to gate
+  // the oracle bit-identically to the solver/reference.
+  const brks = route.legs.map((leg) => legBrackets(leg, 0n));
+  const fees = route.legs.map((leg) => BigInt(leg.feePpm));
+  const adj = route.legs.map((leg) => (oi: bigint) => feeAdjOI(oi, leg.feePpm));
+
+  // Per-leg cursor + CURRENT bracket near (a partial leg carries an advanced near after an event).
+  const cur: number[] = new Array(k).fill(0);
+  const near: bigint[] = brks.map((b) => (b.length ? b[0].nearOI : 0n));
+
+  const anyExhausted = () => cur.some((c, i) => c >= brks[i].length);
+
+  for (let step = 0; step < MAX_V3_STEPS && !anyExhausted(); step++) {
+    // Build each leg's current RouteLeg [near, far, L, fee] on the FIXED live grid.
+    const legs: RouteLeg[] = new Array(k);
+    let degenerate = false;
+    for (let i = 0; i < k; i++) {
+      const b = brks[i][cur[i]];
+      legs[i] = { nearOI: near[i], farOI: b.farOI, L: b.L, feePpm: fees[i] };
+      if (legs[i].nearOI <= legs[i].farOI) degenerate = true;
+    }
+    if (degenerate) break;
+
+    // Route head at the segment edges: product fold of the per-leg fee-adjusted out/in heads.
+    const adjNear = routeHeadFold(legs.map((l, i) => adj[i](l.nearOI)));
+    const ev = routeEventN(legs);
+    const adjFar = routeHeadFold(ev.newFars.map((f, i) => adj[i](f)));
+
+    if (ev.routeIn > 0n && adjNear > 0n) {
+      segs.push({ venue: "route", idx: routeIdx, adjNear, adjFar, gross: ev.routeIn });
+    }
+
+    // Advance: the BOUND leg crosses its tick (next bracket); every OTHER leg's near moves to its
+    // event new far. routeEventN guarantees the partial fill fits WITHIN each partial leg's current
+    // bracket, so the partial near lands inside [farOI, nearOI]. But once it reaches that bracket's
+    // far it has crossed the bracket entirely — advance the partial leg's cursor past every bracket
+    // whose far the new near has reached, so its NEXT event sits on the bracket that actually
+    // contains the near (its far stays strictly below the near). Without this a partial leg
+    // re-processes a degenerate sliver of an already-crossed bracket while the bound leg marches on,
+    // mis-pricing the route. (At k=2 this is the old `i1++ / partial-near = newF / skip` advance.)
+    for (let i = 0; i < k; i++) {
+      if (i === ev.bindLeg) {
+        cur[i]++;
+        near[i] = cur[i] < brks[i].length ? brks[i][cur[i]].nearOI : 0n;
+      } else {
+        near[i] = ev.newFars[i];
+        while (cur[i] < brks[i].length && near[i] <= brks[i][cur[i]].farOI) cur[i]++;
+      }
+    }
+  }
+  return segs;
+}
+
 /**
  * The neutral optimal split. Enumerate every pool's price-monotone segments from TRUE live
  * state, merge globally in DESCENDING fee-adjusted-near-price order, and water-fill to the
@@ -301,12 +503,15 @@ function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
  */
 export function optimalSplit(input: OptimalInput): OptimalResult {
   const { pools, amountIn, zeroForOne } = input;
+  const routes = input.routes ?? [];
   const priceLimit = input.priceLimit ?? 0n;
 
   const perPoolInput: bigint[] = new Array(pools.length).fill(0n);
+  const perRouteInput: bigint[] = new Array(routes.length).fill(0n);
   const perPoolMarginalAdj: bigint[] = new Array(pools.length).fill(0n);
 
-  // Enumerate all candidate segments across all pools.
+  // Enumerate all candidate segments across all pools AND routes — both produce price-monotone
+  // segments tagged by venue, so they compete in ONE global price-descending merge.
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
@@ -316,16 +521,21 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       allSegs.push(...v3Segments(p, i, zeroForOne, priceLimit));
     }
   }
+  for (let i = 0; i < routes.length; i++) {
+    allSegs.push(...routeSegments(routes[i], i));
+  }
 
   // Global price-descending merge. A stable sort on adjNear DESC realises the optimal
-  // water-fill: the best-priced segment across ALL pools is consumed first, ties broken by
-  // farther (deeper) edge so a contiguous pool keeps its natural order.
+  // water-fill: the best-priced segment across ALL venues is consumed first, ties broken by
+  // farther (deeper) edge so a contiguous venue keeps its natural order.
   allSegs.sort((a, b) => {
     if (a.adjNear !== b.adjNear) return a.adjNear < b.adjNear ? 1 : -1;
-    // tie on near price: prefer the segment with the higher far (shallower) so a pool's
-    // own contiguous chain stays in order; cross-pool ties are price-equivalent anyway.
+    // tie on near price: prefer the segment with the higher far (shallower) so a venue's
+    // own contiguous chain stays in order; cross-venue ties are price-equivalent anyway.
     if (a.adjFar !== b.adjFar) return a.adjFar < b.adjFar ? 1 : -1;
-    return a.pool - b.pool;
+    // final tie: deterministic by venue then index (pools before routes).
+    if (a.venue !== b.venue) return a.venue === "pool" ? -1 : 1;
+    return a.idx - b.idx;
   });
 
   let cum = 0n;
@@ -338,19 +548,24 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       take = amountIn - cum;
       crossed = true;
     }
-    perPoolInput[seg.pool] += take;
+    if (seg.venue === "pool") {
+      perPoolInput[seg.idx] += take;
+      // The marginal each engaged pool reaches: if the segment was fully consumed, the pool
+      // has moved to (at least) the far edge; if it is the crossing segment, the cut sits
+      // somewhere inside it — record adjFar as the conservative marginal (the pool's price
+      // after fully draining the segment is adjFar; a partial fill lands between near & far).
+      perPoolMarginalAdj[seg.idx] = seg.adjFar;
+    } else {
+      perRouteInput[seg.idx] += take;
+    }
     cum += take;
-    // The marginal each engaged pool reaches: if the segment was fully consumed, the pool
-    // has moved to (at least) the far edge; if it is the crossing segment, the cut sits
-    // somewhere inside it — record adjFar as the conservative marginal (the pool's price
-    // after fully draining the segment is adjFar; a partial fill lands between near & far).
-    perPoolMarginalAdj[seg.pool] = seg.adjFar;
     if (crossed) {
       cutAdjPrice = seg.adjFar;
       break;
     }
   }
 
-  const totalInput = perPoolInput.reduce((a, b) => a + b, 0n);
-  return { perPoolInput, totalInput, cutAdjPrice, perPoolMarginalAdj };
+  const totalInput =
+    perPoolInput.reduce((a, b) => a + b, 0n) + perRouteInput.reduce((a, b) => a + b, 0n);
+  return { perPoolInput, perRouteInput, totalInput, cutAdjPrice, perPoolMarginalAdj };
 }

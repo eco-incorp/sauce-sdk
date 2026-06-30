@@ -2,10 +2,14 @@
  * EcoSwap off-chain preparation.
  *
  * Builds the per-pool NET CACHE (the drift-invariant tick depth the on-chain unified
- * walk reuses) and the static route segments. Direct pools ship NO prepare-time sqrt
- * edges: the on-chain solver walks each pool's single frontier from its LIVE spot and
- * computes all sqrt/price on the live grid, consulting the cache only for the net at
- * each scanned boundary (a staticcall avoided). The cache is a pure gas optimization.
+ * walk reuses) for BOTH direct pools and multi-hop route-leg pools. Every pool — direct
+ * or leg — ships NO prepare-time sqrt edges: the on-chain solver walks each pool's single
+ * frontier from its LIVE spot and computes all sqrt/price on the live grid, consulting the
+ * cache only for the net at each scanned boundary (a staticcall avoided). The cache is a
+ * pure gas optimization. A multi-hop route is a first-class live-walk venue: each leg is a
+ * SET of leg pools (themselves full EcoPools with their own net caches) the leg splits
+ * across; the on-chain solver composes the legs live, so prepare ships NO static route
+ * segments (prepared.brackets is always []).
  *
  * Pipeline:
  *   1. Discover + read ALL direct pools via the on-chain LENS (ecoswap.lens.sauce.ts)
@@ -21,16 +25,20 @@
  *      (stampPoolCache): the stepRatio, the scanned-window bounds, the deepest
  *      initialized tick, and one [shiftedTick, rawNet] row per initialized tick.
  *      V2 needs no tick cache (the solver streams constant-L from live reserves).
- *   4. Routes: one lens eth_call per hop pair, then compose the two hops OFF-CHAIN
- *      via localQuote (no on-chain quote()) into route segments (still bracket-based,
- *      since routes are static — composed and sorted off-chain).
+ *   4. Routes: for each base token X (≠ in/out), one lens eth_call per edge —
+ *      (in→X) and (X→out) — keeping ALL V3 survivor pools per leg (no best-pool
+ *      reduce, no route cap). Each leg pool is stamped with its OWN net cache via
+ *      stampPoolCache (using the LEG's hop direction zHop), so a leg pool is
+ *      byte-identical on-chain to a direct pool and is walked LIVE by the solver.
+ *      runLens is MEMOIZED per unordered token pair so shared edges read once.
  *
  * RPC efficiency: the entire direct-pool discovery + state + tick read is ONE
- * eth_call (the lens); multi-hop routes add one eth_call per hop pair.
+ * eth_call (the lens); multi-hop routes add at most one eth_call per distinct
+ * (unordered) token-pair edge (memoized).
  */
 
 import type { PublicClient, Hex } from "viem";
-import { runLens, type LensPool } from "./lens.js";
+import { runLens, type LensPool, type LensResult } from "./lens.js";
 import {
   MIN_SQRT_RATIO,
   MAX_SQRT_RATIO,
@@ -39,11 +47,10 @@ import {
   type ChainPoolConfig,
 } from "../shared/constants.js";
 import {
-  EcoBracketKind,
   type EcoSwapConfig,
   type EcoSwapPrepared,
-  type EcoBracket,
   type EcoPool,
+  type EcoLeg,
   type EcoRoute,
   type PoolInfo,
 } from "../shared/types.js";
@@ -83,23 +90,21 @@ const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
  * walk reaches. Must be wide enough to cover the cut for the largest expected trade.
  */
 const V3_TICK_STEPS = 96;
-/** Geometric brackets emitted per V2 pool (also trimmed to exactly the crossed range). */
-const V2_BRACKETS = 16;
 /** Cap on direct pools (top-N by liquidity) — bounds on-chain loop + calldata. */
 const MAX_DIRECT_POOLS = Number(process.env.ECO_MAX_POOLS ?? 12);
 /**
- * Forward drift buffer (extra lens tick boundaries) for ROUTE hops ONLY. Direct pools use
- * 0 (the on-chain solver walks each pool's frontier from the LIVE spot, reading drift live),
- * but routes compose off-chain via localQuote and execute in one flat swapV3 per hop with no
- * live walk, so their prepared bracket curve must extend slightly past the sampled amountIn.
+ * Max number of LEGS (hops) in a discovered route — the depth bound of the path DFS over the
+ * base-token graph. A route always has ≥2 legs (a 1-leg in→out is a direct pool). Default 3
+ * (tokenIn → T1 → T2 → tokenOut at most one interior pair); set to 2 to reproduce the prior
+ * single-intermediate behavior. Override with ECO_MAX_HOPS.
  */
-const ROUTE_DRIFT_TICKS = 2;
-/** Per-bracket price step for V2 discretisation (~0.5% per bracket in sqrt). */
-const V2_SQRT_STEP_BPS = 25n; // 0.25% of sqrt → ~0.5% price per bracket
-/** Input samples used to profile each multi-hop route. */
-const ROUTE_SAMPLES = 6;
-/** Keep at most this many routes (bytecode/gas bound). */
-const MAX_ROUTES = Number(process.env.ECO_MAX_ROUTES ?? 2);
+const MAX_HOPS = Math.max(2, Number(process.env.ECO_MAX_HOPS ?? 3));
+/**
+ * Cap on total discovered routes — a calldata/loop bound (each route is one `routing` tuple +
+ * its leg pools in the on-chain universe), NOT a liquidity gate. Paths beyond this are dropped
+ * and logged. Override with ECO_MAX_ROUTES.
+ */
+const MAX_ROUTES = Number(process.env.ECO_MAX_ROUTES ?? 8);
 /**
  * Engine `_swapV2` hardcodes the constant-product fee at 0.3% (997/1000) for
  * EVERY V2 pool, ignoring the discovered fee tier. So all V2 brackets are pinned
@@ -133,18 +138,6 @@ function sqrtOneMinusFeeScaled(feePpm: number): bigint {
 /** Apply the fee-adjustment to a spot out/in sqrt price. */
 function feeAdjust(sqrtSpot: bigint, feePpm: number): bigint {
   return (sqrtSpot * sqrtOneMinusFeeScaled(feePpm)) / FEE_DENOM;
-}
-
-/**
- * Gross input (tokenIn units incl. fee) to traverse a bracket [sqrtFar, sqrtNear]
- * of constant liquidity L, in unified out/in space:
- *   effIn = L * 2^96 * (1/sqrtFar - 1/sqrtNear);  grossIn = effIn / (1 - fee)
- */
-function bracketCapacity(L: bigint, sqrtNear: bigint, sqrtFar: bigint, feePpm: number): bigint {
-  if (L <= 0n || sqrtFar <= 0n || sqrtNear <= sqrtFar) return 0n;
-  const effIn = (L * Q96) / sqrtFar - (L * Q96) / sqrtNear;
-  if (effIn <= 0n) return 0n;
-  return (effIn * FEE_DENOM) / BigInt(1_000_000 - feePpm);
 }
 
 /** Exact Uniswap V3 TickMath.getSqrtRatioAtTick (real token1/token0 sqrt, Q96). */
@@ -198,7 +191,7 @@ function stepRealTs(sqrtReal: bigint, stepRatio: bigint, zeroForOne: boolean): b
   return zeroForOne ? (sqrtReal * Q96) / stepRatio : (sqrtReal * stepRatio) / Q96;
 }
 
-// ── V3 bracket construction ──────────────────────────────────
+// ── Lens-read adapter (feeds the per-pool net cache stamp) ───
 
 interface V3Read {
   pool: PoolInfo;
@@ -208,18 +201,19 @@ interface V3Read {
   /** liquidityNet keyed by tick index, for the scanned window. */
   net: Map<number, bigint>;
   /**
-   * Forward tick boundaries the LAZY lens actually walked. buildV3Brackets STOPS
-   * here so it never fabricates phantom brackets past the lens's scanned data
-   * (which would assume L unchanged where the lens never read). 0 → no brackets.
+   * Forward tick boundaries the LAZY lens actually walked. stampPoolCache uses this
+   * to size the cache window (windowBot = windowTop ∓ (scannedForward-1)*ts) so the
+   * cache never claims net past the lens's scanned data. 0 → no scan (the quote /
+   * 1-RPC path: the on-chain walk staticcalls every boundary).
    */
   scannedForward: number;
 }
 
 /**
- * Adapt a lens-decoded V3/V4 pool into the V3Read shape `buildV3Brackets`
+ * Adapt a lens-decoded V3/V4 pool into the V3Read shape `stampPoolCache`
  * consumes. The lens already returned slot0 (sqrtPriceX96 + EXACT current tick),
  * active liquidity, and a windowed liquidityNet map keyed by signed tick — so no
- * RPC, and the bracket boundaries (base = floor(tick/ts)*ts, stepping ±ts) line
+ * RPC, and the cache window bounds (base = floor(tick/ts)*ts, stepping ±ts) line
  * up exactly with the ticks the lens scanned.
  */
 function lensToV3Read(p: LensPool): V3Read {
@@ -249,72 +243,7 @@ function feeToTickSpacing(fee: number): number {
   return TICK_SPACING_BY_FEE[fee] ?? 60;
 }
 
-/**
- * Build out/in brackets for one V3 pool from its tick window, in the swap direction:
- * the first bracket's near edge is the current price; each subsequent edge is an
- * initialized-tick boundary. Crossing a boundary updates active liquidity by
- * ±liquidityNet (− when the price moves down for zeroForOne, + when it moves up for
- * oneForZero). The walk STOPS at the lens's scannedForward count so it never
- * fabricates brackets past the data the lens actually read.
- *
- * Used ONLY for ROUTE legs (direct pools carry a per-pool net cache built by
- * stampPoolCache and are walked LIVE on-chain — they ship no prepare-time sqrt edges).
- * Routes are composed off-chain via localQuote, so a route leg's liquidity curve must
- * be materialized as brackets for the local two-hop composition.
- */
-function buildV3Brackets(
-  r: V3Read,
-  refIdx: number,
-  zeroForOne: boolean,
-): EcoBracket[] {
-  const brackets: EcoBracket[] = [];
-  const feePpm = r.pool.fee;
-  const ts = r.tickSpacing;
-  const base = Math.floor(r.tick / ts) * ts;
-  const spotReal = r.pool.sqrtPriceX96;
-
-  // Forward brackets (swap direction). Step nearReal MULTIPLICATIVELY via stepReal so the route
-  // leg's geometry matches the live-walk/oracle geometry. STOP at the lens's scanned boundary.
-  const stepRatio = getSqrtRatioAtTick(ts);
-  let L = r.activeLiquidity;
-  let nearReal = spotReal;
-  let b = zeroForOne ? base : base + ts;
-  const step = zeroForOne ? -ts : ts;
-  for (let k = 0; k < r.scannedForward; k++) {
-    const farReal = stepRealTs(nearReal, stepRatio, zeroForOne);
-    const near = toOutIn(nearReal, zeroForOne);
-    const far = toOutIn(farReal, zeroForOne);
-    if (L > 0n && far > 0n && near > far) {
-      brackets.push(makeBracket(EcoBracketKind.V3, refIdx, near, far, L, feePpm));
-    }
-    const net = r.net.get(b) ?? 0n;
-    L = zeroForOne ? L - net : L + net;
-    if (L < 0n) L = 0n;
-    nearReal = farReal;
-    b += step;
-  }
-  return brackets;
-}
-
-
-// ── V2 bracket construction ──────────────────────────────────
-
-/** Build discretised out/in brackets for one constant-product pool. */
-function buildV2Brackets(pool: PoolInfo, refIdx: number, feePpm: number): EcoBracket[] {
-  const brackets: EcoBracket[] = [];
-  const L = pool.liquidity; // synthetic sqrt(k); recomputed live on-chain
-  let near = pool.sqrtPriceX96; // already out/in for V2
-
-  for (let i = 0; i < V2_BRACKETS; i++) {
-    const far = near - (near * V2_SQRT_STEP_BPS) / 10_000n;
-    if (far <= 0n || far >= near) break;
-    brackets.push(makeBracket(EcoBracketKind.V2, refIdx, near, far, L, feePpm));
-    near = far;
-  }
-  return brackets;
-}
-
-// ── Unified-walk per-pool net cache (replaces the direct-pool bracket build) ──
+// ── Unified-walk per-pool net cache (the only per-pool prepare-time output) ──
 
 const MOD128 = 1n << 128n;
 
@@ -404,148 +333,54 @@ function stampPoolCache(r: V3Read, zeroForOne: boolean, seed: EcoPool): void {
   }
 }
 
-// ── Bracket factory (fee-adjust + capacity) ──────────────────
-
-function makeBracket(
-  kind: EcoBracketKind,
-  refIdx: number,
-  sqrtNear: bigint,
-  sqrtFar: bigint,
-  liquidity: bigint,
-  feePpm: number,
-): EcoBracket {
-  return {
-    kind,
-    refIdx,
-    sqrtNear,
-    sqrtFar,
-    liquidity,
-    capacity: bracketCapacity(liquidity, sqrtNear, sqrtFar, feePpm),
-    sqrtAdjNear: feeAdjust(sqrtNear, feePpm),
-    sqrtAdjFar: feeAdjust(sqrtFar, feePpm),
-  };
-}
-
-// ── Multi-hop route brackets ─────────────────────────────────
-
-/** Build a single lens-pool's out/in brackets (V2 or V3/V4) for route quoting. */
-function lensPoolBrackets(p: LensPool, zeroForOne: boolean, refIdx: number): EcoBracket[] {
+/**
+ * Build a full live-walk EcoPool from a decoded lens pool, stamping its per-pool net cache
+ * (V3/V4) or the constant-L spot seed (V2). `zHop` is the swap direction for THIS pool's hop
+ * (== the pool's `zeroForOne` / `inIsToken0`): for a direct pool it is the overall swap's
+ * `zeroForOne`; for a route-leg pool it is the LEG's hop direction. The resulting EcoPool is
+ * byte-identical on-chain whether it is a direct venue or a leg pool — both are walked LIVE by
+ * the solver — so this single builder serves both. `sourceLabel` is a human-readable tag.
+ */
+function lensToEcoPool(p: LensPool, zHop: boolean, sourceLabel: string): EcoPool {
   if (p.poolType === SwapPoolType.UniV2) {
-    return buildV2Brackets(
-      { sqrtPriceX96: p.sqrtPriceX96, liquidity: p.liquidity } as PoolInfo,
-      refIdx,
-      V2_FEE_PPM,
-    );
+    // Constant-product: no tick cache (the solver streams constant-L geometric slices from the
+    // LIVE out/in spot; on-chain reads getReserves live). inIsToken0 is the pool's own reserve
+    // orientation — for a leg pool, hopIn-is-token0, which the lens already reported as p.inIsToken0.
+    return {
+      poolType: p.poolType,
+      address: p.address,
+      fee: V2_FEE_PPM, // engine _swapV2 uses 0.3% regardless of discovered tier
+      tickSpacing: 0,
+      hooks: ZERO_ADDRESS,
+      feePpm: V2_FEE_PPM,
+      isV2: true,
+      inIsToken0: p.inIsToken0,
+      stateView: ZERO_ADDRESS,
+      poolId: ZERO_BYTES32,
+      spotNearReal: p.sqrtPriceX96, // out/in spot (V2 frontier seed)
+      spotActiveL: p.liquidity, // √k
+      source: sourceLabel,
+    };
   }
-  return buildV3Brackets(lensToV3Read(p), refIdx, zeroForOne);
-}
-
-/** Adapt a LensPool to a minimal PoolInfo for the route descriptor (tokens set). */
-function lensPoolToInfo(p: LensPool, tokenIn: Hex, tokenOut: Hex): PoolInfo {
-  return {
-    address: p.address,
-    tokenIn,
-    tokenOut,
-    fee: p.poolType === SwapPoolType.UniV2 ? V2_FEE_PPM : p.fee,
+  const isV4 = p.poolType === SwapPoolType.UniV4;
+  const pool: EcoPool = {
     poolType: p.poolType,
-    priceLimited: p.poolType !== SwapPoolType.UniV2,
-    sqrtPriceX96: p.sqrtPriceX96,
-    liquidity: p.liquidity,
-    source: "lens",
-    poolId: p.poolId,
-    stateView: p.stateView,
+    address: p.address, // V4: PoolManager singleton
+    fee: p.fee,
     tickSpacing: p.tickSpacing,
-    hooks: p.hooks,
+    hooks: isV4 ? p.hooks ?? ZERO_ADDRESS : ZERO_ADDRESS,
+    feePpm: p.fee,
+    isV2: false,
+    inIsToken0: zHop, // V3/V4 PoolKey orientation = this hop's token sort order (zHop)
+    stateView: isV4 ? p.stateView : ZERO_ADDRESS,
+    poolId: isV4 ? p.poolId : ZERO_BYTES32,
+    source: sourceLabel,
   };
-}
-
-/**
- * Walk a single pool's out/in bracket curve consuming `amountIn` (gross tokenIn),
- * returning the tokenOut produced. Off-chain replacement for the on-chain quote()
- * RPC. Each bracket is [sqrtNear, sqrtFar] of constant L in unified out/in space;
- *   maxEffIn(bracket) = L*2^96*(1/sqrtFar - 1/sqrtNear), grossIn = effIn/(1-fee).
- * For a partial fill, solve the spot where the consumed effIn matches the budget.
- * tokenOut over a bracket from spot sNear→sLow: dOut = L*(sNear - sLow)/2^96.
- */
-function localQuote(brackets: EcoBracket[], amountIn: bigint, feePpm: number): bigint {
-  let budget = amountIn;
-  let out = 0n;
-  const oneMinusFee = BigInt(1_000_000 - feePpm);
-  for (const b of brackets) {
-    if (budget <= 0n) break;
-    const L = b.liquidity;
-    const near = b.sqrtNear;
-    const far = b.sqrtFar;
-    if (L <= 0n || far <= 0n || near <= far) continue;
-    const grossCap = b.capacity; // gross tokenIn to traverse the whole bracket
-    if (grossCap <= 0n) continue;
-    if (budget >= grossCap) {
-      // full bracket
-      out += (L * (near - far)) / Q96;
-      budget -= grossCap;
-    } else {
-      // partial: effIn = budget*(1-fee); solve sLow from
-      //   effIn = L*2^96*(1/far' - 1/near) where far' is the partial far edge.
-      const effIn = (budget * oneMinusFee) / FEE_DENOM;
-      const invNear = (L * Q96) / near;
-      const invLow = invNear + effIn;
-      const sLow = invLow > 0n ? (L * Q96) / invLow : far;
-      const clampedLow = sLow < far ? far : sLow;
-      out += (L * (near - clampedLow)) / Q96;
-      budget = 0n;
-    }
-  }
-  return out;
-}
-
-/**
- * Build route segments by composing the two hops via localQuote (NO on-chain
- * quote()). Profiles cumulative input samples through hop1→hop2 and turns each
- * increment into a (capacity, marginal-sqrt) segment, mirroring the prior
- * sampled-quote shape so the on-chain solver's route handling is unchanged.
- */
-function buildRouteBracketsLocal(
-  hop1Brackets: EcoBracket[],
-  hop2Brackets: EcoBracket[],
-  refIdx: number,
-  amountIn: bigint,
-  hop1Fee: number,
-  hop2Fee: number,
-): EcoBracket[] {
-  const samples: { input: bigint; out: bigint }[] = [];
-  for (let s = 1; s <= ROUTE_SAMPLES; s++) {
-    const input = (amountIn * BigInt(s)) / BigInt(ROUTE_SAMPLES);
-    const mid = localQuote(hop1Brackets, input, hop1Fee);
-    if (mid === 0n) break;
-    const finalOut = localQuote(hop2Brackets, mid, hop2Fee);
-    if (finalOut === 0n) break;
-    samples.push({ input, out: finalOut });
-  }
-  if (samples.length === 0) return [];
-
-  const brackets: EcoBracket[] = [];
-  let prevIn = 0n;
-  let prevOut = 0n;
-  for (const sm of samples) {
-    const dIn = sm.input - prevIn;
-    const dOut = sm.out - prevOut;
-    if (dIn > 0n && dOut > 0n) {
-      const sqrtAdj = isqrt((dOut * Q192) / dIn);
-      brackets.push({
-        kind: EcoBracketKind.Route,
-        refIdx,
-        sqrtNear: sqrtAdj,
-        sqrtFar: sqrtAdj,
-        liquidity: 0n,
-        capacity: dIn,
-        sqrtAdjNear: sqrtAdj,
-        sqrtAdjFar: sqrtAdj,
-      });
-    }
-    prevIn = sm.input;
-    prevOut = sm.out;
-  }
-  return brackets;
+  // The net cache is built in THIS hop's swap direction (zHop): the net-row sort, the window
+  // bounds and the extreme/terminate gate are all swap-direction-oriented, so a leg pool whose
+  // zHop differs from the overall swap is stamped leg-oriented (matching its inIsToken0).
+  stampPoolCache(lensToV3Read(p), zHop, pool);
+  return pool;
 }
 
 // ── Main preparation ─────────────────────────────────────────
@@ -654,148 +489,126 @@ export async function prepareEcoSwap(
   // from live reserves. The engine's _swapV2 hardcodes the 0.3% fee.
   const v2Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV2);
 
-  // ── Discover multi-hop routes (best pool per leg) — via the LENS ──
-  // Each hop pair gets its OWN lens eth_call (one pool pair is one cook()); the
-  // deepest pool per hop is reconstructed into brackets, and route segments are
-  // composed OFF-CHAIN via localQuote (no on-chain quote() RPC). Direct prepare is
-  // still ONE eth_call; routes add one eth_call per (in→base) and (base→out) pair.
-  interface RouteLens {
-    intermediateToken: Hex;
-    hop1Pool: PoolInfo;
-    hop2Pool: PoolInfo;
-    hop1Brackets: EcoBracket[];
-    hop2Brackets: EcoBracket[];
-  }
-  const routesRaw: RouteLens[] = [];
-  for (const baseToken of poolConfig.baseTokens) {
-    const bl = baseToken.toLowerCase();
-    if (bl === inLower || bl === outLower) continue;
-    const z1 = inLower < bl;
-    const z2 = bl < outLower;
-    // ROUTE hops keep a small forward drift buffer (ROUTE_DRIFT_TICKS): unlike DIRECT
-    // pools, routes execute off-chain-composed in ONE flat swapV3 per hop with NO
-    // on-chain live walk to compensate for an under-reaching window — so the prepared
-    // bracket curve must extend slightly past the sampled amountIn for the off-chain
-    // localQuote composition to track the real two-hop swap to truncation. (Direct
-    // pools use driftTicks:0 because the solver walks from the live spot and reads drift live.)
-    const [hop1, hop2] = await Promise.all([
-      runLens(client, lensCookEntry, poolConfig, {
-        tokenIn, tokenOut: baseToken, zeroForOne: z1,
-        amountIn, driftTicks: ROUTE_DRIFT_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
-        target, account: caller,
-      }),
-      runLens(client, lensCookEntry, poolConfig, {
-        tokenIn: baseToken, tokenOut, zeroForOne: z2,
-        amountIn, driftTicks: ROUTE_DRIFT_TICKS, minRelBps, maxTicks: V3_TICK_STEPS,
-        target, account: caller,
-      }),
-    ]);
-    // The on-chain route handler executes BOTH hops via flat swapV3, so only V3
-    // pools are valid route legs. (V2/V4 route hops would need per-hop type
-    // dispatch + a richer route tuple on-chain — a documented follow-up.) Pick the
-    // deepest V3 pool per hop; skip the route if either hop has no V3 pool.
-    const v3Hop1 = hop1.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
-    const v3Hop2 = hop2.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
-    if (v3Hop1.length === 0 || v3Hop2.length === 0) continue;
-    const best1 = v3Hop1.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
-    const best2 = v3Hop2.reduce((a, b) => (a.liquidity > b.liquidity ? a : b));
-    const hop1Brackets = lensPoolBrackets(best1, z1, 0);
-    const hop2Brackets = lensPoolBrackets(best2, z2, 0);
-    if (hop1Brackets.length === 0 || hop2Brackets.length === 0) continue;
-    routesRaw.push({
-      intermediateToken: baseToken,
-      hop1Pool: lensPoolToInfo(best1, tokenIn, baseToken),
-      hop2Pool: lensPoolToInfo(best2, baseToken, tokenOut),
-      hop1Brackets,
-      hop2Brackets,
-    });
-  }
-
-  // ── Build pool descriptors + per-pool net caches ──
-  // Direct pools no longer carry prepared bracket sqrt edges: the on-chain solver walks each
-  // pool's LIVE frontier and reuses only the drift-invariant NET. `brackets` holds ROUTE
-  // segments only (routes are static, composed off-chain). V2 needs no tick cache.
+  // ── Build DIRECT pool descriptors + per-pool net caches ──
+  // Every direct pool ships only its drift-invariant NET cache (no prepared sqrt edges): the
+  // on-chain solver walks each pool's LIVE frontier and reuses the net. V2 streams constant-L
+  // from live reserves (no tick cache). The single lensToEcoPool builder is reused for routes.
   const pools: EcoPool[] = [];
-  const brackets: EcoBracket[] = [];
+  for (const p of v3Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V3"));
+  for (const p of v4Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V4"));
+  for (const p of v2Raw) pools.push(lensToEcoPool(p, p.inIsToken0, "lens V2"));
 
-  // V3 (lens already returned slot0 + windowed ticks() per pool)
-  for (const p of v3Raw) {
-    const pool: EcoPool = {
-      poolType: p.poolType,
-      address: p.address,
-      fee: p.fee,
-      tickSpacing: p.tickSpacing,
-      hooks: ZERO_ADDRESS,
-      feePpm: p.fee,
-      isV2: false,
-      inIsToken0: zeroForOne, // V3 PoolKey orientation = token sort order
-      stateView: ZERO_ADDRESS,
-      poolId: ZERO_BYTES32,
-      source: "lens V3",
+  // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
+  // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
+  // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
+  // pool. We enumerate paths by a BOUNDED, CYCLE-AVOIDING DFS over the base-token graph: nodes are
+  // {tokenIn, tokenOut} ∪ baseTokens, an edge is any (unordered) token pair carrying ≥1 V3 survivor
+  // pool, and a path is tokenIn → (interior base tokens) → tokenOut of length 2..MAX_HOPS legs. The
+  // path's token set is the DFS visited set, so no token repeats within a path (no cycles). Each
+  // edge is read via the LENS with driftTicks:0 (like direct pools — the solver reads drift live),
+  // keeping ALL V3 survivors per leg, stamping each with the LEG's hop direction zHop so its
+  // on-chain inIsToken0 / net-row sort / window math are leg-oriented. runLens is MEMOIZED per
+  // UNORDERED token pair so a shared edge (e.g. WETH↔X used by several paths) reads ONCE. V3-only
+  // legs for this landing — V2/V4 legs need per-hop type dispatch in the on-chain route exec (a
+  // documented follow-up); stamping stays type-agnostic so flipping that on is purely an on-chain
+  // change. MAX_HOPS=2 reproduces the prior 2-hop behavior exactly (single interior base token).
+  const edgeCache = new Map<string, Promise<LensResult>>();
+  const edgeKey = (a: Hex, b: Hex): string => {
+    const al = a.toLowerCase();
+    const bl = b.toLowerCase();
+    return al < bl ? `${al}|${bl}` : `${bl}|${al}`;
+  };
+  const readEdge = (hopIn: Hex, hopOut: Hex): Promise<LensResult> => {
+    const key = edgeKey(hopIn, hopOut);
+    let pending = edgeCache.get(key);
+    if (!pending) {
+      // The lens read is direction-agnostic in VALUE for survivorship/state (it returns each
+      // pool's slot0 + windowed net regardless of swap orientation; the per-pool zeroForOne only
+      // re-orients the net-row sort + window, which stampPoolCache redoes per leg). So one read
+      // per unordered pair is sufficient; every path touching this edge reuses it.
+      pending = runLens(client, lensCookEntry, poolConfig, {
+        tokenIn: hopIn,
+        tokenOut: hopOut,
+        zeroForOne: BigInt(hopIn) < BigInt(hopOut),
+        amountIn,
+        driftTicks: 0, // like direct pools — the solver reads drift LIVE.
+        minRelBps,
+        maxTicks: V3_TICK_STEPS,
+        target,
+        account: caller,
+      });
+      edgeCache.set(key, pending);
+    }
+    return pending;
+  };
+
+  /** Build a V3-only leg from a memoized edge read; returns null if the edge has no V3 survivor. */
+  const buildLeg = async (hopIn: Hex, hopOut: Hex): Promise<EcoLeg | null> => {
+    const zHop = hopIn.toLowerCase() < hopOut.toLowerCase(); // THIS leg's hop direction
+    const lens = await readEdge(hopIn, hopOut);
+    const v3 = lens.pools.filter((p) => p.poolType === SwapPoolType.UniV3);
+    if (v3.length === 0) return null;
+    return {
+      hopIn,
+      hopOut,
+      zeroForOne: zHop,
+      pools: v3.map((p) => lensToEcoPool(p, zHop, "lens route leg V3")),
     };
-    stampPoolCache(lensToV3Read(p), zeroForOne, pool);
-    pools.push(pool);
-  }
+  };
 
-  // V4 (singleton; lens read StateView slot0 + windowed getTickLiquidity)
-  for (const p of v4Raw) {
-    const pool: EcoPool = {
-      poolType: p.poolType,
-      address: p.address, // PoolManager singleton
-      fee: p.fee,
-      tickSpacing: p.tickSpacing,
-      hooks: p.hooks ?? ZERO_ADDRESS,
-      feePpm: p.fee,
-      isV2: false,
-      inIsToken0: zeroForOne,
-      stateView: p.stateView,
-      poolId: p.poolId,
-      source: "lens V4",
-    };
-    stampPoolCache(lensToV3Read(p), zeroForOne, pool);
-    pools.push(pool);
-  }
+  // Interior nodes the DFS may transit through: base tokens that are neither endpoint.
+  const interiorTokens = poolConfig.baseTokens.filter((t) => {
+    const tl = t.toLowerCase();
+    return tl !== inLower && tl !== outLower;
+  });
 
-  // V2 (lens returned synthetic out/in sqrt + synthetic L + inIsToken0). No tick cache: the
-  // solver streams constant-L geometric slices from the LIVE out/in spot. The spot fields seed
-  // the no-drift walk (off-chain reference); on-chain reads getReserves live.
-  for (const p of v2Raw) {
-    pools.push({
-      poolType: p.poolType,
-      address: p.address,
-      fee: V2_FEE_PPM, // engine _swapV2 uses 0.3% regardless of discovered tier
-      tickSpacing: 0,
-      hooks: ZERO_ADDRESS,
-      feePpm: V2_FEE_PPM,
-      isV2: true,
-      inIsToken0: p.inIsToken0,
-      stateView: ZERO_ADDRESS,
-      poolId: ZERO_BYTES32,
-      spotNearReal: p.sqrtPriceX96, // out/in spot (V2 frontier seed)
-      spotActiveL: p.liquidity, // √k
-      source: "lens V2",
-    });
-  }
-
-  // Routes (sampled). Keep the deepest few. Segments composed via localQuote.
   const routes: EcoRoute[] = [];
-  const routeBracketSets: EcoBracket[][] = [];
-  for (const r of routesRaw) {
-    if (routes.length >= MAX_ROUTES) break;
-    const refIdx = routes.length;
-    const rb = buildRouteBracketsLocal(
-      r.hop1Brackets,
-      r.hop2Brackets,
-      refIdx,
-      amountIn,
-      r.hop1Pool.fee,
-      r.hop2Pool.fee,
+  let routesTruncated = 0;
+  // DFS frame: the path of TOKENS so far (starts [tokenIn]), the EcoLegs built between them, and
+  // the visited token set (lowercased) to forbid revisiting any token on the same path (no cycles).
+  // At each node we may close the path by hopping to tokenOut (emit a route), and — if we have
+  // hop budget left — branch into each unvisited interior token. Legs are built lazily, so an
+  // edge with no V3 survivor simply prunes that branch (a dead edge ⇒ no route through it).
+  const dfs = async (
+    token: Hex,
+    legsSoFar: EcoLeg[],
+    interSoFar: Hex[],
+    visited: Set<string>,
+  ): Promise<void> => {
+    const hopsUsed = legsSoFar.length;
+    // Close the path: hop directly to tokenOut. A path needs ≥2 legs to be a route (a direct
+    // 1-leg in→out is a DIRECT pool, already covered by the universe), so only emit when
+    // hopsUsed ≥ 1 (this closing leg makes ≥ 2).
+    if (hopsUsed >= 1 && token.toLowerCase() !== outLower) {
+      if (routes.length >= MAX_ROUTES) {
+        routesTruncated++;
+      } else {
+        const closing = await buildLeg(token, tokenOut);
+        if (closing) {
+          routes.push({ legs: [...legsSoFar, closing], intermediateTokens: [...interSoFar] });
+        }
+      }
+    }
+    // Branch deeper: only if another interior hop still leaves room for the closing leg to out.
+    if (hopsUsed + 2 > MAX_HOPS) return;
+    for (const next of interiorTokens) {
+      const nl = next.toLowerCase();
+      if (visited.has(nl)) continue; // no cycles — each token at most once per path
+      const leg = await buildLeg(token, next);
+      if (!leg) continue; // dead edge — prune
+      visited.add(nl);
+      await dfs(next, [...legsSoFar, leg], [...interSoFar, next], visited);
+      visited.delete(nl);
+    }
+  };
+  await dfs(tokenIn, [], [], new Set<string>([inLower]));
+
+  if (routesTruncated > 0) {
+    console.log(
+      `  EcoSwap capped routes to ${MAX_ROUTES} (ECO_MAX_ROUTES); dropped ${routesTruncated} ` +
+        `additional path(s) — a calldata/loop bound, not a liquidity gate`,
     );
-    if (rb.length === 0) continue;
-    routes.push({ route: { intermediateToken: r.intermediateToken, hop1Pool: r.hop1Pool, hop2Pool: r.hop2Pool } });
-    routeBracketSets.push(rb);
   }
-  for (const set of routeBracketSets) brackets.push(...set);
 
   // The per-pool net cache is an optimization, not a correctness dependency: the on-chain
   // solver reconstructs everything LIVE from each pool's spot read even with no cache (the
@@ -805,35 +618,24 @@ export async function prepareEcoSwap(
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
 
-  // ── Sort the route segments DESC by fee-adjusted near price ──
-  // `brackets` now holds ROUTE segments only (direct pools carry per-pool net caches instead).
-  // Tie-break adjNear DESC, then adjFar DESC, then routeIdx ASC — bit-identical to the merge's
-  // route-cursor order (index.ts buildRouteSegs sorts the same way).
-  brackets.sort((a, b) => {
-    if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
-    if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
-    return a.refIdx - b.refIdx;
-  });
-
-  // Diagnostic: rough coverage = Σ route segment capacity (direct-pool depth is now read live,
-  // so this is only the static route contribution — informational, not a correctness gate).
-  const covered = brackets.reduce((s, b) => s + b.capacity, 0n);
-
   const nV4 = pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
   const nV3 = pools.filter((p) => p.poolType === SwapPoolType.UniV3).length;
   const nV2 = pools.filter((p) => p.isV2).length;
-  const netRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
+  const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
+  const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
   console.log(
-    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2, ${routes.length} routes, ` +
-      `${netRows} net-cache rows (direct pools walked live), ${brackets.length} route segments`,
+    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${routes.length} routes ` +
+      `(${legPoolCount} leg pools), ${directNetRows} direct net-cache rows (all pools walked live)`,
   );
 
   return {
     pools,
     routes,
-    brackets,
+    // Routes are first-class live-walk venues (each leg = a set of leg pools with their own net
+    // caches), not static off-chain-composed segments — so there are NO prepared brackets.
+    brackets: [],
     zeroForOne,
     priceLimit,
-    expectedInputCovered: covered,
+    expectedInputCovered: 0n,
   };
 }

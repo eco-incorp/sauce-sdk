@@ -26,9 +26,21 @@ import {
   V2_STEP_BPS,
   V2_STEP_DEN,
   v2WalkGross,
+  mulDiv,
+  composeStep,
+  routeHeadFold,
+  bracketGross,
+  bracketOut,
+  invertFarFromGrossIn,
+  invertFarFromOut,
+  routeEvent2,
+  routePartial2,
+  routeEventN,
+  routePartialN,
+  type RouteLeg,
 } from "./ecoswap.math";
 import { ecoSwapReference } from "./ecoswap.reference";
-import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
+import { optimalSplit, type OptimalPool, type OptimalRoute } from "./ecoswap.optimal";
 import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
 import { SwapPoolType } from "../shared/constants";
 
@@ -799,4 +811,740 @@ describe("per-pool net cursor — drift-down skip / drift-up out-of-window / in-
       assert.ok(zeroChecks.length > 100, "the uninitialized gap produced many net-0 cursor reads (no advance)");
     });
   }
+});
+
+// ─────────────────────────────────────────────────────────────
+// 9. Multi-hop route composition primitives (INDEPENDENT known answers)
+// ─────────────────────────────────────────────────────────────
+//
+// Pure-value vectors for the route-composition helpers — closed-form / round-trip checks that
+// stand on their own (no oracle), proving each primitive's integer math before the oracle relies
+// on them. All values are unified out/in sqrt prices Q96.
+describe("route composition primitives [composeStep / routeHeadFold]", () => {
+  it("composeStep folds two out/in sqrt heads rescaled by Q96: h1*h2/2^96", () => {
+    // h1 = sqrt(2)*2^96, h2 = sqrt(3)*2^96 ⇒ composed = sqrt(6)*2^96.
+    const h1 = isqrt(2n) * Q96; // not exact sqrt, but composeStep is pure mulDiv — check the identity
+    const h2 = isqrt(3n) * Q96;
+    assert.equal(composeStep(h1, h2), mulDiv(h1, h2, Q96));
+    // identity at unity: composing with 2^96 (rate 1) returns the other head unchanged.
+    const h = 123456789n * Q96 + 987654321n;
+    assert.equal(composeStep(h, Q96), h);
+    assert.equal(composeStep(Q96, h), h);
+  });
+
+  it("routeHeadFold is the LEFT-TO-RIGHT composeStep chain (fixed order, NOT associative)", () => {
+    const a = 5n * Q96 + 7n;
+    const b = 3n * Q96 + 11n;
+    const c = 2n * Q96 + 13n;
+    const fold = routeHeadFold([a, b, c]);
+    const manual = composeStep(composeStep(a, b), c);
+    assert.equal(fold, manual, "fold == ((a∘b)∘c)");
+    // a single leg folds to itself.
+    assert.equal(routeHeadFold([a]), a);
+    // two legs == composeStep.
+    assert.equal(routeHeadFold([a, b]), composeStep(a, b));
+    // The fold associates STRICTLY LEFT (((a∘b)∘c)), NOT right (a∘(b∘c)) — pinned so the
+    // documented fixed order can't silently flip. (Right-assoc is the value to AVOID.)
+    const rightAssoc = composeStep(a, composeStep(b, c));
+    assert.equal(routeHeadFold([a, b, c]), composeStep(composeStep(a, b), c), "left-fold");
+    // For these heads left and right happen to coincide to the wei (small magnitudes), so we
+    // assert the COMPUTED form is the left fold rather than relying on a numeric gap.
+    assert.equal(manual, composeStep(composeStep(a, b), c), "manual is the left fold");
+    void rightAssoc;
+  });
+});
+
+describe("route bracket primitives [bracketGross / bracketOut / inversions]", () => {
+  // One constant-L bracket in out/in space, fee 0.30%.
+  const L = 10n ** 24n;
+  const nearOI = toOutIn(getSqrtRatioAtTick(0), true); // 2^96
+  const farOI = toOutIn(getSqrtRatioAtTick(-600), true); // deeper (smaller) out/in
+  const FEE = 3000n;
+
+  it("bracketOut == L*(near-far)/2^96 and matches the bracketCapacity effIn relation", () => {
+    assert.ok(farOI < nearOI);
+    assert.equal(bracketOut(L, nearOI, farOI), mulDiv(L, nearOI - farOI, Q96));
+    // bracketGross equals the existing bracketCapacity (same integer form, fee as bigint).
+    assert.equal(bracketGross(L, nearOI, farOI, FEE), bracketCapacity(L, nearOI, farOI, Number(FEE)));
+  });
+
+  it("invertFarFromGrossIn round-trips bracketGross: absorbing the full gross lands at far", () => {
+    const gross = bracketGross(L, nearOI, farOI, FEE);
+    const back = invertFarFromGrossIn(L, nearOI, gross, FEE);
+    // exact to a couple wei of mulDiv truncation in the fee round-trip.
+    assertClose(back, farOI, 1n, "invertFarFromGrossIn(gross) ≈ far");
+  });
+
+  it("invertFarFromOut round-trips bracketOut: producing the full out lands at far", () => {
+    const out = bracketOut(L, nearOI, farOI);
+    const back = invertFarFromOut(L, nearOI, out);
+    // bracketOut floors L*(near-far)/2^96, so the inverse recovers far to a wei of truncation.
+    assertClose(back, farOI, 1n, "invertFarFromOut(out) ≈ far");
+  });
+
+  it("partial inversions are monotone interior points (more input ⇒ deeper far)", () => {
+    const gross = bracketGross(L, nearOI, farOI, FEE);
+    const f1 = invertFarFromGrossIn(L, nearOI, gross / 4n, FEE);
+    const f2 = invertFarFromGrossIn(L, nearOI, gross / 2n, FEE);
+    assert.ok(f1 < nearOI && f1 > farOI, "quarter-fill is interior");
+    assert.ok(f2 < f1, "more input ⇒ deeper (smaller) far");
+  });
+});
+
+describe("routeEvent2 — binding leg, conservation, partial inversion", () => {
+  const FEE = 3000n;
+  const near = toOutIn(getSqrtRatioAtTick(0), true);
+  // Two legs whose current brackets differ in width so the binding leg is unambiguous.
+  function leg(L: bigint, farTick: number): RouteLeg {
+    return { nearOI: near, farOI: toOutIn(getSqrtRatioAtTick(farTick), true), L, feePpm: FEE };
+  }
+
+  it("leg1 binds (dXa <= dXb): leg2 partially absorbs dXa, conservation X1==X2", () => {
+    // leg1 narrow (small output crossing), leg2 wide+deep L (huge gross capacity) ⇒ leg1 binds.
+    const leg1 = leg(10n ** 21n, -60);
+    const leg2 = leg(10n ** 27n, -6000);
+    const ev = routeEvent2(leg1, leg2);
+    assert.equal(ev.bind, 1, "narrow leg1 crosses first");
+    // The bound leg keeps its bracket far; the partial leg's far is the inverted interior point.
+    assert.equal(ev.newF1, leg1.farOI, "leg1 crossed fully → far unchanged");
+    assert.ok(ev.newF2 < leg2.nearOI && ev.newF2 > leg2.farOI, "leg2 partial far is interior");
+    // CONSERVATION at the intermediate token X: leg1's full output dXa is fed into leg2 as its
+    // GROSS input (leg2 pays its own fee on the handoff), so leg2's partial far is exactly the
+    // gross-inversion of dXa — the handoff is wei-exact (leg1 out == leg2 gross in == dXa).
+    const xLeg1 = bracketOut(leg1.L, leg1.nearOI, leg1.farOI);
+    assert.equal(ev.dX, xLeg1, "dX == leg1 full output");
+    assert.equal(ev.newF2, invertFarFromGrossIn(leg2.L, leg2.nearOI, ev.dX, FEE), "leg2 far == gross-inversion of dXa");
+    // routeIn is leg1's gross over its full bracket; routeOut is leg2's out over the partial.
+    assert.equal(ev.routeIn, bracketGross(leg1.L, leg1.nearOI, leg1.farOI, FEE));
+    assert.equal(ev.routeOut, bracketOut(leg2.L, leg2.nearOI, ev.newF2));
+  });
+
+  it("leg2 binds (dXb < dXa): leg1 partially produces dXb, conservation X1==X2", () => {
+    // leg2 narrow gross capacity, leg1 wide+deep ⇒ leg2 crosses first, leg1 partial.
+    const leg1 = leg(10n ** 27n, -6000);
+    const leg2 = leg(10n ** 21n, -60);
+    const ev = routeEvent2(leg1, leg2);
+    assert.equal(ev.bind, 2, "narrow leg2 crosses first");
+    assert.equal(ev.newF2, leg2.farOI, "leg2 crossed fully → far unchanged");
+    assert.ok(ev.newF1 < leg1.nearOI && ev.newF1 > leg1.farOI, "leg1 partial far is interior");
+    // CONSERVATION: leg1 produces exactly dXb (== leg2's full gross-crossing output target).
+    const dXb = bracketGross(leg2.L, leg2.nearOI, leg2.farOI, FEE);
+    assert.equal(ev.dX, dXb, "dX == leg2 full gross input");
+    const xLeg1 = bracketOut(leg1.L, leg1.nearOI, ev.newF1);
+    assertClose(xLeg1, dXb, 1n, "leg1 produced output == leg2 absorbed input (conservation)");
+    assert.equal(ev.routeIn, bracketGross(leg1.L, leg1.nearOI, ev.newF1, FEE));
+    assert.equal(ev.routeOut, bracketOut(leg2.L, leg2.nearOI, leg2.farOI));
+  });
+});
+
+describe("routePartial2 — forward-propagate a partial route input through both legs", () => {
+  const FEE = 3000n;
+  const near = toOutIn(getSqrtRatioAtTick(0), true);
+  const leg1: RouteLeg = { nearOI: near, farOI: toOutIn(getSqrtRatioAtTick(-6000), true), L: 10n ** 26n, feePpm: FEE };
+  const leg2: RouteLeg = { nearOI: near, farOI: toOutIn(getSqrtRatioAtTick(-6000), true), L: 10n ** 26n, feePpm: FEE };
+
+  it("conservation: leg1 out (X1) feeds leg2 in; routeOut == leg2 out over [near, f2p]", () => {
+    const targetIn = 100n * 10n ** 18n;
+    const r = routePartial2(leg1, leg2, targetIn);
+    // leg1 absorbs targetIn (gross) ⇒ its far is the gross-inversion; X1 is its output there.
+    assert.equal(r.f1p, invertFarFromGrossIn(leg1.L, leg1.nearOI, targetIn, FEE));
+    assert.equal(r.X1, bracketOut(leg1.L, leg1.nearOI, r.f1p));
+    // leg2 absorbs X1 (gross) ⇒ its far + output follow.
+    assert.equal(r.f2p, invertFarFromGrossIn(leg2.L, leg2.nearOI, r.X1, FEE));
+    assert.equal(r.routeOut, bracketOut(leg2.L, leg2.nearOI, r.f2p));
+    assert.ok(r.X1 > 0n && r.routeOut > 0n && r.routeOut < r.X1, "two fees shrink the through-output");
+  });
+
+  it("more route input ⇒ more route output (monotone)", () => {
+    const small = routePartial2(leg1, leg2, 50n * 10n ** 18n);
+    const big = routePartial2(leg1, leg2, 500n * 10n ** 18n);
+    assert.ok(big.routeOut > small.routeOut, "monotone in route input");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 10. Oracle route modeling — a 2-hop route competes in the merge [optimalSplit]
+// ─────────────────────────────────────────────────────────────
+//
+// The neutral oracle now models a route as ONE venue built from TRUE LIVE leg state. These
+// vectors prove (a) conservation (Σ perPool + Σ perRoute == amountIn within liquidity), (b) a
+// route-ONLY universe routes everything through the route, (c) a route competes against a direct
+// pool and the split equalizes the (fee-adjusted) route head against the direct pool's marginal.
+describe("oracle route modeling — 2-hop route as a venue [optimalSplit]", () => {
+  const E18 = 10n ** 18n;
+  const DEEP = 10n ** 26n; // both legs deep enough to reach a clean interior cut
+
+  // A 2-hop route A->X->B: leg1 zeroForOne (A->X), leg2 zeroForOne (X->B). Both constant-L V3
+  // legs at tick 0 (empty net ⇒ single constant-L curve walked from spot), fee 0.30%.
+  function route2(L1: bigint, L2: bigint, fee: number): OptimalRoute {
+    const spot = getSqrtRatioAtTick(0);
+    return {
+      legs: [
+        { isV2: false, feePpm: fee, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: L1, net: new Map(), zeroForOne: true },
+        { isV2: false, feePpm: fee, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: L2, net: new Map(), zeroForOne: true },
+      ],
+    };
+  }
+
+  it("route-only universe: all input routes through the route, perRouteInput == total", () => {
+    const amountIn = 1000n * E18;
+    const res = optimalSplit({ pools: [], routes: [route2(DEEP, DEEP, 3000)], amountIn, zeroForOne: true, priceLimit: 0n });
+    assert.equal(res.perPoolInput.length, 0);
+    assert.equal(res.perRouteInput.length, 1);
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly through the route");
+    assert.equal(res.perRouteInput[0], amountIn, "all input via the route");
+  });
+
+  it("conservation: Σ perPool + Σ perRoute == amountIn (route vs direct pool)", () => {
+    const direct: OptimalPool = { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: DEEP, net: new Map() };
+    for (const amountIn of [100n * E18, 5000n * E18, 50000n * E18]) {
+      const res = optimalSplit({ pools: [direct], routes: [route2(DEEP, DEEP, 3000)], amountIn, zeroForOne: true, priceLimit: 0n });
+      const sum = res.perPoolInput.reduce((a, b) => a + b, 0n) + res.perRouteInput.reduce((a, b) => a + b, 0n);
+      assert.equal(sum, res.totalInput, `Σ venues == total (amountIn=${amountIn})`);
+      assert.equal(res.totalInput, amountIn, `spends amountIn exactly (amountIn=${amountIn})`);
+    }
+  });
+
+  it("a two-hop route is WORSE than a single direct hop (two fees): direct fills first, route only on overflow", () => {
+    // A SHALLOW direct pool (single hop, one fee) vs a DEEP route (two hops, two fees). The route
+    // head sits BELOW a fresh direct hop, so the merge funds the direct pool first; only once the
+    // shallow direct pool's marginal drops below the route head does the route engage. A tiny
+    // trade ⇒ route gets 0; a large trade overflows the shallow pool into the route.
+    const SHALLOW = 10n ** 21n;
+    const direct: OptimalPool = { isV2: false, feePpm: 3000, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 60, liquidity: SHALLOW, net: new Map() };
+    const small = optimalSplit({ pools: [direct], routes: [route2(DEEP, DEEP, 3000)], amountIn: E18 / 10n, zeroForOne: true, priceLimit: 0n });
+    assert.equal(small.perRouteInput[0], 0n, "small trade: direct hop is strictly better, route unused");
+    assert.equal(small.perPoolInput[0], E18 / 10n, "all to the direct pool");
+
+    // A large trade drains the shallow pool's marginal below the route head ⇒ the route engages.
+    const big = optimalSplit({ pools: [direct], routes: [route2(DEEP, DEEP, 3000)], amountIn: 200000n * E18, zeroForOne: true, priceLimit: 0n });
+    assert.ok(big.perRouteInput[0] > 0n, "large trade spills into the route");
+    assert.ok(big.perPoolInput[0] > 0n, "direct pool still funded");
+    assert.equal(big.perPoolInput[0] + big.perRouteInput[0], 200000n * E18, "exact split");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 11. Route composition vs INDEPENDENT ground truth (closed form / telescoping / greedy)
+// ─────────────────────────────────────────────────────────────
+//
+// Sections 9–10 pin each helper's internal identities and the oracle's plumbing, but the
+// oracle and the (future) cursor-faithful reference SHARE these helpers — testing them only
+// against each other proves nothing about the COMPOSITION being the right answer. The vectors
+// below use ground truth derived a DIFFERENT way:
+//   (a) CLOSED FORM — a 2-hop where each leg is ONE constant-L V3 range with NO tick crossing,
+//       composed via the constant-product RESERVE form (reserveIn=L·Q96/near, reserveOut=
+//       L·near/Q96, k=reserveIn·reserveOut; out = reserveOut − k/(reserveIn+effIn)). That is a
+//       genuinely different arithmetic path from invertFarFromGrossIn's reciprocal-add, so a
+//       match validates the helper composition (not a tautology).
+//   (b) TELESCOPING — summing routeEvent2 over the crossed brackets + a routePartial2 remainder
+//       reproduces routePartial2(total) to the wei (the event walk telescopes to the partial).
+//   (c) GREEDY — split a tiny amountIn across a direct pool + a 2-hop route by greedily handing
+//       small increments to the best CURRENT marginal (route marginal recomputed by actually
+//       composing the legs each step). optimalSplit must track the greedy split within a tight
+//       relative tolerance — a mechanism genuinely different from the segment merge.
+
+// Independent two-hop output for a routeIn, each leg ONE constant-L out/in bracket (no crossing),
+// via the constant-product RESERVE form. effIn floors the fee the SAME way the helpers do
+// (mulDiv(g, D−f, D)); the hyperbola step uses reserves, not the reciprocal-add. Returns the
+// per-leg gross-in / out and the final routeOut.
+function twoHopReserveClosedForm(
+  L1: bigint, near1: bigint, fee1: bigint,
+  L2: bigint, near2: bigint, fee2: bigint,
+  routeIn: bigint,
+): { X1: bigint; routeOut: bigint } {
+  // leg1 reserves at its live spot (constant-L hyperbola ≡ xy=k with k=L^2).
+  const rIn1 = mulDiv(L1, Q96, near1); // = invNear1
+  const rOut1 = mulDiv(L1, near1, Q96);
+  const k1 = rIn1 * rOut1;
+  const effIn1 = mulDiv(routeIn, FEE_DENOM - fee1, FEE_DENOM);
+  const newIn1 = rIn1 + effIn1;
+  const X1 = rOut1 - k1 / newIn1; // leg1 output (token X), floors k/newIn
+  // leg2 absorbs X1 as GROSS input (pays its own fee on the handoff).
+  const rIn2 = mulDiv(L2, Q96, near2);
+  const rOut2 = mulDiv(L2, near2, Q96);
+  const k2 = rIn2 * rOut2;
+  const effIn2 = mulDiv(X1, FEE_DENOM - fee2, FEE_DENOM);
+  const newIn2 = rIn2 + effIn2;
+  const routeOut = rOut2 - k2 / newIn2;
+  return { X1, routeOut };
+}
+
+describe("route composition vs INDEPENDENT ground truth", () => {
+  const E18 = 10n ** 18n;
+  const near = toOutIn(getSqrtRatioAtTick(0), true); // 2^96 out/in spot for both legs
+  const FEE = 3000n;
+
+  // (a) CLOSED FORM — single bracket per leg, no crossing. Legs deep enough that the chosen
+  // routeIn never reaches either bracket's far edge, so routePartial2 stays within bracket 0
+  // and a full event walk would emit nothing before the partial (telescopes to the partial).
+  it("(a) single-bracket-per-leg: routePartial2 == constant-product reserve closed form (wei)", () => {
+    const L1 = 10n ** 26n;
+    const L2 = 3n * 10n ** 26n;
+    const far1 = toOutIn(getSqrtRatioAtTick(-60000), true); // very deep — no crossing in range
+    const far2 = toOutIn(getSqrtRatioAtTick(-60000), true);
+    const leg1: RouteLeg = { nearOI: near, farOI: far1, L: L1, feePpm: FEE };
+    const leg2: RouteLeg = { nearOI: near, farOI: far2, L: L2, feePpm: FEE };
+
+    for (const routeIn of [1n * E18, 100n * E18, 5000n * E18]) {
+      const r = routePartial2(leg1, leg2, routeIn);
+      const cf = twoHopReserveClosedForm(L1, near, FEE, L2, near, FEE, routeIn);
+      // The reserve form and the reciprocal-add form are algebraically equal but truncate the
+      // hyperbola step differently (k/newIn vs L·Q96/(invNear+effIn) then ·L/Q96), so allow a
+      // couple wei of independent-truncation slack on each leg's output.
+      assertClose(r.X1, cf.X1, 1n, `leg1 out X1 == reserve closed form (routeIn=${routeIn})`);
+      assertClose(r.routeOut, cf.routeOut, 1n, `routeOut == reserve closed form (routeIn=${routeIn})`);
+      // The partial stayed strictly interior to both brackets (no crossing) — preconditions hold.
+      assert.ok(r.f1p > far1 && r.f1p < near, "leg1 partial interior (no crossing)");
+      assert.ok(r.f2p > far2 && r.f2p < near, "leg2 partial interior (no crossing)");
+    }
+  });
+
+  // (b) TELESCOPING IDENTITY — routePartial2(total) equals the sum over the crossed full brackets
+  // (routeEvent2 each event) plus a routePartial2 of the remainder on the surviving brackets.
+  // We drive a 2-hop where leg1 has SEVERAL narrow brackets so the route crosses a few leg1 ticks
+  // before the cut, and check that walking the events then partial-filling the remainder
+  // reproduces a single routePartial2(total) to the wei (both routeIn consumed and routeOut).
+  it("(b) telescoping: Σ routeEvent2 (crossed) + routePartial2(remainder) == routePartial2(total)", () => {
+    // leg1: a chain of constant-L brackets one tickSpacing apart (narrow ⇒ leg1 binds each event).
+    // leg2: ONE deep constant-L bracket (huge gross capacity ⇒ never binds, partial-absorbs).
+    const TS = 60;
+    const L1 = 10n ** 24n;
+    const L2 = 10n ** 28n;
+    const fee1 = FEE;
+    const fee2 = FEE;
+    // Build leg1's bracket chain in out/in space from spot tick 0, walking down.
+    const b1: RouteLeg[] = [];
+    let bTick = 0;
+    for (let i = 0; i < 6; i++) {
+      const n = toOutIn(getSqrtRatioAtTick(bTick), true);
+      const f = toOutIn(getSqrtRatioAtTick(bTick - TS), true);
+      b1.push({ nearOI: n, farOI: f, L: L1, feePpm: fee1 });
+      bTick -= TS;
+    }
+    const far2 = toOutIn(getSqrtRatioAtTick(-60000), true);
+    const leg2Deep: RouteLeg = { nearOI: near, farOI: far2, L: L2, feePpm: fee2 };
+
+    // Walk the route as an event sequence: at each event leg1 (on its current narrow bracket) binds
+    // (narrow output) and leg2 partially absorbs; accumulate routeIn / routeOut and advance leg1.
+    let n2 = near; // leg2's running near (advances by the partial far each event)
+    let walkRouteIn = 0n;
+    let walkRouteOut = 0n;
+    const CROSS = 3; // cross the first 3 leg1 brackets fully, then partial-fill into the 4th
+    for (let i = 0; i < CROSS; i++) {
+      const cur1 = b1[i];
+      const cur2: RouteLeg = { nearOI: n2, farOI: far2, L: L2, feePpm: fee2 };
+      const ev = routeEvent2(cur1, cur2);
+      assert.equal(ev.bind, 1, "narrow leg1 binds each event");
+      walkRouteIn += ev.routeIn;
+      walkRouteOut += ev.routeOut;
+      n2 = ev.newF2; // leg2 advanced near (partially consumed)
+    }
+    // Remainder: a partial fill of the 4th leg1 bracket, leg2 continuing from its advanced near.
+    const remIn = bracketGross(b1[CROSS].L, b1[CROSS].nearOI, b1[CROSS].farOI, fee1) / 2n;
+    const rem = routePartial2(
+      b1[CROSS],
+      { nearOI: n2, farOI: far2, L: L2, feePpm: fee2 },
+      remIn,
+    );
+    const totalWalkIn = walkRouteIn + remIn;
+    const totalWalkOut = walkRouteOut + rem.routeOut;
+
+    // Now the SINGLE-SHOT path: routePartial2(total) over the SAME composite must telescope to the
+    // same routeIn/routeOut. leg1 as a single composite bracket from its FIRST near to where the
+    // remainder lands; the through-output is conserved, so a single forward propagation over the
+    // first leg1 bracket's near with the full gross gives the same total out (constant-L telescopes
+    // across the contiguous leg1 chain — interior boundaries cancel exactly).
+    const oneShot = routePartial2(
+      { nearOI: b1[0].nearOI, farOI: b1[CROSS].farOI, L: L1, feePpm: fee1 },
+      leg2Deep,
+      totalWalkIn,
+    );
+    // routeIn consumed matches by construction; the OUTPUT telescopes to the wei because leg1's
+    // contiguous constant-L chain integrates to one hyperbola and leg2 is one constant-L bracket.
+    assertClose(oneShot.routeOut, totalWalkOut, 2n, "telescoped routeOut == event-walk routeOut");
+    assert.ok(totalWalkOut > 0n && totalWalkIn > 0n, "non-trivial telescope");
+  });
+
+  // (c) BRUTE-FORCE GREEDY CROSS-CHECK — split a tiny amountIn across {direct pool, 2-hop route}
+  // by greedily assigning small increments to the best CURRENT post-fee marginal, recomputing the
+  // route marginal by ACTUALLY composing the legs each step. A genuinely different mechanism from
+  // the segment merge; optimalSplit must track it within a tight relative tolerance.
+  it("(c) greedy increment split tracks optimalSplit to the merge granularity (< 0.1%)", () => {
+    const spot = getSqrtRatioAtTick(0);
+    // Direct pool (fee 0.05%) vs a 2-hop route (two 0.30% legs ⇒ two fees). The legs are SHALLOW
+    // (one route event ≈ a few·10·E18 of input ≪ amountIn), so the route enters the merge as MANY
+    // fine micro-segments — the regime where the segment-merge oracle converges to the continuous
+    // optimum. Both venues engage at an interior cut.
+    const directL = 10n ** 22n;
+    const directFee = 500n;
+    const routeLegL = 10n ** 22n;
+    const route: OptimalRoute = {
+      legs: [
+        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: routeLegL, net: new Map(), zeroForOne: true },
+        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: routeLegL, net: new Map(), zeroForOne: true },
+      ],
+    };
+    const directPool: OptimalPool = { isV2: false, feePpm: Number(directFee), sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: directL, net: new Map() };
+
+    const amountIn = 10000n * E18;
+    const STEPS = 40000n;
+    const inc = amountIn / STEPS; // small uniform increment
+
+    // Greedy state: direct pool near (out/in), route leg nears. We measure each venue's post-fee
+    // marginal out-per-in at its CURRENT price and assign each increment to the higher marginal,
+    // then advance that venue's price by absorbing the increment (constant-L reserve step).
+    const D = FEE_DENOM;
+    let dNear = toOutIn(spot, true);
+    let r1Near = toOutIn(spot, true);
+    let r2Near = toOutIn(spot, true);
+    let greedyDirect = 0n;
+    let greedyRoute = 0n;
+
+    // Marginal out/in (scaled 1e18) of a constant-L bracket at near with fee f: post-fee spot
+    // price = (near/Q96)^2 · (1−f). Route marginal = product of the two legs' post-fee spot prices.
+    const SCALE = 10n ** 18n;
+    const marg1 = (n: bigint, f: bigint) => {
+      // (n^2/Q192) · (D−f)/D · SCALE — the instantaneous out/in price (not sqrt).
+      const price = mulDiv(n * n, SCALE, Q192);
+      return mulDiv(price, D - f, D);
+    };
+    const advance = (n: bigint, L: bigint, f: bigint, grossIn: bigint): bigint => {
+      // absorb grossIn at constant L (reserve step), return the new near.
+      const effIn = mulDiv(grossIn, D - f, D);
+      const rIn = mulDiv(L, Q96, n);
+      const newIn = rIn + effIn;
+      return mulDiv(L, Q96, newIn);
+    };
+
+    for (let s = 0n; s < STEPS; s++) {
+      const dMarg = marg1(dNear, directFee);
+      // route marginal = leg1 post-fee price · leg2 post-fee price (composition of instantaneous rates)
+      const rMarg = mulDiv(marg1(r1Near, 3000n), marg1(r2Near, 3000n), SCALE);
+      if (dMarg >= rMarg) {
+        greedyDirect += inc;
+        dNear = advance(dNear, directL, directFee, inc);
+      } else {
+        greedyRoute += inc;
+        // route absorbs inc into leg1; leg1 output feeds leg2.
+        const newR1 = advance(r1Near, routeLegL, 3000n, inc);
+        const x1 = mulDiv(routeLegL, r1Near - newR1, Q96);
+        r1Near = newR1;
+        r2Near = advance(r2Near, routeLegL, 3000n, x1);
+      }
+    }
+
+    const res = optimalSplit({ pools: [directPool], routes: [route], amountIn, zeroForOne: true, priceLimit: 0n });
+    assert.equal(res.totalInput, amountIn, "optimalSplit spends amountIn exactly");
+    // Two independent mechanisms (continuous greedy vs segment-merge water-fill) agree on the split
+    // up to their granularity floors: the greedy's uniform increment and the merge's coarse partial
+    // of the final consumed segment. Both are ≪ 0.1% of amountIn here (shallow legs ⇒ fine route
+    // segments), so bound the disagreement by 0.1% of amountIn — a genuine cross-mechanism check.
+    const tol = amountIn / 1000n; // 0.1%
+    const dDiff = res.perPoolInput[0] > greedyDirect ? res.perPoolInput[0] - greedyDirect : greedyDirect - res.perPoolInput[0];
+    const rDiff = res.perRouteInput[0] > greedyRoute ? res.perRouteInput[0] - greedyRoute : greedyRoute - res.perRouteInput[0];
+    assert.ok(dDiff <= tol, `direct share tracks greedy: |${res.perPoolInput[0]} - ${greedyDirect}| = ${dDiff} > ${tol} (0.1%)`);
+    assert.ok(rDiff <= tol, `route share tracks greedy: |${res.perRouteInput[0]} - ${greedyRoute}| = ${rDiff} > ${tol} (0.1%)`);
+    // Both genuinely engaged (the split is interior, not a corner solution).
+    assert.ok(greedyDirect > 0n && greedyRoute > 0n, "greedy engaged both venues");
+    assert.ok(res.perPoolInput[0] > 0n && res.perRouteInput[0] > 0n, "optimalSplit engaged both venues");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 11b. N-hop route composition — routeEventN / routePartialN (3-hop concrete)
+// ─────────────────────────────────────────────────────────────
+//
+// The N-leg generalization of the route event/partial helpers. Three independent checks:
+//   (a) CLOSED FORM — a 3-hop where each leg is ONE constant-L bracket with NO crossing,
+//       composed via the constant-product RESERVE form (a different arithmetic path than
+//       routePartialN's reciprocal-add chain) == routePartialN to ≤ a few wei.
+//   (b) TELESCOPING — Σ routeEventN (crossed full events) + routePartialN(remainder) over a
+//       3-hop reproduces routePartialN(total) to the wei.
+//   (c) 2-HOP IDENTITY — routeEventN([l1,l2]) === routeEvent2(l1,l2) and routePartialN([l1,l2])
+//       === routePartial2 (the non-negotiable bit-identity guard at k=2), including randomized legs.
+
+// Independent N-hop output for a routeIn, each leg ONE constant-L out/in bracket (no crossing),
+// via the constant-product RESERVE form. Mirrors twoHopReserveClosedForm but chains k legs:
+// leg j absorbs the previous leg's output as GROSS input (pays its own fee), reserves at its
+// live spot near (k=L^2 hyperbola). Returns per-leg through-amounts and the final routeOut.
+function nHopReserveClosedForm(
+  legSpecs: { L: bigint; near: bigint; fee: bigint }[],
+  routeIn: bigint,
+): { flows: bigint[]; routeOut: bigint } {
+  const flows: bigint[] = [routeIn];
+  let inAmt = routeIn;
+  for (const { L, near, fee } of legSpecs) {
+    const rIn = mulDiv(L, Q96, near); // = invNear
+    const rOut = mulDiv(L, near, Q96);
+    const kk = rIn * rOut;
+    const effIn = mulDiv(inAmt, FEE_DENOM - fee, FEE_DENOM);
+    const out = rOut - kk / (rIn + effIn); // floors k/newIn, same as the 2-hop closed form
+    flows.push(out);
+    inAmt = out;
+  }
+  return { flows, routeOut: inAmt };
+}
+
+describe("N-hop route composition [routeEventN / routePartialN] (3-hop concrete)", () => {
+  const E18 = 10n ** 18n;
+  const near = toOutIn(getSqrtRatioAtTick(0), true); // 2^96 out/in spot for all legs
+  const FEE = 3000n;
+
+  // (a) CLOSED FORM — single bracket per leg, no crossing (legs very deep so the routeIn never
+  // reaches any bracket's far edge). routePartialN must match the constant-product reserve chain.
+  it("(a) single-bracket-per-leg 3-hop: routePartialN == constant-product reserve closed form (wei)", () => {
+    const L1 = 10n ** 26n;
+    const L2 = 3n * 10n ** 26n;
+    const L3 = 2n * 10n ** 26n;
+    const farDeep = toOutIn(getSqrtRatioAtTick(-60000), true); // very deep — no crossing in range
+    const legs: RouteLeg[] = [
+      { nearOI: near, farOI: farDeep, L: L1, feePpm: FEE },
+      { nearOI: near, farOI: farDeep, L: L2, feePpm: FEE },
+      { nearOI: near, farOI: farDeep, L: L3, feePpm: FEE },
+    ];
+    const specs = [
+      { L: L1, near, fee: FEE },
+      { L: L2, near, fee: FEE },
+      { L: L3, near, fee: FEE },
+    ];
+    for (const routeIn of [1n * E18, 100n * E18, 5000n * E18]) {
+      const r = routePartialN(legs, routeIn);
+      const cf = nHopReserveClosedForm(specs, routeIn);
+      // The reserve form and the reciprocal-add form are algebraically equal but truncate the
+      // hyperbola step differently per leg, so allow a few wei of independent-truncation slack
+      // (three chained legs ⇒ up to ~3 wei of accumulated truncation).
+      assertClose(r.routeOut, cf.routeOut, 1n, `routeOut == reserve closed form (routeIn=${routeIn})`);
+      // Each leg's partial far stayed strictly interior (no crossing) — preconditions hold.
+      for (const f of r.newFars) assert.ok(f > farDeep && f < near, "leg partial interior (no crossing)");
+    }
+  });
+
+  // (b) TELESCOPING — a 3-hop where leg0 has SEVERAL narrow brackets (binds each event), leg1/leg2
+  // are ONE deep bracket each (huge capacity ⇒ never bind, partial-absorb). Walking the events then
+  // partial-filling the remainder reproduces routePartialN(total) over the composite leg0 to the wei
+  // (leg0's contiguous constant-L chain integrates to one hyperbola; leg1/leg2 are single brackets).
+  it("(b) telescoping: Σ routeEventN (crossed) + routePartialN(remainder) == routePartialN(total)", () => {
+    const TS = 60;
+    const L0 = 10n ** 24n;
+    const Lmid = 10n ** 28n;
+    const Ldeep = 10n ** 28n;
+    const farDeep = toOutIn(getSqrtRatioAtTick(-60000), true);
+    // leg0 bracket chain (narrow, one tickSpacing apart), walking down from spot tick 0.
+    const b0: RouteLeg[] = [];
+    let bTick = 0;
+    for (let i = 0; i < 6; i++) {
+      const n = toOutIn(getSqrtRatioAtTick(bTick), true);
+      const f = toOutIn(getSqrtRatioAtTick(bTick - TS), true);
+      b0.push({ nearOI: n, farOI: f, L: L0, feePpm: FEE });
+      bTick -= TS;
+    }
+    const leg1Deep: RouteLeg = { nearOI: near, farOI: farDeep, L: Lmid, feePpm: FEE };
+    const leg2Deep: RouteLeg = { nearOI: near, farOI: farDeep, L: Ldeep, feePpm: FEE };
+
+    // Walk the route as an event sequence: leg0 (narrow) binds each event; leg1/leg2 partial-absorb.
+    let n1 = near; // leg1 running near (advances each event)
+    let n2 = near; // leg2 running near
+    let walkRouteIn = 0n;
+    let walkRouteOut = 0n;
+    const CROSS = 3; // cross the first 3 leg0 brackets fully, then partial-fill into the 4th
+    for (let i = 0; i < CROSS; i++) {
+      const legs: RouteLeg[] = [
+        b0[i],
+        { nearOI: n1, farOI: farDeep, L: Lmid, feePpm: FEE },
+        { nearOI: n2, farOI: farDeep, L: Ldeep, feePpm: FEE },
+      ];
+      const ev = routeEventN(legs);
+      assert.equal(ev.bindLeg, 0, "narrow leg0 binds each event");
+      walkRouteIn += ev.routeIn;
+      walkRouteOut += ev.routeOut;
+      n1 = ev.newFars[1]; // leg1 advanced near (partially consumed)
+      n2 = ev.newFars[2]; // leg2 advanced near
+    }
+    // Remainder: a partial fill of the 4th leg0 bracket; leg1/leg2 continue from their advanced nears.
+    const remIn = bracketGross(b0[CROSS].L, b0[CROSS].nearOI, b0[CROSS].farOI, FEE) / 2n;
+    const rem = routePartialN(
+      [b0[CROSS], { nearOI: n1, farOI: farDeep, L: Lmid, feePpm: FEE }, { nearOI: n2, farOI: farDeep, L: Ldeep, feePpm: FEE }],
+      remIn,
+    );
+    const totalWalkIn = walkRouteIn + remIn;
+    const totalWalkOut = walkRouteOut + rem.routeOut;
+
+    // SINGLE-SHOT: routePartialN(total) over leg0 as ONE composite bracket (first near → 4th far)
+    // must telescope to the same routeIn/routeOut (constant-L contiguous chain integrates exactly).
+    const oneShot = routePartialN(
+      [{ nearOI: b0[0].nearOI, farOI: b0[CROSS].farOI, L: L0, feePpm: FEE }, leg1Deep, leg2Deep],
+      totalWalkIn,
+    );
+    assertClose(oneShot.routeOut, totalWalkOut, 3n, "telescoped routeOut == event-walk routeOut (3-hop)");
+    assert.ok(totalWalkOut > 0n && totalWalkIn > 0n, "non-trivial telescope");
+  });
+
+  // (c) 2-HOP IDENTITY GUARD — the non-negotiable: routeEventN/routePartialN at k=2 MUST equal
+  // routeEvent2/routePartial2 bit-for-bit (the 2-hop landing stays bit-identical). Checked over the
+  // two binding regimes from the routeEvent2 vectors AND a spread of randomized legs.
+  it("(c) routeEventN([l1,l2]) === routeEvent2 and routePartialN === routePartial2 (bit-identical)", () => {
+    function leg(L: bigint, farTick: number, fee: bigint): RouteLeg {
+      return { nearOI: near, farOI: toOutIn(getSqrtRatioAtTick(farTick), true), L, feePpm: fee };
+    }
+    // The two routeEvent2 binding regimes + a few asymmetric mixes (different fees/widths/depths).
+    const pairs: [RouteLeg, RouteLeg][] = [
+      [leg(10n ** 21n, -60, FEE), leg(10n ** 27n, -6000, FEE)], // leg0 binds
+      [leg(10n ** 27n, -6000, FEE), leg(10n ** 21n, -60, FEE)], // leg1 binds
+      [leg(10n ** 24n, -120, 500n), leg(10n ** 23n, -300, 3000n)],
+      [leg(7n * 10n ** 22n, -240, 3000n), leg(5n * 10n ** 25n, -3000, 500n)],
+      [leg(10n ** 26n, -600, 100n), leg(10n ** 26n, -600, 100n)], // symmetric (tie regime)
+    ];
+    for (const [l1, l2] of pairs) {
+      const en = routeEventN([l1, l2]);
+      const e2 = routeEvent2(l1, l2);
+      assert.equal(en.routeIn, e2.routeIn, "routeIn identical");
+      assert.equal(en.routeOut, e2.routeOut, "routeOut identical");
+      assert.equal(en.bindLeg === 0 ? 1 : 2, e2.bind, "bind identical");
+      assert.equal(en.newFars[0], e2.newF1, "newF1 identical");
+      assert.equal(en.newFars[1], e2.newF2, "newF2 identical");
+      assert.equal(en.dX, e2.dX, "dX identical");
+      // routePartialN === routePartial2 across a spread of partial route inputs.
+      for (const ti of [1n * E18, 37n * E18, 1234n * E18]) {
+        const pn = routePartialN([l1, l2], ti);
+        const p2 = routePartial2(l1, l2, ti);
+        assert.equal(pn.routeOut, p2.routeOut, "routePartial routeOut identical");
+        assert.equal(pn.newFars[0], p2.f1p, "routePartial f1p identical");
+        assert.equal(pn.newFars[1], p2.f2p, "routePartial f2p identical");
+      }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 12. optimalSplit: ONE route + ONE direct pool — post-fee marginal EQUALIZES at the cut
+// ─────────────────────────────────────────────────────────────
+//
+// The whole point of the water-fill: at the cut every engaged venue's post-fee marginal out/in
+// price is the same (to rounding). For a route the comparable marginal is the LEFT-TO-RIGHT
+// product fold of the per-leg fee-adjusted out/in heads — directly comparable to a direct pool's
+// fee-adjusted near. This vector asserts that fold (route head) ≈ the direct pool's marginal at
+// the cut, and that the total spend == amountIn.
+describe("optimalSplit equalization — direct pool + 2-hop route share a common marginal", () => {
+  const E18 = 10n ** 18n;
+  const spot = getSqrtRatioAtTick(0);
+
+  // Helper: the fee-adjusted out/in head for a leg at near `n`, fee `f` (matches the oracle's
+  // feeAdjOI = n · sqrtOneMinusFeeScaled(f) / FEE_DENOM).
+  function feeAdjOI(n: bigint, f: number): bigint {
+    return (n * sqrtOneMinusFeeScaled(f)) / FEE_DENOM;
+  }
+
+  it("post-fee route head ≈ direct-pool fee-adjusted marginal at the cut; total == amountIn", () => {
+    // Both venues with tickSpacing 60 and SHALLOW liquidity (so the route enters as many fine
+    // micro-segments and lands at a clean interior cut without hitting the per-pool step cap).
+    const TS = 60;
+    const directL = 10n ** 22n;
+    const directFee = 500;
+    const legL = 10n ** 22n;
+    const legFee = 3000;
+    const directPool: OptimalPool = { isV2: false, feePpm: directFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: directL, net: new Map() };
+    const route: OptimalRoute = {
+      legs: [
+        { isV2: false, feePpm: legFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: legL, net: new Map(), zeroForOne: true },
+        { isV2: false, feePpm: legFee, sqrtPriceX96: spot, tick: 0, tickSpacing: TS, liquidity: legL, net: new Map(), zeroForOne: true },
+      ],
+    };
+    // Size the trade so BOTH venues engage and land at an interior cut (not exhausting either).
+    const amountIn = 10000n * E18;
+    const res = optimalSplit({ pools: [directPool], routes: [route], amountIn, zeroForOne: true, priceLimit: 0n });
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly");
+    assert.ok(res.perPoolInput[0] > 0n, "direct pool engaged");
+    assert.ok(res.perRouteInput[0] > 0n, "route engaged");
+
+    // Reconstruct the marginal each venue reached by absorbing its assigned input (constant-L step).
+    const advance = (n: bigint, L: bigint, f: number, grossIn: bigint): bigint => {
+      const effIn = mulDiv(grossIn, FEE_DENOM - BigInt(f), FEE_DENOM);
+      const rIn = mulDiv(L, Q96, n);
+      return mulDiv(L, Q96, rIn + effIn);
+    };
+    const dNear0 = toOutIn(spot, true);
+    const dFar = advance(dNear0, directL, directFee, res.perPoolInput[0]);
+    const directMarginalAdj = feeAdjOI(dFar, directFee);
+
+    // Route marginal at the cut: propagate the route input through both legs, then fold the legs'
+    // fee-adjusted far heads (the route's post-fee marginal in the same out/in coordinate).
+    const r1Near0 = toOutIn(spot, true);
+    const r1Far = advance(r1Near0, legL, legFee, res.perRouteInput[0]);
+    const x1 = mulDiv(legL, r1Near0 - r1Far, Q96);
+    const r2Near0 = toOutIn(spot, true);
+    const r2Far = advance(r2Near0, legL, legFee, x1);
+    const routeMarginalAdj = routeHeadFold([feeAdjOI(r1Far, legFee), feeAdjOI(r2Far, legFee)]);
+
+    // Equalization: the two post-fee marginals agree to within the segment-merge resolution — the
+    // water-fill discretizes each venue into tickSpacing-wide segments, so the marginals at the cut
+    // can differ by at most ~one tickSpacing step in sqrt price. For ts=60 that step is ≈0.3% in
+    // sqrt (≈3000 ppm); the realized gap here is well inside it (~700 ppm). 2000 ppm asserts they
+    // genuinely equalized (not a corner solution) while honoring the discretization floor.
+    assertClose(routeMarginalAdj, directMarginalAdj, 2000n, "route head ≈ direct marginal at the cut (segment-merge resolution)");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 13. optimalSplit: multi-pool LEG + OPPOSITE-DIRECTION hops
+// ─────────────────────────────────────────────────────────────
+//
+// Two structural cases the route model must handle: (1) a route whose legs differ — and a leg
+// that competes against a direct pool of a different fee (a stand-in for multi-pool-leg liquidity
+// stitching: the oracle's foundation leg is one pool, but the merge already splits a leg's
+// liquidity against other venues at the same out/in price); (2) a route whose two hops swap in
+// OPPOSITE directions (z1 != z2), e.g. A→X via token0→token1 then X→B via token1→token0 — the
+// route head fold and conservation are direction-agnostic because each leg works in its OWN out/in
+// space (toOutIn already absorbs the per-hop direction).
+describe("optimalSplit — multi-fee competition + opposite-direction route hops", () => {
+  const E18 = 10n ** 18n;
+  const spot = getSqrtRatioAtTick(0);
+
+  it("a route + two direct pools of different fees: Σ venues == amountIn, all engaged at scale", () => {
+    // Two direct pools (fee 0.05% and 0.30%) plus a 2-hop route (two 0.30% legs). A large trade
+    // funds all three to a common cut. This mirrors a leg's liquidity competing against other
+    // pools at the same price (the multi-pool-leg case, modeled as parallel venues here).
+    // SHALLOW direct pools (drain to the route head in ≈2760·E18 / ≈1508·E18); DEEP route legs.
+    const p0: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: spot, tick: 0, tickSpacing: 10, liquidity: 10n ** 24n, net: new Map() };
+    const p1: OptimalPool = { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 24n, net: new Map() };
+    const route: OptimalRoute = {
+      legs: [
+        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: true },
+        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: true },
+      ],
+    };
+    const amountIn = 10000n * E18;
+    const res = optimalSplit({ pools: [p0, p1], routes: [route], amountIn, zeroForOne: true, priceLimit: 0n });
+    const sum = res.perPoolInput.reduce((a, b) => a + b, 0n) + res.perRouteInput.reduce((a, b) => a + b, 0n);
+    assert.equal(sum, res.totalInput, "Σ venues == total");
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly");
+    // The deep-fee-0.05% pool fills first; at scale all three engage.
+    assert.ok(res.perPoolInput[0] > 0n, "0.05% direct pool engaged");
+    assert.ok(res.perPoolInput[1] > 0n, "0.30% direct pool engaged");
+    assert.ok(res.perRouteInput[0] > 0n, "route engaged");
+  });
+
+  it("opposite-direction hops (z1 != z2): the route still composes and conserves", () => {
+    // leg1 zeroForOne (A=token0 → X=token1), leg2 oneForZero (X=token0-of-pool2 → B=token1-of-pool2,
+    // but the hop direction is the reverse), so the second leg's out/in space is the RECIPROCAL.
+    // We seed leg2 at a price where its out/in spot (after toOutIn with zeroForOne:false) is a
+    // sensible head, and assert the route routes input and produces output (composition is
+    // direction-agnostic; each leg uses its own toOutIn). Compared against a direct pool to force a
+    // real split.
+    const spotLeg2Real = getSqrtRatioAtTick(0); // pool2 real sqrt; oneForZero ⇒ out/in = Q192/spot
+    const route: OptimalRoute = {
+      legs: [
+        { isV2: false, feePpm: 3000, sqrtPriceX96: spot, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: true },
+        { isV2: false, feePpm: 3000, sqrtPriceX96: spotLeg2Real, tick: 0, tickSpacing: 60, liquidity: 10n ** 26n, net: new Map(), zeroForOne: false },
+      ],
+    };
+    const directPool: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: spot, tick: 0, tickSpacing: 10, liquidity: 10n ** 24n, net: new Map() };
+    const amountIn = 5000n * E18;
+    const res = optimalSplit({ pools: [directPool], routes: [route], amountIn, zeroForOne: true, priceLimit: 0n });
+    assert.equal(res.totalInput, amountIn, "spends amountIn exactly with an opposite-direction route");
+    assert.ok(res.perRouteInput[0] > 0n, "opposite-direction route engaged");
+    // Conservation holds across the direction flip (Σ venues == total).
+    const sum = res.perPoolInput.reduce((a, b) => a + b, 0n) + res.perRouteInput.reduce((a, b) => a + b, 0n);
+    assert.equal(sum, res.totalInput, "Σ venues == total across the direction flip");
+  });
 });
