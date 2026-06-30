@@ -4,7 +4,6 @@ import type {
   CallExpression,
   MemberExpression,
   ArrayExpression,
-  NewExpression,
   ObjectExpression,
   Property,
 } from 'acorn';

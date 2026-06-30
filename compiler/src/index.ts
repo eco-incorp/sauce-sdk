@@ -42,6 +42,28 @@ export interface CompileOptions {
   args?: ArgValue[];
   /** Bytecode target: 'v1' (prefix, Solidity interpreter) or 'v12' (postfix, Huff runtime). Default 'v1'. */
   target?: CompileTarget;
+  /**
+   * Transform an imported SOURCE module's text before parsing — e.g. strip TypeScript types.
+   * Receives (code, absoluteFilePath); return plain JS. Only invoked for source-file function
+   * imports (`import { fn } from "./mod"`), never for `.json` contract ABIs. Callers importing
+   * `.ts`/`.sauce.ts` modules supply this (the recipes pass `ts.transpileModule`); plain `.js`
+   * /`.sauce` modules need no transform.
+   */
+  transformModule?: (code: string, filePath: string) => string;
+  /**
+   * Drop every function NOT reachable from main() (after compile-time constant folding) so an
+   * imported-but-unreferenced function — or a handler behind a statically-false branch — is not
+   * emitted. Default false (every declared/imported function is emitted, the legacy behaviour).
+   */
+  treeshake?: boolean;
+  /**
+   * Compile-time constants (name → value) used for conditional compilation: an `if`/ternary/
+   * `&&`/`||` whose condition folds to a known value emits only the taken branch, so a guarded
+   * protocol handler call (`if (HAS_CURVE) curve(...)`) vanishes when its flag is false — and
+   * with `treeshake`, the now-unreferenced handler is dropped from the bytecode. Booleans map to
+   * 1n/0n. Top-level `const X = <literal>` in the program are folded the same way.
+   */
+  defines?: Record<string, bigint | boolean | number>;
 }
 
 export interface CompileResult {
@@ -78,6 +100,10 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
   });
 
   const ctx = new CompilerContext(options.baseDirs, options.contracts, target);
+  ctx.transformModule = options.transformModule;
+  ctx.treeshake = options.treeshake ?? false;
+
+  if (options.defines) ctx.setDefines(options.defines);
 
   if (options.args && options.args.length > 0) {
     ctx.mainArgTypes = options.args.map(inferArgType);
