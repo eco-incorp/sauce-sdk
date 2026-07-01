@@ -78,10 +78,39 @@ describe("CHAIN_POOL_CONFIGS shape", () => {
           if (f.v2FeePpm !== undefined) {
             assert.ok(Number.isInteger(f.v2FeePpm) && f.v2FeePpm > 0, "v2FeePpm must be a positive int");
           }
+          if (f.slipstreamTickSpacings !== undefined) {
+            assert.equal(
+              f.factoryType, FactoryType.SlipstreamCL,
+              "slipstreamTickSpacings is only valid on a SlipstreamCL factory",
+            );
+            assert.ok(f.slipstreamTickSpacings.length > 0, "slipstreamTickSpacings, when set, must be non-empty");
+            for (const s of f.slipstreamTickSpacings) {
+              assert.ok(Number.isInteger(s) && s > 0, `slipstreamTickSpacing must be a positive int (${s})`);
+            }
+          }
         });
       });
     });
   }
+
+  it("SlipstreamCL is a recognized FactoryType enum member", () => {
+    assert.ok(FACTORY_TYPE_VALUES.has(FactoryType.SlipstreamCL), "SlipstreamCL must be a FactoryType value");
+  });
+
+  it("re-tags the verified Slipstream CL factories to FactoryType.SlipstreamCL", () => {
+    // The flagship Aerodrome CL (Base) + the verified Velodrome/Shadow Slipstream CL factories are
+    // discovered by tickSpacing key. Each was on-chain-verified to respond to getPool(a,b,int24).
+    const slip = (chain: string) =>
+      CHAIN_POOL_CONFIGS[chain].factories.filter((f) => f.factoryType === FactoryType.SlipstreamCL);
+    assert.ok(
+      slip("base").some((f) => f.label === "Aerodrome CL"),
+      "Base Aerodrome CL must be tagged SlipstreamCL",
+    );
+    assert.ok(slip("optimism").length > 0, "Optimism Velodrome CL must be tagged SlipstreamCL");
+    assert.ok(slip("sonic").length > 0, "Sonic Shadow CL must be tagged SlipstreamCL");
+    assert.ok(slip("celo").length > 0, "Celo Velodrome CL must be tagged SlipstreamCL");
+    assert.ok(slip("ink").length > 0, "Ink Velodrome Slipstream CL must be tagged SlipstreamCL");
+  });
 
   it("includes the newly-added chains", () => {
     assert.ok(CHAIN_POOL_CONFIGS.bsc, "bsc config present");

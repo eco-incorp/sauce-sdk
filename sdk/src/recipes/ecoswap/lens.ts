@@ -51,6 +51,7 @@ import {
   SwapPoolType,
   FactoryType,
   V2_DEFAULT_FEE_PPM,
+  SLIPSTREAM_TICK_SPACINGS,
   type ChainPoolConfig,
   type FactoryConfig,
 } from "../shared/constants.js";
@@ -318,7 +319,15 @@ export async function runLens(
         // Algebra rides the v3Factories param (tagged isAlgebra) and is EXECUTABLE (default on):
         // the engine services algebraSwapCallback (sauce#186), so a cooked Algebra swap lands.
         // includeAlgebra defaults true; pass false to suppress Algebra on a read.
-        (includeAlgebra && f.factoryType === FactoryType.AlgebraV3)) &&
+        (includeAlgebra && f.factoryType === FactoryType.AlgebraV3) ||
+        // Slipstream CL (Velodrome/Aerodrome Slipstream + Ramses-lineage Shadow CL) also rides
+        // v3Factories (tagged isSlipstream). It is V3-shaped for pricing AND execution — the pool
+        // exposes the standard V3 view surface and its swap() re-enters via uniswapV3SwapCallback
+        // (the engine authenticates V3 callbacks by transient expectedPool, not a factory check),
+        // so a discovered Slipstream pool is cooked via swapV3 unchanged. The ONLY difference is
+        // discovery: getPool(a,b,int24 tickSpacing) keyed by tickSpacing, not fee. See
+        // FactoryType.SlipstreamCL + discoverSlipstreamCLPools.
+        f.factoryType === FactoryType.SlipstreamCL) &&
       f.address.toLowerCase() !== NON_FACTORY,
   );
   const v2Factories: FactoryConfig[] = poolConfig.factories.filter(
@@ -338,6 +347,17 @@ export async function runLens(
   const v3FeeSet = new Set<number>();
   for (const f of v3Factories) {
     if (f.factoryType === FactoryType.AlgebraV3) continue;
+    if (f.factoryType === FactoryType.SlipstreamCL) {
+      // A Slipstream factory keys pools by tickSpacing — its "tier column" values ARE
+      // tickSpacings (getPool(a,b,int24 tickSpacing)). Contribute the factory's enabled
+      // tickSpacing menu (default the Slipstream-common set) to the shared column. The lens
+      // reinterprets ft[0] as a tickSpacing for a Slipstream row; over-querying a value a given
+      // factory doesn't enable is harmless (getPool returns 0). The Slipstream-specific step
+      // (ft[2] = stepRatioForSpacing(value)) disambiguates from a standard-V3 fee-tier that
+      // happens to share the numeric value (only 100 overlaps: fee 100 → ts 1, Slipstream ts 100).
+      for (const ts of f.slipstreamTickSpacings ?? [...SLIPSTREAM_TICK_SPACINGS]) v3FeeSet.add(ts);
+      continue;
+    }
     for (const fee of f.feeTiers ?? poolConfig.feeTiers) v3FeeSet.add(fee);
   }
   if (v3FeeSet.size === 0 && v3Factories.length > 0) {
@@ -398,17 +418,33 @@ export async function runLens(
       // by THIS ratio (it has no on-chain TickMath). Algebra v1 forks (Camelot/QuickSwap/Ramses)
       // use a fixed per-factory tickSpacing; configure it via FactoryConfig.algebraTickSpacing
       // (default 60). Standard-V3 rows carry 0 for both (unused — they read the tier's step).
+      // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream]. A
+      // Slipstream row (isSlipstream=1) discovers via getPool(a,b,int24 tickSpacing) — where the
+      // tickSpacing is the v3FeeTiers[j][0] value — and reads the pool's OWN fee(). algebraTs/
+      // algebraStep are 0 for Slipstream (it reads tickSpacing() live like standard V3 and uses the
+      // Slipstream step column v3FeeTiers[j][2]). isAlgebra and isSlipstream are mutually exclusive.
       v3Factories.map((f) => {
         const isAlgebra = f.factoryType === FactoryType.AlgebraV3;
+        const isSlipstream = f.factoryType === FactoryType.SlipstreamCL;
         const aTs = isAlgebra ? f.algebraTickSpacing ?? 60 : 0;
         return [
           BigInt(f.address),
           isAlgebra ? 1n : 0n,
           BigInt(aTs),
           isAlgebra ? stepRatioForSpacing(aTs) : 0n,
+          isSlipstream ? 1n : 0n,
         ];
       }),
-      v3FeeTiers.map((fee) => [BigInt(fee), stepRatioForSpacing(feeToTickSpacing(fee))]),
+      // v3FeeTiers[j] = [value, stepAsFee, stepAsTickSpacing]. For a standard-V3 row the value is a
+      // FEE tier and the step is stepAsFee = stepRatioForSpacing(feeToTickSpacing(value)). For a
+      // Slipstream row the SAME value is a TICKSPACING and the step is stepAsTickSpacing =
+      // stepRatioForSpacing(value). Carrying both disambiguates the single overlapping numeric
+      // value (100): the lens picks column [1] for standard V3 / Algebra, column [2] for Slipstream.
+      v3FeeTiers.map((v) => [
+        BigInt(v),
+        stepRatioForSpacing(feeToTickSpacing(v)),
+        stepRatioForSpacing(v),
+      ]),
       // v2Factories[i] = [factoryAddr, feePpm] — the per-pool constant-product fee
       // (V2_DEFAULT_FEE_PPM=3000 for canonical UniswapV2). Threaded so the lens grosses
       // V2 capacity/floor by the REAL fee, not a hardcoded 0.30%.

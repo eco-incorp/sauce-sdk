@@ -5,6 +5,7 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IStateViewFull } from "./IStateViewFull.json";
 import { IAlgebraFactory } from "./IAlgebraFactory.json";
 import { IAlgebraPool } from "./IAlgebraPool.json";
+import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 
 // EcoSwap on-chain PREPARE LENS (v2, LAZY / dynamic tick reading).
 //
@@ -77,7 +78,7 @@ import { IAlgebraPool } from "./IAlgebraPool.json";
 //   cfg[4]  driftTicks : Uint256 (extra boundaries past the stop, each side)
 //   cfg[5]  minRelBps  : Uint256 (survivor floor in bps of Σ in-range capacity)
 //   cfg[6]  maxTicks   : Uint256 (hard cap on forward tick reads per pool)
-//   v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep]
+//   v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream]
 //                    isAlgebra=1 ⇒ Algebra dynamic-fee fork (Camelot/QuickSwap V3, Ramses V2):
 //                    discover via poolByPair(tokenIn,tokenOut) and read globalState() for
 //                    (price, tick) + the DYNAMIC fee (feeZto for zeroForOne, feeOtz for
@@ -88,7 +89,16 @@ import { IAlgebraPool } from "./IAlgebraPool.json";
 //                    walk (ticks()[1]=liquidityDelta shares the V3 selector + int128 layout),
 //                    the capacity/floor math and the emitted V3 pool row are reused verbatim
 //                    (poolType=1=UniV3; the dynamic fee rides the row's `fee` field).
-//                    Standard-V3 rows carry isAlgebra=0, algebraTs=0, algebraStep=0.
+//                    isSlipstream=1 ⇒ Velodrome/Aerodrome Slipstream (+ Ramses-lineage Shadow) CL:
+//                    the CLFactory keys pools by TICK SPACING, so discover via
+//                    getPool(tokenIn,tokenOut,int24 tickSpacing) where the "tickSpacing" is the
+//                    v3FeeTiers[j][0] value REINTERPRETED as a tickSpacing (the lens is fed the
+//                    Slipstream tickSpacing menu as that column for a Slipstream factory), then
+//                    read the pool's OWN fee() (Slipstream DECOUPLES fee from tickSpacing) — after
+//                    which slot0/liquidity/tickSpacing()/ticks() are byte-identical to standard V3,
+//                    so the tick walk + capacity/floor math + emit are reused verbatim. A
+//                    Slipstream row loops the full v3FeeTiers column (each value = one tickSpacing).
+//                    Standard-V3 rows carry isAlgebra=0, algebraTs=0, algebraStep=0, isSlipstream=0.
 //   v3FeeTiers[j]  = [fee, stepRatio]        stepRatio=floor(sqrt(1.0001^ts)*2^96)
 //   v2Factories[i] = [factoryAddr, feePpm]   feePpm = the pool's constant-product fee
 //                                            (3000 for canonical UniswapV2); the engine
@@ -226,11 +236,13 @@ function main(
     const vf: Tuple = v3Factories[fi];
     const factory: Address = vf[0];
     const isAlg: Uint256 = vf[1]; // 1 ⇒ Algebra dynamic-fee fork (poolByPair + globalState)
+    const isSlip: Uint256 = vf[4]; // 1 ⇒ Slipstream CL (getPool by int24 tickSpacing + fee())
     for (let ti = 0; ti < v3FeeTiers.length; ti = ti + 1) {
       const ft: Tuple = v3FeeTiers[ti];
       const fee: Uint256 = ft[0];
       // Algebra factories yield ONE pool per pair (no fee tiers) — only act at ti===0 so the
-      // pool is discovered/counted exactly once. Standard V3 loops every configured tier.
+      // pool is discovered/counted exactly once. Standard V3 AND Slipstream loop every column
+      // value (a fee tier for V3, a tickSpacing for Slipstream).
       let runIt: Uint256 = 1;
       if (isAlg === 1) {
         if (ti !== 0) {
@@ -246,8 +258,14 @@ function main(
             sqrtP = IAlgebraPool.at(poolAddr).globalState()[0]; // price (== sqrtPriceX96)
           }
         } else {
-          poolAddr = IUniswapV3Factory.at(factory).getPool(tokenIn, tokenOut, fee);
+          if (isSlip === 1) {
+            // Slipstream: the column value `fee` is a TICKSPACING (getPool keyed by int24 tickSpacing).
+            poolAddr = ISlipstreamCLFactory.at(factory).getPool(tokenIn, tokenOut, fee);
+          } else {
+            poolAddr = IUniswapV3Factory.at(factory).getPool(tokenIn, tokenOut, fee);
+          }
           if (poolAddr !== 0) {
+            // Slipstream pools have the standard slot0() surface (only DISCOVERY differs).
             sqrtP = IUniswapV3PoolFull.at(poolAddr).slot0()[0];
           }
         }
@@ -328,6 +346,7 @@ function main(
     const isAlgA3: Uint256 = vfa3[1];
     const algTsA3: Uint256 = vfa3[2];
     const algStepA3: Uint256 = vfa3[3];
+    const isSlipA3: Uint256 = vfa3[4];
     for (let ta3 = 0; ta3 < v3FeeTiers.length; ta3 = ta3 + 1) {
       const fta3: Tuple = v3FeeTiers[ta3];
       let runA3: Uint256 = 1;
@@ -355,9 +374,21 @@ function main(
             stepA3 = algStepA3;
           }
         } else {
-          poolA3 = IUniswapV3Factory.at(factoryA3).getPool(tokenIn, tokenOut, feeA3);
-          if (poolA3 !== 0) {
-            sqrtA3 = IUniswapV3PoolFull.at(poolA3).slot0()[0];
+          if (isSlipA3 === 1) {
+            // Slipstream: fta3[0] is a TICKSPACING (getPool by int24), and the step is the
+            // Slipstream column fta3[2] = stepRatioForSpacing(tickSpacing). The per-pool fee is
+            // READ from fee() (decoupled from tickSpacing), replacing the tier value.
+            poolA3 = ISlipstreamCLFactory.at(factoryA3).getPool(tokenIn, tokenOut, feeA3);
+            stepA3 = fta3[2];
+            if (poolA3 !== 0) {
+              feeA3 = IUniswapV3PoolFull.at(poolA3).fee();
+              sqrtA3 = IUniswapV3PoolFull.at(poolA3).slot0()[0];
+            }
+          } else {
+            poolA3 = IUniswapV3Factory.at(factoryA3).getPool(tokenIn, tokenOut, feeA3);
+            if (poolA3 !== 0) {
+              sqrtA3 = IUniswapV3PoolFull.at(poolA3).slot0()[0];
+            }
           }
         }
       if (poolA3 !== 0) {
@@ -565,6 +596,7 @@ function main(
     const isAlgM: Uint256 = vfm[1];
     const algTsM: Uint256 = vfm[2];
     const algStepM: Uint256 = vfm[3];
+    const isSlipM: Uint256 = vfm[4];
     for (let tm = 0; tm < v3FeeTiers.length; tm = tm + 1) {
       const ftm: Tuple = v3FeeTiers[tm];
       let runM: Uint256 = 1;
@@ -590,9 +622,23 @@ function main(
           stepM = algStepM;
         }
       } else {
-        poolM = IUniswapV3Factory.at(factoryM).getPool(tokenIn, tokenOut, feeM);
-        if (poolM !== 0) {
-          sqrtM = IUniswapV3PoolFull.at(poolM).slot0()[0];
+        if (isSlipM === 1) {
+          // Slipstream: ftm[0] is a TICKSPACING (getPool by int24), step is ftm[2], fee READ from
+          // fee(). step (ftm[2], keyed on the discovery key) and the stride tsM below (the LIVE
+          // tickSpacing()) agree because real Slipstream getPool(a,b,ts) returns tickSpacing()==ts;
+          // the step only sizes this capacity-measure walk (no rows emitted), so it never affects the
+          // survivorship value even on a hypothetical decoupled fork. See the EMIT pass note.
+          poolM = ISlipstreamCLFactory.at(factoryM).getPool(tokenIn, tokenOut, feeM);
+          stepM = ftm[2];
+          if (poolM !== 0) {
+            feeM = IUniswapV3PoolFull.at(poolM).fee();
+            sqrtM = IUniswapV3PoolFull.at(poolM).slot0()[0];
+          }
+        } else {
+          poolM = IUniswapV3Factory.at(factoryM).getPool(tokenIn, tokenOut, feeM);
+          if (poolM !== 0) {
+            sqrtM = IUniswapV3PoolFull.at(poolM).slot0()[0];
+          }
         }
       }
       if (poolM !== 0) {
@@ -831,6 +877,7 @@ function main(
     const isAlg3: Uint256 = vf3[1];
     const algTs3: Uint256 = vf3[2];
     const algStep3: Uint256 = vf3[3];
+    const isSlip3: Uint256 = vf3[4];
     for (let ti3 = 0; ti3 < v3FeeTiers.length; ti3 = ti3 + 1) {
       const ft3: Tuple = v3FeeTiers[ti3];
       let runE3: Uint256 = 1;
@@ -841,7 +888,8 @@ function main(
       }
       if (runE3 === 1) {
       // Resolve discovery + (sqrt,tick,fee,step,ts) per family. Algebra: poolByPair +
-      // globalState's DYNAMIC fee (feeZto/feeOtz by direction); standard V3: getPool + slot0.
+      // globalState's DYNAMIC fee (feeZto/feeOtz by direction); Slipstream: getPool(a,b,int24 ts)
+      // + fee() + the Slipstream step column ft3[2]; standard V3: getPool(a,b,fee) + slot0.
       let poolAddr3: Address = 0;
       let sqrt3: Uint256 = 0;
       let fee3: Uint256 = ft3[0];
@@ -858,9 +906,27 @@ function main(
           step3 = algStep3;
         }
       } else {
-        poolAddr3 = IUniswapV3Factory.at(factory3).getPool(tokenIn, tokenOut, fee3);
-        if (poolAddr3 !== 0) {
-          sqrt3 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
+        if (isSlip3 === 1) {
+          // Slipstream: fee3 (the column value ft3[0]) is a TICKSPACING (getPool keyed by int24),
+          // and step3 is the Slipstream step column ft3[2] = stepRatioForSpacing(that tickSpacing).
+          // The multiplicative step (ft3[2]) is keyed on the DISCOVERY key while the tick-boundary
+          // stride below (ts3) is the pool's LIVE tickSpacing() — these agree because real Slipstream
+          // getPool(a,b,ts) returns a pool whose tickSpacing()==ts (only FEE is decoupled from the
+          // key), so the column step is grid-correct. The step only sizes the capacity walk (how many
+          // boundaries to scan); the EMITTED (tickIndex,net) rows use ts3, and prepare recomputes
+          // exact sqrts — so even a hypothetical decoupled fork would only mis-size the scan COUNT,
+          // never the bracket prices. The per-pool fee is READ from fee() (decoupled), replacing fee3.
+          poolAddr3 = ISlipstreamCLFactory.at(factory3).getPool(tokenIn, tokenOut, fee3);
+          step3 = ft3[2];
+          if (poolAddr3 !== 0) {
+            fee3 = IUniswapV3PoolFull.at(poolAddr3).fee();
+            sqrt3 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
+          }
+        } else {
+          poolAddr3 = IUniswapV3Factory.at(factory3).getPool(tokenIn, tokenOut, fee3);
+          if (poolAddr3 !== 0) {
+            sqrt3 = IUniswapV3PoolFull.at(poolAddr3).slot0()[0];
+          }
         }
       }
       if (poolAddr3 !== 0) {

@@ -65,6 +65,11 @@ export const helperArtifact = loadArtifact(
 export const v2FactoryArtifact = loadArtifact(
   join(FIXTURES, "V2Factory.sol", "V2Factory.json"),
 );
+/** Slipstream CLFactory shim (getPool(a,b,int24) registry) — deployed normally; discovery/lens
+ *  resolve tickSpacing-keyed. It points at a REAL @uniswap/v3-core pool (Slipstream is V3-shaped). */
+export const slipstreamFactoryArtifact = loadArtifact(
+  join(FIXTURES, "SlipstreamCLFactory.sol", "SlipstreamCLFactory.json"),
+);
 /** Runtime bytecode of the V2 pair — etched at a chosen address (no constructor). */
 export const v2PairRuntime = loadDeployedBytecode(
   join(FIXTURES, "V2Pair.sol", "V2Pair.json"),
@@ -241,6 +246,13 @@ export const v2FactoryAbi = parseAbi([
 export const pancakeDeployerAbi = parseAbi([
   "function createPool(bytes creationCode, address tokenA, address tokenB, uint24 fee, int24 tickSpacing) returns (address pool)",
   "function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)",
+]);
+
+// Slipstream CLFactory shim: getPool keyed by int24 tickSpacing (NOT uint24 fee) — the ONE way a
+// Slipstream CLFactory differs from a Uniswap V3 factory. `setPool` records both token orderings.
+export const slipstreamFactoryAbi = parseAbi([
+  "function setPool(address tokenA, address tokenB, int24 tickSpacing, address pool)",
+  "function getPool(address tokenA, address tokenB, int24 tickSpacing) view returns (address)",
 ]);
 
 export const v2PairAbi = parseAbi([
@@ -694,6 +706,63 @@ export async function createAndInitPancakePool(
     abi: v3PoolAbi as Abi,
     functionName: "initialize",
     args: [sqrtPriceX96],
+  });
+  return pool;
+}
+
+/** Deploy the Slipstream CLFactory shim (discovery resolves CL pools via getPool(a,b,int24 ts)). */
+export async function deploySlipstreamFactory(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: slipstreamFactoryArtifact.abi,
+    bytecode: slipstreamFactoryArtifact.bytecode,
+  });
+}
+
+/**
+ * Build a Slipstream CL pool for the local EVM tests. A Slipstream pool is V3-compatible for
+ * pricing AND execution, so the faithful minimal fixture creates a REAL @uniswap/v3-core pool via
+ * the standard V3 factory (`createAndInitPool`) — which already exposes fee()/tickSpacing()/slot0()/
+ * ticks() and calls uniswapV3SwapCallback — and registers it in the Slipstream shim under its
+ * TICK SPACING (the ONE thing that differs from Uniswap V3 is discovery). The pool's fee() is thus
+ * the V3 fee tier passed here, which the discovery/lens path READS from fee() (Slipstream decouples
+ * fee from tickSpacing, so the fee is not assumed from the key). Returns the pool address; callers
+ * mint liquidity into it exactly as they do a plain V3 pool (via `mintPosition`/`batchMintPositions`).
+ *
+ * `tickSpacing` is the Slipstream CLFactory DISCOVERY KEY only — the int24 `getPool(a, b, ts)` is
+ * keyed on it. It is INDEPENDENT of the underlying real V3 pool's grid: the standard V3 factory
+ * derives that grid from `fee` alone (feeAmountTickSpacing(fee): 500→10, 3000→60, 10000→200), NOT
+ * from this key. Callers must ensure the mint bounds are divisible by the REAL grid
+ * (feeAmountTickSpacing(fee)), NOT by this key — this decoupling of the discovery key from the grid
+ * is exactly Slipstream's fee/tickSpacing model (production `getPool(a, b, ts)` returns a pool whose
+ * `tickSpacing() == ts`, so in production the key IS the grid; only the FEE is decoupled). The
+ * discovery config's `slipstreamTickSpacings` must include this key. For maximum fidelity, pass a key
+ * that equals the pool's real grid (e.g. fee 500 → key 10) so the fixture never masks a divergence.
+ */
+export async function createAndRegisterSlipstreamPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  v3Factory: Hex,
+  slipstreamFactory: Hex,
+  token0: Hex,
+  token1: Hex,
+  fee: number,
+  tickSpacing: number,
+  sqrtPriceX96: bigint,
+): Promise<Hex> {
+  // The pool itself is a genuine Uniswap V3 pool (created + initialized via the real V3 factory).
+  const pool = await createAndInitPool(
+    walletClient, publicClient, v3Factory, token0, token1, fee, sqrtPriceX96,
+  );
+  // Register it in the Slipstream shim under its tickSpacing (both orderings) so tickSpacing-keyed
+  // discovery — getPool(a, b, int24 tickSpacing) — surfaces it exactly as production Slipstream does.
+  await writeAndWait(walletClient, publicClient, {
+    address: slipstreamFactory,
+    abi: slipstreamFactoryAbi as Abi,
+    functionName: "setPool",
+    args: [token0, token1, tickSpacing, pool],
   });
   return pool;
 }

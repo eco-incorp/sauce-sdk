@@ -192,7 +192,35 @@ export enum FactoryType {
    * (both source-verified EIP-1967 proxies on Celoscan). See mento-math.ts.
    */
   Mento = "mento",
+  /**
+   * Slipstream-family concentrated liquidity (Velodrome/Aerodrome Slipstream CLFactory, and the
+   * Ramses-lineage forks Shadow Exchange CL). These are UniswapV3-compatible for PRICING and
+   * EXECUTION — the pool exposes the standard V3 view surface (slot0, ticks, liquidity,
+   * tickSpacing) and its swap() re-enters the caller via the exact `uniswapV3SwapCallback` selector
+   * the engine Router already implements (the engine authenticates V3 callbacks via the transient
+   * `expectedPool`, NOT a factory/CREATE2 check, so a Slipstream pool is accepted with NO engine
+   * change and executes through the existing flat `swapV3` path unchanged). The ONLY thing that
+   * differs from Uniswap V3 is DISCOVERY: the CLFactory keys pools by TICK SPACING, not fee —
+   * `getPool(address tokenA, address tokenB, int24 tickSpacing)` — so a fee-tier-enumerating
+   * V3Standard discovery finds nothing (which is why these CL entries were previously INERT under
+   * V3Standard). This type enumerates a per-factory-overridable set of enabled tickSpacings
+   * (`FactoryConfig.slipstreamTickSpacings`, defaulting to the Slipstream-common
+   * [1, 50, 100, 200, 2000]) via `getPool(a, b, int24 tickSpacing)`, and — because Slipstream
+   * DECOUPLES fee from tickSpacing — reads each surviving pool's OWN `fee()` getter to populate the
+   * same `fee` field the V3 path uses (NOT a tickSpacing→fee assumption). The resulting `PoolInfo`
+   * is byte-identical in shape to a V3Standard-discovered pool, so the downstream bracket / lens /
+   * swapV3 path consumes it unchanged. See discoverSlipstreamCLPools in pool-discovery.ts.
+   */
+  SlipstreamCL = "slipstream-cl",
 }
+
+/**
+ * Slipstream-family CLFactory common enabled tickSpacings. Velodrome/Aerodrome Slipstream and the
+ * Ramses-lineage Shadow CL forks enable this canonical set; a factory that enables a different set
+ * overrides it per-config via `FactoryConfig.slipstreamTickSpacings`. Over-querying a spacing the
+ * factory does not enable is harmless — `getPool(a,b,int24)` returns address(0) for it.
+ */
+export const SLIPSTREAM_TICK_SPACINGS = [1, 50, 100, 200, 2000] as const;
 
 /**
  * Backward-compatible alias for the Algebra dynamic-fee factory type. `FactoryType.Algebra`
@@ -241,6 +269,15 @@ export interface FactoryConfig {
    * precompute their step ratio. Defaults to 60 when omitted. Ignored for non-Algebra factories.
    */
   algebraTickSpacing?: number;
+  /**
+   * Slipstream CL (SlipstreamCL factory type) only: the tickSpacings this CLFactory enables. The
+   * Slipstream CLFactory keys pools by tickSpacing — `getPool(tokenA, tokenB, int24 tickSpacing)` —
+   * so discovery enumerates this list (defaulting to the Slipstream-common `SLIPSTREAM_TICK_SPACINGS`
+   * = [1, 50, 100, 200, 2000] when omitted). Over-querying a spacing the factory does not enable is
+   * harmless (getPool returns address(0)); set it to trim the enumerated set for a fork with a
+   * narrower spacing menu. Ignored for non-Slipstream factories.
+   */
+  slipstreamTickSpacings?: number[];
   /**
    * Balancer V2 (BalancerV2 factory type) only: a KNOWN list of ComposableStable pool addresses to
    * probe for the pair. Balancer has NO pair→pool getter (the `address` here is the Vault, shared on
@@ -346,7 +383,11 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     // V3 concentrated liquidity (has price limit)
     { address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
     { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
-    { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Aerodrome CL" },
+    // Aerodrome CL (Velodrome Slipstream on Base) — tickSpacing-keyed getPool(a,b,int24). Verified
+    // on-chain: getPool(WETH,USDC,int24) returns non-zero pools across tickSpacings {1,50,100,200,2000},
+    // and fee() is DECOUPLED from tickSpacing (ts=100 pool → fee 50 ppm; ts=1 pool → fee 80 ppm), so the
+    // per-pool fee is READ from fee(). V3-compatible for execution (swapV3 / uniswapV3SwapCallback).
+    { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Aerodrome CL" },
     { address: "0x71524B4f93c58fcbF659783284E38825f0622859" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
     { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
     // Algebra dynamic-fee (V3-shaped; poolByPair + globalState). EXECUTABLE — the engine now
@@ -425,7 +466,16 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       { address: "0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // Ramses V3 CL — LEFT as V3Standard and FLAGGED: NOT re-tagged to SlipstreamCL because this
+      // address could NOT be verified as tickSpacing-keyed (getPool(a,b,int24) reverts — the address
+      // 0x07E6…6b45 has NO code on Arbitrum mainnet, i.e. it is a stale/incorrect factory). Both the
+      // fee-keyed V3Standard path and a tickSpacing-keyed path fail against it; the address itself
+      // needs re-verification before this entry can be lit up.
       { address: "0x07E60782535752be279929e2DFfDd136Db2e6b45" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Ramses V3 CL" },
+      // Chronos CL — LEFT as V3Standard and FLAGGED: NOT re-tagged to SlipstreamCL because
+      // getPool(a,b,int24) reverts (bare 0x) against this factory on Arbitrum mainnet, so it does NOT
+      // respond as a tickSpacing-keyed CLFactory (nor did the fee-keyed getPool return a pool). Needs
+      // address / interface re-verification before it can be discovered.
       { address: "0x4Db9D624F67E00dbF8ef7AE0e0e8eE54aF1dee49" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Chronos CL" },
       // Algebra (V3-compatible swap with dynamic fees, different factory query)
       { address: "0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Camelot V3" },
@@ -465,7 +515,10 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     factories: [
       // V3 concentrated liquidity (has price limit)
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
-      { address: "0xCc0bDDB707055e04e497aB22a59c2aF4391cd12F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Velodrome CL" },
+      // Velodrome CL (Slipstream on Optimism) — tickSpacing-keyed getPool(a,b,int24). Verified
+      // on-chain: getPool(WETH,USDC,int24) returns non-zero pools at tickSpacings {1,100}. Per-pool
+      // fee READ from fee() (decoupled from tickSpacing). V3-compatible for execution (swapV3).
+      { address: "0xCc0bDDB707055e04e497aB22a59c2aF4391cd12F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Velodrome CL" },
       { address: "0x9c6522117e2ed1fE5bdb72bb0eD5E3f2bdE7DBe0" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
       // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Optimism deployment.
@@ -566,11 +619,11 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     factories: [
       // SwapX (Algebra Integral CL) — dynamic fee, poolByPair + globalState.
       { address: "0x8121a3F8c4176E9765deEa0B95FA2BDfD3016794" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "SwapX (Algebra Integral CL)" },
-      // Shadow Exchange CL (Ramses V3 / UniV3-style) — slot0 state. NOTE: this Ramses/Shadow-family
-      // factory keys getPool by TICK SPACING, not fee, so V3Standard fee-tier discovery will not find
-      // its pools (same latent gap as the arbitrum Ramses V3 / Chronos entries). Kept for the pattern;
-      // a future tickSpacing-keyed discovery fix lights it up.
-      { address: "0xcD2d0637c94fe77C2896BbCBB174cefFb08DE6d7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Shadow Exchange CL (Ramses V3)" },
+      // Shadow Exchange CL (Ramses V3 / Slipstream-style) — tickSpacing-keyed getPool(a,b,int24), now
+      // discoverable via FactoryType.SlipstreamCL. Verified on-chain: getPool(wS,USDC,int24) returns
+      // non-zero pools at tickSpacings {1,50,100,200}. Per-pool fee READ from fee() (decoupled from
+      // tickSpacing). V3-compatible for execution (swapV3 / uniswapV3SwapCallback).
+      { address: "0xcD2d0637c94fe77C2896BbCBB174cefFb08DE6d7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Shadow Exchange CL (Ramses V3)" },
       // SwapX Classic (Solidly ve(3,3), stable + volatile)
       { address: "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "SwapX Classic (Solidly)" },
       // Shadow Exchange Legacy (Solidly PairFactory, stable + volatile)
@@ -595,9 +648,12 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x288dc841A52FCA2707c6947B3A777c5E56cd87BC" as Hex, stateView: "0xbc21f8720BABf4b20d195eE5C6e99c52b76F2bfb" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // Velodrome V2 (Solidly volatile + stable pools). Canonical Superchain Leaf PoolFactory.
       { address: "0x31832f2a97Fd20664D76Cc421207669b55CE4BC0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Velodrome V2" },
-      // NOTE: Velodrome CL (concentrated-liquidity) factory 0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F
-      // is NOT added — it keys getPool by TICK SPACING, not fee, so the V3Standard fee-tier discovery
-      // would not enumerate its pools (same latent gap as the arbitrum Ramses / Sonic Shadow CL entries).
+      // Velodrome CL (Slipstream on Celo) — tickSpacing-keyed getPool(a,b,int24), discovered via
+      // FactoryType.SlipstreamCL. Verified on-chain: getPool(CELO,USDC,int24) returns a non-zero pool at
+      // tickSpacing 100. Per-pool fee READ from fee() (decoupled from tickSpacing). V3-compatible for
+      // execution (swapV3 / uniswapV3SwapCallback). (Previously omitted as a documented latent gap; the
+      // tickSpacing-keyed discovery branch now lights it up.)
+      { address: "0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Velodrome CL" },
       // Mento V2 (Celo stablecoin exchange). `address` is the Broker (BrokerProxy) — discovery enumerates
       // its exchange providers (BiPoolManager) + exchanges. poolType is a benign valid value (Mento is
       // CALLBACK-FREE with no engine SwapPoolType — the swap goes through the Broker in SauceScript). The
@@ -621,11 +677,14 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x640887A9ba3A9C53Ed27D0F7e8246A4F933f3424" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
       // Velodrome V2 (Solidly volatile + stable pools).
       { address: "0x31832f2a97Fd20664D76Cc421207669b55CE4BC0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Velodrome V2 (Solidly)" },
-      // Velodrome Slipstream CL (Ramses V3 / UniV3-style) — slot0 state. NOTE: this Slipstream CL
-      // factory keys getPool by TICK SPACING, not fee, so V3Standard fee-tier discovery will not find
-      // its pools (same latent gap as the arbitrum Ramses / Sonic Shadow CL entries). Kept for the
-      // pattern; a future tickSpacing-keyed discovery fix lights it up.
-      { address: "0x718E46d0962A66942E233760a8bd6038Ce54EdCD" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Velodrome Slipstream CL", feeTiers: [100, 500, 3000, 10000] },
+      // Velodrome Slipstream CL (Ink) — tickSpacing-keyed getPool(a,b,int24), discovered via
+      // FactoryType.SlipstreamCL. Verified on-chain: the factory has code + 6 pools, getPool(a,b,int24)
+      // round-trips exactly against an enumerated pool (e.g. USDT0/WETH ts=100 → 0x0eA741…), and the
+      // pools carry fee DECOUPLED from tickSpacing (ts=100/fee=500, ts=1/fee=100), so the per-pool fee is
+      // READ from fee(). Ink's liquid Slipstream pairs are USDT0-denominated (no WETH/USDC pool today),
+      // and USDT0 IS in baseTokens below, so the WETH/USDT0 pool set is ACTIVELY discovered — not inert.
+      // (Any future WETH/USDC pool drops in on the same tickSpacing-keyed type by address alone.)
+      { address: "0x718E46d0962A66942E233760a8bd6038Ce54EdCD" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Velodrome Slipstream CL" },
     ],
     baseTokens: [
       "0x4200000000000000000000000000000000000006" as Hex, // WETH (OP-stack predeploy, routing hub)

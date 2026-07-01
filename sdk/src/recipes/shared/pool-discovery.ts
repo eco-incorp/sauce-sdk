@@ -19,6 +19,7 @@ import {
   TRADER_JOE_BIN_STEPS,
   TRADER_JOE_BIN_WINDOW,
   TRADER_JOE_DEFAULT_BASE_FACTOR,
+  SLIPSTREAM_TICK_SPACINGS,
   hasPriceLimit,
   type ChainPoolConfig,
   type FactoryConfig,
@@ -54,6 +55,22 @@ const v3FactoryAbi = parseAbi([
 
 const algebraFactoryAbi = parseAbi([
   "function poolByPair(address tokenA, address tokenB) external view returns (address pool)",
+]);
+
+// Slipstream-family CLFactory (Velodrome/Aerodrome Slipstream + Ramses-lineage Shadow CL). It keys
+// pools by TICK SPACING, not fee — getPool(tokenA, tokenB, int24 tickSpacing) — so discovery
+// enumerates a set of enabled tickSpacings (int24, signed). A Slipstream pool is otherwise the
+// standard V3 view surface (slot0/liquidity via v3PoolAbi), except that fee is DECOUPLED from
+// tickSpacing, so the per-pool fee is read from the pool's own fee() getter (below).
+const slipstreamFactoryAbi = parseAbi([
+  "function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address pool)",
+]);
+
+// Slipstream / V3 pool fee() getter — Slipstream decouples fee from tickSpacing, so the per-pool fee
+// must be READ, not assumed from a tickSpacing→fee map. (Uniswap V3 also has fee(); this reader is
+// used for the Slipstream path where the fee tier is not the discovery key.)
+const v3PoolFeeAbi = parseAbi([
+  "function fee() external view returns (uint24)",
 ]);
 
 const v2FactoryAbi = parseAbi([
@@ -433,6 +450,142 @@ async function discoverV3Pools(
       sqrtPriceX96,
       liquidity,
       source: validPools[i].factory.label,
+    });
+  }
+
+  return pools;
+}
+
+// ── Slipstream CL discovery (tickSpacing-keyed V3) ────────────────────────────
+//
+// Velodrome/Aerodrome Slipstream (and the Ramses-lineage Shadow CL) pools are UniswapV3-compatible
+// for pricing AND execution — the pool exposes the standard V3 view surface (slot0/liquidity/ticks/
+// tickSpacing) and its swap() re-enters the caller via the EXACT uniswapV3SwapCallback selector the
+// engine Router already implements (callbacks authenticated by the transient expectedPool, not a
+// factory/CREATE2 check), so a Slipstream pool executes through the existing flat swapV3 path with
+// NO engine change. The ONLY thing that differs is DISCOVERY: the CLFactory keys pools by TICK
+// SPACING — getPool(tokenA, tokenB, int24 tickSpacing) — NOT getPool(a, b, uint24 fee), so a
+// fee-tier-enumerating V3Standard pass finds nothing. This branch enumerates a per-factory set of
+// enabled tickSpacings, and — because Slipstream DECOUPLES fee from tickSpacing — reads each
+// surviving pool's OWN fee() getter to populate the same `fee` field the V3 path uses (NOT a
+// tickSpacing→fee assumption). The resulting PoolInfo is byte-identical in shape to a
+// V3Standard-discovered pool (mirrors discoverV3Pools), so the downstream bracket/lens/swapV3 path
+// consumes it unchanged. See FactoryType.SlipstreamCL.
+
+async function discoverSlipstreamCLPools(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<PoolInfo[]> {
+  // Each Slipstream factory is queried across ITS OWN enabled tickSpacings
+  // (FactoryConfig.slipstreamTickSpacings), defaulting to the Slipstream-common set. Over-querying
+  // a spacing the factory doesn't enable is harmless — getPool(a,b,int24) returns address(0).
+  const getPoolCalls = factories.flatMap((f) =>
+    (f.slipstreamTickSpacings ?? [...SLIPSTREAM_TICK_SPACINGS]).map((tickSpacing) => ({
+      address: f.address,
+      abi: slipstreamFactoryAbi,
+      functionName: "getPool" as const,
+      // int24 tickSpacing — always positive for the enabled set, so the signed ABI encoding is
+      // identical to the unsigned value; viem encodes the JS number as a signed int24 correctly.
+      args: [tokenIn, tokenOut, tickSpacing] as const,
+      factory: f,
+      tickSpacing,
+    })),
+  );
+
+  if (getPoolCalls.length === 0) return [];
+
+  const poolAddresses = await client.multicall({
+    contracts: getPoolCalls.map((c) => ({
+      address: c.address,
+      abi: c.abi,
+      functionName: c.functionName,
+      args: c.args,
+    })),
+    allowFailure: true,
+  });
+
+  const validPools: { address: Hex; factory: FactoryConfig; tickSpacing: number }[] = [];
+  for (let i = 0; i < poolAddresses.length; i++) {
+    const result = poolAddresses[i];
+    if (
+      result.status === "success" &&
+      result.result &&
+      result.result !== ZERO_ADDRESS
+    ) {
+      validPools.push({
+        address: result.result as Hex,
+        factory: getPoolCalls[i].factory,
+        tickSpacing: getPoolCalls[i].tickSpacing,
+      });
+    }
+  }
+
+  if (validPools.length === 0) return [];
+
+  // Read slot0 + liquidity (standard V3 surface) AND the pool's OWN fee() — Slipstream decouples
+  // fee from tickSpacing, so the fee must be READ per pool, not derived from the tickSpacing key.
+  const [slot0Results, liquidityResults, feeResults] = await Promise.all([
+    client.multicall({
+      contracts: validPools.map((p) => ({
+        address: p.address,
+        abi: v3PoolAbi,
+        functionName: "slot0" as const,
+      })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: validPools.map((p) => ({
+        address: p.address,
+        abi: v3PoolAbi,
+        functionName: "liquidity" as const,
+      })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: validPools.map((p) => ({
+        address: p.address,
+        abi: v3PoolFeeAbi,
+        functionName: "fee" as const,
+      })),
+      allowFailure: true,
+    }),
+  ]);
+
+  const pools: PoolInfo[] = [];
+  for (let i = 0; i < validPools.length; i++) {
+    const slot0 = slot0Results[i];
+    const liq = liquidityResults[i];
+    const feeRes = feeResults[i];
+    if (slot0.status !== "success" || liq.status !== "success") continue;
+
+    const [sqrtPriceX96] = slot0.result as unknown as [bigint, ...unknown[]];
+    const liquidity = liq.result as bigint;
+    if (sqrtPriceX96 === 0n || liquidity === 0n) continue;
+
+    // The pool's OWN fee (ppm) from fee() — the byte-identical `fee` field a V3Standard pool
+    // carries. A fee() read failure (non-standard fork) is not fatal: the pool is still a valid
+    // V3-priced venue; fall back to 0 (dynamic/unknown), matching the Algebra convention.
+    const fee = feeRes.status === "success" ? Number(feeRes.result as number) : 0;
+
+    pools.push({
+      address: validPools[i].address,
+      tokenIn,
+      tokenOut,
+      fee,
+      poolType: validPools[i].factory.poolType,
+      priceLimited: hasPriceLimit(validPools[i].factory.poolType),
+      sqrtPriceX96,
+      liquidity,
+      source: validPools[i].factory.label,
+      // The discovery key. In real Slipstream getPool(a,b,ts) returns a pool whose tickSpacing()==ts
+      // (only FEE is decoupled from the key), so this key IS the live grid — a meaningful value, unlike
+      // discoverV3Pools which leaves it undefined for downstream fee→grid derivation. No current
+      // consumer trusts it for a Slipstream row (the EcoSwap solver reads the LIVE tickSpacing() via the
+      // on-chain lens; quoting.ts hardcodes tickSpacing:0 on the V3 quote path), so it is purely
+      // informational here.
+      tickSpacing: validPools[i].tickSpacing,
     });
   }
 
@@ -2931,6 +3084,7 @@ export async function discoverPools(
 
   // Group factories by type
   const v3Factories = factories.filter((f) => f.factoryType === FactoryType.V3Standard);
+  const slipstreamFactories = factories.filter((f) => f.factoryType === FactoryType.SlipstreamCL);
   const v4Factories = factories.filter((f) => f.factoryType === FactoryType.UniswapV4);
   const algebraFactories = factories.filter((f) => f.factoryType === FactoryType.AlgebraV3);
   const v2Factories = factories.filter((f) => f.factoryType === FactoryType.V2Standard);
@@ -2943,10 +3097,11 @@ export async function discoverPools(
   const woofiConfigs = factories.filter((f) => f.factoryType === FactoryType.WOOFi);
 
   // Discover all in parallel
-  const [v3Pools, v4Pools, algebraPools, v2Pools, solidlyV2Pools,
+  const [v3Pools, slipstreamPools, v4Pools, algebraPools, v2Pools, solidlyV2Pools,
          curvePools, balancerPools, dodoPools, traderJoePools,
          maverickPools, woofiPools] = await Promise.all([
     discoverV3Pools(tokenIn, tokenOut, client, v3Factories, feeTiers),
+    discoverSlipstreamCLPools(tokenIn, tokenOut, client, slipstreamFactories),
     discoverV4Pools(tokenIn, tokenOut, client, v4Factories, feeTiers),
     discoverAlgebraPools(tokenIn, tokenOut, client, algebraFactories),
     discoverV2Pools(tokenIn, tokenOut, client, v2Factories),
@@ -2963,8 +3118,11 @@ export async function discoverPools(
   // a pool surfaced as a UniV3 row is cooked via swapV3 and the mid-swap input pull is
   // serviced. They are INCLUDED in the executable set returned to the recipes. See
   // discoverAlgebraPools' header + FactoryType.AlgebraV3 + LIQUIDITY_SOURCES_FEASIBILITY.md §3.
+  // Slipstream CL pools are V3-priced and V3-executable (swapV3 via uniswapV3SwapCallback), so they
+  // sit alongside the V3 pools in the executable set — discovered by tickSpacing key with their own
+  // fee() read. See discoverSlipstreamCLPools + FactoryType.SlipstreamCL.
   return [
-    ...v3Pools, ...v4Pools, ...algebraPools, ...v2Pools, ...solidlyV2Pools,
+    ...v3Pools, ...slipstreamPools, ...v4Pools, ...algebraPools, ...v2Pools, ...solidlyV2Pools,
     ...curvePools, ...balancerPools, ...dodoPools, ...traderJoePools,
     ...maverickPools, ...woofiPools,
   ];
