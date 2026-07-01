@@ -111,6 +111,18 @@ export enum FactoryType {
    * change. Distinct from a stable pool only in the per-asset state read + the quote formula.
    */
   Wombat = "wombat",
+  /**
+   * EulerSwap (Euler v2 vault-backed AMM). Discovery is KNOWN-POOL-ADDRESS based (the EulerSwap factory
+   * has no pool enumeration — only a `deployedPools` mapping + PoolDeployed events), so the candidate
+   * pool addresses are carried per-config in `FactoryConfig.eulerSwapPools` (like Balancer's
+   * balancerStablePools). State: live reserve0/reserve1 + the static curve params (equilibriumReserve0/1,
+   * priceX/priceY, concentrationX/concentrationY, fee) + the vault input cap from getLimits. The curve is
+   * the asymmetric concentrated-liquidity f/fInverse (whitepaper); priced OFF-CHAIN into sampled segments
+   * (BOUNDED by the vault inLimit). Callback-free: executed in SauceScript (computeQuote + transfer +
+   * pool.swap(amount0Out, amount1Out, to, ""); EulerSwap's swap is V2-shaped, empty data ⇒ no flash
+   * callback — the only re-entry is internal to Euler, never the cooking contract), so no engine change.
+   */
+  EulerSwap = "eulerswap",
 }
 
 /**
@@ -172,6 +184,18 @@ export interface FactoryConfig {
    * no engine change).
    */
   balancerStablePools?: Hex[];
+  /**
+   * EulerSwap (EulerSwap factory type) only: a KNOWN list of EulerSwap pool addresses to probe for the
+   * pair. The EulerSwap factory has NO pair→pool getter and no enumeration (only `deployedPools` +
+   * PoolDeployed events), so discovery is known-pool-address based — `discoverEulerSwapPoolsTyped` reads
+   * each pool's getAssets / getReserves / getDynamicParams (the static curve params + directional fee0/fee1)
+   * / getLimits and keeps the pools trading BOTH tokenIn and tokenOut. PRODUCTION needs this populated from
+   * the PoolDeployed-event index
+   * (the standard EulerSwap integration); the EVM test injects the locally-deployed fixture pool address
+   * directly (the test builds the prepared args without discovery). Omitted/empty ⇒ no EulerSwap pools
+   * surfaced (the discovery gap is filled by config, no engine change).
+   */
+  eulerSwapPools?: Hex[];
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */

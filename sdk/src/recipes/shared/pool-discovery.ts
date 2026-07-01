@@ -30,6 +30,7 @@ import type { LbPool } from "./lb-math.js";
 import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 import type { SolidlyStablePool } from "./solidly-stable-math.js";
 import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
+import { type EulerSwapPool } from "./eulerswap-math.js";
 
 // ── ABIs ──────────────────────────────────────────────────────
 
@@ -1777,6 +1778,145 @@ export async function discoverWombatPoolsTyped(
       tokenOut,
       feePpm: wombatHaircutToPpm(haircutRate),
       source: `${valid[i].pool.label} (Wombat)`,
+    });
+  }
+  return out;
+}
+
+// The REAL euler-xyz/euler-swap IEulerSwap surface (verified against master). There are NO individual
+// asset0()/reserve0()/priceX()/fee() getters: assets come from getAssets(), live reserves from
+// getReserves() (uint112,uint112,uint32 status), and ALL curve params live in the DynamicParams struct
+// returned by getDynamicParams() — equilibriumReserve0/1 (uint112), priceX/priceY (uint80),
+// concentrationX/concentrationY (uint64) and DIRECTIONAL fee0/fee1 (uint64; fee0 charged when tokenIn is
+// asset0, fee1 when tokenIn is asset1). getLimits(tokenIn,tokenOut) bounds the sampler.
+const eulerSwapPoolAbi = parseAbi([
+  "function getAssets() external view returns (address asset0, address asset1)",
+  "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 status)",
+  "function getDynamicParams() external view returns ((uint112 equilibriumReserve0, uint112 equilibriumReserve1, uint112 minReserve0, uint112 minReserve1, uint80 priceX, uint80 priceY, uint64 concentrationX, uint64 concentrationY, uint64 fee0, uint64 fee1, uint40 expiration, uint8 swapHookedOperations, address swapHook) params)",
+  "function getLimits(address tokenIn, address tokenOut) external view returns (uint256 inLimit, uint256 outLimit)",
+]);
+
+/** DynamicParams as decoded by viem from the getDynamicParams() tuple. */
+type EulerDynamicParams = {
+  equilibriumReserve0: bigint;
+  equilibriumReserve1: bigint;
+  minReserve0: bigint;
+  minReserve1: bigint;
+  priceX: bigint;
+  priceY: bigint;
+  concentrationX: bigint;
+  concentrationY: bigint;
+  fee0: bigint;
+  fee1: bigint;
+  expiration: number;
+  swapHookedOperations: number;
+  swapHook: Hex;
+};
+
+/** EULER_ONE — 1e18 (the EulerSwap fee fixed-point; ppm round denominator). */
+const EULER_ONE = 10n ** 18n;
+/** Round an EulerSwap fee (1e18-scaled, e.g. 1e15 = 0.1%) to a ppm fee (the price-ordering coordinate). */
+function eulerFeeToPpm(feeWad: bigint): number {
+  return Number((feeWad * 1_000_000n + EULER_ONE / 2n) / EULER_ONE);
+}
+
+/**
+ * Discover EulerSwap pools for the pair AS TYPED `EulerSwapPool` descriptors (the EcoSwap path). The
+ * EulerSwap factory has NO pool enumeration (only a `deployedPools` mapping + PoolDeployed events), so
+ * discovery is KNOWN-POOL-ADDRESS based: each FactoryConfig.eulerSwapPools entry is a candidate pool, and
+ * a (tokenIn,tokenOut) swap is valid iff the pool's {asset0, asset1} (getAssets) == {tokenIn, tokenOut}.
+ * The curve math is OFF-CHAIN ONLY: this reads the live reserves (getReserves) + the static curve params
+ * from the DynamicParams struct (getDynamicParams: equilibriumReserve0/1, priceX/priceY,
+ * concentrationX/concentrationY, DIRECTIONAL fee0/fee1) + the vault `inLimit` (from getLimits), all
+ * oriented by tokenIn, so prepare's `buildEulerSwapSegments` can replay computeQuote with
+ * NO further RPC (BOUNDED by the vault cap), and the on-chain solver consumes the sampled segments
+ * statically + executes CALLBACK-FREE (computeQuote staticcall + transfer + pool.swap(...,"") — NO engine
+ * SwapPoolType, since the asymmetric Euler curve is NOT xy=k).
+ *
+ * Mirrors `discoverBalancerStablePoolsTyped` (known-pool-address, no factory getter): the FactoryConfig
+ * carries the candidate pools in `eulerSwapPools`. Returns the venue descriptor EcoSwap prepare consumes
+ * directly (the on-chain lens does not understand EulerSwap).
+ */
+export async function discoverEulerSwapPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<EulerSwapPool[]> {
+  // Flatten every candidate pool address across the EulerSwap factory configs.
+  const candidates: { address: Hex; label: string }[] = [];
+  for (const f of factories) {
+    for (const addr of f.eulerSwapPools ?? []) candidates.push({ address: addr, label: f.label });
+  }
+  if (candidates.length === 0) return [];
+
+  // Read getAssets() for each candidate to validate the pair + orient the swap.
+  const idResults = await client.multicall({
+    contracts: candidates.map((cp) => ({ address: cp.address, abi: eulerSwapPoolAbi, functionName: "getAssets" as const })),
+    allowFailure: true,
+  });
+
+  const valid: { cp: { address: Hex; label: string }; inIsToken0: boolean }[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const a = idResults[i];
+    if (a.status !== "success") continue;
+    const [rawA0, rawA1] = a.result as readonly [Hex, Hex];
+    const asset0 = rawA0.toLowerCase();
+    const asset1 = rawA1.toLowerCase();
+    const ti = tokenIn.toLowerCase();
+    const to = tokenOut.toLowerCase();
+    if (asset0 === ti && asset1 === to) valid.push({ cp: candidates[i], inIsToken0: true });
+    else if (asset0 === to && asset1 === ti) valid.push({ cp: candidates[i], inIsToken0: false });
+  }
+  if (valid.length === 0) return [];
+
+  // Per-pool live reserves (getReserves) + the DynamicParams curve bundle (getDynamicParams) + the
+  // vault input cap (getLimits).
+  const [resR, dpR, limR] = await Promise.all([
+    client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getReserves" as const })), allowFailure: true }),
+    client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getDynamicParams" as const })), allowFailure: true }),
+    client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getLimits" as const, args: [tokenIn, tokenOut] as const })), allowFailure: true }),
+  ]);
+
+  const out: EulerSwapPool[] = [];
+  for (let i = 0; i < valid.length; i++) {
+    if (resR[i].status !== "success" || dpR[i].status !== "success") continue;
+    const inIsToken0 = valid[i].inIsToken0;
+    const [reserve0, reserve1] = resR[i].result as readonly [bigint, bigint, number];
+    const dp = dpR[i].result as EulerDynamicParams;
+    const x0 = dp.equilibriumReserve0;
+    const y0 = dp.equilibriumReserve1;
+    const px = dp.priceX;
+    const py = dp.priceY;
+    const cx = dp.concentrationX;
+    const cy = dp.concentrationY;
+    // Fee is DIRECTIONAL: fee0 is charged when tokenIn is asset0, fee1 when tokenIn is asset1.
+    const feeWad = inIsToken0 ? dp.fee0 : dp.fee1;
+    // The vault input cap (getLimits inLimit). 0 / failed read ⇒ uncapped (the sampler treats 0 as uncapped).
+    let inLimit = 0n;
+    if (limR[i].status === "success") {
+      const lim = limR[i].result as readonly [bigint, bigint];
+      inLimit = lim[0];
+    }
+    // Orient reserves + curve params by tokenIn (the math module is tokenIn-oriented).
+    const reserveIn = inIsToken0 ? reserve0 : reserve1;
+    const reserveOut = inIsToken0 ? reserve1 : reserve0;
+    if (reserveOut <= 0n) continue; // nothing to pay out
+    out.push({
+      address: valid[i].cp.address,
+      inIsToken0,
+      reserveIn,
+      reserveOut,
+      equilIn: inIsToken0 ? x0 : y0,
+      equilOut: inIsToken0 ? y0 : x0,
+      priceIn: inIsToken0 ? px : py,
+      priceOut: inIsToken0 ? py : px,
+      concIn: inIsToken0 ? cx : cy,
+      concOut: inIsToken0 ? cy : cx,
+      feeWad,
+      inLimit,
+      feePpm: eulerFeeToPpm(feeWad),
+      source: `${valid[i].cp.label} (EulerSwap)`,
     });
   }
   return out;

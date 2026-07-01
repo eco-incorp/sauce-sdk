@@ -216,6 +216,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const solidlyStables = prepared.solidlyStables ?? [];
   const wombats = prepared.wombats ?? [];
   const balancerStables = prepared.balancerStables ?? [];
+  const eulerSwaps = prepared.eulerSwaps ?? [];
   return prepared.brackets
     .filter(
       (b) =>
@@ -224,7 +225,8 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.DODO ||
         b.kind === EcoBracketKind.SolidlyStable ||
         b.kind === EcoBracketKind.Wombat ||
-        b.kind === EcoBracketKind.BalancerStable,
+        b.kind === EcoBracketKind.BalancerStable ||
+        b.kind === EcoBracketKind.EulerSwap,
     )
     .slice()
     .sort((a, b) => {
@@ -239,11 +241,14 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isSolidly = b.kind === EcoBracketKind.SolidlyStable;
       const isWombat = b.kind === EcoBracketKind.Wombat;
       const isBalancer = b.kind === EcoBracketKind.BalancerStable;
-      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable —
-      // kinds 4/5 are callback-free (the pool view IS the swap math); 4 = getAmountOut + pool.swap,
-      // 5 = quotePotentialSwap + approve + pool.swap (Wombat PULLS via transferFrom). Kinds 1/3/6 go
-      // through the engine (1 = swap poolType 3 Curve, 3 = poolType 5 DODO, 6 = poolType 4 BalancerV2).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : 0n;
+      const isEuler = b.kind === EcoBracketKind.EulerSwap;
+      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable, 7
+      // EulerSwap — kinds 4/5/7 are callback-free (the pool view IS the swap math); 4 = getAmountOut +
+      // pool.swap, 5 = quotePotentialSwap + approve + pool.swap (Wombat PULLS via transferFrom), 7 =
+      // computeQuote + transfer + pool.swap(...,"") (EulerSwap is V2-shaped, empty data ⇒ no flash
+      // callback). Kinds 1/3/6 go through the engine (1 = swap poolType 3 Curve, 3 = poolType 5 DODO,
+      // 6 = poolType 4 BalancerV2).
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -256,7 +261,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                 ? BigInt(wombats[b.refIdx].address)
                 : isBalancer
                   ? BigInt(balancerStables[b.refIdx].address)
-                  : 0n;
+                  : isEuler
+                    ? BigInt(eulerSwaps[b.refIdx].address)
+                    : 0n;
       return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
     });
 }
@@ -297,6 +304,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_SOLIDLY_STABLE = (prepared.solidlyStables?.length ?? 0) > 0;
   const HAS_WOMBAT = (prepared.wombats?.length ?? 0) > 0;
   const HAS_BALANCER = (prepared.balancerStables?.length ?? 0) > 0;
+  const HAS_EULER = (prepared.eulerSwaps?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -309,6 +317,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_SOLIDLY_STABLE,
     HAS_WOMBAT,
     HAS_BALANCER,
+    HAS_EULER,
   };
 }
 

@@ -67,6 +67,7 @@ import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
+import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -168,6 +169,16 @@ export interface OptimalPool {
    * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat` are ignored when `balancer` is set.
    */
   balancer?: BalancerStablePool;
+  /**
+   * EulerSwap (Euler v2 vault-backed AMM) pool — when present this pool is an EULERSWAP venue (NOT
+   * V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer). The oracle enumerates its segments via the SHARED
+   * closed-form f/fInverse curve replay (buildEulerSwapSegments) from the live reserves + static curve
+   * params + fee (bounded by the vault inLimit), so the split is exact-on-grid vs prepare's segments (one
+   * replay). The marginal is post-fee (computeQuote nets the fee), so it enters the descending-price merge
+   * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/`balancer` are ignored when `eulerSwap`
+   * is set.
+   */
+  eulerSwap?: EulerSwapPool;
 }
 
 /**
@@ -518,6 +529,22 @@ function balancerStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigin
   return segs;
 }
 
+/**
+ * Enumerate one EulerSwap (Euler v2 vault-backed AMM) pool's segments via the SHARED closed-form
+ * f/fInverse curve replay (buildEulerSwapSegments) from the live reserves + static curve params + fee
+ * (bounded by the vault inLimit). The amountIn caps the sampled range — the same bound prepare uses — so
+ * the oracle and prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid.
+ * The EulerSwap marginalOI is the post-fee execution price (computeQuote nets the fee); adjNear == adjFar
+ * == marginalOI. Awarded as a "pool" venue.
+ */
+function eulerSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildEulerSwapSegments(p.eulerSwap!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -742,7 +769,12 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.balancer) {
+    if (p.eulerSwap) {
+      // EulerSwap (Euler v2 vault-backed AMM) venue: sampled-segment enumeration via the shared
+      // f/fInverse curve replay (capped at amountIn / the vault inLimit — the same bound prepare samples
+      // → identical grid → exact-on-grid split).
+      allSegs.push(...eulerSwapSegments(p, i, amountIn));
+    } else if (p.balancer) {
       // Balancer V2 ComposableStable venue: sampled-segment enumeration via the shared StableMath replay
       // (capped at amountIn — the same bound prepare samples → identical grid → exact-on-grid split).
       allSegs.push(...balancerStableSegments(p, i, amountIn));

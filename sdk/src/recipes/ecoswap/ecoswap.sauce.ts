@@ -6,6 +6,7 @@ import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IKyberPool } from "./IKyberPool.json";
 import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 import { IWombatPool } from "./IWombatPool.json";
+import { IEulerSwapPool } from "./IEulerSwapPool.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -218,6 +219,7 @@ const HAS_DODO: boolean = true;
 const HAS_SOLIDLY_STABLE: boolean = true;
 const HAS_WOMBAT: boolean = true;
 const HAS_BALANCER: boolean = true;
+const HAS_EULER: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -298,6 +300,8 @@ function main(
   let wven: Tuple = new Array(segs.length); // Wombat venue (pool) address
   let binp: Tuple = new Array(segs.length); // Balancer-stable per-venue Σ input
   let bven: Tuple = new Array(segs.length); // Balancer-stable venue (pool) address
+  let einp: Tuple = new Array(segs.length); // EulerSwap per-venue Σ input
+  let even: Tuple = new Array(segs.length); // EulerSwap venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -515,7 +519,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER) && segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER) && segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -837,7 +841,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER) && bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER) && bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -875,9 +879,17 @@ function main(
                     } else {
                       // segKind 6 — Balancer V2 ComposableStable: executed below via the engine
                       // BalancerV2 dispatch (swap poolType:4 → _swapBalancerV2 → Vault.swap).
-                      if (HAS_BALANCER) {
+                      if (HAS_BALANCER && sKind === 6) {
                         binp[sIdx] = binp[sIdx] + stake;
                         bven[sIdx] = sVenue;
+                      } else {
+                        if (HAS_EULER && sKind === 7) {
+                          // segKind 7 — EulerSwap (Euler v2 vault-backed AMM): callback-free, executed
+                          // below via computeQuote (the exact-in-dy out for the awarded share) + transfer
+                          // + pool.swap(a0Out, a1Out, to, "") (EMPTY data ⇒ no flash callback).
+                          einp[sIdx] = einp[sIdx] + stake;
+                          even[sIdx] = sVenue;
+                        }
                       }
                     }
                   }
@@ -1240,6 +1252,41 @@ function main(
         tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(bamt),
         sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
       });
+    }
+  }
+  }
+  // EulerSwap (Euler v2 vault-backed AMM) → CALLBACK-FREE (NO engine SwapPoolType). EulerSwap pools
+  // have an ASYMMETRIC concentrated-liquidity curve (f/fInverse, NOT xy=k), so the engine's _swapV2
+  // would mis-price them. Execute exactly as the EulerSwap periphery would: read the EXACT amountOut
+  // from the pool's computeQuote(tokenIn, tokenOut, Σ, true) view (the periphery quoteExactInput
+  // delegates to this view, and the view IS the swap math ⇒ wei-exact-in-dy for the awarded share),
+  // transfer the awarded input to the pool, then call swap(amount0Out, amount1Out, to, "") with the
+  // output in the OUT-token slot (tokenIn==token0 ⇒ out is amount1Out; tokenIn==token1 ⇒ out is
+  // amount0Out) and EMPTY data — EulerSwap's swap is V2-shaped, so empty data skips the flash callback
+  // and the pool sweeps the pre-transferred input + verifies the curve (callback-free). compute-then-
+  // pull already transferred `cum` (incl. each EulerSwap share) into this contract above. The vault-cap
+  // edge (the cap binding between prepare and cook) is guarded: computeQuote re-reads the live limits
+  // and the pre-swap quote of 0 (or a pool decline) leaves the input un-spent for the terminal refund.
+  if (HAS_EULER) {
+  for (let e = 0; e < segs.length; e = e + 1) {
+    const eamt: Uint256 = einp[e];
+    if (eamt > 0) {
+      const epool: Address = even[e];
+      const eOut: Uint256 = IEulerSwapPool.at(epool).computeQuote(tokenIn, tokenOut, eamt, true);
+      if (eOut > 0) {
+        // Orient the output slot by the pool's OWN asset0 (EulerSwap's token0/token1 are vault0/vault1
+        // from the LP config — NOT necessarily address-sorted), exactly as the Solidly path reads
+        // token0(): tokenIn==asset0 ⇒ out is amount1Out; else out is amount0Out. The real IEulerSwap
+        // exposes assets via getAssets() → (asset0, asset1), not an asset0() getter.
+        const eA0: Address = IEulerSwapPool.at(epool).getAssets()[0];
+        token.transfer(epool, eamt);
+        const eEmpty: bytes = abi.encode(tokenIn).slice(0, 0);
+        if (eA0 === tokenIn) {
+          IEulerSwapPool.at(epool).swap(0, eOut, address.self, eEmpty);
+        } else {
+          IEulerSwapPool.at(epool).swap(eOut, 0, address.self, eEmpty);
+        }
+      }
     }
   }
   }

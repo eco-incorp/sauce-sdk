@@ -98,6 +98,11 @@ export const wombatPoolArtifact = loadArtifact(
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
 );
+/** EulerSwap (Euler v2 vault-backed AMM) pool — deployed normally (constructor sets tokens/reserves/
+ *  curve params/fee/vault output caps). */
+export const eulerSwapPoolArtifact = loadArtifact(
+  join(FIXTURES, "EulerSwapPool.sol", "EulerSwapPool.json"),
+);
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
 );
@@ -970,6 +975,78 @@ export async function deployWombatPool(
   });
   await writeAndWait(walletClient, publicClient, {
     address: token1Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
+  });
+  return pool;
+}
+
+// Mirrors the real euler-xyz/euler-swap IEulerSwap read surface (getAssets/getReserves/getDynamicParams/
+// computeQuote/getLimits/swap) — NO individual asset0()/reserve0()/priceX()/fee() getters.
+export const eulerSwapPoolAbi = parseAbi([
+  "function getAssets() view returns (address asset0, address asset1)",
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 status)",
+  "function computeQuote(address tokenIn, address tokenOut, uint256 amount, bool exactIn) view returns (uint256)",
+  "function getLimits(address tokenIn, address tokenOut) view returns (uint256 inLimit, uint256 outLimit)",
+  "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
+]);
+
+/** EulerSwap curve params for a deploy (1e18 fixed point; reserves/equilibria RAW token units). */
+export interface EulerSwapParams {
+  /** Live reserves (RAW units). */
+  reserve0: bigint;
+  reserve1: bigint;
+  /** Equilibrium reserves x0/y0 (RAW units). */
+  equil0: bigint;
+  equil1: bigint;
+  /** Prices px/py (1e18). */
+  priceX: bigint;
+  priceY: bigint;
+  /** Concentrations cx/cy (1e18; 1e18 == full-range linear, lower == more concentrated). */
+  concX: bigint;
+  concY: bigint;
+  /** Swap fee (1e18-scaled; e.g. 1e15 == 0.1%). */
+  fee: bigint;
+  /** Vault output caps (the available-cash limit per side; 0 ⇒ uncapped). */
+  outCap0: bigint;
+  outCap1: bigint;
+}
+
+/**
+ * Deploy a local EulerSwap (Euler v2 vault-backed AMM) pool and fund it with its asset0/asset1
+ * reserves.
+ *
+ * Mirrors the canonical euler-xyz/euler-swap CurveLib.f + QuoteLib.computeQuote (exact-in) bit-for-bit
+ * (matching the off-chain `eulerswap-math.ts` replay), so `computeQuote(tokenIn, tokenOut, amount, true)`
+ * returns EXACTLY `computeQuote(pool, dx)` to the wei. EcoSwap executes it callback-free (transfer +
+ * pool.swap(...,"")), so the pool must HOLD enough of each token to pay out — `minter` transfers
+ * reserve0/reserve1 (RAW units) in to match the on-chain reserve fields. `asset0Addr`/`asset1Addr` are
+ * the pool's canonical token0/token1 (the curve's x/y sides; NOT necessarily address-sorted).
+ */
+export async function deployEulerSwapPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  asset0Addr: Hex,
+  asset1Addr: Hex,
+  p: EulerSwapParams,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: eulerSwapPoolArtifact.abi,
+    bytecode: eulerSwapPoolArtifact.bytecode,
+    args: [
+      asset0Addr,
+      asset1Addr,
+      [
+        p.reserve0, p.reserve1, p.equil0, p.equil1, p.priceX, p.priceY,
+        p.concX, p.concY, p.fee, p.outCap0, p.outCap1,
+      ],
+    ],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: asset0Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, p.reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: asset1Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, p.reserve1], account: acct,
   });
   return pool;
 }

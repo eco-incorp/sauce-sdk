@@ -47,12 +47,14 @@ import {
   discoverSolidlyStablePoolsTyped,
   discoverWombatPoolsTyped,
   discoverBalancerStablePoolsTyped,
+  discoverEulerSwapPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
+import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import {
   MIN_SQRT_RATIO,
@@ -77,6 +79,7 @@ import {
   type EcoSolidlyStable,
   type EcoWombat,
   type EcoBalancerStable,
+  type EcoEulerSwap,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -566,6 +569,33 @@ function buildWombatBrackets(pool: WombatPool, refIdx: number, amountIn: bigint)
 }
 
 /**
+ * Build EulerSwap segments for one pool by sampling the closed-form f/fInverse curve replay (NO extra RPC
+ * — pure bigint on the read reserves + static curve params + fee, BOUNDED by the vault inLimit). Each
+ * sampled (Δinput, Δoutput) increment becomes a STATIC segment (kind EulerSwap) in unified out/in space,
+ * refIdx → the EulerSwap venue index. The marginal is the POST-FEE execution price (computeQuote nets the
+ * fee), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The EulerSwap
+ * curve is OFF-CHAIN ONLY for the split; the on-chain solver executes CALLBACK-FREE (computeQuote staticcall
+ * + transfer + pool.swap(...,"") — EulerSwap's swap is V2-shaped, empty data ⇒ no flash callback).
+ */
+function buildEulerSwapBrackets(pool: EulerSwapPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildEulerSwapSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.EulerSwap,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the EulerSwap fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
  * Build Balancer V2 ComposableStable segments for one pool by sampling the bigint StableMath replay (NO
  * extra RPC — pure bigint on the read invariant state). Each sampled (Δinput, Δoutput) increment becomes
  * a STATIC segment (kind BalancerStable) in unified out/in space, refIdx → the Balancer venue index. The
@@ -900,6 +930,31 @@ export async function prepareEcoSwap(
   }
   for (const set of balancerBracketSets) brackets.push(...set);
 
+  const eulerSwaps: EcoEulerSwap[] = [];
+  const eulerBracketSets: EcoBracket[][] = [];
+  // EulerSwap — known-pool-address discovery (the EulerSwap factory has NO pool enumeration, only a
+  // `deployedPools` mapping + PoolDeployed events, so the candidate pool addresses are carried per-config
+  // like Balancer; `discoverEulerSwapPoolsTyped` reads each pool's reserves + curve params + fee + the
+  // vault getLimits inLimit). Sampled OFF-CHAIN (bounded by the vault cap); executed CALLBACK-FREE
+  // (computeQuote + transfer + pool.swap(...,"")). NO engine change.
+  const eulerFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.EulerSwap);
+  if (eulerFactories.length > 0) {
+    const eulerRaw = await discoverEulerSwapPoolsTyped(tokenIn, tokenOut, client, eulerFactories);
+    for (const ep of eulerRaw) {
+      const refIdx = eulerSwaps.length;
+      const eb = buildEulerSwapBrackets(ep, refIdx, amountIn);
+      if (eb.length === 0) continue;
+      eulerSwaps.push({
+        address: ep.address,
+        inIsToken0: ep.inIsToken0,
+        feePpm: ep.feePpm,
+        source: ep.source,
+      });
+      eulerBracketSets.push(eb);
+    }
+  }
+  for (const set of eulerBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1085,6 +1140,7 @@ export async function prepareEcoSwap(
     solidlyStables,
     wombats,
     balancerStables,
+    eulerSwaps,
     brackets,
     zeroForOne,
     priceLimit,

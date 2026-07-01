@@ -58,6 +58,11 @@ import {
   buildBalancerStableSegments,
   type BalancerStablePool,
 } from "../shared/balancer-stable-math";
+import {
+  computeQuote,
+  buildEulerSwapSegments,
+  type EulerSwapPool,
+} from "../shared/eulerswap-math";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -1747,5 +1752,93 @@ describe("Balancer V2 ComposableStable — StableMath getDy known-answer + sampl
     // Σ effOut over the grid == getDy(amountIn) (the sampler is a partition of the curve).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
     assert.equal(sumOut, balancerGetDy(p, amountIn), "Σ segment effOut == getDy(amountIn)");
+  });
+});
+
+// ── EulerSwap (Euler v2 vault-backed AMM) known-answer + segment sampler ──────
+//
+// Pins the off-chain f/fInverse curve replay (computeQuote + buildEulerSwapSegments) BEFORE the
+// local-EVM test, so a regression in the closed-form bigint math (the in-region f() ceil-rounding, the
+// fee netting, the vault-cap bound) is caught without anvil. The wei-exact bound is documented in
+// eulerswap-math.ts: the SPLIT is exact-on-grid vs the oracle (one shared sampler) and the realized dy
+// is exact-in-dy (the pool computeQuote view == the pool swap math). These vectors are the deterministic
+// computeQuote outputs for fixed states (regenerate only on an intentional math change). Curve params
+// are 1e18 fixed point (priceX/priceY, concentrationX/concentrationY, fee); reserves are RAW units. A
+// near-equilibrium swap loses only the fee + tiny concentration slippage. Cross-checked bit-for-bit
+// against the EulerSwapPool.sol fixture computeQuote in ecoswap.euler.evm.test.ts.
+describe("EulerSwap (Euler v2 vault-backed AMM) — computeQuote known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  function pool(
+    rIn: bigint, rOut: bigint, eqIn: bigint, eqOut: bigint,
+    pIn: bigint, pOut: bigint, cIn: bigint, cOut: bigint, feeWad: bigint, inLimit = 0n,
+  ): EulerSwapPool {
+    return {
+      address: Z, inIsToken0: true, reserveIn: rIn, reserveOut: rOut,
+      equilIn: eqIn, equilOut: eqOut, priceIn: pIn, priceOut: pOut, concIn: cIn, concOut: cOut,
+      feeWad, inLimit, feePpm: Number((feeWad * 1_000_000n) / E18), source: "kat",
+    };
+  }
+
+  it("balanced 1:1 at equilibrium, conc 0.9 / fee 0.1% — exact f-region curve vectors", () => {
+    const p = pool(
+      1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18,
+      E18, E18, (9n * E18) / 10n, (9n * E18) / 10n, E18 / 1000n,
+    );
+    // Hand-pinned from the closed-form replay (mirrors the EulerSwapPool fixture computeQuote bit-for-bit).
+    assert.equal(computeQuote(p, 1_000n * E18), 998_900_120_084_950_289_957n);
+    assert.equal(computeQuote(p, 10_000n * E18), 9_979_939_679_003_649_864_357n);
+    assert.equal(computeQuote(p, 100_000n * E18), 98_816_459_063_196_196_740_729n);
+    // Concentrated shape: a small trade returns ~the input net of the 0.1% fee with sub-bps slippage.
+    const out1k = computeQuote(p, 1_000n * E18);
+    assert.ok(out1k < 1_000n * E18 && out1k > 998n * E18, "near-1:1 minus fee on the concentrated curve");
+  });
+
+  it("full-range linear (conc 1.0), fee 0.05% — exact linear vectors", () => {
+    const p = pool(
+      1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18,
+      E18, E18, E18, E18, (5n * E18) / 10_000n,
+    );
+    // conc == 1e18 ⇒ the linear f-branch: out == net input · py/px (1:1 here), so just the fee (the
+    // canonical ceil-rounding loses 1 wei vs the exact 0.9995·in).
+    assert.equal(computeQuote(p, 1_000n * E18), 999_499_999_999_999_999_999n);
+    assert.equal(computeQuote(p, 50_000n * E18), 49_974_999_999_999_999_999_999n);
+  });
+
+  it("imbalanced reserves below equilibrium (in-region f), conc 0.85 — exact vector", () => {
+    const p = pool(
+      800_000n * E18, 1_200_000n * E18, 1_000_000n * E18, 1_000_000n * E18,
+      E18, E18, (85n * E18) / 100n, (85n * E18) / 100n, E18 / 1000n,
+    );
+    assert.equal(computeQuote(p, 50_000n * E18), 45_976_530_531_207_718_101_064n);
+  });
+
+  it("buildEulerSwapSegments — covers amountIn, descending marginals, partition of the curve", () => {
+    const p = pool(
+      1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18,
+      E18, E18, (9n * E18) / 10n, (9n * E18) / 10n, E18 / 1000n,
+    );
+    const amountIn = 100_000n * E18;
+    const segs = buildEulerSwapSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == computeQuote(amountIn) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, computeQuote(p, amountIn), "Σ segment effOut == computeQuote(amountIn)");
+  });
+
+  it("vault-cap bound — the sampler is capped at inLimit (not amountIn)", () => {
+    const cap = 5_000n * E18;
+    const p = pool(
+      1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18, 1_000_000n * E18,
+      E18, E18, (9n * E18) / 10n, (9n * E18) / 10n, E18 / 1000n, cap,
+    );
+    const segs = buildEulerSwapSegments(p, 100_000n * E18);
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, cap, "segments cover only the vault inLimit, not the full amountIn");
   });
 });

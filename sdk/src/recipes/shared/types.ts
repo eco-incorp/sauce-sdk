@@ -221,6 +221,7 @@ export enum EcoBracketKind {
   SolidlyStable = 6, // Solidly STABLE (sAMM) segment (static, off-chain-sampled via the x3y+y3x replay)
   Wombat = 7, // Wombat single-sided stableswap segment (static, off-chain-sampled via the coverage-ratio replay)
   BalancerStable = 8, // Balancer V2 ComposableStable segment (static, off-chain-sampled via the StableMath A-invariant replay)
+  EulerSwap = 9, // EulerSwap (Euler v2 vault-backed AMM) segment (static, off-chain-sampled via the f/fInverse curve replay)
 }
 
 /**
@@ -498,6 +499,30 @@ export interface EcoBalancerStable {
 }
 
 /**
+ * One EulerSwap (Euler v2 vault-backed AMM) venue to execute, indexed by an EcoBracket.refIdx (kind ===
+ * EulerSwap). EulerSwap pools have an ASYMMETRIC concentrated-liquidity curve (f/fInverse, NOT xy=k), so
+ * they must NOT be routed through the V2 (_swapV2) path. prepare samples the curve OFF-CHAIN into static
+ * segments (kind EulerSwap) via the closed-form f/fInverse replay (BOUNDED by the vault `inLimit` from
+ * getLimits); the on-chain solver consumes those through the static-segment cursor and EXECUTES the
+ * awarded Σ share CALLBACK-FREE: an on-chain `pool.computeQuote(tokenIn, tokenOut, Σ, true)` staticcall
+ * yields the EXACT out (the periphery quoteExactInput delegates to this view, and the view IS the swap
+ * math), the awarded input is transferred to the pool, and `pool.swap(amount0Out, amount1Out, to, "")`
+ * lands it (EulerSwap's swap is V2-shaped; EMPTY data skips the flash callback, so it is callback-free).
+ * NO engine SwapPoolType. `address` is the pool; `inIsToken0` orients the output slot; feePpm is the
+ * price-ordering coordinate / diagnostic. The vault-cap edge (the cap binding between prepare and cook)
+ * is handled by computeQuote reverting SwapLimitExceeded + the solver's guarded terminal refund.
+ */
+export interface EcoEulerSwap {
+  /** Pool address — the computeQuote/getLimits/swap target. */
+  address: Hex;
+  /** true => tokenIn is the pool's token0 (output is amount1Out); false => output is amount0Out. */
+  inIsToken0: boolean;
+  /** Rounded ppm swap fee (the price-ordering coordinate; the on-chain out is the pool computeQuote view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -561,6 +586,15 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   balancerStables?: EcoBalancerStable[];
+  /**
+   * EulerSwap venues (kind === EulerSwap brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share CALLBACK-FREE (computeQuote staticcall + transfer + pool.swap(...,"")
+   * — NO engine SwapPoolType); the EulerSwap marginal is supplied entirely as the static sampled segments
+   * in `brackets` (the f/fInverse curve replay, bounded by the vault inLimit). Optional/empty when no
+   * EulerSwap pools were discovered (omitted ⇒ no EulerSwap venue, so existing test-side `EcoSwapPrepared`
+   * literals stay additive-compatible).
+   */
+  eulerSwaps?: EcoEulerSwap[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;
