@@ -412,6 +412,16 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     { address: "0x87DD13Dd25a1DBde0E1EdcF5B8Fa6cfff7eABCaD" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
     // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
     { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
+    // Balancer V2 / Fluid / EulerSwap / Fermi on Base: LEFT EMPTY + FLAGGED (verified, none is a deep
+    // both-baseToken stable venue):
+    //  · Balancer V2 — the deepest V2 stable pools holding baseTokens are dust: USDC/USDbC/axlUSDC
+    //    0x0C65…86Db (~$1.4k) and DAI-USDbC 0x6FbF…83e9 (~$1.5k); not worth wiring.
+    //  · Fluid DEX — the FluidDexT1 pools on Base pair USDC against non-baseToken stables (EURC, yoUSD,
+    //    wstUSR, sUSDe, sUSDai, GHO, USDe); NONE pairs two Base baseTokens (USDC/DAI/USDbC), so nothing
+    //    is routable via the stablecoin baseTokens.
+    //  · EulerSwap — the Base factory 0xf0CFe22d…1262 pools trade WETH/USDC, cbBTC/USDC, EURC/USDC, etc.
+    //    (no both-baseToken stable pair) AND expose a non-v2 surface (getDynamicParams reverts).
+    //  · Fermi — no FermiSwapper deployment on Base (router 0xb1076fe3… is Ethereum-only).
   ],
   baseTokens: [
     WETH, USDC, DAI, USDbC,
@@ -439,8 +449,42 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x1097053Fd2ea711dad45caCcc45EfF7548fCB362" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2" },
       // Curve
       { address: "0x90E00ACe148ca3b23Ac1bC8C240C2a7Dd9c2d7f5" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
-      // Balancer V2 (Vault address — pool discovery via known pools)
-      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2" },
+      // Balancer V2 (Vault address — pool discovery via known ComposableStable pool addresses).
+      // On-chain verified via Vault.getPoolTokens(getPoolId(pool)) — the two deepest V2 stable pools
+      // holding baseTokens (the plain-stablecoin V2 pools have largely migrated to V3/boosted, so these
+      // are the surviving raw-USDC/USDT/DAI venues):
+      //   0x8353…Cb2aF  GHO/USDT/USDC ComposableStable  (USDC ≈32,521 · USDT ≈40,357 · GHO ≈47,353; ~$120k)
+      //   0x06Df…1b42  USD Stable Pool DAI/USDC/USDT     (DAI ≈8,550 · USDC ≈8,526 · USDT ≈18,576; ~$35k)
+      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2",
+        balancerStablePools: [
+          "0x8353157092ED8Be69a9DF8F95af097bbF33Cb2aF" as Hex, // GHO/USDT/USDC ComposableStable
+          "0x06Df3b2bbB68adc8B0e302443692037ED9f91b42" as Hex, // Balancer USD Stable Pool (DAI/USDC/USDT)
+        ] },
+      // Fluid DEX (Instadapp FluidDexT1 — Liquidity-Layer re-centering AMM; callback-free typed path).
+      // Known-pool-address discovery: `fluidPools` = FluidDexT1 pool addresses, `fluidResolver` = the
+      // periphery DexResolver (getDexTokens orients the pair; estimateSwapIn quotes — the pool has no
+      // getAmountOut view). On-chain verified: DexFactory.getDexAddress(id) → getDexTokens (correct
+      // resolver 0x11D80… returns token0/token1; the DexReservesResolver 0x05Bd… reverts getDexTokens, so
+      // the DexResolver is the one wired) → both pools are USDC/USDT (both baseTokens). estimateSwapIn
+      // depth: dexId2 0x6677…9F9B deep (1M USDC → 1.0006M USDT), dexId34 0xea73…15C0 thin (quotes small
+      // sizes — 10k USDC → 10,003 USDT; truncates to 0 past ~few-tens-of-thousands-$).
+      // poolType UniV2 is INERT for Fluid: discovery keys off factoryType (Fluid), and Fluid venues flow
+      // into their own EcoFluid bucket executed via the callback-free typed path — never dispatched as a
+      // UniV2 router swap. It is a placeholder, not a claim that Fluid is a UniV2 pool.
+      { address: "0x91716C4EDA1Fb55e84Bf8b4c7085f84285c19085" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Fluid, label: "Fluid DEX",
+        fluidResolver: "0x11D80CfF056Cef4F9E6d23da8672fE9873e5cC07" as Hex,
+        fluidPools: [
+          "0x667701e51B4D1Ca244F17C78F7aB8744B4C99F9B" as Hex, // USDC/USDT (deep)
+          "0xea734B615888c669667038D11950f44b177F15C0" as Hex, // USDC/USDT (thin)
+        ] },
+      // EulerSwap: LEFT EMPTY + FLAGGED. The deployed EulerSwap pools (factory
+      // 0xb013be1D0D380C13B58e889f412895970A2Cf228, 24 pools incl. several USDC/USDT) expose the
+      // EulerSwap **v1** surface (curve()=="EulerSwap v1", getParams()) — they REVERT getDynamicParams(),
+      // which `discoverEulerSwapPoolsTyped` requires (the v2 curve bundle: equilibriumReserve0/1,
+      // priceX/priceY, concentrationX/concentrationY, directional fee0/fee1). Wiring a v1 pool would
+      // silently discover nothing (the getDynamicParams multicall entry reverts → the pool is dropped),
+      // and the v1 reserves are tiny ($10–2,000 per operator-bound pool). Re-light by address once a
+      // stable-pair EulerSwap **v2** pool (getDynamicParams) is deployed. eulerSwapPools intentionally omitted.
       // DODO V2
       { address: "0x72d220cE168C4f361dD4deE5D826a01AD8598f6C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // Maverick V2
@@ -448,6 +492,13 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // KyberSwap Classic / DMM (amplified constant-product on virtual reserves; V2-shaped,
       // callback-free). Ethereum DMMFactory — getPools(a,b) → per-pool getTradeInfo().
       { address: "0x833e4083B7ae46CeA85695c4f7ed25CDAd8886dE" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.KyberClassic, label: "KyberSwap Classic" },
+      // Fermi / propAMM: LEFT EMPTY + FLAGGED. The FermiSwapper router
+      // 0xb1076fe3ab5e28005c7c323bac5ac06a680d452e has code ONLY on Ethereum (no code on
+      // arbitrum/optimism/base/polygon/bsc). isActive(USDC,USDT)==true and getPairs() lists a USDC/USDT
+      // pair, BUT quoteAmounts(USDC,USDT,+amt) REVERTS StaleUpdate() at every size — the oracle feed is
+      // stale, so the pair cannot produce a quote at read time. `discoverFermiPoolsTyped` keeps only
+      // strictly-positive sampled quotes, so every sample maps to 0 → the pool is dropped. No verifiable
+      // quotable stable pair, so no Fermi FactoryConfig entry is wired (re-light when the feed is live).
     ],
     baseTokens: [
       "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as Hex, // WETH
@@ -492,8 +543,30 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xCe9240869391928253Ed9cc9Bcb8cb98CB5B0722" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Chronos V1" },
       // Curve
       { address: "0x445FE580eF8d70FF569aB36e80c647af338db351" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
-      // Balancer V2
-      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2" },
+      // Balancer V2 (Vault — known ComposableStable pool addresses). On-chain verified via
+      // Vault.getPoolTokens(getPoolId(pool)):
+      //   0x1533…2382  USDT-USDC.e-DAI StablePool  (DAI ≈32,208 · USDT ≈66,842 · USDC.e ≈31,071; ~$130k;
+      //                                             DAI+USDT are baseTokens — USDC.e is bridged, not native)
+      //   0x423A…4A5   Stable 4pool                 (nativeUSDC ≈770 · DAI ≈801 · USDT ≈3,084 · USDC.e ≈742;
+      //                                             ~$5.4k; holds native USDC 0xaf88…)
+      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2",
+        balancerStablePools: [
+          "0x1533A3278f3F9141d5F820A184EA4B017fce2382" as Hex, // USDT-USDC.e-DAI StablePool
+          "0x423A1323c871aBC9d89EB06855bF5347048Fc4A5" as Hex, // Balancer Stable 4pool (native USDC/DAI/USDT/USDC.e)
+        ] },
+      // Fluid DEX (FluidDexT1 typed path). On-chain verified: DexFactory.getDexAddress → getDexTokens (via
+      // DexResolver 0x11D80…) → dexId3 0x3C04…CDa7 is USDC(0xaf88…, native)/USDT(0xFd08…) — both baseTokens;
+      // estimateSwapIn deep (1M USDC → 1.0003M USDT).
+      // poolType UniV2 is INERT for Fluid (discovery keys off factoryType; Fluid executes callback-free via
+      // its own EcoFluid path, never dispatched as a UniV2 router swap) — a placeholder, not a UniV2 claim.
+      { address: "0x91716C4EDA1Fb55e84Bf8b4c7085f84285c19085" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Fluid, label: "Fluid DEX",
+        fluidResolver: "0x11D80CfF056Cef4F9E6d23da8672fE9873e5cC07" as Hex,
+        fluidPools: [
+          "0x3C0441B42195F4aD6aa9a0978E06096ea616CDa7" as Hex, // USDC/USDT (deep)
+        ] },
+      // EulerSwap: LEFT EMPTY + FLAGGED (same reason as ethereum — the deployed pools expose the v1
+      // getParams() surface and REVERT getDynamicParams() the recipe requires). Fermi: no FermiSwapper
+      // deployment on Arbitrum (router 0xb1076fe3… is Ethereum-only). Both intentionally omitted.
       // DODO V2
       { address: "0x2A3CE1DebAf2F0F5A0A6dEB64DF95B11a2407d3C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // Trader Joe LB
@@ -559,8 +632,31 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "SushiSwap V2" },
       // Curve
       { address: "0x47bB542B9dE58b970bA50c9dae444DDB4c16751a" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
-      // Balancer V2
-      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2" },
+      // Balancer V2 (Vault — known ComposableStable pool addresses). On-chain verified via
+      // Vault.getPoolTokens(getPoolId(pool)):
+      //   0x06Df…1b42  Polygon Stable Pool (USDC.e/DAI/miMATIC/USDT)  (USDC.e ≈20,497 · DAI ≈20,452 ·
+      //                                     miMATIC ≈33,034 · USDT ≈21,485; ~$74k; DAI+USDT are baseTokens —
+      //                                     USDC here is bridged USDC.e 0x2791…, not the native 0x3c49… baseToken)
+      //   0x0d34…FD4f  TUSD Stablepool (USDC.e/TUSD/DAI/USDT)          (USDC.e ≈2,826 · TUSD ≈4,620 ·
+      //                                     DAI ≈2,784 · USDT ≈3,965; ~$13k; DAI+USDT tradeable)
+      // (Polygon has NO deep native-USDC 0x3c49… V2 stable pool — the deepest is ~$997, dust — so these
+      // legacy USDC.e-anchored pools carry the DAI↔USDT stable depth.)
+      { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2",
+        balancerStablePools: [
+          "0x06Df3b2bbB68adc8B0e302443692037ED9f91b42" as Hex, // Polygon Stable Pool (USDC.e/DAI/miMATIC/USDT)
+          "0x0d34e5dD4D8f043557145598E4e2dC286B35FD4f" as Hex, // TUSD Stablepool (USDC.e/TUSD/DAI/USDT)
+        ] },
+      // Fluid DEX (FluidDexT1 typed path). On-chain verified: DexFactory.getDexAddress → getDexTokens (via
+      // DexResolver 0x11D80…) → dexId1 0x0B1a…C9e7 is native USDC(0x3c49…)/USDT(0xc213…) — both baseTokens;
+      // estimateSwapIn shows a thin-but-real stable pool (quotes small sizes; truncates past ~few-thousand-$).
+      // poolType UniV2 is INERT for Fluid (discovery keys off factoryType; Fluid executes callback-free via
+      // its own EcoFluid path, never dispatched as a UniV2 router swap) — a placeholder, not a UniV2 claim.
+      { address: "0x91716C4EDA1Fb55e84Bf8b4c7085f84285c19085" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Fluid, label: "Fluid DEX",
+        fluidResolver: "0x11D80CfF056Cef4F9E6d23da8672fE9873e5cC07" as Hex,
+        fluidPools: [
+          "0x0B1a513ee24972DAEf112bC777a5610d4325C9e7" as Hex, // native USDC/USDT
+        ] },
+      // EulerSwap + Fermi: LEFT EMPTY + FLAGGED (no EulerSwap v2 stable pool; no FermiSwapper on Polygon).
       // DODO V2
       { address: "0x79887f65f83bdf15Bcc8736b5e1Eed0C37B8571d" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
