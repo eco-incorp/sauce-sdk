@@ -4,3 +4,7 @@ out = "out"
 libs = []
 optimizer = true
 optimizer_runs = 200
+# via_ir: the Maverick V2 fixture's bin swap-math walk (MaverickV2Pool.sol) has deep local/param
+# nesting that overflows the legacy stack allocator; the IR pipeline (with the optimizer) handles it.
+# All other fixtures compile fine either way — via_ir is a superset, so this is a no-op for them.
+via_ir = true

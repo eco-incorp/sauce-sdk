@@ -31,6 +31,15 @@ import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 import type { SolidlyStablePool } from "./solidly-stable-math.js";
 import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 import { type EulerSwapPool } from "./eulerswap-math.js";
+import {
+  getSqrtPrice as getMaverickSqrtPrice,
+  getTickL,
+  tickSqrtPrices,
+  maverickFeeToPpm,
+  MAVERICK_ENGINE_TICK_LIMIT,
+  type MaverickPool,
+  type MaverickTick,
+} from "./maverick-math.js";
 
 // ── ABIs ──────────────────────────────────────────────────────
 
@@ -1920,6 +1929,189 @@ export async function discoverEulerSwapPoolsTyped(
     });
   }
   return out;
+}
+
+// ── Maverick V2 discovery (typed) ───────────────────────────────────────────
+
+// Maverick V2 pool read surface (the EcoSwap typed path — distinct from the legacy flat-tuple
+// maverickPoolAbi above). getState() returns the State struct (activeTick / protocolFeeRatioD3 +
+// the live reserves the walk seeds from); fee(bool tokenAIn) is the DIRECTIONAL 1e18-scaled swap
+// fee; tickSpacing() is the bin-width exponent; getTick(int32) returns the per-tick reserves the
+// off-chain bin swap-math replay walks; tokenA()/tokenB() orient the swap.
+const maverickV2PoolAbi = parseAbi([
+  "function tokenA() external view returns (address)",
+  "function tokenB() external view returns (address)",
+  "function tickSpacing() external view returns (uint256)",
+  "function fee(bool tokenAIn) external view returns (uint256)",
+  "function getState() external view returns ((uint128 reserveA, uint128 reserveB, int64 lastTwaD8, int64 lastLogPriceD8, uint40 lastTimestamp, int32 activeTick, bool isLocked, uint32 binCounter, uint8 protocolFeeRatioD3) state)",
+  "function getTick(int32 tick) external view returns ((uint128 reserveA, uint128 reserveB, uint128 totalSupply, uint32[4] binIdsByTick) tickState)",
+]);
+
+/** getState() decoded tuple shape. */
+type MaverickState = {
+  reserveA: bigint;
+  reserveB: bigint;
+  lastTwaD8: bigint;
+  lastLogPriceD8: bigint;
+  lastTimestamp: number;
+  activeTick: number;
+  isLocked: boolean;
+  binCounter: number;
+  protocolFeeRatioD3: number;
+};
+/** getTick() decoded tuple shape. */
+type MaverickTickState = {
+  reserveA: bigint;
+  reserveB: bigint;
+  totalSupply: bigint;
+  binIdsByTick: readonly number[];
+};
+
+/** How many ticks on each side of the active tick to read for the swap-math walk. */
+const MAVERICK_TICK_WINDOW = Number(process.env.ECO_MAVERICK_TICK_WINDOW ?? 40);
+
+/**
+ * Discover Maverick V2 pools for the pair AS TYPED `MaverickPool` descriptors (the EcoSwap path —
+ * distinct from the legacy `discoverMaverickV2Pools` PoolInfo aggregator, which mis-models a bin pool
+ * as ONE synthetic sqrt). Maverick V2 is a BIN-based directional AMM: the curve is a per-tick
+ * concentrated-liquidity walk (L re-derived per tick from (reserveA,reserveB)), NOT xy=k and NOT the
+ * drift-invariant liquidityNet tick walk — so it is a SAMPLED-SEGMENT source. The bin math is OFF-CHAIN
+ * ONLY: this reads getState (activeTick / protocolFeeRatioD3), tokenA/tokenB (orientation), the
+ * DIRECTIONAL fee(tokenAIn), tickSpacing, and getTick over a window around the active tick, so prepare's
+ * `buildMaverickSegments` can replay the bin swap-math with NO further RPC; the on-chain solver consumes
+ * the sampled segments statically + EXECUTES the awarded Σ share via swap(SwapParams{poolType:7}) → live
+ * _swapMaverickV2 (Maverick is a CALLBACK pool → the engine services maverickV2SwapCallback).
+ *
+ * Mirrors `discoverDodoV2PoolsTyped`: off-chain discovery + state reads, returning the venue descriptor
+ * EcoSwap prepare consumes directly (the on-chain lens does not understand Maverick). Factory path:
+ * lookup(tokenA, tokenB, 0, N) over BOTH token orderings (Maverick's lookup is order-dependent).
+ *
+ * ENGINE tickLimit=0 GATE. The engine `_swapMaverickV2` hardcodes `tickLimit: 0`, which caps/reverts a
+ * swap whose active tick is on the wrong side of tick 0 for its direction (a tokenA-in swap must walk UP
+ * toward tick 0, so activeTick must be <= 0; a tokenB-in swap must walk DOWN toward tick 0, so activeTick
+ * must be >= 0). Discovery DROPS a pool whose live active tick sits on the wrong side for its direction —
+ * the engine swap would revert (PoolCurrentTickBeyondSwapLimit) or fail to fill. Documented in
+ * maverick-math.ts (MAVERICK_ENGINE_TICK_LIMIT) and reported as the engine gap.
+ */
+export async function discoverMaverickV2PoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<MaverickPool[]> {
+  if (factories.length === 0) return [];
+  const inLower = tokenIn.toLowerCase();
+
+  const pools: MaverickPool[] = [];
+  const seen = new Set<string>();
+  for (const factory of factories) {
+    for (const [tA, tB] of [
+      [tokenIn, tokenOut],
+      [tokenOut, tokenIn],
+    ] as [Hex, Hex][]) {
+      let addresses: string[];
+      try {
+        addresses = (await client.readContract({
+          address: factory.address,
+          abi: maverickFactoryAbi,
+          functionName: "lookup",
+          args: [tA, tB, 0n, 10n],
+        })) as string[];
+      } catch {
+        continue;
+      }
+
+      for (const addr of addresses) {
+        if (!addr || addr === ZERO_ADDRESS) continue;
+        const key = addr.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const pool = addr as Hex;
+
+        try {
+          const [tokenARaw, stateRaw, tsRaw] = await Promise.all([
+            client.readContract({ address: pool, abi: maverickV2PoolAbi, functionName: "tokenA" }) as Promise<Hex>,
+            client.readContract({ address: pool, abi: maverickV2PoolAbi, functionName: "getState" }) as Promise<MaverickState>,
+            client.readContract({ address: pool, abi: maverickV2PoolAbi, functionName: "tickSpacing" }) as Promise<bigint>,
+          ]);
+
+          const tokenAIn = inLower === (tokenARaw as string).toLowerCase();
+          const activeTick = Number(stateRaw.activeTick);
+          const tickSpacing = Number(tsRaw);
+          if (tickSpacing <= 0) continue;
+
+          // ENGINE tickLimit=0 GATE: tokenA-in walks UP → activeTick must be <= 0; tokenB-in walks DOWN
+          // → activeTick must be >= 0. A pool on the wrong side would revert / not fill through the engine.
+          if (tokenAIn && activeTick > MAVERICK_ENGINE_TICK_LIMIT) continue;
+          if (!tokenAIn && activeTick < MAVERICK_ENGINE_TICK_LIMIT) continue;
+
+          // Directional fee for THIS swap direction.
+          const feeWad = (await client.readContract({
+            address: pool,
+            abi: maverickV2PoolAbi,
+            functionName: "fee",
+            args: [tokenAIn],
+          })) as bigint;
+
+          // Read the tick window around the active tick, in ASCENDING tick order.
+          const lo = activeTick - MAVERICK_TICK_WINDOW;
+          const hi = activeTick + MAVERICK_TICK_WINDOW;
+          const tickNums: number[] = [];
+          for (let t = lo; t <= hi; t++) tickNums.push(t);
+          const tickResults = await client.multicall({
+            contracts: tickNums.map((t) => ({
+              address: pool,
+              abi: maverickV2PoolAbi,
+              functionName: "getTick" as const,
+              args: [t] as const,
+            })),
+            allowFailure: true,
+          });
+
+          const ticks: MaverickTick[] = [];
+          for (let k = 0; k < tickNums.length; k++) {
+            const r = tickResults[k];
+            if (r.status !== "success") continue;
+            const st = r.result as MaverickTickState;
+            if (st.reserveA === 0n && st.reserveB === 0n) continue;
+            ticks.push({ tick: tickNums[k], reserveA: st.reserveA, reserveB: st.reserveB });
+          }
+          if (ticks.length === 0) continue;
+
+          // Seed the walk's starting price from the active tick's reserves (clamped to its bounds).
+          const active = ticks.find((t) => t.tick === activeTick);
+          if (!active) continue; // active tick must carry liquidity to seed the walk
+          const { sqrtLowerPrice, sqrtUpperPrice } = tickSqrtPrices(tickSpacing, activeTick);
+          const activeL = getTickL(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+          if (activeL === 0n) continue;
+          const poolSqrtPrice = getMaverickSqrtPrice(
+            active.reserveA,
+            active.reserveB,
+            sqrtLowerPrice,
+            sqrtUpperPrice,
+            activeL,
+          );
+
+          pools.push({
+            poolType: SwapPoolType.MaverickV2,
+            address: pool,
+            tokenAIn,
+            activeTick,
+            poolSqrtPrice,
+            tickSpacing,
+            fee: feeWad,
+            protocolFeeD3: BigInt(stateRaw.protocolFeeRatioD3),
+            ticks,
+            feePpm: maverickFeeToPpm(feeWad),
+            source: factory.label,
+          });
+        } catch {
+          // Pool state read failed (non-Maverick surface / partial pool) — skip.
+        }
+      }
+    }
+  }
+  return pools;
 }
 
 /** Integer square root (babylonian method) */

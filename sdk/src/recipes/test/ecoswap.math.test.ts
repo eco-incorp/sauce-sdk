@@ -63,6 +63,15 @@ import {
   buildEulerSwapSegments,
   type EulerSwapPool,
 } from "../shared/eulerswap-math";
+import {
+  getDy as maverickGetDy,
+  buildMaverickSegments,
+  getTickL as maverickGetTickL,
+  getSqrtPrice as maverickGetSqrtPrice,
+  tickSqrtPrices as maverickTickSqrtPrices,
+  type MaverickPool,
+  type MaverickTick,
+} from "../shared/maverick-math";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -1840,5 +1849,86 @@ describe("EulerSwap (Euler v2 vault-backed AMM) — computeQuote known-answer + 
     const segs = buildEulerSwapSegments(p, 100_000n * E18);
     const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
     assert.equal(sumCap, cap, "segments cover only the vault inLimit, not the full amountIn");
+  });
+});
+
+// ── Maverick V2 (bin-based directional AMM) known-answer + segment sampler ────
+//
+// Pins the off-chain bin swap-math replay (getDy + buildMaverickSegments) BEFORE the local-EVM test,
+// so a regression in the closed-form bigint math (getTickL, the within-tick computeSwapExactIn
+// drain/partial, the directional fee, the multi-tick walk under the engine tickLimit=0) is caught
+// without anvil. The wei-exact bound is documented in maverick-math.ts: the SPLIT is exact-on-grid vs
+// the oracle (one shared sampler) and the realized dy is the ENGINE swap, cross-checked against the
+// on-chain MaverickV2Quoter.calculateSwap in ecoswap.maverick.evm.test.ts. These vectors are the
+// deterministic getDy outputs for a fixed tick book (regenerate only on an intentional math change).
+//
+// The book: tokenA-in from a NEGATIVE active tick (-3) with symmetric per-tick reserves, walking UP
+// toward the engine tickLimit=0 (the ONLY tokenA-in config the engine's hardcoded tickLimit=0 fills —
+// see maverick-math.ts). Deep enough (ticks -3..0 × 500k each side) that a ≤100k trade fills within the
+// window; a 2M trade saturates at the book's B liquidity (the tick-limit depth bound the sampler caps at).
+// Reserves are >= 2^78 wei so the getTickL precision-bump path is NOT taken (the normal deep-pool regime
+// the on-chain fixture matches bit-for-bit — the bumped-small-reserve path is a Solidity-overflow edge the
+// deep regime avoids, exactly as real Maverick WETH/USDC ticks hold >> 2^78 wei).
+describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = ("0x" + "11".repeat(20)) as `0x${string}`;
+  const TICK_SPACING = 10;
+  const ACTIVE_TICK = -3;
+
+  function pool(reservePerSide = 500_000n * E18, feeWad = E18 / 1000n): MaverickPool {
+    const ticks: MaverickTick[] = [];
+    for (let t = -3; t <= 3; t++) ticks.push({ tick: t, reserveA: reservePerSide, reserveB: reservePerSide });
+    const { sqrtLowerPrice, sqrtUpperPrice } = maverickTickSqrtPrices(TICK_SPACING, ACTIVE_TICK);
+    const active = ticks.find((t) => t.tick === ACTIVE_TICK)!;
+    const activeL = maverickGetTickL(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+    const poolSqrtPrice = maverickGetSqrtPrice(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice, activeL);
+    return {
+      poolType: 7, address: Z, tokenAIn: true, activeTick: ACTIVE_TICK, poolSqrtPrice,
+      tickSpacing: TICK_SPACING, fee: feeWad, protocolFeeD3: 0n, ticks,
+      feePpm: Number((feeWad * 1_000_000n) / E18), source: "kat",
+    };
+  }
+
+  it("symmetric book, tokenA-in from tick -3, fee 0.1% — exact within-tick + cross-tick vectors", () => {
+    const p = pool();
+    // Hand-pinned from the closed-form replay (mirrors the on-chain MaverickV2Pool fixture swap math
+    // bit-for-bit). tokenA is cheap at a negative tick (price < 1), so a small trade returns slightly MORE
+    // B than A.
+    assert.equal(maverickGetDy(p, 1_000n * E18), 1_001_499_372_716_065_198_010n);
+    assert.equal(maverickGetDy(p, 10_000n * E18), 10_014_948_656_608_216_862_717n);
+    assert.equal(maverickGetDy(p, 50_000n * E18), 50_073_741_739_748_791_392_336n);
+    assert.equal(maverickGetDy(p, 100_000n * E18), 100_144_979_733_943_102_081_541n);
+  });
+
+  it("tick-limit depth bound — a swap saturates at the book's out-side liquidity up to tick 0", () => {
+    const p = pool();
+    // The reachable ticks (-3..0) hold their B, but the walk stops at tick 0 (engine tickLimit=0), so a
+    // huge input drains only the reachable B (here 1.5M across the traversed ticks up to the limit).
+    assert.equal(maverickGetDy(p, 2_000_000n * E18), 1_500_000n * E18);
+  });
+
+  it("buildMaverickSegments — covers min(amountIn,depth), descending marginals, partition of the curve", () => {
+    const p = pool();
+    const amountIn = 100_000n * E18;
+    const segs = buildMaverickSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    // amountIn (100k) is within the tick-limit depth, so the segments cover the full amountIn.
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (within the depth bound)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == getDy(sumCap) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, maverickGetDy(p, sumCap), "Σ segment effOut == getDy(sumCap)");
+  });
+
+  it("depth bound — the sampler caps at the tick-limit-consumable input, not amountIn", () => {
+    const p = pool();
+    // amountIn (10,000,000) far exceeds the reachable depth ⇒ the sampler caps at the input the engine
+    // swap can actually consume before tickLimit=0 stops it.
+    const segs = buildMaverickSegments(p, 10_000_000n * E18);
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.ok(sumCap > 0n && sumCap < 10_000_000n * E18, "segments cover only the reachable depth, not the full amountIn");
   });
 });

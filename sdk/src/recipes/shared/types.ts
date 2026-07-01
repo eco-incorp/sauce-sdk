@@ -222,6 +222,7 @@ export enum EcoBracketKind {
   Wombat = 7, // Wombat single-sided stableswap segment (static, off-chain-sampled via the coverage-ratio replay)
   BalancerStable = 8, // Balancer V2 ComposableStable segment (static, off-chain-sampled via the StableMath A-invariant replay)
   EulerSwap = 9, // EulerSwap (Euler v2 vault-backed AMM) segment (static, off-chain-sampled via the f/fInverse curve replay)
+  MaverickV2 = 10, // Maverick V2 (bin-based directional AMM) segment (static, off-chain-sampled via the bin swap-math replay; executed through the engine)
 }
 
 /**
@@ -523,6 +524,30 @@ export interface EcoEulerSwap {
 }
 
 /**
+ * One Maverick V2 venue to execute, indexed by an EcoBracket.refIdx (kind === MaverickV2). Maverick V2
+ * is a BIN-based directional AMM whose bins do NOT map to the drift-invariant liquidityNet tick walk
+ * (bin L is re-derived per tick from (reserveA,reserveB) and the pool has dynamic-distribution kinds),
+ * so it is a SAMPLED-SEGMENT source (like DODO): prepare samples its closed-form bin swap-math into
+ * static segments (kind MaverickV2) via the off-chain `buildMaverickSegments` replay; the on-chain
+ * solver consumes those through the static-segment cursor and EXECUTES the awarded Σ share via the
+ * EXISTING engine MaverickV2 dispatch swap(SwapParams{poolType:7, pool}) → _swapMaverickV2 (Maverick is
+ * a CALLBACK pool — the pool re-enters maverickV2SwapCallback mid-swap to pull input — so it MUST go
+ * through the engine Router, NOT the callback-free path). The engine reads the pool's tokenA() and sets
+ * tokenAIn on-chain, so the SwapParams carry NO curve/orientation data. `address` is the pool (the swap
+ * target). feePpm (the directional swap fee, rounded) is the price-ordering coordinate / diagnostic.
+ * `tokenAIn` is a diagnostic (the engine resolves direction on-chain).
+ */
+export interface EcoMaverick {
+  /** Pool address — the swap(SwapParams{poolType:7, pool}) target. */
+  address: Hex;
+  /** true => tokenIn is the pool's tokenA (price rises through ticks); diagnostic (engine resolves on-chain). */
+  tokenAIn: boolean;
+  /** Rounded ppm directional fee (the price-ordering coordinate; the on-chain out is computed by _swapMaverickV2). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -595,6 +620,16 @@ export interface EcoSwapPrepared {
    * literals stay additive-compatible).
    */
   eulerSwaps?: EcoEulerSwap[];
+  /**
+   * Maverick V2 venues (kind === MaverickV2 brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share via the EXISTING engine MaverickV2 dispatch
+   * swap(SwapParams{poolType:7, pool:maverickPools[refIdx].address}) → _swapMaverickV2 (Maverick is a
+   * CALLBACK pool → the engine services maverickV2SwapCallback); the bin-math marginal is supplied
+   * entirely as the static sampled segments in `brackets` (the off-chain bin swap-math replay).
+   * Optional/empty when no Maverick pools were discovered (omitted ⇒ no Maverick venue, so existing
+   * test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  maverickPools?: EcoMaverick[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

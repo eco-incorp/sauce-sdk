@@ -103,6 +103,11 @@ export const traderJoeLBPairArtifact = loadArtifact(
 export const eulerSwapPoolArtifact = loadArtifact(
   join(FIXTURES, "EulerSwapPool.sol", "EulerSwapPool.json"),
 );
+/** Maverick V2 (bin-based directional AMM) pool — deployed normally (constructor sets tokens/tickSpacing/
+ *  directional fees/protocolFee), then seeded per-tick + active tick / pool sqrt price. */
+export const maverickV2PoolArtifact = loadArtifact(
+  join(FIXTURES, "MaverickV2Pool.sol", "MaverickV2Pool.json"),
+);
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
 );
@@ -1480,4 +1485,101 @@ export async function getTickLiquidityNet(
     args: [tick],
   })) as readonly [bigint, bigint, bigint, bigint, bigint, bigint, number, boolean];
   return { liquidityGross: r[0], liquidityNet: r[1], initialized: r[7] };
+}
+
+// ── Maverick V2 (bin-based directional AMM) fixture ──────────────
+
+export const maverickV2PoolAbi = parseAbi([
+  "struct SwapParams { uint256 amount; bool tokenAIn; bool exactOutput; int32 tickLimit; }",
+  "function tokenA() view returns (address)",
+  "function tokenB() view returns (address)",
+  "function fee(bool tokenAIn) view returns (uint256)",
+  "function tickSpacing() view returns (uint256)",
+  "function getState() view returns ((uint128 reserveA, uint128 reserveB, int64 lastTwaD8, int64 lastLogPriceD8, uint40 lastTimestamp, int32 activeTick, bool isLocked, uint32 binCounter, uint8 protocolFeeRatioD3) state)",
+  "function getTick(int32 tick) view returns ((uint128 reserveA, uint128 reserveB, uint128 totalSupply, uint32[4] binIdsByTick) tickState)",
+  "function setTick(int32 tick, uint128 reserveA, uint128 reserveB)",
+  "function setActive(int32 activeTick, uint256 poolSqrtPrice)",
+  "function tickSqrtPrice(int32 tick) view returns (uint256)",
+  "function getTickL(uint256 reserveA, uint256 reserveB, uint256 sqrtLower, uint256 sqrtUpper) pure returns (uint256)",
+  "function getSqrtPrice(uint256 reserveA, uint256 reserveB, uint256 sqrtLower, uint256 sqrtUpper, uint256 L) pure returns (uint256)",
+  "function calculateSwap(uint128 amount, bool tokenAIn, bool exactOutput, int32 tickLimit) view returns (uint256 amountIn, uint256 amountOut, uint256 gasEstimate)",
+  "function swap(address recipient, SwapParams params, bytes data) returns (uint256 amountIn, uint256 amountOut)",
+]);
+
+/** One seeded Maverick tick: tick index + both token-side reserves (native units). */
+export interface MaverickTickSeed {
+  tick: number;
+  reserveA: bigint;
+  reserveB: bigint;
+}
+
+/** Constructor + seed params for a Maverick V2 pool fixture (mirrors the off-chain MaverickPool). */
+export interface MaverickDeployParams {
+  /** Canonical tokenA (the pool's tokenA — NOT necessarily address-sorted). */
+  tokenA: Hex;
+  /** Canonical tokenB. */
+  tokenB: Hex;
+  tickSpacing: number;
+  /** Directional fees (1e18-scaled). */
+  feeAIn: bigint;
+  feeBIn: bigint;
+  protocolFeeRatioD3: number;
+  /** Seeded ticks around the active tick. */
+  ticks: MaverickTickSeed[];
+  /** Live active tick. */
+  activeTick: number;
+  /** Live pool sqrt price (1e18) — the walk's starting price within the active tick. */
+  poolSqrtPrice: bigint;
+}
+
+/**
+ * Deploy a local Maverick V2 pool, seed its tick book + active state, and fund it with the reserves it
+ * pays out. Mirrors the canonical Maverick V2 TickMath + SwapMath bit-for-bit (matching the off-chain
+ * `maverick-math.ts` replay), so the engine `_swapMaverickV2` swap consumes/pays EXACTLY the off-chain
+ * `getDy(pool, amountIn)` == the fixture's own `calculateSwap(amountIn)` view to the wei.
+ *
+ * Maverick is a CALLBACK pool: the engine calls `pool.swap(recipient, SwapParams, "")`, the pool
+ * re-enters the engine's `maverickV2SwapCallback` to PULL the input, then transfers the output to the
+ * recipient. So the pool must HOLD both sides' reserves — `minter` transfers each tick's reserveA of
+ * tokenA + reserveB of tokenB into the pool.
+ */
+export async function deployMaverickV2Pool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  p: MaverickDeployParams,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: maverickV2PoolArtifact.abi,
+    bytecode: maverickV2PoolArtifact.bytecode,
+    args: [p.tokenA, p.tokenB, BigInt(p.tickSpacing), p.feeAIn, p.feeBIn, p.protocolFeeRatioD3],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+
+  let totalA = 0n;
+  let totalB = 0n;
+  for (const t of p.ticks) {
+    await writeAndWait(walletClient, publicClient, {
+      address: pool, abi: maverickV2PoolAbi as Abi, functionName: "setTick",
+      args: [t.tick, t.reserveA, t.reserveB], account: acct,
+    });
+    totalA += t.reserveA;
+    totalB += t.reserveB;
+  }
+  await writeAndWait(walletClient, publicClient, {
+    address: pool, abi: maverickV2PoolAbi as Abi, functionName: "setActive",
+    args: [p.activeTick, p.poolSqrtPrice], account: acct,
+  });
+  // Fund the pool with the full book it pays out (both sides).
+  if (totalA > 0n) {
+    await writeAndWait(walletClient, publicClient, {
+      address: p.tokenA, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, totalA], account: acct,
+    });
+  }
+  if (totalB > 0n) {
+    await writeAndWait(walletClient, publicClient, {
+      address: p.tokenB, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, totalB], account: acct,
+    });
+  }
+  return pool;
 }

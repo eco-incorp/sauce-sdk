@@ -220,6 +220,7 @@ const HAS_SOLIDLY_STABLE: boolean = true;
 const HAS_WOMBAT: boolean = true;
 const HAS_BALANCER: boolean = true;
 const HAS_EULER: boolean = true;
+const HAS_MAVERICK: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -302,6 +303,8 @@ function main(
   let bven: Tuple = new Array(segs.length); // Balancer-stable venue (pool) address
   let einp: Tuple = new Array(segs.length); // EulerSwap per-venue Σ input
   let even: Tuple = new Array(segs.length); // EulerSwap venue (pool) address
+  let minp: Tuple = new Array(segs.length); // Maverick V2 per-venue Σ input
+  let mven: Tuple = new Array(segs.length); // Maverick V2 venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -519,7 +522,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER) && segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK) && segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -841,7 +844,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER) && bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK) && bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -889,6 +892,15 @@ function main(
                           // + pool.swap(a0Out, a1Out, to, "") (EMPTY data ⇒ no flash callback).
                           einp[sIdx] = einp[sIdx] + stake;
                           even[sIdx] = sVenue;
+                        } else {
+                          // segKind 8 — Maverick V2 (bin-based directional AMM): executed below via the
+                          // engine MaverickV2 dispatch (swap poolType:7 → _swapMaverickV2 → the pool's
+                          // maverickV2SwapCallback pulls the input mid-swap). Maverick is a CALLBACK pool,
+                          // so it MUST go through the engine (not callback-free).
+                          if (HAS_MAVERICK && sKind === 8) {
+                            minp[sIdx] = minp[sIdx] + stake;
+                            mven[sIdx] = sVenue;
+                          }
                         }
                       }
                     }
@@ -1287,6 +1299,32 @@ function main(
           IEulerSwapPool.at(epool).swap(eOut, 0, address.self, eEmpty);
         }
       }
+    }
+  }
+  }
+  // Maverick V2 → poolType 7 (SwapPoolType.MaverickV2) → _swapMaverickV2. Maverick is a CALLBACK pool:
+  // the engine reads the pool's tokenA(), sets tokenAIn, and calls pool.swap(recipient, SwapParams{amount,
+  // tokenAIn, exactOutput:false, tickLimit:0}, ""); the pool re-enters maverickV2SwapCallback(amountToPay,
+  // …) to pull the input from the payer. So the bin math runs INSIDE the pool + engine callback, and the
+  // SwapParams carry NO curve data — the segment merge already used it (exact-on-grid), and the realized
+  // out is the engine swap (cross-checked wei-exact against the on-chain quoter in the EVM test).
+  // amountSpecified is NEGATIVE (the unified exact-in convention; _swapMaverickV2 takes abs()). payer ==
+  // address.self (compute-then-pull transferred `cum`, incl. each Maverick share, above) so the callback's
+  // safeTransfer draws from this contract; recipient == address.self. The poolKey is unused for poolType 7
+  // — zeroed to match the V2-path SwapParams shape. The engine tickLimit=0 caps the swap at tick 0; the
+  // sampler/discovery already gated the pool so the awarded Σ fills before that boundary (any un-consumed
+  // input is returned by the guarded terminal refund below).
+  if (HAS_MAVERICK) {
+  for (let m = 0; m < segs.length; m = m + 1) {
+    const mamt: Uint256 = minp[m];
+    if (mamt > 0) {
+      const mpool: Address = mven[m];
+      router.swap({
+        poolType: 7, pool: mpool,
+        poolKey: { currency0: 0, currency1: 0, fee: 0, tickSpacing: 0, hooks: 0 },
+        tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(mamt),
+        sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+      });
     }
   }
   }

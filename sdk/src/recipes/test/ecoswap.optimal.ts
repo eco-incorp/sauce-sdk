@@ -68,6 +68,7 @@ import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/so
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
+import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -179,6 +180,16 @@ export interface OptimalPool {
    * is set.
    */
   eulerSwap?: EulerSwapPool;
+  /**
+   * Maverick V2 (bin-based directional AMM) pool — when present this pool is a MAVERICK venue (NOT
+   * V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer/Euler). The oracle enumerates its segments via the
+   * SHARED bin swap-math replay (buildMaverickSegments) from the live tick book + directional fee +
+   * the engine tickLimit=0, so the split is exact-on-grid vs prepare's segments (one replay). The
+   * marginal is post-fee (getDy nets the directional fee), so it enters the descending-price merge
+   * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/`balancer`/`eulerSwap` are ignored
+   * when `maverick` is set.
+   */
+  maverick?: MaverickPool;
 }
 
 /**
@@ -545,6 +556,22 @@ function eulerSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): S
   return segs;
 }
 
+/**
+ * Enumerate one Maverick V2 (bin-based directional AMM) pool's segments via the SHARED bin swap-math
+ * replay (buildMaverickSegments) from the live tick book + directional fee + the engine tickLimit=0
+ * depth cap. The amountIn caps the sampled range — the same bound prepare samples — so the oracle and
+ * prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid. The Maverick
+ * marginalOI is the post-fee execution price (getDy nets the directional fee); adjNear == adjFar ==
+ * marginalOI. Awarded as a "pool" venue.
+ */
+function maverickSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildMaverickSegments(p.maverick!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -769,7 +796,12 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.eulerSwap) {
+    if (p.maverick) {
+      // Maverick V2 (bin-based directional AMM) venue: sampled-segment enumeration via the shared bin
+      // swap-math replay (capped at amountIn / the engine tickLimit=0 depth — the same bound prepare
+      // samples → identical grid → exact-on-grid split).
+      allSegs.push(...maverickSegments(p, i, amountIn));
+    } else if (p.eulerSwap) {
       // EulerSwap (Euler v2 vault-backed AMM) venue: sampled-segment enumeration via the shared
       // f/fInverse curve replay (capped at amountIn / the vault inLimit — the same bound prepare samples
       // → identical grid → exact-on-grid split).

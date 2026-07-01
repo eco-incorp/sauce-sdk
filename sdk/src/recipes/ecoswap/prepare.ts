@@ -48,6 +48,7 @@ import {
   discoverWombatPoolsTyped,
   discoverBalancerStablePoolsTyped,
   discoverEulerSwapPoolsTyped,
+  discoverMaverickV2PoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
@@ -55,6 +56,7 @@ import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
+import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import {
   MIN_SQRT_RATIO,
@@ -80,6 +82,7 @@ import {
   type EcoWombat,
   type EcoBalancerStable,
   type EcoEulerSwap,
+  type EcoMaverick,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -596,6 +599,34 @@ function buildEulerSwapBrackets(pool: EulerSwapPool, refIdx: number, amountIn: b
 }
 
 /**
+ * Build Maverick V2 segments for one pool by sampling the bin swap-math replay (NO extra RPC — pure
+ * bigint on the read tick book + directional fee, BOUNDED by the engine tickLimit=0 depth). Each sampled
+ * (Δinput, Δoutput) increment becomes a STATIC segment (kind MaverickV2) in unified out/in space, refIdx →
+ * the Maverick venue index. The marginal is the POST-FEE execution price (buildMaverickSegments nets the
+ * directional fee), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar.
+ * Maverick's bin math is OFF-CHAIN ONLY for the split; the on-chain solver EXECUTES the awarded Σ share
+ * through the engine (swap poolType 7 → _swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input
+ * mid-swap — Maverick is a CALLBACK pool, so it CANNOT be executed callback-free).
+ */
+function buildMaverickBrackets(pool: MaverickPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildMaverickSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.MaverickV2,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Maverick directional fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
  * Build Balancer V2 ComposableStable segments for one pool by sampling the bigint StableMath replay (NO
  * extra RPC — pure bigint on the read invariant state). Each sampled (Δinput, Δoutput) increment becomes
  * a STATIC segment (kind BalancerStable) in unified out/in space, refIdx → the Balancer venue index. The
@@ -955,6 +986,32 @@ export async function prepareEcoSwap(
   }
   for (const set of eulerBracketSets) brackets.push(...set);
 
+  const maverickPools: EcoMaverick[] = [];
+  const maverickBracketSets: EcoBracket[][] = [];
+  // Maverick V2 — factory lookup discovery (lookup(tokenA, tokenB, idx) over both orderings). Maverick is
+  // a BIN-based directional AMM: the bin curve does NOT map to the drift-invariant liquidityNet tick walk,
+  // so it is a SAMPLED-SEGMENT source (like DODO). `discoverMaverickV2PoolsTyped` reads the tick book around
+  // the active tick + the directional fee + tickSpacing (and GATES a pool OUT when its live active tick sits
+  // on the wrong side of tick 0 for its direction — the engine hardcodes tickLimit=0). Sampled OFF-CHAIN;
+  // EXECUTED through the engine (swap poolType 7 → _swapMaverickV2 → maverickV2SwapCallback). NO engine change.
+  const maverickFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.MaverickV2Factory);
+  if (maverickFactories.length > 0) {
+    const maverickRaw = await discoverMaverickV2PoolsTyped(tokenIn, tokenOut, client, maverickFactories);
+    for (const mp of maverickRaw) {
+      const refIdx = maverickPools.length;
+      const mb = buildMaverickBrackets(mp, refIdx, amountIn);
+      if (mb.length === 0) continue;
+      maverickPools.push({
+        address: mp.address,
+        tokenAIn: mp.tokenAIn,
+        feePpm: mp.feePpm,
+        source: `${mp.source} (Maverick V2)`,
+      });
+      maverickBracketSets.push(mb);
+    }
+  }
+  for (const set of maverickBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1117,13 +1174,15 @@ export async function prepareEcoSwap(
   const nSolidlySegs = brackets.filter((b) => b.kind === EcoBracketKind.SolidlyStable).length;
   const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
+  const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
       `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
-      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable)`,
+      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
+      `${nMaverickSegs} Maverick)`,
   );
 
   return {
@@ -1141,6 +1200,7 @@ export async function prepareEcoSwap(
     wombats,
     balancerStables,
     eulerSwaps,
+    maverickPools,
     brackets,
     zeroForOne,
     priceLimit,
