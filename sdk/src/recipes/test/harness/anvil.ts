@@ -13,6 +13,8 @@ export interface AnvilHandle {
   rpcUrl: string;
   port: number;
   stop(): void;
+  /** Resolves once the anvil child process has fully exited (its port is released). */
+  stopped: Promise<void>;
 }
 
 /** Find a free TCP port by binding to :0 and reading the assigned port. */
@@ -91,8 +93,17 @@ export async function startAnvil(opts: { timeoutMs?: number } = {}): Promise<Anv
     });
 
     let exited = false;
+    // `stopped` resolves on the child's exit event — a caller that boots a new
+    // anvil right after stop() (the per-cell reset path) can await it to be sure
+    // the prior process is fully gone (and its port released) before the next
+    // startAnvil, closing the teardown/boot race that flaked under machine load.
+    let markStopped: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      markStopped = resolve;
+    });
     child.once("exit", () => {
       exited = true;
+      markStopped();
     });
 
     const stop = () => {
@@ -108,7 +119,7 @@ export async function startAnvil(opts: { timeoutMs?: number } = {}): Promise<Anv
     try {
       await rpcReady(rpcUrl, timeoutMs);
       if (exited) throw new Error(`anvil exited during boot: ${stderr}`);
-      return { rpcUrl, port, stop };
+      return { rpcUrl, port, stop, stopped };
     } catch (e) {
       lastErr = e;
       stop();

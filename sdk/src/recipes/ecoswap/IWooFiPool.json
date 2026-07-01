@@ -1,0 +1,29 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "query",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "fromToken", "type": "address" },
+        { "name": "toToken", "type": "address" },
+        { "name": "fromAmount", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "toAmount", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "swap",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        { "name": "fromToken", "type": "address" },
+        { "name": "toToken", "type": "address" },
+        { "name": "fromAmount", "type": "uint256" },
+        { "name": "minToAmount", "type": "uint256" },
+        { "name": "to", "type": "address" },
+        { "name": "rebateTo", "type": "address" }
+      ],
+      "outputs": [{ "name": "realToAmount", "type": "uint256" }]
+    }
+  ]
+}

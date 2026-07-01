@@ -70,6 +70,7 @@ import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
+import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -201,6 +202,16 @@ export interface OptimalPool {
    * venue fields are ignored when `cryptoSwap` is set.
    */
   cryptoSwap?: CryptoSwapPool;
+  /**
+   * WOOFi (WooPPV2 sPMM) pool — when present this pool is a WOOFi venue (NOT V2/V3/Curve/LB/DODO/
+   * Solidly/Wombat/Balancer/Euler/Maverick/CryptoSwap). WOOFi is an ORACLE-PRICED synthetic proactive
+   * market maker: the oracle enumerates its segments via the SHARED closed-form sPMM replay
+   * (buildWooFiSegments) from the SNAPSHOT WooracleV2 price/spread/coeff + decimals + feeRate, so the
+   * split is exact-on-grid vs prepare's segments (one replay at the SAME snapshot). The WOOFi marginalOI
+   * is the post-fee execution price (query nets the swap fee); adjNear == adjFar == marginalOI. All the
+   * other venue fields are ignored when `woofi` is set.
+   */
+  woofi?: WooFiPool;
 }
 
 /**
@@ -599,6 +610,22 @@ function cryptoSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): 
   return segs;
 }
 
+/**
+ * Enumerate one WOOFi (WooPPV2 sPMM) pool's segments via the SHARED closed-form oracle-price replay
+ * (buildWooFiSegments) from the SNAPSHOT WooracleV2 price/spread/coeff + decimals + feeRate. The amountIn
+ * caps the sampled range — the same bound prepare samples — so the oracle and prepare emit the IDENTICAL
+ * segment grid AT THE SAME ORACLE SNAPSHOT (single source), making the split exact-on-grid. The WOOFi
+ * marginalOI is the post-fee execution price (query nets the swap fee); adjNear == adjFar == marginalOI.
+ * Awarded as a "pool" venue.
+ */
+function wooFiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildWooFiSegments(p.woofi!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -823,7 +850,9 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.cryptoSwap) {
+    if (p.woofi) {
+      allSegs.push(...wooFiSegments(p, i, amountIn));
+    } else if (p.cryptoSwap) {
       // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) venue: sampled-segment enumeration via
       // the shared bounded-Newton A-gamma replay (capped at amountIn — the same bound prepare samples →
       // identical grid → exact-on-grid split).

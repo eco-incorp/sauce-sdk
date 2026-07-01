@@ -54,6 +54,11 @@ import {
   type WombatPool,
 } from "../shared/wombat-math";
 import {
+  query as wooFiQuery,
+  buildWooFiSegments,
+  type WooFiPool,
+} from "../shared/woofi-math";
+import {
   getDy as balancerGetDy,
   buildBalancerStableSegments,
   type BalancerStablePool,
@@ -1701,6 +1706,73 @@ describe("Wombat (single-sided stableswap) — quotePotentialSwap known-answer +
     // Σ effOut over the grid == quotePotentialSwap(amountIn) (the sampler is a partition of the curve).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
     assert.equal(sumOut, quotePotentialSwap(p, amountIn), "Σ segment effOut == quotePotentialSwap(amountIn)");
+  });
+});
+
+// ── WOOFi (WooPPV2 sPMM) known-answer + segment sampler ──────────────────────
+//
+// Pins the off-chain oracle-price sPMM replay (query + buildWooFiSegments) BEFORE the local-EVM test,
+// so a regression in the closed-form _calcQuoteAmountSellBase / _calcBaseAmountSellQuote + fee math is
+// caught without anvil. The wei-exact bound is documented in woofi-math.ts: the SPLIT is exact-on-grid
+// at the SNAPSHOT oracle (one shared sampler) and the realized dy is exact-in-dy (the pool query view
+// reads the LIVE oracle == the pool swap math). These vectors are the deterministic query outputs for
+// fixed oracle states (regenerate only on an intentional math change). price scaled 1e8; spread 1bp
+// (1e14 WAD); coeff 1e9 (WAD); feeRate 25 (0.025%). A near-1:1 base↔quote stable swap loses only the
+// fee + tiny gamma/spread slippage.
+describe("WOOFi (WooPPV2 sPMM) — query known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const E8 = 10n ** 8n;
+  const E6 = 10n ** 6n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  const SPREAD = 10n ** 14n; // 0.0001e18 = 1 bp
+  const COEFF = 10n ** 9n; // gamma coefficient k (WAD-scaled)
+  const FEER = 25n; // 0.025% (1e5-scaled)
+  function pool(
+    sellBase: boolean, price: bigint, priceDec: bigint, quoteDec: bigint, baseDec: bigint,
+  ): WooFiPool {
+    return {
+      address: Z, tokenIn: Z, tokenOut: Z, sellBase, price, spread: SPREAD, coeff: COEFF,
+      priceDec, quoteDec, baseDec, feeRate: FEER, feePpm: 250, source: "kat",
+    };
+  }
+
+  it("sell base (base 18-dec → quote 6-dec), price $1 (1e8) — exact sPMM vectors", () => {
+    const p = pool(true, E8, E8, E6, E18);
+    // Hand-pinned from the closed-form replay (mirrors the WooPPV2 fixture _calc*/fee bit-for-bit).
+    assert.equal(wooFiQuery(p, 1_000n * E18), 999_649_026n);
+    assert.equal(wooFiQuery(p, 10_000n * E18), 9_996_400_275n);
+    assert.equal(wooFiQuery(p, 100_000n * E18), 99_955_005_000n);
+    // Near-1:1 minus the 0.025% fee + tiny gamma/spread slippage: 1000 base ≈ 999.649 quote.
+    const out1k = wooFiQuery(p, 1_000n * E18);
+    assert.ok(out1k < 1_000n * E6 && out1k > 999n * E6, "near-1:1 minus fee on the sPMM curve");
+  });
+
+  it("sell quote (quote 6-dec → base 18-dec), price $1 (1e8) — exact sPMM vectors", () => {
+    const p = pool(false, E8, E8, E6, E18);
+    assert.equal(wooFiQuery(p, 1_000n * E6), 999_649_025_499_937_500_000n);
+    assert.equal(wooFiQuery(p, 10_000n * E6), 9_996_400_299_993_750_000_000n);
+    assert.equal(wooFiQuery(p, 100_000n * E6), 99_955_007_499_375_000_000_000n);
+  });
+
+  it("sell base at a non-unit price (base 18-dec → quote 18-dec, price $2000) — exact vector", () => {
+    const p = pool(true, 2000n * E8, E8, E18, E18);
+    assert.equal(wooFiQuery(p, 1n * E18), 1_999_296_051_000_000_000_000n);
+    assert.equal(wooFiQuery(p, 10n * E18), 19_992_600_600_000_000_000_000n);
+  });
+
+  it("buildWooFiSegments — covers amountIn, descending marginals, partition of the curve", () => {
+    const p = pool(true, E8, E8, E6, E18);
+    const amountIn = 100_000n * E18;
+    const segs = buildWooFiSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == query(amountIn) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, wooFiQuery(p, amountIn), "Σ segment effOut == query(amountIn)");
   });
 });
 

@@ -50,6 +50,7 @@ import {
   discoverEulerSwapPoolsTyped,
   discoverMaverickV2PoolsTyped,
   discoverCryptoSwapPoolsTyped,
+  discoverWooFiPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
@@ -57,6 +58,7 @@ import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
+import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
@@ -86,6 +88,7 @@ import {
   type EcoEulerSwap,
   type EcoMaverick,
   type EcoCryptoSwap,
+  type EcoWooFi,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -603,6 +606,34 @@ function buildWombatBrackets(pool: WombatPool, refIdx: number, amountIn: bigint)
 }
 
 /**
+ * Build WOOFi (WooPPV2 sPMM) segments for one pool by sampling the closed-form oracle-price replay at a
+ * SNAPSHOT (NO extra RPC — pure bigint on the read price/spread/coeff/decimals/feeRate). Each sampled
+ * (Δinput, Δoutput) increment becomes a STATIC segment (kind WOOFi) in unified out/in space, refIdx → the
+ * WOOFi venue index. The marginal is the POST-FEE execution price (query already nets the swap fee), so it
+ * enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The WOOFi curve is
+ * OFF-CHAIN ONLY for the split; the on-chain solver executes CALLBACK-FREE (query staticcall + transfer +
+ * pool.swap — WooPPV2 is transfer-first). The split is priced at the SNAPSHOT oracle; the executed dy is
+ * re-read wei-exact by query at the LIVE oracle (see woofi-math.ts for the oracle-snapshot model).
+ */
+function buildWooFiBrackets(pool: WooFiPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildWooFiSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.WOOFi,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the WOOFi swap fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
  * Build EulerSwap segments for one pool by sampling the closed-form f/fInverse curve replay (NO extra RPC
  * — pure bigint on the read reserves + static curve params + fee, BOUNDED by the vault inLimit). Each
  * sampled (Δinput, Δoutput) increment becomes a STATIC segment (kind EulerSwap) in unified out/in space,
@@ -1069,6 +1100,35 @@ export async function prepareEcoSwap(
   }
   for (const set of cryptoBracketSets) brackets.push(...set);
 
+  const wooFiPools: EcoWooFi[] = [];
+  const wooFiBracketSets: EcoBracket[][] = [];
+  // WOOFi (WooPPV2 sPMM) — single-pool-per-chain discovery (the FactoryConfig.address is the WooPPV2
+  // pool). WOOFi is ORACLE-PRICED (prices off its WooracleV2 feed), NOT xy=k, so it is a SAMPLED-SEGMENT
+  // source. `discoverWooFiPoolsTyped` reads the pool's quoteToken/wooracle + the base's SNAPSHOT oracle
+  // state (price/spread/coeff) + decimals + feeRate; only a DIRECT base↔quote leg is in scope (base→base
+  // is two legs). Sampled OFF-CHAIN at the snapshot; executed CALLBACK-FREE (query for minToAmount +
+  // transfer + pool.swap — WooPPV2 is transfer-first, computing the sold amount from balanceOf − reserve).
+  // NO engine change. The split is exact-on-grid at the snapshot; the executed dy is wei-exact at the live
+  // oracle (the exogenous prepare→cook oracle move is bps-tiny for stablecoin pairs + amountOutMin-guarded).
+  const woofiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.WOOFi);
+  if (woofiConfigs.length > 0) {
+    const wooRaw = await discoverWooFiPoolsTyped(tokenIn, tokenOut, client, woofiConfigs);
+    for (const wp of wooRaw) {
+      const refIdx = wooFiPools.length;
+      const wb = buildWooFiBrackets(wp, refIdx, amountIn);
+      if (wb.length === 0) continue;
+      wooFiPools.push({
+        address: wp.address,
+        fromToken: wp.tokenIn,
+        toToken: wp.tokenOut,
+        feePpm: wp.feePpm,
+        source: wp.source,
+      });
+      wooFiBracketSets.push(wb);
+    }
+  }
+  for (const set of wooFiBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1214,7 +1274,8 @@ export async function prepareEcoSwap(
     dodos.length === 0 &&
     solidlyStables.length === 0 &&
     wombats.length === 0 &&
-    balancerStables.length === 0
+    balancerStables.length === 0 &&
+    wooFiPools.length === 0
   ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
@@ -1233,6 +1294,7 @@ export async function prepareEcoSwap(
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   const nCryptoSegs = brackets.filter((b) => b.kind === EcoBracketKind.CryptoSwap).length;
+  const nWooFiSegs = brackets.filter((b) => b.kind === EcoBracketKind.WOOFi).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
@@ -1240,7 +1302,7 @@ export async function prepareEcoSwap(
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap)`,
+      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi)`,
   );
 
   return {
@@ -1260,6 +1322,7 @@ export async function prepareEcoSwap(
     eulerSwaps,
     maverickPools,
     cryptoSwaps,
+    wooFiPools,
     brackets,
     zeroForOne,
     priceLimit,

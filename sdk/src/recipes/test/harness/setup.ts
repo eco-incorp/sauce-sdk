@@ -99,6 +99,11 @@ export const solidlyStablePoolArtifact = loadArtifact(
 export const wombatPoolArtifact = loadArtifact(
   join(FIXTURES, "WombatPool.sol", "WombatPool.json"),
 );
+/** WOOFi (WooPPV2 sPMM) pool — deployed normally (constructor sets base/quote/decimals + a built-in
+ *  settable WooracleV2 state price/spread/coeff + feeRate). */
+export const wooFiPoolArtifact = loadArtifact(
+  join(FIXTURES, "WooFiPool.sol", "WooFiPool.json"),
+);
 /** Trader Joe LB pair — deployed normally (constructor sets tokens/binStep/baseFactor/activeId). */
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
@@ -1044,6 +1049,64 @@ export async function deployWombatPool(
   });
   await writeAndWait(walletClient, publicClient, {
     address: token1Addr, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
+  });
+  return pool;
+}
+
+export const wooFiPoolAbi = parseAbi([
+  "function baseToken() view returns (address)",
+  "function quoteToken() view returns (address)",
+  "function price() view returns (uint256)",
+  "function spread() view returns (uint256)",
+  "function coeff() view returns (uint256)",
+  "function feeRate() view returns (uint256)",
+  "function setState(uint256 price, uint256 spread, uint256 coeff, bool feasible)",
+  "function sync()",
+  "function query(address fromToken, address toToken, uint256 fromAmount) view returns (uint256)",
+  "function swap(address fromToken, address toToken, uint256 fromAmount, uint256 minToAmount, address to, address rebateTo) returns (uint256)",
+]);
+
+/**
+ * Deploy a local WOOFi (WooPPV2 sPMM) pool and fund it with both base + quote reserves.
+ *
+ * Mirrors the canonical WooPPV2 `_calcQuoteAmountSellBase`/`_calcBaseAmountSellQuote` sPMM quote + fee
+ * bit-for-bit (matching the off-chain `woofi-math.ts` replay), so `query(fromToken, toToken, amount)`
+ * returns EXACTLY `query(pool, dx)` to the wei at the CURRENT (settable) oracle state. EcoSwap executes it
+ * callback-free (transfer + swap; WooPPV2 is TRANSFER-FIRST), so the pool must HOLD both tokens — `minter`
+ * transfers baseReserve/quoteReserve in, then `sync()` snaps the internal reserve accounting. `priceDec`
+ * is the price scale (canonically 1e8); `price`/`spread`/`coeff` are the WooracleV2 sPMM inputs. Move the
+ * oracle later with `setState`.
+ */
+export async function deployWooFiPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  base: Hex,
+  quote: Hex,
+  priceDec: bigint,
+  quoteDec: bigint,
+  baseDec: bigint,
+  price: bigint,
+  spread: bigint,
+  coeff: bigint,
+  feeRate: bigint,
+  baseReserve: bigint,
+  quoteReserve: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: wooFiPoolArtifact.abi,
+    bytecode: wooFiPoolArtifact.bytecode,
+    args: [base, quote, priceDec, quoteDec, baseDec, price, spread, coeff, feeRate],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: base, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, baseReserve], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: quote, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, quoteReserve], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: pool, abi: wooFiPoolAbi as Abi, functionName: "sync", args: [], account: acct,
   });
   return pool;
 }

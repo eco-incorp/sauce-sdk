@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20Min {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+}
+
+/// @notice Faithful WOOFi (WooPPV2 synthetic proactive market maker, sPMM v2) 2-token pool for local EVM
+/// tests of EcoSwap's callback-free WOOFi path.
+///
+/// Reproduces the canonical woonetwork/WooPoolV2 `WooPPV2._calcQuoteAmountSellBase` /
+/// `_calcBaseAmountSellQuote` sPMM quote + the `_tryQuerySellBase`/`_tryQuerySellQuote` fee BIT-FOR-BIT
+/// with the off-chain bigint replay in `sdk/src/recipes/shared/woofi-math.ts` — the SAME oracle-price
+/// math (price scaled by priceDec=1e8, spread/coeff/gamma WAD, feeRate 1e5-scaled) and the SAME plain
+/// integer divides. So `query(fromToken, toToken, fromAmount)` returns EXACTLY the off-chain
+/// `query(pool, dx)` to the wei at the CURRENT oracle state — the wei-exact-in-dy gate.
+///
+/// WOOFi is a BASE/QUOTE PMM: `quoteToken` is the numeraire; `baseToken` is priced by the (here BUILT-IN,
+/// settable) WooracleV2 feed. This fixture supports the two DIRECT legs — sell base (base→quote) and sell
+/// quote (quote→base). The oracle state (price/spread/coeff) is SETTABLE via `setState`, so a test can
+/// MOVE the price between prepare and cook and assert the exec re-reads the LIVE oracle (exact-in-dy)
+/// while the split was priced at the snapshot.
+///
+/// EcoSwap executes a WOOFi pool CALLBACK-FREE (it is oracle-priced, NOT xy=k): it reads `query`, TRANSFERS
+/// the input to this pool (WooPPV2 is TRANSFER-FIRST — swap computes the sold amount from
+/// balanceOf(fromToken) − reserve), then calls `swap(fromToken, toToken, amount, minToAmount, to,
+/// rebateTo)`. This fixture implements exactly that surface. The pool HOLDS both tokens so it can pay out.
+contract WooFiPool {
+    uint256 private constant WAD = 1e18;
+    uint256 private constant FEE_SCALE = 1e5;
+
+    address public baseToken;
+    address public quoteToken;
+    uint256 public immutable priceDec; // 10**oracle.decimals(base) (canonically 1e8)
+    uint256 public immutable quoteDec; // 10**decimals(quote)
+    uint256 public immutable baseDec; // 10**decimals(base)
+    uint256 public feeRate; // 1e5-scaled (0.025% = 25)
+
+    // Built-in WooracleV2 state for the base token (the sPMM inputs).
+    uint256 public price; // scaled by priceDec
+    uint256 public spread; // WAD
+    uint256 public coeff; // WAD
+    bool public woFeasible;
+
+    // The pool's internal reserve accounting (WooPPV2 tracks reserve separately from balanceOf so a
+    // transfer-first swap can measure the sold amount as balanceOf − reserve).
+    uint256 public baseReserve;
+    uint256 public quoteReserve;
+
+    event WooSwap(address fromToken, address toToken, uint256 fromAmount, uint256 toAmount, address to);
+
+    constructor(
+        address base_,
+        address quote_,
+        uint256 priceDec_,
+        uint256 quoteDec_,
+        uint256 baseDec_,
+        uint256 price_,
+        uint256 spread_,
+        uint256 coeff_,
+        uint256 feeRate_
+    ) {
+        baseToken = base_;
+        quoteToken = quote_;
+        priceDec = priceDec_;
+        quoteDec = quoteDec_;
+        baseDec = baseDec_;
+        price = price_;
+        spread = spread_;
+        coeff = coeff_;
+        feeRate = feeRate_;
+        woFeasible = true;
+    }
+
+    /// @notice Update the WooracleV2 state for the base token (models a keeper posting a new price).
+    function setState(uint256 price_, uint256 spread_, uint256 coeff_, bool feasible_) external {
+        price = price_;
+        spread = spread_;
+        coeff = coeff_;
+        woFeasible = feasible_;
+    }
+
+    /// @notice Snap the internal reserves to the current balances (called after the deployer funds the
+    /// pool, so the first swap's balanceOf − reserve measures only the newly-transferred input).
+    function sync() external {
+        baseReserve = IERC20Min(baseToken).balanceOf(address(this));
+        quoteReserve = IERC20Min(quoteToken).balanceOf(address(this));
+    }
+
+    // ── sPMM math (mirrors woofi-math.ts / WooPPV2._calc*) ─────────────────
+
+    /// @notice _calcQuoteAmountSellBase then the sell-base fee off the OUTPUT.
+    function _sellBaseQuote(uint256 baseAmount) internal view returns (uint256) {
+        if (baseAmount == 0 || price == 0) return 0;
+        uint256 gamma = (baseAmount * price * coeff) / priceDec / baseDec;
+        if (gamma + spread >= WAD) return 0;
+        uint256 factor = WAD - gamma - spread;
+        uint256 quoteAmount = (((baseAmount * price * quoteDec) / priceDec) * factor) / WAD / baseDec;
+        uint256 fee = (quoteAmount * feeRate) / FEE_SCALE;
+        return quoteAmount > fee ? quoteAmount - fee : 0;
+    }
+
+    /// @notice sell-quote fee off the INPUT then _calcBaseAmountSellQuote.
+    function _sellQuoteBase(uint256 quoteAmount) internal view returns (uint256) {
+        if (quoteAmount == 0 || price == 0) return 0;
+        uint256 swapFee = (quoteAmount * feeRate) / FEE_SCALE;
+        if (quoteAmount <= swapFee) return 0;
+        uint256 q = quoteAmount - swapFee;
+        uint256 gamma = (q * coeff) / quoteDec;
+        if (gamma + spread >= WAD) return 0;
+        uint256 factor = WAD - gamma - spread;
+        return (((q * baseDec * priceDec) / price) * factor) / WAD / quoteDec;
+    }
+
+    /// @notice Exact toAmount for `fromAmount` of `fromToken` at the CURRENT oracle state — identical to
+    /// the off-chain query and to what `swap` enforces.
+    function query(address fromToken, address toToken, uint256 fromAmount) public view returns (uint256) {
+        require(woFeasible, "WooPPV2: !ORACLE_FEASIBLE");
+        if (fromToken == baseToken && toToken == quoteToken) {
+            return _sellBaseQuote(fromAmount);
+        }
+        if (fromToken == quoteToken && toToken == baseToken) {
+            return _sellQuoteBase(fromAmount);
+        }
+        revert("BAD_TOKENS");
+    }
+
+    /// @notice Callback-free swap — the surface EcoSwap calls. WooPPV2 is TRANSFER-FIRST: the caller has
+    /// already transferred `fromAmount` in, so this measures the received amount as balanceOf − reserve,
+    /// quotes the exact out at the LIVE oracle, checks the minimum, pays out, and updates reserves.
+    function swap(
+        address fromToken,
+        address toToken,
+        uint256 fromAmount,
+        uint256 minToAmount,
+        address to,
+        address /*rebateTo*/
+    ) external returns (uint256 realToAmount) {
+        require(to != address(0), "WooPPV2: !to");
+        if (fromToken == baseToken && toToken == quoteToken) {
+            require(IERC20Min(baseToken).balanceOf(address(this)) - baseReserve >= fromAmount, "WooPPV2: !BASE");
+            realToAmount = _sellBaseQuote(fromAmount);
+            require(realToAmount >= minToAmount, "WooPPV2: quoteAmount_LT_minQuoteAmount");
+            baseReserve += fromAmount;
+            quoteReserve -= realToAmount;
+            IERC20Min(quoteToken).transfer(to, realToAmount);
+        } else if (fromToken == quoteToken && toToken == baseToken) {
+            require(IERC20Min(quoteToken).balanceOf(address(this)) - quoteReserve >= fromAmount, "WooPPV2: !QUOTE");
+            realToAmount = _sellQuoteBase(fromAmount);
+            require(realToAmount >= minToAmount, "WooPPV2: baseAmount_LT_minBaseAmount");
+            quoteReserve += fromAmount;
+            baseReserve -= realToAmount;
+            IERC20Min(baseToken).transfer(to, realToAmount);
+        } else {
+            revert("BAD_TOKENS");
+        }
+        emit WooSwap(fromToken, toToken, fromAmount, realToAmount, to);
+    }
+}

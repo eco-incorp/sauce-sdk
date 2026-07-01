@@ -224,6 +224,7 @@ export enum EcoBracketKind {
   EulerSwap = 9, // EulerSwap (Euler v2 vault-backed AMM) segment (static, off-chain-sampled via the f/fInverse curve replay)
   MaverickV2 = 10, // Maverick V2 (bin-based directional AMM) segment (static, off-chain-sampled via the bin swap-math replay; executed through the engine)
   CryptoSwap = 11, // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) segment (static, off-chain-sampled via the A-gamma invariant replay; executed CALLBACK-FREE via approve + exchange(uint256,...))
+  WOOFi = 12, // WOOFi (WooPPV2 synthetic proactive market maker) segment (static, off-chain-sampled via the sPMM oracle-price replay at a snapshot; executed CALLBACK-FREE via transfer + swap(fromToken,toToken,amt,minTo,to,rebateTo))
 }
 
 /**
@@ -574,6 +575,33 @@ export interface EcoCryptoSwap {
 }
 
 /**
+ * One WOOFi venue to execute, indexed by an EcoBracket.refIdx (kind === WOOFi). WOOFi (WooPPV2) is an
+ * ORACLE-PRICED synthetic proactive market maker (sPMM, NOT xy=k): it prices off its on-chain WooracleV2
+ * feed (price/spread/coeff), so it must NOT be routed through the V2 (_swapV2) path. prepare samples the
+ * curve OFF-CHAIN into static segments (kind WOOFi) via the closed-form sPMM replay at a SNAPSHOT oracle
+ * price; the on-chain solver consumes those through the static-segment cursor and EXECUTES the awarded Σ
+ * share CALLBACK-FREE: an on-chain `pool.query(fromToken, toToken, Σ)` staticcall (reading the LIVE
+ * oracle) yields the EXACT out (used as minToAmount), the awarded input is TRANSFERRED to the pool
+ * (WooPPV2 is transfer-first — it computes the sold amount from balanceOf − reserve), and
+ * `pool.swap(fromToken, toToken, Σ, minToAmount, to, rebateTo)` lands it. NO engine SwapPoolType — the
+ * pool view IS the swap math, so it is wei-exact-in-dy at the live oracle. The split is exact-on-grid at
+ * the SNAPSHOT price (the oracle can move between prepare and cook — an exogenous, bps-tiny, guarded
+ * residual; see woofi-math.ts). `address` is the pool; `fromToken`/`toToken` are the swap call's token
+ * args; feePpm (the WooPPV2 feeRate) is the price-ordering coordinate / diagnostic.
+ */
+export interface EcoWooFi {
+  /** Pool address — the query/swap/transfer target. */
+  address: Hex;
+  /** The pool's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The pool's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Rounded ppm fee (the price-ordering coordinate; the on-chain out is the pool query view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -666,6 +694,15 @@ export interface EcoSwapPrepared {
    * CryptoSwap venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
    */
   cryptoSwaps?: EcoCryptoSwap[];
+  /**
+   * WOOFi (WooPPV2 sPMM) venues (kind === WOOFi brackets reference these by refIdx). The on-chain
+   * solver executes the awarded Σ share CALLBACK-FREE (query staticcall for minToAmount + transfer +
+   * pool.swap — NO engine SwapPoolType); the WOOFi marginal is supplied entirely as the static sampled
+   * segments in `brackets` (the sPMM oracle-price replay at a snapshot). Optional/empty when no WOOFi
+   * pools were discovered (omitted ⇒ no WOOFi venue, so existing test-side `EcoSwapPrepared` literals
+   * stay additive-compatible).
+   */
+  wooFiPools?: EcoWooFi[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

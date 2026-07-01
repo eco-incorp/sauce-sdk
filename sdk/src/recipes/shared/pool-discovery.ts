@@ -31,6 +31,7 @@ import type { LbPool } from "./lb-math.js";
 import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 import type { SolidlyStablePool } from "./solidly-stable-math.js";
 import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
+import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type EulerSwapPool } from "./eulerswap-math.js";
 import {
   getSqrtPrice as getMaverickSqrtPrice,
@@ -249,6 +250,22 @@ const maverickPoolAbi = parseAbi([
 
 const woofiAbi = parseAbi([
   "function query(address fromToken, address toToken, uint256 fromAmount) external view returns (uint256 toAmount)",
+]);
+
+// WooPPV2 sPMM read surface for the EcoSwap TYPED path (distinct from the legacy query-only woofiAbi).
+// The pool exposes the quote-token numeraire, the WooracleV2 feed address, and per-base-token feeRate
+// (1e5-scaled) inside the packed `tokenInfos(base)` struct (reserve, feeRate). WooracleV2.state(base)
+// returns the sPMM inputs (price, spread, coeff, woFeasible) and decimals(base) the price scale (1e8).
+const wooPPV2Abi = parseAbi([
+  "function quoteToken() external view returns (address)",
+  "function wooracle() external view returns (address)",
+  "function tokenInfos(address token) external view returns (uint192 reserve, uint16 feeRate, uint128 maxGamma, uint128 maxNotionalSwap)",
+  "function query(address fromToken, address toToken, uint256 fromAmount) external view returns (uint256 toAmount)",
+]);
+
+const wooracleV2Abi = parseAbi([
+  "function state(address base) external view returns (uint128 price, uint64 spread, uint64 coeff, bool woFeasible)",
+  "function decimals(address base) external view returns (uint8)",
 ]);
 
 // ── KyberSwap Classic / DMM ──────────────────────────────────
@@ -1713,6 +1730,109 @@ async function discoverWOOFiPools(
   }
 
   return pools;
+}
+
+/** Round a WooPPV2 feeRate (1e5-scaled, e.g. 25 = 0.025%) to a ppm fee (the price-ordering coordinate). */
+function wooFiFeeToPpm(feeRate: bigint): number {
+  return Number((feeRate * 1_000_000n + WOO_FEE_SCALE / 2n) / WOO_FEE_SCALE);
+}
+
+/**
+ * Discover WOOFi (WooPPV2 sPMM) pools for the pair AS TYPED `WooFiPool` descriptors (the EcoSwap path —
+ * distinct from the legacy `discoverWOOFiPools` PoolInfo aggregator, which only verified the pair). WOOFi
+ * is an ORACLE-PRICED synthetic proactive market maker: each FactoryConfig.address is ONE WooPPV2 pool
+ * (one per chain), a base/quote model where `quoteToken` is the numeraire (usually USDC) and every other
+ * supported token is a `baseToken` priced by WooracleV2. A (tokenIn,tokenOut) swap is a DIRECT leg iff
+ * ONE side is the quote and the OTHER is a supported base (sell base or sell quote) — a base→base pair is
+ * two chained sPMM legs and is OUT of scope for this single-oracle replay.
+ *
+ * The sPMM math is OFF-CHAIN ONLY: this reads the pool's quoteToken + wooracle + the base token's SNAPSHOT
+ * oracle state (price/spread/coeff/woFeasible from wooracle.state(base)) + the price scale
+ * (wooracle.decimals(base)) + the token decimals + the base's feeRate (tokenInfos(base)), so prepare's
+ * `buildWooFiSegments` can replay `query` with NO further RPC, and the on-chain solver consumes the sampled
+ * segments statically + executes CALLBACK-FREE (query staticcall for minToAmount + transfer + pool.swap —
+ * NO engine SwapPoolType, since WOOFi is NOT xy=k and the swap is transfer-first callback-free).
+ *
+ * Mirrors `discoverWombatPoolsTyped` / `discoverSolidlyStablePoolsTyped`: off-chain discovery + state
+ * reads, returning the venue descriptor EcoSwap prepare consumes directly (the on-chain lens does not
+ * understand WOOFi). A pool is kept only when the base is oracle-FEASIBLE (woFeasible && price > 0) and a
+ * small `query` verifies the pair trades. `sellBase` is true when tokenIn is the base (base→quote).
+ */
+export async function discoverWooFiPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  woofiConfigs: FactoryConfig[],
+): Promise<WooFiPool[]> {
+  if (woofiConfigs.length === 0) return [];
+  const inLower = tokenIn.toLowerCase();
+  const outLower = tokenOut.toLowerCase();
+
+  const out: WooFiPool[] = [];
+  const seen = new Set<string>();
+  for (const cfg of woofiConfigs) {
+    const key = cfg.address.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const [quoteToken, wooracle] = await Promise.all([
+        client.readContract({ address: cfg.address, abi: wooPPV2Abi, functionName: "quoteToken" }) as Promise<Hex>,
+        client.readContract({ address: cfg.address, abi: wooPPV2Abi, functionName: "wooracle" }) as Promise<Hex>,
+      ]);
+      if (!quoteToken || quoteToken === ZERO_ADDRESS) continue;
+      const quoteLower = quoteToken.toLowerCase();
+
+      // Exactly one side must be the quote (a base→base pair is two legs — out of scope).
+      const inIsQuote = inLower === quoteLower;
+      const outIsQuote = outLower === quoteLower;
+      if (inIsQuote === outIsQuote) continue; // both-quote (impossible) or neither-quote (base→base)
+      const sellBase = !inIsQuote; // tokenIn is the base ⇒ base→quote
+      const base = sellBase ? tokenIn : tokenOut;
+
+      // SNAPSHOT oracle state + the price scale for the base.
+      const [state, priceDecRaw, feeInfo, decInRaw, decOutRaw, testOut] = await Promise.all([
+        client.readContract({ address: wooracle, abi: wooracleV2Abi, functionName: "state", args: [base] }) as Promise<readonly [bigint, bigint, bigint, boolean]>,
+        client.readContract({ address: wooracle, abi: wooracleV2Abi, functionName: "decimals", args: [base] }).then((d) => Number(d)).catch(() => 8),
+        client.readContract({ address: cfg.address, abi: wooPPV2Abi, functionName: "tokenInfos", args: [base] }).catch(() => null) as Promise<readonly [bigint, bigint, bigint, bigint] | null>,
+        client.readContract({ address: tokenIn, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+        client.readContract({ address: tokenOut, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+        client.readContract({ address: cfg.address, abi: wooPPV2Abi, functionName: "query", args: [tokenIn, tokenOut, 10n ** BigInt(6)] }).catch(() => 0n) as Promise<bigint>,
+      ]);
+      const [price, spread, coeff, woFeasible] = state;
+      if (!woFeasible || price <= 0n) continue; // oracle not feasible — the pool would revert
+      if (testOut === 0n) continue; // pair not supported / no reserve to pay out
+
+      const feeRate = feeInfo ? feeInfo[1] : 0n;
+      // maxGamma / maxNotionalSwap (uint128) — WooPPV2's shared _calc* view path require()s bound BOTH
+      // the swap and the query staticcall; buildWooFiSegments truncates the sampled ladder at them so the
+      // exec never awards a share the on-chain query() would revert on. 0n ⇒ unknown/uncapped.
+      const maxGamma = feeInfo ? feeInfo[2] : 0n;
+      const maxNotionalSwap = feeInfo ? feeInfo[3] : 0n;
+      const priceDec = 10n ** BigInt(priceDecRaw);
+      const baseDec = 10n ** BigInt(sellBase ? decInRaw : decOutRaw);
+      const quoteDec = 10n ** BigInt(sellBase ? decOutRaw : decInRaw);
+      out.push({
+        address: cfg.address,
+        tokenIn,
+        tokenOut,
+        sellBase,
+        price,
+        spread,
+        coeff,
+        priceDec,
+        quoteDec,
+        baseDec,
+        feeRate,
+        maxNotionalSwap,
+        maxGamma,
+        feePpm: wooFiFeeToPpm(feeRate),
+        source: `${cfg.label} (WooFi sPMM)`,
+      });
+    } catch {
+      // Pool / oracle read failed (unsupported token, paused, or not a WooPPV2) — skip.
+    }
+  }
+  return out;
 }
 
 // ── KyberSwap Classic / DMM discovery ───────────────────────
