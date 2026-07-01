@@ -2012,12 +2012,14 @@ export async function discoverWooFiPoolsTyped(
       if (!woFeasible || price <= 0n) continue; // oracle not feasible — the pool would revert
       if (testOut === 0n) continue; // pair not supported / no reserve to pay out
 
-      const feeRate = feeInfo ? feeInfo[1] : 0n;
+      // tokenInfos.feeRate is a uint16, which viem decodes as a JS `number` (not bigint) — coerce to bigint
+      // so the downstream WooFiPool.feeRate (bigint) + wooFiFeeToPpm(bigint) arithmetic never mixes types.
+      const feeRate = feeInfo ? BigInt(feeInfo[1]) : 0n;
       // maxGamma / maxNotionalSwap (uint128) — WooPPV2's shared _calc* view path require()s bound BOTH
       // the swap and the query staticcall; buildWooFiSegments truncates the sampled ladder at them so the
       // exec never awards a share the on-chain query() would revert on. 0n ⇒ unknown/uncapped.
-      const maxGamma = feeInfo ? feeInfo[2] : 0n;
-      const maxNotionalSwap = feeInfo ? feeInfo[3] : 0n;
+      const maxGamma = feeInfo ? BigInt(feeInfo[2]) : 0n;
+      const maxNotionalSwap = feeInfo ? BigInt(feeInfo[3]) : 0n;
       const priceDec = 10n ** BigInt(priceDecRaw);
       const baseDec = 10n ** BigInt(sellBase ? decInRaw : decOutRaw);
       const quoteDec = 10n ** BigInt(sellBase ? decOutRaw : decInRaw);

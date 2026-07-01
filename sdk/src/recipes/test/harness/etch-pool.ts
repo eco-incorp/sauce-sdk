@@ -374,4 +374,995 @@ export const solidlyPoolReadAbi = parseAbi([
   "function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)",
 ]);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// DODO V2 PMM (DSP) prod-mirror etch — ADDITIVE extension of this harness.
+//
+// A DODO DSP pool is an EIP-1167 CLONE of a single DSP implementation, exactly like an
+// Aerodrome Pool — so the SAME etch-runtime mechanism applies: setCode the REAL 45-byte
+// proxy at the pool address + the REAL DSP impl at its captured address, setStorageAt the
+// captured PMM curve state VERBATIM, then repoint the base/quote token slots at local
+// MintableERC20s. The swap then runs the GENUINE DSP bytecode (getPMMStateForCall /
+// querySellBase|Quote / sellBase|sellQuote), computing the mainnet-identical PMM integral.
+//
+// DEPENDENCY CONTRACTS the DSP swap/quote path touches (beyond pool + impl):
+//   • the DODO factory (getDODO(base,quote) → address[]) the production FactoryType.DODOZoo
+//     discovery reads — stood up as a tiny read-only shim returning [pool] for the pair (and
+//     an empty array otherwise). NO factory graph rebuild needed.
+//   • the MT (maintainer) FEE-RATE MODEL. The DSP's querySell*/sell* read the maintainer fee
+//     from it (mulFloor(gross, mtFeeRate)). The REAL model reverts getFeeRate(trader) unless
+//     msg.sender is the pool AND (per the capture) makes an external call to a downstream
+//     fee-rate impl — so we stand up a tiny read-only shim at its CAPTURED address that returns
+//     the CAPTURED RESOLVED mtFeeRate (read from the pool context at capture) for BOTH
+//     getFeeRate(address) (the swap path, pool-as-caller) and _FEE_RATE_() (the discovery
+//     fallback, recipe-as-caller). The fee is a scalar the DSP multiplies in; using the captured
+//     resolved value keeps the executed dy EXACT vs the neutral oracle (whose mtFeeRate came
+//     from the same capture) — see the test's HONEST fee accounting.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** A captured dependency runtime (beyond pool/impl) the swap/quote path touches. */
+export interface DependencyBytecode {
+  name: string;
+  address: Hex;
+  runtime: Hex;
+  runtimeSha256?: Hex;
+}
+
+/** DODO bytecode snapshot: pool proxy + DSP impl (clone) + the dependency runtimes. */
+export interface DodoBytecodeSnapshot extends PoolBytecodeSnapshot {
+  dependencies?: DependencyBytecode[];
+}
+
+/** DODO state snapshot (written by harness/dodo-snapshot.ts). */
+export interface DodoStateSnapshot {
+  chain: string;
+  block: string;
+  pool: Hex;
+  factory: Hex;
+  dvmFactory?: Hex;
+  dspFactory?: Hex;
+  version: string;
+  baseToken: Hex;
+  quoteToken: Hex;
+  baseSymbol: string;
+  quoteSymbol: string;
+  baseDecimals: number;
+  quoteDecimals: number;
+  pmm: { i: string; K: string; B: string; Q: string; B0: string; Q0: string; R: number };
+  baseReserve: string;
+  quoteReserve: string;
+  lpFeeRate: string;
+  mtFeeRate: string;
+  mtFeeRateModel: Hex;
+  probe: {
+    sellBase: { payBaseAmount: string; receiveQuoteAmount: string; mtFee: string };
+    sellQuote: { payQuoteAmount: string; receiveBaseAmount: string; mtFee: string };
+  };
+  storage: Record<string, Hex>;
+  mtStorage?: Record<string, Hex>;
+}
+
+/** Load a DODO `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadDodoSnapshots(name: string): {
+  bytecode: DodoBytecodeSnapshot;
+  state: DodoStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as DodoBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as DodoStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Extend verifyBytecodeIntegrity over the DODO dependency runtimes: re-hash each and match
+ * its capture-time sha256 anchor (NO RPC). Returns pool/impl (via verifyBytecodeIntegrity) +
+ * per-dependency {name, expected, actual, ok}.
+ */
+export function verifyDodoBytecodeIntegrity(bytecode: DodoBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  implementation?: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const base = verifyBytecodeIntegrity(bytecode);
+  const dependencies = (bytecode.dependencies ?? []).map((d) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name: d.name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { ...base, dependencies };
+}
+
+// ── DSP clone storage layout (verified against the captured slots — see dodo-snapshot.ts). ──
+//   slot 1 _BASE_TOKEN_    slot 2 _QUOTE_TOKEN_    slot 14 _MT_FEE_RATE_MODEL_
+// The PMM curve state (packed reserves slot3 / packed targets slot5, guide price i slot17,
+// slippage K slot16, R) is applied VERBATIM from the captured window; getPMMStateForCall
+// recomputes B0/Q0 from it exactly (a DSP _expectTarget round-trip), so we touch ONLY the three
+// address slots after the verbatim copy.
+const DSP_SLOT = {
+  baseToken: 1,
+  quoteToken: 2,
+  mtFeeRateModel: 14,
+} as const;
+
+/** getDODO(address,address) selector (production FactoryType.DODOZoo discovery). */
+const GET_DODO_SELECTOR = "1273b0c6";
+
+/**
+ * A minimal read-only DODO FACTORY shim: getDODO(base,quote) → the single reproduced pool as a
+ * one-element address[]; every other pair / selector → an empty address[]. We setCode this at the
+ * captured factory address and store the pool at slot0. NO Solidity compile, NO write tx.
+ *
+ * ABI return for a one-element address[]: head offset 0x20, then [length=1, pool] — 3 words.
+ * Empty array: [0x20, 0] — 2 words. The shim answers getDODO unconditionally (address-agnostic):
+ * the test stands up exactly ONE DODO pool for the pair, so a constant reply is faithful (the
+ * production discovery queries BOTH orderings and de-dupes on the pool address, so replying the
+ * SAME pool to both orderings is correct — the second is dropped by discovery's `seen` set).
+ */
+export function buildDodoFactoryShimRuntime(): Hex {
+  // Runtime:
+  //   sel = shr(0xe0, calldataload(0))
+  //   if sel == getDODO: mstore(0,0x20); mstore(0x20,1); mstore(0x40,sload(0)); return(0,0x60)
+  //   else:              mstore(0,0x20); mstore(0x20,0);                        return(0,0x40)
+  //
+  // Hand-assembled with an offset-exact JUMPDEST for the getDODO body.
+  const bytes = (h: string) => h.length / 2;
+  const header = "60003560e01c"; // PUSH1 0 CALLDATALOAD PUSH1 0xe0 SHR
+  // DUP1 PUSH4 <sel> EQ PUSH2 <dest> JUMPI
+  const cmp = (sel: string, dest: number) =>
+    "8063" + sel + "1461" + dest.toString(16).padStart(4, "0") + "57";
+  // Empty-array body (fallthrough): mstore(0,0x20) mstore(0x20,0) return(0,0x40)
+  //   PUSH1 0x20 PUSH1 0 MSTORE  PUSH1 0 PUSH1 0x20 MSTORE  PUSH1 0x40 PUSH1 0 RETURN
+  const emptyBody = "6020600052" + "6000602052" + "604060" + "00f3";
+  // getDODO body (JUMPDEST): mstore(0,0x20) mstore(0x20,1) mstore(0x40,sload(0)) return(0,0x60)
+  //   JUMPDEST PUSH1 0x20 PUSH1 0 MSTORE  PUSH1 1 PUSH1 0x20 MSTORE
+  //   PUSH1 0 SLOAD PUSH1 0x40 MSTORE  PUSH1 0x60 PUSH1 0 RETURN
+  const dodoBody =
+    "5b" + "6020600052" + "6001602052" + "600054604052" + "606060" + "00f3";
+
+  const dispatchLen = bytes(header) + bytes(cmp(GET_DODO_SELECTOR, 0)) + bytes(emptyBody);
+  const dodoDest = dispatchLen; // getDODO JUMPDEST sits right after the empty-array fallthrough
+  const code = header + cmp(GET_DODO_SELECTOR, dodoDest) + emptyBody + dodoBody;
+  return ("0x" + code) as Hex;
+}
+
+/** MT fee-rate model shim slot layout: slot0 = the captured resolved mtFeeRate. */
+const MT_SHIM_RATE_SLOT = 0;
+
+/** getFeeRate(address) / _FEE_RATE_() selectors — the two readers the DSP + discovery use. */
+const GET_FEE_RATE_SELECTOR = "8198edbf";
+const FEE_RATE_SELECTOR = "bd2e6ca3";
+
+export interface EtchedDodoPool {
+  /** The DSP pool address (the getDODO / sell target discovery resolves). */
+  pool: Hex;
+  /** The DSP implementation address (etched with the real impl runtime). */
+  impl: Hex;
+  /** The DODO factory shim (getDODO) — point a poolConfig DODOZoo factory here. */
+  factory: Hex;
+  /** The MT fee-rate model shim (getFeeRate / _FEE_RATE_) at its captured address. */
+  mtFeeModel: Hex;
+  /** The locally-deployed base/quote tokens (captured decimals). */
+  baseToken: Hex;
+  quoteToken: Hex;
+  /** Captured reserves + resolved fee rates, echoed for the test. */
+  baseReserve: bigint;
+  quoteReserve: bigint;
+  lpFeeRate: bigint;
+  mtFeeRate: bigint;
+}
+
+/**
+ * Stand up the captured REAL DODO V2 DSP pool on the local anvil, OFFLINE.
+ *
+ *   1. Deploy two MintableERC20s (captured base/quote decimals) — base < NOT sorted: DODO is
+ *      base/quote-ORIENTED, not address-sorted (the DSP stores _BASE_TOKEN_/_QUOTE_TOKEN_
+ *      explicitly), so we assign base=first, quote=second regardless of address order.
+ *   2. setCode the DODO factory shim at the captured factory address; store the pool at slot0.
+ *   3. setCode the MT fee-rate model shim at its captured address; store the RESOLVED mtFeeRate.
+ *   4. setCode the REAL DSP impl at its captured address + the REAL 45-byte EIP-1167 proxy at the
+ *      pool address (the proxy embeds the impl address, so the impl MUST live at its captured
+ *      address for the delegatecall to resolve — the same V4 StateView→PoolManager constraint).
+ *   5. setStorageAt the pool clone VERBATIM (all captured slots), THEN override base/quote token
+ *      (→ local tokens) + the MT fee model slot (→ the shim, which is already at its captured
+ *      address, so this is a re-affirm — kept explicit so a snapshot without the raw window still
+ *      reconstructs). getPMMStateForCall then recomputes the mainnet-identical PMM state.
+ *   6. Fund the pool's base/quote balances with the captured reserves (so sell* can pay out and
+ *      so the DSP's balance-minus-reserve paid-amount read is exact), + caller headroom.
+ *
+ * The swap path then runs the GENUINE DSP bytecode: querySellBase|Quote returns the mainnet-
+ * identical dy for the captured PMM state, and sellBase|sellQuote transfers real tokens.
+ */
+export async function etchDodoPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: DodoBytecodeSnapshot; state: DodoStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedDodoPool> {
+  const { bytecode, state } = snapshots;
+  if (!bytecode.isMinimalProxy || !bytecode.implementation) {
+    throw new Error("etchDodoPool expects an EIP-1167 clone snapshot (pool + DSP implementation)");
+  }
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  // 1. Local base/quote tokens with the CAPTURED decimals (DODO stores tokens explicitly and its
+  //    PMM state is in raw units — decimals must match so the reserves stay valid raw values).
+  const baseToken = await deployToken(
+    walletClient, publicClient, `${state.baseSymbol}-local`, state.baseSymbol, Number(state.baseDecimals),
+  );
+  const quoteToken = await deployToken(
+    walletClient, publicClient, `${state.quoteSymbol}-local`, state.quoteSymbol, Number(state.quoteDecimals),
+  );
+
+  const poolAddress = getAddress(bytecode.pool.address) as Hex;
+  const factory = getAddress(state.factory) as Hex;
+  const mtFeeModel = getAddress(state.mtFeeRateModel) as Hex;
+  const mtFeeRate = BigInt(state.mtFeeRate);
+  const lpFeeRate = BigInt(state.lpFeeRate);
+  const baseReserve = BigInt(state.baseReserve);
+  const quoteReserve = BigInt(state.quoteReserve);
+
+  // 2. DODO factory shim at the captured factory address; store the pool at slot0.
+  await testClient.setCode({ address: factory, bytecode: buildDodoFactoryShimRuntime() });
+  await testClient.setStorageAt({ address: factory, index: slotHex(0), value: addrWord(poolAddress) });
+
+  // 3. MT fee-rate model shim at its captured address; store the RESOLVED mtFeeRate at slot0.
+  //    Answers BOTH getFeeRate(address) (swap path) and _FEE_RATE_() (discovery fallback) → slot0.
+  await testClient.setCode({
+    address: mtFeeModel,
+    bytecode: buildFactoryShimRuntime(
+      [
+        { selector: GET_FEE_RATE_SELECTOR, slot: MT_SHIM_RATE_SLOT },
+        { selector: FEE_RATE_SELECTOR, slot: MT_SHIM_RATE_SLOT },
+      ],
+      0n,
+    ),
+  });
+  await testClient.setStorageAt({
+    address: mtFeeModel,
+    index: slotHex(MT_SHIM_RATE_SLOT),
+    value: word(mtFeeRate),
+  });
+
+  // 4. Etch the REAL DSP impl at its captured address + the REAL proxy at the pool address.
+  const impl = getAddress(bytecode.implementation.address) as Hex;
+  await testClient.setCode({ address: impl, bytecode: bytecode.implementation.runtime });
+  await testClient.setCode({ address: poolAddress, bytecode: bytecode.pool.runtime });
+
+  // 5. Reconstruct the DSP clone's storage VERBATIM, then repoint tokens + MT model.
+  const set = (slot: number, value: Hex) =>
+    testClient.setStorageAt({ address: poolAddress, index: slotHex(slot), value });
+  for (const [k, v] of Object.entries(state.storage)) {
+    await set(Number(k), v);
+  }
+  await set(DSP_SLOT.baseToken, addrWord(baseToken));
+  await set(DSP_SLOT.quoteToken, addrWord(quoteToken));
+  await set(DSP_SLOT.mtFeeRateModel, addrWord(mtFeeModel));
+
+  // 6. Fund the pool's reserves (so sell* can pay out + the paid-amount read is exact) + caller.
+  await mint(walletClient, publicClient, baseToken, poolAddress, baseReserve);
+  await mint(walletClient, publicClient, quoteToken, poolAddress, quoteReserve);
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, baseToken, acct.address as Hex, opts.callerFund);
+    await mint(walletClient, publicClient, quoteToken, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool: poolAddress,
+    impl,
+    factory,
+    mtFeeModel,
+    baseToken,
+    quoteToken,
+    baseReserve,
+    quoteReserve,
+    lpFeeRate,
+    mtFeeRate,
+  };
+}
+
+/** DODO DSP read surface (the getters the test + discovery + oracle read on the REAL pool). */
+export const dodoPoolReadAbi = parseAbi([
+  "function _BASE_TOKEN_() view returns (address)",
+  "function _QUOTE_TOKEN_() view returns (address)",
+  "function _LP_FEE_RATE_() view returns (uint256)",
+  "function _MT_FEE_RATE_MODEL_() view returns (address)",
+  "function getPMMStateForCall() view returns (uint256 i, uint256 K, uint256 B, uint256 Q, uint256 B0, uint256 Q0, uint256 R)",
+  "function querySellBase(address trader, uint256 payBaseAmount) view returns (uint256 receiveQuoteAmount, uint256 mtFee)",
+  "function querySellQuote(address trader, uint256 payQuoteAmount) view returns (uint256 receiveBaseAmount, uint256 mtFee)",
+  "function version() view returns (string)",
+]);
+
+/** DODO factory shim read surface (getDODO). */
+export const dodoFactoryShimAbi = parseAbi([
+  "function getDODO(address baseToken, address quoteToken) view returns (address[] pools)",
+]);
+
+/** MT fee-rate model shim read surface (getFeeRate / _FEE_RATE_). */
+export const dodoMtFeeModelShimAbi = parseAbi([
+  "function getFeeRate(address trader) view returns (uint256)",
+  "function _FEE_RATE_() view returns (uint256)",
+]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Wombat Exchange (single-sided stableswap) prod-mirror etch — ADDITIVE extension.
+//
+// A Wombat Main Pool is NOT an EIP-1167 clone (like Aerodrome/DODO): it is an EIP-1967 TRANSPARENT
+// PROXY delegatecalling a logic impl, and it holds NO tokens itself. Each token's reserve lives in a
+// per-token ASSET contract (cash + liability, both WAD, packed in one storage slot; the Asset HOLDS
+// the underlying ERC20). So the etch shape is richer than a 2-contract clone: proxy + impl + N assets +
+// the underlying ERC20s. The SAME etch-runtime mechanism still applies — setCode the REAL runtimes at
+// their captured addresses, setStorageAt the captured state VERBATIM — but with TWO wrinkles:
+//
+//   • The proxy delegatecalls its impl (the impl address is baked in the proxy runtime as a PUSH20
+//     constant AND stored at the EIP-1967 impl slot), so the impl MUST be etched at its captured
+//     address for swap/quotePotentialSwap to resolve (the same V4 StateView→PoolManager constraint).
+//   • The Asset's `underlyingToken`/`decimals` are IMMUTABLES baked into the Asset bytecode (verified:
+//     the token address literally appears in the Asset runtime, NOT in any storage slot), so the test
+//     CANNOT repoint them via setStorageAt. It must etch a local MintableERC20 AT THE REAL underlying
+//     token address (setCode the MintableERC20 runtime there + seed the `decimals` storage slot). The
+//     Asset then transfers/pulls the LOCAL token (identical bytecode, storage-backed balances) while
+//     satisfying its immutable == the real address.
+//
+// NO factory shim is needed: the production FactoryType.Wombat discovery reads addressOfAsset(token) /
+// ampFactor() / haircutRate() / cash() / liability() directly off the pool + assets (the FactoryConfig
+// `address` IS the pool), so reconstructing the pool + asset state is sufficient for discovery to
+// surface the venue. The on-chain execution is callback-free (quotePotentialSwap staticcall + approve +
+// pool.swap; Wombat PULLS via transferFrom), so no engine SwapPoolType and no factory/gauge graph.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** One captured Asset runtime + its swap-relevant state (cash/liability packed in slot 8). */
+export interface WombatAssetSnapshot {
+  address: Hex;
+  runtime: Hex;
+  runtimeSha256?: Hex;
+}
+
+/** Wombat bytecode snapshot: Pool proxy + logic impl + per-token Asset runtimes (keyed by lowercased
+ *  underlying token address, matching the state snapshot's `assetsMap`). Underlying ERC20 runtimes are
+ *  NOT captured — the test etches its own MintableERC20 at each real token address. */
+export interface WombatBytecodeSnapshot {
+  chain: string;
+  block: string;
+  pool: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  implementation: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  isMinimalProxy: boolean;
+  /** Per-token Asset runtimes, keyed by lowercased underlying token address. */
+  assets: Record<string, WombatAssetSnapshot>;
+}
+
+/** Per-Asset captured state (cash/liability WAD, underlying + held balance, decimals, raw slot window). */
+export interface WombatAssetState {
+  address: Hex;
+  cash: string;
+  liability: string;
+  underlyingToken: Hex;
+  underlyingBalance: string;
+  lpDecimals: number;
+  underlyingDecimals: number;
+  cashLiabSlot: string;
+  storage: Record<string, Hex>;
+}
+
+/** Wombat state snapshot (written by harness/wombat-snapshot.ts). */
+export interface WombatStateSnapshot {
+  chain: string;
+  block: string;
+  pool: Hex;
+  implementation: Hex;
+  tokenUSDC: Hex;
+  tokenUSDT: Hex;
+  decimalsUSDC: number;
+  decimalsUSDT: number;
+  ampFactor: string;
+  haircutRate: string;
+  startCovRatio: string;
+  endCovRatio: string;
+  poolSlots: Record<string, { slot: string; value: Hex }>;
+  /** _assets[token] mapping slots, keyed by lowercased token address. */
+  assetsMap: Record<string, { slot: Hex; value: Hex; asset: Hex }>;
+  poolStorage: Record<string, Hex>;
+  assetUSDC: WombatAssetState;
+  assetUSDT: WombatAssetState;
+  probe: { fromToken: Hex; toToken: Hex; amountIn: string; amountOut: string; haircut: string };
+}
+
+/** Load a Wombat `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadWombatSnapshots(name: string): {
+  bytecode: WombatBytecodeSnapshot;
+  state: WombatStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as WombatBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as WombatStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Wombat bytecode integrity (NO RPC): re-hash the Pool proxy, impl, and every Asset runtime
+ * and match each capture-time sha256 anchor. Returns pool/impl (via verifyBytecodeIntegrity's shape) +
+ * per-asset {token, expected, actual, ok}.
+ */
+export function verifyWombatBytecodeIntegrity(bytecode: WombatBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  implementation: { expected?: Hex; actual: Hex; ok: boolean };
+  assets: { token: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const poolActual = runtimeSha256(bytecode.pool.runtime);
+  const implActual = runtimeSha256(bytecode.implementation.runtime);
+  const assets = Object.entries(bytecode.assets).map(([token, a]) => {
+    const actual = runtimeSha256(a.runtime);
+    return {
+      token,
+      expected: a.runtimeSha256,
+      actual,
+      ok: !a.runtimeSha256 || a.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return {
+    pool: {
+      expected: bytecode.pool.runtimeSha256,
+      actual: poolActual,
+      ok: !bytecode.pool.runtimeSha256 || bytecode.pool.runtimeSha256.toLowerCase() === poolActual.toLowerCase(),
+    },
+    implementation: {
+      expected: bytecode.implementation.runtimeSha256,
+      actual: implActual,
+      ok:
+        !bytecode.implementation.runtimeSha256 ||
+        bytecode.implementation.runtimeSha256.toLowerCase() === implActual.toLowerCase(),
+    },
+    assets,
+  };
+}
+
+// ── MintableERC20 storage layout (verified empirically): slot2 = decimals (uint8). name/symbol/supply/
+//    balanceOf/allowance are set by the constructor / mint(); only `decimals()` needs seeding when the
+//    runtime is etched at a foreign address (the constructor never ran there). ──
+const ERC20_DECIMALS_SLOT = 2;
+
+// EIP-1967 implementation slot: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1).
+const EIP1967_IMPL_SLOT =
+  "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc" as Hex;
+
+export interface EtchedWombatPool {
+  /** The Wombat Main Pool proxy address (the quotePotentialSwap/swap + discovery target). */
+  pool: Hex;
+  /** The logic implementation address (etched with the real impl runtime). */
+  impl: Hex;
+  /** The from-token (== state.tokenUSDC) — a local MintableERC20 etched at the REAL underlying address. */
+  fromToken: Hex;
+  /** The to-token (== state.tokenUSDT). */
+  toToken: Hex;
+  /** The from/to Asset addresses (etched with the real Asset runtimes at their captured addresses). */
+  fromAsset: Hex;
+  toAsset: Hex;
+  /** Captured pool-wide params, echoed for the test. */
+  ampFactor: bigint;
+  haircutRate: bigint;
+}
+
+/**
+ * Stand up the captured REAL Wombat Main Pool on the local anvil, OFFLINE.
+ *
+ *   1. Deploy ONE local MintableERC20 to capture its runtime, then setCode that runtime at EACH real
+ *      underlying token address (USDC + USDT) and seed the `decimals` slot — because the Asset's
+ *      `underlyingToken` immutable points at the real address, the local token MUST live there.
+ *   2. setCode the REAL Pool impl at its captured address + the REAL Pool proxy at the pool address
+ *      (the proxy delegatecalls the impl; the impl address is baked in the proxy runtime, so the impl
+ *      MUST sit at its captured address).
+ *   3. setCode each REAL Asset runtime at its captured address; setStorageAt the captured Asset storage
+ *      VERBATIM (slot 8 packs cash|liability — the swap-relevant state).
+ *   4. Reconstruct the Pool proxy storage: the EIP-1967 impl slot, the captured linear window (amp 202 /
+ *      haircut 203 / covRatio 264 / reentrancy guard 0), and the two hashed _assets[token] mapping slots
+ *      (so addressOfAsset(token) resolves each Asset — the production discovery + the swap read this).
+ *   5. Fund each Asset with its captured underlying balance (so pool.swap can pay out tokenOut and the
+ *      Asset's held-balance invariants hold), + caller headroom in the from-token.
+ *
+ * The swap path then runs the GENUINE impl + Asset bytecode: quotePotentialSwap returns the mainnet-
+ * identical dy for the captured coverage-ratio state, and pool.swap PULLS the from-token via
+ * transferFrom + pays out the to-token.
+ */
+export async function etchWombatPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: WombatBytecodeSnapshot; state: WombatStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedWombatPool> {
+  const { bytecode, state } = snapshots;
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(state.pool) as Hex;
+  const impl = getAddress(bytecode.implementation.address) as Hex;
+  const fromToken = getAddress(state.tokenUSDC) as Hex;
+  const toToken = getAddress(state.tokenUSDT) as Hex;
+
+  // 1. Capture a local MintableERC20 runtime, then etch it at EACH real underlying token address.
+  //    (The Asset bakes underlyingToken as an immutable → the local token must live at the real addr.)
+  const scratch = await deployToken(walletClient, publicClient, "wombat-scratch", "WSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  for (const [tok, dec] of [
+    [fromToken, state.decimalsUSDC],
+    [toToken, state.decimalsUSDT],
+  ] as [Hex, number][]) {
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(dec)) });
+  }
+
+  // 2. Etch the REAL impl at its captured address + the REAL proxy at the pool address.
+  await testClient.setCode({ address: impl, bytecode: bytecode.implementation.runtime });
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+
+  // 3. Etch each REAL Asset runtime at its captured address + setStorageAt its captured storage verbatim.
+  const assetByToken: Record<string, WombatAssetState> = {
+    [fromToken.toLowerCase()]: state.assetUSDC,
+    [toToken.toLowerCase()]: state.assetUSDT,
+  };
+  for (const [tokLower, aState] of Object.entries(assetByToken)) {
+    const assetRuntime = bytecode.assets[tokLower];
+    if (!assetRuntime) throw new Error(`no Asset runtime in snapshot for token ${tokLower}`);
+    const assetAddr = getAddress(aState.address) as Hex;
+    await testClient.setCode({ address: assetAddr, bytecode: assetRuntime.runtime });
+    for (const [k, v] of Object.entries(aState.storage)) {
+      await testClient.setStorageAt({ address: assetAddr, index: slotHex(Number(k)), value: v });
+    }
+  }
+
+  // 4. Reconstruct the Pool proxy storage: EIP-1967 impl slot, the captured linear window, and the two
+  //    hashed _assets[token] mapping slots (addressOfAsset(token) → the Asset).
+  await testClient.setStorageAt({ address: pool, index: EIP1967_IMPL_SLOT, value: addrWord(impl) });
+  for (const [k, v] of Object.entries(state.poolStorage)) {
+    await testClient.setStorageAt({ address: pool, index: slotHex(Number(k)), value: v });
+  }
+  for (const entry of Object.values(state.assetsMap)) {
+    await testClient.setStorageAt({ address: pool, index: entry.slot, value: entry.value });
+  }
+
+  // 5. Fund each Asset with its captured held underlying balance, + caller headroom in the from-token.
+  await mint(walletClient, publicClient, fromToken, getAddress(state.assetUSDC.address) as Hex, BigInt(state.assetUSDC.underlyingBalance));
+  await mint(walletClient, publicClient, toToken, getAddress(state.assetUSDT.address) as Hex, BigInt(state.assetUSDT.underlyingBalance));
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, fromToken, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    impl,
+    fromToken,
+    toToken,
+    fromAsset: getAddress(state.assetUSDC.address) as Hex,
+    toAsset: getAddress(state.assetUSDT.address) as Hex,
+    ampFactor: BigInt(state.ampFactor),
+    haircutRate: BigInt(state.haircutRate),
+  };
+}
+
+/** Wombat Pool read surface (the getters the test + discovery + oracle read on the REAL pool). */
+export const wombatPoolReadAbi = parseAbi([
+  "function addressOfAsset(address token) view returns (address)",
+  "function ampFactor() view returns (uint256)",
+  "function haircutRate() view returns (uint256)",
+  "function quotePotentialSwap(address fromToken, address toToken, int256 fromAmount) view returns (uint256 potentialOutcome, uint256 haircut)",
+]);
+
+/** Wombat Asset read surface (cash/liability WAD; underlyingToken immutable). */
+export const wombatAssetReadAbi = parseAbi([
+  "function cash() view returns (uint120)",
+  "function liability() view returns (uint120)",
+  "function underlyingToken() view returns (address)",
+  "function decimals() view returns (uint8)",
+]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WOOFi (WooPPV2 sPMM v2) prod-mirror etch — ADDITIVE extension of this harness.
+//
+// A WooPPV2 pool is NOT an EIP-1167 clone (like Aerodrome/DODO) and NOT a Wombat-style asset graph: it is
+// an EIP-1967 TRANSPARENT PROXY delegatecalling a sPMM logic impl, plus a SEPARATE WooracleV2 price feed
+// contract, plus TWO Chainlink CL aggregator feeds the oracle consults for feasibility/staleness. So the
+// FULL swap/quote dependency graph the test reproduces is:
+//
+//   WooPPV2 proxy 0x5520…9FA4  (EIP-1967 transparent proxy)
+//     └ delegatecall → WooPPV2 impl  (the sPMM query/swap math)
+//          ├ tokenIn.balanceOf(pool)              (transfer-first: sold = balanceOf − tokenInfos.reserve)
+//          ├ WooracleV2.state(base)                → the sPMM price/spread/coeff + feasibility
+//          │    ├ CL[base].latestRoundData()       (Chainlink base/USD feed)
+//          │    └ CL[quote].latestRoundData()      (Chainlink quote/USD feed)
+//          └ tokenInfos(base) / quoteToken()       (per-base feeRate + reserve; numeraire)
+//
+// The SAME etch-runtime mechanism applies for the pool + impl + oracle — setCode the REAL runtimes at their
+// captured addresses, setStorageAt the captured state VERBATIM — with THREE wrinkles unique to WOOFi:
+//
+//   • EIP-1967 impl slot. The proxy delegatecalls the impl address stored at the EIP-1967 impl slot (NOT a
+//     PUSH20 in the runtime like an EIP-1167 clone), so we reconstruct that slot + etch the REAL impl at its
+//     captured address (the same V4 StateView→PoolManager immutable constraint — the swap resolves only when
+//     the impl sits at the address the slot names).
+//   • MAPPING-KEYED STATE. WooPPV2.tokenInfos(base), WooracleV2.woState(base)/clOracles(base)/clOracles(quote)
+//     are all mapping entries keyed by the REAL token address (keccak(token, baseSlot)). They CANNOT be
+//     repointed at a fresh local token by overwriting a scalar (like Solidly's token0 slot) — the keys would
+//     no longer match. So (mirroring Wombat's immutable-underlying) the test etches a local MintableERC20
+//     runtime AT EACH REAL token address (USDT + USDC) and seeds its `decimals` slot; every captured mapping
+//     slot then stays valid and the pool moves the local (storage-backed) tokens.
+//   • CHAINLINK FEEDS ARE AGGREGATOR PROXIES that DELEGATECALL an underlying aggregator NOT in the capture —
+//     so their REAL runtime cannot be etched and made to answer latestRoundData() (it forwards to an
+//     uncaptured aggregator). Per the capture note, the test etches a tiny READ-ONLY CL SHIM at each CL feed
+//     address that returns the CAPTURED latestRoundData 5-tuple (roundId, answer, startedAt, updatedAt,
+//     answeredInRound) + decimals — the deterministic values state() gated on at the pinned block. The block
+//     TIMESTAMP must be pinned in the test (setNextBlockTimestamp) so state()'s WO-staleness (block.timestamp
+//     ≤ oracle.timestamp + staleDuration) + the CL updatedAt windows pass exactly as at capture.
+//
+// NO factory shim is needed: FactoryType.WOOFi discovery reads quoteToken()/wooracle()/tokenInfos()/
+// state()/decimals() directly off the pool + oracle (the FactoryConfig `address` IS the WooPPV2 pool). The
+// on-chain execution is callback-free (query() staticcall → transfer → pool.swap; WooPPV2 is TRANSFER-FIRST),
+// so no engine SwapPoolType and no router/gauge graph.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** WOOFi bytecode snapshot: WooPPV2 proxy + impl + dependency runtimes (wooracle + the two CL feeds). */
+export interface WooFiBytecodeSnapshot {
+  chain: string;
+  chainId?: number;
+  block: string;
+  blockTimestamp?: string;
+  pool: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  implementation: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  isMinimalProxy: boolean;
+  /** wooracle + clBase + clQuote real runtimes (each sha256-anchored). */
+  dependencies: {
+    wooracle: DependencyBytecode;
+    clBase: DependencyBytecode;
+    clQuote: DependencyBytecode;
+  };
+}
+
+/** One captured Chainlink round (the deterministic latestRoundData the CL shim replays). */
+export interface WooFiClRound {
+  token: Hex;
+  feed: Hex;
+  decimals: number;
+  oracleDecimal: number;
+  cloPreferred: boolean;
+  latestRoundData: {
+    roundId: string;
+    answer: string;
+    startedAt: string;
+    updatedAt: string;
+    answeredInRound: string;
+  };
+}
+
+/** WOOFi state snapshot (written by harness/woofi-snapshot.ts). */
+export interface WooFiStateSnapshot {
+  chain: string;
+  chainId?: number;
+  block: string;
+  blockTimestamp: string;
+  source: string;
+  pool: Hex;
+  poolImpl: Hex;
+  eip1967ImplSlot: Hex;
+  wooracle: Hex;
+  tokenIn: Hex; // == base (sellBase: base → quote)
+  tokenOut: Hex; // == quote
+  base: Hex;
+  quote: Hex;
+  sellBase: boolean;
+  tokenInSymbol: string;
+  tokenOutSymbol: string;
+  decimalsIn: number;
+  decimalsOut: number;
+  oracle: {
+    quoteToken: Hex;
+    price: string;
+    spread: string;
+    coeff: string;
+    woFeasible: boolean;
+    priceDecimals: number;
+    quoteDecimals: number;
+    timestamp: string;
+    staleDuration: string;
+    bound: string;
+    woState: { price: string; spread: string; coeff: string; woFeasible: boolean };
+  };
+  tokenInfos: { reserve: string; feeRate: string; maxGamma: string; maxNotionalSwap: string };
+  reserves: { usdc: string; usdt: string };
+  clOracles: { base: WooFiClRound; quote: WooFiClRound };
+  storage: {
+    wooracle: Record<string, Hex>;
+    pool: Record<string, Hex>;
+  };
+  probe: { fromToken: Hex; toToken: Hex; fromAmount: string; toAmount: string };
+}
+
+/** Load a WOOFi `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadWooFiSnapshots(name: string): {
+  bytecode: WooFiBytecodeSnapshot;
+  state: WooFiStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as WooFiBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as WooFiStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the WOOFi bytecode integrity (NO RPC): re-hash the WooPPV2 proxy, impl, and the wooracle + both CL
+ * feed runtimes and match each capture-time sha256 anchor. Returns pool/impl (via verifyBytecodeIntegrity's
+ * shape) + per-dependency {name, expected, actual, ok}. (The two CL runtimes carry anchors too even though
+ * the test etches SHIMS in their place — the anchor still proves the CAPTURED real runtime blob is intact.)
+ */
+export function verifyWooFiBytecodeIntegrity(bytecode: WooFiBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  implementation: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const poolActual = runtimeSha256(bytecode.pool.runtime);
+  const implActual = runtimeSha256(bytecode.implementation.runtime);
+  const dependencies = Object.entries(bytecode.dependencies).map(([name, d]) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return {
+    pool: {
+      expected: bytecode.pool.runtimeSha256,
+      actual: poolActual,
+      ok: !bytecode.pool.runtimeSha256 || bytecode.pool.runtimeSha256.toLowerCase() === poolActual.toLowerCase(),
+    },
+    implementation: {
+      expected: bytecode.implementation.runtimeSha256,
+      actual: implActual,
+      ok:
+        !bytecode.implementation.runtimeSha256 ||
+        bytecode.implementation.runtimeSha256.toLowerCase() === implActual.toLowerCase(),
+    },
+    dependencies,
+  };
+}
+
+/**
+ * Build a tiny READ-ONLY Chainlink-feed shim runtime that replays a CAPTURED round.
+ *
+ * Answers exactly the two selectors WooracleV2.state() calls on a CL feed:
+ *   latestRoundData() feaf968c → the 5-word tuple (roundId, answer, startedAt, updatedAt, answeredInRound)
+ *   decimals()        313ce567 → the feed's uint8 decimals
+ * Any UNLISTED selector returns a single zero word (an explicit default — state() touches no other CL getter).
+ *
+ * The round is HARDCODED as PUSH32 constants in the return body (the values are captured constants — no
+ * storage seeding needed). `answer` is an int256 stored as its two's-complement 256-bit word; all captured
+ * answers are positive (a USD stable feed), so the raw bigint is the correct word. Hand-assembled with an
+ * offset-exact JUMPDEST per body, so it needs NO Solidity compile and NO write tx.
+ */
+export function buildChainlinkFeedShimRuntime(round: {
+  roundId: bigint;
+  answer: bigint;
+  startedAt: bigint;
+  updatedAt: bigint;
+  answeredInRound: bigint;
+  decimals: bigint;
+}): Hex {
+  const bytes = (h: string) => h.length / 2;
+  const w = (v: bigint) => {
+    // int256/uint256 two's-complement 256-bit word (positive values fit directly).
+    const masked = ((v % (1n << 256n)) + (1n << 256n)) % (1n << 256n);
+    return masked.toString(16).padStart(64, "0");
+  };
+  // latestRoundData body: mstore each of 5 words at 0x00,0x20,0x40,0x60,0x80 then return(0,0xa0).
+  //   PUSH32 <word> PUSH1 <off> MSTORE  (×5), then PUSH1 0xa0 PUSH1 0 RETURN.
+  const mstore = (word: bigint, off: number) =>
+    "7f" + w(word) + "60" + off.toString(16).padStart(2, "0") + "52";
+  const lrdBody =
+    "5b" + // JUMPDEST
+    mstore(round.roundId, 0x00) +
+    mstore(round.answer, 0x20) +
+    mstore(round.startedAt, 0x40) +
+    mstore(round.updatedAt, 0x60) +
+    mstore(round.answeredInRound, 0x80) +
+    "60a0" + "6000" + "f3"; // PUSH1 0xa0 PUSH1 0 RETURN (return(0, 0xa0))
+  // decimals body: PUSH32 <dec> PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN.
+  const decBody = "5b" + "7f" + w(round.decimals) + "600052602060" + "00f3";
+  // default body (fallthrough): return one zero word.
+  const zeroBody = "600060005260206000" + "f3"; // PUSH1 0 PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+
+  const header = "60003560e01c"; // sel = shr(0xe0, calldataload(0))
+  const cmp = (sel: string, dest: number) =>
+    "8063" + sel + "1461" + dest.toString(16).padStart(4, "0") + "57"; // DUP1 PUSH4 sel EQ PUSH2 dest JUMPI
+
+  // Dispatch: header + cmp(latestRoundData) + cmp(decimals) + zero-body fallthrough, THEN the two JUMPDEST bodies.
+  const dispatchLen =
+    bytes(header) + bytes(cmp("00000000", 0)) + bytes(cmp("00000000", 0)) + bytes(zeroBody);
+  const lrdDest = dispatchLen;
+  const decDest = lrdDest + bytes(lrdBody);
+  const code =
+    header +
+    cmp("feaf968c", lrdDest) + // latestRoundData()
+    cmp("313ce567", decDest) + // decimals()
+    zeroBody +
+    lrdBody +
+    decBody;
+  return ("0x" + code) as Hex;
+}
+
+// EIP-1967 impl slot: reuse the constant defined for Wombat (EIP1967_IMPL_SLOT), and the ERC20 decimals slot.
+
+export interface EtchedWooFiPool {
+  /** The WooPPV2 pool proxy address (the query/swap + discovery target — captured mainnet address). */
+  pool: Hex;
+  /** The sPMM logic implementation address (etched with the real impl runtime at its captured address). */
+  impl: Hex;
+  /** The WooracleV2 price-feed address (etched with the real oracle runtime at its captured address). */
+  wooracle: Hex;
+  /** The two Chainlink CL feed addresses (etched with the read-only round shims at their captured addresses). */
+  clBase: Hex;
+  clQuote: Hex;
+  /** The tokenIn (== base, sellBase) — a local MintableERC20 etched at the REAL base token address. */
+  tokenIn: Hex;
+  /** The tokenOut (== quote). */
+  tokenOut: Hex;
+  base: Hex;
+  quote: Hex;
+  /** Captured per-base config, echoed for the test. */
+  reserve: bigint;
+  feeRate: bigint;
+  /** Captured oracle state, echoed for the test. */
+  price: bigint;
+  spread: bigint;
+  coeff: bigint;
+  /** The pinned capture block timestamp — the test MUST setNextBlockTimestamp to this before cook. */
+  blockTimestamp: bigint;
+}
+
+/**
+ * Stand up the captured REAL Arbitrum WooPPV2 sPMM pool on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it AT EACH real token address (base + quote) and
+ *      seed its `decimals` slot — because tokenInfos/woState/clOracles are keyed by the REAL token address,
+ *      the local tokens MUST live at those addresses (mirrors Wombat's immutable-underlying etch).
+ *   2. setCode the REAL WooPPV2 impl at its captured address + the REAL proxy at the pool address (the proxy
+ *      delegatecalls the impl named by the EIP-1967 slot, so the impl MUST sit at its captured address).
+ *   3. setCode the REAL WooracleV2 runtime at its captured address; setStorageAt its captured storage verbatim.
+ *   4. setCode a read-only CL shim at EACH CL feed address, replaying its captured latestRoundData + decimals
+ *      (the real CL runtimes are aggregator proxies delegating to uncaptured aggregators — a shim is the only
+ *      faithful offline stand-in, and the captured rounds are the deterministic values state() gated on).
+ *   5. setStorageAt the WooPPV2 proxy storage verbatim (EIP-1967 impl slot + quoteToken/wooracle/feeAddr +
+ *      the packed tokenInfos(base) slots) and the wooracle storage verbatim (already in step 3).
+ *   6. Fund the pool's BASE balance to EXACTLY tokenInfos.reserve (so the transfer-first sold = balanceOf −
+ *      reserve reads the transferred amount) and its QUOTE balance generously (so swap can pay out), + caller
+ *      headroom in tokenIn.
+ *
+ * The swap path then runs the GENUINE impl + oracle bytecode: query(base, quote, dx) reads the LIVE oracle
+ * state (gated on the pinned timestamp + the CL shims) and returns the mainnet-identical toAmount, and swap()
+ * computes sold from the transferred balance and pays out the quote.
+ */
+export async function etchWooFiPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: WooFiBytecodeSnapshot; state: WooFiStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedWooFiPool> {
+  const { bytecode, state } = snapshots;
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(state.pool) as Hex;
+  const impl = getAddress(bytecode.implementation.address) as Hex;
+  const wooracle = getAddress(state.wooracle) as Hex;
+  const base = getAddress(state.base) as Hex;
+  const quote = getAddress(state.quote) as Hex;
+  const tokenIn = getAddress(state.tokenIn) as Hex; // == base (sellBase)
+  const tokenOut = getAddress(state.tokenOut) as Hex; // == quote
+  const clBase = getAddress(state.clOracles.base.feed) as Hex;
+  const clQuote = getAddress(state.clOracles.quote.feed) as Hex;
+  const reserve = BigInt(state.tokenInfos.reserve);
+  const feeRate = BigInt(state.tokenInfos.feeRate);
+  const blockTimestamp = BigInt(state.blockTimestamp);
+
+  // 1. Capture a local MintableERC20 runtime, then etch it at EACH real token address + seed decimals.
+  const scratch = await deployToken(walletClient, publicClient, "woofi-scratch", "WSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  for (const [tok, dec] of [
+    [base, state.decimalsIn],
+    [quote, state.decimalsOut],
+  ] as [Hex, number][]) {
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(dec)) });
+  }
+
+  // 2. Etch the REAL impl at its captured address + the REAL proxy at the pool address.
+  await testClient.setCode({ address: impl, bytecode: bytecode.implementation.runtime });
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+
+  // 3. Etch the REAL WooracleV2 runtime at its captured address + setStorageAt its captured storage verbatim.
+  await testClient.setCode({ address: wooracle, bytecode: bytecode.dependencies.wooracle.runtime });
+  for (const [k, v] of Object.entries(state.storage.wooracle)) {
+    await testClient.setStorageAt({ address: wooracle, index: k as Hex, value: v });
+  }
+
+  // 4. Etch a read-only CL shim at EACH CL feed address, replaying its captured latestRoundData + decimals.
+  for (const cl of [state.clOracles.base, state.clOracles.quote]) {
+    const rd = cl.latestRoundData;
+    const shim = buildChainlinkFeedShimRuntime({
+      roundId: BigInt(rd.roundId),
+      answer: BigInt(rd.answer),
+      startedAt: BigInt(rd.startedAt),
+      updatedAt: BigInt(rd.updatedAt),
+      answeredInRound: BigInt(rd.answeredInRound),
+      decimals: BigInt(cl.decimals),
+    });
+    await testClient.setCode({ address: getAddress(cl.feed) as Hex, bytecode: shim });
+  }
+
+  // 5. setStorageAt the WooPPV2 proxy storage verbatim (EIP-1967 impl slot + scalars + packed tokenInfos).
+  for (const [k, v] of Object.entries(state.storage.pool)) {
+    await testClient.setStorageAt({ address: pool, index: k as Hex, value: v });
+  }
+  // Re-affirm the EIP-1967 impl slot from the typed field (already in storage.pool, but explicit so a
+  // snapshot without the raw window still resolves the delegate).
+  await testClient.setStorageAt({ address: pool, index: state.eip1967ImplSlot, value: addrWord(impl) });
+
+  // 6. Fund the pool: BASE to EXACTLY tokenInfos.reserve (transfer-first sold = balanceOf − reserve), QUOTE
+  //    generously (so swap pays out), + caller headroom in tokenIn.
+  await mint(walletClient, publicClient, base, pool, reserve);
+  await mint(walletClient, publicClient, quote, pool, BigInt(state.reserves.usdc));
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    impl,
+    wooracle,
+    clBase,
+    clQuote,
+    tokenIn,
+    tokenOut,
+    base,
+    quote,
+    reserve,
+    feeRate,
+    price: BigInt(state.oracle.price),
+    spread: BigInt(state.oracle.spread),
+    coeff: BigInt(state.oracle.coeff),
+    blockTimestamp,
+  };
+}
+
+/** WooPPV2 pool read surface (the getters the test + discovery + oracle read on the REAL pool). */
+export const wooFiPoolReadAbi = parseAbi([
+  "function quoteToken() view returns (address)",
+  "function wooracle() view returns (address)",
+  "function tokenInfos(address token) view returns (uint192 reserve, uint16 feeRate, uint128 maxGamma, uint128 maxNotionalSwap)",
+  "function query(address fromToken, address toToken, uint256 fromAmount) view returns (uint256 toAmount)",
+]);
+
+/** WooracleV2 read surface (state / decimals — the sPMM inputs the test cross-checks). */
+export const wooracleV2ReadAbi = parseAbi([
+  "function state(address base) view returns (uint128 price, uint64 spread, uint64 coeff, bool woFeasible)",
+  "function decimals(address base) view returns (uint8)",
+  "function clOracles(address token) view returns (address oracle, int8 decimal, bool cloPreferred)",
+]);
+
+/** Chainlink CL feed read surface (the two getters the CL shim answers). */
+export const chainlinkFeedReadAbi = parseAbi([
+  "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+  "function decimals() view returns (uint8)",
+]);
+
 export { erc20Abi };
