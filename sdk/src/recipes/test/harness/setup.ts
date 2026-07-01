@@ -1756,6 +1756,48 @@ export async function setupAlgebraPool(
   return { pool, inner };
 }
 
+/**
+ * Wrap an ALREADY-CREATED v3-core `inner` pool in the Algebra adapter and register it on the
+ * Algebra factory's poolByPair, WITHOUT minting (the caller reconstructed the inner pool's tick
+ * profile separately — e.g. via reproducePool for the prod-mirror lane). The adapter exposes the
+ * Algebra read surface (globalState/liquidity/tickSpacing/ticks) proxied off the inner pool and
+ * re-enters the engine via algebraSwapCallback at swap time (sauce#186), so the executed swap math
+ * is the inner pool's genuine v3-core math over its reconstructed state while the callback PATH is
+ * the real Algebra path. `dynFee` is the (uint16) dynamic fee the adapter reports for both
+ * directions — pass the captured globalState fee so the lens prices at the fee the pool charged.
+ * Returns the adapter address discovery surfaces via poolByPair(token0, token1).
+ */
+export async function wrapAlgebraAdapter(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  algebraFactory: Hex,
+  inner: Hex,
+  token0: Hex,
+  token1: Hex,
+  dynFee: number,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: algebraPoolArtifact.abi,
+    bytecode: algebraPoolArtifact.bytecode,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: pool,
+    abi: algebraPoolAbi as Abi,
+    functionName: "initialize",
+    args: [inner, dynFee, dynFee],
+    account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: algebraFactory,
+    abi: algebraFactoryAbi as Abi,
+    functionName: "setPool",
+    args: [token0, token1, pool],
+    account: minter,
+  });
+  return pool;
+}
+
 /** Read the Algebra adapter's globalState (price/tick + dynamic fee per direction). */
 export async function getAlgebraGlobalState(
   publicClient: PublicClient,
