@@ -131,9 +131,15 @@ describe("EcoSwap Trader Joe LB (local fixture) — engine _swapTraderJoeLB exac
   let tokenIn: Hex; // = tokenX of every LB pair (swapForY: X → Y)
   let tokenOut: Hex; // = tokenY
   let solverSrc: string;
-  let cleanSnapshot: Hex;
+  // Each cell runs on its OWN fresh anvil + freshly-deployed stack (setup() below): no shared
+  // mutable node state between cells, so there is no snapshot/loadState reset race (the old
+  // revert+re-snapshot dance dropped a cell to a 0-fill; a bare loadState MERGES and drifts each
+  // cell's pool address). reset() just tears the anvil down and rebuilds. See setup().
 
-  before(async () => {
+  // Boot a fresh anvil + deploy the whole stack. Called by before() once and by reset() before
+  // every subsequent cell, tearing the prior anvil down first — so each cell is fully isolated.
+  async function setup(): Promise<void> {
+    anvil?.stop();
     anvil = await startAnvil();
     c = await makeClients(anvil.rpcUrl);
     await ensureMulticall3(c.publicClient, c.testClient);
@@ -148,16 +154,16 @@ describe("EcoSwap Trader Joe LB (local fixture) — engine _swapTraderJoeLB exac
     await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
 
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
-    cleanSnapshot = await c.testClient.snapshot();
-  });
+  }
+
+  before(setup);
 
   after(() => {
     anvil?.stop();
   });
 
   async function reset(): Promise<void> {
-    await c.testClient.revert({ id: cleanSnapshot });
-    cleanSnapshot = await c.testClient.snapshot();
+    await setup();
   }
 
   // Off-chain LbPool descriptor for a deployed fixture. tokenIn is the pair's tokenX, so the trade

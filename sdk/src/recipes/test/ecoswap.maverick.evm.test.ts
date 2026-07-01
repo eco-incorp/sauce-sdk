@@ -147,15 +147,17 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
   let tokenIn: Hex; // == the pool's tokenA (tokenAIn) — the price-rising side
   let tokenOut: Hex; // == the pool's tokenB
   let solverSrc: string;
-  // ONE immutable base snapshot taken in before() (after Multicall3 etch + engine deploy + caller
-  // funding). Every cell reverts to THIS id then re-snapshots the SAME base state — we never chain a
-  // revert onto a snapshot taken right after a prior revert. Each cell (re)deploys its Maverick pool +
-  // sets approvals AFTER the revert and asserts the pre-cook invariants, so the compiled args always
-  // match live on-chain state (the 0-fill flake was a chained revert→re-snapshot→revert drifting the
-  // fresh-pool/approval state out from under the args).
-  let cleanBase: Hex;
+  // Each cell runs on its OWN fresh anvil + freshly-deployed stack (setup() below): no shared mutable
+  // node state between cells, so there is no snapshot/loadState reset race. A snapshot revert+re-snapshot
+  // dance chained a revert onto a just-minted id (its consumed-id race dropped a cell to a 0-fill), and a
+  // bare loadState MERGES (never CLEARS a live account, so a prior cell's pool code lingers → the next
+  // CREATE collides, or with the nonce left to climb the pool drifts to a new address). A fresh chain per
+  // cell removes all shared state — reset() just tears the anvil down and rebuilds. See setup().
 
-  before(async () => {
+  // Boot a fresh anvil + deploy the whole stack. Called by before() once and by reset() before every
+  // subsequent cell, tearing the prior anvil down first — so each cell is fully isolated.
+  async function setup(): Promise<void> {
+    anvil?.stop();
     anvil = await startAnvil();
     c = await makeClients(anvil.rpcUrl);
     await ensureMulticall3(c.publicClient, c.testClient);
@@ -169,20 +171,16 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
     await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
 
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
-    cleanBase = await c.testClient.snapshot();
-  });
+  }
+
+  before(setup);
 
   after(() => {
     anvil?.stop();
   });
 
-  // Revert to the immutable base and immediately re-snapshot it. anvil consumes a snapshot id on
-  // revert, so we mint a fresh id — but ALWAYS off the same base state (nothing runs between the
-  // revert and the snapshot), never off a post-cook state. This is the deterministic setup the cells
-  // build their pool + approvals on top of.
   async function reset(): Promise<void> {
-    await c.testClient.revert({ id: cleanBase });
-    cleanBase = await c.testClient.snapshot();
+    await setup();
   }
 
   // Assert the pre-cook invariants the compiled args assume: the caller can pay `amountIn` of tokenIn,
@@ -389,7 +387,7 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     // Pre-cook invariants: caller funded, target approved, the pool holds the tokenOut it must pay.
     // Deterministic setup is what makes the guard-triple regression gate (spent>0) meaningful — a
-    // 0-fill here now means a dead treeshaken merge head, NOT a drifted snapshot.
+    // 0-fill here now means a dead treeshaken merge head, NOT a drifted chain.
     const segSum = segRows.reduce((a, r) => a + r[1], 0n);
     await assertPreCook(caller, target, amountIn, [{ pool, expectedOut: getDy(opOnChain, segSum) }]);
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);

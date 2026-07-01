@@ -115,9 +115,15 @@ describe("EcoSwap Solidly STABLE (sAMM, local fixture) — callback-free exact-i
   let tokenIn: Hex; // == token0 (lower address)
   let tokenOut: Hex; // == token1
   let solverSrc: string;
-  let cleanSnapshot: Hex;
+  // Each cell runs on its OWN fresh anvil + freshly-deployed stack (setup() below): no shared
+  // mutable node state between cells, so there is no snapshot/loadState reset race (the old
+  // revert+re-snapshot dance dropped a cell to a 0-fill; a bare loadState MERGES and drifts each
+  // cell's pool address). reset() just tears the anvil down and rebuilds. See setup().
 
-  before(async () => {
+  // Boot a fresh anvil + deploy the whole stack. Called by before() once and by reset() before
+  // every subsequent cell, tearing the prior anvil down first — so each cell is fully isolated.
+  async function setup(): Promise<void> {
+    anvil?.stop();
     anvil = await startAnvil();
     c = await makeClients(anvil.rpcUrl);
     await ensureMulticall3(c.publicClient, c.testClient);
@@ -131,16 +137,16 @@ describe("EcoSwap Solidly STABLE (sAMM, local fixture) — callback-free exact-i
     await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
 
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
-    cleanSnapshot = await c.testClient.snapshot();
-  });
+  }
+
+  before(setup);
 
   after(() => {
     anvil?.stop();
   });
 
   async function reset(): Promise<void> {
-    await c.testClient.revert({ id: cleanSnapshot });
-    cleanSnapshot = await c.testClient.snapshot();
+    await setup();
   }
 
   // Off-chain SolidlyStablePool descriptor for the deployed fixture (tokenIn = token0 ⇒ inIsToken0).
