@@ -25,6 +25,7 @@ import {
 } from "./constants.js";
 import type { PoolInfo } from "./types.js";
 import { A_PRECISION_DEFAULT, type CurvePool } from "./curve-math.js";
+import { FEE_DENOMINATOR_CRYPTO, type CryptoSwapPool } from "./cryptoswap-math.js";
 import type { BalancerStablePool } from "./balancer-stable-math.js";
 import type { LbPool } from "./lb-math.js";
 import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
@@ -141,6 +142,32 @@ const curvePoolAbi = parseAbi([
   "function A() external view returns (uint256)",
   "function fee() external view returns (uint256)",
   "function coins(uint256 i) external view returns (address)",
+]);
+
+// Curve CryptoSwap registry (crypto/tricrypto Metaregistry) + pool read surface. The crypto
+// registry mirrors the StableSwap registry's find_pool_for_coins/get_coin_indices — but the coin
+// indices are used as UINT256 (the crypto exchange(uint256,uint256,...) ABI). The pool exposes the
+// A-gamma invariant state: A(), gamma(), balances(uint256), price_scale(), D(), coins(uint256),
+// and the packed dynamic-fee params via mid_fee()/out_fee()/fee_gamma(). get_dy is the exact
+// on-chain quote (the min_dy for exchange + the cross-check ground truth).
+const curveCryptoRegistryAbi = parseAbi([
+  "function find_pool_for_coins(address from, address to) external view returns (address pool)",
+  "function get_coin_indices(address pool, address from, address to) external view returns (uint256 i, uint256 j)",
+  "function get_n_coins(address pool) external view returns (uint256)",
+  "function get_decimals(address pool) external view returns (uint256[8] decimals)",
+]);
+
+const cryptoPoolAbi = parseAbi([
+  "function A() external view returns (uint256)",
+  "function gamma() external view returns (uint256)",
+  "function balances(uint256 i) external view returns (uint256)",
+  "function price_scale() external view returns (uint256)",
+  "function D() external view returns (uint256)",
+  "function coins(uint256 i) external view returns (address)",
+  "function mid_fee() external view returns (uint256)",
+  "function out_fee() external view returns (uint256)",
+  "function fee_gamma() external view returns (uint256)",
+  "function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256)",
 ]);
 
 const balancerPoolAbi = parseAbi([
@@ -874,6 +901,135 @@ export async function discoverCurvePoolsTyped(
         balances,
         rates,
         feePpm10: feeRaw,
+        source: registry.label,
+      });
+    } catch {
+      // Registry / pool read failed — skip this registry.
+    }
+  }
+
+  return pools;
+}
+
+/** Round a Curve crypto mid_fee (1e10-scaled, e.g. 5e6 = 0.05%) to a ppm fee (the price coordinate). */
+function cryptoFeeToPpm(midFee: bigint): number {
+  return Number((midFee * 1_000_000n + FEE_DENOMINATOR_CRYPTO / 2n) / FEE_DENOMINATOR_CRYPTO);
+}
+
+/**
+ * Discover a Curve CryptoSwap pool (twocrypto-ng / tricrypto-ng volatile-asset pool) for the pair AS
+ * A TYPED `CryptoSwapPool` descriptor (the EcoSwap CALLBACK-FREE path). CryptoSwap pools trade on the
+ * A-gamma invariant with a DYNAMIC fee (NOT the StableSwap A-invariant, NOT xy=k) AND use uint256
+ * coin indices (exchange(uint256 i, uint256 j, dx, min_dy)), so the engine `_swapCurve` — which calls
+ * exchange(int128,int128,...) — does NOT match them. The curve math is OFF-CHAIN ONLY: this reads the
+ * live A-gamma state (A=ANN, gamma, price_scale, D, balances[], decimals→precisions[], mid/out/fee_gamma)
+ * so prepare's `buildCryptoSwapSegments` can replay get_dy with NO further RPC, and the on-chain solver
+ * consumes the sampled segments statically + executes CALLBACK-FREE (get_dy staticcall for min_dy +
+ * approve + exchange(uint256 i, uint256 j, Σ, min_dy) — Curve exchange PULLS via transferFrom).
+ *
+ * Mirrors `discoverCurvePoolsTyped` (the StableSwap sibling): registry find_pool_for_coins →
+ * get_coin_indices (uint256 i,j) → get_n_coins/get_decimals; pool A()/gamma()/price_scale()/D()/
+ * balances(k)/mid_fee()/out_fee()/fee_gamma(). SCOPE: 2-coin crypto pools (a tokenIn→tokenOut swap
+ * reads exactly two coins). A pool with n_coins != 2 for the pair is skipped (a tricrypto swap would
+ * need the price_scale of the specific pair's coin against coin0 — a 2-coin descriptor is what the
+ * off-chain replay + the callback-free exchange consume). The crypto registry `A()` already reports
+ * the A_MULTIPLIER·N^N-scaled ANN the invariant uses, so `A` is stored as ANN directly.
+ */
+export async function discoverCryptoSwapPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  registries: FactoryConfig[],
+): Promise<CryptoSwapPool[]> {
+  if (registries.length === 0) return [];
+
+  const pools: CryptoSwapPool[] = [];
+  for (const registry of registries) {
+    try {
+      const poolAddr = (await client.readContract({
+        address: registry.address,
+        abi: curveCryptoRegistryAbi,
+        functionName: "find_pool_for_coins",
+        args: [tokenIn, tokenOut],
+      })) as Hex;
+      if (!poolAddr || poolAddr === ZERO_ADDRESS) continue;
+
+      // uint256 coin indices + coin count + decimals from the registry.
+      const [indices, nCoinsRaw, decimalsRaw] = await Promise.all([
+        client.readContract({
+          address: registry.address,
+          abi: curveCryptoRegistryAbi,
+          functionName: "get_coin_indices",
+          args: [poolAddr, tokenIn, tokenOut],
+        }) as Promise<readonly [bigint, bigint]>,
+        client
+          .readContract({ address: registry.address, abi: curveCryptoRegistryAbi, functionName: "get_n_coins", args: [poolAddr] })
+          .catch(() => 2n) as Promise<bigint>,
+        client
+          .readContract({ address: registry.address, abi: curveCryptoRegistryAbi, functionName: "get_decimals", args: [poolAddr] })
+          .catch(() => null) as Promise<readonly bigint[] | null>,
+      ]);
+
+      const i = Number(indices[0]);
+      const j = Number(indices[1]);
+      const N = Number(nCoinsRaw) || 2;
+      // 2-coin scope: the price_scale/replay below assumes a 2-coin pool (coin0 numeraire, coin1
+      // price-scaled). A non-2-coin (tricrypto) pool needs a per-pair price and is deferred.
+      if (N !== 2) continue;
+      if (i < 0 || j < 0 || i >= N || j >= N) continue;
+
+      // Live A-gamma state. A() is ANN (already A_MULTIPLIER·N^N-scaled), used directly.
+      const [A, gamma, priceScale, D, midFee, outFee, feeGamma] = await Promise.all([
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "A" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "gamma" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "price_scale" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "D" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "mid_fee" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "out_fee" }) as Promise<bigint>,
+        client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "fee_gamma" }) as Promise<bigint>,
+      ]);
+      const balances: bigint[] = await Promise.all(
+        Array.from({ length: N }, (_, k) =>
+          client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "balances", args: [BigInt(k)] }) as Promise<bigint>,
+        ),
+      );
+      if (balances.some((b) => b <= 0n) || D <= 0n || priceScale <= 0n) continue;
+
+      // precisions[k] = 10**(18 - decimals[k]) — the registry get_decimals returns uint256[8].
+      let decimals: number[];
+      if (decimalsRaw && decimalsRaw.length >= N) {
+        decimals = Array.from({ length: N }, (_, k) => Number(decimalsRaw[k]));
+      } else {
+        const coinAddrs = await Promise.all(
+          Array.from({ length: N }, (_, k) =>
+            client.readContract({ address: poolAddr, abi: cryptoPoolAbi, functionName: "coins", args: [BigInt(k)] }) as Promise<Hex>,
+          ),
+        );
+        decimals = await Promise.all(
+          coinAddrs.map((addr) =>
+            client
+              .readContract({ address: addr, abi: erc20DecimalsAbi, functionName: "decimals" })
+              .then((d) => Number(d))
+              .catch(() => 18),
+          ),
+        );
+      }
+      const precisions = decimals.map((d) => 10n ** BigInt(18 - d));
+
+      pools.push({
+        address: poolAddr,
+        i,
+        j,
+        A,
+        gamma,
+        priceScale,
+        D,
+        balances,
+        precisions,
+        midFee,
+        outFee,
+        feeGamma,
+        feePpm: cryptoFeeToPpm(midFee),
         source: registry.label,
       });
     } catch {

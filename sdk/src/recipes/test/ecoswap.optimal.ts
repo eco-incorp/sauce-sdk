@@ -62,6 +62,7 @@ import {
 // (buildCurve/Lb/DodoBrackets). The oracle enumerates the SAME segments from true live state, so
 // the split is exact-on-grid (EXACT for LB — a bin is a flat constant-sum slice).
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
+import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
 import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
@@ -190,6 +191,16 @@ export interface OptimalPool {
    * when `maverick` is set.
    */
   maverick?: MaverickPool;
+  /**
+   * Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) pool — when present this pool is a
+   * CRYPTOSWAP venue (NOT V2/V3/Curve-stable/LB/DODO/Solidly/Wombat/Balancer/Euler/Maverick). The
+   * oracle enumerates its segments via the SHARED bounded-Newton A-gamma replay
+   * (buildCryptoSwapSegments) from the live A/gamma/price_scale/D/balances/fee state, so the split is
+   * exact-on-grid vs prepare's segments (one replay). The CryptoSwap marginalOI is the post-fee
+   * execution price (getDyCrypto nets the dynamic fee); adjNear == adjFar == marginalOI. All the other
+   * venue fields are ignored when `cryptoSwap` is set.
+   */
+  cryptoSwap?: CryptoSwapPool;
 }
 
 /**
@@ -572,6 +583,22 @@ function maverickSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Se
   return segs;
 }
 
+/**
+ * Enumerate one Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) pool's segments via the SHARED
+ * bounded-Newton A-gamma replay (buildCryptoSwapSegments) from the live A/gamma/price_scale/D/balances/
+ * fee state. The amountIn caps the sampled range — the same bound prepare samples — so the oracle and
+ * prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid. The CryptoSwap
+ * marginalOI is the post-fee execution price (getDyCrypto nets the dynamic fee); adjNear == adjFar ==
+ * marginalOI. Awarded as a "pool" venue.
+ */
+function cryptoSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildCryptoSwapSegments(p.cryptoSwap!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -796,7 +823,12 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.maverick) {
+    if (p.cryptoSwap) {
+      // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) venue: sampled-segment enumeration via
+      // the shared bounded-Newton A-gamma replay (capped at amountIn — the same bound prepare samples →
+      // identical grid → exact-on-grid split).
+      allSegs.push(...cryptoSwapSegments(p, i, amountIn));
+    } else if (p.maverick) {
       // Maverick V2 (bin-based directional AMM) venue: sampled-segment enumeration via the shared bin
       // swap-math replay (capped at amountIn / the engine tickLimit=0 depth — the same bound prepare
       // samples → identical grid → exact-on-grid split).

@@ -49,8 +49,10 @@ import {
   discoverBalancerStablePoolsTyped,
   discoverEulerSwapPoolsTyped,
   discoverMaverickV2PoolsTyped,
+  discoverCryptoSwapPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
+import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
 import { buildLbSegments, lbFeeToPpm, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
@@ -83,6 +85,7 @@ import {
   type EcoBalancerStable,
   type EcoEulerSwap,
   type EcoMaverick,
+  type EcoCryptoSwap,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -454,6 +457,34 @@ function buildCurveBrackets(pool: CurvePool, refIdx: number, amountIn: bigint): 
       liquidity: 0n,
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Curve fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
+ * Build Curve CryptoSwap segments for one pool by sampling the bounded-Newton A-gamma replay (NO
+ * extra RPC — pure bigint on the read A/gamma/price_scale/D/balances/fee params). Each sampled
+ * (Δinput, Δoutput) increment becomes a STATIC segment (kind CryptoSwap) in unified out/in space,
+ * refIdx → the CryptoSwap venue index. The marginal is the POST-FEE execution price (getDyCrypto
+ * already nets the dynamic fee), so it enters the descending-price merge directly as both
+ * sqrtAdjNear and sqrtAdjFar. The CryptoSwap curve is OFF-CHAIN ONLY for the split; the on-chain
+ * solver executes CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...) —
+ * crypto pools use uint256 coin indices the engine's int128 _swapCurve does NOT match).
+ */
+function buildCryptoSwapBrackets(pool: CryptoSwapPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildCryptoSwapSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.CryptoSwap,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the CryptoSwap dynamic fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
     });
   }
@@ -1012,6 +1043,32 @@ export async function prepareEcoSwap(
   }
   for (const set of maverickBracketSets) brackets.push(...set);
 
+  const cryptoSwaps: EcoCryptoSwap[] = [];
+  const cryptoBracketSets: EcoBracket[][] = [];
+  // Curve CryptoSwap — crypto/tricrypto Metaregistry lookup (find_pool_for_coins → get_coin_indices,
+  // UINT256 i,j). CryptoSwap pools trade on the A-gamma invariant with a dynamic fee AND use uint256
+  // coin indices, so the engine `_swapCurve` (exchange(int128,...)) does NOT match — a SAMPLED-SEGMENT
+  // source executed CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...)).
+  // Sampled OFF-CHAIN via the bounded-Newton replay; NO engine change. LOW priority (volatile-asset).
+  const cryptoRegistries = poolConfig.factories.filter((f) => f.factoryType === FactoryType.CurveCryptoRegistry);
+  if (cryptoRegistries.length > 0) {
+    const cryptoRaw = await discoverCryptoSwapPoolsTyped(tokenIn, tokenOut, client, cryptoRegistries);
+    for (const cp of cryptoRaw) {
+      const refIdx = cryptoSwaps.length;
+      const cb = buildCryptoSwapBrackets(cp, refIdx, amountIn);
+      if (cb.length === 0) continue;
+      cryptoSwaps.push({
+        address: cp.address,
+        i: cp.i,
+        j: cp.j,
+        feePpm: cp.feePpm,
+        source: `${cp.source} (Curve CryptoSwap)`,
+      });
+      cryptoBracketSets.push(cb);
+    }
+  }
+  for (const set of cryptoBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1175,6 +1232,7 @@ export async function prepareEcoSwap(
   const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
+  const nCryptoSegs = brackets.filter((b) => b.kind === EcoBracketKind.CryptoSwap).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
@@ -1182,7 +1240,7 @@ export async function prepareEcoSwap(
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick)`,
+      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap)`,
   );
 
   return {
@@ -1201,6 +1259,7 @@ export async function prepareEcoSwap(
     balancerStables,
     eulerSwaps,
     maverickPools,
+    cryptoSwaps,
     brackets,
     zeroForOne,
     priceLimit,

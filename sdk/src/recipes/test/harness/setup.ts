@@ -85,6 +85,11 @@ export const curveStableSwapArtifact = loadArtifact(
 export const dodoV2PoolArtifact = loadArtifact(
   join(FIXTURES, "DodoV2Pool.sol", "DodoV2Pool.json"),
 );
+/** Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) 2-coin pool — deployed normally (constructor
+ *  sets coins/precisions/A/gamma/price_scale/balances/fee params + computes D). */
+export const cryptoSwapPoolArtifact = loadArtifact(
+  join(FIXTURES, "CryptoSwapPool.sol", "CryptoSwapPool.json"),
+);
 /** Solidly STABLE (sAMM) pool — deployed normally (constructor sets tokens/decimals/fee). */
 export const solidlyStablePoolArtifact = loadArtifact(
   join(FIXTURES, "SolidlyStablePool.sol", "SolidlyStablePool.json"),
@@ -713,6 +718,65 @@ export async function deployCurveStableSwap(
   });
   const acct = (minter ?? walletClient.account) as Account;
   // Fund the pool with its full coin balances (it transfers tokenOut out on exchange).
+  for (let k = 0; k < coins.length; k++) {
+    await writeAndWait(walletClient, publicClient, {
+      address: coins[k],
+      abi: erc20Abi as Abi,
+      functionName: "transfer",
+      args: [pool, balances[k]],
+      account: acct,
+    });
+  }
+  return pool;
+}
+
+/** Minimal Curve CryptoSwap fixture ABI (coins/get_dy/exchange(uint256,...) + state reads). */
+export const cryptoSwapAbi = parseAbi([
+  "function coins(uint256 i) view returns (address)",
+  "function balances(uint256 i) view returns (uint256)",
+  "function A() view returns (uint256)",
+  "function gamma() view returns (uint256)",
+  "function price_scale() view returns (uint256)",
+  "function D() view returns (uint256)",
+  "function mid_fee() view returns (uint256)",
+  "function out_fee() view returns (uint256)",
+  "function fee_gamma() view returns (uint256)",
+  "function get_dy(uint256 i, uint256 j, uint256 dx) view returns (uint256)",
+  "function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) returns (uint256)",
+]);
+
+/**
+ * Deploy a local Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) 2-coin pool and fund it with
+ * its coin balances.
+ *
+ * Mirrors the canonical tricrypto-ng newton_D/newton_y + twocrypto-ng get_dy/_fee bit-for-bit (matching
+ * the off-chain `cryptoswap-math.ts` replay), so `get_dy(i,j,dx)` returns EXACTLY `getDyCrypto(pool, dx)`
+ * to the wei and `exchange(i,j,dx,min_dy)` sends that. CryptoSwap uses UINT256 coin indices, so EcoSwap
+ * executes it CALLBACK-FREE (approve + exchange), NOT through the engine. Curve exchange PULLS coin i via
+ * transferFrom and transfers coin j out, so the pool must HOLD both coin balances — `minter` transfers
+ * each coin's full balance into the pool. `A` is ANN (already A_MULTIPLIER·N^N-scaled); `precisions[k]` =
+ * 10**(18 - decimals[k]); `priceScale` scales coin1 into coin0.
+ */
+export async function deployCryptoSwapPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  coins: [Hex, Hex],
+  precisions: [bigint, bigint],
+  A: bigint,
+  gamma: bigint,
+  priceScale: bigint,
+  balances: [bigint, bigint],
+  midFee: bigint,
+  outFee: bigint,
+  feeGamma: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: cryptoSwapPoolArtifact.abi,
+    bytecode: cryptoSwapPoolArtifact.bytecode,
+    args: [coins, precisions, A, gamma, priceScale, balances, midFee, outFee, feeGamma],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
   for (let k = 0; k < coins.length; k++) {
     await writeAndWait(walletClient, publicClient, {
       address: coins[k],

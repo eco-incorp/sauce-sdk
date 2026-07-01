@@ -7,6 +7,7 @@ import { IKyberPool } from "./IKyberPool.json";
 import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 import { IWombatPool } from "./IWombatPool.json";
 import { IEulerSwapPool } from "./IEulerSwapPool.json";
+import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -221,6 +222,7 @@ const HAS_WOMBAT: boolean = true;
 const HAS_BALANCER: boolean = true;
 const HAS_EULER: boolean = true;
 const HAS_MAVERICK: boolean = true;
+const HAS_CRYPTO: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -305,6 +307,8 @@ function main(
   let even: Tuple = new Array(segs.length); // EulerSwap venue (pool) address
   let minp: Tuple = new Array(segs.length); // Maverick V2 per-venue Σ input
   let mven: Tuple = new Array(segs.length); // Maverick V2 venue (pool) address
+  let cryinp: Tuple = new Array(segs.length); // Curve CryptoSwap per-venue Σ input
+  let cryven: Tuple = new Array(segs.length); // Curve CryptoSwap venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -522,7 +526,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK) && segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO) && segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -844,7 +848,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK) && bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO) && bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -900,6 +904,13 @@ function main(
                           if (HAS_MAVERICK && sKind === 8) {
                             minp[sIdx] = minp[sIdx] + stake;
                             mven[sIdx] = sVenue;
+                          } else {
+                            // segKind 9 — Curve CryptoSwap: callback-free, executed below via get_dy
+                            // (min_dy) + approve + exchange(uint256 i, uint256 j, Σ, min_dy).
+                            if (HAS_CRYPTO && sKind === 9) {
+                              cryinp[sIdx] = cryinp[sIdx] + stake;
+                              cryven[sIdx] = sVenue;
+                            }
                           }
                         }
                       }
@@ -1325,6 +1336,34 @@ function main(
         tokenIn: tokenIn, tokenOut: tokenOut, amountSpecified: Math.neg(mamt),
         sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
       });
+    }
+  }
+  }
+  // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) → CALLBACK-FREE (NO engine SwapPoolType).
+  // CryptoSwap pools trade on the A-gamma invariant with a dynamic fee AND use UINT256 coin indices
+  // (exchange(uint256 i, uint256 j, dx, min_dy)), so the engine's _swapCurve (exchange(int128,...))
+  // does NOT match them. Execute exactly as the Curve router would: resolve the pool's uint256 coin
+  // indices on-chain by reading coins(0) (2-coin pool ⇒ tokenIn is coin0 iff coins(0)==tokenIn, else
+  // coin1; the other coin is 1-i), read the EXACT out from the pool's own get_dy(i, j, Σ) view (the
+  // view IS the swap math ⇒ wei-exact-in-dy for the awarded share) as min_dy, APPROVE the pool for the
+  // awarded input (Curve exchange PULLS via transferFrom, like Wombat — unlike the transfer-first
+  // V2/Solidly path), then call exchange(i, j, Σ, min_dy) (min_dy == the quoted out ⇒ the min never
+  // trips). compute-then-pull already transferred `cum` (incl. each CryptoSwap share) into this
+  // contract above, so the approved pull draws from this contract's balance and the out lands here.
+  if (HAS_CRYPTO) {
+  for (let x = 0; x < segs.length; x = x + 1) {
+    const cxamt: Uint256 = cryinp[x];
+    if (cxamt > 0) {
+      const cxpool: Address = cryven[x];
+      const cxc0: Address = ICryptoSwapPool.at(cxpool).coins(0);
+      let cxi: Uint256 = 1;
+      let cxj: Uint256 = 0;
+      if (cxc0 === tokenIn) { cxi = 0; cxj = 1; }
+      const cxOut: Uint256 = ICryptoSwapPool.at(cxpool).get_dy(cxi, cxj, cxamt);
+      if (cxOut > 0) {
+        token.approve(cxpool, cxamt);
+        ICryptoSwapPool.at(cxpool).exchange(cxi, cxj, cxamt, cxOut);
+      }
     }
   }
   }

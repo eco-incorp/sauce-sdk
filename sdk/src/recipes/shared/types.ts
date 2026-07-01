@@ -223,6 +223,7 @@ export enum EcoBracketKind {
   BalancerStable = 8, // Balancer V2 ComposableStable segment (static, off-chain-sampled via the StableMath A-invariant replay)
   EulerSwap = 9, // EulerSwap (Euler v2 vault-backed AMM) segment (static, off-chain-sampled via the f/fInverse curve replay)
   MaverickV2 = 10, // Maverick V2 (bin-based directional AMM) segment (static, off-chain-sampled via the bin swap-math replay; executed through the engine)
+  CryptoSwap = 11, // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) segment (static, off-chain-sampled via the A-gamma invariant replay; executed CALLBACK-FREE via approve + exchange(uint256,...))
 }
 
 /**
@@ -548,6 +549,31 @@ export interface EcoMaverick {
 }
 
 /**
+ * One Curve CryptoSwap venue to execute, indexed by an EcoBracket.refIdx (kind === CryptoSwap).
+ * Curve CryptoSwap pools (twocrypto-ng / tricrypto-ng volatile-asset pools) trade on the A-gamma
+ * invariant with a dynamic fee — NOT xy=k — AND use uint256 coin indices (exchange(uint256 i,
+ * uint256 j, dx, min_dy)), so the engine `_swapCurve` (which calls exchange(int128,int128,...))
+ * does NOT match them. prepare samples the curve OFF-CHAIN into static segments (kind CryptoSwap)
+ * via the bounded-Newton bigint replay; the on-chain solver consumes those through the static-
+ * segment cursor and EXECUTES the awarded Σ share CALLBACK-FREE (NO engine SwapPoolType): read the
+ * EXACT out from the pool's own `get_dy(i, j, Σ)` view (the view IS the swap math ⇒ wei-exact-in-dy
+ * for the awarded share) as min_dy, APPROVE the pool for the awarded input (Curve exchange PULLS via
+ * transferFrom), then call `exchange(i, j, Σ, min_dy)`. `address` is the pool; `i`/`j` are the
+ * uint256 coin indices; feePpm (the rounded mid_fee) is the price-ordering coordinate / diagnostic.
+ */
+export interface EcoCryptoSwap {
+  /** Pool address — the get_dy/exchange/approve target. */
+  address: Hex;
+  /** uint256 coin index of tokenIn. */
+  i: number;
+  /** uint256 coin index of tokenOut. */
+  j: number;
+  /** Rounded ppm fee (the price-ordering coordinate; the on-chain out is the pool get_dy view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -630,6 +656,16 @@ export interface EcoSwapPrepared {
    * test-side `EcoSwapPrepared` literals stay additive-compatible).
    */
   maverickPools?: EcoMaverick[];
+  /**
+   * Curve CryptoSwap venues (kind === CryptoSwap brackets reference these by refIdx). The on-chain
+   * solver executes the awarded Σ share CALLBACK-FREE (get_dy staticcall for min_dy + approve +
+   * pool.exchange(uint256 i, uint256 j, Σ, min_dy) — NO engine SwapPoolType, since crypto pools use
+   * uint256 coin indices that the engine's int128 _swapCurve does not match); the CryptoSwap
+   * marginal is supplied entirely as the static sampled segments in `brackets` (the A-gamma
+   * invariant replay). Optional/empty when no CryptoSwap pools were discovered (omitted ⇒ no
+   * CryptoSwap venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  cryptoSwaps?: EcoCryptoSwap[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

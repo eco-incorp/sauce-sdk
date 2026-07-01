@@ -79,6 +79,17 @@ export enum FactoryType {
   SolidlyV2 = "solidly-v2",
   /** Curve registry: find_pool_for_coins(from, to) */
   CurveRegistry = "curve-registry",
+  /**
+   * Curve CryptoSwap registry (crypto/tricrypto Metaregistry): find_pool_for_coins(from, to) →
+   * get_coin_indices (UINT256 i,j). CryptoSwap pools (twocrypto-ng / tricrypto-ng volatile-asset)
+   * trade on the A-gamma invariant with a DYNAMIC fee (NOT the StableSwap A-invariant, NOT xy=k) AND
+   * use uint256 coin indices, so the engine `_swapCurve` (exchange(int128,int128,...)) does NOT match
+   * them. State: A()=ANN, gamma(), price_scale(), D(), balances(uint256), mid_fee/out_fee/fee_gamma.
+   * The curve is priced OFF-CHAIN (bounded-Newton A-gamma replay) into sampled segments; CALLBACK-FREE:
+   * executed in SauceScript (get_dy staticcall for min_dy + approve + exchange(uint256 i, uint256 j, Σ,
+   * min_dy); Curve exchange PULLS via transferFrom), so no engine change. LOW priority (volatile-asset).
+   */
+  CurveCryptoRegistry = "curve-crypto-registry",
   /** Balancer V2: pool address → getPoolId() → Vault.swap() */
   BalancerV2 = "balancer-v2",
   /** DODO V2: getDODO(base, quote) → sellBase/sellQuote */

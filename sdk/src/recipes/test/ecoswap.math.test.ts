@@ -72,6 +72,12 @@ import {
   type MaverickPool,
   type MaverickTick,
 } from "../shared/maverick-math";
+import {
+  getDyCrypto,
+  newtonD as cryptoNewtonD,
+  buildCryptoSwapSegments,
+  type CryptoSwapPool,
+} from "../shared/cryptoswap-math";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -1695,6 +1701,88 @@ describe("Wombat (single-sided stableswap) — quotePotentialSwap known-answer +
     // Σ effOut over the grid == quotePotentialSwap(amountIn) (the sampler is a partition of the curve).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
     assert.equal(sumOut, quotePotentialSwap(p, amountIn), "Σ segment effOut == quotePotentialSwap(amountIn)");
+  });
+});
+
+// ── Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) known-answer + segment sampler ──────
+//
+// Pins the off-chain A-gamma invariant replay (getDyCrypto + newtonD + buildCryptoSwapSegments) BEFORE
+// the local-EVM test, so a regression in the bounded-Newton bigint math (newton_D / newton_y) or the
+// price_scale/precisions scaling / dynamic fee is caught without anvil. The wei-exact bound is documented
+// in cryptoswap-math.ts: the SPLIT is exact-on-grid vs the oracle (one shared sampler) and the realized dy
+// is exact-in-dy (the pool get_dy view == the pool exchange math). These vectors are the deterministic
+// getDyCrypto outputs for fixed states (regenerate only on an intentional math change). A = ANN
+// (A_MULTIPLIER·N^N·A_raw, A_raw=400000 → 1.6e13); gamma 1.45e14; fee mid 0.05%/out 0.4%/fee_gamma 0.23
+// (1e10 fee units). CryptoSwap coin indices are UINT256 (the callback-free exchange(uint256,...) ABI, NOT
+// the engine's int128 _swapCurve).
+describe("Curve CryptoSwap (volatile-asset A-gamma) — get_dy known-answer + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  const ANN = 10000n * 4n * 400000n; // A_MULTIPLIER·N^N·A_raw
+  const GAMMA = 145_000_000_000_000n; // 1.45e14
+  const MID = 5_000_000n; // 0.05% (1e10 units)
+  const OUT = 40_000_000n; // 0.4%
+  const FEE_GAMMA = 230_000_000_000_000_000n; // 0.23e18
+  function pool(
+    bal: [bigint, bigint], prec: [bigint, bigint], priceScale: bigint, i = 0, j = 1,
+  ): CryptoSwapPool {
+    const xp = [bal[0] * prec[0], (bal[1] * prec[1] * priceScale) / E18];
+    const D = cryptoNewtonD(ANN, GAMMA, xp);
+    return {
+      address: Z, i, j, A: ANN, gamma: GAMMA, priceScale, D, balances: bal, precisions: prec,
+      midFee: MID, outFee: OUT, feeGamma: FEE_GAMMA, feePpm: 5, source: "kat",
+    };
+  }
+
+  it("balanced 1:1 18-dec pool — exact A-gamma get_dy vectors + exact D", () => {
+    const p = pool([1_000_000n * E18, 1_000_000n * E18], [1n, 1n], E18);
+    // D of a balanced 1:1 pool with Σ scaled balances 2e6·1e18 is exactly N·isqrt(x0·x1) fixpoint.
+    assert.equal(p.D, 2_000_000n * E18);
+    // Hand-pinned from the bounded-Newton replay (mirrors the CryptoSwapPool fixture bit-for-bit).
+    assert.equal(getDyCrypto(p, 1_000n * E18), 999_499_994_933_332_929_937n);
+    assert.equal(getDyCrypto(p, 10_000n * E18), 9_994_995_877_278_405_356_786n);
+    assert.equal(getDyCrypto(p, 100_000n * E18), 99_886_027_679_301_120_182_982n);
+    // Crypto shape: a small trade returns ~the input net of the 0.05% mid_fee (≈ 0.9995·in) with sub-bps
+    // A-gamma slippage on top — near a stable curve when the pool sits at balance (fee → mid_fee).
+    const out1k = getDyCrypto(p, 1_000n * E18);
+    assert.ok(out1k < 1_000n * E18 && out1k > 999n * E18, "near-1:1 minus mid_fee on the A-gamma curve");
+  });
+
+  it("imbalanced pool — exact vector", () => {
+    const p = pool([1_200_000n * E18, 1_000_000n * E18], [1n, 1n], E18);
+    assert.equal(getDyCrypto(p, 50_000n * E18), 49_597_742_875_297_523_609_779n);
+  });
+
+  it("decimals normalisation — 6-dec out coin (precisions[1]=1e12) denormalises exactly", () => {
+    const p = pool([1_000_000n * E18, 1_000_000n * 10n ** 6n], [1n, 10n ** 12n], E18);
+    // 1000 (18-dec) in → ~1000 (6-dec) out net of mid_fee: 999.499995 units.
+    assert.equal(getDyCrypto(p, 1_000n * E18), 999_499_995n);
+  });
+
+  it("price_scale != 1 (coin1 @ 2000·coin0) — both directions economically exact", () => {
+    // Value-balanced pool: 2M coin0 (USD) + 1000 coin1 (ETH) at price_scale 2000.
+    const p = pool([2_000_000n * E18, 1_000n * E18], [1n, 1n], 2000n * E18);
+    assert.equal(p.D, 4_000_000n * E18);
+    // coin0 → coin1 (USD → ETH): 2000 USD ≈ 1 ETH minus fee/slippage.
+    assert.equal(getDyCrypto(p, 2_000n * E18), 999_499_994_933_332_396n);
+    // coin1 → coin0 (ETH → USD): 1 ETH ≈ 2000 USD minus fee/slippage.
+    const pr = pool([2_000_000n * E18, 1_000n * E18], [1n, 1n], 2000n * E18, 1, 0);
+    assert.equal(getDyCrypto(pr, 1n * E18), 1_998_999_989_866_664_792_184n);
+  });
+
+  it("buildCryptoSwapSegments — covers amountIn, descending marginals, partition of the curve", () => {
+    const p = pool([1_000_000n * E18, 1_000_000n * E18], [1n, 1n], E18);
+    const amountIn = 100_000n * E18;
+    const segs = buildCryptoSwapSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == getDyCrypto(amountIn) (the sampler is a partition of the curve).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, getDyCrypto(p, amountIn), "Σ segment effOut == getDyCrypto(amountIn)");
   });
 });
 

@@ -218,6 +218,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const balancerStables = prepared.balancerStables ?? [];
   const eulerSwaps = prepared.eulerSwaps ?? [];
   const maverickPools = prepared.maverickPools ?? [];
+  const cryptoSwaps = prepared.cryptoSwaps ?? [];
   return prepared.brackets
     .filter(
       (b) =>
@@ -228,7 +229,8 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.Wombat ||
         b.kind === EcoBracketKind.BalancerStable ||
         b.kind === EcoBracketKind.EulerSwap ||
-        b.kind === EcoBracketKind.MaverickV2,
+        b.kind === EcoBracketKind.MaverickV2 ||
+        b.kind === EcoBracketKind.CryptoSwap,
     )
     .slice()
     .sort((a, b) => {
@@ -245,14 +247,16 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isBalancer = b.kind === EcoBracketKind.BalancerStable;
       const isEuler = b.kind === EcoBracketKind.EulerSwap;
       const isMaverick = b.kind === EcoBracketKind.MaverickV2;
+      const isCrypto = b.kind === EcoBracketKind.CryptoSwap;
       // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable, 7
-      // EulerSwap, 8 Maverick V2 — kinds 4/5/7 are callback-free (the pool view IS the swap math); 4 =
-      // getAmountOut + pool.swap, 5 = quotePotentialSwap + approve + pool.swap (Wombat PULLS via
-      // transferFrom), 7 = computeQuote + transfer + pool.swap(...,"") (EulerSwap is V2-shaped, empty
-      // data ⇒ no flash callback). Kinds 1/3/6/8 go through the engine (1 = swap poolType 3 Curve, 3 =
-      // poolType 5 DODO, 6 = poolType 4 BalancerV2, 8 = poolType 7 MaverickV2 — a CALLBACK pool, so it
-      // must go through the engine's maverickV2SwapCallback).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : 0n;
+      // EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap — kinds 4/5/7/9 are callback-free (the pool view
+      // IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap + approve + pool.swap
+      // (Wombat PULLS via transferFrom), 7 = computeQuote + transfer + pool.swap(...,""), 9 = get_dy +
+      // approve + exchange(uint256 i, uint256 j, Σ, min_dy) (Curve exchange PULLS via transferFrom, and
+      // crypto pools use uint256 coin indices the engine's int128 _swapCurve does NOT match). Kinds
+      // 1/3/6/8 go through the engine (1 = swap poolType 3 Curve StableSwap, 3 = poolType 5 DODO, 6 =
+      // poolType 4 BalancerV2, 8 = poolType 7 MaverickV2 — a CALLBACK pool via maverickV2SwapCallback).
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -269,7 +273,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                     ? BigInt(eulerSwaps[b.refIdx].address)
                     : isMaverick
                       ? BigInt(maverickPools[b.refIdx].address)
-                      : 0n;
+                      : isCrypto
+                        ? BigInt(cryptoSwaps[b.refIdx].address)
+                        : 0n;
       return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
     });
 }
@@ -312,6 +318,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_BALANCER = (prepared.balancerStables?.length ?? 0) > 0;
   const HAS_EULER = (prepared.eulerSwaps?.length ?? 0) > 0;
   const HAS_MAVERICK = (prepared.maverickPools?.length ?? 0) > 0;
+  const HAS_CRYPTO = (prepared.cryptoSwaps?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -326,6 +333,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_BALANCER,
     HAS_EULER,
     HAS_MAVERICK,
+    HAS_CRYPTO,
   };
 }
 
