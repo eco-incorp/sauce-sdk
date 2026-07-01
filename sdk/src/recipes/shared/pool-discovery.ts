@@ -33,6 +33,7 @@ import type { SolidlyStablePool } from "./solidly-stable-math.js";
 import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
+import { type FluidPool, fluidSampleInputs, FLUID_FEE_SCALE } from "./fluid-math.js";
 import { type EulerSwapPool } from "./eulerswap-math.js";
 import {
   getSqrtPrice as getMaverickSqrtPrice,
@@ -277,6 +278,27 @@ const wooracleV2Abi = parseAbi([
 const fermiPoolAbi = parseAbi([
   "function quoteAmounts(address tokenIn, address tokenOut, int256 amountSpecified) external view returns (uint256 amountIn, uint256 amountOut)",
   "function isActive(address baseAsset, address quoteAsset) external view returns (bool)",
+]);
+
+// Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) read
+// surface for the EcoSwap TYPED path — the REAL VERIFIED interface (fluid-contracts-public
+// poolT1/coreModule/core/main.sol + periphery/resolvers/dex/main.sol; FluidDexT1
+// 0x6d83f60eEac0e50A1250760151E81Db2a278e03a). The DexT1 pool has NO standalone token0()/token1() getters
+// (token0/token1 are immutables exposed ONLY inside constantsView()'s struct) — so the pair is oriented via
+// the periphery resolver's `getDexTokens(dex) -> (address token0, address token1)`. Swapping is
+// `swapIn(bool swap0to1, uint256 amountIn, uint256 amountOutMin, address to)` (approve-first: it pulls via
+// safeTransferFrom). The pool has NO getAmountOut view — its own estimate is a REVERT (FluidDexSwapResult)
+// — so the quote goes through the same resolver's
+// `estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) -> uint256 amountOut`,
+// which does the pool's revert-decode in Solidity and returns a plain uint256.
+// estimateSwapIn is `payable` on-chain (it wraps the pool's mutating swapIn in a try/catch), but it is
+// side-effect-free (the pool reverts with the result BEFORE touching the Liquidity layer when
+// to == ADDRESS_DEAD) so an eth_call reads it cleanly. Declared `view` here only so viem's typed
+// `readContract` accepts it — eth_call does not enforce mutability. The on-chain solver staticcalls it too.
+// getDexTokens is a plain resolver view.
+const fluidResolverAbi = parseAbi([
+  "function getDexTokens(address dex) external view returns (address token0, address token1)",
+  "function estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) external view returns (uint256 amountOut)",
 ]);
 
 // ── KyberSwap Classic / DMM ──────────────────────────────────
@@ -1947,6 +1969,123 @@ export async function discoverFermiPoolsTyped(
       });
     } catch {
       // Router read failed (not a FermiSwapper, paused, or unsupported pair) — skip.
+    }
+  }
+  return out;
+}
+
+// ── Fluid DEX discovery ──────────────────────────────────────
+
+/**
+ * Discover Fluid DEX (Instadapp fluid-contracts-public FluidDexT1) pools for the pair AS TYPED `FluidPool`
+ * descriptors (the EcoSwap callback-free path). Fluid DEX is a Liquidity-Layer-backed re-centering AMM (NOT
+ * xy=k), so it must NOT be priced through the V2 synthetic-sqrt path. Discovery is KNOWN-POOL-ADDRESS based
+ * (the candidate DexT1 pool addresses are in `FactoryConfig.fluidPools`; the periphery resolver in
+ * `FactoryConfig.fluidResolver`). A pool is kept only when it trades BOTH tokenIn and tokenOut (its
+ * token0/token1 match the pair) AND the resolver ladder shows a strictly-positive out.
+ *
+ * The DexT1 pool exposes NO raw curve state and NO getAmountOut view (its own estimate is a REVERT —
+ * FluidDexSwapResult), so the split cannot be priced from a closed-form snapshot. Instead this SAMPLES the
+ * pool via a small ladder of `resolver.estimateSwapIn(dex, swap0to1, +cumIn, 0)` eth_calls (the resolver
+ * does the pool's revert-decode in Solidity and returns a plain uint256) over [0, amountIn] and stores the
+ * (cumIn, cumOut) points on the descriptor. `buildFluidSegments` then differences that ladder into segments
+ * with NO further RPC (so the oracle shares them). Execution is CALLBACK-FREE (approve + pool.swapIn —
+ * Fluid PULLS via safeTransferFrom, approve-first like Fermi/Wombat/Curve). The utilization/borrow CAP is
+ * modeled by stopping at the first slice the resolver quotes 0 (past the tradeable cap), like EulerSwap's
+ * inLimit.
+ *
+ * `amountIn` sizes the ladder range. Mirrors `discoverFermiPoolsTyped` / `discoverEulerSwapPoolsTyped` —
+ * off-chain discovery + state reads, returning the venue descriptor EcoSwap prepare consumes directly (the
+ * on-chain lens does not understand Fluid).
+ */
+export async function discoverFluidPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  fluidConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<FluidPool[]> {
+  if (fluidConfigs.length === 0 || amountIn <= 0n) return [];
+
+  const sampleIn = fluidSampleInputs(amountIn);
+  if (sampleIn.length === 0) return [];
+
+  const out: FluidPool[] = [];
+  const seen = new Set<string>();
+  for (const cfg of fluidConfigs) {
+    const resolver = cfg.fluidResolver;
+    if (!resolver) continue;
+    for (const pool of cfg.fluidPools ?? []) {
+      const key = pool.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try {
+        // Orient the pair: token0/token1 fix swap0to1 (true ⇒ tokenIn is token0). Read via the resolver's
+        // getDexTokens (the pool has NO token0()/token1() getters). Skip a pool that does not trade EXACTLY
+        // this pair.
+        const [t0, t1] = (await client
+          .readContract({ address: resolver, abi: fluidResolverAbi, functionName: "getDexTokens", args: [pool] })
+          .catch(() => [ZERO_ADDRESS, ZERO_ADDRESS])) as [Hex, Hex];
+        const inIs0 = t0.toLowerCase() === tokenIn.toLowerCase() && t1.toLowerCase() === tokenOut.toLowerCase();
+        const inIs1 = t1.toLowerCase() === tokenIn.toLowerCase() && t0.toLowerCase() === tokenOut.toLowerCase();
+        if (!inIs0 && !inIs1) continue;
+        const swap0to1 = inIs0; // tokenIn is token0 ⇒ swap0→1
+
+        // Sample the LIVE quote ladder via the resolver's estimateSwapIn (amountOutMin 0 ⇒ pure quote).
+        const quotes = await Promise.all(
+          sampleIn.map((amt) =>
+            client
+              .readContract({
+                address: resolver,
+                abi: fluidResolverAbi,
+                functionName: "estimateSwapIn",
+                args: [pool, swap0to1, amt, 0n],
+              })
+              .then((r) => r as bigint)
+              .catch(() => 0n),
+          ),
+        );
+
+        // Keep only the strictly-positive, non-decreasing prefix of the ladder (a zero/failed quote = past
+        // the tradeable range / the utilization cap; a non-increasing out = degenerate).
+        const cumIn: bigint[] = [];
+        const cumOut: bigint[] = [];
+        let prevOut = 0n;
+        for (let i = 0; i < sampleIn.length; i++) {
+          const o = quotes[i];
+          if (o <= prevOut) break;
+          cumIn.push(sampleIn[i]);
+          cumOut.push(o);
+          prevOut = o;
+        }
+        if (cumOut.length === 0 || cumOut[0] <= 0n) continue; // pair not tradeable / no out
+
+        // Derive an effective fee (ppm) from the shallowest slice for price-ordering / diagnostics: the
+        // near-par spot ratio's shortfall vs 1:1 is dominated by the fee (the pool folds the fee into the
+        // resolver quote — there is no fee getter on the path). Best-effort; 0 when the ladder is too
+        // thin/coarse to infer.
+        let feePpm = 0;
+        const in0 = cumIn[0];
+        const out0 = cumOut[0];
+        if (in0 > 0n && out0 > 0n && out0 < in0) {
+          const shortfall = ((in0 - out0) * FLUID_FEE_SCALE) / in0;
+          if (shortfall > 0n && shortfall < FLUID_FEE_SCALE) feePpm = Number(shortfall);
+        }
+
+        out.push({
+          address: pool,
+          resolver,
+          swap0to1,
+          tokenIn,
+          tokenOut,
+          cumIn,
+          cumOut,
+          feePpm,
+          source: `${cfg.label} (Fluid DEX)`,
+        });
+      } catch {
+        // Pool/resolver read failed (not a FluidDexT1, paused, or unsupported pair) — skip.
+      }
     }
   }
   return out;

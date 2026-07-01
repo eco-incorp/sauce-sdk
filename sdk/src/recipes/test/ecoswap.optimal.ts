@@ -72,6 +72,7 @@ import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
+import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -222,6 +223,16 @@ export interface OptimalPool {
    * == adjFar == marginalOI. All the other venue fields are ignored when `fermi` is set.
    */
   fermi?: FermiPool;
+  /**
+   * Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) pool
+   * — when present this pool is a FLUID venue (NOT V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer/Euler/
+   * Maverick/CryptoSwap/WOOFi/Fermi). The oracle enumerates its segments via the SHARED sampler
+   * (buildFluidSegments) from the pool's LIVE estimateSwapIn ladder (the same (cumIn, cumOut) points prepare
+   * sampled), so the split is exact-on-grid vs prepare's segments (one shared ladder). The Fluid marginalOI
+   * is the post-fee + post-cap execution price (the resolver estimate nets the swap fee + utilization);
+   * adjNear == adjFar == marginalOI. All the other venue fields are ignored when `fluid` is set.
+   */
+  fluid?: FluidPool;
 }
 
 /**
@@ -651,6 +662,22 @@ function fermiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
   return segs;
 }
 
+/**
+ * Enumerate one Fluid DEX (Instadapp FluidDexT1) pool's segments via the SHARED sampler (buildFluidSegments)
+ * over the pool's LIVE estimateSwapIn ladder (the same (cumIn, cumOut) points prepare sampled), so the
+ * oracle and prepare emit the IDENTICAL segment grid from the SAME sampled snapshot (single source), making
+ * the split exact-on-grid. The Fluid marginalOI is the post-fee + post-cap execution price (the resolver
+ * estimate folds the fee + utilization into the quote); adjNear == adjFar == marginalOI. Awarded as a
+ * "pool" venue.
+ */
+function fluidSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildFluidSegments(p.fluid!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -875,7 +902,9 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.fermi) {
+    if (p.fluid) {
+      allSegs.push(...fluidSegments(p, i, amountIn));
+    } else if (p.fermi) {
       allSegs.push(...fermiSegments(p, i, amountIn));
     } else if (p.woofi) {
       allSegs.push(...wooFiSegments(p, i, amountIn));

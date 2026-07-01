@@ -226,6 +226,7 @@ export enum EcoBracketKind {
   CryptoSwap = 11, // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) segment (static, off-chain-sampled via the A-gamma invariant replay; executed CALLBACK-FREE via approve + exchange(uint256,...))
   WOOFi = 12, // WOOFi (WooPPV2 synthetic proactive market maker) segment (static, off-chain-sampled via the sPMM oracle-price replay at a snapshot; executed CALLBACK-FREE via transfer + swap(fromToken,toToken,amt,minTo,to,rebateTo))
   Fermi = 13, // Fermi / propAMM (gattaca-com/propamm FermiSwap — Obric-style proactive AMM, K=v0²·multX/multY) segment (static, off-chain-sampled via the closed-form replay at a state snapshot; executed CALLBACK-FREE via getAmountOut + approve + swap(tokenIn,tokenOut,amt,minOut,to) — propAMM PULLS via transferFrom)
+  Fluid = 14, // Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) segment (static, off-chain-sampled via a LIVE resolver estimateSwapIn ladder at a state snapshot; executed CALLBACK-FREE via estimateSwapIn + approve + swapIn(swap0to1,amt,minOut,to) — Fluid PULLS via transferFrom)
 }
 
 /**
@@ -630,6 +631,42 @@ export interface EcoFermi {
 }
 
 /**
+ * One Fluid DEX venue to execute, indexed by an EcoBracket.refIdx (kind === Fluid). Fluid DEX (Instadapp
+ * fluid-contracts-public FluidDexT1) is a Liquidity-Layer-backed re-centering AMM (NOT xy=k): it prices off
+ * the layer's supply/borrow exchange prices + a center price + utilization/borrow caps, so it must NOT be
+ * routed through the V2 (_swapV2) path. The DexT1 pool exposes no getAmountOut view (its own estimate is a
+ * REVERT — FluidDexSwapResult — which SauceScript can't try/catch), so prepare samples a LIVE
+ * `estimateSwapIn` ladder OFF-CHAIN via the periphery DexReservesResolver into static segments (kind
+ * Fluid); the on-chain solver consumes those through the static-segment cursor and EXECUTES the awarded Σ
+ * share CALLBACK-FREE: an on-chain `resolver.estimateSwapIn(dex, swap0to1, +Σ, 0)` staticcall (reading the
+ * LIVE layer state — it does the pool's revert-decode in Solidity and returns a plain uint256) yields the
+ * out, the pool is APPROVED for the awarded input (Fluid PULLS via safeTransferFrom inside swapIn —
+ * approve-first, like Fermi/Wombat/Curve, NOT transfer-first like WOOFi), and
+ * `pool.swapIn(swap0to1, +Σ, amountOutMin, to)` lands it (amountOutMin == the just-quoted out ⇒ it never
+ * trips when the state is unchanged). NO engine SwapPoolType (DexT1 re-enters its OWN Liquidity layer via
+ * operate(), never the cooking contract). SNAPSHOTTED-QUOTE class: the split is exact-on-grid on the
+ * sampled quote ladder (the layer prices accrue every block + caps can shrink between prepare and cook —
+ * an exogenous, amountOutMin/terminal-refund-guarded residual; see fluid-math.ts). `address` is the DexT1
+ * pool; `resolver` is the estimate view target; `swap0to1` orients the swapIn direction; feePpm is the
+ * price-ordering coordinate / diagnostic (derived from the ladder — there is no fee getter on the path).
+ */
+export interface EcoFluid {
+  /** DexT1 pool address — the swapIn/approve target AND the resolver `dex_` arg. */
+  address: Hex;
+  /** DexReservesResolver address — the estimateSwapIn staticcall target (the live quote view). */
+  resolver: Hex;
+  /** true ⇒ tokenIn is the pool's token0 (swap0to1 = true); false ⇒ tokenIn is token1. */
+  swap0to1: boolean;
+  /** The pool's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The pool's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Derived ppm fee (the price-ordering coordinate; the on-chain out is the resolver estimateSwapIn view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -740,6 +777,15 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   fermiPools?: EcoFermi[];
+  /**
+   * Fluid DEX (FluidDexT1 Liquidity-Layer-backed re-centering AMM) venues (kind === Fluid brackets
+   * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE
+   * (resolver.estimateSwapIn staticcall for minOut + approve + pool.swapIn — NO engine SwapPoolType); the
+   * Fluid marginal is supplied entirely as the static sampled segments in `brackets` (the LIVE
+   * estimateSwapIn ladder at a snapshot). Optional/empty when no Fluid pools were discovered (omitted ⇒ no
+   * Fluid venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  fluidPools?: EcoFluid[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

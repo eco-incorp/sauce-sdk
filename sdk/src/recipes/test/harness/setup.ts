@@ -104,6 +104,14 @@ export const wombatPoolArtifact = loadArtifact(
 export const wooFiPoolArtifact = loadArtifact(
   join(FIXTURES, "WooFiPool.sol", "WooFiPool.json"),
 );
+/** Fluid DEX (Instadapp FluidDexT1 — Liquidity-Layer-backed re-centering AMM) pool + resolver — deployed
+ * normally (constructor sets token0/token1 + the layer exchange rates / center price / fee). */
+export const fluidDexPoolArtifact = loadArtifact(
+  join(FIXTURES, "FluidDexPool.sol", "FluidDexPool.json"),
+);
+export const fluidDexResolverArtifact = loadArtifact(
+  join(FIXTURES, "FluidDexPool.sol", "FluidDexResolver.json"),
+);
 /** Fermi / propAMM (Obric-style proactive AMM) pool — deployed normally (constructor sets tokenX/tokenY +
  *  the settable derived curve state K/base + feePpm). */
 export const fermiPoolArtifact = loadArtifact(
@@ -1160,6 +1168,65 @@ export async function deployFermiPool(
     address: tokenY, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, yReserve], account: acct,
   });
   return pool;
+}
+
+// The REAL Fluid DEX surface the fixtures mirror: DexT1 token0/token1 + swapIn (approve-first pull, output
+// to `to`, FluidDexSwapResult revert on ADDRESS_DEAD) + the periphery resolver estimateSwapIn (revert-
+// decode). `setLayer`/`setCaps` are fixture-only helpers (drive the drift + cap cells).
+// The real FluidDexT1 pool has NO token0()/token1() getters — token0/token1 live only inside
+// constantsView()'s struct; the pair is oriented via the resolver's getDexTokens (mirrors the deployed pool).
+export const fluidDexPoolAbi = parseAbi([
+  "function constantsView() view returns ((uint256 dexId, address token0, address token1))",
+  "function setLayer(uint256 exchangeRate0, uint256 exchangeRate1, uint256 centerPrice)",
+  "function setCaps(uint256 outCap0, uint256 outCap1)",
+  "function swapIn(bool swap0to1, uint256 amountIn, uint256 amountOutMin, address to) payable returns (uint256 amountOut)",
+]);
+export const fluidDexResolverAbi = parseAbi([
+  "function getDexTokens(address dex) view returns (address token0, address token1)",
+  "function estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) returns (uint256 amountOut)",
+]);
+
+/**
+ * Deploy a local Fluid DEX (FluidDexT1) pool + its DexReservesResolver and fund the pool with both token0 +
+ * token1 reserves. The pool prices off settable Liquidity-Layer state (exchange rates + center price + fee)
+ * — canonical on-chain state, NOT xy=k — and exposes the REAL DexT1 surface (swapIn approve-first;
+ * FluidDexSwapResult revert on ADDRESS_DEAD). EcoSwap executes it callback-free (resolver estimateSwapIn +
+ * approve + pool.swapIn; Fluid PULLS via safeTransferFrom), so the pool must HOLD both tokens — `minter`
+ * transfers reserve0/reserve1 in. `centerPrice`/`exchangeRate*` are 1e18-scaled; `feePpm` is 1e6-scaled.
+ * Returns { pool, resolver }.
+ */
+export async function deployFluidDexPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  token0: Hex,
+  token1: Hex,
+  exchangeRate0: bigint,
+  exchangeRate1: bigint,
+  centerPrice: bigint,
+  feePpm: bigint,
+  reserve0: bigint,
+  reserve1: bigint,
+  depth: bigint,
+  minter?: Account,
+): Promise<{ pool: Hex; resolver: Hex }> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: fluidDexPoolArtifact.abi,
+    bytecode: fluidDexPoolArtifact.bytecode,
+    args: [token0, token1, exchangeRate0, exchangeRate1, centerPrice, feePpm, depth],
+  });
+  const resolver = await deployContract(walletClient, publicClient, {
+    abi: fluidDexResolverArtifact.abi,
+    bytecode: fluidDexResolverArtifact.bytecode,
+    args: [],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: token0, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
+  });
+  return { pool, resolver };
 }
 
 // Mirrors the real euler-xyz/euler-swap IEulerSwap read surface (getAssets/getReserves/getDynamicParams/

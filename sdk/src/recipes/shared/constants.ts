@@ -149,6 +149,27 @@ export enum FactoryType {
    * callback — the only re-entry is internal to Euler, never the cooking contract), so no engine change.
    */
   EulerSwap = "eulerswap",
+  /**
+   * Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — a Liquidity-Layer-backed re-centering AMM;
+   * high-volume ETH/Arbitrum stable venue). Discovery is KNOWN-POOL-ADDRESS based (the DexT1 pools are
+   * deployed by a factory with no simple pair→pool getter on the swap surface), so the candidate DexT1
+   * pool addresses are carried per-config in `FactoryConfig.fluidPools` (like EulerSwap's eulerSwapPools /
+   * Balancer's balancerStablePools) and the periphery DexReservesResolver address in
+   * `FactoryConfig.fluidResolver`. The DexT1 pool prices off the Liquidity-Layer supply/borrow exchange
+   * prices + a center price + utilization/borrow caps — ALL canonical on-chain state, NOT xy=k — and
+   * exposes NO getAmountOut view (its own estimate is a REVERT, FluidDexSwapResult, which SauceScript
+   * can't try/catch). So discovery SAMPLES a LIVE ladder via the RESOLVER's
+   * `estimateSwapIn(dex, swap0to1, +amountIn, 0)` (which does the pool's revert-decode in Solidity and
+   * returns a plain uint256); the curve is priced OFF-CHAIN into sampled segments from that ladder.
+   * CALLBACK-FREE: executed in SauceScript (a live resolver estimateSwapIn staticcall for amountOutMin +
+   * approve + pool.swapIn(swap0to1, amt, amountOutMin, to); Fluid PULLS via safeTransferFrom inside swapIn,
+   * approve-first, like Fermi/Wombat/Curve — NOT transfer-first like WOOFi), so no engine change (DexT1
+   * re-enters its OWN Liquidity layer via operate(), never the cooking contract). SNAPSHOTTED-QUOTE class:
+   * the split is exact-on-grid vs the oracle on the shared sampled ladder; the exec re-reads the live
+   * estimate as amountOutMin. Verified surface: FluidDexT1 0x6d83f60eEac0e50A1250760151E81Db2a278e03a;
+   * fluid-contracts-public poolT1/coreModule/core/main.sol + periphery/resolvers/dex/main.sol.
+   */
+  Fluid = "fluid",
 }
 
 /**
@@ -222,6 +243,26 @@ export interface FactoryConfig {
    * surfaced (the discovery gap is filled by config, no engine change).
    */
   eulerSwapPools?: Hex[];
+  /**
+   * Fluid DEX (Fluid factory type) only: a KNOWN list of FluidDexT1 pool addresses to probe for the pair.
+   * The DexT1 pools have no simple pair→pool getter on the swap surface, so discovery is known-pool-address
+   * based — `discoverFluidPoolsTyped` reads the resolver's getDexTokens(dex) to orient the pair (swap0to1;
+   * the pool has NO token0()/token1() getters — they live only inside constantsView()'s struct) and
+   * SAMPLES the resolver `estimateSwapIn` ladder, keeping the pools trading BOTH tokenIn and tokenOut with a
+   * strictly-positive quote. PRODUCTION populates this from the Fluid pool index / subgraph; the EVM test
+   * injects the locally-deployed fixture pool address directly. Omitted/empty ⇒ no Fluid pools surfaced (the
+   * discovery gap is filled by config, no engine change).
+   */
+  fluidPools?: Hex[];
+  /**
+   * Fluid DEX (Fluid factory type) only: the periphery DexReservesResolver address. The DexT1 pool's own
+   * estimate is a REVERT (FluidDexSwapResult) that SauceScript can't try/catch, so BOTH discovery sampling
+   * and the on-chain per-slice exec quote go through the RESOLVER's
+   * `estimateSwapIn(dex, swap0to1, amountIn, 0)` (it does the try/catch in Solidity and returns a plain
+   * uint256). Required when `fluidPools` is non-empty. Verified: fluid-contracts-public
+   * periphery/resolvers/dex/main.sol.
+   */
+  fluidResolver?: Hex;
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */

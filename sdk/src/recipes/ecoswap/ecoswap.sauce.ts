@@ -10,6 +10,8 @@ import { IEulerSwapPool } from "./IEulerSwapPool.json";
 import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
 import { IWooFiPool } from "./IWooFiPool.json";
 import { IFermiPool } from "./IFermiPool.json";
+import { IFluidDexPool } from "./IFluidDexPool.json";
+import { IFluidDexResolver } from "./IFluidDexResolver.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -233,6 +235,7 @@ const HAS_MAVERICK: boolean = true;
 const HAS_CRYPTO: boolean = true;
 const HAS_WOOFI: boolean = true;
 const HAS_FERMI: boolean = true;
+const HAS_FLUID: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -245,6 +248,13 @@ function main(
   const caller: Address = cfg[3];
   const priceLimit: Uint256 = cfg[4];
   const directCount: Uint256 = cfg[5];
+  // cfg[6] = the chain-wide Fluid DEX DexReservesResolver address (0 when no Fluid venue). The Fluid
+  // per-slice quote goes through this resolver's estimateSwapIn (the pool's own estimate is a revert
+  // SauceScript can't try/catch); one resolver serves every Fluid pool on the chain. OPTIONAL 7th cfg
+  // field — guarded by cfg.length so the many venue EVM tests that hand-build a 6-field cfg (no Fluid)
+  // stay valid; production always emits it (index.ts).
+  let fluidResolver: Address = 0;
+  if (cfg.length > 6) { fluidResolver = cfg[6]; }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -323,6 +333,8 @@ function main(
   let wooven: Tuple = new Array(segs.length); // WOOFi venue (pool) address
   let feinp: Tuple = new Array(segs.length); // Fermi/propAMM per-venue Σ input
   let feven: Tuple = new Array(segs.length); // Fermi/propAMM venue (pool) address
+  let flinp: Tuple = new Array(segs.length); // Fluid DEX per-venue Σ input
+  let flven: Tuple = new Array(segs.length); // Fluid DEX venue (DexT1 pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -540,7 +552,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI) &&segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID) &&segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -862,7 +874,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID) &&bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -937,6 +949,15 @@ function main(
                                 if (HAS_FERMI && sKind === 11) {
                                   feinp[sIdx] = feinp[sIdx] + stake;
                                   feven[sIdx] = sVenue;
+                                } else {
+                                  // segKind 12 — Fluid DEX (FluidDexT1 Liquidity-Layer-backed re-centering
+                                  // AMM): callback-free, executed below via the resolver estimateSwapIn
+                                  // (minOut) + approve + pool.swapIn (Fluid PULLS via safeTransferFrom, so
+                                  // approve-first, like Fermi — NOT transfer-first like WOOFi).
+                                  if (HAS_FLUID && sKind === 12) {
+                                    flinp[sIdx] = flinp[sIdx] + stake;
+                                    flven[sIdx] = sVenue;
+                                  }
                                 }
                               }
                             }
@@ -1443,6 +1464,45 @@ function main(
       if (feOut > 0) {
         token.approve(fepool, feamt);
         IFermiPool.at(fepool).fermiSwapWithAllowances(tokenIn, tokenOut, feamt, feOut, address.self);
+      }
+    }
+  }
+  }
+  // Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — a Liquidity-Layer-backed re-centering AMM) →
+  // CALLBACK-FREE (NO engine SwapPoolType). Fluid DEX prices off the Liquidity-Layer supply/borrow exchange
+  // prices + a center price + utilization caps — canonical on-chain state, NOT xy=k — so the engine's
+  // _swapV2 would mis-price it. Execute exactly as a Fluid taker would, against the REAL verified surface:
+  // the DexT1 pool has NO getAmountOut view (its own estimate is a REVERT, FluidDexSwapResult, which this
+  // interpreter can't try/catch), so read the LIVE amountOut from the periphery DexReservesResolver's
+  // estimateSwapIn(dex, swap0to1, +Σ, 0) (it does the pool's revert-decode in Solidity and returns a plain
+  // uint256 for the exact-in leg). swap0to1 is the pool's own token0()==tokenIn orientation. APPROVE the
+  // pool for the awarded input (Fluid PULLS via safeTransferFrom inside swapIn — approve-first, like
+  // Fermi/Wombat/Curve, unlike the transfer-first WOOFi/Solidly path), then call
+  // pool.swapIn(swap0to1, +Σ, amountOutMin, to) with amountOutMin == the just-quoted out (the exact-in
+  // slippage bound; it never trips when the layer state is unchanged and re-reads the SAME live state
+  // atomically if the layer accrued / caps shrank between the quote and the swap). compute-then-pull
+  // already transferred `cum` (incl. each Fluid share) into this contract above, so the approved pull draws
+  // from this contract's balance and the out lands here (to == self). DexT1 re-enters its OWN Liquidity
+  // layer via operate(), never this cooking contract, so it is callback-free — no engine change.
+  if (HAS_FLUID) {
+  for (let g = 0; g < segs.length; g = g + 1) {
+    const flamt: Uint256 = flinp[g];
+    if (flamt > 0) {
+      const flpool: Address = flven[g];
+      // swap0to1: true when tokenIn is the pool's token0. Derived on-chain via the resolver's getDexTokens
+      // (the pool has NO token0()/token1() getters — token0/token1 live only inside constantsView()'s
+      // struct) so the direction bit is never trusted from off-chain data. getDexTokens returns a 2-tuple
+      // (token0, token1); take [0].
+      const flt0: Address = IFluidDexResolver.at(fluidResolver).getDexTokens(flpool)[0];
+      // swap0to1 is a uint256 0/1 — the compiler ABI-encodes it as the `bool` arg (BYTE_1). Derived
+      // on-chain from the pool itself so the direction bit is never trusted from off-chain data.
+      let flZ: Uint256 = 0;
+      if (flt0 === tokenIn) { flZ = 1; }
+      // LIVE quote via the resolver (amountOutMin 0 ⇒ pure quote) — the exact-in out for the awarded share.
+      const flOut: Uint256 = IFluidDexResolver.at(fluidResolver).estimateSwapIn(flpool, flZ, flamt, 0);
+      if (flOut > 0) {
+        token.approve(flpool, flamt);
+        IFluidDexPool.at(flpool).swapIn(flZ, flamt, flOut, address.self);
       }
     }
   }

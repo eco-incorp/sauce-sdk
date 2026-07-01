@@ -52,6 +52,7 @@ import {
   discoverCryptoSwapPoolsTyped,
   discoverWooFiPoolsTyped,
   discoverFermiPoolsTyped,
+  discoverFluidPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
@@ -61,6 +62,7 @@ import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/so
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
+import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
@@ -92,6 +94,7 @@ import {
   type EcoCryptoSwap,
   type EcoWooFi,
   type EcoFermi,
+  type EcoFluid,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -665,6 +668,35 @@ function buildFermiBrackets(pool: FermiPool, refIdx: number, amountIn: bigint): 
 }
 
 /**
+ * Build Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM)
+ * segments for one pool by DIFFERENCING the LIVE estimateSwapIn ladder discovery sampled (NO extra RPC —
+ * the (cumIn, cumOut) points are on the descriptor). Each (Δinput, Δoutput) slice becomes a STATIC segment
+ * (kind Fluid) in unified out/in space, refIdx → the Fluid venue index. The marginal is the POST-FEE +
+ * POST-CAP execution price (the pool folds fee + utilization into the resolver estimate), so it enters the
+ * descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The split is priced at the sampled
+ * SNAPSHOT ladder; the on-chain solver executes CALLBACK-FREE (a LIVE resolver estimateSwapIn staticcall
+ * for amountOutMin + approve + pool.swapIn — Fluid PULLS via safeTransferFrom). The executed out re-reads
+ * the live estimate at exec (see fluid-math.ts for the SNAPSHOTTED-QUOTE class).
+ */
+function buildFluidBrackets(pool: FluidPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildFluidSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.Fluid,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Fluid fee + cap (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
  * Build EulerSwap segments for one pool by sampling the closed-form f/fInverse curve replay (NO extra RPC
  * — pure bigint on the read reserves + static curve params + fee, BOUNDED by the vault inLimit). Each
  * sampled (Δinput, Δoutput) increment becomes a STATIC segment (kind EulerSwap) in unified out/in space,
@@ -1191,6 +1223,45 @@ export async function prepareEcoSwap(
   }
   for (const set of fermiBracketSets) brackets.push(...set);
 
+  const fluidPools: EcoFluid[] = [];
+  const fluidBracketSets: EcoBracket[][] = [];
+  // Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) —
+  // KNOWN-POOL-ADDRESS discovery (FactoryConfig.fluidPools + FactoryConfig.fluidResolver). Fluid prices off
+  // the Liquidity-Layer supply/borrow exchange prices + a center price + utilization caps (canonical
+  // on-chain state, NOT xy=k), so it is a SAMPLED-SEGMENT source. The DexT1 pool exposes NO getAmountOut
+  // view (its own estimate is a REVERT), so `discoverFluidPoolsTyped` orients the pair via the resolver's
+  // getDexTokens (the pool has NO token0()/token1() getters — token0/token1 live only inside
+  // constantsView()'s struct) and SAMPLES a LIVE ladder via the periphery RESOLVER's estimateSwapIn over
+  // [0, amountIn]; the split is
+  // built from that ladder (no closed form). Executed CALLBACK-FREE (a live resolver estimateSwapIn
+  // staticcall for amountOutMin + approve + pool.swapIn — Fluid PULLS via safeTransferFrom, so approve-
+  // first, unlike WOOFi's transfer-first path). NO engine change. SNAPSHOTTED-QUOTE class: the split is
+  // exact-on-grid vs the oracle on the shared sampled ladder; the exec re-reads the live estimate
+  // (amountOutMin bounds a bad fill). The layer prices accrue every block + caps can shrink between prepare
+  // and cook — the same snapshot assumption the recipe documents for Fermi / WOOFi / V3 fee, plus the
+  // EulerSwap-style cap bound (the sampler stops at the first 0-quote slice; the terminal refund covers a
+  // cap that shrank before cook).
+  const fluidConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Fluid);
+  if (fluidConfigs.length > 0) {
+    const fluidRaw = await discoverFluidPoolsTyped(tokenIn, tokenOut, client, fluidConfigs, amountIn);
+    for (const fp of fluidRaw) {
+      const refIdx = fluidPools.length;
+      const fb = buildFluidBrackets(fp, refIdx, amountIn);
+      if (fb.length === 0) continue;
+      fluidPools.push({
+        address: fp.address,
+        resolver: fp.resolver,
+        swap0to1: fp.swap0to1,
+        fromToken: fp.tokenIn,
+        toToken: fp.tokenOut,
+        feePpm: fp.feePpm,
+        source: fp.source,
+      });
+      fluidBracketSets.push(fb);
+    }
+  }
+  for (const set of fluidBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1338,7 +1409,8 @@ export async function prepareEcoSwap(
     wombats.length === 0 &&
     balancerStables.length === 0 &&
     wooFiPools.length === 0 &&
-    fermiPools.length === 0
+    fermiPools.length === 0 &&
+    fluidPools.length === 0
   ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
@@ -1359,6 +1431,7 @@ export async function prepareEcoSwap(
   const nCryptoSegs = brackets.filter((b) => b.kind === EcoBracketKind.CryptoSwap).length;
   const nWooFiSegs = brackets.filter((b) => b.kind === EcoBracketKind.WOOFi).length;
   const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
+  const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
@@ -1366,7 +1439,8 @@ export async function prepareEcoSwap(
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi)`,
+      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi, ` +
+      `${nFluidSegs} Fluid)`,
   );
 
   return {
@@ -1388,6 +1462,7 @@ export async function prepareEcoSwap(
     cryptoSwaps,
     wooFiPools,
     fermiPools,
+    fluidPools,
     brackets,
     zeroForOne,
     priceLimit,
