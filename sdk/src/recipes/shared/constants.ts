@@ -367,6 +367,10 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     { address: "0x420DD381b31aEf6683db6B902084cB0FFECe40Da" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Aerodrome V2" },
     // Maverick V2
     { address: "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e" as Hex, poolType: SwapPoolType.MaverickV2, factoryType: FactoryType.MaverickV2Factory, label: "Maverick V2" },
+    // Curve (MetaRegistry — the resolved AddressProvider.get_address(7) address, hardcoded here; find_pool_for_coins).
+    { address: "0x87DD13Dd25a1DBde0E1EdcF5B8Fa6cfff7eABCaD" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
+    // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
+    { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
   ],
   baseTokens: [
     WETH, USDC, DAI, USDbC,
@@ -386,6 +390,8 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xbACEB8eC6b9355Dfc0269C18bac9d6E2Bdc29C4F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 mainnet deployment.
+      { address: "0x000000000004444c5dc75cB358380D2e3dE08A90" as Hex, stateView: "0x7fFE42C4a5DEeA5b0feC41C94C136Cf115597227" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
       { address: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Uniswap V2" },
       { address: "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "SushiSwap V2" },
@@ -424,6 +430,8 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // Algebra (V3-compatible swap with dynamic fees, different factory query)
       { address: "0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Camelot V3" },
       { address: "0xAA2cd7477c451E703f3B9231d37de3ECDf0bc45A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Ramses V2" },
+      // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Arbitrum deployment.
+      { address: "0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32" as Hex, stateView: "0x76Fd297e2D437cd7f76d50F01AfE6160f86e9990" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
       { address: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "SushiSwap V2" },
       { address: "0x02a84c1b3BBD7401a5f7fa98a384EBC70bB5749E" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2" },
@@ -440,8 +448,8 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x2A3CE1DebAf2F0F5A0A6dEB64DF95B11a2407d3C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // Trader Joe LB
       { address: "0x8e42f2F4101563bF679975178e880FD87d3eFd4e" as Hex, poolType: SwapPoolType.TraderJoeLB, factoryType: FactoryType.TraderJoeLB, label: "Trader Joe LB" },
-      // WOOFi
-      { address: "0xeFF23B4bE1091b53205E35f3AfCD9C7182bf3062" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
+      // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
+      { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
     ],
     baseTokens: [
       "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" as Hex, // WETH
@@ -460,14 +468,18 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xCc0bDDB707055e04e497aB22a59c2aF4391cd12F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Velodrome CL" },
       { address: "0x9c6522117e2ed1fE5bdb72bb0eD5E3f2bdE7DBe0" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Optimism deployment.
+      { address: "0x9a13F98Cb987694C9F086b1F5eB990EeA8264Ec3" as Hex, stateView: "0xc18a3169788F4F75A170290584ECA6395C75Ecdb" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
       { address: "0xFbc12984689e5f15626Bad03Ad60160Fe98B303C" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "SushiSwap V2" },
       // Solidly V2 (volatile + stable pools)
       { address: "0xF1046053aa5682b4F9a81b5481394DA16BE5FF5a" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Velodrome V2" },
+      // Curve (MetaRegistry — find_pool_for_coins across all Curve pools).
+      { address: "0xc65CB3156225380BEda366610BaB18D5835A1647" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
       // Balancer V2
       { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2" },
-      // WOOFi
-      { address: "0xd1778F9DF3eee5473A9640f13682e3846f61fEbC" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
+      // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
+      { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
     ],
     baseTokens: [
       "0x4200000000000000000000000000000000000006" as Hex, // WETH
@@ -487,6 +499,8 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x917933899c6a5F8E37F31E19f92CdBFF7e8FF0e2" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       // Algebra (V3-compatible with dynamic fees)
       { address: "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "QuickSwap V3" },
+      // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Polygon deployment.
+      { address: "0x67366782805870060151383F4BbFF9daB53e5cD6" as Hex, stateView: "0x5eA1bD7974c8A611cBAB0bDCAFcB1D9CC9b3BA5a" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
       { address: "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "QuickSwap V2" },
       { address: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "SushiSwap V2" },
@@ -496,6 +510,8 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2" },
       // DODO V2
       { address: "0x79887f65f83bdf15Bcc8736b5e1Eed0C37B8571d" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
+      // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
+      { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
     ],
     baseTokens: [
       "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" as Hex, // WMATIC
@@ -513,10 +529,19 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     factories: [
       // V3 concentrated liquidity. Pancake's medium tier is 2500 (0.25%) on BSC, not 3000.
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
+      // Uniswap V3 (standard 0.30% tier — NOT Pancake's 2500).
+      { address: "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
+      // THENA Fusion (Algebra dynamic-fee CL; poolByPair + globalState). Executable — the engine
+      // services algebraSwapCallback (sauce#186). Algebra v1 pools share a fixed tickSpacing of 60.
+      { address: "0x306F06C147f064A010530292A1EB6737c3e378e4" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, algebraTickSpacing: 60, label: "THENA Fusion" },
+      // Maverick V2
+      { address: "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e" as Hex, poolType: SwapPoolType.MaverickV2, factoryType: FactoryType.MaverickV2Factory, label: "Maverick V2" },
       // V2 constant-product. Pancake V2 charges 0.20% (2000 ppm), not the 0.30% default.
       { address: "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2", v2FeePpm: 2000 },
       // Solidly V2 (volatile + stable pools)
       { address: "0x27DfD2D7b85e0010542da35C6EBcD59E45fc949D" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Thena (Solidly fork)" },
+      // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
+      { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
       // PancakeSwap StableSwap (Curve-like A-invariant). NOTE: discovery interface is
       // getPairInfo/getThreePoolPairInfo, NOT Curve's find_pool_for_coins — the CurveRegistry
       // reader in pool-discovery.ts needs a Pancake-StableSwap branch before it enumerates pools,
