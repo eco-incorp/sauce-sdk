@@ -51,6 +51,7 @@ import {
   discoverMaverickV2PoolsTyped,
   discoverCryptoSwapPoolsTyped,
   discoverWooFiPoolsTyped,
+  discoverFermiPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
@@ -59,6 +60,7 @@ import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
+import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
@@ -89,6 +91,7 @@ import {
   type EcoMaverick,
   type EcoCryptoSwap,
   type EcoWooFi,
+  type EcoFermi,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -634,6 +637,34 @@ function buildWooFiBrackets(pool: WooFiPool, refIdx: number, amountIn: bigint): 
 }
 
 /**
+ * Build Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) segments for one pool
+ * by DIFFERENCING the LIVE quote ladder discovery sampled (NO extra RPC — the (cumIn, cumOut) points are on
+ * the descriptor). Each (Δinput, Δoutput) slice becomes a STATIC segment (kind Fermi) in unified out/in
+ * space, refIdx → the Fermi venue index. The marginal is the POST-FEE execution price (the router folds the
+ * fee into the quote), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar.
+ * The split is priced at the sampled SNAPSHOT ladder; the on-chain solver executes CALLBACK-FREE (a LIVE
+ * quoteAmounts staticcall for amountCheck + approve + fermiSwapWithAllowances — propAMM PULLS via
+ * transferFrom). The executed out re-reads the live quote at exec (see fermi-math.ts for the class).
+ */
+function buildFermiBrackets(pool: FermiPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildFermiSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.Fermi,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Fermi swap fee (post-fee dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
  * Build EulerSwap segments for one pool by sampling the closed-form f/fInverse curve replay (NO extra RPC
  * — pure bigint on the read reserves + static curve params + fee, BOUNDED by the vault inLimit). Each
  * sampled (Δinput, Δoutput) increment becomes a STATIC segment (kind EulerSwap) in unified out/in space,
@@ -1129,6 +1160,37 @@ export async function prepareEcoSwap(
   }
   for (const set of wooFiBracketSets) brackets.push(...set);
 
+  const fermiPools: EcoFermi[] = [];
+  const fermiBracketSets: EcoBracket[][] = [];
+  // Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) — ROUTER discovery (the
+  // FactoryConfig.address is a FermiSwapper router). propAMM prices off its OWN on-chain state, NOT xy=k, so
+  // it is a SAMPLED-SEGMENT source. The router exposes NO curve-state getters, so `discoverFermiPoolsTyped`
+  // checks `isActive` for the pair and SAMPLES a LIVE `quoteAmounts` ladder over [0, amountIn]; the split is
+  // built from that ladder (no closed-form K/base). Executed CALLBACK-FREE (a live quoteAmounts staticcall
+  // for amountCheck + approve + fermiSwapWithAllowances — propAMM PULLS via transferFrom, so approve-first,
+  // unlike WOOFi's transfer-first path). NO engine change. SNAPSHOTTED-QUOTE class: the split is
+  // exact-on-grid vs the oracle on the shared sampled ladder; the exec re-reads the live quote (amountCheck
+  // + amountOutMin bound a bad fill), and the exogenous prepare→cook maker-param update is the same
+  // snapshot assumption the recipe documents for WOOFi / V3 fee / Balancer state.
+  const fermiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Fermi);
+  if (fermiConfigs.length > 0) {
+    const fermiRaw = await discoverFermiPoolsTyped(tokenIn, tokenOut, client, fermiConfigs, amountIn);
+    for (const fp of fermiRaw) {
+      const refIdx = fermiPools.length;
+      const fb = buildFermiBrackets(fp, refIdx, amountIn);
+      if (fb.length === 0) continue;
+      fermiPools.push({
+        address: fp.address,
+        fromToken: fp.tokenIn,
+        toToken: fp.tokenOut,
+        feePpm: fp.feePpm,
+        source: fp.source,
+      });
+      fermiBracketSets.push(fb);
+    }
+  }
+  for (const set of fermiBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1275,7 +1337,8 @@ export async function prepareEcoSwap(
     solidlyStables.length === 0 &&
     wombats.length === 0 &&
     balancerStables.length === 0 &&
-    wooFiPools.length === 0
+    wooFiPools.length === 0 &&
+    fermiPools.length === 0
   ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
@@ -1295,6 +1358,7 @@ export async function prepareEcoSwap(
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   const nCryptoSegs = brackets.filter((b) => b.kind === EcoBracketKind.CryptoSwap).length;
   const nWooFiSegs = brackets.filter((b) => b.kind === EcoBracketKind.WOOFi).length;
+  const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
@@ -1302,7 +1366,7 @@ export async function prepareEcoSwap(
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi)`,
+      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi)`,
   );
 
   return {
@@ -1323,6 +1387,7 @@ export async function prepareEcoSwap(
     maverickPools,
     cryptoSwaps,
     wooFiPools,
+    fermiPools,
     brackets,
     zeroForOne,
     priceLimit,

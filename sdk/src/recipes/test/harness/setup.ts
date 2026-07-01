@@ -104,6 +104,11 @@ export const wombatPoolArtifact = loadArtifact(
 export const wooFiPoolArtifact = loadArtifact(
   join(FIXTURES, "WooFiPool.sol", "WooFiPool.json"),
 );
+/** Fermi / propAMM (Obric-style proactive AMM) pool — deployed normally (constructor sets tokenX/tokenY +
+ *  the settable derived curve state K/base + feePpm). */
+export const fermiPoolArtifact = loadArtifact(
+  join(FIXTURES, "FermiPool.sol", "FermiPool.json"),
+);
 /** Trader Joe LB pair — deployed normally (constructor sets tokens/binStep/baseFactor/activeId). */
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
@@ -1107,6 +1112,52 @@ export async function deployWooFiPool(
   });
   await writeAndWait(walletClient, publicClient, {
     address: pool, abi: wooFiPoolAbi as Abi, functionName: "sync", args: [], account: acct,
+  });
+  return pool;
+}
+
+// The REAL FermiSwapper surface the fixture mirrors: signed-amount quote/swap + isActive. `setState` is a
+// fixture-only helper (drives the drift cell); the real router has no curve-state getters.
+export const fermiPoolAbi = parseAbi([
+  "function isActive(address a, address b) view returns (bool)",
+  "function setState(uint256 K, uint256 base)",
+  "function quoteAmounts(address tokenIn, address tokenOut, int256 amountSpecified) view returns (uint256 amountIn, uint256 amountOut)",
+  "function fermiSwapWithAllowances(address tokenIn, address tokenOut, int256 amountSpecified, uint256 amountCheck, address recipient) returns (uint256 amountIn, uint256 amountOut)",
+]);
+
+/**
+ * Deploy a local Fermi / propAMM (Obric-style proactive AMM) pool and fund it with both X + Y reserves.
+ *
+ * The pricing engine internally uses the Obric closed form (K = v0²·multX/multY, base = v0 + reserveX −
+ * targetX) with the fee off the output, but exposes only the REAL FermiSwapper SURFACE (quoteAmounts tuple +
+ * fermiSwapWithAllowances with a SIGNED amountSpecified) — the curve state is private (settable via
+ * `setState`). EcoSwap executes it callback-free (approve + fermiSwapWithAllowances; propAMM PULLS via
+ * transferFrom), so the pool must HOLD both tokens — `minter` transfers xReserve/yReserve in. `feePpm` is
+ * 1e6-scaled (0.03% = 300).
+ */
+export async function deployFermiPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  tokenX: Hex,
+  tokenY: Hex,
+  K: bigint,
+  base: bigint,
+  feePpm: bigint,
+  xReserve: bigint,
+  yReserve: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: fermiPoolArtifact.abi,
+    bytecode: fermiPoolArtifact.bytecode,
+    args: [tokenX, tokenY, K, base, feePpm],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenX, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, xReserve], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenY, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, yReserve], account: acct,
   });
   return pool;
 }

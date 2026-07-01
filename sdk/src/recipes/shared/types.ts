@@ -225,6 +225,7 @@ export enum EcoBracketKind {
   MaverickV2 = 10, // Maverick V2 (bin-based directional AMM) segment (static, off-chain-sampled via the bin swap-math replay; executed through the engine)
   CryptoSwap = 11, // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) segment (static, off-chain-sampled via the A-gamma invariant replay; executed CALLBACK-FREE via approve + exchange(uint256,...))
   WOOFi = 12, // WOOFi (WooPPV2 synthetic proactive market maker) segment (static, off-chain-sampled via the sPMM oracle-price replay at a snapshot; executed CALLBACK-FREE via transfer + swap(fromToken,toToken,amt,minTo,to,rebateTo))
+  Fermi = 13, // Fermi / propAMM (gattaca-com/propamm FermiSwap — Obric-style proactive AMM, K=v0²·multX/multY) segment (static, off-chain-sampled via the closed-form replay at a state snapshot; executed CALLBACK-FREE via getAmountOut + approve + swap(tokenIn,tokenOut,amt,minOut,to) — propAMM PULLS via transferFrom)
 }
 
 /**
@@ -602,6 +603,33 @@ export interface EcoWooFi {
 }
 
 /**
+ * One Fermi / propAMM venue to execute, indexed by an EcoBracket.refIdx (kind === Fermi). Fermi
+ * (gattaca-com/propamm FermiSwapper) is an OBRIC-style proactive market maker (NOT xy=k), so it must NOT be
+ * routed through the V2 (_swapV2) path. The FermiSwapper exposes no curve-state getters, so prepare samples
+ * a LIVE `quoteAmounts` ladder OFF-CHAIN into static segments (kind Fermi); the on-chain solver consumes
+ * those through the static-segment cursor and EXECUTES the awarded Σ share CALLBACK-FREE: an on-chain
+ * `pool.quoteAmounts(fromToken, toToken, +Σ)[1]` staticcall (reading the LIVE state) yields the out, the
+ * pool is APPROVED for the awarded input (propAMM PULLS via transferFrom, like Wombat/Curve — NOT
+ * transfer-first like WOOFi), and `pool.fermiSwapWithAllowances(fromToken, toToken, +Σ, amountCheck, to)`
+ * lands it (amountCheck == the just-quoted out ⇒ it never trips when the state is unchanged). NO engine
+ * SwapPoolType. SNAPSHOTTED-QUOTE class: the split is exact-on-grid on the sampled quote ladder (the maker
+ * can update state between prepare and cook — an exogenous, amountCheck/amountOutMin-guarded residual; see
+ * fermi-math.ts). `address` is the router; `fromToken`/`toToken` are the swap call's token args; feePpm is
+ * the price-ordering coordinate / diagnostic (derived from the ladder — there is no feePpm getter).
+ */
+export interface EcoFermi {
+  /** Router address — the quoteAmounts/fermiSwapWithAllowances/approve target. */
+  address: Hex;
+  /** The pool's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The pool's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Derived ppm fee (the price-ordering coordinate; the on-chain out is the pool quoteAmounts view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -703,6 +731,15 @@ export interface EcoSwapPrepared {
    * stay additive-compatible).
    */
   wooFiPools?: EcoWooFi[];
+  /**
+   * Fermi / propAMM venues (kind === Fermi brackets reference these by refIdx). The on-chain solver
+   * executes the awarded Σ share CALLBACK-FREE (getAmountOut staticcall for minOut + approve + pool.swap
+   * — NO engine SwapPoolType); the Fermi marginal is supplied entirely as the static sampled segments in
+   * `brackets` (the Obric-style closed-form replay at a snapshot). Optional/empty when no Fermi pools were
+   * discovered (omitted ⇒ no Fermi venue, so existing test-side `EcoSwapPrepared` literals stay
+   * additive-compatible).
+   */
+  fermiPools?: EcoFermi[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

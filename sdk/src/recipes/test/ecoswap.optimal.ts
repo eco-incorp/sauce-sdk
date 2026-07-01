@@ -71,6 +71,7 @@ import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
+import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -212,6 +213,15 @@ export interface OptimalPool {
    * other venue fields are ignored when `woofi` is set.
    */
   woofi?: WooFiPool;
+  /**
+   * Fermi / propAMM (gattaca-com/propamm FermiSwap — Obric-style proactive AMM) pool — when present this
+   * pool is a FERMI venue (NOT V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer/Euler/Maverick/CryptoSwap/WOOFi).
+   * The oracle enumerates its segments via the SHARED closed-form replay (buildFermiSegments) from the
+   * SNAPSHOT K/base + fee, so the split is exact-on-grid vs prepare's segments (one replay at the SAME
+   * snapshot). The Fermi marginalOI is the post-fee execution price (getAmountOut nets the swap fee); adjNear
+   * == adjFar == marginalOI. All the other venue fields are ignored when `fermi` is set.
+   */
+  fermi?: FermiPool;
 }
 
 /**
@@ -626,6 +636,21 @@ function wooFiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
   return segs;
 }
 
+/**
+ * Enumerate one Fermi / propAMM pool's segments via the SHARED sampler (buildFermiSegments) over the pool's
+ * LIVE quote ladder (the same (cumIn, cumOut) points prepare sampled), so the oracle and prepare emit the
+ * IDENTICAL segment grid from the SAME sampled snapshot (single source), making the split exact-on-grid. The
+ * Fermi marginalOI is the post-fee execution price (the router folds the fee into the quote); adjNear ==
+ * adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function fermiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildFermiSegments(p.fermi!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -850,7 +875,9 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.woofi) {
+    if (p.fermi) {
+      allSegs.push(...fermiSegments(p, i, amountIn));
+    } else if (p.woofi) {
       allSegs.push(...wooFiSegments(p, i, amountIn));
     } else if (p.cryptoSwap) {
       // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) venue: sampled-segment enumeration via

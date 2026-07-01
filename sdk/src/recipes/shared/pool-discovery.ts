@@ -32,6 +32,7 @@ import { dodoFeeToPpm, RState, type DodoPool } from "./dodo-math.js";
 import type { SolidlyStablePool } from "./solidly-stable-math.js";
 import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
+import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
 import { type EulerSwapPool } from "./eulerswap-math.js";
 import {
   getSqrtPrice as getMaverickSqrtPrice,
@@ -266,6 +267,16 @@ const wooPPV2Abi = parseAbi([
 const wooracleV2Abi = parseAbi([
   "function state(address base) external view returns (uint128 price, uint64 spread, uint64 coeff, bool woFeasible)",
   "function decimals(address base) external view returns (uint8)",
+]);
+
+// Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) read surface for the
+// EcoSwap TYPED path — the REAL verified FermiSwapper ABI (0xb1076fe3ab5e28005c7c323bac5ac06a680d452e). The
+// router exposes NO raw curve state (no tokenX/tokenY/K/base/feePpm getters) and NO getAmountOut view — only
+// a SIGNED-amount quote (amountSpecified positive = exact tokenIn), a signed-amount swap, and pair listing /
+// aliveness. Discovery reads `isActive` for the pair and SAMPLES the curve via `quoteAmounts` eth_calls.
+const fermiPoolAbi = parseAbi([
+  "function quoteAmounts(address tokenIn, address tokenOut, int256 amountSpecified) external view returns (uint256 amountIn, uint256 amountOut)",
+  "function isActive(address baseAsset, address quoteAsset) external view returns (bool)",
 ]);
 
 // ── KyberSwap Classic / DMM ──────────────────────────────────
@@ -1830,6 +1841,112 @@ export async function discoverWooFiPoolsTyped(
       });
     } catch {
       // Pool / oracle read failed (unsupported token, paused, or not a WooPPV2) — skip.
+    }
+  }
+  return out;
+}
+
+// ── Fermi / propAMM discovery ────────────────────────────────
+
+/**
+ * Discover Fermi / propAMM (gattaca-com/propamm FermiSwapper) pools for the pair AS TYPED `FermiPool`
+ * descriptors (the EcoSwap callback-free path). propAMM is an OBRIC-style proactive market maker (NOT xy=k),
+ * so it must NOT be priced through the V2 synthetic-sqrt path. Each FactoryConfig.address is a FermiSwapper
+ * ROUTER; a pair is kept only when `isActive(tokenIn, tokenOut)` (either orientation) reports it live.
+ *
+ * The FermiSwapper exposes NO raw curve state (no tokenX/tokenY/K/base getters, no getAmountOut view), so the
+ * split cannot be priced from a closed-form snapshot. Instead this SAMPLES the pool via a small ladder of
+ * `quoteAmounts(tokenIn, tokenOut, +cumIn)` eth_calls (positive amountSpecified = exact-in per the propAMM
+ * taker) over [0, amountIn] and stores the (cumIn, cumOut) points on the descriptor. `buildFermiSegments`
+ * then differences that ladder into segments with NO further RPC (so the oracle shares them). Execution is
+ * CALLBACK-FREE (approve + fermiSwapWithAllowances — propAMM PULLS via transferFrom, approve-first like
+ * Wombat/Curve). A pool is kept only when the pair is active AND the ladder shows a strictly positive out.
+ *
+ * `amountIn` sizes the ladder range. Mirrors `discoverWooFiPoolsTyped` — off-chain discovery + state reads,
+ * returning the venue descriptor EcoSwap prepare consumes directly (the on-chain lens does not understand
+ * Fermi).
+ */
+export async function discoverFermiPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  fermiConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<FermiPool[]> {
+  if (fermiConfigs.length === 0 || amountIn <= 0n) return [];
+
+  const sampleIn = fermiSampleInputs(amountIn);
+  if (sampleIn.length === 0) return [];
+
+  const out: FermiPool[] = [];
+  const seen = new Set<string>();
+  for (const cfg of fermiConfigs) {
+    const key = cfg.address.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      // Aliveness — the router reports whether the pair is tradeable (either orientation).
+      const active = (await client
+        .readContract({ address: cfg.address, abi: fermiPoolAbi, functionName: "isActive", args: [tokenIn, tokenOut] })
+        .catch(() => false)) as boolean;
+      const activeRev = active
+        ? true
+        : ((await client
+            .readContract({ address: cfg.address, abi: fermiPoolAbi, functionName: "isActive", args: [tokenOut, tokenIn] })
+            .catch(() => false)) as boolean);
+      if (!activeRev) continue;
+
+      // Sample the LIVE quote ladder: quoteAmounts(tokenIn, tokenOut, +cumIn)[1] is the exact-in out.
+      const quotes = await Promise.all(
+        sampleIn.map((amt) =>
+          client
+            .readContract({
+              address: cfg.address,
+              abi: fermiPoolAbi,
+              functionName: "quoteAmounts",
+              args: [tokenIn, tokenOut, amt],
+            })
+            .then((r) => (r as [bigint, bigint])[1])
+            .catch(() => 0n),
+        ),
+      );
+
+      // Keep only the strictly-positive, non-decreasing prefix of the ladder (a zero/failed quote = past the
+      // tradeable range; a non-increasing out = degenerate).
+      const cumIn: bigint[] = [];
+      const cumOut: bigint[] = [];
+      let prevOut = 0n;
+      for (let i = 0; i < sampleIn.length; i++) {
+        const o = quotes[i];
+        if (o <= prevOut) break;
+        cumIn.push(sampleIn[i]);
+        cumOut.push(o);
+        prevOut = o;
+      }
+      if (cumOut.length === 0 || cumOut[0] <= 0n) continue; // pair not tradeable / no out
+
+      // Derive an effective fee (ppm) from the shallowest slice for price-ordering / diagnostics: the
+      // near-par spot ratio's shortfall vs 1:1 is dominated by the fee (the router folds the fee into the
+      // quote — there is no feePpm() getter). Best-effort; 0 when the ladder is too thin/coarse to infer.
+      let feePpm = 0;
+      const in0 = cumIn[0];
+      const out0 = cumOut[0];
+      if (in0 > 0n && out0 > 0n && out0 < in0) {
+        const shortfall = ((in0 - out0) * FERMI_FEE_SCALE) / in0;
+        if (shortfall > 0n && shortfall < FERMI_FEE_SCALE) feePpm = Number(shortfall);
+      }
+
+      out.push({
+        address: cfg.address,
+        tokenIn,
+        tokenOut,
+        cumIn,
+        cumOut,
+        feePpm,
+        source: `${cfg.label} (Fermi propAMM)`,
+      });
+    } catch {
+      // Router read failed (not a FermiSwapper, paused, or unsupported pair) — skip.
     }
   }
   return out;

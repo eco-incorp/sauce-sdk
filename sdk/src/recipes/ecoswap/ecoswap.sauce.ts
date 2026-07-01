@@ -9,6 +9,7 @@ import { IWombatPool } from "./IWombatPool.json";
 import { IEulerSwapPool } from "./IEulerSwapPool.json";
 import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
 import { IWooFiPool } from "./IWooFiPool.json";
+import { IFermiPool } from "./IFermiPool.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -231,6 +232,7 @@ const HAS_EULER: boolean = true;
 const HAS_MAVERICK: boolean = true;
 const HAS_CRYPTO: boolean = true;
 const HAS_WOOFI: boolean = true;
+const HAS_FERMI: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -319,6 +321,8 @@ function main(
   let cryven: Tuple = new Array(segs.length); // Curve CryptoSwap venue (pool) address
   let wooinp: Tuple = new Array(segs.length); // WOOFi per-venue Σ input
   let wooven: Tuple = new Array(segs.length); // WOOFi venue (pool) address
+  let feinp: Tuple = new Array(segs.length); // Fermi/propAMM per-venue Σ input
+  let feven: Tuple = new Array(segs.length); // Fermi/propAMM venue (pool) address
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -536,7 +540,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI) &&segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI) &&segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -858,7 +862,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI) &&bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -926,6 +930,14 @@ function main(
                               if (HAS_WOOFI && sKind === 10) {
                                 wooinp[sIdx] = wooinp[sIdx] + stake;
                                 wooven[sIdx] = sVenue;
+                              } else {
+                                // segKind 11 — Fermi/propAMM (Obric-style proactive AMM): callback-free,
+                                // executed below via getAmountOut (minOut) + approve + swap (propAMM PULLS
+                                // via transferFrom, so approve-first, unlike WOOFi's transfer-first path).
+                                if (HAS_FERMI && sKind === 11) {
+                                  feinp[sIdx] = feinp[sIdx] + stake;
+                                  feven[sIdx] = sVenue;
+                                }
                               }
                             }
                           }
@@ -1404,6 +1416,33 @@ function main(
       if (wooOut > 0) {
         token.transfer(woopool, wooamt);
         IWooFiPool.at(woopool).swap(tokenIn, tokenOut, wooamt, wooOut, address.self, caller);
+      }
+    }
+  }
+  }
+  // Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) → CALLBACK-FREE (NO engine
+  // SwapPoolType). propAMM prices off its OWN on-chain state, NOT xy=k, so the engine's _swapV2 would
+  // mis-price it. Execute exactly as the propAMM taker would, against the REAL verified FermiSwapper surface:
+  // read the LIVE amountOut from quoteAmounts(tokenIn, tokenOut, +Σ) — the real quote returns a TUPLE
+  // (amountIn, amountOut); the second value ([1]) is the out for the exact-in leg (amountSpecified POSITIVE =
+  // exact tokenIn per the taker convention). APPROVE the pool for the awarded input (propAMM PULLS via
+  // transferFrom inside fermiSwapWithAllowances — approve-first, like Wombat/Curve, unlike the transfer-first
+  // WOOFi/Solidly path), then call fermiSwapWithAllowances(tokenIn, tokenOut, +Σ, amountCheck, to) with
+  // amountCheck == the just-quoted out (the exact-in slippage bound; it never trips when the state is
+  // unchanged and re-reads the SAME live state atomically if the maker MOVED params between quote and swap).
+  // compute-then-pull already transferred `cum` (incl. each Fermi share) into this contract above, so the
+  // approved pull draws from this contract's balance and the out lands here (to == self).
+  if (HAS_FERMI) {
+  for (let f = 0; f < segs.length; f = f + 1) {
+    const feamt: Uint256 = feinp[f];
+    if (feamt > 0) {
+      const fepool: Address = feven[f];
+      // amountSpecified is a SIGNED int256; feamt is a realistic-size POSITIVE amount ⇒ encodes as +int256
+      // (exact-in). The quote returns (amountIn, amountOut) — take [1] for the out.
+      const feOut: Uint256 = IFermiPool.at(fepool).quoteAmounts(tokenIn, tokenOut, feamt)[1];
+      if (feOut > 0) {
+        token.approve(fepool, feamt);
+        IFermiPool.at(fepool).fermiSwapWithAllowances(tokenIn, tokenOut, feamt, feOut, address.self);
       }
     }
   }

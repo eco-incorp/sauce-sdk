@@ -220,6 +220,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const maverickPools = prepared.maverickPools ?? [];
   const cryptoSwaps = prepared.cryptoSwaps ?? [];
   const wooFiPools = prepared.wooFiPools ?? [];
+  const fermiPools = prepared.fermiPools ?? [];
   return prepared.brackets
     .filter(
       (b) =>
@@ -232,7 +233,8 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.EulerSwap ||
         b.kind === EcoBracketKind.MaverickV2 ||
         b.kind === EcoBracketKind.CryptoSwap ||
-        b.kind === EcoBracketKind.WOOFi,
+        b.kind === EcoBracketKind.WOOFi ||
+        b.kind === EcoBracketKind.Fermi,
     )
     .slice()
     .sort((a, b) => {
@@ -251,6 +253,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isMaverick = b.kind === EcoBracketKind.MaverickV2;
       const isCrypto = b.kind === EcoBracketKind.CryptoSwap;
       const isWooFi = b.kind === EcoBracketKind.WOOFi;
+      const isFermi = b.kind === EcoBracketKind.Fermi;
       // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable, 7
       // EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap, 10 WOOFi — kinds 4/5/7/9/10 are callback-free (the
       // pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap + approve +
@@ -258,10 +261,11 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // get_dy + approve + exchange(uint256 i, uint256 j, Σ, min_dy) (Curve exchange PULLS via
       // transferFrom, and crypto pools use uint256 coin indices the engine's int128 _swapCurve does NOT
       // match), 10 = query + transfer + swap(fromToken,toToken,Σ,minTo,to,rebateTo) (WooPPV2 is
-      // transfer-first, oracle-priced sPMM). Kinds 1/3/6/8 go through the engine (1 = swap poolType 3
-      // Curve StableSwap, 3 = poolType 5 DODO, 6 = poolType 4 BalancerV2, 8 = poolType 7 MaverickV2 — a
-      // CALLBACK pool via maverickV2SwapCallback).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : 0n;
+      // transfer-first, oracle-priced sPMM), 11 = getAmountOut + approve + swap(tokenIn,tokenOut,Σ,minOut,to)
+      // (Fermi/propAMM — Obric-style proactive AMM; propAMM PULLS via transferFrom, so approve-first). Kinds
+      // 1/3/6/8 go through the engine (1 = swap poolType 3 Curve StableSwap, 3 = poolType 5 DODO, 6 =
+      // poolType 4 BalancerV2, 8 = poolType 7 MaverickV2 — a CALLBACK pool via maverickV2SwapCallback).
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -282,7 +286,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                         ? BigInt(cryptoSwaps[b.refIdx].address)
                         : isWooFi
                           ? BigInt(wooFiPools[b.refIdx].address)
-                          : 0n;
+                          : isFermi
+                            ? BigInt(fermiPools[b.refIdx].address)
+                            : 0n;
       return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
     });
 }
@@ -327,6 +333,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_MAVERICK = (prepared.maverickPools?.length ?? 0) > 0;
   const HAS_CRYPTO = (prepared.cryptoSwaps?.length ?? 0) > 0;
   const HAS_WOOFI = (prepared.wooFiPools?.length ?? 0) > 0;
+  const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -343,6 +350,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_MAVERICK,
     HAS_CRYPTO,
     HAS_WOOFI,
+    HAS_FERMI,
   };
 }
 

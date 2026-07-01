@@ -241,12 +241,14 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     const ALL = {
       HAS_V2: true, HAS_V3: true, HAS_V4: true, HAS_KYBER: true, HAS_ROUTES: true,
       HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: true,
-      HAS_WOOFI: true,
+      HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
+      HAS_FERMI: true,
     };
     const V3_ONLY = {
       HAS_V2: false, HAS_V3: true, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
       HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
-      HAS_WOOFI: false,
+      HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
+      HAS_FERMI: false,
     };
     const size = (r: any): number =>
       (r.bytecode ?? r.bytecodes).reduce((a: number, b: Uint8Array) => a + b.length, 0);

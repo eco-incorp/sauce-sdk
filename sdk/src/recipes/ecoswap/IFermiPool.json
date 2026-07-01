@@ -1,0 +1,34 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "quoteAmounts",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "tokenIn", "type": "address" },
+        { "name": "tokenOut", "type": "address" },
+        { "name": "amountSpecified", "type": "int256" }
+      ],
+      "outputs": [
+        { "name": "amountIn", "type": "uint256" },
+        { "name": "amountOut", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "fermiSwapWithAllowances",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        { "name": "tokenIn", "type": "address" },
+        { "name": "tokenOut", "type": "address" },
+        { "name": "amountSpecified", "type": "int256" },
+        { "name": "amountCheck", "type": "uint256" },
+        { "name": "recipient", "type": "address" }
+      ],
+      "outputs": [
+        { "name": "amountIn", "type": "uint256" },
+        { "name": "amountOut", "type": "uint256" }
+      ]
+    }
+  ]
+}

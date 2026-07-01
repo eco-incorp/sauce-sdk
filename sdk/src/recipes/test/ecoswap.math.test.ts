@@ -59,6 +59,12 @@ import {
   type WooFiPool,
 } from "../shared/woofi-math";
 import {
+  getAmountOut as fermiGetAmountOut,
+  buildFermiSegments,
+  fermiSampleInputs,
+  type FermiPool,
+} from "../shared/fermi-math";
+import {
   getDy as balancerGetDy,
   buildBalancerStableSegments,
   type BalancerStablePool,
@@ -1773,6 +1779,73 @@ describe("WOOFi (WooPPV2 sPMM) — query known-answer + sampler", () => {
     // Σ effOut over the grid == query(amountIn) (the sampler is a partition of the curve).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
     assert.equal(sumOut, wooFiQuery(p, amountIn), "Σ segment effOut == query(amountIn)");
+  });
+});
+
+// ── Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) ladder + sampler ──
+//
+// The real FermiSwapper exposes NO closed-form state getters and NO getAmountOut view — the split is priced
+// off a LIVE `quoteAmounts` ladder discovery samples (see fermi-math.ts). So there is no hand-pinned
+// closed-form KAT to assert; instead this pins the LADDER machinery: `getAmountOut` interpolates the
+// (cumIn, cumOut) points, and `buildFermiSegments` differences that ladder into a descending-marginal
+// partition. We synthesize a plausible near-1:1 ladder (the Obric X→Y form K/base − K/(base+dx) at a deep
+// curve, fee off the output) as the sampled quotes — mirroring what discovery would store from the router.
+describe("Fermi / propAMM (Obric-style proactive AMM) — quote-ladder interpolation + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  const V0 = 10_000_000n * E18;
+  const K = V0 * V0; // v0² · multX/multY with multX==multY
+  const BASE = V0; // v0 + reserveX − targetX with reserveX==targetX
+  const FEE_SCALE = 10n ** 6n;
+  const FEEPPM = 300n; // 0.03% (1e6-scaled)
+
+  // The Obric X→Y closed form + fee off the output — used ONLY to synthesize the sampled ladder the router
+  // would return (NOT a getter the recipe reads).
+  function xToY(dx: bigint): bigint {
+    if (dx <= 0n) return 0n;
+    const gross = K / BASE - K / (BASE + dx);
+    const fee = (gross * FEEPPM) / FEE_SCALE;
+    return gross > fee ? gross - fee : 0n;
+  }
+
+  function ladderPool(amountIn: bigint): FermiPool {
+    const cumIn = fermiSampleInputs(amountIn);
+    const cumOut = cumIn.map(xToY);
+    return { address: Z, tokenIn: Z, tokenOut: Z, cumIn, cumOut, feePpm: Number(FEEPPM), source: "kat" };
+  }
+
+  it("getAmountOut — exact at a ladder point, interpolated between", () => {
+    const amountIn = 100_000n * E18;
+    const p = ladderPool(amountIn);
+    // Exact at a stored sample.
+    const i = p.cumIn.length - 1;
+    assert.equal(fermiGetAmountOut(p, p.cumIn[i]), p.cumOut[i], "exact at the last ladder point");
+    // A SMALL trade is near-1:1 minus the 0.03% fee + tiny curvature slippage on the deep curve; a large
+    // trade loses more to curvature (monotone out, less than in).
+    const small = p.cumIn[0];
+    const outSmall = fermiGetAmountOut(p, small);
+    assert.ok(outSmall < small && outSmall > (small * 999n) / 1000n, "near-1:1 minus fee on a small propAMM slice");
+    const out = fermiGetAmountOut(p, amountIn);
+    assert.ok(out < amountIn && out > (amountIn * 98n) / 100n, "large trade: below par by fee + curvature");
+    // Interpolation is monotone and bracketed between the two neighbouring ladder points.
+    const mid = (p.cumIn[0] + p.cumIn[1]) / 2n;
+    const interp = fermiGetAmountOut(p, mid);
+    assert.ok(interp >= p.cumOut[0] && interp <= p.cumOut[1], "interpolated between neighbouring points");
+  });
+
+  it("buildFermiSegments — covers amountIn, descending marginals, partition of the ladder", () => {
+    const amountIn = 100_000n * E18;
+    const p = ladderPool(amountIn);
+    const segs = buildFermiSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+    }
+    // Σ effOut over the grid == getAmountOut(amountIn) (the sampler is a partition of the ladder).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, fermiGetAmountOut(p, amountIn), "Σ segment effOut == getAmountOut(amountIn)");
   });
 });
 

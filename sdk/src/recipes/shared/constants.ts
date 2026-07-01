@@ -101,6 +101,21 @@ export enum FactoryType {
   /** WOOFi: single pool per chain, query() for verification */
   WOOFi = "woofi",
   /**
+   * Fermi / propAMM (gattaca-com/propamm FermiSwapper — an OBRIC-style proactive AMM). Discovery is
+   * ROUTER-ADDRESS based: the FactoryConfig `address` is a FermiSwapper router (verified surface at
+   * 0xb1076fe3ab5e28005c7c323bac5ac06a680d452e). propAMM prices off its OWN on-chain state, NOT xy=k. The
+   * router exposes NO raw curve-state getters and NO getAmountOut view — only a SIGNED-amount quote
+   * `quoteAmounts(tokenIn, tokenOut, int256 amountSpecified) -> (amountIn, amountOut)` (positive = exact-in),
+   * a signed-amount swap `fermiSwapWithAllowances(tokenIn, tokenOut, int256, amountCheck, recipient)`, and
+   * `isActive`/`getPairs`. Discovery checks `isActive` and SAMPLES a LIVE `quoteAmounts` ladder; the curve is
+   * priced OFF-CHAIN into sampled segments from that ladder. CALLBACK-FREE: executed in SauceScript (a live
+   * quoteAmounts staticcall for amountCheck + approve + fermiSwapWithAllowances; propAMM PULLS via
+   * transferFrom, like Wombat/Curve — NOT transfer-first like WOOFi), so no engine change. SNAPSHOTTED-QUOTE
+   * class (the split is priced off the sampled quote snapshot; the exec re-reads the live quote as
+   * amountCheck). See LIQUIDITY_SOURCES_FEASIBILITY.md.
+   */
+  Fermi = "fermi",
+  /**
    * KyberSwap Classic / DMM: amplified constant-product on VIRTUAL reserves.
    * Discovery: getPools(tokenA, tokenB) → per-pool getTradeInfo()
    * (reserve0, reserve1, vReserve0, vReserve1, feeInPrecision). The curve geometry
