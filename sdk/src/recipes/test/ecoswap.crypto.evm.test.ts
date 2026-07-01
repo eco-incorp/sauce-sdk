@@ -130,6 +130,7 @@ function cryptoSegRows(pool: CryptoSwapPool, refIdx: number, amountIn: bigint): 
     s.marginalOI, // sqrtAdjFar (a CryptoSwap segment is a flat slice)
     9n, // segKind = Curve CryptoSwap (callback-free)
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

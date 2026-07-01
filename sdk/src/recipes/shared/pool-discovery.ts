@@ -34,6 +34,7 @@ import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
 import { type FluidPool, fluidSampleInputs, FLUID_FEE_SCALE } from "./fluid-math.js";
+import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import { type EulerSwapPool } from "./eulerswap-math.js";
 import {
   getSqrtPrice as getMaverickSqrtPrice,
@@ -299,6 +300,29 @@ const fermiPoolAbi = parseAbi([
 const fluidResolverAbi = parseAbi([
   "function getDexTokens(address dex) external view returns (address token0, address token1)",
   "function estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) external view returns (uint256 amountOut)",
+]);
+
+// Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) read surface for the
+// EcoSwap TYPED path — the REAL VERIFIED interface (mento-core Broker.sol / IBroker.sol /
+// IExchangeProvider.sol; Broker 0x777A8255cA72412f0d706dc03C9D1987306B4CaD, BiPoolManager
+// 0x22d9db95E6Ae61c104A7B6F6C78D7993B94ec901). Discovery is a two-step enumeration:
+//   Broker.getExchangeProviders() -> address[]        (the registered providers; BiPoolManager is one)
+//   IExchangeProvider.getExchanges() -> Exchange[]     where Exchange { bytes32 exchangeId; address[] assets; }
+// An exchange matches (tokenIn,tokenOut) when {tokenIn,tokenOut} == {assets[0],assets[1]} (unordered),
+// yielding (exchangeProvider = the provider that returned it, exchangeId = Exchange.exchangeId). The Broker
+// has a PLAIN getAmountOut VIEW (no revert-decode resolver, unlike Fluid):
+//   getAmountOut(address exchangeProvider, bytes32 exchangeId, address tokenIn, address tokenOut,
+//                uint256 amountIn) view -> uint256 amountOut
+// Discovery samples that view over [0, amountIn]. swapIn is the on-chain exec surface (approve the BROKER
+// first — it pulls via transferFrom into the reserve). getExchanges returns a nested dynamic tuple array
+// (assets is a dynamic address[]) — decoded by viem in TS discovery, NOT on-chain.
+const mentoBrokerAbi = parseAbi([
+  "function getExchangeProviders() external view returns (address[])",
+  "function getAmountOut(address exchangeProvider, bytes32 exchangeId, address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut)",
+]);
+const mentoExchangeProviderAbi = parseAbi([
+  "struct Exchange { bytes32 exchangeId; address[] assets; }",
+  "function getExchanges() external view returns (Exchange[])",
 ]);
 
 // ── KyberSwap Classic / DMM ──────────────────────────────────
@@ -2086,6 +2110,149 @@ export async function discoverFluidPoolsTyped(
       } catch {
         // Pool/resolver read failed (not a FluidDexT1, paused, or unsupported pair) — skip.
       }
+    }
+  }
+  return out;
+}
+
+// ── Mento V2 discovery ───────────────────────────────────────
+
+/**
+ * Discover Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues for the pair AS TYPED
+ * `MentoPool` descriptors (the EcoSwap callback-free path). Mento is a BiPool oracle-priced stablecoin
+ * exchange (NOT xy=k), so it must NOT be priced through the V2 synthetic-sqrt path. Discovery is ENUMERABLE
+ * and self-describing (unlike Fluid's known-pool-address list): the FactoryConfig `address` is the Broker.
+ *
+ * Two-step enumeration (VERIFIED against mento-core, do NOT skip step 1):
+ *   1. `Broker.getExchangeProviders()` → the registered exchange-provider addresses (BiPoolManager is one).
+ *      When `FactoryConfig.mentoExchangeProviders` is set it RESTRICTS to those (skips the enumeration —
+ *      used by the local fixture); otherwise the live provider set is queried (governance-mutable).
+ *   2. `provider.getExchanges()` → Exchange[] { bytes32 exchangeId; address[] assets; }. An exchange matches
+ *      (tokenIn,tokenOut) when {tokenIn,tokenOut} == {assets[0],assets[1]} (UNORDERED), yielding
+ *      (exchangeProvider = the provider, exchangeId = Exchange.exchangeId).
+ *
+ * The Broker has a PLAIN `getAmountOut(exchangeProvider, exchangeId, tokenIn, tokenOut, amountIn)` VIEW
+ * (deterministic at the current bucket state; no revert-decode resolver needed — simpler than Fluid), so
+ * this SAMPLES a small ladder of `getAmountOut` eth_calls over [0, amountIn] and stores the (cumIn, cumOut)
+ * points on the descriptor. `buildMentoSegments` then differences that ladder into segments with NO further
+ * RPC (so the oracle shares them). Execution is CALLBACK-FREE (approve the BROKER + broker.swapIn — Mento
+ * PULLS via transferFrom into the reserve, approve-first like Fermi/Wombat/Curve/Fluid). A venue is kept
+ * only when its exchange trades BOTH tokenIn and tokenOut AND the ladder shows a strictly-positive out (a
+ * zero/failed quote past a trading limit truncates the ladder, like EulerSwap's inLimit).
+ *
+ * `amountIn` sizes the ladder range. Mirrors `discoverFluidPoolsTyped` / `discoverFermiPoolsTyped` —
+ * off-chain discovery + state reads, returning the venue descriptor EcoSwap prepare consumes directly (the
+ * on-chain lens does not understand Mento).
+ */
+export async function discoverMentoPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  mentoConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<MentoPool[]> {
+  if (mentoConfigs.length === 0 || amountIn <= 0n) return [];
+
+  const sampleIn = mentoSampleInputs(amountIn);
+  if (sampleIn.length === 0) return [];
+
+  const inLc = tokenIn.toLowerCase();
+  const outLc = tokenOut.toLowerCase();
+  const out: MentoPool[] = [];
+  const seen = new Set<string>();
+  for (const cfg of mentoConfigs) {
+    const broker = cfg.address;
+    try {
+      // STEP 1 — the registered exchange providers. Use the config hint when present (deterministic /
+      // local fixture); otherwise enumerate live (governance-mutable).
+      let providers: Hex[];
+      if (cfg.mentoExchangeProviders && cfg.mentoExchangeProviders.length > 0) {
+        providers = cfg.mentoExchangeProviders;
+      } else {
+        providers = (await client
+          .readContract({ address: broker, abi: mentoBrokerAbi, functionName: "getExchangeProviders" })
+          .catch(() => [])) as Hex[];
+      }
+
+      for (const provider of providers) {
+        // STEP 2 — this provider's exchanges (Exchange { bytes32 exchangeId; address[] assets; }).
+        const exchanges = (await client
+          .readContract({ address: provider, abi: mentoExchangeProviderAbi, functionName: "getExchanges" })
+          .catch(() => [])) as readonly { exchangeId: Hex; assets: readonly Hex[] }[];
+
+        for (const ex of exchanges) {
+          const assets = ex.assets ?? [];
+          if (assets.length < 2) continue;
+          const a0 = assets[0].toLowerCase();
+          const a1 = assets[1].toLowerCase();
+          // Match {tokenIn,tokenOut} == {assets[0],assets[1]} UNORDERED.
+          const matches = (a0 === inLc && a1 === outLc) || (a1 === inLc && a0 === outLc);
+          if (!matches) continue;
+
+          const key = `${provider.toLowerCase()}:${ex.exchangeId.toLowerCase()}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          // Sample the LIVE quote ladder: getAmountOut(provider, exchangeId, tokenIn, tokenOut, +cumIn).
+          const quotes = await Promise.all(
+            sampleIn.map((amt) =>
+              client
+                .readContract({
+                  address: broker,
+                  abi: mentoBrokerAbi,
+                  functionName: "getAmountOut",
+                  args: [provider, ex.exchangeId, tokenIn, tokenOut, amt],
+                })
+                .then((r) => r as bigint)
+                .catch(() => 0n),
+            ),
+          );
+
+          // Keep only the strictly-positive, non-decreasing prefix of the ladder (a zero/failed quote =
+          // past a trading limit; a non-increasing out = degenerate).
+          const cumIn: bigint[] = [];
+          const cumOut: bigint[] = [];
+          let prevOut = 0n;
+          for (let i = 0; i < sampleIn.length; i++) {
+            const o = quotes[i];
+            if (o <= prevOut) break;
+            cumIn.push(sampleIn[i]);
+            cumOut.push(o);
+            prevOut = o;
+          }
+          if (cumOut.length === 0 || cumOut[0] <= 0n) continue; // pair not tradeable / no out
+
+          // Derive an effective fee/spread (ppm) from the shallowest slice for DIAGNOSTICS ONLY — the real
+          // merge price coordinate is `marginalOI`, computed from the ladder dy in buildMentoSegments (shared
+          // by prepare + oracle) independent of this field. This is a PAR-PAIR heuristic: it reads the shortfall
+          // vs 1:1 (near-par spot ratio's shortfall ≈ the exchange spread, folded into the quote — there is no
+          // fee getter on the Broker path). For a non-par pair (oracle center price ≠ ~1:1, e.g. cUSD/cEUR, or
+          // differing decimals) out0 may exceed or differ from in0 for reasons other than spread, so feePpm is
+          // mis-derived or left 0 — do NOT trust it as an accurate fee for non-par pairs. Best-effort; 0 when
+          // the ladder is too thin/coarse or the pair is not ~par.
+          let feePpm = 0;
+          const in0 = cumIn[0];
+          const out0 = cumOut[0];
+          if (in0 > 0n && out0 > 0n && out0 < in0) {
+            const shortfall = ((in0 - out0) * MENTO_FEE_SCALE) / in0;
+            if (shortfall > 0n && shortfall < MENTO_FEE_SCALE) feePpm = Number(shortfall);
+          }
+
+          out.push({
+            broker,
+            exchangeProvider: provider,
+            exchangeId: ex.exchangeId,
+            tokenIn,
+            tokenOut,
+            cumIn,
+            cumOut,
+            feePpm,
+            source: `${cfg.label} (Mento V2)`,
+          });
+        }
+      }
+    } catch {
+      // Broker/provider read failed (not a Mento Broker, or unsupported pair) — skip.
     }
   }
   return out;

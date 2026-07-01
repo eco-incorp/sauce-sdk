@@ -104,6 +104,7 @@ function dodoSegRows(pool: DodoPool, refIdx: number, amountIn: bigint): bigint[]
     s.marginalOI, // sqrtAdjFar (a DODO segment is a flat slice)
     3n, // segKind = DODO
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

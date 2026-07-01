@@ -227,6 +227,7 @@ export enum EcoBracketKind {
   WOOFi = 12, // WOOFi (WooPPV2 synthetic proactive market maker) segment (static, off-chain-sampled via the sPMM oracle-price replay at a snapshot; executed CALLBACK-FREE via transfer + swap(fromToken,toToken,amt,minTo,to,rebateTo))
   Fermi = 13, // Fermi / propAMM (gattaca-com/propamm FermiSwap — Obric-style proactive AMM, K=v0²·multX/multY) segment (static, off-chain-sampled via the closed-form replay at a state snapshot; executed CALLBACK-FREE via getAmountOut + approve + swap(tokenIn,tokenOut,amt,minOut,to) — propAMM PULLS via transferFrom)
   Fluid = 14, // Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) segment (static, off-chain-sampled via a LIVE resolver estimateSwapIn ladder at a state snapshot; executed CALLBACK-FREE via estimateSwapIn + approve + swapIn(swap0to1,amt,minOut,to) — Fluid PULLS via transferFrom)
+  Mento = 15, // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) segment (static, off-chain-sampled via a LIVE Broker getAmountOut ladder at a bucket snapshot; executed CALLBACK-FREE via getAmountOut + approve BROKER + swapIn(exchangeProvider,exchangeId,tokenIn,tokenOut,amt,minOut) — Mento PULLS via transferFrom into the reserve)
 }
 
 /**
@@ -667,6 +668,45 @@ export interface EcoFluid {
 }
 
 /**
+ * One Mento V2 venue to execute, indexed by an EcoBracket.refIdx (kind === Mento). Mento V2 (Celo
+ * mento-protocol/mento-core Broker + BiPoolManager) is a BiPool oracle-priced stablecoin exchange (NOT
+ * xy=k): the Broker routes to a registered exchange provider (BiPoolManager) that prices off oracle rates +
+ * a spread over interval-updated pricing buckets, so it must NOT be routed through the V2 (_swapV2) path.
+ * The exchange has a PLAIN `getAmountOut` VIEW on the Broker (no revert-decode resolver needed — simpler
+ * than Fluid), so prepare samples a LIVE `broker.getAmountOut(exchangeProvider, exchangeId, tokenIn,
+ * tokenOut, +cumIn)` ladder OFF-CHAIN into static segments (kind Mento); the on-chain solver consumes those
+ * through the static-segment cursor and EXECUTES the awarded Σ share CALLBACK-FREE: an on-chain
+ * `broker.getAmountOut(exchangeProvider, exchangeId, tokenIn, tokenOut, +Σ)` staticcall (the LIVE bucket
+ * quote) yields the out, the BROKER is APPROVED for the awarded input (Mento PULLS via transferFrom into
+ * the reserve inside swapIn — approve-first, like Fermi/Wombat/Curve/Fluid, NOT transfer-first like WOOFi),
+ * and `broker.swapIn(exchangeProvider, exchangeId, tokenIn, tokenOut, +Σ, amountOutMin)` lands it
+ * (amountOutMin == the just-quoted out ⇒ it never trips when the bucket state is unchanged). NO engine
+ * SwapPoolType (swapIn re-enters only the Reserve / stable-asset mint-burn, never the cooking contract).
+ * SNAPSHOTTED-QUOTE class (interval-updated buckets, same family as Fluid/WOOFi): the split is exact-on-grid
+ * on the sampled quote ladder; the buckets refresh only on config.referenceRateResetFrequency (gated by
+ * oracle reports) — an exogenous, amountOutMin/terminal-refund-guarded residual; also subject to
+ * TradingLimits + BreakerBox reverts (see mento-math.ts). `broker` is the getAmountOut/swapIn/approve
+ * target; `exchangeProvider`+`exchangeId` identify the BiPool exchange (resolved OFF-CHAIN in discovery via
+ * getExchangeProviders → getExchanges); feePpm is the price-ordering coordinate / diagnostic (derived from
+ * the ladder — the exchange folds the spread into the quote).
+ */
+export interface EcoMento {
+  /** Broker (BrokerProxy) address — the getAmountOut/swapIn/approve target. */
+  broker: Hex;
+  /** The resolved exchange provider (e.g. BiPoolManager) for this exchange — a getAmountOut/swapIn arg. */
+  exchangeProvider: Hex;
+  /** The resolved exchange id (bytes32) for this (tokenIn,tokenOut) pair — a getAmountOut/swapIn arg. */
+  exchangeId: Hex;
+  /** The venue's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The venue's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Derived ppm fee/spread (the price-ordering coordinate; the on-chain out is the Broker getAmountOut view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -786,6 +826,15 @@ export interface EcoSwapPrepared {
    * Fluid venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
    */
   fluidPools?: EcoFluid[];
+  /**
+   * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues (kind === Mento brackets
+   * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE
+   * (broker.getAmountOut staticcall for minOut + approve BROKER + broker.swapIn — NO engine SwapPoolType);
+   * the Mento marginal is supplied entirely as the static sampled segments in `brackets` (the LIVE Broker
+   * getAmountOut ladder at a bucket snapshot). Optional/empty when no Mento venues were discovered (omitted
+   * ⇒ no Mento venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  mentoPools?: EcoMento[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

@@ -126,6 +126,7 @@ function maverickSegRows(pool: MaverickPool, refIdx: number, amountIn: bigint): 
     s.marginalOI, // sqrtAdjFar (a Maverick segment is a flat slice)
     8n, // segKind = Maverick V2 (engine callback path)
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

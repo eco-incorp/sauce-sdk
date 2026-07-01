@@ -220,6 +220,18 @@ function fluidResolverAddr(prepared: EcoSwapPrepared): bigint {
   return first ? BigInt(first.resolver) : 0n;
 }
 
+/**
+ * The chain-wide Mento V2 Broker address (the getAmountOut quote + swapIn target the on-chain solver calls
+ * for every Mento slice) — carried as `cfg[7]`. All Mento venues on a chain share one Broker, so take the
+ * first prepared Mento venue's broker; 0 when no Mento venue (the guard folds the branch away under
+ * treeshake, so the 0 is never dereferenced). The per-venue exchangeProvider/exchangeId travel in the segs
+ * row (venue = segs[5], exchangeId = segs[6]).
+ */
+function mentoBrokerAddr(prepared: EcoSwapPrepared): bigint {
+  const first = prepared.mentoPools?.[0];
+  return first ? BigInt(first.broker) : 0n;
+}
+
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const curves = prepared.curves ?? [];
   const lbs = prepared.lbs ?? [];
@@ -233,6 +245,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const wooFiPools = prepared.wooFiPools ?? [];
   const fermiPools = prepared.fermiPools ?? [];
   const fluidPools = prepared.fluidPools ?? [];
+  const mentoPools = prepared.mentoPools ?? [];
   return prepared.brackets
     .filter(
       (b) =>
@@ -247,6 +260,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.CryptoSwap ||
         b.kind === EcoBracketKind.WOOFi ||
         b.kind === EcoBracketKind.Fermi ||
+        b.kind === EcoBracketKind.Mento ||
         b.kind === EcoBracketKind.Fluid,
     )
     .slice()
@@ -268,6 +282,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isWooFi = b.kind === EcoBracketKind.WOOFi;
       const isFermi = b.kind === EcoBracketKind.Fermi;
       const isFluid = b.kind === EcoBracketKind.Fluid;
+      const isMento = b.kind === EcoBracketKind.Mento;
       // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable, 7
       // EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap, 10 WOOFi — kinds 4/5/7/9/10 are callback-free (the
       // pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap + approve +
@@ -279,10 +294,14 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // (Fermi/propAMM — Obric-style proactive AMM; propAMM PULLS via transferFrom, so approve-first), 12 =
       // resolver.estimateSwapIn + approve + pool.swapIn(swap0to1,Σ,minOut,to) (Fluid DEX — FluidDexT1
       // Liquidity-Layer-backed re-centering AMM; Fluid PULLS via safeTransferFrom, so approve-first, and the
-      // quote is on the periphery resolver because the pool's own estimate is a revert). Kinds 1/3/6/8 go
-      // through the engine (1 = swap poolType 3 Curve StableSwap, 3 = poolType 5 DODO, 6 = poolType 4
+      // quote is on the periphery resolver because the pool's own estimate is a revert), 13 =
+      // broker.getAmountOut + approve BROKER + broker.swapIn(exchangeProvider,exchangeId,tokenIn,tokenOut,Σ,minOut)
+      // (Mento V2 — Celo Broker + BiPoolManager stablecoin exchange; Mento PULLS via transferFrom into the
+      // reserve, so approve-first, and the venue carries the exchangeProvider in `venue` (segs[5]) + the
+      // exchangeId in the 7th `venueAux` column (segs[6]); the broker is chain-wide via cfg[7]). Kinds 1/3/6/8
+      // go through the engine (1 = swap poolType 3 Curve StableSwap, 3 = poolType 5 DODO, 6 = poolType 4
       // BalancerV2, 8 = poolType 7 MaverickV2 — a CALLBACK pool via maverickV2SwapCallback).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : 0n;
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -307,8 +326,14 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                             ? BigInt(fermiPools[b.refIdx].address)
                             : isFluid
                               ? BigInt(fluidPools[b.refIdx].address)
-                              : 0n;
-      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue];
+                              : isMento
+                                ? BigInt(mentoPools[b.refIdx].exchangeProvider)
+                                : 0n;
+      // venueAux (segs[6]) — the per-segment auxiliary 256-bit value. Non-zero ONLY for Mento (the bytes32
+      // exchangeId, threaded as a uint256 so the 256-bit value survives intact — it must NOT be truncated).
+      // Every other kind pads 0; the on-chain solver reads segs[6] only inside the Mento (segKind 13) branch.
+      const venueAux = isMento ? BigInt(mentoPools[b.refIdx].exchangeId) : 0n;
+      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue, venueAux];
     });
 }
 
@@ -354,6 +379,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_WOOFI = (prepared.wooFiPools?.length ?? 0) > 0;
   const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0;
   const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0;
+  const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -372,6 +398,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_WOOFI,
     HAS_FERMI,
     HAS_FLUID,
+    HAS_MENTO,
   };
 }
 
@@ -462,6 +489,7 @@ export async function ecoSwap(
         prepared.priceLimit,
         BigInt(directCount),
         fluidResolverAddr(prepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
+        mentoBrokerAddr(prepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
       ],
       poolTuples,
       netCache,
@@ -623,6 +651,7 @@ export async function quoteEcoSwap(
         usePrepared.priceLimit,
         BigInt(directCount),
         fluidResolverAddr(usePrepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
+        mentoBrokerAddr(usePrepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
       ],
       poolTuples,
       netCache,

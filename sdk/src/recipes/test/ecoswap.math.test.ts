@@ -71,6 +71,12 @@ import {
   type FluidPool,
 } from "../shared/fluid-math";
 import {
+  getAmountOut as mentoGetAmountOut,
+  buildMentoSegments,
+  mentoSampleInputs,
+  type MentoPool,
+} from "../shared/mento-math";
+import {
   getDy as balancerGetDy,
   buildBalancerStableSegments,
   type BalancerStablePool,
@@ -1960,6 +1966,114 @@ describe("Fluid DEX (FluidDexT1 Liquidity-Layer re-centering AMM) — quote-ladd
     // Build over the truncated ladder capped at amountIn (the on-chain merge would only award the tradeable
     // prefix; anything past the cap is un-fillable, so the split covers only up to the cap boundary).
     const segs = buildFluidSegments(p, amountIn);
+    const covered = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.ok(segs.every((s) => s.effOut > 0n), "every segment has a positive out (none past the cap)");
+    assert.equal(covered, capBoundary, "covered input == the cap boundary (the tradeable prefix)");
+    assert.ok(covered < amountIn, "the cap truncates the covered input below amountIn");
+  });
+});
+
+// ── Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) quote-ladder ──
+//
+// Mento's BiPoolManager prices off oracle rates + a spread over interval-updated pricing buckets — the
+// split is priced off a LIVE Broker `getAmountOut` ladder discovery samples (see mento-math.ts). So there
+// is no hand-pinned closed-form KAT to assert; instead this pins the LADDER machinery: `getAmountOut`
+// interpolates the (cumIn, cumOut) points, and `buildMentoSegments` differences that ladder into a
+// descending-marginal partition. We synthesize a plausible near-1:1 constant-product-over-buckets ladder
+// (a cUSD/USDC-style stable pair — bucket0/bucket1 with a spread off the output, then a trading-limit cap)
+// as the sampled quotes — mirroring what discovery would store from the Broker.
+describe("Mento V2 (Celo Broker + BiPoolManager bucket-priced exchange) — quote-ladder interpolation + sampler", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  const ZID = "0x0000000000000000000000000000000000000000000000000000000000000001" as `0x${string}`;
+  const SPREAD_SCALE = 10n ** 6n;
+  const SPREADPPM = 100n; // 0.01% (1e6-scaled) — Mento stable-tier spread
+  // Constant-product bucket amounts (near-1:1 stable pair): out = bucket1 - bucket0*bucket1/(bucket0+dx),
+  // deep enough that a 100k swap stays near-1:1 but the marginal genuinely descends so the split
+  // equalizes across venues of different depth.
+  const BUCKET0 = 20_000_000n * E18;
+  const BUCKET1 = 20_000_000n * E18;
+  // A trading-limit out-cap that bites only well past the sampled range.
+  const OUT_CAP = 500_000n * E18;
+
+  // The bucket constant-product out minus the spread off the output, then capped. Used ONLY to synthesize
+  // the sampled ladder the Broker would return (NOT a getter the recipe reads).
+  function xToY(dx: bigint): bigint {
+    if (dx <= 0n) return 0n;
+    const gross = BUCKET1 - (BUCKET0 * BUCKET1) / (BUCKET0 + dx);
+    const spread = (gross * SPREADPPM) / SPREAD_SCALE;
+    const net = gross > spread ? gross - spread : 0n;
+    return net > OUT_CAP ? 0n : net;
+  }
+
+  function ladderPool(amountIn: bigint): MentoPool {
+    const cumIn = mentoSampleInputs(amountIn);
+    const cumOut = cumIn.map(xToY);
+    return {
+      broker: Z, exchangeProvider: Z, exchangeId: ZID, tokenIn: Z, tokenOut: Z,
+      cumIn, cumOut, feePpm: Number(SPREADPPM), source: "kat",
+    };
+  }
+
+  it("getAmountOut — exact at a ladder point, interpolated between, spread-adjusted", () => {
+    const amountIn = 100_000n * E18;
+    const p = ladderPool(amountIn);
+    // Exact at a stored sample.
+    const i = p.cumIn.length - 1;
+    assert.equal(mentoGetAmountOut(p, p.cumIn[i]), p.cumOut[i], "exact at the last ladder point");
+    // A SMALL trade is near-1:1 minus the 0.01% spread + tiny bucket slippage; a large trade loses more to
+    // the constant-product term (monotone out, less than in).
+    const small = p.cumIn[0];
+    const outSmall = mentoGetAmountOut(p, small);
+    assert.ok(outSmall < small && outSmall > (small * 999n) / 1000n, "near-1:1 minus spread on a small Mento slice");
+    const out = mentoGetAmountOut(p, amountIn);
+    assert.ok(out < amountIn && out > (amountIn * 98n) / 100n, "large trade: below par by spread + bucket slippage");
+    // Interpolation is monotone and bracketed between the two neighbouring ladder points.
+    const mid = (p.cumIn[0] + p.cumIn[1]) / 2n;
+    const interp = mentoGetAmountOut(p, mid);
+    assert.ok(interp >= p.cumOut[0] && interp <= p.cumOut[1], "interpolated between neighbouring points");
+  });
+
+  it("buildMentoSegments — covers amountIn, descending (flat) marginals, partition of the ladder", () => {
+    const amountIn = 100_000n * E18;
+    const p = ladderPool(amountIn);
+    const segs = buildMentoSegments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals non-increasing");
+    }
+    // Σ effOut over the grid == getAmountOut(amountIn) (the sampler is a partition of the ladder).
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, mentoGetAmountOut(p, amountIn), "Σ segment effOut == getAmountOut(amountIn)");
+  });
+
+  it("trading-limit cap: discovery truncates the ladder; segments stay a clean partition", () => {
+    // Size amountIn so the LAST samples exceed OUT_CAP → those quote 0. discoverMentoPoolsTyped keeps only
+    // the strictly-positive non-decreasing PREFIX (the trading-limit edge); replay that truncation here,
+    // then build over the truncated descriptor.
+    const amountIn = 40_000_000n * E18; // net at par pushes the tail samples over OUT_CAP
+    const rawIn = mentoSampleInputs(amountIn);
+    const rawOut = rawIn.map(xToY);
+    assert.ok(rawOut.some((o) => o === 0n), "some tail samples exceed the trading-limit cap and quote 0");
+    // Discovery's non-decreasing-positive prefix rule (verbatim from discoverMentoPoolsTyped).
+    const cumIn: bigint[] = [];
+    const cumOut: bigint[] = [];
+    let prev = 0n;
+    for (let i = 0; i < rawIn.length; i++) {
+      if (rawOut[i] <= prev) break;
+      cumIn.push(rawIn[i]);
+      cumOut.push(rawOut[i]);
+      prev = rawOut[i];
+    }
+    assert.ok(cumIn.length > 0 && cumIn.length < rawIn.length, "prefix truncated below the cap");
+    const capBoundary = cumIn[cumIn.length - 1];
+    const p: MentoPool = {
+      broker: Z, exchangeProvider: Z, exchangeId: ZID, tokenIn: Z, tokenOut: Z,
+      cumIn, cumOut, feePpm: Number(SPREADPPM), source: "kat-cap",
+    };
+    const segs = buildMentoSegments(p, amountIn);
     const covered = segs.reduce((a, s) => a + s.capacity, 0n);
     assert.ok(segs.every((s) => s.effOut > 0n), "every segment has a positive out (none past the cap)");
     assert.equal(covered, capBoundary, "covered input == the cap boundary (the tradeable prefix)");

@@ -109,6 +109,7 @@ function lbSegRows(pool: LbPool, refIdx: number, amountIn: bigint): bigint[][] {
     s.marginalOI, // sqrtAdjFar (an LB bin is a flat slice)
     2n, // segKind = LB
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

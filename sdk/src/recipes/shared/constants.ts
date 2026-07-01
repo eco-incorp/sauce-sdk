@@ -170,6 +170,28 @@ export enum FactoryType {
    * fluid-contracts-public poolT1/coreModule/core/main.sol + periphery/resolvers/dex/main.sol.
    */
   Fluid = "fluid",
+  /**
+   * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange). Discovery is
+   * ENUMERABLE via the Broker: the FactoryConfig `address` is the Broker (BrokerProxy). Mento is a BiPool
+   * oracle-priced exchange — the Broker routes to a registered exchange provider (BiPoolManager) that prices
+   * off oracle rates + a spread over interval-updated pricing buckets, NOT xy=k. Discovery is a two-step
+   * enumeration: `Broker.getExchangeProviders()` → for each provider `provider.getExchanges()` → an
+   * Exchange { bytes32 exchangeId; address[] assets; } matches (tokenIn,tokenOut) when {tokenIn,tokenOut}
+   * == {assets[0],assets[1]} (unordered), yielding (exchangeProvider, exchangeId). The Broker has a PLAIN
+   * `getAmountOut(exchangeProvider, exchangeId, tokenIn, tokenOut, amountIn)` VIEW (no revert-decode
+   * resolver), so discovery SAMPLES that view over [0, amountIn] and the curve is priced OFF-CHAIN into
+   * sampled segments from that ladder. CALLBACK-FREE: executed in SauceScript (a live Broker getAmountOut
+   * staticcall for amountOutMin + approve the BROKER + broker.swapIn(exchangeProvider, exchangeId, tokenIn,
+   * tokenOut, amt, amountOutMin); Mento PULLS via transferFrom into the reserve inside swapIn, approve-first
+   * like Fermi/Wombat/Curve/Fluid — NOT transfer-first like WOOFi), so no engine change (swapIn re-enters
+   * only the Reserve / stable-asset mint-burn, never the cooking contract). SNAPSHOTTED-QUOTE class (buckets
+   * refresh only on config.referenceRateResetFrequency, gated by oracle reports — treat getAmountOut as a
+   * snapshot; also subject to TradingLimits + BreakerBox reverts). The provider set is governance-mutable —
+   * discovery goes through getExchangeProviders(), not a hardcoded BiPoolManager. Verified: Broker
+   * 0x777A8255cA72412f0d706dc03C9D1987306B4CaD, BiPoolManager 0x22d9db95E6Ae61c104A7B6F6C78D7993B94ec901
+   * (both source-verified EIP-1967 proxies on Celoscan). See mento-math.ts.
+   */
+  Mento = "mento",
 }
 
 /**
@@ -263,6 +285,16 @@ export interface FactoryConfig {
    * periphery/resolvers/dex/main.sol.
    */
   fluidResolver?: Hex;
+  /**
+   * Mento V2 (Mento factory type) only: an OPTIONAL hint of the exchange-provider addresses (BiPoolManager
+   * etc.) to enumerate. Discovery is ENUMERABLE and self-describing — `discoverMentoPoolsTyped` calls
+   * `Broker.getExchangeProviders()` (the FactoryConfig `address` is the Broker) to obtain the providers,
+   * then `provider.getExchanges()` on each — so this field is NOT required (the provider set is
+   * governance-mutable and discovered live). When present it RESTRICTS enumeration to these providers
+   * (skipping getExchangeProviders); the canonical BiPoolManager is verified here for documentation /
+   * a deterministic local-fixture path. Verified: BiPoolManager 0x22d9db95E6Ae61c104A7B6F6C78D7993B94ec901.
+   */
+  mentoExchangeProviders?: Hex[];
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */
@@ -541,6 +573,11 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // NOTE: Velodrome CL (concentrated-liquidity) factory 0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F
       // is NOT added — it keys getPool by TICK SPACING, not fee, so the V3Standard fee-tier discovery
       // would not enumerate its pools (same latent gap as the arbitrum Ramses / Sonic Shadow CL entries).
+      // Mento V2 (Celo stablecoin exchange). `address` is the Broker (BrokerProxy) — discovery enumerates
+      // its exchange providers (BiPoolManager) + exchanges. poolType is a benign valid value (Mento is
+      // CALLBACK-FREE with no engine SwapPoolType — the swap goes through the Broker in SauceScript). The
+      // canonical BiPoolManager is pinned as a documented provider hint. Verified proxies on Celoscan.
+      { address: "0x777A8255cA72412f0d706dc03C9D1987306B4CaD" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Mento, label: "Mento V2", mentoExchangeProviders: ["0x22d9db95E6Ae61c104A7B6F6C78D7993B94ec901" as Hex] },
     ],
     baseTokens: [
       "0x471EcE3750Da237f93B8E339c536989b8978a438" as Hex, // CELO (native ERC20, routing hub, 18 dec)

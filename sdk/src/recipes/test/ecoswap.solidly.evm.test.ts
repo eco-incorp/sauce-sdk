@@ -93,6 +93,7 @@ function stableSegRows(pool: SolidlyStablePool, refIdx: number, amountIn: bigint
     s.marginalOI, // sqrtAdjFar (a stable segment is a flat slice)
     4n, // segKind = Solidly stable (callback-free)
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

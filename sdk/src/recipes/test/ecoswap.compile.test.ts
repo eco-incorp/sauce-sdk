@@ -55,12 +55,13 @@ const netCache: bigint[][] = [
   [OFFSET - 180n, 5n * 10n ** 16n],
 ];
 const routing: bigint[][] = [];
-// Sampled-segment venue rows: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue].
-// One representative Curve segment so the compiler infers the 6-col `segs` row shape (the
-// solver reads segs[i][0..5]); kind 1 = Curve. Used as the default `segs` arg in compileBoth so
-// every fixture compiles the bestKind===1 cursor + the Curve/LB/DODO execution loops.
+// Sampled-segment venue rows: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux].
+// One representative Curve segment so the compiler infers the 7-col `segs` row shape (the solver reads
+// segs[i][0..6] — segs[6] = venueAux, the Mento bytes32 exchangeId, 0 for every other kind); kind 1 = Curve.
+// Used as the default `segs` arg in compileBoth so every fixture compiles the bestKind===1 cursor + the
+// Curve/LB/DODO execution loops.
 const SEG_VENUE = BigInt("0xc0c0000000000000000000000000000000000001");
-const segs: bigint[][] = [[0n, 10n ** 17n, 1n << 96n, 1n << 96n, 1n, SEG_VENUE]];
+const segs: bigint[][] = [[0n, 10n ** 17n, 1n << 96n, 1n << 96n, 1n, SEG_VENUE, 0n]];
 
 /**
  * Build the `cfg` scalar tuple index.ts emits:
@@ -219,11 +220,11 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     const CURVE = BigInt("0xc0c0000000000000000000000000000000000001");
     const LB = BigInt("0x1b1b000000000000000000000000000000000002");
     const DODO = BigInt("0xd0d0000000000000000000000000000000000003");
-    // [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue], DESC sqrtAdjNear.
+    // [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux], DESC sqrtAdjNear.
     const mixedSegs: bigint[][] = [
-      [0n, 4n * 10n ** 17n, (1n << 96n) + 30n, (1n << 96n) + 30n, 1n, CURVE], // Curve
-      [0n, 3n * 10n ** 17n, (1n << 96n) + 20n, (1n << 96n) + 20n, 2n, LB], // LB
-      [0n, 2n * 10n ** 17n, (1n << 96n) + 10n, (1n << 96n) + 10n, 3n, DODO], // DODO
+      [0n, 4n * 10n ** 17n, (1n << 96n) + 30n, (1n << 96n) + 30n, 1n, CURVE, 0n], // Curve
+      [0n, 3n * 10n ** 17n, (1n << 96n) + 20n, (1n << 96n) + 20n, 2n, LB, 0n], // LB
+      [0n, 2n * 10n ** 17n, (1n << 96n) + 10n, (1n << 96n) + 10n, 3n, DODO, 0n], // DODO
     ];
     compileBoth(directOnly, directNet, routing, 1, mixedSegs);
   });
@@ -242,13 +243,13 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       HAS_V2: true, HAS_V3: true, HAS_V4: true, HAS_KYBER: true, HAS_ROUTES: true,
       HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: true,
       HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
-      HAS_FERMI: true,
+      HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true,
     };
     const V3_ONLY = {
       HAS_V2: false, HAS_V3: true, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
       HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
       HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
-      HAS_FERMI: false,
+      HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false,
     };
     const size = (r: any): number =>
       (r.bytecode ?? r.bytecodes).reduce((a: number, b: Uint8Array) => a + b.length, 0);

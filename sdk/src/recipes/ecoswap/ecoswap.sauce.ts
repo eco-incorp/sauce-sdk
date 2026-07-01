@@ -12,6 +12,7 @@ import { IWooFiPool } from "./IWooFiPool.json";
 import { IFermiPool } from "./IFermiPool.json";
 import { IFluidDexPool } from "./IFluidDexPool.json";
 import { IFluidDexResolver } from "./IFluidDexResolver.json";
+import { IMentoBroker } from "./IMentoBroker.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -236,6 +237,7 @@ const HAS_CRYPTO: boolean = true;
 const HAS_WOOFI: boolean = true;
 const HAS_FERMI: boolean = true;
 const HAS_FLUID: boolean = true;
+const HAS_MENTO: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -255,6 +257,13 @@ function main(
   // stay valid; production always emits it (index.ts).
   let fluidResolver: Address = 0;
   if (cfg.length > 6) { fluidResolver = cfg[6]; }
+  // cfg[7] = the chain-wide Mento V2 Broker address (0 when no Mento venue). The Mento per-slice quote +
+  // swap both go through this Broker's getAmountOut / swapIn; the per-venue exchangeProvider + exchangeId
+  // travel in the segs row (venue = segs[5] = provider, segs[6] = exchangeId). One Broker serves every Mento
+  // venue on the chain. OPTIONAL 8th cfg field — guarded by cfg.length so the many venue EVM tests that
+  // hand-build a shorter cfg (no Mento) stay valid; production always emits it (index.ts).
+  let mentoBroker: Address = 0;
+  if (cfg.length > 7) { mentoBroker = cfg[7]; }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -335,6 +344,9 @@ function main(
   let feven: Tuple = new Array(segs.length); // Fermi/propAMM venue (pool) address
   let flinp: Tuple = new Array(segs.length); // Fluid DEX per-venue Σ input
   let flven: Tuple = new Array(segs.length); // Fluid DEX venue (DexT1 pool) address
+  let mtinp: Tuple = new Array(segs.length); // Mento V2 per-venue Σ input
+  let mtven: Tuple = new Array(segs.length); // Mento V2 venue exchangeProvider address (segs[5])
+  let mtxid: Tuple = new Array(segs.length); // Mento V2 venue exchangeId (bytes32-as-uint256, segs[6])
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -552,7 +564,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID) &&segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO) &&segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -874,7 +886,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO) &&bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -957,6 +969,18 @@ function main(
                                   if (HAS_FLUID && sKind === 12) {
                                     flinp[sIdx] = flinp[sIdx] + stake;
                                     flven[sIdx] = sVenue;
+                                  } else {
+                                    // segKind 13 — Mento V2 (Celo Broker + BiPoolManager stablecoin
+                                    // exchange): callback-free, executed below via the Broker getAmountOut
+                                    // (minOut) + approve BROKER + broker.swapIn (Mento PULLS via transferFrom
+                                    // into the reserve, so approve-first, like Fermi/Fluid — NOT transfer-first
+                                    // like WOOFi). sVenue (segs[5]) is the exchangeProvider; sg[6] is the
+                                    // bytes32 exchangeId (as uint256, kept intact — not truncated).
+                                    if (HAS_MENTO && sKind === 13) {
+                                      mtinp[sIdx] = mtinp[sIdx] + stake;
+                                      mtven[sIdx] = sVenue;
+                                      mtxid[sIdx] = sg[6];
+                                    }
                                   }
                                 }
                               }
@@ -1503,6 +1527,39 @@ function main(
       if (flOut > 0) {
         token.approve(flpool, flamt);
         IFluidDexPool.at(flpool).swapIn(flZ, flamt, flOut, address.self);
+      }
+    }
+  }
+  }
+  // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) → CALLBACK-FREE (NO
+  // engine SwapPoolType). Mento is a BiPool oracle-priced exchange (the Broker routes to a registered
+  // exchange provider that prices off oracle rates + a spread over interval-updated buckets — canonical
+  // on-chain state, NOT xy=k), so the engine's _swapV2 would mis-price it. Execute exactly as a Mento taker
+  // would, against the REAL verified surface: read the LIVE amountOut from the Broker's PLAIN
+  // getAmountOut(exchangeProvider, exchangeId, tokenIn, tokenOut, +Σ) VIEW (no revert-decode resolver, unlike
+  // Fluid) for the exact-in leg. The exchangeProvider is the accumulated venue (mtven, segs[5]) and the
+  // exchangeId is the accumulated bytes32 (mtxid, segs[6]) — resolved OFF-CHAIN in discovery. APPROVE the
+  // BROKER for the awarded input (Mento PULLS via transferFrom into the reserve inside swapIn —
+  // approve-first, like Fermi/Fluid/Wombat/Curve, unlike the transfer-first WOOFi/Solidly path), then call
+  // broker.swapIn(exchangeProvider, exchangeId, tokenIn, tokenOut, +Σ, amountOutMin) with amountOutMin ==
+  // the just-quoted out (the exact-in slippage bound; it never trips when the bucket state is unchanged and
+  // re-reads the SAME live state atomically if the buckets refreshed / a trading limit moved between the
+  // quote and the swap). compute-then-pull already transferred `cum` (incl. each Mento share) into this
+  // contract above, so the approved pull draws from this contract's balance and the out lands here (msg.sender
+  // == self). swapIn re-enters only the Reserve / stable-asset mint-burn, never this cooking contract, so it
+  // is callback-free — no engine change.
+  if (HAS_MENTO) {
+  for (let h = 0; h < segs.length; h = h + 1) {
+    const mtamt: Uint256 = mtinp[h];
+    if (mtamt > 0) {
+      const mtprov: Address = mtven[h];
+      const mtid: Uint256 = mtxid[h];
+      // LIVE quote via the Broker (the exact-in out for the awarded share). mtid is the full bytes32
+      // exchangeId (as uint256) — the compiler ABI-encodes it as the `bytes32` arg intact (not truncated).
+      const mtOut: Uint256 = IMentoBroker.at(mentoBroker).getAmountOut(mtprov, mtid, tokenIn, tokenOut, mtamt);
+      if (mtOut > 0) {
+        token.approve(mentoBroker, mtamt);
+        IMentoBroker.at(mentoBroker).swapIn(mtprov, mtid, tokenIn, tokenOut, mtamt, mtOut);
       }
     }
   }

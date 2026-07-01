@@ -105,6 +105,7 @@ function curveSegRows(pool: CurvePool, refIdx: number, amountIn: bigint): bigint
     s.marginalOI, // sqrtAdjFar (a Curve segment is a flat slice)
     1n, // segKind = Curve
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

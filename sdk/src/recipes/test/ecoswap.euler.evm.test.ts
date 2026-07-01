@@ -117,6 +117,7 @@ function eulerSegRows(pool: EulerSwapPool, refIdx: number, amountIn: bigint): bi
     s.marginalOI, // sqrtAdjFar (an EulerSwap segment is a flat slice)
     7n, // segKind = EulerSwap (callback-free)
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

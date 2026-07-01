@@ -96,6 +96,7 @@ function wombatSegRows(pool: WombatPool, refIdx: number, amountIn: bigint): bigi
     s.marginalOI, // sqrtAdjFar (a Wombat segment is a flat slice)
     5n, // segKind = Wombat (callback-free)
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

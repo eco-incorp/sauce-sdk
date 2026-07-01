@@ -113,6 +113,7 @@ function balancerSegRows(pool: BalancerStablePool, refIdx: number, amountIn: big
     s.marginalOI, // sqrtAdjFar (a Balancer segment is a flat slice)
     6n, // segKind = Balancer ComposableStable
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

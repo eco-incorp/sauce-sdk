@@ -53,6 +53,7 @@ import {
   discoverWooFiPoolsTyped,
   discoverFermiPoolsTyped,
   discoverFluidPoolsTyped,
+  discoverMentoPoolsTyped,
 } from "../shared/pool-discovery.js";
 import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
@@ -63,6 +64,7 @@ import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
+import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
@@ -95,6 +97,7 @@ import {
   type EcoWooFi,
   type EcoFermi,
   type EcoFluid,
+  type EcoMento,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -697,6 +700,35 @@ function buildFluidBrackets(pool: FluidPool, refIdx: number, amountIn: bigint): 
 }
 
 /**
+ * Build Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) segments for one venue by
+ * DIFFERENCING the LIVE Broker getAmountOut ladder discovery sampled (NO extra RPC — the (cumIn, cumOut)
+ * points are on the descriptor). Each (Δinput, Δoutput) slice becomes a STATIC segment (kind Mento) in
+ * unified out/in space, refIdx → the Mento venue index. The marginal is the POST-SPREAD execution price (the
+ * exchange folds the spread into getAmountOut), so it enters the descending-price merge directly as both
+ * sqrtAdjNear and sqrtAdjFar. The split is priced at the sampled bucket SNAPSHOT ladder; the on-chain solver
+ * executes CALLBACK-FREE (a LIVE Broker getAmountOut staticcall for amountOutMin + approve the BROKER +
+ * broker.swapIn — Mento PULLS via transferFrom into the reserve). The executed out re-reads the live quote
+ * at exec (see mento-math.ts for the SNAPSHOTTED-QUOTE class).
+ */
+function buildMentoBrackets(pool: MentoPool, refIdx: number, amountIn: bigint): EcoBracket[] {
+  const segs = buildMentoSegments(pool, amountIn);
+  const brackets: EcoBracket[] = [];
+  for (const sm of segs) {
+    brackets.push({
+      kind: EcoBracketKind.Mento,
+      refIdx,
+      sqrtNear: sm.marginalOI,
+      sqrtFar: sm.marginalOI,
+      liquidity: 0n,
+      capacity: sm.capacity,
+      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Mento spread (post-spread dy)
+      sqrtAdjFar: sm.marginalOI,
+    });
+  }
+  return brackets;
+}
+
+/**
  * Build EulerSwap segments for one pool by sampling the closed-form f/fInverse curve replay (NO extra RPC
  * — pure bigint on the read reserves + static curve params + fee, BOUNDED by the vault inLimit). Each
  * sampled (Δinput, Δoutput) increment becomes a STATIC segment (kind EulerSwap) in unified out/in space,
@@ -1262,6 +1294,44 @@ export async function prepareEcoSwap(
   }
   for (const set of fluidBracketSets) brackets.push(...set);
 
+  const mentoPools: EcoMento[] = [];
+  const mentoBracketSets: EcoBracket[][] = [];
+  // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) — ENUMERABLE
+  // discovery via the Broker (FactoryConfig.address = Broker). Mento is a BiPool oracle-priced exchange
+  // (the Broker routes to a registered exchange provider that prices off oracle rates + a spread over
+  // interval-updated buckets — canonical on-chain state, NOT xy=k), so it is a SAMPLED-SEGMENT source.
+  // `discoverMentoPoolsTyped` runs the two-step enumeration (Broker.getExchangeProviders →
+  // provider.getExchanges) to map (tokenIn,tokenOut) → (exchangeProvider, exchangeId), then SAMPLES the
+  // Broker's PLAIN getAmountOut VIEW over [0, amountIn] (no revert-decode resolver, unlike Fluid); the split
+  // is built from that ladder (no closed form). Executed CALLBACK-FREE (a live Broker getAmountOut staticcall
+  // for amountOutMin + approve the BROKER + broker.swapIn — Mento PULLS via transferFrom into the reserve, so
+  // approve-first, unlike WOOFi's transfer-first path). NO engine change. SNAPSHOTTED-QUOTE class: the split
+  // is exact-on-grid vs the oracle on the shared sampled ladder; the exec re-reads the live quote
+  // (amountOutMin bounds a bad fill). The buckets refresh only on config.referenceRateResetFrequency (gated
+  // by oracle reports) — the same snapshot assumption the recipe documents for Fluid / Fermi / WOOFi — and
+  // swapIn is subject to TradingLimits + BreakerBox (the terminal refund covers a slice a limit/breaker
+  // rejects before cook).
+  const mentoConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Mento);
+  if (mentoConfigs.length > 0) {
+    const mentoRaw = await discoverMentoPoolsTyped(tokenIn, tokenOut, client, mentoConfigs, amountIn);
+    for (const mp of mentoRaw) {
+      const refIdx = mentoPools.length;
+      const mb = buildMentoBrackets(mp, refIdx, amountIn);
+      if (mb.length === 0) continue;
+      mentoPools.push({
+        broker: mp.broker,
+        exchangeProvider: mp.exchangeProvider,
+        exchangeId: mp.exchangeId,
+        fromToken: mp.tokenIn,
+        toToken: mp.tokenOut,
+        feePpm: mp.feePpm,
+        source: mp.source,
+      });
+      mentoBracketSets.push(mb);
+    }
+  }
+  for (const set of mentoBracketSets) brackets.push(...set);
+
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
   // best pool) — a first-class live-walk venue held to the same wei-exact standard as a direct
@@ -1410,7 +1480,8 @@ export async function prepareEcoSwap(
     balancerStables.length === 0 &&
     wooFiPools.length === 0 &&
     fermiPools.length === 0 &&
-    fluidPools.length === 0
+    fluidPools.length === 0 &&
+    mentoPools.length === 0
   ) {
     throw new Error(`No usable pools/routes for ${tokenIn} -> ${tokenOut}`);
   }
@@ -1432,6 +1503,7 @@ export async function prepareEcoSwap(
   const nWooFiSegs = brackets.filter((b) => b.kind === EcoBracketKind.WOOFi).length;
   const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
+  const nMentoSegs = brackets.filter((b) => b.kind === EcoBracketKind.Mento).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
@@ -1440,7 +1512,7 @@ export async function prepareEcoSwap(
       `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
       `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi, ` +
-      `${nFluidSegs} Fluid)`,
+      `${nFluidSegs} Fluid, ${nMentoSegs} Mento)`,
   );
 
   return {
@@ -1463,6 +1535,7 @@ export async function prepareEcoSwap(
     wooFiPools,
     fermiPools,
     fluidPools,
+    mentoPools,
     brackets,
     zeroForOne,
     priceLimit,

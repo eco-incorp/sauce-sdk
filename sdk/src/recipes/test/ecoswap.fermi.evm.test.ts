@@ -124,6 +124,7 @@ function fermiSegRows(pool: FermiPool, refIdx: number, amountIn: bigint): bigint
     s.marginalOI, // sqrtAdjFar (a Fermi segment is a flat slice)
     11n, // segKind = Fermi (callback-free)
     BigInt(pool.address),
+    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
   ]);
 }
 

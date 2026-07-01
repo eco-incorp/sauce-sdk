@@ -117,6 +117,14 @@ export const fluidDexResolverArtifact = loadArtifact(
 export const fermiPoolArtifact = loadArtifact(
   join(FIXTURES, "FermiPool.sol", "FermiPool.json"),
 );
+/** Mento V2 (Celo Broker + BiPoolManager) — the Broker is the swap entry; the BiPoolManager is the
+ *  ENUMERABLE exchange provider (getExchanges). Both deployed normally; the Broker holds token reserves. */
+export const mentoBrokerArtifact = loadArtifact(
+  join(FIXTURES, "MentoBroker.sol", "MentoBroker.json"),
+);
+export const mentoBiPoolManagerArtifact = loadArtifact(
+  join(FIXTURES, "MentoBroker.sol", "MentoBiPoolManager.json"),
+);
 /** Trader Joe LB pair — deployed normally (constructor sets tokens/binStep/baseFactor/activeId). */
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
@@ -1227,6 +1235,85 @@ export async function deployFluidDexPool(
     address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
   });
   return { pool, resolver };
+}
+
+// The REAL Mento V2 surface the fixtures mirror: the BiPoolManager exchange provider (getExchanges +
+// registerExchange helper) and the Broker (getExchangeProviders + getAmountOut view + swapIn approve-first
+// pull, output to msg.sender). `configureExchange`/`setBuckets`/`setCaps`/`setBreaker` are fixture-only
+// helpers (drive the drift + limit + breaker cells). The Exchange struct is the verified
+// IExchangeProvider.Exchange { bytes32 exchangeId; address[] assets; }.
+export const mentoBiPoolManagerAbi = parseAbi([
+  "function registerExchange(address asset0, address asset1) returns (bytes32 exchangeId)",
+  "function getExchanges() view returns ((bytes32 exchangeId, address[] assets)[])",
+]);
+export const mentoBrokerAbi = parseAbi([
+  "function addExchangeProvider(address provider)",
+  "function getExchangeProviders() view returns (address[])",
+  "function configureExchange(address provider, bytes32 exchangeId, address asset0, address asset1, uint256 rate0, uint256 rate1, uint256 centerPrice, uint256 spreadPpm, uint256 depth)",
+  "function setBuckets(address provider, bytes32 exchangeId, uint256 rate0, uint256 rate1, uint256 centerPrice)",
+  "function setCaps(address provider, bytes32 exchangeId, uint256 outCap0, uint256 outCap1)",
+  "function setBreaker(bool tripped)",
+  "function getAmountOut(address exchangeProvider, bytes32 exchangeId, address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256 amountOut)",
+  "function swapIn(address exchangeProvider, bytes32 exchangeId, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin) returns (uint256 amountOut)",
+]);
+
+/**
+ * Deploy a local Mento V2 stack — the BiPoolManager (exchange provider) + the Broker (swap entry) — register
+ * ONE BiPool exchange for (asset0, asset1), configure its bucket state (oracle rates + center price + spread
+ * + a utilization depth), fund the Broker with both reserves, and wire the provider into the Broker. The
+ * Broker prices off the settable bucket state (canonical on-chain, NOT xy=k) and exposes the REAL Mento
+ * surface (getExchangeProviders / getAmountOut view / swapIn approve-first pull). EcoSwap executes it
+ * callback-free (Broker getAmountOut + approve the BROKER + broker.swapIn; Mento PULLS via transferFrom), so
+ * the Broker must HOLD both tokens — `minter` transfers reserve0/reserve1 in. `centerPrice`/`rate*` are
+ * 1e18-scaled; `spreadPpm` is 1e6-scaled. Returns { broker, provider, exchangeId }.
+ */
+export async function deployMento(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  asset0: Hex,
+  asset1: Hex,
+  rate0: bigint,
+  rate1: bigint,
+  centerPrice: bigint,
+  spreadPpm: bigint,
+  reserve0: bigint,
+  reserve1: bigint,
+  depth: bigint,
+  minter?: Account,
+): Promise<{ broker: Hex; provider: Hex; exchangeId: Hex }> {
+  const acct = (minter ?? walletClient.account) as Account;
+  const provider = await deployContract(walletClient, publicClient, {
+    abi: mentoBiPoolManagerArtifact.abi,
+    bytecode: mentoBiPoolManagerArtifact.bytecode,
+    args: [],
+  });
+  const broker = await deployContract(walletClient, publicClient, {
+    abi: mentoBrokerArtifact.abi,
+    bytecode: mentoBrokerArtifact.bytecode,
+    args: [],
+  });
+  // Register the exchange on the provider (it enumerates via getExchanges) — read back the deterministic id.
+  const exchangeId = (await publicClient.readContract({
+    address: provider, abi: mentoBiPoolManagerAbi as Abi, functionName: "registerExchange", args: [asset0, asset1],
+  })) as Hex;
+  await writeAndWait(walletClient, publicClient, {
+    address: provider, abi: mentoBiPoolManagerAbi as Abi, functionName: "registerExchange", args: [asset0, asset1],
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: broker, abi: mentoBrokerAbi as Abi, functionName: "addExchangeProvider", args: [provider],
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: broker, abi: mentoBrokerAbi as Abi, functionName: "configureExchange",
+    args: [provider, exchangeId, asset0, asset1, rate0, rate1, centerPrice, spreadPpm, depth],
+  });
+  // The Broker holds both reserves (it pays the out and, in the fixture, receives the pulled input).
+  await writeAndWait(walletClient, publicClient, {
+    address: asset0, abi: erc20Abi as Abi, functionName: "transfer", args: [broker, reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: asset1, abi: erc20Abi as Abi, functionName: "transfer", args: [broker, reserve1], account: acct,
+  });
+  return { broker, provider, exchangeId };
 }
 
 // Mirrors the real euler-xyz/euler-swap IEulerSwap read surface (getAssets/getReserves/getDynamicParams/
