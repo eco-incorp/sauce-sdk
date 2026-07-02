@@ -1,5 +1,5 @@
 /**
- * EulerSwap (Euler v2 vault-backed AMM) — VERBATIM bigint replay + off-chain segment sampler.
+ * EulerSwap (Euler vault-backed AMM, v1+v2) — VERBATIM bigint replay + off-chain segment sampler.
  *
  * THE SINGLE SOURCE for EulerSwap swap math. Imported by BOTH:
  *   - the production `prepare.ts` (buildEulerSwapSegments), and
@@ -79,6 +79,17 @@ export const Q192 = 1n << 192n;
 
 /** EulerSwap curve fixed-point ONE — 1e18 (prices, concentrations, fee). */
 export const EULER_ONE = 10n ** 18n;
+
+/**
+ * Round an EulerSwap fee (1e18-scaled, e.g. 1e15 = 0.1%) to a ppm fee (the price-ordering coordinate /
+ * diagnostic) — ROUND-HALF-UP. THE SINGLE SOURCE: discovery (`discoverEulerSwapPoolsTyped`), the prod-mirror
+ * `offPool` descriptor, and the known-answer test descriptors ALL build `feePpm` through this one helper, so
+ * the ordering coordinate matches bit-for-bit (a truncating vs round-half-up mismatch could order-differ a
+ * higher-fee pool between the oracle-under-test and the production descriptor — see the review finding).
+ */
+export function eulerFeeToPpm(feeWad: bigint): number {
+  return Number((feeWad * 1_000_000n + EULER_ONE / 2n) / EULER_ONE);
+}
 
 /** Integer square root (Babylonian) — bit-identical to the other *-math modules' `isqrt`. */
 export function isqrt(x: bigint): bigint {

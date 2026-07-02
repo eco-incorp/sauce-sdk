@@ -6,7 +6,7 @@ interface IERC20Min {
     function balanceOf(address) external view returns (uint256);
 }
 
-/// @notice Faithful EulerSwap (Euler v2 vault-backed AMM) 2-asset pool for local EVM tests of EcoSwap's
+/// @notice Faithful EulerSwap (Euler vault-backed AMM, v1+v2) 2-asset pool for local EVM tests of EcoSwap's
 /// callback-free EulerSwap path.
 ///
 /// Reproduces the canonical euler-xyz/euler-swap `CurveLib.f` + `QuoteLib.computeQuote` /
@@ -35,13 +35,44 @@ interface IERC20Min {
 /// units (uint112-bounded in the real contract; we keep uint256 for the fixture). The curve params are in
 /// the canonical (asset0=x, asset1=y) orientation.
 ///
-/// GETTER SURFACE — this fixture exposes the SAME read surface as the real euler-xyz/euler-swap IEulerSwap
-/// (getAssets, getReserves, getDynamicParams, computeQuote, getLimits, swap): there is NO individual
-/// asset0()/reserve0()/priceX()/fee() getter on the real pool. So discovery + the on-chain solver read the
-/// genuine interface, not a bespoke one — the fee is DIRECTIONAL (fee0/fee1) even though this fixture sets
-/// both to the same value.
+/// GETTER SURFACE — this fixture exposes BOTH real euler-xyz/euler-swap read surfaces (v1 + v2), so the
+/// SAME fixture proves the recipe's dual-version discovery (like Uni V2/V3/V4 side by side):
+///   · common: getAssets, getReserves, computeQuote, getLimits, swap, curve() (the version discriminator).
+///   · v1 (curve()=="EulerSwap v1"): getParams() — the STATIC 12-field immutable struct with a SINGLE
+///     non-directional fee. This is the surface every currently-deployed pool exposes.
+///   · v2 (curve()=="EulerSwap v2"): getDynamicParams() — the directional-fee bundle.
+/// There is NO individual asset0()/reserve0()/priceX()/fee() getter on the real pool. The default is v1
+/// (curve()=="EulerSwap v1"); a fixture can be flipped to v2 by deploying with isV1=false so both discovery
+/// branches are exercisable. The curve math + exec surface are IDENTICAL across versions.
 contract EulerSwapPool {
     uint256 private constant ONE = 1e18;
+
+    /// @dev bytes32("EulerSwap v1") / bytes32("EulerSwap v2") — the curve() version constant.
+    bytes32 private constant CURVE_V1 = bytes32(bytes("EulerSwap v1"));
+    bytes32 private constant CURVE_V2 = bytes32(bytes("EulerSwap v2"));
+
+    /// @dev v1 IEulerSwap.Params (the getParams() return) — the STATIC immutable curve struct, in the real
+    /// v1 field order (vault0, vault1, eulerAccount, equilibriumReserve0/1, priceX, priceY, concentrationX,
+    /// concentrationY, fee (SINGLE), protocolFee, protocolFeeRecipient). uint112/uint256 in the real
+    /// contract; the fixture never overflows.
+    struct Params {
+        address vault0;
+        address vault1;
+        address eulerAccount;
+        uint112 equilibriumReserve0;
+        uint112 equilibriumReserve1;
+        uint256 priceX;
+        uint256 priceY;
+        uint256 concentrationX;
+        uint256 concentrationY;
+        uint256 fee;
+        uint256 protocolFee;
+        address protocolFeeRecipient;
+    }
+
+    /// @dev true ⇒ curve()=="EulerSwap v1" + getDynamicParams() reverts (the deployed-pool shape); false ⇒
+    /// curve()=="EulerSwap v2".
+    bool private isV1;
 
     /// @dev Mirrors IEulerSwap.DynamicParams (the getDynamicParams() return). uint112/uint80/uint64 in the
     /// real contract; we widen to uint256 storage (the getter down-casts) since the fixture never overflows.
@@ -82,6 +113,12 @@ contract EulerSwapPool {
     event Swap(address indexed sender, uint256 amount0Out, uint256 amount1Out, address indexed to);
 
     // ── real IEulerSwap read surface ──────────────────────────────────────
+    /// @notice curve() → the version discriminator ("EulerSwap v1" / "EulerSwap v2"). Discovery reads this
+    /// to pick getParams() (v1) vs getDynamicParams() (v2).
+    function curve() external view returns (bytes32) {
+        return isV1 ? CURVE_V1 : CURVE_V2;
+    }
+
     /// @notice getAssets() → (asset0, asset1). The real pool has NO asset0()/asset1() getter.
     function getAssets() external view returns (address, address) {
         return (asset0, asset1);
@@ -92,9 +129,30 @@ contract EulerSwapPool {
         return (uint112(reserve0), uint112(reserve1), 1);
     }
 
-    /// @notice getDynamicParams() → the curve-param struct. All curve params live HERE, not as getters.
-    /// fee is DIRECTIONAL (fee0/fee1); this fixture sets both to the same `fee`.
+    /// @notice getParams() → the v1 STATIC 12-field struct (a SINGLE non-directional fee). The v1 surface;
+    /// REVERTS when this fixture is deployed as v2 (mirroring the real v2 impl, which lacks getParams()).
+    function getParams() external view returns (Params memory) {
+        require(isV1, "V2_HAS_NO_GETPARAMS");
+        return Params({
+            vault0: address(0),
+            vault1: address(0),
+            eulerAccount: address(0),
+            equilibriumReserve0: uint112(equilibriumReserve0),
+            equilibriumReserve1: uint112(equilibriumReserve1),
+            priceX: priceX,
+            priceY: priceY,
+            concentrationX: concentrationX,
+            concentrationY: concentrationY,
+            fee: fee,
+            protocolFee: 0,
+            protocolFeeRecipient: address(0)
+        });
+    }
+
+    /// @notice getDynamicParams() → the v2 curve-param struct (DIRECTIONAL fee0/fee1). REVERTS when this
+    /// fixture is deployed as v1 (mirroring the real v1 impl, which reverts getDynamicParams()).
     function getDynamicParams() external view returns (DynamicParams memory) {
+        require(!isV1, "V1_HAS_NO_GETDYNAMICPARAMS");
         return DynamicParams({
             equilibriumReserve0: uint112(equilibriumReserve0),
             equilibriumReserve1: uint112(equilibriumReserve1),
@@ -114,7 +172,9 @@ contract EulerSwapPool {
 
     /// @notice Curve params bundle — avoids the 13-arg constructor "stack too deep".
     /// p = [reserve0, reserve1, x0, y0, px, py, cx, cy, fee, outCap0, outCap1].
-    constructor(address a0, address a1, uint256[11] memory p) {
+    /// `_isV1` selects the exposed surface: true ⇒ curve()=="EulerSwap v1" + getParams() (getDynamicParams
+    /// reverts); false ⇒ curve()=="EulerSwap v2" + getDynamicParams() (getParams reverts).
+    constructor(address a0, address a1, uint256[11] memory p, bool _isV1) {
         asset0 = a0;
         asset1 = a1;
         reserve0 = p[0];
@@ -128,6 +188,7 @@ contract EulerSwapPool {
         fee = p[8];
         outCap0 = p[9];
         outCap1 = p[10];
+        isV1 = _isV1;
     }
 
     // ── curve math (mirrors eulerswap-math.ts / CurveLib.f) ────────────────

@@ -176,7 +176,7 @@ export interface OptimalPool {
    */
   balancer?: BalancerStablePool;
   /**
-   * EulerSwap (Euler v2 vault-backed AMM) pool — when present this pool is an EULERSWAP venue (NOT
+   * EulerSwap (Euler vault-backed AMM, v1+v2) pool — when present this pool is an EULERSWAP venue (NOT
    * V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer). The oracle enumerates its segments via the SHARED
    * closed-form f/fInverse curve replay (buildEulerSwapSegments) from the live reserves + static curve
    * params + fee (bounded by the vault inLimit), so the split is exact-on-grid vs prepare's segments (one
@@ -595,7 +595,7 @@ function balancerStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigin
 }
 
 /**
- * Enumerate one EulerSwap (Euler v2 vault-backed AMM) pool's segments via the SHARED closed-form
+ * Enumerate one EulerSwap (Euler vault-backed AMM, v1+v2) pool's segments via the SHARED closed-form
  * f/fInverse curve replay (buildEulerSwapSegments) from the live reserves + static curve params + fee
  * (bounded by the vault inLimit). The amountIn caps the sampled range — the same bound prepare uses — so
  * the oracle and prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid.
@@ -948,7 +948,7 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       // samples → identical grid → exact-on-grid split).
       allSegs.push(...maverickSegments(p, i, amountIn));
     } else if (p.eulerSwap) {
-      // EulerSwap (Euler v2 vault-backed AMM) venue: sampled-segment enumeration via the shared
+      // EulerSwap (Euler vault-backed AMM, v1+v2) venue: sampled-segment enumeration via the shared
       // f/fInverse curve replay (capped at amountIn / the vault inLimit — the same bound prepare samples
       // → identical grid → exact-on-grid split).
       allSegs.push(...eulerSwapSegments(p, i, amountIn));

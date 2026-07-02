@@ -221,7 +221,7 @@ export enum EcoBracketKind {
   SolidlyStable = 6, // Solidly STABLE (sAMM) segment (static, off-chain-sampled via the x3y+y3x replay)
   Wombat = 7, // Wombat single-sided stableswap segment (static, off-chain-sampled via the coverage-ratio replay)
   BalancerStable = 8, // Balancer V2 ComposableStable segment (static, off-chain-sampled via the StableMath A-invariant replay)
-  EulerSwap = 9, // EulerSwap (Euler v2 vault-backed AMM) segment (static, off-chain-sampled via the f/fInverse curve replay)
+  EulerSwap = 9, // EulerSwap (Euler vault-backed AMM, v1+v2) segment (static, off-chain-sampled via the f/fInverse curve replay)
   MaverickV2 = 10, // Maverick V2 (bin-based directional AMM) segment (static, off-chain-sampled via the bin swap-math replay; executed through the engine)
   CryptoSwap = 11, // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) segment (static, off-chain-sampled via the A-gamma invariant replay; executed CALLBACK-FREE via approve + exchange(uint256,...))
   WOOFi = 12, // WOOFi (WooPPV2 synthetic proactive market maker) segment (static, off-chain-sampled via the sPMM oracle-price replay at a snapshot; executed CALLBACK-FREE via transfer + swap(fromToken,toToken,amt,minTo,to,rebateTo))
@@ -505,7 +505,7 @@ export interface EcoBalancerStable {
 }
 
 /**
- * One EulerSwap (Euler v2 vault-backed AMM) venue to execute, indexed by an EcoBracket.refIdx (kind ===
+ * One EulerSwap (Euler vault-backed AMM, v1+v2) venue to execute, indexed by an EcoBracket.refIdx (kind ===
  * EulerSwap). EulerSwap pools have an ASYMMETRIC concentrated-liquidity curve (f/fInverse, NOT xy=k), so
  * they must NOT be routed through the V2 (_swapV2) path. prepare samples the curve OFF-CHAIN into static
  * segments (kind EulerSwap) via the closed-form f/fInverse replay (BOUNDED by the vault `inLimit` from

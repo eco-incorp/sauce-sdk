@@ -1,5 +1,12 @@
 /**
- * EcoSwap EulerSwap (Euler v2 vault-backed AMM) local-EVM integration — the callback-free exact-in-dy gate.
+ * EcoSwap EulerSwap (Euler vault-backed AMM) local-EVM integration — the callback-free exact-in-dy gate.
+ *
+ * Covers BOTH EulerSwap versions (v1 + v2 coexist, like Uni V2/V3/V4): the shared curve math + the exec
+ * surface (computeQuote/getAssets/swap) are version-agnostic; only DISCOVERY differs (v1 reads
+ * curve()+getParams() with a single fee, v2 reads getDynamicParams() with directional fee0/fee1). The
+ * fixture exposes both surfaces and defaults to v1 (the shape every real deployed pool exposes), so the
+ * cook cells below run on v1 pools; two dedicated discovery cells prove the curve()-discriminated v1 AND
+ * v2 detection paths against the deployed fixture.
  *
  * Stands up a local EulerSwap pool (the EulerSwapPool.sol fixture, whose CurveLib.f + QuoteLib.computeQuote
  * exact-in mirror the off-chain `eulerswap-math.ts` replay bit-for-bit), deploys the Sauce engine, and cooks
@@ -62,7 +69,8 @@ import {
   type DeployedV12Stack,
 } from "./harness/setup";
 import { type Engine, engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
-import { MIN_SQRT_RATIO } from "../shared/constants";
+import { MIN_SQRT_RATIO, SwapPoolType, FactoryType, type FactoryConfig } from "../shared/constants";
+import { discoverEulerSwapPoolsTyped } from "../shared/pool-discovery";
 import {
   computeQuote,
   buildEulerSwapSegments,
@@ -132,7 +140,7 @@ function sortSegs(rows: bigint[][]): bigint[][] {
   });
 }
 
-describe("EcoSwap EulerSwap (Euler v2 vault-backed AMM, local fixture) — callback-free exact-in-dy", () => {
+describe("EcoSwap EulerSwap (Euler vault-backed AMM, local fixture, v1+v2) — callback-free exact-in-dy", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
@@ -407,6 +415,51 @@ describe("EcoSwap EulerSwap (Euler v2 vault-backed AMM, local fixture) — callb
     console.log(`  [Euler vault-cap:${engine}] cap bound ⇒ guarded refund (spent=${spent} received=${received})`);
   }
 
+  // ── DISCOVERY: the REAL discoverEulerSwapPoolsTyped path detects v1 vs v2 via curve() ──
+  // Not a cook — a direct call to the production discovery helper against the deployed fixture, asserting
+  // it (a) reads curve() to pick the version, (b) reads the version's curve-param getter (getParams for v1,
+  // getDynamicParams for v2), (c) normalizes into the SAME tokenIn-oriented EulerSwapPool descriptor whose
+  // off-chain computeQuote replay matches the pool's on-chain view to the wei. Version-parametrized so BOTH
+  // branches are proven to coexist. Engine-independent (a read path), so run once (not per-engine).
+  async function runDiscovery(isV1: boolean): Promise<void> {
+    await reset();
+    const rIn = 1_000_000n * E18;
+    const rOut = 1_000_000n * E18;
+    const pool = await deployEulerSwapPool(
+      c.walletClient, c.publicClient, tokenIn, tokenOut,
+      { reserve0: rIn, reserve1: rOut, equil0: rIn, equil1: rOut, priceX: E18, priceY: E18,
+        concX: CONC, concY: CONC, fee: FEE, outCap0: 0n, outCap1: 0n },
+      c.account0, isV1,
+    );
+
+    // A FactoryType.EulerSwap config carrying the deployed fixture as a known pool — exactly how the
+    // production ChainPoolConfig wires a real pool by address (constants.ts eulerSwapPools).
+    const factory: FactoryConfig = {
+      address: "0x00000000000000000000000000000000000000E5" as Hex,
+      poolType: SwapPoolType.UniV2, factoryType: FactoryType.EulerSwap,
+      label: "EulerSwap-fixture", eulerSwapPools: [pool],
+    };
+
+    const found = await discoverEulerSwapPoolsTyped(tokenIn, tokenOut, c.publicClient, [factory]);
+    assert.equal(found.length, 1, `discovery surfaces the ${isV1 ? "v1" : "v2"} fixture pool`);
+    const fp = found[0];
+    assert.equal(fp.address.toLowerCase(), pool.toLowerCase(), "discovered the right pool");
+    assert.ok(fp.source.includes(isV1 ? "v1" : "v2"), `source tags the version (${fp.source})`);
+    assert.equal(fp.inIsToken0, true, "tokenIn == asset0 orientation");
+    assert.equal(fp.feeWad, FEE, "fee read (v1 single / v2 fee0)");
+
+    // The discovered descriptor's off-chain computeQuote == the pool's on-chain computeQuote view — wei
+    // exact, proving discovery captured the curve params correctly (whichever getter it read).
+    for (const dx of [1_000n * E18, 10_000n * E18, 100_000n * E18]) {
+      const onView = (await c.publicClient.readContract({
+        address: pool, abi: eulerSwapPoolAbi, functionName: "computeQuote",
+        args: [tokenIn, tokenOut, dx, true],
+      })) as bigint;
+      assert.equal(computeQuote(fp, dx), onView, `discovered ${isV1 ? "v1" : "v2"} pool computeQuote == on-chain view @ ${dx}`);
+    }
+    console.log(`  [Euler discovery] ${isV1 ? "v1 (curve+getParams)" : "v2 (getDynamicParams)"} pool discovered + wei-exact vs on-chain view`);
+  }
+
   // Post-fee out/in marginal price at a cumulative input `share` — a small finite-difference slice of
   // computeQuote around `share` (the same coordinate the segments carry). Used only to check the split
   // equalized marginals.
@@ -444,4 +497,14 @@ describe("EcoSwap EulerSwap (Euler v2 vault-backed AMM, local fixture) — callb
       await runVaultCap(engine);
     });
   }
+
+  // Discovery is a read path (engine-independent) — run once per version, not per-engine. Proves v1 and
+  // v2 coexist in discoverEulerSwapPoolsTyped (curve()-discriminated), matching how the recipe supports
+  // Uni V2/V3/V4 side by side.
+  it("EulerSwap discovery — v1 pool detected via curve()+getParams(), wei-exact descriptor", async () => {
+    await runDiscovery(true);
+  });
+  it("EulerSwap discovery — v2 pool detected via getDynamicParams(), wei-exact descriptor (coexists with v1)", async () => {
+    await runDiscovery(false);
+  });
 });

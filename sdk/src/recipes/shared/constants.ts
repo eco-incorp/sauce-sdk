@@ -138,15 +138,20 @@ export enum FactoryType {
    */
   Wombat = "wombat",
   /**
-   * EulerSwap (Euler v2 vault-backed AMM). Discovery is KNOWN-POOL-ADDRESS based (the EulerSwap factory
+   * EulerSwap (Euler vault-backed AMM). Discovery is KNOWN-POOL-ADDRESS based (the EulerSwap factory
    * has no pool enumeration — only a `deployedPools` mapping + PoolDeployed events), so the candidate
    * pool addresses are carried per-config in `FactoryConfig.eulerSwapPools` (like Balancer's
-   * balancerStablePools). State: live reserve0/reserve1 + the static curve params (equilibriumReserve0/1,
-   * priceX/priceY, concentrationX/concentrationY, fee) + the vault input cap from getLimits. The curve is
-   * the asymmetric concentrated-liquidity f/fInverse (whitepaper); priced OFF-CHAIN into sampled segments
-   * (BOUNDED by the vault inLimit). Callback-free: executed in SauceScript (computeQuote + transfer +
-   * pool.swap(amount0Out, amount1Out, to, ""); EulerSwap's swap is V2-shaped, empty data ⇒ no flash
-   * callback — the only re-entry is internal to Euler, never the cooking contract), so no engine change.
+   * balancerStablePools). BOTH VERSIONS coexist: `discoverEulerSwapPoolsTyped` reads each pool's curve()
+   * bytes32 to pick the curve-param getter — v1 ("EulerSwap v1") uses getParams() (a static immutable
+   * 12-field struct with a SINGLE non-directional fee; the surface every currently-deployed pool exposes),
+   * v2 ("EulerSwap v2") uses getDynamicParams() (directional fee0/fee1). State: live reserve0/reserve1 +
+   * the static curve params (equilibriumReserve0/1, priceX/priceY, concentrationX/concentrationY, fee) +
+   * the vault input cap from getLimits. The curve is the asymmetric concentrated-liquidity f/fInverse
+   * (whitepaper), IDENTICAL across v1/v2; priced OFF-CHAIN into sampled segments (BOUNDED by the vault
+   * inLimit). Callback-free: executed in SauceScript (computeQuote + transfer + pool.swap(amount0Out,
+   * amount1Out, to, ""); EulerSwap's swap is V2-shaped, empty data ⇒ no flash callback — the only re-entry
+   * is internal to Euler, never the cooking contract), so no engine change. The exec surface
+   * (computeQuote/getAssets/swap) is version-agnostic.
    */
   EulerSwap = "eulerswap",
   /**
@@ -477,14 +482,24 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
           "0x667701e51B4D1Ca244F17C78F7aB8744B4C99F9B" as Hex, // USDC/USDT (deep)
           "0xea734B615888c669667038D11950f44b177F15C0" as Hex, // USDC/USDT (thin)
         ] },
-      // EulerSwap: LEFT EMPTY + FLAGGED. The deployed EulerSwap pools (factory
-      // 0xb013be1D0D380C13B58e889f412895970A2Cf228, 24 pools incl. several USDC/USDT) expose the
-      // EulerSwap **v1** surface (curve()=="EulerSwap v1", getParams()) — they REVERT getDynamicParams(),
-      // which `discoverEulerSwapPoolsTyped` requires (the v2 curve bundle: equilibriumReserve0/1,
-      // priceX/priceY, concentrationX/concentrationY, directional fee0/fee1). Wiring a v1 pool would
-      // silently discover nothing (the getDynamicParams multicall entry reverts → the pool is dropped),
-      // and the v1 reserves are tiny ($10–2,000 per operator-bound pool). Re-light by address once a
-      // stable-pair EulerSwap **v2** pool (getDynamicParams) is deployed. eulerSwapPools intentionally omitted.
+      // EulerSwap (Euler vault-backed AMM; callback-free typed path). Discovery is known-pool-address
+      // based (the EulerSwap factory 0xb013be1D0D380C13B58e889f412895970A2Cf228 has NO pair→pool getter,
+      // only `deployedPools` + PoolDeployed events), so `eulerSwapPools` carries the candidate pool
+      // addresses. `discoverEulerSwapPoolsTyped` now handles BOTH versions side by side (like Uni V2/V3/V4):
+      // each pool's curve() bytes32 discriminates v1 ("EulerSwap v1", getParams() — a static immutable
+      // 12-field struct with a SINGLE non-directional fee) from v2 ("EulerSwap v2", getDynamicParams() —
+      // directional fee0/fee1). The deployed mainnet pools are all v1. Wired: the deepest LIVE (EVC-operator-
+      // authorized) stable-stable v1 pool — USDC/USDT 0x3bBCC029…F28A8 (getReserves ≈179 USDC / ≈1165 USDT
+      // virtual; getLimits maxOut ≈1165 USDT, vault cash-backed; computeQuote 100 USDC→100.03 USDT verified
+      // live at block 25445491). poolType UniV2 is INERT for EulerSwap (discovery keys off factoryType; the
+      // asymmetric Euler curve is NOT xy=k, so it flows into the EcoEuler bucket executed callback-free —
+      // never dispatched as a UniV2 router swap; it is a placeholder, not a claim it is a V2 pool). Several
+      // other listed v1 pools (USDe/USDT 0x794138…, USDC/USDT 0x701f…) are operator-UNAUTHORIZED / dead
+      // (getLimits 0/0, computeQuote reverts OperatorNotInstalled) — intentionally NOT wired.
+      { address: "0xb013be1D0D380C13B58e889f412895970A2Cf228" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.EulerSwap, label: "EulerSwap",
+        eulerSwapPools: [
+          "0x3bBCC029f312ECe579a7dEb77B13CB8aE15F28A8" as Hex, // USDC/USDT v1 (deepest live stable pool)
+        ] },
       // DODO V2
       { address: "0x72d220cE168C4f361dD4deE5D826a01AD8598f6C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // Maverick V2

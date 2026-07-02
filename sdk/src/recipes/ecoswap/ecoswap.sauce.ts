@@ -929,7 +929,7 @@ function main(
                         bven[sIdx] = sVenue;
                       } else {
                         if (HAS_EULER && sKind === 7) {
-                          // segKind 7 — EulerSwap (Euler v2 vault-backed AMM): callback-free, executed
+                          // segKind 7 — EulerSwap (Euler vault-backed AMM, v1+v2): callback-free, executed
                           // below via computeQuote (the exact-in-dy out for the awarded share) + transfer
                           // + pool.swap(a0Out, a1Out, to, "") (EMPTY data ⇒ no flash callback).
                           einp[sIdx] = einp[sIdx] + stake;
@@ -1352,7 +1352,7 @@ function main(
     }
   }
   }
-  // EulerSwap (Euler v2 vault-backed AMM) → CALLBACK-FREE (NO engine SwapPoolType). EulerSwap pools
+  // EulerSwap (Euler vault-backed AMM, v1+v2) → CALLBACK-FREE (NO engine SwapPoolType). EulerSwap pools
   // have an ASYMMETRIC concentrated-liquidity curve (f/fInverse, NOT xy=k), so the engine's _swapV2
   // would mis-price them. Execute exactly as the EulerSwap periphery would: read the EXACT amountOut
   // from the pool's computeQuote(tokenIn, tokenOut, Σ, true) view (the periphery quoteExactInput

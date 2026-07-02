@@ -84,6 +84,7 @@ import {
 import {
   computeQuote,
   buildEulerSwapSegments,
+  eulerFeeToPpm,
   type EulerSwapPool,
 } from "../shared/eulerswap-math";
 import {
@@ -2229,7 +2230,7 @@ describe("Balancer V2 ComposableStable — StableMath getDy known-answer + sampl
   });
 });
 
-// ── EulerSwap (Euler v2 vault-backed AMM) known-answer + segment sampler ──────
+// ── EulerSwap (Euler vault-backed AMM, v1+v2) known-answer + segment sampler ──
 //
 // Pins the off-chain f/fInverse curve replay (computeQuote + buildEulerSwapSegments) BEFORE the
 // local-EVM test, so a regression in the closed-form bigint math (the in-region f() ceil-rounding, the
@@ -2240,7 +2241,7 @@ describe("Balancer V2 ComposableStable — StableMath getDy known-answer + sampl
 // are 1e18 fixed point (priceX/priceY, concentrationX/concentrationY, fee); reserves are RAW units. A
 // near-equilibrium swap loses only the fee + tiny concentration slippage. Cross-checked bit-for-bit
 // against the EulerSwapPool.sol fixture computeQuote in ecoswap.euler.evm.test.ts.
-describe("EulerSwap (Euler v2 vault-backed AMM) — computeQuote known-answer + sampler", () => {
+describe("EulerSwap (Euler vault-backed AMM, v1 + v2 share the curve) — computeQuote known-answer + sampler", () => {
   const E18 = 10n ** 18n;
   const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
   function pool(
@@ -2250,7 +2251,7 @@ describe("EulerSwap (Euler v2 vault-backed AMM) — computeQuote known-answer + 
     return {
       address: Z, inIsToken0: true, reserveIn: rIn, reserveOut: rOut,
       equilIn: eqIn, equilOut: eqOut, priceIn: pIn, priceOut: pOut, concIn: cIn, concOut: cOut,
-      feeWad, inLimit, feePpm: Number((feeWad * 1_000_000n) / E18), source: "kat",
+      feeWad, inLimit, feePpm: eulerFeeToPpm(feeWad), source: "kat",
     };
   }
 
@@ -2314,6 +2315,88 @@ describe("EulerSwap (Euler v2 vault-backed AMM) — computeQuote known-answer + 
     const segs = buildEulerSwapSegments(p, 100_000n * E18);
     const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
     assert.equal(sumCap, cap, "segments cover only the vault inLimit, not the full amountIn");
+  });
+
+  // ── EulerSwap V1 — REAL deployed-pool computeQuote vectors (verified LIVE) ──
+  //
+  // The EulerSwap v1 curve (CurveLib.f/fInverse @ tag eulerswap-1.0) is IDENTICAL to the v2 curve, so the
+  // SAME `eulerswap-math.ts` replay serves both versions (the recipe discovers v1 via curve()=="EulerSwap
+  // v1" + getParams(), v2 via getDynamicParams() — see discoverEulerSwapPoolsTyped). These vectors pin
+  // that the off-chain replay reproduces the REAL DEPLOYED v1 pool's on-chain computeQuote view
+  // BIT-FOR-BIT. Params are the LIVE getParams() of the deepest live stable v1 pool
+  // 0x3bBCC029f312ECe579a7dEb77B13CB8aE15F28A8 (USDC/USDT), and reserves the LIVE getReserves(), both
+  // captured at mainnet block 25445491; each expected `out` was cast-called on that pool at that block
+  // (both directions, incl. the reserve-saturated large-input cases). Regenerate only if the pinned block
+  // or the curve math changes. This is the v1 analogue of the synthetic vectors above + the bit-for-bit
+  // cross-check the (currently synthetic) EVM fixture provides.
+  describe("V1 real-pool vectors (0x3bBCC029 USDC/USDT, mainnet block 25445491)", () => {
+    // getParams(): equilibriumReserve0=1345300000 (USDC x0), equilibriumReserve1=0 (USDT y0),
+    // priceX=1000000, priceY=1000683, concentrationX=concentrationY=999970609005089300, fee=9800000000000.
+    // getReserves(): reserve0=179313998 (USDC), reserve1=1165412863 (USDT).
+    const eqR0 = 1_345_300_000n;
+    const eqR1 = 0n;
+    const priceX = 1_000_000n;
+    const priceY = 1_000_683n;
+    const conc = 999_970_609_005_089_300n;
+    const feeV1 = 9_800_000_000_000n; // 9.8e12 (1e18-scaled) = 0.00098% ≈ 9.8 ppm — live getParams().fee
+    const reserve0 = 179_313_998n; // USDC
+    const reserve1 = 1_165_412_863n; // USDT
+
+    // USDC→USDT: tokenIn == asset0, so inIsToken0 true (reserveIn=reserve0, params in canonical orientation).
+    const usdcToUsdt: EulerSwapPool = {
+      address: Z, inIsToken0: true, reserveIn: reserve0, reserveOut: reserve1,
+      equilIn: eqR0, equilOut: eqR1, priceIn: priceX, priceOut: priceY, concIn: conc, concOut: conc,
+      feeWad: feeV1, inLimit: 0n, feePpm: eulerFeeToPpm(feeV1), source: "v1-real",
+    };
+    // USDT→USDC: tokenIn == asset1, so inIsToken0 false (reserveIn=reserve1, params mirrored by orient).
+    const usdtToUsdc: EulerSwapPool = {
+      address: Z, inIsToken0: false, reserveIn: reserve1, reserveOut: reserve0,
+      equilIn: eqR1, equilOut: eqR0, priceIn: priceY, priceOut: priceX, concIn: conc, concOut: conc,
+      feeWad: feeV1, inLimit: 0n, feePpm: eulerFeeToPpm(feeV1), source: "v1-real",
+    };
+
+    it("USDC→USDT — off-chain computeQuote == live on-chain computeQuote (bit-for-bit)", () => {
+      // in (USDC, 6dec) → out (USDT, 6dec), each cast-called live on 0x3bBCC029 at block 25445491.
+      assert.equal(computeQuote(usdcToUsdt, 1_000_000n), 1_000_924n); // 1 USDC
+      assert.equal(computeQuote(usdcToUsdt, 100_000_000n), 100_033_963n); // 100 USDC
+      assert.equal(computeQuote(usdcToUsdt, 1_000_000_000n), 999_529_672n); // 1000 USDC
+      // Large inputs saturate at the tokenOut reserve (the virtual out-side reserve1) — live-verified.
+      assert.equal(computeQuote(usdcToUsdt, 10_000_000_000n), 1_165_412_863n);
+      assert.equal(computeQuote(usdcToUsdt, 100_000_000_000n), 1_165_412_863n);
+    });
+
+    it("USDT→USDC — off-chain computeQuote == live on-chain computeQuote (bit-for-bit)", () => {
+      assert.equal(computeQuote(usdtToUsdc, 1_000_000n), 999_042n); // 1 USDT
+      assert.equal(computeQuote(usdtToUsdc, 100_000_000n), 99_698_772n); // 100 USDT
+      assert.equal(computeQuote(usdtToUsdc, 1_000_000_000n), 179_249_264n); // 1000 USDT
+      assert.equal(computeQuote(usdtToUsdc, 10_000_000_000n), 179_308_584n);
+    });
+
+    it("V1 single non-directional fee — both directions net the SAME fee rate", () => {
+      // v1 getParams() carries ONE fee; discovery folds it into feeWad for both directions. Assert the
+      // descriptor's feeWad is direction-invariant (the discovery normalization contract) and that a tiny
+      // trade loses ~fee only (the near-equilibrium regime, sub-bps concentration slippage).
+      assert.equal(usdcToUsdt.feeWad, usdtToUsdc.feeWad, "v1 fee is the same both directions");
+      const feePpm = eulerFeeToPpm(feeV1); // round-half-up, matching discovery + the descriptor
+      assert.equal(usdcToUsdt.feePpm, feePpm, "descriptor feePpm == the production round-half-up ppm");
+      assert.ok(feePpm >= 0 && feePpm < 100, "v1 stable pool fee is a few ppm");
+    });
+
+    it("buildEulerSwapSegments on real v1 state — descending, partitions the curve", () => {
+      // 1000 USDC — below the ~1165 USDT out-side reserve, so every sampled slice stays productive and the
+      // ladder is a full partition (larger inputs saturate at reserveOut ⇒ the tail slices quote 0 and the
+      // sampler truncates — that cap edge is the vault-cap test above).
+      const amountIn = 1_000_000_000n; // 1000 USDC
+      const segs = buildEulerSwapSegments(usdcToUsdt, amountIn);
+      assert.ok(segs.length > 0, "non-empty ladder on real v1 params");
+      const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+      assert.equal(sumCap, amountIn, "segments cover the full amountIn");
+      for (let i = 1; i < segs.length; i++) {
+        assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals descending");
+      }
+      const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+      assert.equal(sumOut, computeQuote(usdcToUsdt, amountIn), "Σ effOut == computeQuote(amountIn)");
+    });
   });
 });
 

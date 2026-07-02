@@ -3840,3 +3840,337 @@ export const fermiSwapperReadAbi = parseAbi([
   "function isActive(address a, address b) view returns (bool)",
   "function fermiSwapWithAllowances(address tokenIn, address tokenOut, int256 amountSpecified, uint256 amountCheck, address recipient) returns (uint256, uint256)",
 ]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EulerSwap V1 (euler-xyz/euler-swap tag eulerswap-1.0) prod-mirror etch — ADDITIVE extension.
+//
+// EulerSwap V1 is the SECOND WHOLE-GRAPH prod-mirror captured via debug_traceCall(prestateTracer) (after
+// Mento): the swap moves the LP's funds through a ~24-contract EVK/EVC/oracle graph, so harness/
+// eulerv1-snapshot.ts traces EVERY production entry point (getAssets/curve/getReserves/getParams/getLimits —
+// discovery; computeQuote — the exec quote; a FULL SUCCESSFUL swap under a pre-transfer stateOverride — the
+// exec write) and dumps {code, touched-storage} per address. So the snapshot's `contracts` is the FULL graph
+// and `storage` is the union of touched slots keyed by ABSOLUTE contract address. This etch is the direct
+// analogue of etchMentoGraph — setCode every captured contract at its captured address + setStorageAt every
+// captured slot verbatim — with TWO source-specific wrinkles:
+//
+//   • TOKEN REPOINTING (Fluid/Wombat immutable-at-real-address class). Each EVK EVault bakes its underlying
+//     token address as an IMMUTABLE in its 366-byte proxy runtime (verified: the real USDC address appears
+//     in vault0's runtime; USDT in vault1's), and `getAssets()` == vault0.asset()/vault1.asset() resolves to
+//     them. So the tokens CANNOT be repointed by a scalar overwrite — the etch etches a local MintableERC20
+//     AT EACH REAL token address, funds each vault with its captured `cash` in the local token, and the swap
+//     then deposits/withdraws the LOCAL storage-backed tokens through the REAL vault code (identical to
+//     Fluid's token0/token1 + Liquidity-layer funding).
+//   • BLOCK-TIMESTAMP PIN (Fluid/Mento class). The swap's vault liquidity check reads an EulerRouter oracle
+//     whose ChainlinkOracle adapters enforce a `maxStaleness` window (90000s): the two captured feeds are
+//     ~24060s / ~70476s stale at the pinned block, both < 90000s, so the test PINS block.timestamp to the
+//     captured block ts (pinEulerV1BlockTimestamp) — where both feeds are fresh — reproducing the captured
+//     quote to the wei. A fresh anvil's wall-clock (~2026) is FAR past ⇒ the staleness check would revert.
+//
+// NO factory shim is needed: FactoryType.EulerSwap discovery is KNOWN-POOL-ADDRESS based (the config carries
+// the pool in `eulerSwapPools`; discoverEulerSwapPoolsTyped reads curve()+getParams()+getReserves()+
+// getLimits() off the etched pool graph). The on-chain execution is CALLBACK-FREE (computeQuote staticcall +
+// token.transfer(pool) + pool.swap(...,"") — the only re-entry is INTERNAL to Euler, the EVC self-wrap +
+// vault deposit/withdraw, never the cooking contract), so NO engine SwapPoolType.
+//
+// FIDELITY: every contract in the swap path — pool, EulerSwap impl, EVC, both EVaults + all EVK module impls,
+// the EulerRouter oracle + its two ChainlinkOracle adapters + their real Chainlink aggregators, the IRM, the
+// dToken, Permit2 — is the REAL captured runtime, byte-for-byte. The Chainlink feed runtimes carry the REAL
+// captured rounds (NOT shims), so the oracle prices the liquidity check off genuine mainnet feed data at the
+// pinned timestamp. NO mock, NO shim, NO stand-in in the swap path.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** One contract in the EulerSwap V1 graph bytecode snapshot (harness/eulerv1-snapshot.ts `contracts[]`). */
+export interface EulerV1ContractBytecode {
+  address: Hex;
+  role: string;
+  runtime: Hex;
+  runtimeSha256?: Hex;
+  touchedSlots: number;
+}
+
+/** EulerSwap V1 graph bytecode snapshot (harness/eulerv1-snapshot.ts). */
+export interface EulerV1BytecodeSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  blockTimestamp?: string;
+  source: string;
+  pool: Hex;
+  factory: Hex;
+  impl: Hex;
+  contracts: EulerV1ContractBytecode[];
+}
+
+/** EulerSwap V1 graph state snapshot (harness/eulerv1-snapshot.ts). */
+export interface EulerV1StateSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  blockTimestamp: string;
+  source: string;
+  pool: Hex;
+  factory: Hex;
+  asset0: Hex;
+  asset1: Hex;
+  tokenIn: Hex;
+  tokenOut: Hex;
+  tokenInSymbol: string;
+  tokenOutSymbol: string;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
+  isAsset0In: boolean;
+  curve: Hex;
+  reserve0: string;
+  reserve1: string;
+  status: number;
+  params: {
+    vault0: Hex; vault1: Hex; eulerAccount: Hex;
+    equilibriumReserve0: string; equilibriumReserve1: string;
+    priceX: string; priceY: string; concentrationX: string; concentrationY: string;
+    fee: string; protocolFee: string; protocolFeeRecipient: Hex;
+  };
+  getLimits: { inLimit: string; outLimit: string };
+  evc: Hex;
+  vault0: Hex;
+  vault1: Hex;
+  eulerAccount: Hex;
+  vault0Cash: string;
+  vault1Cash: string;
+  operatorAuthorized: boolean;
+  chainlinkFeeds: { feed: Hex; roundId: string; answer: string; updatedAt: string; staleSecs: string }[];
+  probe: { amountIn: string; amountOut: string };
+  ladder: { cap: string; cumIn: string[]; cumOut: string[] };
+  /** The union touched storage per contract (absolute slot → value), set verbatim on each etched contract. */
+  storage: Record<string, Record<string, Hex>>;
+}
+
+/** Load a EulerSwap V1 `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadEulerV1Snapshots(name: string): {
+  bytecode: EulerV1BytecodeSnapshot;
+  state: EulerV1StateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as EulerV1BytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as EulerV1StateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the EulerSwap V1 bytecode-graph integrity (NO RPC): re-hash EVERY contract runtime in the graph and
+ * match its capture-time sha256 anchor. Returns per-contract {address, role, expected, actual, ok} + allOk.
+ * A reviewer with no RPC key can run this to prove the checked-in blobs are the pinned-block mainnet code,
+ * byte-for-byte (mirrors verifyMentoBytecodeIntegrity).
+ */
+export function verifyEulerV1BytecodeIntegrity(bytecode: EulerV1BytecodeSnapshot): {
+  contracts: { address: Hex; role: string; expected?: Hex; actual: Hex; ok: boolean }[];
+  allOk: boolean;
+} {
+  const contracts = bytecode.contracts.map((c) => {
+    const actual = runtimeSha256(c.runtime);
+    return {
+      address: c.address,
+      role: c.role,
+      expected: c.runtimeSha256,
+      actual,
+      ok: !c.runtimeSha256 || c.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { contracts, allOk: contracts.every((c) => c.ok) };
+}
+
+/** A minimal test-client surface for the EulerSwap V1 block-timestamp pin (anvil_setTime + mine). */
+type EulerV1TimeClient = {
+  request: (args: { method: string; params: unknown[] }) => Promise<unknown>;
+  mine: (a: { blocks: number }) => Promise<void>;
+};
+
+/**
+ * Pin the anvil block clock to `state.blockTimestamp` and mine one block, so the next quote/cook sees a
+ * `block.timestamp` at the captured block's ts — the window where the swap's oracle Chainlink feeds are
+ * within their `maxStaleness` (90000s; the captured feeds are ~24060s/~70476s stale). Uses `anvil_setTime`
+ * (can jump BACKWARD — a fresh anvil's genesis clock is at wall-time, FAR past the captured Ethereum ts, and
+ * `evm_setNextBlockTimestamp` refuses to go backward). Call AFTER etching and BEFORE the first quote/cook, on
+ * EVERY fresh anvil. Mirrors pinMentoBlockTimestamp / pinFluidBlockTimestamp.
+ */
+export async function pinEulerV1BlockTimestamp(
+  testClient: EulerV1TimeClient,
+  state: { blockTimestamp: string },
+): Promise<bigint> {
+  const ts = BigInt(state.blockTimestamp);
+  await testClient.request({ method: "anvil_setTime", params: [Number(ts)] });
+  await testClient.mine({ blocks: 1 });
+  return ts;
+}
+
+/** The canonical Permit2 (the EVault deposit pull path routes through it). */
+const EULERV1_PERMIT2 = getAddress("0x000000000022D473030F116dDEE9f6B43aC78BA3") as Hex;
+/** MintableERC20 allowance mapping is at storage slot 5 (slot0 name, 1 symbol, 2 decimals, 3 totalSupply,
+ *  4 balanceOf, 5 allowance) — verified against the fixture source. */
+const ERC20_ALLOWANCE_SLOT = 5n;
+
+/** keccak for allowance[owner][spender]: keccak256(spender ‖ keccak256(owner ‖ slot)). */
+function mappingSlot2(owner: Hex, spender: Hex, slot: bigint): Hex {
+  const inner = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [getAddress(owner), slot]));
+  return keccak256(encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [getAddress(spender), inner]));
+}
+
+export interface EtchedEulerV1Pool {
+  /** The EulerSwap V1 pool address (the discovery/computeQuote/swap target — captured mainnet address). */
+  pool: Hex;
+  /** The EulerSwap factory address (echoed; the config wires it, discovery keys off factoryType). */
+  factory: Hex;
+  /** The EVC (Ethereum Vault Connector) address (etched real runtime). */
+  evc: Hex;
+  /** vault0/vault1 (EVK EVault proxies, funded with their captured cash in the local token). */
+  vault0: Hex;
+  vault1: Hex;
+  /** tokenIn/tokenOut — local MintableERC20s etched at the REAL token addresses (vault immutables). */
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** asset0/asset1 (the pool's canonical orientation — asset0 == the local token at the real asset0 addr). */
+  asset0: Hex;
+  asset1: Hex;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
+  /** true ⇒ tokenIn == asset0 (the swap output is amount1Out). */
+  isAsset0In: boolean;
+  /** Number of contracts etched (the whole graph) + storage slots reconstructed. */
+  contractCount: number;
+  slotCount: number;
+  /** The pinned block timestamp the test must pin the clock to (Chainlink staleness). */
+  blockTimestamp: bigint;
+}
+
+/**
+ * Stand up the captured REAL EulerSwap V1 pool + its whole ~24-contract EVK/EVC/oracle GRAPH on the local
+ * anvil, OFFLINE. (Proven a full swap against this etch receives tokenOut == the captured mainnet
+ * computeQuote probe, wei-exact — see harness/eulerv1-snapshot.ts's anchor + the section header.)
+ *
+ *   1. Repoint the tokens: capture a local MintableERC20 runtime, etch it AT EACH REAL token address
+ *      (asset0=USDC, asset1=USDT) + seed its `decimals` slot — because the EVaults bake the underlying token
+ *      as an IMMUTABLE, the local tokens MUST live at the real addresses.
+ *   2. setCode EVERY captured contract runtime at its captured address (the whole graph), skipping the two
+ *      token addresses (repointed above — their captured proxy runtime is NOT wanted).
+ *   3. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (skipping the tokens —
+ *      their captured proxy slots don't apply to the local ERC20 layout). This reconstructs the pool CtxLib
+ *      reserves, the vault accounting, the EVC operator-auth + on-behalf, the oracle feed rounds, etc.
+ *   4. Fund each vault with its captured `cash` in the LOCAL token (so cash == balanceOf holds and the swap's
+ *      deposit/withdraw moves real balances), + optional caller headroom in tokenIn. NOTE: pin the clock with
+ *      pinEulerV1BlockTimestamp after this, before the first quote/cook (Chainlink staleness — see header).
+ *
+ * The swap path then runs the GENUINE graph: computeQuote returns the mainnet-identical dy for the captured
+ * curve+vault state, and pool.swap deposits the pre-transferred tokenIn into vault0 + withdraws tokenOut from
+ * vault1 (via the EVC + the real oracle liquidity check) — all real captured code, no fork, no RPC.
+ */
+export async function etchEulerV1Pool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: EulerV1BytecodeSnapshot; state: EulerV1StateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedEulerV1Pool> {
+  const { bytecode, state } = snapshots;
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(state.pool) as Hex;
+  const evc = getAddress(state.evc) as Hex;
+  const vault0 = getAddress(state.vault0) as Hex;
+  const vault1 = getAddress(state.vault1) as Hex;
+  const asset0 = getAddress(state.asset0) as Hex;
+  const asset1 = getAddress(state.asset1) as Hex;
+  const tokenIn = getAddress(state.tokenIn) as Hex;
+  const tokenOut = getAddress(state.tokenOut) as Hex;
+
+  // 1. Repoint the tokens: one local MintableERC20 runtime, etched at EACH real asset address + seed decimals.
+  //    asset0/asset1 (== the vaults' underlying) are EVault immutables ⇒ the local tokens MUST live there.
+  const scratch = await deployToken(walletClient, publicClient, "eulerv1-scratch", "ESCR", 6);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  const decByAsset: Record<string, number> = {
+    [asset0.toLowerCase()]: asset0.toLowerCase() === tokenIn.toLowerCase() ? state.tokenInDecimals : state.tokenOutDecimals,
+    [asset1.toLowerCase()]: asset1.toLowerCase() === tokenIn.toLowerCase() ? state.tokenInDecimals : state.tokenOutDecimals,
+  };
+  const tokenSet = new Set([asset0.toLowerCase(), asset1.toLowerCase()]);
+  for (const tok of [asset0, asset1]) {
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(decByAsset[tok.toLowerCase()])) });
+  }
+
+  // 2. setCode EVERY captured contract runtime at its captured address (the whole graph; skip the tokens).
+  for (const c of bytecode.contracts) {
+    const addr = getAddress(c.address) as Hex;
+    if (tokenSet.has(addr.toLowerCase())) continue;
+    await testClient.setCode({ address: addr, bytecode: c.runtime });
+  }
+
+  // 3. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (skip the repointed
+  //    token addresses — their captured proxy slots don't apply to the local ERC20 layout). This INCLUDES
+  //    the Permit2 record slot (keyed by the REAL pool/token/vault addresses, all preserved by the etch), so
+  //    the Permit2-mediated pull below finds the pool's Permit2 allowance for the vault intact.
+  let slotCount = 0;
+  for (const [addr, slots] of Object.entries(state.storage)) {
+    if (tokenSet.has(addr.toLowerCase())) continue;
+    const a = getAddress(addr) as Hex;
+    for (const [slot, value] of Object.entries(slots)) {
+      await testClient.setStorageAt({ address: a, index: slot as Hex, value });
+      slotCount++;
+    }
+  }
+
+  // 4. Reconstruct the pool → Permit2 pull allowance on the LOCAL tokens (the ONE piece the token-repoint
+  //    drops). EulerSwap's depositAssets pulls the pre-transferred input from the pool into the vault via
+  //    Permit2: Permit2.transferFrom(pool, vault, amt, token) checks its OWN allowance record (reconstructed
+  //    verbatim in step 3, keyed by the real pool/token/vault) THEN calls token.transferFrom(pool, vault, amt)
+  //    with Permit2 as the spender — so the token must record allowance[pool][Permit2]. On mainnet the pool
+  //    holds a near-infinite pool→Permit2 approval (verified: the swap DECREMENTS Circle-USDC's
+  //    allowed[pool][Permit2] slot by exactly the input); that approval lives in the token's storage, which
+  //    the repoint skipped. Set it to max on the LOCAL token layout (MintableERC20 allowance is slot 5, and
+  //    its transferFrom treats type(uint256).max as infinite ⇒ no decrement) so the REAL Permit2-mediated
+  //    pull succeeds. GATING, not pricing — the pulled AMOUNT is still the real curve/vault result.
+  const set = async (addr: Hex, slot: Hex, value: Hex) =>
+    testClient.setStorageAt({ address: addr, index: slot, value });
+  for (const tok of [asset0, asset1]) {
+    const allowanceSlot = mappingSlot2(pool, EULERV1_PERMIT2, ERC20_ALLOWANCE_SLOT);
+    await set(tok, allowanceSlot, word((1n << 256n) - 1n));
+  }
+
+  // 5. Fund each vault with its captured `cash` in the LOCAL token (so the vault's cash == balanceOf invariant
+  //    holds and the swap's deposit/withdraw moves real balances), + caller headroom in tokenIn. vault0 holds
+  //    asset0, vault1 holds asset1.
+  await mint(walletClient, publicClient, asset0, vault0, BigInt(state.vault0Cash));
+  await mint(walletClient, publicClient, asset1, vault1, BigInt(state.vault1Cash));
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    factory: getAddress(state.factory) as Hex,
+    evc,
+    vault0,
+    vault1,
+    tokenIn,
+    tokenOut,
+    asset0,
+    asset1,
+    tokenInDecimals: state.tokenInDecimals,
+    tokenOutDecimals: state.tokenOutDecimals,
+    isAsset0In: state.isAsset0In,
+    contractCount: bytecode.contracts.length,
+    slotCount,
+    blockTimestamp: BigInt(state.blockTimestamp),
+  };
+}
+
+/** EulerSwap V1 pool read surface (the getters the test + discovery + exec read on the REAL pool graph). */
+export const eulerV1PoolReadAbi = parseAbi([
+  "function curve() view returns (bytes32)",
+  "function getAssets() view returns (address asset0, address asset1)",
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 status)",
+  "function getParams() view returns ((address vault0, address vault1, address eulerAccount, uint112 equilibriumReserve0, uint112 equilibriumReserve1, uint256 priceX, uint256 priceY, uint256 concentrationX, uint256 concentrationY, uint256 fee, uint256 protocolFee, address protocolFeeRecipient) params)",
+  "function getLimits(address tokenIn, address tokenOut) view returns (uint256 inLimit, uint256 outLimit)",
+  "function computeQuote(address tokenIn, address tokenOut, uint256 amount, bool exactIn) view returns (uint256)",
+]);

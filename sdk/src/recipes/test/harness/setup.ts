@@ -141,7 +141,7 @@ export const mentoBiPoolManagerArtifact = loadArtifact(
 export const traderJoeLBPairArtifact = loadArtifact(
   join(FIXTURES, "TraderJoeLBPair.sol", "TraderJoeLBPair.json"),
 );
-/** EulerSwap (Euler v2 vault-backed AMM) pool — deployed normally (constructor sets tokens/reserves/
+/** EulerSwap (Euler vault-backed AMM, v1+v2) pool — deployed normally (constructor sets tokens/reserves/
  *  curve params/fee/vault output caps). */
 export const eulerSwapPoolArtifact = loadArtifact(
   join(FIXTURES, "EulerSwapPool.sol", "EulerSwapPool.json"),
@@ -1407,11 +1407,14 @@ export async function deployMento(
   return { broker, provider, exchangeId };
 }
 
-// Mirrors the real euler-xyz/euler-swap IEulerSwap read surface (getAssets/getReserves/getDynamicParams/
-// computeQuote/getLimits/swap) — NO individual asset0()/reserve0()/priceX()/fee() getters.
+// Mirrors the real euler-xyz/euler-swap IEulerSwap read surface — BOTH v1 (curve/getParams) and v2
+// (getDynamicParams) — plus the shared getAssets/getReserves/computeQuote/getLimits/swap. NO individual
+// asset0()/reserve0()/priceX()/fee() getters.
 export const eulerSwapPoolAbi = parseAbi([
+  "function curve() view returns (bytes32)",
   "function getAssets() view returns (address asset0, address asset1)",
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 status)",
+  "function getParams() view returns ((address vault0, address vault1, address eulerAccount, uint112 equilibriumReserve0, uint112 equilibriumReserve1, uint256 priceX, uint256 priceY, uint256 concentrationX, uint256 concentrationY, uint256 fee, uint256 protocolFee, address protocolFeeRecipient) params)",
   "function computeQuote(address tokenIn, address tokenOut, uint256 amount, bool exactIn) view returns (uint256)",
   "function getLimits(address tokenIn, address tokenOut) view returns (uint256 inLimit, uint256 outLimit)",
   "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
@@ -1439,7 +1442,7 @@ export interface EulerSwapParams {
 }
 
 /**
- * Deploy a local EulerSwap (Euler v2 vault-backed AMM) pool and fund it with its asset0/asset1
+ * Deploy a local EulerSwap (Euler vault-backed AMM, v1+v2) pool and fund it with its asset0/asset1
  * reserves.
  *
  * Mirrors the canonical euler-xyz/euler-swap CurveLib.f + QuoteLib.computeQuote (exact-in) bit-for-bit
@@ -1456,7 +1459,10 @@ export async function deployEulerSwapPool(
   asset1Addr: Hex,
   p: EulerSwapParams,
   minter?: Account,
+  isV1 = true,
 ): Promise<Hex> {
+  // `isV1` selects the exposed surface (default v1 — every currently-deployed real pool is v1):
+  // true ⇒ curve()=="EulerSwap v1" + getParams() (getDynamicParams reverts); false ⇒ the v2 surface.
   const pool = await deployContract(walletClient, publicClient, {
     abi: eulerSwapPoolArtifact.abi,
     bytecode: eulerSwapPoolArtifact.bytecode,
@@ -1467,6 +1473,7 @@ export async function deployEulerSwapPool(
         p.reserve0, p.reserve1, p.equil0, p.equil1, p.priceX, p.priceY,
         p.concX, p.concY, p.fee, p.outCap0, p.outCap1,
       ],
+      isV1,
     ],
   });
   const acct = (minter ?? walletClient.account) as Account;

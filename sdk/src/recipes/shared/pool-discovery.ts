@@ -36,7 +36,7 @@ import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
 import { type FluidPool, fluidSampleInputs, FLUID_FEE_SCALE } from "./fluid-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
-import { type EulerSwapPool } from "./eulerswap-math.js";
+import { type EulerSwapPool, eulerFeeToPpm } from "./eulerswap-math.js";
 import {
   getSqrtPrice as getMaverickSqrtPrice,
   getTickL,
@@ -2661,20 +2661,40 @@ export async function discoverWombatPoolsTyped(
   return out;
 }
 
-// The REAL euler-xyz/euler-swap IEulerSwap surface (verified against master). There are NO individual
-// asset0()/reserve0()/priceX()/fee() getters: assets come from getAssets(), live reserves from
-// getReserves() (uint112,uint112,uint32 status), and ALL curve params live in the DynamicParams struct
-// returned by getDynamicParams() — equilibriumReserve0/1 (uint112), priceX/priceY (uint80),
-// concentrationX/concentrationY (uint64) and DIRECTIONAL fee0/fee1 (uint64; fee0 charged when tokenIn is
-// asset0, fee1 when tokenIn is asset1). getLimits(tokenIn,tokenOut) bounds the sampler.
+// The REAL euler-xyz/euler-swap IEulerSwap surface. TWO on-chain shapes coexist (like Uni V2/V3/V4 in
+// this recipe) — discovery detects the version via `curve()` (a bytes32 constant) and reads the matching
+// curve-param getter:
+//
+//   · v1 (tag eulerswap-1.0, curve()=="EulerSwap v1"): the curve params are IMMUTABLE (packed in the
+//     pool's MetaProxy trailing calldata) and read via getParams() — a 12-field STATIC struct
+//     (vault0, vault1, eulerAccount, equilibriumReserve0/1 (uint112), priceX/priceY (uint256),
+//     concentrationX/concentrationY (uint256), fee (uint256, SINGLE non-directional), protocolFee,
+//     protocolFeeRecipient). There is NO getDynamicParams() (it REVERTS on v1). Verified live against the
+//     real deployed v1 pool 0x3bBCC029f312ECe579a7dEb77B13CB8aE15F28A8 (USDC/USDT, mainnet).
+//   · v2 (master, curve()=="EulerSwap v2"): the curve params live in a DynamicParams struct returned by
+//     getDynamicParams() — equilibriumReserve0/1 (uint112), priceX/priceY (uint80),
+//     concentrationX/concentrationY (uint64), DIRECTIONAL fee0/fee1 (uint64; fee0 charged when tokenIn is
+//     asset0, fee1 when tokenIn is asset1), expiration, swapHookedOperations, swapHook.
+//
+// Common to both: getAssets() (assets — NO asset0()/asset1() getter), getReserves()
+// (uint112,uint112,uint32 status — VIRTUAL curve-state reserves), getLimits(tokenIn,tokenOut) (bounds the
+// sampler), curve() (the version discriminator). The curve MATH (CurveLib.f / fInverse) is IDENTICAL
+// across v1 and v2, so ONE eulerswap-math replay serves both — a v1 pool's off-chain computeQuote
+// reproduces the live pool's computeQuote view bit-for-bit (verified on 0x3bBCC029 across 9 vectors both
+// directions). The EXEC surface (computeQuote/getAssets/swap) is likewise version-agnostic.
 const eulerSwapPoolAbi = parseAbi([
+  "function curve() external view returns (bytes32)",
   "function getAssets() external view returns (address asset0, address asset1)",
   "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 status)",
+  "function getParams() external view returns ((address vault0, address vault1, address eulerAccount, uint112 equilibriumReserve0, uint112 equilibriumReserve1, uint256 priceX, uint256 priceY, uint256 concentrationX, uint256 concentrationY, uint256 fee, uint256 protocolFee, address protocolFeeRecipient) params)",
   "function getDynamicParams() external view returns ((uint112 equilibriumReserve0, uint112 equilibriumReserve1, uint112 minReserve0, uint112 minReserve1, uint80 priceX, uint80 priceY, uint64 concentrationX, uint64 concentrationY, uint64 fee0, uint64 fee1, uint40 expiration, uint8 swapHookedOperations, address swapHook) params)",
   "function getLimits(address tokenIn, address tokenOut) external view returns (uint256 inLimit, uint256 outLimit)",
 ]);
 
-/** DynamicParams as decoded by viem from the getDynamicParams() tuple. */
+/** bytes32("EulerSwap v1") — the curve() constant that identifies a v1 pool (right-zero-padded ASCII). */
+const EULER_CURVE_V1 = "0x45756c6572537761702076310000000000000000000000000000000000000000";
+
+/** DynamicParams as decoded by viem from the v2 getDynamicParams() tuple. */
 type EulerDynamicParams = {
   equilibriumReserve0: bigint;
   equilibriumReserve1: bigint;
@@ -2691,25 +2711,75 @@ type EulerDynamicParams = {
   swapHook: Hex;
 };
 
-/** EULER_ONE — 1e18 (the EulerSwap fee fixed-point; ppm round denominator). */
-const EULER_ONE = 10n ** 18n;
-/** Round an EulerSwap fee (1e18-scaled, e.g. 1e15 = 0.1%) to a ppm fee (the price-ordering coordinate). */
-function eulerFeeToPpm(feeWad: bigint): number {
-  return Number((feeWad * 1_000_000n + EULER_ONE / 2n) / EULER_ONE);
-}
+/** Params as decoded by viem from the v1 getParams() tuple (12 fields, static/immutable). */
+type EulerV1Params = {
+  vault0: Hex;
+  vault1: Hex;
+  eulerAccount: Hex;
+  equilibriumReserve0: bigint;
+  equilibriumReserve1: bigint;
+  priceX: bigint;
+  priceY: bigint;
+  concentrationX: bigint;
+  concentrationY: bigint;
+  fee: bigint;
+  protocolFee: bigint;
+  protocolFeeRecipient: Hex;
+};
+
+/**
+ * Normalized curve-param bundle used by discovery to build the tokenIn-oriented EulerSwapPool descriptor,
+ * unifying the v1 (getParams — single fee) and v2 (getDynamicParams — directional fee0/fee1) shapes. The
+ * curve math is version-independent; only the SOURCE getter + the fee direction differ.
+ */
+type EulerCurveBundle = {
+  /** equilibriumReserve0 (x0). */
+  x0: bigint;
+  /** equilibriumReserve1 (y0). */
+  y0: bigint;
+  /** priceX (px). */
+  px: bigint;
+  /** priceY (py). */
+  py: bigint;
+  /** concentrationX (cx). */
+  cx: bigint;
+  /** concentrationY (cy). */
+  cy: bigint;
+  /** Fee charged when tokenIn is asset0 (1e18-scaled). v1: the single fee; v2: fee0. */
+  fee0: bigint;
+  /** Fee charged when tokenIn is asset1 (1e18-scaled). v1: the single fee; v2: fee1. */
+  fee1: bigint;
+};
+
+// eulerFeeToPpm (round-half-up) lives in eulerswap-math.ts — THE SINGLE SOURCE, shared by discovery, the
+// prod-mirror descriptor, and the known-answer test descriptors so the ppm ordering coordinate matches
+// bit-for-bit (imported at the top of this file alongside EulerSwapPool).
 
 /**
  * Discover EulerSwap pools for the pair AS TYPED `EulerSwapPool` descriptors (the EcoSwap path). The
  * EulerSwap factory has NO pool enumeration (only a `deployedPools` mapping + PoolDeployed events), so
  * discovery is KNOWN-POOL-ADDRESS based: each FactoryConfig.eulerSwapPools entry is a candidate pool, and
  * a (tokenIn,tokenOut) swap is valid iff the pool's {asset0, asset1} (getAssets) == {tokenIn, tokenOut}.
+ *
+ * BOTH EulerSwap VERSIONS COEXIST (like Uni V2/V3/V4 in this recipe). Each candidate's `curve()` bytes32
+ * discriminates v1 ("EulerSwap v1") from v2 ("EulerSwap v2"), and discovery reads the matching curve-param
+ * getter:
+ *   · v1: getParams() — a STATIC 12-field struct (IMMUTABLE, packed in the MetaProxy trailing calldata):
+ *     equilibriumReserve0/1, priceX/priceY, concentrationX/concentrationY, a SINGLE non-directional fee.
+ *     There is NO getDynamicParams() on v1 (it REVERTS). This is the surface every currently-deployed pool
+ *     exposes (mainnet factory 0xb013be1D…, Base factory 0xf0CFe22d…).
+ *   · v2: getDynamicParams() — the mutable curve bundle with DIRECTIONAL fee0/fee1.
+ * The curve MATH is identical (CurveLib.f/fInverse), so both versions normalize into the SAME
+ * tokenIn-oriented `EulerSwapPool` descriptor and share prepare's `buildEulerSwapSegments` replay + the
+ * version-agnostic on-chain exec (computeQuote/getAssets/swap). A v1 pool's off-chain computeQuote
+ * reproduces the live pool's computeQuote view bit-for-bit (verified on 0x3bBCC029, 9 vectors both dirs).
+ *
  * The curve math is OFF-CHAIN ONLY: this reads the live reserves (getReserves) + the static curve params
- * from the DynamicParams struct (getDynamicParams: equilibriumReserve0/1, priceX/priceY,
- * concentrationX/concentrationY, DIRECTIONAL fee0/fee1) + the vault `inLimit` (from getLimits), all
- * oriented by tokenIn, so prepare's `buildEulerSwapSegments` can replay computeQuote with
- * NO further RPC (BOUNDED by the vault cap), and the on-chain solver consumes the sampled segments
- * statically + executes CALLBACK-FREE (computeQuote staticcall + transfer + pool.swap(...,"") — NO engine
- * SwapPoolType, since the asymmetric Euler curve is NOT xy=k).
+ * (getParams / getDynamicParams) + the vault `inLimit` (from getLimits), all oriented by tokenIn, so
+ * prepare's `buildEulerSwapSegments` can replay computeQuote with NO further RPC (BOUNDED by the vault
+ * cap), and the on-chain solver consumes the sampled segments statically + executes CALLBACK-FREE
+ * (computeQuote staticcall + transfer + pool.swap(...,"") — NO engine SwapPoolType, since the asymmetric
+ * Euler curve is NOT xy=k).
  *
  * Mirrors `discoverBalancerStablePoolsTyped` (known-pool-address, no factory getter): the FactoryConfig
  * carries the candidate pools in `eulerSwapPools`. Returns the venue descriptor EcoSwap prepare consumes
@@ -2728,13 +2798,19 @@ export async function discoverEulerSwapPoolsTyped(
   }
   if (candidates.length === 0) return [];
 
-  // Read getAssets() for each candidate to validate the pair + orient the swap.
-  const idResults = await client.multicall({
-    contracts: candidates.map((cp) => ({ address: cp.address, abi: eulerSwapPoolAbi, functionName: "getAssets" as const })),
-    allowFailure: true,
-  });
+  // Read getAssets() (validate the pair + orient the swap) + curve() (v1/v2 discriminator) per candidate.
+  const [idResults, curveResults] = await Promise.all([
+    client.multicall({
+      contracts: candidates.map((cp) => ({ address: cp.address, abi: eulerSwapPoolAbi, functionName: "getAssets" as const })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: candidates.map((cp) => ({ address: cp.address, abi: eulerSwapPoolAbi, functionName: "curve" as const })),
+      allowFailure: true,
+    }),
+  ]);
 
-  const valid: { cp: { address: Hex; label: string }; inIsToken0: boolean }[] = [];
+  const valid: { cp: { address: Hex; label: string }; inIsToken0: boolean; isV1: boolean; curveOk: boolean }[] = [];
   for (let i = 0; i < candidates.length; i++) {
     const a = idResults[i];
     if (a.status !== "success") continue;
@@ -2743,33 +2819,71 @@ export async function discoverEulerSwapPoolsTyped(
     const asset1 = rawA1.toLowerCase();
     const ti = tokenIn.toLowerCase();
     const to = tokenOut.toLowerCase();
-    if (asset0 === ti && asset1 === to) valid.push({ cp: candidates[i], inIsToken0: true });
-    else if (asset0 === to && asset1 === ti) valid.push({ cp: candidates[i], inIsToken0: false });
+    // curve() == "EulerSwap v1" ⇒ v1 (read getParams()); a SUCCESSFUL non-v1 curve() ⇒ v2 (getDynamicParams()).
+    // A FAILED curve() is ambiguous (rare — a static immutable read shares the getParams/getDynamicParams
+    // multicall batch, so a curve()-only failure is transient): the true discriminator is then which
+    // curve-param getter succeeds, resolved in the second loop below (`curveOk` records the ambiguity). We
+    // provisionally tag such a pool v1 (getParams success is itself the v1 marker) so a valid v1 pool with a
+    // transient curve() blip is not silently misclassified v2 → dropped on the reverting getDynamicParams().
+    const curveOk = curveResults[i].status === "success";
+    const isV1 = curveOk
+      ? (curveResults[i].result as Hex).toLowerCase() === EULER_CURVE_V1
+      : true; // ambiguous — provisional v1, reconciled against the getters below
+    if (asset0 === ti && asset1 === to) valid.push({ cp: candidates[i], inIsToken0: true, isV1, curveOk });
+    else if (asset0 === to && asset1 === ti) valid.push({ cp: candidates[i], inIsToken0: false, isV1, curveOk });
   }
   if (valid.length === 0) return [];
 
-  // Per-pool live reserves (getReserves) + the DynamicParams curve bundle (getDynamicParams) + the
-  // vault input cap (getLimits).
-  const [resR, dpR, limR] = await Promise.all([
+  // Per-pool live reserves (getReserves) + BOTH curve-param getters (v1 getParams + v2 getDynamicParams,
+  // allowFailure — each pool responds to exactly one; we select by `isV1`) + the vault input cap
+  // (getLimits). Reading both getters unconditionally keeps discovery a fixed 4-multicall shape regardless
+  // of the version mix, and allowFailure makes the unused getter a harmless revert.
+  const [resR, pR, dpR, limR] = await Promise.all([
     client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getReserves" as const })), allowFailure: true }),
+    client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getParams" as const })), allowFailure: true }),
     client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getDynamicParams" as const })), allowFailure: true }),
     client.multicall({ contracts: valid.map((v) => ({ address: v.cp.address, abi: eulerSwapPoolAbi, functionName: "getLimits" as const, args: [tokenIn, tokenOut] as const })), allowFailure: true }),
   ]);
 
   const out: EulerSwapPool[] = [];
   for (let i = 0; i < valid.length; i++) {
-    if (resR[i].status !== "success" || dpR[i].status !== "success") continue;
-    const inIsToken0 = valid[i].inIsToken0;
+    if (resR[i].status !== "success") continue;
+    const { inIsToken0, curveOk } = valid[i];
+
+    // Resolve the version. When curve() SUCCEEDED it is authoritative (valid[i].isV1). When it FAILED
+    // (ambiguous — see the first loop), the true discriminator is which curve-param getter answered:
+    // getParams() ⇒ v1, else getDynamicParams() ⇒ v2. getParams success is itself the v1 marker, so a valid
+    // v1 pool with a transient curve() blip is classified v1 (not silently dropped on a reverting
+    // getDynamicParams()). If curve() failed AND getParams() failed, fall through to v2 (both getters read;
+    // if getDynamicParams() also fails the pool is dropped below — a genuinely broken pool).
+    const isV1 = curveOk ? valid[i].isV1 : pR[i].status === "success";
+
+    // Normalize the version-specific curve params into a common bundle (single vs directional fee folded).
+    let bundle: EulerCurveBundle | null = null;
+    if (isV1) {
+      if (pR[i].status !== "success") continue; // v1 pool with an unreadable getParams() ⇒ drop
+      const p = pR[i].result as EulerV1Params;
+      // v1 fee is a SINGLE non-directional value (charged regardless of direction).
+      bundle = {
+        x0: p.equilibriumReserve0, y0: p.equilibriumReserve1,
+        px: p.priceX, py: p.priceY, cx: p.concentrationX, cy: p.concentrationY,
+        fee0: p.fee, fee1: p.fee,
+      };
+    } else {
+      if (dpR[i].status !== "success") continue; // v2 pool with an unreadable getDynamicParams() ⇒ drop
+      const dp = dpR[i].result as EulerDynamicParams;
+      bundle = {
+        x0: dp.equilibriumReserve0, y0: dp.equilibriumReserve1,
+        px: dp.priceX, py: dp.priceY, cx: dp.concentrationX, cy: dp.concentrationY,
+        fee0: dp.fee0, fee1: dp.fee1,
+      };
+    }
+
     const [reserve0, reserve1] = resR[i].result as readonly [bigint, bigint, number];
-    const dp = dpR[i].result as EulerDynamicParams;
-    const x0 = dp.equilibriumReserve0;
-    const y0 = dp.equilibriumReserve1;
-    const px = dp.priceX;
-    const py = dp.priceY;
-    const cx = dp.concentrationX;
-    const cy = dp.concentrationY;
-    // Fee is DIRECTIONAL: fee0 is charged when tokenIn is asset0, fee1 when tokenIn is asset1.
-    const feeWad = inIsToken0 ? dp.fee0 : dp.fee1;
+    const { x0, y0, px, py, cx, cy } = bundle;
+    // Fee is DIRECTIONAL for the descriptor: fee0 when tokenIn is asset0, fee1 when tokenIn is asset1
+    // (v1 collapses both to the single fee, so this is direction-invariant there).
+    const feeWad = inIsToken0 ? bundle.fee0 : bundle.fee1;
     // The vault input cap (getLimits inLimit). 0 / failed read ⇒ uncapped (the sampler treats 0 as uncapped).
     let inLimit = 0n;
     if (limR[i].status === "success") {
@@ -2794,7 +2908,7 @@ export async function discoverEulerSwapPoolsTyped(
       feeWad,
       inLimit,
       feePpm: eulerFeeToPpm(feeWad),
-      source: `${valid[i].cp.label} (EulerSwap)`,
+      source: `${valid[i].cp.label} (EulerSwap ${isV1 ? "v1" : "v2"})`,
     });
   }
   return out;

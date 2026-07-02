@@ -1,73 +1,400 @@
 /**
- * EcoSwap EulerSwap PROD-MIRROR — BLOCKED (no mirrorable real target deployed).
+ * EcoSwap EulerSwap V1 (Euler vault-backed AMM, euler-xyz/euler-swap tag eulerswap-1.0) PROD-MIRROR —
+ * REAL BYTECODE, NO FORK, OFFLINE.
  *
- * The EulerSwap analogue of ecoswap.fluid.prodmirror.evm.test.ts / ecoswap.dodo.prodmirror.evm.test.ts
- * CANNOT be built: there is NO deployed EulerSwap pool of the version the recipe targets. This file is a
- * documented placeholder (single `it.skip`) recording the exact blocker + the re-light condition, matching
- * how the codebase flags deferred/unlit sources (constants.ts EulerSwap FactoryConfig entries: mainnet
- * :481-487, Base :422-423, Arbitrum :567, Polygon :659). It is intentionally NOT wired to anvil/RPC/harness
- * so it runs OFFLINE in milliseconds and never fabricates a pool or stubs the core Euler pricing.
+ * The EulerSwap analogue of ecoswap.mento.prodmirror.evm.test.ts / ecoswap.fluid.prodmirror.evm.test.ts.
+ * Unlike ecoswap.euler.evm.test.ts (which deploys a MOCK EulerSwapPool.sol fixture), this test stands up
+ * the GENUINE deployed EulerSwap V1 pool 0x3bBCC029 (USDC/USDT, mainnet) + its WHOLE ~24-contract
+ * EVK/EVC/oracle quote+swap contract GRAPH captured from Ethereum mainnet, and runs the swap against it —
+ * proving the production discovery + execution path works on the real contracts, with NO fork and NO RPC at
+ * run time (etch + setStorageAt + a timestamp pin, seconds).
  *
- * WHY BLOCKED — STRUCTURAL, not a data gap. The recipe's `discoverEulerSwapPoolsTyped`
- * (shared/pool-discovery.ts:2718) hard-requires each pool's `getDynamicParams()` — the EulerSwap **v2**
- * curve bundle `(equilibriumReserve0/1, minReserve0/1, priceX/priceY, concentrationX/concentrationY,
- * directional fee0/fee1, expiration, swapHookedOperations, swapHook)` (the ABI at pool-discovery.ts:2673).
- * A pool that reverts `getDynamicParams()` fails the discovery multicall entry → is dropped, so the whole
- * production `FactoryType.EulerSwap` discovery→bracket→execute path has NOTHING to price. A prod-mirror
- * needs a REAL pool that responds to that view at a capturable state; none exists.
+ * MECHANISM (mirrors Mento's whole-graph etch + Fluid's immutable-token/ts-pin, in harness/etch-pool.ts):
+ *   CAPTURE (one-time, harness/eulerv1-snapshot.ts, uses the RPC key):
+ *     the wired FactoryType.EulerSwap target on Ethereum — the DEEPEST LIVE (operator-authorized) stable
+ *     V1 pool (USDC/USDT 0x3bBCC029, constants.ts eulerSwapPools[0]) — moves the LP's funds through a
+ *     ~24-contract graph (pool MetaProxy → EulerSwap impl → EVC → 2 EVK EVaults + their module impls →
+ *     EulerRouter oracle → 2 ChainlinkOracle adapters → their Chainlink aggregators → IRM → dToken →
+ *     Permit2 + the two ERC20s). We enumerate the EXACT touched set via debug_traceCall(prestateTracer) on
+ *     EVERY production entry point (getAssets/curve/getReserves/getParams/getLimits — discovery; computeQuote
+ *     — the exec quote; a FULL SUCCESSFUL swap under a pre-transfer stateOverride — the exec write) and dump
+ *     {code, touched-storage} per address into fixtures/snapshots/ethereum-eulerv1-USDCUSDT.{bytecode,state}
+ *     .json (WITH sha256 anchors). Block pinned (25445491). No key/url is ever persisted.
+ *   ETCH (this test, OFFLINE): boot a plain anvil (NO fork); setCode EVERY captured contract at its captured
+ *     address; setStorageAt every captured slot VERBATIM by absolute key (pool CtxLib reserves, vault
+ *     accounting, EVC operator-auth + on-behalf, oracle feed rounds, …); etch a local MintableERC20 AT EACH
+ *     REAL token address (asset0/asset1 are EVault IMMUTABLES — the V4 StateView→PoolManager immutable
+ *     class), fund each vault with its captured `cash`, reconstruct the pool→Permit2 pull allowance on the
+ *     local tokens (the one piece the token-repoint drops — see etch-pool.ts), then PIN block.timestamp to
+ *     the captured block ts (pinEulerV1BlockTimestamp — the oracle's ChainlinkOracle adapters enforce a
+ *     90000s maxStaleness; the captured feeds are ~24060s/~70476s stale, both fresh at the pinned ts). The
+ *     swap then runs the GENUINE graph: computeQuote returns the mainnet-identical dy and pool.swap deposits
+ *     the pre-transferred input into vault0 + withdraws the output from vault1 through the EVC + the real
+ *     oracle liquidity check.
  *
- * EXHAUSTIVE SCAN (one-time, read-only RPC; pinned mainnet 25441767 / Base 48084524):
- *   · Ethereum factory 0xb013be1D0D380C13B58e889f412895970A2Cf228 — poolsLength() = 24. ALL 24 pools:
- *       curve() = 0x45756c6572537761702076310000… = ASCII "EulerSwap v1"; getDynamicParams() REVERTS
- *       (execution reverted). Several stable pairs exist (USDC/USDT ×several, USDC/DAI) and getReserves()
- *       works — e.g. USDC/USDT 0x701f1F0b…68a8 = 234004994 / 51847945 (~$234 / ~$51, tiny operator-bound
- *       reserves) — but NONE is v2. eulerSwapImpl() = 0xc35a0FDA69e9D71e68C0d9CBb541Adfd21D6B117
- *       (itself curve()="EulerSwap v1", getDynamicParams() reverts).
- *   · Base factory 0xf0CFe22d23699ff1B2CFe6B8f706A6DB63911262 — poolsLength() = 9. ALL 9 pools:
- *       curve() = "EulerSwap v1"; getDynamicParams() REVERTS. No pool pairs two Base baseTokens (only
- *       WETH/USDC, EURC/USDC, cbBTC-ish/USDC, EURC/WETH — mixed volatile/stable).
- *       eulerSwapImpl() = 0x3Ce63C16CB719a0c755DA25cd5dD35170A00424f (curve()="EulerSwap v1").
+ * CENTRAL VERIFICATION (this file asserts all three explicitly):
+ *   (a) REAL bytecode — eth_getCode at the pool + EVERY dependency (EVC, both vaults, the EulerSwap impl,
+ *       the EulerRouter oracle, the module impls, …) in the test == the captured real runtime, byte-for-byte
+ *       (a NO-RPC sha256 tripwire proves the checked-in blobs are intact). No mock EulerSwapPool.sol is in
+ *       the swap path (the addresses are the captured mainnet addresses, running captured code). The REAL
+ *       pool getters reconstruct exactly — curve()=="EulerSwap v1", getAssets/getReserves/getParams/getLimits
+ *       == captured, and computeQuote reproduces the captured probe ladder to the WEI.
+ *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
+ *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts optimalSplit,
+ *       seeded from the captured curve params via the SHARED buildEulerSwapSegments — the identical grid
+ *       discoverEulerSwapPoolsTyped samples) == the REAL pool's OWN pre-swap computeQuote view of the awarded
+ *       slice, all to the wei. spent == the awarded Σ is asserted explicitly.
  *
- * ROOT CAUSE — every EulerSwap pool is an EIP-1167 minimal-proxy CLONE delegating to the factory's single
- * pinned `eulerSwapImpl`, and that implementation is **v1** on every chain the recipe knows. `getDynamicParams()`
- * is absent from the v1 impl's dispatch, so NO pool minted by either factory can EVER respond to it — a v2
- * state cannot be reconstructed from these deployments. (Confirms constants.ts verbatim: "expose the EulerSwap
- * **v1** surface (curve()=='EulerSwap v1', getParams()) — they REVERT getDynamicParams() … Re-light by address
- * once a stable-pair EulerSwap **v2** pool (getDynamicParams) is deployed. eulerSwapPools intentionally omitted.")
+ * HONEST fidelity — FULL-REAL-CODE, NO STUB/SHIM: every contract in the swap path (pool, EulerSwap impl,
+ * EVC, both EVaults + all EVK module impls, the EulerRouter oracle + its two ChainlinkOracle adapters +
+ * their REAL Chainlink aggregators, the IRM, the dToken, Permit2) is the REAL captured runtime, byte-for-
+ * byte, and the Chainlink feed runtimes carry the REAL captured rounds (NOT read-only shims) — the oracle
+ * prices the vault liquidity check off genuine mainnet feed data at the pinned timestamp. The ONE
+ * reconstructed-not-captured item is a GATING allowance (pool→Permit2 max approval on the LOCAL token; the
+ * real pool holds a near-infinite one, verified DECREMENTED by the swap) — GATING, not pricing, so the
+ * executed dy is still the real curve/vault result. computeQuote is EXACT-IN-DY (the periphery
+ * quoteExactInput delegates to it, and the view IS the swap math EulerSwap.swap enforces), so received ==
+ * computeQuote(awarded Σ) to the wei.
  *
- * COVERAGE THAT DOES EXIST — the synthetic ecoswap.euler.evm.test.ts stands up the EulerSwapPool.sol fixture
- * (CurveLib.f + QuoteLib.computeQuote mirroring eulerswap-math.ts bit-for-bit) and cooks the callback-free
- * exact-in-dy EcoSwap path on v1 (+ v12). That is the strongest available proof until a v2 pool ships; it is
- * a locally-deployed-fixture test, NOT a prod-mirror, so it does NOT assert against captured mainnet bytecode.
+ * EULERSWAP IS A SAMPLED-SEGMENT VENUE (like DODO / Wombat): buildEulerSwapSegments samples the f/fInverse
+ * curve on a squared-index geometric grid capped at min(amountIn, inLimit), and the strictly-descending
+ * guard drops the final near-saturation slice — so the awarded Σ is the grid's covered capacity, a small
+ * documented tail below amountIn, NOT the full amountIn. The engine's static-segment cursor consumes the
+ * IDENTICAL grid, so spent == the oracle's awarded Σ to the wei (the correct exact-on-grid property).
  *
- * RE-LIGHT (when this becomes buildable):
- *   1. Re-run the scan; if any pool's curve() reads "EulerSwap v2" AND getDynamicParams() returns a tuple:
- *   2. Enumerate the WHOLE touched contract set with `cast access-list` on the pool's quote (getDynamicParams
- *      / computeQuote) AND swap paths — the pool + its EVault(s) + the EVC (+ any price oracle) — resolving
- *      proxies via eth_getCode.
- *   3. Write harness/euler-snapshot.ts (ADDITIVELY reusing harness/etch-pool.ts, like fluid-snapshot.ts):
- *      eth_getCode every runtime → fixtures/snapshots/<chain>-euler-<pair>.bytecode.json (WITH sha256 anchors);
- *      eth_getStorageAt every touched slot across ALL dependency contracts → .state.json; pin the block.
- *   4. Register the pool: add its address to the wired FactoryConfig's `eulerSwapPools` (constants.ts) so the
- *      production FactoryType.EulerSwap discovery path finds it.
- *   5. Replace this it.skip with the real prod-mirror body (mirror ecoswap.fluid.prodmirror.evm.test.ts):
- *      boot a PLAIN anvil (NO fork), setCode every real runtime at its captured address, setStorageAt-
- *      reconstruct all captured slots across the whole graph, repoint tokens at local MintableERC20s, fund,
- *      cook EcoSwap through the real discovery path, and assert (a) eth_getCode byte-equals the captured
- *      runtime at the pool + every dependency, (b) OFFLINE + fast, (c) wei-exact vs ecoswap.optimal.ts AND
- *      vs the pool's own computeQuote view of the awarded slice — on v1 AND v12.
+ * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the artifacts are
+ * absent). No state cache — etch+setStorage is a few seconds.
  *
- * Run: pnpm --filter './sdk' test:recipes:evm   (or npx tsx --test this file) — SKIPS, milliseconds, offline.
+ * Run: npx tsx --test src/recipes/test/ecoswap.euler.prodmirror.evm.test.ts
+ *      ECO_ENGINE=both pnpm --filter './sdk' test:recipes:evm
  */
 
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { type Account, type Hex } from "viem";
 
-describe("EcoSwap EulerSwap PROD-MIRROR", () => {
-  it.skip(
-    "BLOCKED: no EulerSwap v2 pool deployed — every pool on the mainnet (0xb013be1D…, 24 pools) and " +
-      "Base (0xf0CFe22d…, 9 pools) factories is an EIP-1167 clone of a v1 impl (curve()=\"EulerSwap v1\") " +
-      "that REVERTS getDynamicParams(), which discoverEulerSwapPoolsTyped requires. No real target to " +
-      "mirror. Re-light once a stable-pair EulerSwap v2 pool ships (see file header for the capture steps).",
-    () => {},
-  );
+import { startAnvil, type AnvilHandle } from "./harness/anvil";
+import { makeClients, type HarnessClients } from "./harness/clients";
+import { cook } from "./harness/cook";
+import {
+  ensureMulticall3,
+  deployStack,
+  mint,
+  approve,
+  balanceOf,
+  type DeployedStack,
+  type DeployedV12Stack,
+} from "./harness/setup";
+import {
+  etchEulerV1Pool,
+  loadEulerV1Snapshots,
+  verifyEulerV1BytecodeIntegrity,
+  pinEulerV1BlockTimestamp,
+  eulerV1PoolReadAbi,
+  type EtchedEulerV1Pool,
+  type EulerV1StateSnapshot,
+} from "./harness/etch-pool";
+import {
+  type Engine,
+  engineCells,
+  maybeDeployV12Stack,
+  cookTarget,
+} from "./harness/engine";
+import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
+import { EcoBracketKind } from "../shared/types";
+import { ecoSwap } from "../ecoswap/index";
+import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
+import { computeQuote, buildEulerSwapSegments, eulerFeeToPpm, type EulerSwapPool } from "../shared/eulerswap-math";
+
+const SNAP_NAME = "ethereum-eulerv1-USDCUSDT";
+const ENGINE_CELLS = engineCells();
+
+describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL bytecode, no fork, offline", () => {
+  const snaps = loadEulerV1Snapshots(SNAP_NAME);
+
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let etched: EtchedEulerV1Pool;
+
+  // Boot a fresh anvil + etch the real pool graph + deploy the engine, then PIN the block clock (the
+  // oracle's Chainlink staleness window). Called before each cell so each engine runs in full isolation
+  // (cheap: the whole setup is etch + setStorageAt + a handful of deploys, seconds not minutes).
+  async function setup(): Promise<void> {
+    anvil?.stop();
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    // Caller headroom in tokenIn — 2x the trade sizing below.
+    etched = await etchEulerV1Pool(c.walletClient, c.publicClient, c.testClient, snaps, {
+      minter: c.walletClient.account as Account,
+      callerFund: 200_000n * 10n ** BigInt(snaps.state.tokenInDecimals),
+    });
+    // PIN block.timestamp to the captured block ts — the window where the swap's oracle Chainlink feeds
+    // are within their maxStaleness (see the harness header). A fresh anvil's wall-clock is FAR past.
+    await pinEulerV1BlockTimestamp(c.testClient, snaps.state);
+  }
+
+  before(setup);
+  after(() => {
+    anvil?.stop();
+  });
+
+  /** A poolConfig with ONLY a EulerSwap factory carrying the reproduced pool → the production
+   *  FactoryType.EulerSwap discovery path resolves the etched pool via curve()+getParams()+getReserves()+
+   *  getLimits(); the lens ignores non-V2/V3/V4 factory types, so no direct pools are surfaced and the
+   *  EulerSwap venue rides entirely through discoverEulerSwapPoolsTyped. (No factory shim is needed —
+   *  discovery reads the config-carried eulerSwapPools list directly.) The `address`/`poolType` are inert
+   *  placeholders (discovery keys off factoryType). */
+  function eulerPoolConfig(tokenIn: Hex, tokenOut: Hex): ChainPoolConfig {
+    return {
+      factories: [
+        {
+          address: etched.factory,
+          poolType: SwapPoolType.UniV2, // inert for EulerSwap — discovery keys off factoryType
+          factoryType: FactoryType.EulerSwap,
+          label: "Local EulerSwap V1 (prod-mirror)",
+          eulerSwapPools: [etched.pool],
+        },
+      ],
+      feeTiers: [],
+      baseTokens: [tokenIn, tokenOut],
+    };
+  }
+
+  // The pool's own on-chain computeQuote view (the exact-in-dy ground truth for the executed slice) —
+  // the periphery quoteExactInput delegates to this, and the view IS the swap math the pool enforces.
+  async function onQuote(amt: bigint): Promise<bigint> {
+    return (await c.publicClient.readContract({
+      address: etched.pool, abi: eulerV1PoolReadAbi, functionName: "computeQuote",
+      args: [etched.tokenIn, etched.tokenOut, amt, true],
+    })) as bigint;
+  }
+
+  /** The neutral oracle's EulerSwapPool descriptor, built from the CAPTURED V1 params + live reserves,
+   *  oriented for tokenIn == asset0 (the captured direction). The oracle segments this via the SHARED
+   *  buildEulerSwapSegments — the IDENTICAL closed-form f/fInverse replay discoverEulerSwapPoolsTyped uses
+   *  — so the split is exact-on-grid vs the oracle by construction, and the off-chain computeQuote replay
+   *  reproduces the pool's on-chain computeQuote to the wei (proven below + in ecoswap.math.ts). */
+  function offPool(state: EulerV1StateSnapshot): EulerSwapPool {
+    const p = state.params;
+    const inIsToken0 = state.isAsset0In; // true for this pool (tokenIn == asset0 == USDC)
+    const r0 = BigInt(state.reserve0);
+    const r1 = BigInt(state.reserve1);
+    const x0 = BigInt(p.equilibriumReserve0);
+    const y0 = BigInt(p.equilibriumReserve1);
+    const px = BigInt(p.priceX);
+    const py = BigInt(p.priceY);
+    const cx = BigInt(p.concentrationX);
+    const cy = BigInt(p.concentrationY);
+    const feeWad = BigInt(p.fee); // v1 single non-directional fee
+    return {
+      address: etched.pool,
+      inIsToken0,
+      reserveIn: inIsToken0 ? r0 : r1,
+      reserveOut: inIsToken0 ? r1 : r0,
+      equilIn: inIsToken0 ? x0 : y0,
+      equilOut: inIsToken0 ? y0 : x0,
+      priceIn: inIsToken0 ? px : py,
+      priceOut: inIsToken0 ? py : px,
+      concIn: inIsToken0 ? cx : cy,
+      concOut: inIsToken0 ? cy : cx,
+      feeWad,
+      inLimit: BigInt(state.getLimits.inLimit),
+      feePpm: eulerFeeToPpm(feeWad), // round-half-up — THE SINGLE SOURCE discovery uses (matches the descriptor)
+      source: "prod-mirror",
+    };
+  }
+
+  // ── (a) REAL BYTECODE — the etched code IS the captured mainnet runtime, byte-for-byte. ──
+  it("etches the REAL EulerSwap V1 pool + its whole EVK/EVC/oracle graph bytecode (byte-equal) + reproduces the captured quotes", async () => {
+    // NO-NETWORK integrity tripwire FIRST: the checked-in runtime blobs still hash to the sha256 anchors
+    // recorded at capture time (byte-equal to the pinned-block on-chain code). A reviewer without the RPC
+    // key can run this — it proves the snapshot wasn't silently altered after capture, with NO RPC.
+    const integ = verifyEulerV1BytecodeIntegrity(snaps.bytecode);
+    assert.ok(integ.allOk, "every contract runtime sha256 matches its capture anchor");
+    assert.ok(integ.contracts.length >= 20, `the full graph is captured (${integ.contracts.length} contracts)`);
+    for (const con of integ.contracts) {
+      assert.ok(con.expected, `contract ${con.address} (${con.role}) carries a sha256 integrity anchor`);
+      assert.ok(con.ok, `contract ${con.address} (${con.role}) runtime sha256 matches the capture anchor (got ${con.actual})`);
+    }
+
+    // getCode at the pool + EVERY dependency must EQUAL the captured real runtime (no mock in the path).
+    // The two token addresses are repointed to local MintableERC20s (asset0/asset1 are vault immutables),
+    // so they are the ONLY captured addresses whose code intentionally differs — skip them here.
+    const tokenSet = new Set([etched.asset0.toLowerCase(), etched.asset1.toLowerCase()]);
+    for (const con of snaps.bytecode.contracts) {
+      if (tokenSet.has(con.address.toLowerCase())) continue;
+      const code = await c.publicClient.getCode({ address: con.address });
+      assert.ok(code, `dependency ${con.role} (${con.address}) has code`);
+      assert.equal(
+        code!.toLowerCase(),
+        con.runtime.toLowerCase(),
+        `eth_getCode at ${con.role} (${con.address}) == the captured REAL runtime (byte-equal)`,
+      );
+    }
+    assert.equal(etched.pool.toLowerCase(), snaps.bytecode.pool.toLowerCase(), "pool at captured mainnet address");
+
+    // The REAL pool getters reconstruct exactly (real code + verbatim state). curve() discriminates v1.
+    const curve = (await c.publicClient.readContract({ address: etched.pool, abi: eulerV1PoolReadAbi, functionName: "curve" })) as Hex;
+    assert.equal(curve.toLowerCase(), snaps.state.curve.toLowerCase(), "curve() == the captured \"EulerSwap v1\" constant");
+    const assets = (await c.publicClient.readContract({ address: etched.pool, abi: eulerV1PoolReadAbi, functionName: "getAssets" })) as readonly [Hex, Hex];
+    assert.equal(assets[0].toLowerCase(), etched.asset0.toLowerCase(), "getAssets asset0 == the etched local token at the real asset0 address");
+    assert.equal(assets[1].toLowerCase(), etched.asset1.toLowerCase(), "getAssets asset1 == the etched local token at the real asset1 address");
+    const reserves = (await c.publicClient.readContract({ address: etched.pool, abi: eulerV1PoolReadAbi, functionName: "getReserves" })) as readonly [bigint, bigint, number];
+    assert.equal(reserves[0], BigInt(snaps.state.reserve0), "getReserves reserve0 == captured");
+    assert.equal(reserves[1], BigInt(snaps.state.reserve1), "getReserves reserve1 == captured");
+    assert.equal(reserves[2], snaps.state.status, "getReserves status == captured (1 = unlocked)");
+    const params = (await c.publicClient.readContract({ address: etched.pool, abi: eulerV1PoolReadAbi, functionName: "getParams" })) as {
+      vault0: Hex; vault1: Hex; eulerAccount: Hex; equilibriumReserve0: bigint; equilibriumReserve1: bigint;
+      priceX: bigint; priceY: bigint; concentrationX: bigint; concentrationY: bigint; fee: bigint;
+    };
+    assert.equal(params.vault0.toLowerCase(), etched.vault0.toLowerCase(), "getParams vault0 == captured");
+    assert.equal(params.vault1.toLowerCase(), etched.vault1.toLowerCase(), "getParams vault1 == captured");
+    assert.equal(params.equilibriumReserve0, BigInt(snaps.state.params.equilibriumReserve0), "getParams eqReserve0 == captured");
+    assert.equal(params.priceX, BigInt(snaps.state.params.priceX), "getParams priceX == captured");
+    assert.equal(params.priceY, BigInt(snaps.state.params.priceY), "getParams priceY == captured");
+    assert.equal(params.concentrationX, BigInt(snaps.state.params.concentrationX), "getParams concentrationX == captured");
+    assert.equal(params.fee, BigInt(snaps.state.params.fee), "getParams fee == captured (single non-directional v1 fee)");
+
+    // getLimits reads the vault caps THROUGH the module graph (RiskManager) — reconstructed exactly.
+    const limits = (await c.publicClient.readContract({
+      address: etched.pool, abi: eulerV1PoolReadAbi, functionName: "getLimits", args: [etched.tokenIn, etched.tokenOut],
+    })) as readonly [bigint, bigint];
+    assert.equal(limits[0], BigInt(snaps.state.getLimits.inLimit), "getLimits inLimit == captured (vault cap through the module graph)");
+    assert.equal(limits[1], BigInt(snaps.state.getLimits.outLimit), "getLimits outLimit == captured");
+
+    // The REAL computeQuote reproduces the captured probe ladder to the WEI (the f/fInverse curve over the
+    // reconstructed reserves + params, netting the fee) — the exec-quote + discovery-sampler ground truth.
+    for (let i = 0; i < snaps.state.ladder.cumIn.length; i++) {
+      const amt = BigInt(snaps.state.ladder.cumIn[i]);
+      const got = await onQuote(amt);
+      assert.equal(got.toString(), snaps.state.ladder.cumOut[i], `REAL computeQuote(${amt}) == captured mainnet value`);
+    }
+    const probe = await onQuote(BigInt(snaps.state.probe.amountIn));
+    assert.equal(probe.toString(), snaps.state.probe.amountOut, "REAL computeQuote(probe) == the captured mainnet value to the wei");
+
+    console.log(
+      `  [eulerv1-prod-mirror] REAL bytecode etched: pool ${etched.pool} + ${etched.contractCount - 1} deps ` +
+        `(EVC/2 vaults/impl/EulerRouter oracle/module impls/…), ${etched.slotCount} storage slots; ` +
+        `captured block ${snaps.state.block} ts ${snaps.state.blockTimestamp}; reserves ${reserves[0]}/${reserves[1]}; ` +
+        `${snaps.state.tokenInSymbol}/${snaps.state.tokenOutSymbol}`,
+    );
+  });
+
+  // ── (b)+(c) FAST/OFFLINE run through the production discovery path, wei-exact vs the oracle. ──
+  async function runProdMirror(engine: Engine): Promise<void> {
+    await setup();
+    const t0 = Date.now();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    // Swap tokenIn → tokenOut (USDC → USDT, the captured direction): tokenIn == asset0, tokenOut == asset1.
+    const tokenIn = etched.tokenIn;
+    const tokenOut = etched.tokenOut;
+
+    // amountIn == 1000 USDC — well within BOTH the vault inLimit (~$299M) AND the pool's VIRTUAL output
+    // reserve (~1165 USDT curve reserveOut; the swappable output saturates there — the getReserves are the
+    // curve virtual reserves, NOT the deep vault cash). At 1000 USDC → ~999.5 USDT the trade sits on the
+    // productive part of the f/fInverse curve (well left of saturation), so the M=24 grid covers [0, amountIn]
+    // and the merge awards the WHOLE grid Σ to this one venue (single-venue full-fill, asserted below). A
+    // 100k+ USDC trade would overshoot the ~1165 USDT reserveOut and saturate — not a meaningful mirror.
+    const amountIn = 1_000n * 10n ** BigInt(snaps.state.tokenInDecimals);
+    const poolConfig = eulerPoolConfig(tokenIn, tokenOut);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn); // ensure headroom
+
+    // Run EcoSwap through the PRODUCTION FactoryType.EulerSwap discovery path (reads the etched pool graph).
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      anvil.rpcUrl,
+      cookTarget(engine, stack, v12),
+      caller,
+      poolConfig,
+      undefined,
+      engine,
+    );
+
+    // Discovery surfaced exactly the ONE reproduced EulerSwap venue (via the real getters).
+    assert.equal(prepared.pools.length, 0, "lens surfaces no direct V2/V3/V4 pools (EulerSwap-only config)");
+    assert.equal((prepared.eulerSwaps ?? []).length, 1, "discovered exactly the 1 reproduced EulerSwap venue");
+    assert.equal(
+      prepared.eulerSwaps![0].address.toLowerCase(),
+      etched.pool.toLowerCase(),
+      "the discovered EulerSwap venue is the REAL etched pool",
+    );
+    assert.equal(prepared.eulerSwaps![0].inIsToken0, true, "discovery oriented the venue as inIsToken0 (tokenIn == asset0)");
+    assert.ok(prepared.eulerSwaps![0].source.includes("v1"), `the discovered venue is tagged v1 (${prepared.eulerSwaps![0].source})`);
+    assert.ok(
+      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.EulerSwap),
+      "EulerSwap segments present",
+    );
+
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one EulerSwap venue seeded from the CAPTURED curve params via
+    // the SHARED buildEulerSwapSegments (the identical grid discoverEulerSwapPoolsTyped sampled). Pure
+    // off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the engine's
+    // static-segment cursor consumes the IDENTICAL grid, so on-chain spent == oracle.totalInput to the wei.
+    const op = offPool(snaps.state);
+    assert.ok(buildEulerSwapSegments(op, amountIn).length > 0, "non-empty EulerSwap segment ladder from the captured params");
+    const optPools: OptimalPool[] = [{ eulerSwap: op, feePpm: op.feePpm }];
+    const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
+    const awarded = oracle.perPoolInput[0] ?? 0n;
+    assert.ok(awarded > 0n, "oracle allocates to the reproduced EulerSwap venue");
+
+    // The REAL pool's OWN pre-swap computeQuote view for the KNOWN awarded Σ — the engine-independent
+    // ground truth for the executed dy of the awarded slice (the periphery quoteExactInput delegates to
+    // this view, and the view IS the swap math). The block clock is PINNED (oracle stays fresh).
+    const onViewAwarded = await onQuote(awarded);
+
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    // EulerSwap PULLS the awarded input the recipe pre-transferred to the pool into the Liquidity vault0 (NOT
+    // held by the pool) — measure the vault0 tokenIn delta for the "netted the full input" check.
+    const vaultInBefore = await balanceOf(c.publicClient, tokenIn, etched.vault0);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "cook() must succeed against the REAL EulerSwap graph");
+
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+    const vaultIn = (await balanceOf(c.publicClient, tokenIn, etched.vault0)) - vaultInBefore;
+
+    assert.ok(spent > 0n, "caller spends tokenIn");
+    assert.ok(received > 0n, "caller receives tokenOut");
+    // HONEST fee accounting: EulerSwap nets the FULL awarded input into the Liquidity vault0 (the fee is
+    // folded into a smaller output, not a smaller input). Assert vault0 received exactly what was spent.
+    assert.equal(vaultIn, spent, "REAL EulerSwap vault0 netted the FULL input (fee is folded into the output quote)");
+
+    // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance. EulerSwap is a
+    // SAMPLED-SEGMENT venue (like DODO/Wombat), but at this sizing (well left of the output-reserve
+    // saturation) the M=24 grid covers [0, amountIn] with monotone-descending marginals, so the merge awards
+    // the WHOLE amountIn — spent == oracle awarded Σ == oracle.totalInput == amountIn to the WEI.
+    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
+    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
+    assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (grid covers [0, amountIn], one deep venue)");
+
+    // The caller-received tokenOut == the neutral-oracle computeQuote(spent) == the REAL pool's OWN pre-swap
+    // computeQuote(awarded Σ) view, all to the WEI. NO tolerance. The three-way agreement (TS oracle replay
+    // == the real on-chain view == the executed swap), for exactly the awarded Σ the solver spent, ties the
+    // executed output to the real pool's own asymmetric f/fInverse curve.
+    assert.equal(received, computeQuote(op, spent), "received == neutral-oracle computeQuote(spent) (wei-exact-in-dy)");
+    assert.equal(received, onViewAwarded, "received == REAL pool pre-swap computeQuote(awarded Σ) (exact-in-dy)");
+
+    const ms = Date.now() - t0;
+    console.log(
+      `  [eulerv1-prod-mirror:${engine}] WEI-EXACT vs neutral oracle — spent=${spent} received=${received} ` +
+        `(oracle awarded=${awarded}, computeQuote=${computeQuote(op, spent)}, realView=${onViewAwarded}, amountIn=${amountIn}); ` +
+        `wall-clock ${ms} ms (no fork, no RPC)`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`runs EcoSwap through the REAL EulerSwap V1 graph [${engine}] — wei-exact vs the neutral oracle, offline`, { skip }, async () => {
+      await runProdMirror(engine);
+    });
+  }
 });
