@@ -757,7 +757,8 @@ function buildEulerSwapBrackets(pool: EulerSwapPool, refIdx: number, amountIn: b
 
 /**
  * Build Maverick V2 segments for one pool by sampling the bin swap-math replay (NO extra RPC — pure
- * bigint on the read tick book + directional fee, BOUNDED by the engine tickLimit=0 depth). Each sampled
+ * bigint on the read tick book + directional fee, BOUNDED by the engine's per-direction FULL-RANGE
+ * tickLimit depth — type(int32).max/min, ../sauce PR #193, i.e. the pool's available liquidity). Each sampled
  * (Δinput, Δoutput) increment becomes a STATIC segment (kind MaverickV2) in unified out/in space, refIdx →
  * the Maverick venue index. The marginal is the POST-FEE execution price (buildMaverickSegments nets the
  * directional fee), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar.
@@ -1148,9 +1149,11 @@ export async function prepareEcoSwap(
   // Maverick V2 — factory lookup discovery (lookup(tokenA, tokenB, idx) over both orderings). Maverick is
   // a BIN-based directional AMM: the bin curve does NOT map to the drift-invariant liquidityNet tick walk,
   // so it is a SAMPLED-SEGMENT source (like DODO). `discoverMaverickV2PoolsTyped` reads the tick book around
-  // the active tick + the directional fee + tickSpacing (and GATES a pool OUT when its live active tick sits
-  // on the wrong side of tick 0 for its direction — the engine hardcodes tickLimit=0). Sampled OFF-CHAIN;
-  // EXECUTED through the engine (swap poolType 7 → _swapMaverickV2 → maverickV2SwapCallback). NO engine change.
+  // the active tick + the directional fee + tickSpacing and surfaces EVERY liquid pool regardless of which
+  // side of tick 0 its active tick sits on — the FIXED engine (../sauce PR #193) passes a per-direction
+  // FULL-RANGE tickLimit (type(int32).max/min), so there is NO active-tick side gate (the OLD tickLimit=0 cap
+  // + its discovery gate are gone). Sampled OFF-CHAIN; EXECUTED through the engine (swap poolType 7 →
+  // _swapMaverickV2 → maverickV2SwapCallback). NO engine change.
   const maverickFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.MaverickV2Factory);
   if (maverickFactories.length > 0) {
     const maverickRaw = await discoverMaverickV2PoolsTyped(tokenIn, tokenOut, client, maverickFactories);

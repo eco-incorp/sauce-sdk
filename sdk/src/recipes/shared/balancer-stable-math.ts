@@ -54,6 +54,8 @@
  *   https://github.com/balancer/balancer-v2-monorepo/blob/master/pkg/pool-stable/contracts/ComposableStablePool.sol
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
 
@@ -310,15 +312,17 @@ export const BALANCER_STABLE_SAMPLES = Number(process.env.ECO_BALANCER_SAMPLES ?
  * Geometric-ish cumulative inputs (∝ s^2 — denser near 0 where the stable curve is flattest then
  * bends), each replayed through getDy on the READ state (NO extra RPC — pure bigint, bounded Newton).
  * Each increment becomes a (capacity=Δin, effOut=Δout, marginalOI) segment. The samples are monotone in
- * input so the marginals are naturally descending (a convex out(in)); a non-decreasing marginal
- * (rounding noise near saturation, or past the pool's effective depth) is dropped so the merge stays
- * strictly price-ordered.
+ * input so the marginals are naturally descending (a convex out(in)); a non-descending slice
+ * (rounding noise near saturation, or a non-convex region past the pool's effective depth) is FOLDED
+ * into the last segment (isotonic backward-merge — capacity + effOut conserved, blended marginal
+ * recomputed) so the merge stays monotone price-ordered without discarding liquidity. See
+ * shared/segment-merge.ts.
  *
  * Exact-on-grid: the split equalizes marginals on THIS sampled grid; the per-pool out for the awarded
  * Σ share is re-evaluated wei-exact by one atomic engine Vault.swap(Σ share) at execution. M≈24
  * (default) keeps the grid bound `O(curvature·maxSlice)` negligible near peg. Mirrors
- * `buildCurveSegments` / `buildSolidlyStableSegments` (same squared-index geometric grid + strictly-
- * descending guard).
+ * `buildCurveSegments` / `buildSolidlyStableSegments` (same squared-index geometric grid + isotonic
+ * backward-merge).
  */
 export function buildBalancerStableSegments(
   pool: BalancerStablePool,
@@ -341,11 +345,9 @@ export function buildBalancerStableSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      // Strictly-descending guard — drop a slice whose marginal did not improve on the prior
-      // (rounding noise near saturation) so the merge stays monotone price-ordered.
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice is FOLDED into the
+      // last segment, not dropped, so no liquidity is discarded. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

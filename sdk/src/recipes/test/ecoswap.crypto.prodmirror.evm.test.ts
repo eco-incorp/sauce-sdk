@@ -152,6 +152,14 @@ async function sampleRealSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
+      // NOTE — INTENTIONALLY INDEPENDENT of the production merge. This test does NOT call the shared
+      // buildCryptoSwapSegments (whose off-chain replay diverges from the real twocrypto-NG curve — the
+      // fidelity note in the header). It samples the REAL pool's on-chain get_dy and builds its OWN
+      // ladder, then feeds the SAME ladder to the solver AND uses its Σ as the expectation, so the test
+      // stays self-consistent whatever the ladder policy is. For a deep pool + small trade the real curve
+      // is monotone-descending, so this simple append (== the merge's append branch on a descending
+      // ladder) and the isotonic backward-merge produce the IDENTICAL ladder here. Real-state crypto
+      // MERGE coverage comes from ecoswap.crypto.evm.test.ts (production buildCryptoSwapSegments).
       if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
         segs.push({ capacity: dIn, effOut: dOut, marginalOI });
       }
@@ -386,8 +394,8 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
 
     // NEUTRAL ORACLE over the SAME real-curve samples: the awarded input Σ each venue receives. With ONE
     // venue whose segment ladder covers [0, amountIn], the merge awards the whole covered Σ to it — the
-    // awarded == segSum by construction (no split). (Curve is a SAMPLED-SEGMENT venue; the strictly-
-    // descending guard may drop a final near-saturation slice, so the awarded Σ is the covered capacity.)
+    // awarded == segSum by construction (no split). (Curve is a SAMPLED-SEGMENT venue; on this deep pool +
+    // small trade the real curve is monotone-descending so segSum == amountIn — see sampleRealSegments.)
     const awarded = segSum;
     assert.ok(awarded > 0n, "oracle awards to the reproduced CryptoSwap venue");
 
@@ -429,8 +437,9 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     assert.equal(spent, awarded, "on-chain spent == awarded input (wei-exact-on-grid)");
     // Single-venue full-fill: the ~1%-of-reserve sizing keeps the ladder within [0, amountIn], so the whole
     // trade allocates to the one pool. Assert it EXPLICITLY (a regression that under-fills or splits fails
-    // here, not silently). (segSum can be one near-saturation slice short of amountIn if the descending
-    // guard dropped it — for this deep pool + small trade the ladder is monotone, so segSum == amountIn.)
+    // here, not silently). (For this deep pool + small trade the real-curve ladder is monotone-descending,
+    // so every sampled slice is APPENDED and segSum == amountIn — this test builds its own ladder; see
+    // sampleRealSegments.)
     assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (no unspent wei, no split)");
 
     // The caller-received tokenOut == the REAL pool's OWN pre-swap get_dy view for the awarded Σ, to the

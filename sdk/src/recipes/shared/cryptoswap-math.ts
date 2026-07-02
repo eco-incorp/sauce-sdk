@@ -80,6 +80,8 @@
  * StableSwap / Wombat.
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
 
@@ -327,13 +329,15 @@ export const CRYPTOSWAP_SAMPLES = Number(process.env.ECO_CRYPTOSWAP_SAMPLES ?? 2
  * Geometric-ish cumulative inputs (∝ s^2 — denser near 0 where the curve bends most), each replayed
  * through getDyCrypto on the READ state (NO extra RPC — pure bounded-Newton bigint). Each increment
  * becomes a (capacity=Δin, effOut=Δout, marginalOI) segment. The samples are monotone in input so
- * the marginals are naturally descending (a convex out(in)); a non-decreasing marginal (rounding
- * noise near saturation) is dropped so the merge stays strictly price-ordered.
+ * the marginals are naturally descending (a convex out(in)); a non-descending slice (rounding noise
+ * near saturation, or a non-convex region past an imbalance boundary) is FOLDED into the last segment
+ * (isotonic backward-merge — capacity + effOut conserved, blended marginal recomputed) so the merge
+ * stays monotone price-ordered without discarding liquidity. See shared/segment-merge.ts.
  *
  * Exact-on-grid: the split equalizes marginals on THIS sampled grid; the per-pool dy for the awarded
  * Σ share is re-evaluated wei-exact by one atomic on-chain get_dy(Σ share) at execution. Mirrors
- * `buildCurveSegments` / `buildWombatSegments` (same squared-index geometric grid + strictly-
- * descending guard).
+ * `buildCurveSegments` / `buildWombatSegments` (same squared-index geometric grid + isotonic
+ * backward-merge).
  */
 export function buildCryptoSwapSegments(
   pool: CryptoSwapPool,
@@ -355,12 +359,10 @@ export function buildCryptoSwapSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      if (
-        marginalOI > 0n &&
-        (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)
-      ) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice (CryptoSwap near an
+      // imbalance boundary can price a deeper region better than the last band) is FOLDED into the
+      // last segment, not dropped, so the past-boundary liquidity survives. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

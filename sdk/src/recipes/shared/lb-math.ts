@@ -49,6 +49,8 @@
  * coordinate both sides share.
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / curve-math Q192). */
 export const Q192 = 1n << 192n;
 
@@ -249,7 +251,6 @@ export function buildLbSegments(pool: LbPool, amountIn: bigint): LbSegment[] {
     : ids.filter((id) => id >= pool.activeId).sort((a, b) => a - b); // INC
 
   let cum = 0n;
-  let prevMarg = 0n;
   for (const id of walk) {
     if (cum >= amountIn) break;
     const bin = byId.get(id)!;
@@ -267,12 +268,13 @@ export function buildLbSegments(pool: LbPool, amountIn: bigint): LbSegment[] {
     const marginalOI = isqrt((outReserve * Q192) / grossIn);
     if (marginalOI <= 0n) continue;
 
-    // Strictly-descending guard (rounding noise) — keep the merge monotone price-ordered.
-    if (segs.length === 0 || marginalOI <= prevMarg) {
-      segs.push({ capacity: grossIn, effOut: outReserve, marginalOI });
-      prevMarg = marginalOI;
-      cum += grossIn;
-    }
+    // Isotonic backward-merge (liquidity-preserving) — an LB bin whose marginal is NOT <= the last
+    // segment's (a discrete deeper bin priced better than the current band) is FOLDED into the last
+    // segment, not dropped, so the past-cliff bin liquidity survives into the split. `cum` tracks the
+    // total gross input over ALL kept bins (appended or merged) so the outward walk still stops once
+    // it covers amountIn. See shared/segment-merge.ts.
+    pushMonotoneSegment(segs, grossIn, outReserve, marginalOI);
+    cum += grossIn;
   }
   return segs;
 }

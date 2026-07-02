@@ -103,6 +103,23 @@ import {
   buildCryptoSwapSegments,
   type CryptoSwapPool,
 } from "../shared/cryptoswap-math";
+import {
+  buildLbSegments,
+  getSwapOut as lbGetSwapOut,
+  getPriceFromId as lbGetPriceFromId,
+  lbGrossToDrain,
+  baseFee as lbBaseFee,
+  isqrt as lbIsqrt,
+  Q192 as LB_Q192,
+  LB_REAL_ID_SHIFT,
+  type LbPool,
+} from "../shared/lb-math";
+import {
+  buildDodoSegments,
+  getDy as dodoGetDy,
+  type DodoPool,
+} from "../shared/dodo-math";
+import { pushMonotoneSegment, isqrt as mergeIsqrt, Q192 as MERGE_Q192 } from "../shared/segment-merge";
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -2529,5 +2546,289 @@ describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampl
 
     // The vestige removal STRICTLY increases the fill: full-range fills past tick 0, the old cap could not.
     assert.ok(fullOut > cappedOut, "full-range fill > old tickLimit=0 cap (the case the cap hid)");
+  });
+});
+
+// ── FORCED-CLIFF regression: isotonic backward-MERGE replaces the descending-marginal DROP ──────────
+//
+// THE LEFTOVER this pins: on a DISCRETE / non-convex source (LB bins, a DODO R-state boundary, Maverick
+// bins) a sampled slice can price a DEEPER region BETTER than the last band (its fee-adjusted marginal
+// RISES). The OLD strictly-descending guard DROPPED such a slice — and, because it also stopped tracking
+// the ladder tail, silently discarded ALL the liquidity behind it — so the split UNDER-filled the pool
+// even though the engine fills through the region. The MERGE folds the violating slice into the last
+// segment (conserving capacity + effOut), so the past-cliff liquidity survives into the split.
+//
+// The shared helper `pushMonotoneSegment` (shared/segment-merge.ts) is the single source every
+// buildXSegments uses — prepare.ts, the neutral oracle (ecoswap.optimal.ts) and the cursor-faithful
+// reference (ecoswap.solver-reference.ts) all consume the SAME ladder, so `solver == oracle to the wei`
+// holds by construction (the 428 fast wei-exact vectors above pass unchanged). These cells assert the
+// TWO regression properties directly on the builders: (1) the merged ladder is monotone-descending AND
+// conserves total capacity/effOut (== the pool's own quote of the covered input — wei-exact), and (2) it
+// covers STRICTLY MORE than the OLD drop-guard would (replayed in-test) on a real depth cliff.
+describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE replaces the DROP", () => {
+  const E18 = 10n ** 18n;
+
+  // Replay of the OLD strictly-descending DROP guard on a per-slice basis (the code these cells replace),
+  // driven by the SAME raw (capacity, effOut, marginalOI) slices the merge sees. Returns the kept segments.
+  function oldDropLadder(raw: { capacity: bigint; effOut: bigint; marginalOI: bigint }[]) {
+    const segs: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+    for (const s of raw) {
+      if (s.marginalOI > 0n && (segs.length === 0 || s.marginalOI <= segs[segs.length - 1].marginalOI)) {
+        segs.push({ capacity: s.capacity, effOut: s.effOut, marginalOI: s.marginalOI });
+      }
+    }
+    return segs;
+  }
+
+  function sumCap(segs: { capacity: bigint }[]): bigint {
+    return segs.reduce((a, s) => a + s.capacity, 0n);
+  }
+  function sumEff(segs: { effOut: bigint }[]): bigint {
+    return segs.reduce((a, s) => a + s.effOut, 0n);
+  }
+  function assertMonotone(segs: { marginalOI: bigint }[], label: string) {
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, `${label}: marginals descending at ${i}`);
+    }
+  }
+
+  // ── The shared helper's own invariants (pool-adjacent-violators cascade) ──
+  describe("pushMonotoneSegment — conserves capacity/effOut, cascades backward to monotone", () => {
+    it("folds a violating slice AND cascades so the whole ladder is monotone (capacity + effOut conserved)", () => {
+      // A cliff ladder: descending (100,90,80), a JUMP UP (120 — violation), then descending (70,60).
+      // The 120 slice must fold backward far enough that the merged tail prices <= the segment before it.
+      // Build each slice from (capacity, effOut) and DERIVE the marginal via the builders' own formula so
+      // the synthetic data is self-consistent (an appended segment keeps the passed marginal, a folded one
+      // recomputes — both must equal isqrt(effOut·Q192/capacity)).
+      const scale = MERGE_Q192 / 200n;
+      const targetMargs = [100n, 90n, 80n, 120n, 70n, 60n].map((x) => x * scale);
+      const caps = [10n, 10n, 10n, 10n, 10n, 10n].map((x) => x * E18);
+      const slices = caps.map((cap, i) => {
+        const effOut = (cap * targetMargs[i] * targetMargs[i]) / MERGE_Q192;
+        return { cap, effOut, marginalOI: mergeIsqrt((effOut * MERGE_Q192) / cap) };
+      });
+
+      const segs: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+      let totalCap = 0n;
+      let totalEff = 0n;
+      for (const s of slices) {
+        totalCap += s.cap;
+        totalEff += s.effOut;
+        pushMonotoneSegment(segs, s.cap, s.effOut, s.marginalOI);
+      }
+      assert.ok(segs.length < slices.length, "at least one fold happened (fewer segments than raw slices)");
+      assertMonotone(segs, "cascade");
+      assert.equal(sumCap(segs), totalCap, "capacity conserved — NO liquidity discarded");
+      assert.equal(sumEff(segs), totalEff, "effOut conserved — NO liquidity discarded");
+      // Every stored segment's marginal == isqrt(effOut·Q192/capacity) (the builders' formula — an
+      // appended segment kept its self-consistent passed value, a merged one recomputed the blend).
+      for (const s of segs) {
+        assert.equal(s.marginalOI, mergeIsqrt((s.effOut * MERGE_Q192) / s.capacity), "blended marginal formula");
+      }
+    });
+
+    it("degenerate slice (marginalOI == 0) is a no-op — nothing discarded, nothing folded", () => {
+      const segs: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+      pushMonotoneSegment(segs, 5n * E18, 3n * E18, MERGE_Q192 / 2n);
+      const before = segs.length;
+      pushMonotoneSegment(segs, 1n * E18, 0n, 0n); // marginalOI 0 → skipped
+      assert.equal(segs.length, before, "zero-marginal slice skipped (matches the old guard's >0 gate)");
+    });
+
+    it("already-descending slices are APPENDED unchanged (bit-for-bit the old guard's common path)", () => {
+      const scale = MERGE_Q192 / 200n;
+      const segs: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+      for (const m of [90n, 80n, 70n].map((x) => x * scale)) {
+        pushMonotoneSegment(segs, 10n * E18, (10n * E18 * m * m) / MERGE_Q192, m);
+      }
+      assert.equal(segs.length, 3, "no fold on a descending ladder — appended unchanged");
+      assertMonotone(segs, "descending");
+    });
+  });
+
+  // ── LB: a tiny-reserve bin (round-up distortion) between deep bins forces a fold ──
+  //
+  // LB enumerates ONE segment per bin. A near-empty bin's ROUND-UP gross-to-drain distorts its
+  // fee-adjusted marginal UPWARD (better-priced than the deeper bins around it), so the old guard
+  // DROPPED it AND every deep bin behind it — discarding almost all the pool's liquidity. The merge
+  // folds the distorted bin and keeps the deep bins.
+  it("LB — tiny-reserve bin cliff: merge fills the deep bins the drop discarded (Σeff == getSwapOut, wei-exact)", () => {
+    const ACTIVE = Number(LB_REAL_ID_SHIFT); // id 2^23 == price 1.0
+    const pool: LbPool = {
+      poolType: 6,
+      address: ("0x" + "22".repeat(20)) as `0x${string}`,
+      binStep: 20,
+      baseFactor: 5000,
+      activeId: ACTIVE,
+      swapForY: true, // in = X, out = Y (bins id <= active, DEC)
+      bins: [
+        { id: ACTIVE, reserveX: 0n, reserveY: 1_000_000n },
+        { id: ACTIVE - 1, reserveX: 0n, reserveY: 3n }, // tiny — round-up distorts its marginal UP
+        { id: ACTIVE - 2, reserveX: 0n, reserveY: 2_000_000n },
+        { id: ACTIVE - 3, reserveX: 0n, reserveY: 5_000_000n },
+      ],
+      source: "cliff",
+    };
+    const amountIn = 100_000_000n;
+
+    // The merged ladder (the SHARED builder — the exact ladder prepare + oracle + reference consume).
+    const merged = buildLbSegments(pool, amountIn);
+    assertMonotone(merged, "LB merged");
+    const mCap = sumCap(merged);
+    const mEff = sumEff(merged);
+    // Conservation / wei-exact: Σ merged effOut == the pool's own getSwapOut of the covered input.
+    assert.equal(mEff, lbGetSwapOut(pool, mCap), "LB Σ merged effOut == getSwapOut(Σcap) — wei-exact");
+
+    // Reconstruct the RAW per-bin slices the builder saw, and replay the OLD drop guard on them.
+    const fee = lbBaseFee(pool.binStep, pool.baseFactor);
+    const walk = pool.bins.map((b) => b.id).filter((id) => id <= pool.activeId).sort((a, b) => b - a);
+    const byId = new Map(pool.bins.map((b) => [b.id, b]));
+    const raw: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+    for (const id of walk) {
+      const bin = byId.get(id)!;
+      const price128 = lbGetPriceFromId(id, pool.binStep);
+      const outReserve = bin.reserveY;
+      if (outReserve <= 0n || price128 <= 0n) continue;
+      const grossIn = lbGrossToDrain(outReserve, price128, true, fee);
+      if (grossIn <= 0n) continue;
+      const m = lbIsqrt((outReserve * LB_Q192) / grossIn);
+      if (m <= 0n) continue;
+      raw.push({ capacity: grossIn, effOut: outReserve, marginalOI: m });
+    }
+    const dropped = oldDropLadder(raw);
+    // The regression guard: the old drop discards the deep bins behind the distorted tiny bin.
+    assert.ok(mCap > sumCap(dropped), "LB: merge covers STRICTLY MORE input than the old drop-guard");
+    assert.ok(mEff > sumEff(dropped), "LB: merge fills STRICTLY MORE output than the old drop-guard");
+    // The dropped ladder lost the vast majority of the pool's ~8M out reserve to the tiny-bin cliff.
+    assert.ok(sumEff(dropped) * 4n < mEff, "LB: the old drop discarded most of the pool's liquidity");
+  });
+
+  // ── DODO: selling base across the ABOVE_ONE → R==ONE boundary improves the marginal → a fold ──
+  //
+  // A DODO pool in the ABOVE_ONE R-state uses a TWO-PART integral once the trade crosses back to
+  // R==ONE. Across that boundary a sampled slice's average marginal can RISE, tripping the old guard —
+  // which then dropped that slice and every deeper slice, under-filling the PMM curve.
+  it("DODO — R-state boundary cliff: merge fills through it (Σeff == getDy, wei-exact) vs the drop", () => {
+    const pool: DodoPool = {
+      poolType: 5,
+      address: ("0x" + "33".repeat(20)) as `0x${string}`,
+      baseToken: ("0x" + "aa".repeat(20)) as `0x${string}`,
+      quoteToken: ("0x" + "bb".repeat(20)) as `0x${string}`,
+      sellBase: true,
+      i: E18,
+      K: E18 / 2n,
+      B: 400_000n * E18,
+      Q: 600_000n * E18,
+      B0: 500_000n * E18,
+      Q0: 500_000n * E18,
+      R: 1, // ABOVE_ONE (RState.ABOVE_ONE) — numeric literal (const enum not importable as a value)
+      lpFeeRate: E18 / 1000n,
+      mtFeeRate: 0n,
+      feePpm: 1000,
+      source: "cliff",
+    };
+    const amountIn = 500_000n * E18; // crosses R==ONE at backToOnePayBase = B0 - B = 100k
+
+    const merged = buildDodoSegments(pool, amountIn);
+    assertMonotone(merged, "DODO merged");
+    const mCap = sumCap(merged);
+    assert.equal(sumEff(merged), dodoGetDy(pool, mCap), "DODO Σ merged effOut == getDy(Σcap) — wei-exact");
+
+    // Replay the raw sampled slices (the builder's squared-index geometric grid) + old drop guard.
+    const M = 24n;
+    const raw: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+    let prevIn = 0n;
+    let prevOut = 0n;
+    for (let s = 1; s <= 24; s++) {
+      const ss = BigInt(s);
+      const input = (amountIn * ss * ss) / (M * M);
+      if (input <= prevIn) continue;
+      const out = dodoGetDy(pool, input);
+      if (out <= 0n) continue;
+      const dIn = input - prevIn;
+      const dOut = out - prevOut;
+      if (dIn > 0n && dOut > 0n) {
+        const m = mergeIsqrt((dOut * MERGE_Q192) / dIn);
+        if (m > 0n) raw.push({ capacity: dIn, effOut: dOut, marginalOI: m });
+      }
+      prevIn = input;
+      prevOut = out;
+    }
+    const dropped = oldDropLadder(raw);
+    assert.ok(mCap > sumCap(dropped), "DODO: merge covers STRICTLY MORE input than the old drop-guard");
+    assert.ok(sumEff(merged) > sumEff(dropped), "DODO: merge fills STRICTLY MORE output than the old drop-guard");
+  });
+
+  // ── Maverick: shallow head ticks then a DEEP tick — one sampled slice straddles the cliff, rising ──
+  //
+  // A Maverick book with near-empty active + next ticks and a huge deep tick just past them: the FIRST
+  // sampled slice drains the shallow head at a poor marginal, and the next slice — reaching the deep
+  // tick — has a MUCH better average marginal (a violation). The old guard kept only the tiny head
+  // slice and discarded the deep tick's millions in liquidity; the merge folds and keeps it.
+  it("Maverick — shallow-then-deep cliff: merge keeps the deep tick the drop discarded (Σeff == getDy)", () => {
+    const TS = 1;
+    const AT = 0;
+    const Z = ("0x" + "11".repeat(20)) as `0x${string}`;
+    const reserves: Record<number, bigint> = {
+      [0]: 1n * E18,
+      [1]: 1n * E18,
+      [2]: 10_000_000n * E18, // the deep tick past the shallow head
+    };
+    const ticks: MaverickTick[] = Object.entries(reserves).map(([t, r]) => ({
+      tick: Number(t),
+      reserveA: r,
+      reserveB: r,
+    }));
+    const { sqrtLowerPrice, sqrtUpperPrice } = maverickTickSqrtPrices(TS, AT);
+    const active = ticks.find((t) => t.tick === AT)!;
+    const activeL = maverickGetTickL(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+    const poolSqrtPrice = maverickGetSqrtPrice(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice, activeL);
+    const pool: MaverickPool = {
+      poolType: 7,
+      address: Z,
+      tokenAIn: true,
+      activeTick: AT,
+      poolSqrtPrice,
+      tickSpacing: TS,
+      fee: E18 / 1000n,
+      protocolFeeD3: 0n,
+      ticks,
+      feePpm: 1000,
+      source: "cliff",
+    };
+    const amountIn = 100_000n * E18;
+
+    const merged = buildMaverickSegments(pool, amountIn);
+    assertMonotone(merged, "Maverick merged");
+    const mCap = sumCap(merged);
+    assert.equal(sumEff(merged), maverickGetDy(pool, mCap), "Maverick Σ merged effOut == getDy(Σcap) — wei-exact");
+
+    // Raw slices + old drop guard (same squared-index grid the sampler uses, capped at consumable depth).
+    const consumable = maverickSimulate(pool, amountIn).amountIn;
+    const cap = consumable > 0n && consumable < amountIn ? consumable : amountIn;
+    const M = 24n;
+    const raw: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+    let prevIn = 0n;
+    let prevOut = 0n;
+    for (let s = 1; s <= 24; s++) {
+      const ss = BigInt(s);
+      const input = (cap * ss * ss) / (M * M);
+      if (input <= prevIn) continue;
+      const out = maverickGetDy(pool, input);
+      if (out <= 0n) continue;
+      const dIn = input - prevIn;
+      const dOut = out - prevOut;
+      if (dIn > 0n && dOut > 0n) {
+        const m = mergeIsqrt((dOut * MERGE_Q192) / dIn);
+        if (m > 0n) raw.push({ capacity: dIn, effOut: dOut, marginalOI: m });
+      }
+      prevIn = input;
+      prevOut = out;
+    }
+    const dropped = oldDropLadder(raw);
+    assert.ok(mCap > sumCap(dropped), "Maverick: merge covers STRICTLY MORE input than the old drop-guard");
+    assert.ok(sumEff(merged) > sumEff(dropped), "Maverick: merge fills STRICTLY MORE output than the old drop-guard");
+    // The old drop kept only the tiny head slice; the deep tick's millions were discarded.
+    assert.ok(sumCap(dropped) * 100n < mCap, "Maverick: the old drop discarded the deep-tick liquidity");
   });
 });

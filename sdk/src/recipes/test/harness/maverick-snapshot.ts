@@ -19,13 +19,12 @@
  * (USDT + USDC are both BSC baseTokens), but SHALLOW — Maverick's deep liquidity is in its volatile
  * WETH / BTC pairs, not the near-abandoned stable pairs (the same story as DODO's stable venues).
  *
- * ENGINE tickLimit=0 GATE (the known one-line engine cap). The engine `_swapMaverickV2` hardcodes
- * `tickLimit: 0`: a tokenA-in swap walks tick UP (must have activeTick <= 0), a tokenB-in swap walks
- * tick DOWN (must have activeTick >= 0). This pool's tokenA is USDT, tokenB is USDC, activeTick = +7, so
- * ONLY the tokenB-in direction (USDC -> USDT, walking DOWN toward tick 0) is engine-executable — the
- * tokenA-in (USDT -> USDC) direction reverts PoolCurrentTickBeyondSwapLimit. Discovery already gates the
- * pool to the tokenB-in direction (see discoverMaverickV2PoolsTyped). The prod-mirror test sizes the
- * trade within the tick 7 -> 0 reachable range (the ticks holding output tokenA/USDT reserves).
+ * ENGINE tickLimit (../sauce PR #193 — the OLD tickLimit=0 gate is gone). The FIXED engine
+ * `_swapMaverickV2` passes a per-direction FULL-RANGE tickLimit (type(int32).max for tokenA-in,
+ * type(int32).min for tokenB-in), so a swap walks the WHOLE live tick book bounded only by liquidity, in
+ * EITHER direction — there is no active-tick side gate anymore. This pool's tokenA is USDT, tokenB is
+ * USDC, activeTick = +7; this prod-mirror exercises the tokenB-in direction (USDC -> USDT), sizing the
+ * trade within the pool's available output (tokenA/USDT) reserve.
  *
  * DEPENDENCY CONTRACTS captured (every contract the swap / quote path touches):
  *   1. the pool runtime at the captured BSC address (self-contained — NOT a proxy),
@@ -263,7 +262,8 @@ async function main() {
         `tokenB-in engine-executable=${c.tokenBInExecutable}`,
     );
   }
-  // Pick the deepest pool that is engine-executable in the tokenB-in direction (the tickLimit=0 gate).
+  // Pick the deepest pool this fixture exercises in the tokenB-in direction (both directions are now
+  // engine-executable under the full-range tickLimit — ../sauce PR #193; the fixture drives tokenB-in).
   const top = candidates.find((c) => c.tokenBInExecutable) ?? candidates[0];
   const pool = top.pool;
   console.log(
@@ -459,7 +459,8 @@ async function main() {
     feeBIn: feeBIn.toString(),
     protocolFeeRatioD3: Number(state.protocolFeeRatioD3),
     engineTickLimit: ENGINE_TICK_LIMIT,
-    // The engine-executable direction under tickLimit=0 (tokenB-in walks DOWN, activeTick >= 0).
+    // The direction this fixture exercises (tokenB-in walks DOWN from activeTick). Both directions are
+    // engine-executable under the full-range tickLimit (../sauce PR #193).
     engineExecutableDirection: `${symB}->${symA} (tokenB-in)`,
     engineTokenAIn: false,
     state: {
@@ -497,7 +498,7 @@ async function main() {
       `  activeTick=${activeTick} reserveA=${state.reserveA} reserveB=${state.reserveB} protocolFeeD3=${Number(state.protocolFeeRatioD3)}\n` +
       `  feeAIn=${feeAIn} feeBIn=${feeBIn} binCounter=${Number(state.binCounter)}\n` +
       `  captured ${decodedTicks.length} live ticks in [${tickLo}, ${tickHi}], ${decodedBins.length} bins, ${Object.keys(storage).length} raw slots\n` +
-      `  engine-executable: ${symB}->${symA} (tokenB-in), tickLimit=0\n` +
+      `  fixture direction: ${symB}->${symA} (tokenB-in), full-range tickLimit\n` +
       probes
         .map((p) => `  probe calculateSwap(${p.amountIn} ${symB}) -> in=${p.amountInUsed} out=${p.amountOut} gas=${p.gasEstimate}`)
         .join("\n"),

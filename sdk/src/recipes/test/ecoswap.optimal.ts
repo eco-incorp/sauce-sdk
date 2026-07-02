@@ -189,7 +189,8 @@ export interface OptimalPool {
    * Maverick V2 (bin-based directional AMM) pool — when present this pool is a MAVERICK venue (NOT
    * V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer/Euler). The oracle enumerates its segments via the
    * SHARED bin swap-math replay (buildMaverickSegments) from the live tick book + directional fee +
-   * the engine tickLimit=0, so the split is exact-on-grid vs prepare's segments (one replay). The
+   * the engine's per-direction FULL-RANGE tickLimit (type(int32).max/min — ../sauce PR #193), so the
+   * split is exact-on-grid vs prepare's segments (one replay). The
    * marginal is post-fee (getDy nets the directional fee), so it enters the descending-price merge
    * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/`balancer`/`eulerSwap` are ignored
    * when `maverick` is set.
@@ -612,7 +613,8 @@ function eulerSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): S
 
 /**
  * Enumerate one Maverick V2 (bin-based directional AMM) pool's segments via the SHARED bin swap-math
- * replay (buildMaverickSegments) from the live tick book + directional fee + the engine tickLimit=0
+ * replay (buildMaverickSegments) from the live tick book + directional fee + the engine's per-direction
+ * FULL-RANGE tickLimit (type(int32).max/min — ../sauce PR #193, i.e. the pool's available liquidity)
  * depth cap. The amountIn caps the sampled range — the same bound prepare samples — so the oracle and
  * prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid. The Maverick
  * marginalOI is the post-fee execution price (getDy nets the directional fee); adjNear == adjFar ==
@@ -944,8 +946,8 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       allSegs.push(...cryptoSwapSegments(p, i, amountIn));
     } else if (p.maverick) {
       // Maverick V2 (bin-based directional AMM) venue: sampled-segment enumeration via the shared bin
-      // swap-math replay (capped at amountIn / the engine tickLimit=0 depth — the same bound prepare
-      // samples → identical grid → exact-on-grid split).
+      // swap-math replay (capped at amountIn / the engine's per-direction FULL-RANGE tickLimit depth,
+      // type(int32).max/min — the same bound prepare samples → identical grid → exact-on-grid split).
       allSegs.push(...maverickSegments(p, i, amountIn));
     } else if (p.eulerSwap) {
       // EulerSwap (Euler vault-backed AMM, v1+v2) venue: sampled-segment enumeration via the shared

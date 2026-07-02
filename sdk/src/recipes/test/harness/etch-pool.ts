@@ -2315,8 +2315,9 @@ export const curveCryptoRegistryShimAbi = parseAbi([
 //     (storage-backed) tokens while its immutable tokenA()/tokenB() still name the real addresses.
 //
 // Maverick is a CALLBACK pool: the engine `_swapMaverickV2` (SwapPoolType 7) reads the pool's tokenA(),
-// sets tokenAIn, calls pool.swap(recipient, SwapParams{amount, tokenAIn, exactOutput:false, tickLimit:0},
-// "") and the pool RE-ENTERS the engine's `maverickV2SwapCallback` to PULL the input mid-swap. The real
+// sets tokenAIn, calls pool.swap(recipient, SwapParams{amount, tokenAIn, exactOutput:false, tickLimit:
+// per-direction full-range}, "") and the pool RE-ENTERS the engine's `maverickV2SwapCallback` to PULL the
+// input mid-swap. The real
 // Maverick V2 Pool.swap does NOT check the factory/CREATE2 during the swap (it trusts msg.sender — the
 // engine — to pay via the callback), so a non-canonical locally-etched pool is accepted exactly like the
 // V3/V4 local-pool cases. The FACTORY is needed ONLY for discovery: FactoryType.MaverickV2Factory reads
@@ -2324,10 +2325,11 @@ export const curveCryptoRegistryShimAbi = parseAbi([
 // factory address returning [pool] for the pair; the pool's own factory() immutable is irrelevant to the
 // swap. NO factory graph rebuild.
 //
-// ENGINE tickLimit=0 GATE (documented in maverick-math.ts): the engine hardcodes tickLimit:0, so only the
-// tokenB-in direction (USDC→USDT, activeTick=+7 walking DOWN toward 0) is executable for this pool;
-// discovery gates it to tokenB-in. The captured quoter probes (100/1000/5000 USDC) all FULLY consume
-// within the tick-7→0 reachable payout window (~8963 USDT of output reserve), so the trade lands exactly.
+// ENGINE tickLimit (documented in maverick-math.ts): the FIXED engine (../sauce PR #193) passes a
+// per-direction FULL-RANGE tickLimit (type(int32).max/min), so BOTH directions are executable across the
+// whole live tick book (the OLD tickLimit=0 gate + its tokenB-in-only discovery gate are gone). This
+// fixture's captured quoter probes (100/1000/5000 USDC, tokenB-in USDC→USDT) FULLY consume within the
+// pool's available payout reserve, so the trade lands exactly.
 // ══════════════════════════════════════════════════════════════════════════════
 
 /** Maverick bytecode snapshot: the self-contained pool runtime + dependency runtimes (the quoter). */

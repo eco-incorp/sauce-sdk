@@ -54,16 +54,17 @@
  *     executes. These are boolean/limit GATING, NOT pricing — the RELEASED amount is still the REAL
  *     BiPoolManager quote to the wei (this test proves it: received == the captured mainnet probe).
  *
- * PARTIAL FILL (DISCLOSED — a real property of this deep near-1:1 bucket, NOT a bug): the REAL cUSD/USDC
- * ConstantSum exchange's post-spread marginal is NEAR-FLAT and slightly RISING with size at this scale (the
- * ~$12M buckets barely move), so the SHARED buildMentoSegments strict-descending guard keeps only the FIRST
- * sampled slice (the best-priced) and drops the ~non-descending rest — the split awards just that slice and
- * stops. This is the CORRECT water-fill behavior for a venue whose marginal does not descend: the oracle and
- * the on-chain solver award the IDENTICAL amount off the IDENTICAL grid. So the wei-exact gate is
- * spent == awarded == oracle.totalInput (asserted to the wei), and the awarded amount is the first ladder
- * point (≈173.6 cUSD), a strict PARTIAL of the 100k amountIn — disclosed + asserted exactly (not full-fill).
- * The received tokenOut is still the REAL Broker's LIVE getAmountOut(awarded) to the wei == the captured
- * mainnet ladder value for that exact size.
+ * FULL FILL via the isotonic backward-MERGE (liquidity-preserving): the REAL cUSD/USDC ConstantSum
+ * exchange's post-spread marginal is NEAR-FLAT and slightly RISING with size at this scale (the ~$12M
+ * buckets barely move). The SHARED buildMentoSegments now MERGES (not drops) the non-descending slices —
+ * a slice whose marginal does not fall is FOLDED into the last segment (capacity + effOut conserved) via
+ * shared/segment-merge.ts, so the near-flat tail is PRESERVED rather than discarded. The result is a
+ * monotone-descending ladder that spans the WHOLE amountIn, so the split awards the FULL 100k (a complete
+ * fill), not the old first-slice partial. (Under the OLD strictly-descending DROP guard this venue awarded
+ * only the first ~173.6 cUSD sample point and discarded the rest — the exact UNDER-fill this merge fixes.)
+ * The wei-exact gate is unchanged: spent == awarded == oracle.totalInput (asserted to the wei), off the
+ * IDENTICAL grid the on-chain solver consumes. The received tokenOut is still the REAL Broker's LIVE
+ * getAmountOut(awarded) to the wei.
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the artifacts are
  * absent). No state cache — etch+setStorage is a few seconds.
@@ -367,27 +368,30 @@ describe("EcoSwap Mento V2 (Celo Broker + BiPoolManager) prod-mirror — REAL by
     assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
     assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
 
-    // PARTIAL FILL (DISCLOSED — see the header): the REAL cUSD/USDC ConstantSum marginal is near-flat/slightly
-    // rising at this scale, so buildMentoSegments keeps only the FIRST slice and the split awards just it — a
-    // strict PARTIAL of amountIn. Assert the awarded == the first ladder sample point to the WEI (the exact
-    // amount the strict-descending water-fill lands on this real venue), and that it IS a partial (< amountIn).
+    // FULL FILL via the isotonic backward-MERGE (see the header): the REAL cUSD/USDC ConstantSum marginal is
+    // near-flat/slightly rising at this scale, so buildMentoSegments now FOLDS the non-descending slices into
+    // a monotone ladder spanning the whole amountIn (rather than dropping them). The split therefore awards
+    // the FULL amountIn — a complete fill, and STRICTLY MORE than the first ladder sample the OLD drop-guard
+    // stopped at (the regression this merge fixes, asserted directly below).
     const firstLadderIn = BigInt(snaps.state.ladder.cumIn[0]);
-    assert.equal(spent, firstLadderIn, "spent == the first sampled ladder slice (the only strictly-descending segment on this near-flat real venue)");
-    assert.ok(spent < amountIn, "PARTIAL fill: the near-flat real marginal awards only the best slice, not the full amountIn (disclosed)");
+    assert.equal(spent, amountIn, "FULL fill: the merge preserves the near-flat tail, awarding the whole amountIn");
+    assert.ok(spent > firstLadderIn, "merge fills STRICTLY MORE than the old drop-guard's first-slice partial");
 
-    // The caller-received tokenOut == the REAL Broker's OWN LIVE getAmountOut(spent) view, to the WEI. Because
-    // the block clock is PINNED (no bucket refresh), the snapshot ladder the split priced == the live view at
-    // exec, so this is BOTH exact-on-grid AND exact-in-dy (the strongest Mento cross-check).
+    // The caller-received tokenOut == the REAL Broker's OWN LIVE getAmountOut(awarded Σ) view, to the WEI.
+    // Because the block clock is PINNED (no bucket refresh), the snapshot ladder the split priced == the live
+    // view at exec, so this is BOTH exact-on-grid AND exact-in-dy (the strongest Mento cross-check). onViewAwarded
+    // is getAmountOut(awarded) for the FULL awarded Σ (== the captured mainnet quote for that exact size, since
+    // the awarded 100k is a captured ladder point — the top of the sampled grid).
     assert.equal(received, onViewAwarded, "received == REAL Broker LIVE getAmountOut(awarded Σ) (exact-in-dy)");
-    // And it equals the CAPTURED mainnet ladder value for this exact awarded size — a direct tie to the real
-    // chain value, not just an internally-consistent replay.
-    const capturedForAwarded = BigInt(snaps.state.ladder.cumOut[0]);
+    // And it equals the CAPTURED mainnet ladder value for this exact awarded size (the FULL amountIn == the last
+    // sampled ladder point) — a direct tie to the real chain value, not just an internally-consistent replay.
+    const capturedForAwarded = BigInt(snaps.state.ladder.cumOut[snaps.state.ladder.cumOut.length - 1]);
     assert.equal(received, capturedForAwarded, "received == the CAPTURED mainnet getAmountOut(awarded) value to the wei");
 
     const ms = Date.now() - t0;
     console.log(
       `  [mento-prod-mirror:${engine}] WEI-EXACT vs neutral oracle — spent=${spent} received=${received} ` +
-        `(oracle awarded=${awarded}, liveView=${onViewAwarded}, capturedForAwarded=${capturedForAwarded}, amountIn=${amountIn}, PARTIAL near-flat marginal); ` +
+        `(oracle awarded=${awarded}, liveView=${onViewAwarded}, capturedForAwarded=${capturedForAwarded}, amountIn=${amountIn}, FULL fill via merge); ` +
         `wall-clock ${ms} ms (no fork, no RPC)`,
     );
   }

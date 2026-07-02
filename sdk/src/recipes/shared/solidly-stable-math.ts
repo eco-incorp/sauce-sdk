@@ -48,6 +48,8 @@
  *   https://github.com/aerodrome-finance/contracts (sAMM Pool.sol — identical math)
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / dodo-math / ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
 
@@ -203,14 +205,16 @@ export const SOLIDLY_STABLE_SAMPLES = Number(process.env.ECO_SOLIDLY_SAMPLES ?? 
  * bends), each replayed through getAmountOutStable on the READ state (NO extra RPC — pure bigint,
  * bounded Newton). Each increment becomes a (capacity=Δin, effOut=Δout, marginalOI) segment. The
  * samples are monotone in input so the marginals are naturally descending (a convex out(in)); a
- * non-decreasing marginal (rounding noise near saturation, or past the pool's effective depth) is
- * dropped so the merge stays strictly price-ordered.
+ * non-descending slice (rounding noise near saturation, or a non-convex region past the pool's
+ * effective depth) is FOLDED into the last segment (isotonic backward-merge — capacity + effOut
+ * conserved, blended marginal recomputed) so the merge stays monotone price-ordered without discarding
+ * liquidity. See shared/segment-merge.ts.
  *
  * Exact-on-grid: the split equalizes marginals on THIS sampled grid; the per-pool out for the awarded
  * Σ share is re-evaluated wei-exact by one atomic on-chain getAmountOut(Σ share) at execution. M≈24
  * (default) keeps the grid bound `O(curvature·maxSlice)` negligible near peg. Mirrors
- * `buildCurveSegments` / `buildDodoSegments` (same squared-index geometric grid + strictly-descending
- * guard).
+ * `buildCurveSegments` / `buildDodoSegments` (same squared-index geometric grid + isotonic
+ * backward-merge).
  */
 export function buildSolidlyStableSegments(
   pool: SolidlyStablePool,
@@ -233,11 +237,9 @@ export function buildSolidlyStableSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      // Strictly-descending guard — drop a slice whose marginal did not improve on the prior
-      // (rounding noise near saturation) so the merge stays monotone price-ordered.
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice is FOLDED into the
+      // last segment, not dropped, so no liquidity is discarded. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

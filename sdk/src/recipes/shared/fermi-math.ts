@@ -41,6 +41,8 @@
  *   FermiSwapper 0xb1076fe3ab5e28005c7c323bac5ac06a680d452e (Etherscan verified)
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
 
@@ -169,8 +171,10 @@ export interface FermiSegment {
  * descending-marginal (capacity=Δin, effOut=Δout, marginalOI) slices. NO RPC (the ladder was sampled at
  * discovery) — a pure function over the descriptor, so prepare and the oracle produce identical segments
  * from the same ladder. `amountIn` caps the range (the ladder is already sampled over [0, amountIn]). A
- * non-decreasing marginal (rounding noise, or past where the curve collapses) is dropped so the merge stays
- * strictly price-ordered. Mirrors `buildWooFiSegments` / `buildDodoSegments` (same strictly-descending guard).
+ * non-descending slice (rounding noise, or past where the curve collapses) is FOLDED into the last segment
+ * (isotonic backward-merge — capacity + effOut conserved, blended marginal recomputed) so the merge stays
+ * monotone price-ordered without discarding liquidity. Mirrors `buildWooFiSegments` / `buildDodoSegments`
+ * (same isotonic backward-merge). See shared/segment-merge.ts.
  */
 export function buildFermiSegments(
   pool: FermiPool,
@@ -192,9 +196,9 @@ export function buildFermiSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice is FOLDED into the
+      // last segment, not dropped, so no liquidity is discarded. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

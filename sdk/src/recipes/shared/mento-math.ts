@@ -74,6 +74,8 @@
  *   Celoscan BiPoolManager (verified proxy): https://celoscan.io/address/0x22d9db95e6ae61c104a7b6f6c78d7993b94ec901
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
 
@@ -210,9 +212,10 @@ export interface MentoSegment {
  * descending-marginal (capacity=Δin, effOut=Δout, marginalOI) slices. NO RPC (the ladder was sampled at
  * discovery) — a pure function over the descriptor, so prepare and the oracle produce identical segments
  * from the same ladder. `amountIn` caps the range (the ladder is already sampled over [0, amountIn]). A
- * non-decreasing marginal (rounding noise, or past where a trading limit collapses the quote) is dropped so
- * the merge stays strictly price-ordered. Mirrors `buildFluidSegments` / `buildFermiSegments` (same
- * strictly-descending guard).
+ * non-descending slice (rounding noise, or the near-flat/slightly-rising ConstantSum tail at scale) is
+ * FOLDED into the last segment (isotonic backward-merge — capacity + effOut conserved, blended marginal
+ * recomputed) so the merge stays monotone price-ordered without discarding liquidity. Mirrors
+ * `buildFluidSegments` / `buildFermiSegments` (same isotonic backward-merge). See shared/segment-merge.ts.
  */
 export function buildMentoSegments(
   pool: MentoPool,
@@ -234,9 +237,9 @@ export function buildMentoSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice is FOLDED into the
+      // last segment, not dropped, so no liquidity is discarded. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

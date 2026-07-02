@@ -299,8 +299,9 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
     }
 
     // The REAL MaverickV2Quoter reproduces the captured probe quotes (the real bin swap math), in the
-    // engine-executable tokenB-in direction with tickLimit=0. calculateSwap is state-mutating in signature
-    // (returns via a revert-free path) → simulate on the pre-swap state.
+    // tokenB-in direction this fixture drives (the trade consumes before tick 0, so the full-range
+    // tickLimit is immaterial here). calculateSwap is state-mutating in signature (returns via a
+    // revert-free path) → simulate on the pre-swap state.
     for (const p of snaps.state.probes) {
       const sim = await c.publicClient.simulateContract({
         address: etched.quoter, abi: maverickQuoterAbi, functionName: "calculateSwap",

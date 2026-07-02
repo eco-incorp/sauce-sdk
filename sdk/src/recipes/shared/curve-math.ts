@@ -33,6 +33,8 @@
  * makes NO extra RPC.
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
 
@@ -293,8 +295,10 @@ export const CURVE_SAMPLES = Number(process.env.ECO_CURVE_SAMPLES ?? 24);
  * Geometric cumulative inputs (denser near 0 where the curve is steepest), each replayed
  * through get_dy on the READ state (NO extra RPC — pure bigint). Each increment becomes a
  * (capacity=Δin, effOut=Δout, marginalOI) segment. The samples are monotone in input so the
- * marginals are naturally descending (a convex out(in)); a non-decreasing marginal (rounding
- * noise near the cap) is dropped so the merge stays strictly price-ordered.
+ * marginals are naturally descending (a convex out(in)); a non-descending slice (rounding
+ * noise near the cap, or a non-convex region) is FOLDED into the last segment (isotonic
+ * backward-merge — capacity + effOut conserved, blended marginal recomputed) so the merge stays
+ * monotone price-ordered without discarding liquidity. See shared/segment-merge.ts.
  *
  * Exact-on-grid: the split equalizes marginals on THIS sampled grid; the per-pool dy for the
  * awarded share is re-evaluated wei-exact by one atomic get_dy(Σ share) at execution. M≈24
@@ -324,11 +328,9 @@ export function buildCurveSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      // Strictly descending guard: drop a slice whose marginal did not improve on the prior
-      // (rounding noise near saturation) so the merge stays monotone price-ordered.
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice is FOLDED into the
+      // last segment, not dropped, so no liquidity is discarded. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

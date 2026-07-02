@@ -1389,15 +1389,17 @@ function main(
   }
   // Maverick V2 → poolType 7 (SwapPoolType.MaverickV2) → _swapMaverickV2. Maverick is a CALLBACK pool:
   // the engine reads the pool's tokenA(), sets tokenAIn, and calls pool.swap(recipient, SwapParams{amount,
-  // tokenAIn, exactOutput:false, tickLimit:0}, ""); the pool re-enters maverickV2SwapCallback(amountToPay,
-  // …) to pull the input from the payer. So the bin math runs INSIDE the pool + engine callback, and the
-  // SwapParams carry NO curve data — the segment merge already used it (exact-on-grid), and the realized
-  // out is the engine swap (cross-checked wei-exact against the on-chain quoter in the EVM test).
+  // tokenAIn, exactOutput:false, tickLimit: full-range}, ""); the pool re-enters maverickV2SwapCallback(
+  // amountToPay, …) to pull the input from the payer. So the bin math runs INSIDE the pool + engine callback,
+  // and the SwapParams carry NO curve data — the segment merge already used it (exact-on-grid), and the
+  // realized out is the engine swap (cross-checked wei-exact against the on-chain quoter in the EVM test).
   // amountSpecified is NEGATIVE (the unified exact-in convention; _swapMaverickV2 takes abs()). payer ==
   // address.self (compute-then-pull transferred `cum`, incl. each Maverick share, above) so the callback's
   // safeTransfer draws from this contract; recipient == address.self. The poolKey is unused for poolType 7
-  // — zeroed to match the V2-path SwapParams shape. The engine tickLimit=0 caps the swap at tick 0; the
-  // sampler/discovery already gated the pool so the awarded Σ fills before that boundary (any un-consumed
+  // — zeroed to match the V2-path SwapParams shape. The engine passes the per-direction FULL-RANGE tickLimit
+  // (type(int32).max for tokenA-in, type(int32).min for tokenB-in — ../sauce PR #193), so the swap walks the
+  // whole live tick book bounded only by liquidity (it may cross tick 0); the sampler used the SAME bound
+  // (buildMaverickSegments' maxInput cap) so the awarded Σ fills within the pool's depth (any un-consumed
   // input is returned by the guarded terminal refund below).
   if (HAS_MAVERICK) {
   for (let m = 0; m < segs.length; m = m + 1) {

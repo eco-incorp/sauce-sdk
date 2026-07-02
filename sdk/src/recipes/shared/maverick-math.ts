@@ -54,6 +54,8 @@
  *   https://github.com/yldfi/maverick-v2-math  (bigint reference port: swapMath.ts / tickMath.ts / pool.ts)
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / dodo-math / curve-math Q192). */
 export const Q192 = 1n << 192n;
 
@@ -346,7 +348,8 @@ export interface MaverickTick {
  *
  * The engine `_swapMaverickV2` resolves the swap direction ON-CHAIN (it reads the pool's `tokenA()`
  * and sets `tokenAIn = (tokenIn == tokenA)`), and calls `pool.swap(recipient, SwapParams{amount,
- * tokenAIn, exactOutput:false, tickLimit:0}, "")`. So the on-chain SwapParams carry ONLY {pool,
+ * tokenAIn, exactOutput:false, tickLimit: per-direction full-range}, "")` (see the ENGINE tickLimit
+ * note below — ../sauce PR #193). So the on-chain SwapParams carry ONLY {pool,
  * tokenIn, tokenOut, amountSpecified, payer, recipient}. The fields here are OFF-CHAIN ONLY — they
  * feed buildMaverickSegments (the price/capacity replay). `tokenAIn` tags the direction (tokenIn ==
  * tokenA ⇒ tokenA is the input ⇒ price rises through ticks; else tokenB-in ⇒ price falls). `fee` is
@@ -545,14 +548,16 @@ export const MAVERICK_SAMPLES = Number(process.env.ECO_MAVERICK_SAMPLES ?? 24);
  * at tick 0) so no segment promises depth the engine cannot fill. Geometric-ish cumulative inputs
  * (∝ s^2 — denser near 0 where the curve is steepest), each
  * replayed through getDy on the READ tick book (NO extra RPC — pure bigint). Each increment becomes a
- * (capacity=Δin, effOut=Δout, marginalOI) segment. The samples are monotone in input so the marginals
- * are naturally descending (a convex out(in)); a non-decreasing marginal (rounding noise near
- * saturation, or past the pool's effective depth) is dropped so the merge stays strictly price-ordered.
+ * (capacity=Δin, effOut=Δout, marginalOI) segment. The bin book is NOT globally convex, so a slice
+ * that crosses into a deeper bin can price BETTER than the last band (a non-descending marginal); such
+ * a slice is FOLDED into the last segment (isotonic backward-merge — capacity + effOut conserved,
+ * blended marginal recomputed) so the merge stays monotone price-ordered without discarding the
+ * past-cliff bin liquidity. See shared/segment-merge.ts.
  *
  * Exact-on-grid: the split equalizes marginals on THIS sampled grid; the per-pool dy for the awarded Σ
  * share is realized wei-exact by ONE atomic engine swap (_swapMaverickV2) at execution, cross-checked
  * against the on-chain quoter. Mirrors `buildDodoSegments` / `buildCurveSegments` (same squared-index
- * geometric grid + strictly-descending guard).
+ * geometric grid + isotonic backward-merge).
  */
 export function buildMaverickSegments(
   pool: MaverickPool,
@@ -578,9 +583,10 @@ export function buildMaverickSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice (a Maverick bin
+      // boundary priced better than the last band) is FOLDED into the last segment, not dropped, so
+      // the past-cliff liquidity survives into the split. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;

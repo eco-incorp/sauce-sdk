@@ -74,6 +74,8 @@
  *   https://github.com/woonetwork/WooPoolV2/blob/main/contracts/interfaces/IWooracleV2_2.sol  (State{price,spread,coeff,woFeasible})
  */
 
+import { pushMonotoneSegment } from "./segment-merge.js";
+
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
 
@@ -246,14 +248,15 @@ export const WOOFI_SAMPLES = Number(process.env.ECO_WOOFI_SAMPLES ?? 24);
  * Geometric-ish cumulative inputs (∝ s^2 — denser near 0 where the curve is flattest, then bends via
  * gamma), each replayed through `query` on the SNAPSHOT oracle state (NO extra RPC — pure closed-form
  * bigint). Each increment becomes a (capacity=Δin, effOut=Δout, marginalOI) segment. The samples are
- * monotone in input so the marginals are naturally descending; a non-decreasing marginal (rounding noise,
- * or past the point where the (1e18−gamma−spread) factor collapses) is dropped so the merge stays strictly
- * price-ordered.
+ * monotone in input so the marginals are naturally descending; a non-descending slice (rounding noise,
+ * or past the point where the (1e18−gamma−spread) factor collapses) is FOLDED into the last segment
+ * (isotonic backward-merge — capacity + effOut conserved, blended marginal recomputed) so the merge stays
+ * monotone price-ordered without discarding liquidity. See shared/segment-merge.ts.
  *
  * Exact-on-grid-at-snapshot: the split equalizes marginals on THIS sampled grid (priced at the snapshot
  * oracle); the per-pool out for the awarded Σ share is re-evaluated wei-exact by one atomic on-chain
  * query(Σ share) at execution against the LIVE oracle. Mirrors `buildWombatSegments` / `buildDodoSegments`
- * (same squared-index geometric grid + strictly-descending guard).
+ * (same squared-index geometric grid + isotonic backward-merge).
  *
  * The ladder is TRUNCATED at `wooFiInputCap` — the largest dx WooPPV2's shared `_calc*` view path accepts
  * before its notionalSwap / gamma require()s trip. The on-chain exec makes an UNGUARDED `query(awarded)`
@@ -284,9 +287,9 @@ export function buildWooFiSegments(
     const dOut = out - prevOut;
     if (dIn > 0n && dOut > 0n) {
       const marginalOI = isqrt((dOut * Q192) / dIn);
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
+      // Isotonic backward-merge (liquidity-preserving) — a non-descending slice is FOLDED into the
+      // last segment, not dropped, so no liquidity is discarded. See shared/segment-merge.ts.
+      pushMonotoneSegment(segs, dIn, dOut, marginalOI);
     }
     prevIn = input;
     prevOut = out;
