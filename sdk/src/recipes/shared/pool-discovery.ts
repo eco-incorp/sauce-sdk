@@ -163,6 +163,8 @@ const curvePoolAbi = parseAbi([
   "function A() external view returns (uint256)",
   "function fee() external view returns (uint256)",
   "function coins(uint256 i) external view returns (address)",
+  // StableSwap-NG only: the off-peg dynamic-fee multiplier (1e10-scaled). Absent on legacy pools.
+  "function offpeg_fee_multiplier() external view returns (uint256)",
 ]);
 
 // Curve CryptoSwap registry (crypto/tricrypto Metaregistry) + pool read surface. The crypto
@@ -1070,10 +1072,15 @@ export async function discoverCurvePoolsTyped(
       const N = Number(nCoinsRaw) || 2;
       if (i < 0 || j < 0 || i >= N || j >= N) continue;
 
-      // Pool state: A, fee, and the full balances array.
-      const [A, feeRaw] = await Promise.all([
+      // Pool state: A, fee, the off-peg multiplier (NG only — absent on legacy pools ⇒ undefined),
+      // and the full balances array.
+      const [A, feeRaw, offpegRaw] = await Promise.all([
         client.readContract({ address: poolAddr, abi: curvePoolAbi, functionName: "A" }) as Promise<bigint>,
         client.readContract({ address: poolAddr, abi: curvePoolAbi, functionName: "fee" }) as Promise<bigint>,
+        client
+          .readContract({ address: poolAddr, abi: curvePoolAbi, functionName: "offpeg_fee_multiplier" })
+          .then((v) => v as bigint)
+          .catch(() => undefined) as Promise<bigint | undefined>,
       ]);
       const balances: bigint[] = await Promise.all(
         Array.from({ length: N }, (_, k) =>
@@ -1128,6 +1135,9 @@ export async function discoverCurvePoolsTyped(
         balances,
         rates,
         feePpm10: feeRaw,
+        // NG dynamic fee: makes the off-chain replay wei-exact against get_dy/exchange for an NG
+        // pool. Legacy pools have no such getter ⇒ undefined ⇒ getDy falls back to the flat fee.
+        offpegFeeMultiplier: offpegRaw,
         source: registry.label,
       });
     } catch {

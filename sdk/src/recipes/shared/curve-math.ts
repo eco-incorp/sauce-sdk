@@ -85,6 +85,18 @@ export interface CurvePool {
   rates: bigint[];
   /** Swap fee in 1e10 units (pool `fee()`; e.g. 4_000_000 = 0.04%). */
   feePpm10: bigint;
+  /**
+   * StableSwap-NG dynamic-fee multiplier (`offpeg_fee_multiplier()`, 1e10-scaled) — OPTIONAL.
+   *
+   * NG plain pools charge a DYNAMIC fee: the base `feePpm10` is scaled UP the further the two
+   * swapped coins' post-swap balances sit off peg (imbalanced pools pay more). When this is set
+   * AND exceeds `FEE_DENOMINATOR_CURVE`, `getDy` applies the NG `_dynamic_fee` formula (below) so
+   * the replay is wei-exact against an NG pool's `get_dy`/`exchange`. When omitted (or ≤ the
+   * denominator), `getDy` uses the FLAT `feePpm10` — the legacy/plain-pool behavior — so this is a
+   * strict backward-compatible superset (a legacy pool, or the CurveStableSwap.sol test fixture,
+   * needs no change). Curve `Stableswap-NG` semantics.
+   */
+  offpegFeeMultiplier?: bigint;
   /** Discovery source label. */
   source: string;
 }
@@ -184,6 +196,30 @@ export function getY(
 }
 
 /**
+ * StableSwap-NG `_dynamic_fee` — the off-peg-scaled swap fee (1e10 units) for the two swapped
+ * coins' post-swap balances `xpi`, `xpj` (both in the common 1e18 xp unit). Mirrors the NG Vyper:
+ *
+ *   if offpeg <= FEE_DENOMINATOR: return fee            # multiplier disabled ⇒ flat fee
+ *   xps2 = (xpi + xpj) ** 2
+ *   return (offpeg * fee) /
+ *          ((offpeg - FEE_DENOMINATOR) * 4 * xpi * xpj / xps2 + FEE_DENOMINATOR)
+ *
+ * At peg (xpi == xpj) the `4·xpi·xpj/(xpi+xpj)²` term is 1 ⇒ the denominator is `offpeg` ⇒ the
+ * result is exactly `fee`; the further off peg, the smaller that term ⇒ the larger the fee. `getDy`
+ * passes the two MIDPOINTS `(xp[i]+x)/2`, `(xp[j]+y)/2` (old+new per coin), exactly as the NG Vyper.
+ * The `4·a·b/(a+b)²` ratio is scale-invariant, so a common factor between the two args cancels —
+ * but the args must be the OLD+NEW midpoints (what NG passes), not the new balances alone.
+ */
+export function dynamicFee(xpi: bigint, xpj: bigint, fee: bigint, offpeg: bigint): bigint {
+  if (offpeg <= FEE_DENOMINATOR_CURVE) return fee;
+  const xps2 = (xpi + xpj) * (xpi + xpj);
+  return (
+    (offpeg * fee) /
+    (((offpeg - FEE_DENOMINATOR_CURVE) * 4n * xpi * xpj) / xps2 + FEE_DENOMINATOR_CURVE)
+  );
+}
+
+/**
  * get_dy — the exact tokens-out for `dx` tokenIn (i → j), INCLUDING the swap fee.
  * Mirrors Curve `StableSwap.get_dy` bit-for-bit (the rates[]-scaled, post-`get_y` form):
  *
@@ -192,11 +228,14 @@ export function getY(
  *   x     = xp[i] + dx * rates[i] / PRECISION
  *   y     = get_y(i, j, x, xp)
  *   dy    = (xp[j] - y - 1)                       # -1: round DOWN in the pool's favor
- *   fee   = fee * dy / FEE_DENOMINATOR
+ *   fee   = _fee * dy / FEE_DENOMINATOR
  *   return (dy - fee) * PRECISION / rates[j]
  *
- * The `-1` and the integer fee truncation are the canonical rounding; reproduced exactly so
- * the off-chain dy equals the engine `_swapCurve` exchange() output to the wei.
+ * `_fee` is the FLAT `feePpm10` for a legacy/plain pool, or the NG `_dynamic_fee` (scaled by the
+ * post-swap off-peg imbalance) when `offpegFeeMultiplier` is set and > FEE_DENOMINATOR — matching
+ * a StableSwap-NG pool's `get_dy`/`exchange` to the wei. The `-1` and the integer fee truncation
+ * are the canonical rounding; reproduced exactly so the off-chain dy equals the engine `_swapCurve`
+ * exchange() output to the wei.
  */
 export function getDy(pool: CurvePool, dx: bigint): bigint {
   if (dx <= 0n) return 0n;
@@ -206,7 +245,19 @@ export function getDy(pool: CurvePool, dx: bigint): bigint {
   const y = getY(pool.i, pool.j, x, xp, amp, pool.aPrecision);
   let dy = xp[pool.j] - y - 1n; // round down in the pool's favor
   if (dy <= 0n) return 0n;
-  const fee = (pool.feePpm10 * dy) / FEE_DENOMINATOR_CURVE;
+  // NG dynamic fee: scale the base fee by the two swapped coins' MID off-peg imbalance — the args
+  // are the (old + new)/2 midpoints per coin, exactly `_dynamic_fee((xp[i]+x)/2, (xp[j]+y)/2)` in
+  // the NG Vyper (xp[i]/xp[j] are the OLD balances, x/y the NEW), NOT the post-swap balances alone.
+  const feeRate =
+    pool.offpegFeeMultiplier !== undefined
+      ? dynamicFee(
+          (xp[pool.i] + x) / 2n,
+          (xp[pool.j] + y) / 2n,
+          pool.feePpm10,
+          pool.offpegFeeMultiplier,
+        )
+      : pool.feePpm10;
+  const fee = (feeRate * dy) / FEE_DENOMINATOR_CURVE;
   dy = dy - fee;
   return (dy * PRECISION) / pool.rates[pool.j];
 }

@@ -1365,4 +1365,928 @@ export const chainlinkFeedReadAbi = parseAbi([
   "function decimals() view returns (uint8)",
 ]);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Balancer V2 ComposableStable prod-mirror etch — ADDITIVE extension of this harness.
+//
+// A Balancer ComposableStable pool is NEITHER an EIP-1167 clone (Aerodrome/DODO) NOR a proxy (Wombat/
+// WOOFi): it is a SELF-CONTAINED contract holding its whole StableMath state (amp / scaling / swap fee /
+// name / symbol) in its own low storage slots — and it holds NO tokens. The registered token BALANCES
+// live in the canonical Balancer V2 Vault (0xBA12…, the engine `_swapBalancerV2` constant) under a
+// per-poolId EnumerableMap. So the FULL swap/quote dependency graph the engine touches is exactly:
+//
+//   ComposableStablePool 0x8353…Cb2aF   (self-contained; getPoolId / StableMath getters)
+//     └ Balancer V2 Vault 0xBA12…        (holds the pooled tokens; Vault.swap(GIVEN_IN) does the math?
+//          — NO: the Vault CALLS pool.onSwap(...), which runs the StableMath, then the Vault moves the
+//            registered assets. Both runtimes are real + captured, so the whole path runs offline.)
+//
+// The etch shape (mirrors Wombat/WOOFi's immutable/mapping-keyed token constraint):
+//   • The Vault's per-pool accounting (`_generalPoolsBalances[poolId]`, an EnumerableMap) is keyed by the
+//     REAL poolId (whose first 20 bytes ARE the real pool address) and stores the REAL token addresses in
+//     its `_keys[i]` / `_indexes[token]` slots. Those keys CANNOT be repointed by overwriting one scalar
+//     (Solidly-style) — the keccak keys would no longer match. So the pool MUST be etched at its captured
+//     address (so getPoolId is consistent) and each REAL non-BPT token MUST be a local MintableERC20 etched
+//     AT its real address (setCode the ERC20 runtime there + seed `decimals`), exactly like Wombat's
+//     immutable-underlying / WOOFi's mapping-keyed tokens. The BPT (`_keys[bptIndex]` == the pool address)
+//     is NOT a swap token and is NOT repointed — StableMath excludes it.
+//   • Every captured Vault slot (the EnumerableMap `_length`, `_keys[i]`, the packed BalanceAllocation at
+//     `_keys[i]+1`, `_indexes[token]`, and the registration flag) is applied VERBATIM by its ABSOLUTE key,
+//     so getPoolTokens reconstructs the mainnet balances byte-identically and the real Vault.swap runs.
+//   • Every captured pool slot (0..31) is applied VERBATIM, so getAmplificationParameter / getScalingFactors
+//     / getSwapFeePercentage / getBptIndex return the mainnet values the production discovery reads.
+//
+// NO factory shim is needed: FactoryType.BalancerV2 discovery is KNOWN-POOL-ADDRESS based — the
+// FactoryConfig.address IS the Vault (canonical) and `balancerStablePools` carries the pool address; the
+// discovery reads getPoolId off the pool then getPoolTokens off the Vault (both etched real runtimes).
+// The on-chain execution is the EXISTING engine BalancerV2 dispatch (poolType 4 → _swapBalancerV2 →
+// pool.getPoolId() → Vault.swap(SingleSwap{GIVEN_IN})), so no engine SwapPoolType is added.
+//
+// FIDELITY: this fixture's picked pool has ZERO rate providers (getRateProviders() all address(0)), so
+// onSwap makes NO external rate-provider call — the dependency graph is EXACTLY {Vault, pool}, both real
+// runtimes captured. NO stubs, NO shims, NO read-only stand-ins. Full real-code parity offline.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** One registered token in the Balancer pool's Vault token list (INCLUDING the BPT at bptIndex). */
+export interface BalancerStateToken {
+  address: Hex;
+  symbol: string;
+  decimals: number;
+  isBpt: boolean;
+  balance: string;
+}
+
+/** Balancer bytecode snapshot: the self-contained pool + the Vault dependency runtime (both sha256-anchored). */
+export interface BalancerBytecodeSnapshot extends PoolBytecodeSnapshot {
+  dependencies?: DependencyBytecode[];
+}
+
+/** Balancer state snapshot (written by harness/balancer-snapshot.ts). */
+export interface BalancerStateSnapshot {
+  chain: string;
+  block: string;
+  vault: Hex;
+  pool: Hex;
+  poolId: Hex;
+  poolName: string;
+  poolSymbol: string;
+  poolVersion: string;
+  specialization: number;
+  authorizer: Hex;
+  protocolFeesCollector: Hex;
+  amp: string;
+  ampPrecision: string;
+  swapFeeWad: string;
+  bptIndex: number;
+  scalingFactors: string[];
+  rateProviders: Hex[];
+  lastChangeBlock: string;
+  tokens: BalancerStateToken[];
+  vaultLayout: { generalPoolBalancesBase: number; poolRegistrationBase: number; enumerableMapStructRoot: Hex; note: string };
+  /** Every captured Vault slot, ABSOLUTE storage key → value (set verbatim on the etched Vault). */
+  vaultSlots: Record<string, Hex>;
+  vaultSlotNotes: { key: Hex; value: Hex; note: string }[];
+  /** Pool storage window 0..31 (set verbatim on the etched pool). */
+  poolStorage: Record<string, Hex>;
+  probe: { tokenIn: Hex; tokenInSymbol: string; tokenOut: Hex; tokenOutSymbol: string; amountIn: string; amountOut: string };
+}
+
+/** Load a Balancer `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadBalancerSnapshots(name: string): {
+  bytecode: BalancerBytecodeSnapshot;
+  state: BalancerStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as BalancerBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as BalancerStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Balancer bytecode integrity (NO RPC): re-hash the pool runtime + the Vault dependency runtime
+ * and match each capture-time sha256 anchor. Returns pool (via verifyBytecodeIntegrity's shape) +
+ * per-dependency {name, expected, actual, ok}. Reuses verifyDodoBytecodeIntegrity's structure — the
+ * Balancer snapshot has the SAME {pool, dependencies[]} shape.
+ */
+export function verifyBalancerBytecodeIntegrity(bytecode: BalancerBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const base = verifyBytecodeIntegrity(bytecode);
+  const dependencies = (bytecode.dependencies ?? []).map((d) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name: d.name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { pool: base.pool, dependencies };
+}
+
+export interface EtchedBalancerPool {
+  /** The ComposableStable pool address (the getPoolId / discovery / swap target — captured mainnet address). */
+  pool: Hex;
+  /** The Balancer V2 Vault address (etched with the real Vault runtime at the canonical 0xBA12…). */
+  vault: Hex;
+  /** The pool's real poolId (getPoolId returns it; the Vault accounting is keyed by it). */
+  poolId: Hex;
+  /** The swap tokenIn/tokenOut — local MintableERC20s etched at the REAL token addresses. */
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** The NON-BPT registered token addresses (each a local MintableERC20 at its real address). */
+  nonBptTokens: Hex[];
+  /** The 0-based bptIndex in the full registered token list. */
+  bptIndex: number;
+}
+
+/**
+ * Stand up the captured REAL Balancer V2 ComposableStable pool + Vault on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it AT EACH real NON-BPT token address + seed its
+ *      `decimals` slot — because the Vault's `_keys`/`_indexes` are keyed by the real token addresses, the
+ *      local tokens MUST live at those addresses (mirrors Wombat's immutable-underlying / WOOFi's mapping-
+ *      keyed token etch). The BPT (`_keys[bptIndex]` == the pool address) is NOT a swap token, not repointed.
+ *   2. setCode the REAL Vault runtime at the canonical 0xBA12… + setStorageAt every captured Vault slot
+ *      VERBATIM by its ABSOLUTE key (the EnumerableMap `_length`/`_keys`/packed BalanceAllocation/`_indexes`
+ *      + the pool-registration flag) — so getPoolTokens reconstructs the mainnet balances byte-identically.
+ *   3. setCode the REAL pool runtime at its captured address + setStorageAt its captured 0..31 storage
+ *      VERBATIM — so the StableMath getters return the mainnet amp / scaling / fee / bptIndex.
+ *   4. Fund the Vault with each NON-BPT token's captured registered balance (so Vault.swap can pay out), +
+ *      caller headroom in tokenIn.
+ *
+ * The swap path then runs the GENUINE Vault + pool bytecode: Vault.swap(GIVEN_IN) calls pool.onSwap (the
+ * real StableMath A-invariant) and moves the registered assets — the mainnet-identical dy for the captured
+ * balances, with NO fork and NO RPC. `opts.tokenInAddr`/`tokenOutAddr` pick the swap pair (default: the
+ * first two NON-BPT tokens, matching the captured probe direction).
+ */
+export async function etchBalancerPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: BalancerBytecodeSnapshot; state: BalancerStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint; tokenInAddr?: Hex; tokenOutAddr?: Hex } = {},
+): Promise<EtchedBalancerPool> {
+  const { bytecode, state } = snapshots;
+  const vaultDep = (bytecode.dependencies ?? []).find((d) => BigInt(d.address) === BigInt(state.vault));
+  if (!vaultDep) throw new Error("etchBalancerPool: no Balancer V2 Vault runtime in the bytecode snapshot");
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(state.pool) as Hex;
+  const vault = getAddress(state.vault) as Hex;
+  const bptIndex = state.bptIndex;
+
+  // 1. Capture a local MintableERC20 runtime, etch it at each REAL non-BPT token address + seed decimals.
+  const scratch = await deployToken(walletClient, publicClient, "balancer-scratch", "BSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  const nonBptTokens: Hex[] = [];
+  for (let k = 0; k < state.tokens.length; k++) {
+    const t = state.tokens[k];
+    if (t.isBpt) continue; // the BPT is the pool itself — not a swap token, not repointed
+    const tok = getAddress(t.address) as Hex;
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(t.decimals)) });
+    nonBptTokens.push(tok);
+  }
+
+  // 2. Etch the REAL Vault at the canonical address + setStorageAt every captured Vault slot VERBATIM.
+  await testClient.setCode({ address: vault, bytecode: vaultDep.runtime });
+  for (const [key, val] of Object.entries(state.vaultSlots)) {
+    await testClient.setStorageAt({ address: vault, index: key as Hex, value: val });
+  }
+
+  // 3. Etch the REAL pool at its captured address + setStorageAt its captured 0..31 storage VERBATIM.
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+  for (const [k, v] of Object.entries(state.poolStorage)) {
+    await testClient.setStorageAt({ address: pool, index: slotHex(Number(k)), value: v });
+  }
+
+  // 4. Fund the Vault with each NON-BPT token's captured registered balance (so Vault.swap can pay out), +
+  //    caller headroom in tokenIn.
+  for (let k = 0; k < state.tokens.length; k++) {
+    const t = state.tokens[k];
+    if (t.isBpt) continue;
+    await mint(walletClient, publicClient, getAddress(t.address) as Hex, vault, BigInt(t.balance));
+  }
+  const tokenIn = getAddress(opts.tokenInAddr ?? nonBptTokens[0]) as Hex;
+  const tokenOut = getAddress(opts.tokenOutAddr ?? nonBptTokens[1]) as Hex;
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return { pool, vault, poolId: state.poolId, tokenIn, tokenOut, nonBptTokens, bptIndex };
+}
+
+/** Balancer ComposableStable pool read surface (the getters the test + discovery read on the REAL pool). */
+export const balancerPoolReadAbi = parseAbi([
+  "function getPoolId() view returns (bytes32)",
+  "function getAmplificationParameter() view returns (uint256 value, bool isUpdating, uint256 precision)",
+  "function getScalingFactors() view returns (uint256[] scalingFactors)",
+  "function getSwapFeePercentage() view returns (uint256)",
+  "function getBptIndex() view returns (uint256)",
+  "function getRateProviders() view returns (address[])",
+]);
+
+/** Balancer V2 Vault read + swap surface (getPoolTokens for reconstruction, swap/queryBatchSwap for the
+ *  ground-truth cross-check the test reads on the etched real Vault). */
+export const balancerVaultReadAbi = parseAbi([
+  "function getPoolTokens(bytes32 poolId) view returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock)",
+  "function getPool(bytes32 poolId) view returns (address, uint8)",
+  "struct SingleSwap { bytes32 poolId; uint8 kind; address assetIn; address assetOut; uint256 amount; bytes userData; }",
+  "struct FundManagement { address sender; bool fromInternalBalance; address recipient; bool toInternalBalance; }",
+  "function swap(SingleSwap singleSwap, FundManagement funds, uint256 limit, uint256 deadline) returns (uint256)",
+  "struct BatchSwapStep { bytes32 poolId; uint256 assetInIndex; uint256 assetOutIndex; uint256 amount; bytes userData; }",
+  "function queryBatchSwap(uint8 kind, BatchSwapStep[] swaps, address[] assets, FundManagement funds) returns (int256[])",
+]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Curve StableSwap-NG prod-mirror etch — ADDITIVE extension of this harness.
+//
+// A Curve StableSwap-NG plain pool is a SELF-CONTAINED Vyper contract (NOT a proxy, NOT an
+// EIP-1167 clone): its whole invariant state (A/fee/balances/admin-balances/rate-oracle
+// bookkeeping) lives in its own LINEAR storage slots, and the two coins are baked as IMMUTABLES
+// in the runtime bytecode (verified: `coins(0)`/`coins(1)` resolve to the real token addresses
+// straight from an etched runtime with NO storage seeding). So the etch shape is the leanest of
+// all the sources: setCode the ONE real runtime + setStorageAt the captured linear window.
+//
+// EXECUTION vs VIEW — the honest fidelity split for Curve-NG:
+//   • The EXECUTION path — `exchange(i, j, dx, min_dy)`, exactly what the engine `_swapCurve`
+//     calls — is FULLY SELF-CONTAINED in the etched pool runtime: it computes the StableSwap-NG
+//     invariant (get_D / get_y) + the off-peg DYNAMIC fee entirely inline and moves the coins. It
+//     makes NO external call. So the on-chain swap is 100% REAL captured code with NO stub.
+//   • The read-only `get_dy` VIEW, by contrast, DELEGATES: the NG pool staticcalls its immutable
+//     Factory's `views_implementation()` and forwards to an external `StableSwapViews.get_dy`
+//     (verified via a callTracer: get_dy STATICCALLs the NG Factory `0x6a8cbed7…`,
+//     selector `views_implementation()` = 0xe31593d8). That Factory + Views graph is NOT in the
+//     capture, so `get_dy` reverts offline. This is IRRELEVANT to the recipe: neither discovery
+//     nor the oracle nor the engine calls `get_dy` — the off-chain quote is the bit-for-bit Vyper
+//     replay (curve-math.ts, now NG-dynamic-fee-aware), and the on-chain quote ground-truth is a
+//     read-only `eth_call` of the REAL `exchange` on the pre-swap state (the actual swap path).
+//     The test asserts BOTH the replay AND the real `exchange` eth_call agree with the executed
+//     swap to the wei — a STRONGER cross-check than the delegated view would be.
+//
+// DISCOVERY (FactoryType.CurveRegistry): the production path reads the registry surface
+// (find_pool_for_coins → get_coin_indices(int128 i,j,bool) → get_n_coins / get_decimals[uint256×8])
+// then the pool getters (A / fee / offpeg_fee_multiplier / balances[k] / coins[k] → decimals()).
+// The pool getters run the REAL etched runtime. The registry surface is stood up as a tiny
+// READ-ONLY MetaRegistry SHIM at the WIRED CurveRegistry address (the legacy StableSwap registry
+// wired in constants.ts returns address(0) for this NG pool on mainnet — see the capture note — so
+// the offline shim faithfully stands in for the resolved MetaRegistry the reader would otherwise
+// hit). The shim returns CONSTANTS (the captured pool address / indices / n_coins / decimals) — a
+// read-only registry lookup for the single reproduced pair, no compile, no write tx.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Curve bytecode snapshot: the self-contained NG pool (no proxy, no clone, no dependencies). */
+export interface CurveBytecodeSnapshot extends PoolBytecodeSnapshot {
+  dependencies?: DependencyBytecode[];
+}
+
+/** One coin in the captured Curve pool (address is a runtime IMMUTABLE — restored by setCode). */
+export interface CurveStateCoin {
+  address: Hex;
+  symbol: string;
+  decimals: number;
+  poolBalanceOf: string;
+  immutableInRuntime: boolean;
+}
+
+/** Curve StableSwap-NG state snapshot (written by harness/curveStable-snapshot.ts). */
+export interface CurveStateSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  pool: Hex;
+  poolSymbol: string;
+  source: string;
+  discovery: {
+    wiredRegistry: Hex;
+    wiredFindPool: Hex;
+    metaRegistry: Hex;
+    metaFindPool: Hex;
+    addressProvider: Hex;
+  };
+  i: number;
+  j: number;
+  underlying: boolean;
+  nCoins: number;
+  coins: CurveStateCoin[];
+  tokenIn: Hex;
+  tokenOut: Hex;
+  A: string;
+  aPrecision: string;
+  fee: string;
+  adminFee: string;
+  offpegFeeMultiplier: string;
+  storedRates: string[];
+  balances: string[];
+  adminBalances: string[];
+  storedBalances: string[];
+  rates: string[];
+  virtualPrice: string;
+  probe: {
+    forward: { i: number; j: number; dx: string; dy: string };
+    reverse: { i: number; j: number; dx: string; dy: string };
+  };
+  storage: Record<string, Hex>;
+}
+
+/** Load a Curve `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadCurveSnapshots(name: string): {
+  bytecode: CurveBytecodeSnapshot;
+  state: CurveStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as CurveBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as CurveStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Curve bytecode integrity (NO RPC): re-hash the pool runtime + any dependency runtimes
+ * and match each capture-time sha256 anchor. Reuses verifyBytecodeIntegrity for the pool (a Curve
+ * NG pool is self-contained ⇒ typically no dependencies) + per-dependency {name, expected, actual, ok}.
+ */
+export function verifyCurveBytecodeIntegrity(bytecode: CurveBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const base = verifyBytecodeIntegrity(bytecode);
+  const dependencies = (bytecode.dependencies ?? []).map((d) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name: d.name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { pool: base.pool, dependencies };
+}
+
+/** MetaRegistry-shim selectors (the surface discoverCurvePoolsTyped reads via curveRegistryAbi). */
+const CURVE_REG_SELECTOR = {
+  findPool: "a87df06c", // find_pool_for_coins(address,address)          -> address
+  coinIndices: "eb85226d", // get_coin_indices(address,address,address)  -> (int128 i, int128 j, bool)
+  nCoins: "940494f1", // get_n_coins(address)                            -> uint256
+  decimals: "52b51555", // get_decimals(address)                         -> uint256[8]
+} as const;
+
+/** One answered registry getter: 4-byte selector (no 0x) -> its CONSTANT return-data words. */
+interface ConstResponseEntry {
+  selector: string; // 8 hex chars, no 0x
+  words: bigint[]; // the ABI return words (each a 32-byte word), returned verbatim
+}
+
+/**
+ * Build a tiny READ-ONLY shim runtime that answers each listed selector with a CONSTANT sequence of
+ * 32-byte return words, and every UNLISTED selector with a single zero word. Hand-assembled as an
+ * N-target jump table with offset-exact JUMPDESTs — NO Solidity compile, NO write tx.
+ *
+ * This generalises `buildFactoryShimRuntime` (which returns a single SLOADed slot per selector) to
+ * MULTI-WORD constant responses, needed by the Curve MetaRegistry surface: get_coin_indices returns
+ * 3 words (int128 i, int128 j, bool underlying) and get_decimals returns a uint256[8] FIXED array (8
+ * inline words) — neither fits the one-slot shim. Every response here is a compile-time constant
+ * (the captured pool address / indices / n_coins / decimals for the single reproduced pair), so a
+ * constant reply is faithful (the reader queries exactly this one pair).
+ */
+export function buildConstResponseShimRuntime(entries: ConstResponseEntry[]): Hex {
+  const bytes = (h: string) => h.length / 2;
+  const w = (v: bigint) => (((v % (1n << 256n)) + (1n << 256n)) % (1n << 256n)).toString(16).padStart(64, "0");
+  const header = "60003560e01c"; // sel = shr(0xe0, calldataload(0))
+  const cmp = (sel: string, dest: number) =>
+    "8063" + sel + "1461" + dest.toString(16).padStart(4, "0") + "57"; // DUP1 PUSH4 sel EQ PUSH2 dest JUMPI
+  const gotoDefault = (dest: number) => "61" + dest.toString(16).padStart(4, "0") + "56"; // PUSH2 dest JUMP
+  // Return `words`: for each k, PUSH32 <word> PUSH2 <off> MSTORE ; then PUSH2 <len> PUSH1 0 RETURN.
+  const retWords = (words: bigint[]) => {
+    let body = "";
+    for (let k = 0; k < words.length; k++) {
+      const off = k * 0x20;
+      body += "7f" + w(words[k]) + "61" + off.toString(16).padStart(4, "0") + "52"; // PUSH32 v PUSH2 off MSTORE
+    }
+    const len = words.length * 0x20;
+    body += "61" + len.toString(16).padStart(4, "0") + "6000f3"; // PUSH2 len PUSH1 0 RETURN
+    return body;
+  };
+  const bodyFor = (e: ConstResponseEntry) => "5b" + retWords(e.words); // JUMPDEST + return body
+  const defaultBody = "5b" + retWords([0n]); // JUMPDEST + return one zero word
+
+  for (const e of entries) {
+    if (e.selector.length !== 8) throw new Error(`const shim: selector "${e.selector}" must be 8 hex chars`);
+  }
+  if (entries.length > 0xff) throw new Error("const shim: too many selector entries");
+
+  // Dispatch: header + one cmp per entry + goto-default trailer, then each JUMPDEST body, then default.
+  const dispatchLen = bytes(header) + entries.length * bytes(cmp("00000000", 0)) + bytes(gotoDefault(0));
+  let off = dispatchLen;
+  const dests: number[] = [];
+  for (const e of entries) {
+    dests.push(off);
+    off += bytes(bodyFor(e));
+  }
+  const defaultOff = off;
+  const code =
+    header +
+    entries.map((e, i) => cmp(e.selector, dests[i])).join("") +
+    gotoDefault(defaultOff) +
+    entries.map((e) => bodyFor(e)).join("") +
+    defaultBody;
+  return ("0x" + code) as Hex;
+}
+
+/** Build the Curve MetaRegistry shim from a captured state snapshot (constant per-pair responses). */
+export function buildCurveMetaRegistryShimRuntime(state: CurveStateSnapshot): Hex {
+  const pool = BigInt(getAddress(state.pool));
+  const i = BigInt(state.i);
+  const j = BigInt(state.j);
+  const underlying = state.underlying ? 1n : 0n;
+  const n = BigInt(state.nCoins);
+  // get_decimals returns uint256[8] — the first nCoins are the real decimals, the rest 0.
+  const decWords: bigint[] = Array.from({ length: 8 }, (_, k) =>
+    k < state.coins.length ? BigInt(state.coins[k].decimals) : 0n,
+  );
+  return buildConstResponseShimRuntime([
+    { selector: CURVE_REG_SELECTOR.findPool, words: [pool] },
+    { selector: CURVE_REG_SELECTOR.coinIndices, words: [i, j, underlying] },
+    { selector: CURVE_REG_SELECTOR.nCoins, words: [n] },
+    { selector: CURVE_REG_SELECTOR.decimals, words: decWords },
+  ]);
+}
+
+export interface EtchedCurvePool {
+  /** The pool address (the exchange()/discovery target — the captured mainnet address). */
+  pool: Hex;
+  /** The MetaRegistry shim address (the WIRED CurveRegistry address — point a poolConfig factory here). */
+  registry: Hex;
+  /** The locally-deployed coins, etched at the REAL coin addresses (immutables ⇒ must live there). */
+  coins: Hex[];
+  /** tokenIn == coins[i], tokenOut == coins[j] — echoed for the test. */
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** Captured invariant params, echoed for the test. */
+  A: bigint;
+  fee: bigint;
+  offpegFeeMultiplier: bigint;
+  /** balances(k) (net of admin) + storedBalances(k) (the pool's ERC20 balanceOf reserve). */
+  balances: bigint[];
+  storedBalances: bigint[];
+}
+
+/** MintableERC20 decimals slot (verified in the Wombat/WOOFi section). */
+const CURVE_ERC20_DECIMALS_SLOT = 2;
+
+/**
+ * Stand up the captured REAL Curve StableSwap-NG pool on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it AT EACH real coin address + seed its
+ *      `decimals` slot — because the pool's `coins(k)` are IMMUTABLES baked in the runtime (they
+ *      resolve to the real addresses off the etched code), the local tokens MUST live at those
+ *      addresses (mirrors Wombat's immutable-underlying / WOOFi's mapping-keyed token etch). The
+ *      pool's exchange() then moves the LOCAL storage-backed tokens.
+ *   2. setCode the REAL NG pool runtime at its captured address (coins auto-restored via immutables).
+ *   3. setStorageAt the captured linear storage window VERBATIM (A-ramp / fee / offpeg / stored &
+ *      admin balances / rate-oracle bookkeeping) — so A()/fee()/balances(k)/get_virtual_price() and
+ *      the inline exchange() invariant compute the mainnet-identical dy.
+ *   4. setCode the READ-ONLY MetaRegistry shim at the WIRED CurveRegistry address (constant per-pair
+ *      find_pool_for_coins / get_coin_indices / get_n_coins / get_decimals from the snapshot).
+ *   5. Fund the pool with each coin's captured storedBalance (its ERC20 balanceOf reserve, so
+ *      exchange() can pay out + the balance invariants hold), + caller headroom in tokenIn.
+ *
+ * The swap path then runs the GENUINE NG bytecode: exchange(i, j, dx, min_dy) computes the mainnet-
+ * identical dy (get_D / get_y + the off-peg dynamic fee, ALL inline) for the captured state and moves
+ * the local coins. `opts.registryAddr` overrides the shim address (default: the wired CurveRegistry).
+ */
+export async function etchCurveStablePool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: CurveBytecodeSnapshot; state: CurveStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint; registryAddr?: Hex } = {},
+): Promise<EtchedCurvePool> {
+  const { bytecode, state } = snapshots;
+  if (bytecode.isMinimalProxy || bytecode.implementation) {
+    throw new Error("etchCurveStablePool expects a self-contained pool snapshot (no proxy/impl)");
+  }
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(bytecode.pool.address) as Hex;
+  const registry = getAddress(opts.registryAddr ?? state.discovery.wiredRegistry) as Hex;
+  const A = BigInt(state.A);
+  const fee = BigInt(state.fee);
+  const offpegFeeMultiplier = BigInt(state.offpegFeeMultiplier);
+  const balances = state.balances.map((b) => BigInt(b));
+  const storedBalances = state.storedBalances.map((b) => BigInt(b));
+
+  // 1. Capture a local MintableERC20 runtime, then etch it at EACH real coin address + seed decimals.
+  //    (coins(k) are immutables → the local tokens must live at the real coin addresses.)
+  const scratch = await deployToken(walletClient, publicClient, "curve-scratch", "CSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  const coins: Hex[] = [];
+  for (const coin of state.coins) {
+    const tok = getAddress(coin.address) as Hex;
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({
+      address: tok,
+      index: slotHex(CURVE_ERC20_DECIMALS_SLOT),
+      value: word(BigInt(coin.decimals)),
+    });
+    coins.push(tok);
+  }
+
+  // 2. Etch the REAL NG pool runtime at its captured address (coins restored via immutables).
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+
+  // 3. setStorageAt the captured linear storage window VERBATIM.
+  for (const [k, v] of Object.entries(state.storage)) {
+    await testClient.setStorageAt({ address: pool, index: slotHex(Number(k)), value: v });
+  }
+
+  // 4. Read-only MetaRegistry shim at the wired CurveRegistry address.
+  await testClient.setCode({ address: registry, bytecode: buildCurveMetaRegistryShimRuntime(state) });
+
+  // 5. Fund the pool with each coin's captured ERC20 balanceOf reserve (storedBalance) + caller.
+  for (let k = 0; k < coins.length; k++) {
+    await mint(walletClient, publicClient, coins[k], pool, storedBalances[k]);
+  }
+  const tokenIn = coins[state.i];
+  const tokenOut = coins[state.j];
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    registry,
+    coins,
+    tokenIn,
+    tokenOut,
+    A,
+    fee,
+    offpegFeeMultiplier,
+    balances,
+    storedBalances,
+  };
+}
+
+/** Curve NG pool read surface (the getters the test + discovery read on the REAL pool). */
+export const curvePoolReadAbi = parseAbi([
+  "function A() view returns (uint256)",
+  "function fee() view returns (uint256)",
+  "function offpeg_fee_multiplier() view returns (uint256)",
+  "function balances(uint256 i) view returns (uint256)",
+  "function coins(uint256 i) view returns (address)",
+  "function get_virtual_price() view returns (uint256)",
+  // exchange is the REAL execution path — read-only via eth_call on the pre-swap state = the quote.
+  "function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) returns (uint256)",
+]);
+
+/** Curve MetaRegistry shim read surface (the registry getters discovery reads). */
+export const curveRegistryShimAbi = parseAbi([
+  "function find_pool_for_coins(address from, address to) view returns (address)",
+  "function get_coin_indices(address pool, address from, address to) view returns (int128 i, int128 j, bool underlying)",
+  "function get_n_coins(address pool) view returns (uint256)",
+  "function get_decimals(address pool) view returns (uint256[8])",
+]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Curve CryptoSwap (twocrypto-NG) prod-mirror etch — ADDITIVE extension of this harness.
+//
+// A twocrypto-NG CryptoSwap pool is a SELF-CONTAINED Vyper contract like the StableSwap-NG pool
+// (coins baked as IMMUTABLES, invariant state in linear slots), BUT its get_dy/exchange dependency
+// graph is RICHER — verified statically against the captured runtimes (the pool references the MATH
+// library selectors 0x43d188fb/0x81d18d87/0xe6864766 and the factory selector 0xcab4d3db):
+//
+//   Pool 0x6e54…A9C2  (twocrypto-NG, coins crvUSD+WETH baked as immutables)
+//     ├ MATH library 0x7983…2e51  (CurveCryptoMathOptimized) — get_dy AND exchange STATICCALL it for
+//     │   newton_D / get_y (A-gamma invariant). A PURE library: no swap-relevant storage. The pool
+//     │   references it as a baked immutable address, so it MUST be etched at its captured address
+//     │   (the same V4 StateView→PoolManager / EIP-1167-impl immutable constraint) or the STATICCALL
+//     │   returns 0x → the invariant reads garbage → get_dy/exchange revert.
+//     └ Factory 0x98EE…AF7F  — exchange() reads factory.fee_receiver() (0xcab4d3db) in its admin-fee
+//         bookkeeping. This SAME address is ALSO the CurveCryptoRegistry discovery registry the
+//         production FactoryType.CurveCryptoRegistry path queries. So ONE shim at the factory address
+//         serves BOTH roles: it answers fee_receiver() (the CAPTURED real receiver address, from
+//         factory slot 3 — a benign scalar exchange stores for later admin claims; a single exchange
+//         makes NO transfer to it) AND the registry surface (find_pool_for_coins / get_coin_indices
+//         [UINT256 i,j — 2 words, NOT the StableSwap 3-word (i,j,underlying)] / get_n_coins /
+//         get_decimals[uint256[8]]). The real factory's find_pool_for_coins returns 0 for a PAIR
+//         lookup (Curve factories resolve by pool, not pair), so the shim faithfully stands in for the
+//         resolved registry the production reader would otherwise reach — read-only discovery metadata,
+//         output-irrelevant to the swap.
+//
+// EXECUTION vs VIEW — the honest fidelity split for CryptoSwap:
+//   • The EXECUTION path — exchange(uint256 i,j,dx,min_dy), what the recipe calls CALLBACK-FREE — runs
+//     the REAL etched pool + MATH runtimes end-to-end (newton_D/get_y + the A-gamma dynamic fee inline,
+//     the fee_receiver read serviced by the shim). 100% real captured code on the swap path.
+//   • The on-chain get_dy(uint256 i,j,dx) VIEW (the recipe's min_dy source AND the test's exact-in-dy
+//     ground truth) is ALSO fully self-contained in {pool, MATH} — it does NOT touch the factory — so
+//     it runs offline against the etched real code. (Contrast the StableSwap-NG pool, whose get_dy
+//     delegates to an uncaptured views contract; twocrypto-NG's get_dy is inline + MATH only.)
+//   • FIDELITY CAVEAT (disclosed): the off-chain `cryptoswap-math.ts` A-gamma replay mirrors the
+//     tricrypto-NG newton_D/newton_y specialised to N=2. For THIS pool's live params it does NOT
+//     reproduce the pool's own D()/get_dy to the wei (the twocrypto-NG MATH library and the recorded
+//     A()/gamma() scaling diverge from the tricrypto-NG replay), so the off-chain oracle CANNOT be the
+//     wei-exact ground truth for the real pool. The test therefore uses the pool's OWN on-chain get_dy
+//     view as the exact-in-dy ground truth (the ACTUAL swap math the recipe reads for min_dy) — a
+//     STRONGER cross-check than the off-chain replay, since it is the real Vyper+MATH curve. See the
+//     test's HONEST fidelity note.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Curve CryptoSwap bytecode snapshot: the self-contained NG pool + the MATH library + factory runtimes. */
+export interface CurveCryptoBytecodeSnapshot extends PoolBytecodeSnapshot {
+  /** MATH library + factory real runtimes (each sha256-anchored). */
+  dependencies?: DependencyBytecode[];
+}
+
+/** One coin in the captured CryptoSwap pool (address is a runtime IMMUTABLE — restored by setCode). */
+export interface CurveCryptoStateCoin {
+  address: Hex;
+  symbol: string;
+  decimals: number;
+}
+
+/** Curve CryptoSwap (twocrypto-NG) state snapshot (written by harness/curveCrypto-snapshot.ts). */
+export interface CurveCryptoStateSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  source: string;
+  onCharter?: boolean;
+  charterNote?: string;
+  pool: Hex;
+  factory: Hex;
+  registry: Hex;
+  math: Hex;
+  feeReceiver: Hex;
+  coinsImmutable: boolean;
+  coins: Hex[];
+  coin0: Hex;
+  coin1: Hex;
+  tokenIn: Hex;
+  tokenOut: Hex;
+  i: number;
+  j: number;
+  symbols: string[];
+  poolSymbol: string;
+  poolName: string;
+  decimals: number[];
+  precisions: string[];
+  A: string;
+  gamma: string;
+  priceScale: string;
+  priceOracle: string;
+  D: string;
+  balances: string[];
+  midFee: string;
+  outFee: string;
+  feeGamma: string;
+  fee: string;
+  totalSupply: string;
+  probe: {
+    sellCoin0: { i: number; j: number; dx: string; dy: string };
+    sellCoin1: { i: number; j: number; dx: string; dy: string };
+  };
+  storage: Record<string, Hex>;
+  factoryStorage: Record<string, Hex>;
+}
+
+/** Load a Curve CryptoSwap `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadCurveCryptoSnapshots(name: string): {
+  bytecode: CurveCryptoBytecodeSnapshot;
+  state: CurveCryptoStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as CurveCryptoBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as CurveCryptoStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Curve CryptoSwap bytecode integrity (NO RPC): re-hash the pool runtime + the MATH + factory
+ * dependency runtimes and match each capture-time sha256 anchor. Returns pool (via verifyBytecodeIntegrity's
+ * shape) + per-dependency {name, expected, actual, ok}. Reuses verifyDodoBytecodeIntegrity's structure.
+ */
+export function verifyCurveCryptoBytecodeIntegrity(bytecode: CurveCryptoBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const base = verifyBytecodeIntegrity(bytecode);
+  const dependencies = (bytecode.dependencies ?? []).map((d) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name: d.name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { pool: base.pool, dependencies };
+}
+
+/** CryptoRegistry-shim selectors (find_pool_for_coins / get_coin_indices[UINT256] / n_coins / decimals). */
+const CURVE_CRYPTO_REG_SELECTOR = {
+  findPool: "a87df06c", // find_pool_for_coins(address,address)      -> address
+  coinIndices: "eb85226d", // get_coin_indices(address,address,address) -> (uint256 i, uint256 j)  [2 words]
+  nCoins: "940494f1", // get_n_coins(address)                          -> uint256
+  decimals: "52b51555", // get_decimals(address)                       -> uint256[8]
+} as const;
+
+/** fee_receiver() selector the pool's exchange() reads on the factory. */
+const CURVE_CRYPTO_FEE_RECEIVER_SELECTOR = "cab4d3db";
+
+/**
+ * Build the Curve CryptoSwap combined factory-shim runtime from a captured state snapshot: ONE read-only
+ * contract at the factory address that answers BOTH the discovery-registry surface (find_pool_for_coins /
+ * get_coin_indices [UINT256 i,j — 2 words] / get_n_coins / get_decimals[8]) AND the pool's fee_receiver()
+ * read — constant per-pair responses (the captured pool/indices/n_coins/decimals/feeReceiver). Generalises
+ * `buildConstResponseShimRuntime`; every reply is a compile-time constant (the reader queries exactly this
+ * one pair; exchange reads the one fee_receiver), so a constant reply is faithful.
+ */
+export function buildCurveCryptoFactoryShimRuntime(state: CurveCryptoStateSnapshot): Hex {
+  const pool = BigInt(getAddress(state.pool));
+  const i = BigInt(state.i);
+  const j = BigInt(state.j);
+  const n = BigInt(state.coins.length);
+  const feeReceiver = BigInt(getAddress(state.feeReceiver));
+  const decWords: bigint[] = Array.from({ length: 8 }, (_, k) =>
+    k < state.coins.length ? BigInt(state.decimals[k]) : 0n,
+  );
+  return buildConstResponseShimRuntime([
+    { selector: CURVE_CRYPTO_REG_SELECTOR.findPool, words: [pool] },
+    { selector: CURVE_CRYPTO_REG_SELECTOR.coinIndices, words: [i, j] }, // UINT256 (i,j) — 2 words
+    { selector: CURVE_CRYPTO_REG_SELECTOR.nCoins, words: [n] },
+    { selector: CURVE_CRYPTO_REG_SELECTOR.decimals, words: decWords },
+    { selector: CURVE_CRYPTO_FEE_RECEIVER_SELECTOR, words: [feeReceiver] }, // exchange() admin-fee read
+  ]);
+}
+
+export interface EtchedCurveCryptoPool {
+  /** The pool address (the get_dy/exchange/discovery target — the captured mainnet address). */
+  pool: Hex;
+  /** The MATH library address (etched with the real CurveCryptoMathOptimized runtime at its captured address). */
+  math: Hex;
+  /** The factory/registry shim address (the CurveCryptoRegistry + fee_receiver source). */
+  registry: Hex;
+  /** The locally-deployed coins, etched at the REAL coin addresses (immutables ⇒ must live there). */
+  coins: Hex[];
+  /** tokenIn == coins[i], tokenOut == coins[j] — echoed for the test. */
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** The captured resolved fee_receiver (echoed for the test). */
+  feeReceiver: Hex;
+  /** Captured invariant params, echoed for the test. */
+  A: bigint;
+  gamma: bigint;
+  priceScale: bigint;
+  D: bigint;
+  midFee: bigint;
+  outFee: bigint;
+  feeGamma: bigint;
+  /** balances(k) — the pool's coin reserves (native units). */
+  balances: bigint[];
+}
+
+/**
+ * Stand up the captured REAL Curve CryptoSwap (twocrypto-NG) pool on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it AT EACH real coin address + seed its
+ *      `decimals` slot — because the pool's `coins(k)` are IMMUTABLES baked in the runtime, the local
+ *      tokens MUST live at those addresses (mirrors the StableSwap-NG / Wombat immutable-coin etch).
+ *      The pool's exchange() then PULLS the LOCAL storage-backed coin i via transferFrom + pays out j.
+ *   2. setCode the REAL MATH library runtime at its captured address (the pool STATICCALLs it for
+ *      newton_D/get_y — a baked immutable address, so it MUST sit there or the invariant reverts).
+ *   3. setCode the REAL NG pool runtime at its captured address (coins auto-restored via immutables).
+ *   4. setStorageAt the captured linear pool storage window VERBATIM (A / gamma / price_scale / D /
+ *      balances / dynamic-fee params / rate-oracle bookkeeping) — so A()/gamma()/price_scale()/D()/
+ *      balances(k) and the inline get_dy/exchange invariant compute the mainnet-identical dy.
+ *   5. setCode the combined READ-ONLY factory/registry shim at the captured factory address (constant
+ *      per-pair find_pool_for_coins / get_coin_indices / get_n_coins / get_decimals + fee_receiver).
+ *   6. Fund the pool with each coin's captured balance (so exchange() can pay out + the balance
+ *      invariants hold), + caller headroom in tokenIn.
+ *
+ * The swap path then runs the GENUINE pool + MATH bytecode: get_dy(i,j,dx) / exchange(i,j,dx,min_dy)
+ * compute the mainnet-identical dy (newton_D/get_y + the A-gamma dynamic fee) for the captured state and
+ * move the local coins. `opts.registryAddr` overrides the shim address (default: the captured factory).
+ */
+export async function etchCurveCryptoPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: CurveCryptoBytecodeSnapshot; state: CurveCryptoStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint; registryAddr?: Hex } = {},
+): Promise<EtchedCurveCryptoPool> {
+  const { bytecode, state } = snapshots;
+  if (bytecode.isMinimalProxy || bytecode.implementation) {
+    throw new Error("etchCurveCryptoPool expects a self-contained pool snapshot (no proxy/impl)");
+  }
+  // The A-gamma invariant is served by ONE OR MORE math contracts (twocrypto-ng splits
+  // CurveCryptoMathOptimized across a primary the pool STATICCALLs + a helper that primary calls) —
+  // etch EVERY captured math dependency (name "math" / "math-helper-*") at its captured address.
+  const mathDeps = (bytecode.dependencies ?? []).filter((d) => d.name === "math" || d.name.startsWith("math-helper"));
+  if (mathDeps.length === 0) throw new Error("etchCurveCryptoPool: no MATH library runtime in the bytecode snapshot");
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(bytecode.pool.address) as Hex;
+  const math = getAddress(mathDeps[0].address) as Hex; // the primary math (the pool's direct callee)
+  const registry = getAddress(opts.registryAddr ?? state.factory) as Hex;
+  const balances = state.balances.map((b) => BigInt(b));
+
+  // 1. Capture a local MintableERC20 runtime, then etch it at EACH real coin address + seed decimals.
+  const scratch = await deployToken(walletClient, publicClient, "curve-crypto-scratch", "CCSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  const coins: Hex[] = [];
+  for (let k = 0; k < state.coins.length; k++) {
+    const tok = getAddress(state.coins[k]) as Hex;
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({
+      address: tok,
+      index: slotHex(CURVE_ERC20_DECIMALS_SLOT),
+      value: word(BigInt(state.decimals[k])),
+    });
+    coins.push(tok);
+  }
+
+  // 2. Etch EVERY REAL MATH library runtime at its captured address (the pool STATICCALLs the primary,
+  //    which in turn STATICCALLs the helper — both must be present or the invariant reverts).
+  for (const md of mathDeps) {
+    await testClient.setCode({ address: getAddress(md.address) as Hex, bytecode: md.runtime });
+  }
+
+  // 3. Etch the REAL NG pool runtime at its captured address (coins restored via immutables).
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+
+  // 4. setStorageAt the captured linear pool storage window VERBATIM.
+  for (const [k, v] of Object.entries(state.storage)) {
+    await testClient.setStorageAt({ address: pool, index: slotHex(Number(k)), value: v });
+  }
+
+  // 5. Combined read-only factory/registry shim at the captured factory address (discovery + fee_receiver).
+  await testClient.setCode({ address: registry, bytecode: buildCurveCryptoFactoryShimRuntime(state) });
+
+  // 6. Fund the pool with each coin's captured balance (so exchange() can pay out) + caller headroom.
+  for (let k = 0; k < coins.length; k++) {
+    await mint(walletClient, publicClient, coins[k], pool, balances[k]);
+  }
+  const tokenIn = coins[state.i];
+  const tokenOut = coins[state.j];
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    math,
+    registry,
+    coins,
+    tokenIn,
+    tokenOut,
+    feeReceiver: getAddress(state.feeReceiver) as Hex,
+    A: BigInt(state.A),
+    gamma: BigInt(state.gamma),
+    priceScale: BigInt(state.priceScale),
+    D: BigInt(state.D),
+    midFee: BigInt(state.midFee),
+    outFee: BigInt(state.outFee),
+    feeGamma: BigInt(state.feeGamma),
+    balances,
+  };
+}
+
+/** Curve CryptoSwap (twocrypto-NG) pool read surface (the getters the test + discovery read). */
+export const curveCryptoPoolReadAbi = parseAbi([
+  "function A() view returns (uint256)",
+  "function gamma() view returns (uint256)",
+  "function price_scale() view returns (uint256)",
+  "function D() view returns (uint256)",
+  "function mid_fee() view returns (uint256)",
+  "function out_fee() view returns (uint256)",
+  "function fee_gamma() view returns (uint256)",
+  "function balances(uint256 i) view returns (uint256)",
+  "function coins(uint256 i) view returns (address)",
+  "function fee_receiver() view returns (address)",
+  // get_dy is the REAL exact quote (self-contained in pool + MATH) — the exact-in-dy ground truth.
+  "function get_dy(uint256 i, uint256 j, uint256 dx) view returns (uint256)",
+  // exchange is the REAL execution path — read-only via eth_call on the pre-swap state = the quote.
+  "function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) returns (uint256)",
+]);
+
+/** Curve CryptoSwap factory/registry shim read surface (the registry getters discovery reads + fee_receiver). */
+export const curveCryptoRegistryShimAbi = parseAbi([
+  "function find_pool_for_coins(address from, address to) view returns (address)",
+  "function get_coin_indices(address pool, address from, address to) view returns (uint256 i, uint256 j)",
+  "function get_n_coins(address pool) view returns (uint256)",
+  "function get_decimals(address pool) view returns (uint256[8])",
+  "function fee_receiver() view returns (address)",
+]);
+
 export { erc20Abi };
