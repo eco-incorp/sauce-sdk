@@ -92,7 +92,7 @@ export enum FactoryType {
   CurveCryptoRegistry = "curve-crypto-registry",
   /** Balancer V2: pool address → getPoolId() → Vault.swap() */
   BalancerV2 = "balancer-v2",
-  /** DODO V2: getDODO(base, quote) → sellBase/sellQuote */
+  /** DODO V2 (DVMFactory): getDODOPool(base, quote) → address[] → sellBase/sellQuote */
   DODOZoo = "dodo-zoo",
   /** Trader Joe LB: getLBPairInformation(tokenX, tokenY, binStep) */
   TraderJoeLB = "trader-joe-lb",

@@ -387,7 +387,7 @@ export const solidlyPoolReadAbi = parseAbi([
 // querySellBase|Quote / sellBase|sellQuote), computing the mainnet-identical PMM integral.
 //
 // DEPENDENCY CONTRACTS the DSP swap/quote path touches (beyond pool + impl):
-//   • the DODO factory (getDODO(base,quote) → address[]) the production FactoryType.DODOZoo
+//   • the DODO DVMFactory (getDODOPool(base,quote) → address[]) the production FactoryType.DODOZoo
 //     discovery reads — stood up as a tiny read-only shim returning [pool] for the pair (and
 //     an empty array otherwise). NO factory graph rebuild needed.
 //   • the MT (maintainer) FEE-RATE MODEL. The DSP's querySell*/sell* read the maintainer fee
@@ -492,16 +492,22 @@ const DSP_SLOT = {
   mtFeeRateModel: 14,
 } as const;
 
-/** getDODO(address,address) selector (production FactoryType.DODOZoo discovery). */
-const GET_DODO_SELECTOR = "1273b0c6";
+/** getDODOPool(address,address) selector — the REAL DVMFactory getter the production
+ *  FactoryType.DODOZoo discovery calls (verified on-chain; the V1 Zoo `getDODO` reverts on it). */
+const GET_DODO_POOL_SELECTOR = "57a281dc";
 
 /**
- * A minimal read-only DODO FACTORY shim: getDODO(base,quote) → the single reproduced pool as a
- * one-element address[]; every other pair / selector → an empty address[]. We setCode this at the
+ * A minimal read-only DODO DVMFactory shim: getDODOPool(base,quote) → the single reproduced pool as
+ * a one-element address[]; every other pair / selector → an empty address[]. We setCode this at the
  * captured factory address and store the pool at slot0. NO Solidity compile, NO write tx.
  *
+ * This shim implements the REAL getter (getDODOPool), NOT the V1 Zoo `getDODO` — so the prod-mirror
+ * exercises the exact discovery call path production uses and can no longer MASK a wrong-getter
+ * mismatch (a shim that answered getDODO would reply to a call the fixed discovery never makes,
+ * so discovery would find nothing — the test would fail loudly rather than pass on a fiction).
+ *
  * ABI return for a one-element address[]: head offset 0x20, then [length=1, pool] — 3 words.
- * Empty array: [0x20, 0] — 2 words. The shim answers getDODO unconditionally (address-agnostic):
+ * Empty array: [0x20, 0] — 2 words. The shim answers getDODOPool unconditionally (address-agnostic):
  * the test stands up exactly ONE DODO pool for the pair, so a constant reply is faithful (the
  * production discovery queries BOTH orderings and de-dupes on the pool address, so replying the
  * SAME pool to both orderings is correct — the second is dropped by discovery's `seen` set).
@@ -509,10 +515,10 @@ const GET_DODO_SELECTOR = "1273b0c6";
 export function buildDodoFactoryShimRuntime(): Hex {
   // Runtime:
   //   sel = shr(0xe0, calldataload(0))
-  //   if sel == getDODO: mstore(0,0x20); mstore(0x20,1); mstore(0x40,sload(0)); return(0,0x60)
-  //   else:              mstore(0,0x20); mstore(0x20,0);                        return(0,0x40)
+  //   if sel == getDODOPool: mstore(0,0x20); mstore(0x20,1); mstore(0x40,sload(0)); return(0,0x60)
+  //   else:                  mstore(0,0x20); mstore(0x20,0);                        return(0,0x40)
   //
-  // Hand-assembled with an offset-exact JUMPDEST for the getDODO body.
+  // Hand-assembled with an offset-exact JUMPDEST for the getDODOPool body.
   const bytes = (h: string) => h.length / 2;
   const header = "60003560e01c"; // PUSH1 0 CALLDATALOAD PUSH1 0xe0 SHR
   // DUP1 PUSH4 <sel> EQ PUSH2 <dest> JUMPI
@@ -521,15 +527,15 @@ export function buildDodoFactoryShimRuntime(): Hex {
   // Empty-array body (fallthrough): mstore(0,0x20) mstore(0x20,0) return(0,0x40)
   //   PUSH1 0x20 PUSH1 0 MSTORE  PUSH1 0 PUSH1 0x20 MSTORE  PUSH1 0x40 PUSH1 0 RETURN
   const emptyBody = "6020600052" + "6000602052" + "604060" + "00f3";
-  // getDODO body (JUMPDEST): mstore(0,0x20) mstore(0x20,1) mstore(0x40,sload(0)) return(0,0x60)
+  // getDODOPool body (JUMPDEST): mstore(0,0x20) mstore(0x20,1) mstore(0x40,sload(0)) return(0,0x60)
   //   JUMPDEST PUSH1 0x20 PUSH1 0 MSTORE  PUSH1 1 PUSH1 0x20 MSTORE
   //   PUSH1 0 SLOAD PUSH1 0x40 MSTORE  PUSH1 0x60 PUSH1 0 RETURN
   const dodoBody =
     "5b" + "6020600052" + "6001602052" + "600054604052" + "606060" + "00f3";
 
-  const dispatchLen = bytes(header) + bytes(cmp(GET_DODO_SELECTOR, 0)) + bytes(emptyBody);
-  const dodoDest = dispatchLen; // getDODO JUMPDEST sits right after the empty-array fallthrough
-  const code = header + cmp(GET_DODO_SELECTOR, dodoDest) + emptyBody + dodoBody;
+  const dispatchLen = bytes(header) + bytes(cmp(GET_DODO_POOL_SELECTOR, 0)) + bytes(emptyBody);
+  const dodoDest = dispatchLen; // getDODOPool JUMPDEST sits right after the empty-array fallthrough
+  const code = header + cmp(GET_DODO_POOL_SELECTOR, dodoDest) + emptyBody + dodoBody;
   return ("0x" + code) as Hex;
 }
 
@@ -541,11 +547,11 @@ const GET_FEE_RATE_SELECTOR = "8198edbf";
 const FEE_RATE_SELECTOR = "bd2e6ca3";
 
 export interface EtchedDodoPool {
-  /** The DSP pool address (the getDODO / sell target discovery resolves). */
+  /** The DSP pool address (the getDODOPool / sell target discovery resolves). */
   pool: Hex;
   /** The DSP implementation address (etched with the real impl runtime). */
   impl: Hex;
-  /** The DODO factory shim (getDODO) — point a poolConfig DODOZoo factory here. */
+  /** The DODO DVMFactory shim (getDODOPool) — point a poolConfig DODOZoo factory here. */
   factory: Hex;
   /** The MT fee-rate model shim (getFeeRate / _FEE_RATE_) at its captured address. */
   mtFeeModel: Hex;
@@ -681,9 +687,9 @@ export const dodoPoolReadAbi = parseAbi([
   "function version() view returns (string)",
 ]);
 
-/** DODO factory shim read surface (getDODO). */
+/** DODO DVMFactory shim read surface (getDODOPool — the REAL getter). */
 export const dodoFactoryShimAbi = parseAbi([
-  "function getDODO(address baseToken, address quoteToken) view returns (address[] pools)",
+  "function getDODOPool(address baseToken, address quoteToken) view returns (address[] machines)",
 ]);
 
 /** MT fee-rate model shim read surface (getFeeRate / _FEE_RATE_). */
@@ -2456,7 +2462,7 @@ const MAVERICK_LOOKUP_SELECTOR = "e262790d";
  * [0x20, 0] — 2 words. The shim answers lookup UNCONDITIONALLY (address/index-agnostic): the test stands
  * up exactly ONE Maverick pool for the pair, and discovery queries BOTH token orderings + de-dupes on the
  * pool address, so replying the SAME pool to both orderings is correct (the second is dropped by the
- * `seen` set). This mirrors buildDodoFactoryShimRuntime's getDODO array reply, retargeted to `lookup`.
+ * `seen` set). This mirrors buildDodoFactoryShimRuntime's getDODOPool array reply, retargeted to `lookup`.
  */
 export function buildMaverickFactoryShimRuntime(): Hex {
   const bytes = (h: string) => h.length / 2;

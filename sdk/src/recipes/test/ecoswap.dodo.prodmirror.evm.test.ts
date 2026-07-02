@@ -18,7 +18,7 @@
  *   ETCH (this test, OFFLINE): boot a plain anvil (NO fork); setCode the REAL DSP impl at its
  *     captured address + the REAL proxy at the pool address; setStorageAt the captured storage,
  *     then repoint _BASE_TOKEN_/_QUOTE_TOKEN_ at local MintableERC20s and stand up (a) a tiny DODO
- *     factory shim (getDODO) at the captured factory address and (b) a tiny MT fee-rate model shim
+ *     DVMFactory shim (getDODOPool — the REAL getter) at the captured factory address and (b) a tiny MT fee-rate model shim
  *     returning the CAPTURED RESOLVED mtFeeRate at the captured MT address. The swap then runs the
  *     GENUINE DSP bytecode: querySellBase returns the mainnet-identical dy for the captured PMM state.
  *
@@ -236,12 +236,14 @@ describe("EcoSwap DODO V2 (DSP) prod-mirror — REAL bytecode, no fork, offline"
     assert.equal(sq[0], BigInt(snaps.state.probe.sellQuote.receiveBaseAmount), "REAL querySellQuote(probe) == captured mainnet value");
     assert.equal(sq[1], BigInt(snaps.state.probe.sellQuote.mtFee), "REAL querySellQuote(probe) mtFee == captured");
 
-    // The DODO factory shim resolves the pool the production discovery path reads.
+    // The DODO DVMFactory shim resolves the pool the production discovery path reads — via the REAL
+    // getter getDODOPool (NOT the V1 Zoo getDODO), so this exercises the exact call the fixed
+    // discovery makes and can no longer mask a wrong-getter mismatch.
     const gd = (await c.publicClient.readContract({
-      address: etched.factory, abi: dodoFactoryShimAbi, functionName: "getDODO", args: [etched.baseToken, etched.quoteToken],
+      address: etched.factory, abi: dodoFactoryShimAbi, functionName: "getDODOPool", args: [etched.baseToken, etched.quoteToken],
     })) as readonly Hex[];
-    assert.equal(gd.length, 1, "shim getDODO returns exactly one pool");
-    assert.equal(gd[0].toLowerCase(), etched.pool.toLowerCase(), "shim getDODO resolves the etched pool");
+    assert.equal(gd.length, 1, "shim getDODOPool returns exactly one pool");
+    assert.equal(gd[0].toLowerCase(), etched.pool.toLowerCase(), "shim getDODOPool resolves the etched pool");
 
     // The MT fee-rate model shim returns the captured resolved rate for both readers.
     const [gfr, fr] = await Promise.all([

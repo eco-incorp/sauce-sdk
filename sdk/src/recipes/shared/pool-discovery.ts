@@ -216,8 +216,13 @@ const balancerVaultAbi = parseAbi([
   "function getPoolTokens(bytes32 poolId) external view returns (address[] tokens, uint256[] balances, uint256 lastChangeBlock)",
 ]);
 
-const dodoZooAbi = parseAbi([
-  "function getDODO(address baseToken, address quoteToken) external view returns (address[] pools)",
+// DODO V2 registry/factory getter. The wired FactoryType.DODOZoo address is a DVMFactory (verified
+// on-chain: getDODOPool(base,quote) returns a flat address[] of PMM pools; the DODO V1 Zoo getter
+// `getDODO` REVERTS on it — see the historical wrong-getter bug). The registry is base/quote-ORIENTED
+// (a pair registered as base=X,quote=Y answers only that ordering), so discovery queries BOTH
+// orderings and de-dupes on the returned pool address.
+const dodoFactoryAbi = parseAbi([
+  "function getDODOPool(address baseToken, address quoteToken) external view returns (address[] machines)",
 ]);
 
 const dodoPoolAbi = parseAbi([
@@ -1423,51 +1428,64 @@ async function discoverDODOPools(
 
   const pools: PoolInfo[] = [];
   for (const zoo of zoos) {
-    // DODO is order-dependent (base/quote), try both orderings
+    // DODO is base/quote-ORIENTED: query BOTH orderings and de-dupe. getDODOPool returns [] for a
+    // pair it does not register (a clean "no pool"); a REVERT means the getter/ABI is wrong or the
+    // factory is absent — surfaced as a warning below rather than silently swallowed as "no pools".
+    let reverts = 0;
     for (const [base, quote] of [[tokenIn, tokenOut], [tokenOut, tokenIn]] as [Hex, Hex][]) {
+      let addresses: string[];
       try {
-        const addresses = await client.readContract({
+        addresses = (await client.readContract({
           address: zoo.address,
-          abi: dodoZooAbi,
-          functionName: "getDODO",
+          abi: dodoFactoryAbi,
+          functionName: "getDODOPool",
           args: [base, quote],
-        }) as string[];
-
-        for (const addr of addresses) {
-          if (!addr || addr === ZERO_ADDRESS) continue;
-
-          try {
-            const [baseReserve, quoteReserve] = await Promise.all([
-              client.readContract({ address: addr as Hex, abi: dodoPoolAbi, functionName: "_BASE_RESERVE_" }) as Promise<bigint>,
-              client.readContract({ address: addr as Hex, abi: dodoPoolAbi, functionName: "_QUOTE_RESERVE_" }) as Promise<bigint>,
-            ]);
-
-            if (baseReserve === 0n || quoteReserve === 0n) continue;
-
-            const syntheticLiquidity = sqrt(baseReserve * quoteReserve);
-            const Q96 = 1n << 96n;
-            const syntheticSqrtPrice = baseReserve > 0n
-              ? (sqrt(quoteReserve * Q96 * Q96) * Q96) / sqrt(baseReserve * Q96 * Q96)
-              : 1n;
-
-            pools.push({
-              address: addr as Hex,
-              tokenIn,
-              tokenOut,
-              fee: 0, // DODO uses dynamic fees
-              poolType: SwapPoolType.DODOV2,
-              priceLimited: false,
-              sqrtPriceX96: syntheticSqrtPrice > 0n ? syntheticSqrtPrice : 1n,
-              liquidity: syntheticLiquidity,
-              source: zoo.label,
-            });
-          } catch {
-            // Pool state read failed
-          }
-        }
+        })) as string[];
       } catch {
-        // getDODO call failed
+        reverts++;
+        continue;
       }
+
+      for (const addr of addresses) {
+        if (!addr || addr === ZERO_ADDRESS) continue;
+
+        try {
+          const [baseReserve, quoteReserve] = await Promise.all([
+            client.readContract({ address: addr as Hex, abi: dodoPoolAbi, functionName: "_BASE_RESERVE_" }) as Promise<bigint>,
+            client.readContract({ address: addr as Hex, abi: dodoPoolAbi, functionName: "_QUOTE_RESERVE_" }) as Promise<bigint>,
+          ]);
+
+          if (baseReserve === 0n || quoteReserve === 0n) continue;
+
+          const syntheticLiquidity = sqrt(baseReserve * quoteReserve);
+          const Q96 = 1n << 96n;
+          const syntheticSqrtPrice = baseReserve > 0n
+            ? (sqrt(quoteReserve * Q96 * Q96) * Q96) / sqrt(baseReserve * Q96 * Q96)
+            : 1n;
+
+          pools.push({
+            address: addr as Hex,
+            tokenIn,
+            tokenOut,
+            fee: 0, // DODO uses dynamic fees
+            poolType: SwapPoolType.DODOV2,
+            priceLimited: false,
+            sqrtPriceX96: syntheticSqrtPrice > 0n ? syntheticSqrtPrice : 1n,
+            liquidity: syntheticLiquidity,
+            source: zoo.label,
+          });
+        } catch {
+          // Pool state read failed
+        }
+      }
+    }
+    // Both orderings reverted (never a clean []): the getter is wrong or the factory has no code.
+    // Loud (not silent) so a wrong-getter regression can't masquerade as "pair has no pool".
+    if (reverts === 2) {
+      console.warn(
+        `[dodo] getDODOPool reverted on both orderings for ${zoo.label} @ ${zoo.address} ` +
+          `(pair ${tokenIn}/${tokenOut}) — factory absent or ABI mismatch; no pools discovered.`,
+      );
     }
   }
 
@@ -1496,7 +1514,7 @@ async function discoverDODOPools(
  *
  * Mirrors `discoverCurvePoolsTyped`: off-chain discovery + state reads, returning the venue
  * descriptor EcoSwap prepare consumes directly (the on-chain lens does not understand DODO). Zoo
- * path: getDODO(base, quote) over BOTH orderings (DODO pools are base/quote-oriented, so the pair
+ * path: getDODOPool(base, quote) over BOTH orderings (DODO pools are base/quote-oriented, so the pair
  * may be registered either way); pool path: getPMMStateForCall() + _BASE_TOKEN_()/_QUOTE_TOKEN_() +
  * _LP_FEE_RATE_() + the MT fee-rate model getFeeRate(caller). The DODO registry/factory address is
  * the `DODOZoo` FactoryConfig entry (documented placeholders per chain in constants.ts).
@@ -1519,8 +1537,12 @@ export async function discoverDodoV2PoolsTyped(
   const inLower = tokenIn.toLowerCase();
 
   for (const zoo of zoos) {
-    // DODO is base/quote-oriented — query both orderings; the pool's own _BASE_TOKEN_() is the
-    // authoritative orientation (sellBase = tokenIn is the base).
+    // DODO is base/quote-oriented — query BOTH orderings via getDODOPool (the real DVMFactory getter,
+    // verified on-chain: returns a flat address[] of machines; the V1 Zoo `getDODO` reverts on it).
+    // The pool's own _BASE_TOKEN_() is the authoritative orientation (sellBase = tokenIn is the base).
+    // getDODOPool returns [] for an unregistered pair (clean "no pool"); a REVERT on BOTH orderings
+    // means the getter/ABI is wrong or the factory is absent — surfaced (not silently swallowed).
+    let reverts = 0;
     for (const [base, quote] of [
       [tokenIn, tokenOut],
       [tokenOut, tokenIn],
@@ -1529,11 +1551,12 @@ export async function discoverDodoV2PoolsTyped(
       try {
         addresses = (await client.readContract({
           address: zoo.address,
-          abi: dodoZooAbi,
-          functionName: "getDODO",
+          abi: dodoFactoryAbi,
+          functionName: "getDODOPool",
           args: [base, quote],
         })) as string[];
       } catch {
+        reverts++;
         continue;
       }
 
@@ -1616,6 +1639,14 @@ export async function discoverDodoV2PoolsTyped(
           // Pool state read failed (non-PMM surface / partial pool) — skip.
         }
       }
+    }
+    // Both orderings reverted (never a clean []): the getter is wrong or the factory has no code.
+    // Loud (not silent) so a wrong-getter regression can't masquerade as "pair has no pool".
+    if (reverts === 2) {
+      console.warn(
+        `[dodo] getDODOPool reverted on both orderings for ${zoo.label} @ ${zoo.address} ` +
+          `(pair ${tokenIn}/${tokenOut}) — factory absent or ABI mismatch; no pools discovered.`,
+      );
     }
   }
 
