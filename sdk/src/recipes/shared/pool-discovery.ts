@@ -311,11 +311,16 @@ const fermiPoolAbi = parseAbi([
 // — so the quote goes through the same resolver's
 // `estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) -> uint256 amountOut`,
 // which does the pool's revert-decode in Solidity and returns a plain uint256.
-// estimateSwapIn is `payable` on-chain (it wraps the pool's mutating swapIn in a try/catch), but it is
-// side-effect-free (the pool reverts with the result BEFORE touching the Liquidity layer when
-// to == ADDRESS_DEAD) so an eth_call reads it cleanly. Declared `view` here only so viem's typed
-// `readContract` accepts it — eth_call does not enforce mutability. The on-chain solver staticcalls it too.
-// getDexTokens is a plain resolver view.
+// estimateSwapIn is `payable` (non-view) on-chain: it wraps the pool's swapIn in a try/catch, and the REAL
+// FluidDexT1 pool TOUCHES STATE on the ADDRESS_DEAD estimate path BEFORE it reverts with the result (verified
+// by ecoswap.fluid.prodmirror.evm.test.ts: a STATICCALL to the real resolver returns 0 because the state
+// write in the reverting sub-call is forbidden under STATICCALL — the mock fixture happens to revert with a
+// pure result before any write, masking this). So the on-chain solver must emit a plain CALL (NOT a
+// STATICCALL) — the recipe's IFluidDexResolver.json marks estimateSwapIn `nonpayable` for exactly this; the
+// internal ADDRESS_DEAD revert rolls back any state, so the CALL is side-effect-free in effect. Here in
+// DISCOVERY it is read off-chain via viem's `readContract`, whose eth_call is a top-level call (not the
+// STATICCALL opcode) that permits — and discards — the sub-call's state write, so it reads cleanly; the
+// `view` mutability below is only so viem's typed `readContract` accepts it. getDexTokens is a plain view.
 const fluidResolverAbi = parseAbi([
   "function getDexTokens(address dex) external view returns (address token0, address token1)",
   "function estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) external view returns (uint256 amountOut)",

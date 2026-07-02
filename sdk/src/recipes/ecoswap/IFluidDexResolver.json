@@ -13,7 +13,7 @@
     {
       "type": "function",
       "name": "estimateSwapIn",
-      "stateMutability": "view",
+      "stateMutability": "nonpayable",
       "inputs": [
         { "name": "dex", "type": "address" },
         { "name": "swap0to1", "type": "bool" },

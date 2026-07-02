@@ -42,13 +42,15 @@ import {
   getAddress,
   pad,
   toHex as viemToHex,
+  keccak256,
+  encodeAbiParameters,
   type Hex,
   type Account,
   type PublicClient,
   type WalletClient,
 } from "viem";
 
-import { deployToken, erc20Abi, mint } from "./setup";
+import { deployToken, deployBurnableToken, erc20Abi, mint } from "./setup";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SNAP_DIR = join(__dirname, "..", "fixtures", "snapshots");
@@ -2986,4 +2988,855 @@ export const lbPairReadAbi = parseAbi([
 /** LB v2.2 factory shim read surface (getLBPairInformation). */
 export const lbFactoryShimAbi = parseAbi([
   "function getLBPairInformation(address tokenX, address tokenY, uint256 binStep) view returns (uint256 binStep2, address LBPair, bool createdByOwner, bool ignoredForRouting)",
+]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — a Liquidity-Layer-backed re-centering AMM)
+// prod-mirror etch — ADDITIVE extension of this harness.
+//
+// A FluidDexT1 pool is NEITHER an EIP-1167 clone NOR a standalone reserve pool. Its price comes from the
+// SHARED Liquidity-Layer supply/borrow exchange prices + a re-centering center price + utilization/borrow
+// caps — ALL canonical on-chain state living across a MULTI-CONTRACT graph — so there is NO closed-form
+// curve to replay off-chain and NO getAmountOut view on the pool. The FULL quote/swap dependency graph the
+// test reproduces (enumerated at capture via `cast access-list` + a `cast run` call-tree, see
+// harness/fluid-snapshot.ts) is:
+//
+//   pool (FluidDexT1 0x6677…)            — token0/token1 + the module map are IMMUTABLES in the runtime
+//     ├ resolver (DexResolver 0x11D8…)   — the quote surface getDexTokens + estimateSwapIn (pure logic;
+//     │                                    reads NO storage of its own — it staticcalls the pool)
+//     └ liquidity (InfiniteProxy 0x52Aa…)— the shared Liquidity layer the pool SLOADs (packed exchange
+//          ├ operate module   (0x4bDC…)    prices / supply-borrow / center-price) for the estimate AND
+//          └ secondary module (0x4350…)    DELEGATECALLs into for the exec operate() (the 2 dispatch targets)
+//
+// The SAME etch-runtime mechanism applies (setCode every REAL runtime at its captured address, setStorageAt
+// the captured state VERBATIM by ABSOLUTE key), with TWO Fluid-specific wrinkles:
+//
+//   • token0/token1 ARE IMMUTABLES. The DexT1 pool bakes token0/token1 into its runtime (exposed only
+//     inside constantsView()'s struct — there are NO token0()/token1() getters), so the test CANNOT repoint
+//     them via setStorageAt. It etches a local MintableERC20 AT EACH REAL token address (USDC + USDT) and
+//     seeds its `decimals` slot (mirrors Wombat's immutable-underlying / WOOFi's mapping-keyed token etch).
+//     The pool then pulls/pays the LOCAL (storage-backed) tokens while its immutables == the real addresses.
+//   • BLOCK TIMESTAMP MUST BE PINNED to storedTs + a few seconds. Fluid's exchange-price accrual computes
+//     `block.timestamp - lastUpdateTimestamp`; at now == storedTs it PANICS 0x11 (underflow) → the resolver
+//     catches it → returns 0, and a large positive delta ACCRUES the prices away from the captured probe. A
+//     fresh anvil's genesis clock is at wall-time (already PAST storedTs on a 2026 machine), so the test
+//     uses `anvil_setTime` (which CAN jump BACKWARD, unlike setNextBlockTimestamp) to land the next mined
+//     block at storedTs + delta (verified bit-exact for 1..12s — see pinFluidBlockTimestamp). NOTE: the
+//     etch alone leaves the clock at wall-time — the test MUST call pinFluidBlockTimestamp AFTER etching and
+//     BEFORE the first quote/cook, and every fresh anvil (per engine cell) must re-pin.
+//
+// NO factory shim is needed: the production FactoryType.Fluid discovery reads the RESOLVER's getDexTokens +
+// estimateSwapIn (a config-carried resolver address) and the FactoryConfig.fluidPools list directly — so
+// reconstructing the pool + resolver + Liquidity graph state is sufficient for discovery to surface the
+// venue. The on-chain execution is CALLBACK-FREE (a live resolver estimateSwapIn staticcall for
+// amountOutMin + approve + pool.swapIn — Fluid PULLS via safeTransferFrom, re-entering its OWN Liquidity
+// layer via operate(), never the cooking contract), so no engine SwapPoolType and no router dispatch.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Fluid bytecode snapshot: the DexT1 pool + the resolver + the Liquidity proxy + its 2 modules (each
+ *  sha256-anchored). Same {pool, dependencies[]} shape as the DODO/Balancer snapshots. */
+export interface FluidBytecodeSnapshot extends PoolBytecodeSnapshot {
+  blockTimestamp?: string;
+  dependencies?: DependencyBytecode[];
+}
+
+/** Fluid state snapshot (written by harness/fluid-snapshot.ts). */
+export interface FluidStateSnapshot {
+  chain: string;
+  block: string;
+  /** The pinned block's timestamp — the test pins block.timestamp to this + a few seconds (accrual). */
+  blockTimestamp: string;
+  pool: Hex;
+  resolver: Hex;
+  factory: Hex;
+  liquidity: Hex;
+  proxyAdmin: Hex;
+  proxyDummyImplementation: Hex;
+  implementations: Hex[];
+  deployer: Hex;
+  operateDispatchSlot: Hex;
+  operateModule: Hex;
+  secondaryModule: Hex;
+  token0: Hex;
+  token1: Hex;
+  token0Symbol: string;
+  token1Symbol: string;
+  token0Decimals: number;
+  token1Decimals: number;
+  /** The REAL Liquidity-layer reserves at the pinned block (the test funds the etched proxy with these). */
+  liquidityReserve0: string;
+  liquidityReserve1: string;
+  /** Wei-exact anchor: the resolver estimateSwapIn ladder (== the real swapIn output), both directions. */
+  probe: {
+    swap0to1: { amountIn: string; amountOut: string }[];
+    swap1to0: { amountIn: string; amountOut: string }[];
+  };
+  /** Raw pool storage window (absolute slot → value), set verbatim on the etched pool. */
+  poolStorage: Record<string, Hex>;
+  /** The Liquidity proxy's touched slots (absolute slot → value), set verbatim on the etched proxy. */
+  liquidityStorage: Record<string, Hex>;
+}
+
+/** Load a Fluid `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadFluidSnapshots(name: string): {
+  bytecode: FluidBytecodeSnapshot;
+  state: FluidStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as FluidBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as FluidStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Fluid bytecode integrity (NO RPC): re-hash the pool runtime + every dependency runtime
+ * (resolver + Liquidity proxy + the two modules) and match each capture-time sha256 anchor. Returns pool
+ * (via verifyBytecodeIntegrity's shape) + per-dependency {name, expected, actual, ok}. Reuses the DODO/
+ * Balancer {pool, dependencies[]} structure.
+ */
+export function verifyFluidBytecodeIntegrity(bytecode: FluidBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const base = verifyBytecodeIntegrity(bytecode);
+  const dependencies = (bytecode.dependencies ?? []).map((d) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name: d.name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { pool: base.pool, dependencies };
+}
+
+/** A minimal test-client surface for the Fluid block-timestamp pin (anvil_setTime + mine). */
+type FluidTimeClient = {
+  request: (args: { method: string; params: unknown[] }) => Promise<unknown>;
+  mine: (a: { blocks: number }) => Promise<void>;
+  getBlockTimestamp?: () => Promise<bigint>;
+};
+
+/**
+ * Pin the anvil block clock to `state.blockTimestamp + deltaSeconds` (default 3) and mine one block, so the
+ * next quote/cook sees a `block.timestamp` a FEW seconds past the pinned block's stored `lastUpdateTimestamp`
+ * — the ONLY window in which Fluid's exchange-price accrual (`block.timestamp - lastUpdateTimestamp`) is
+ * (a) non-underflowing (it PANICS 0x11 at delta==0) and (b) below the accrual rounding quantum (so the
+ * resolver quote stays BIT-EXACT with the captured probe; verified 1..12s). Uses `anvil_setTime`, which CAN
+ * jump BACKWARD — a fresh anvil's genesis clock is at wall-time (PAST storedTs on a 2026 machine), and
+ * `evm_setNextBlockTimestamp` refuses to go backward. Call AFTER etching and BEFORE the first quote/cook, on
+ * EVERY fresh anvil.
+ */
+export async function pinFluidBlockTimestamp(
+  testClient: FluidTimeClient,
+  state: { blockTimestamp: string },
+  deltaSeconds = 3,
+): Promise<bigint> {
+  const ts = BigInt(state.blockTimestamp) + BigInt(deltaSeconds);
+  await testClient.request({ method: "anvil_setTime", params: [Number(ts)] });
+  await testClient.mine({ blocks: 1 });
+  return ts;
+}
+
+export interface EtchedFluidPool {
+  /** The FluidDexT1 pool address (the swapIn / approve target + the resolver `dex_` arg — captured mainnet address). */
+  pool: Hex;
+  /** The periphery DexResolver address (the getDexTokens / estimateSwapIn quote target). */
+  resolver: Hex;
+  /** The shared Liquidity-layer InfiniteProxy address (funded with the reserves so the pool can pay out). */
+  liquidity: Hex;
+  /** token0/token1 — local MintableERC20s etched at the REAL token addresses (Fluid immutables). */
+  token0: Hex;
+  token1: Hex;
+  token0Decimals: number;
+  token1Decimals: number;
+  /** Captured Liquidity-layer reserves, echoed for the test. */
+  reserve0: bigint;
+  reserve1: bigint;
+  /** The pinned block timestamp (state.blockTimestamp) the test must pin the clock to (+ a few s). */
+  blockTimestamp: bigint;
+}
+
+/**
+ * Stand up the captured REAL Fluid DexT1 pool + its whole quote/swap contract graph on the local anvil,
+ * OFFLINE. (Proven bit-exact vs the captured probe — see harness/fluid-snapshot.ts's anchor.)
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it AT EACH REAL token address (token0=USDC,
+ *      token1=USDT) + seed its `decimals` slot — because token0/token1 are IMMUTABLES baked into the pool
+ *      runtime (read via constantsView()), the local tokens MUST live at the real addresses.
+ *   2. setCode the REAL pool runtime at its captured address + EVERY dependency runtime (resolver +
+ *      Liquidity proxy + the operate/secondary modules) at its captured address.
+ *   3. setStorageAt the pool's captured storage + the Liquidity proxy's captured touched slots, VERBATIM by
+ *      ABSOLUTE key (incl. the operate() sig→module dispatch entry + the packed exchange-price slots).
+ *   4. Fund the etched Liquidity proxy with the captured reserves (so swapIn can pay the output out), +
+ *      caller headroom in the from-token.
+ *
+ * The swap path then runs the GENUINE pool + resolver + Liquidity bytecode: resolver.estimateSwapIn returns
+ * the mainnet-identical dy for the captured layer state, and pool.swapIn PULLS the from-token via
+ * safeTransferFrom into the Liquidity layer + pays out the to-token. NOTE: the caller MUST call
+ * pinFluidBlockTimestamp after this and before the first quote/cook (Fluid accrual — see the header).
+ */
+export async function etchFluidPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: FluidBytecodeSnapshot; state: FluidStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedFluidPool> {
+  const { bytecode, state } = snapshots;
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const pool = getAddress(state.pool) as Hex;
+  const resolver = getAddress(state.resolver) as Hex;
+  const liquidity = getAddress(state.liquidity) as Hex;
+  const token0 = getAddress(state.token0) as Hex; // real USDC address
+  const token1 = getAddress(state.token1) as Hex; // real USDT address
+  const reserve0 = BigInt(state.liquidityReserve0);
+  const reserve1 = BigInt(state.liquidityReserve1);
+
+  // 1. Capture a local MintableERC20 runtime, etch it at each REAL token address + seed decimals.
+  //    (token0/token1 are pool immutables → the local tokens MUST live at the real addresses.)
+  const scratch = await deployToken(walletClient, publicClient, "fluid-scratch", "FSCR", 6);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  for (const [tok, dec] of [
+    [token0, state.token0Decimals],
+    [token1, state.token1Decimals],
+  ] as [Hex, number][]) {
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(dec)) });
+  }
+
+  // 2. Etch the REAL pool + every dependency runtime at its captured address.
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+  for (const d of bytecode.dependencies ?? []) {
+    await testClient.setCode({ address: getAddress(d.address) as Hex, bytecode: d.runtime });
+  }
+
+  // 3. setStorageAt the captured pool + Liquidity storage VERBATIM by absolute key.
+  for (const [k, v] of Object.entries(state.poolStorage)) {
+    await testClient.setStorageAt({ address: pool, index: k as Hex, value: v });
+  }
+  for (const [k, v] of Object.entries(state.liquidityStorage)) {
+    await testClient.setStorageAt({ address: liquidity, index: k as Hex, value: v });
+  }
+
+  // 4. Fund the etched Liquidity proxy with the captured reserves (so swapIn can pay the output out), +
+  //    caller headroom in the from-token (token0 == USDC, the swap0to1 direction).
+  await mint(walletClient, publicClient, token0, liquidity, reserve0);
+  await mint(walletClient, publicClient, token1, liquidity, reserve1);
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, token0, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    resolver,
+    liquidity,
+    token0,
+    token1,
+    token0Decimals: state.token0Decimals,
+    token1Decimals: state.token1Decimals,
+    reserve0,
+    reserve1,
+    blockTimestamp: BigInt(state.blockTimestamp),
+  };
+}
+
+/** Fluid DexT1 pool read surface (constantsView returns the immutable struct; swapIn is the exec entry). */
+export const fluidPoolReadAbi = parseAbi([
+  "function constantsView() view returns (uint256 dexId, address liquidity, address factory, address implementation0, address implementation1, address implementation2, address implementation3, address implementation4, address deployerContract, address token0, address token1, bytes32 supplyToken0Slot, bytes32 borrowToken0Slot, bytes32 supplyToken1Slot, bytes32 borrowToken1Slot)",
+  "function swapIn(bool swap0to1, uint256 amountIn, uint256 amountOutMin, address to) payable returns (uint256 amountOut)",
+]);
+
+/** Fluid periphery DexResolver read surface (the getters discovery + the on-chain solver read). */
+export const fluidResolverReadAbi = parseAbi([
+  "function getDexTokens(address dex) view returns (address token0, address token1)",
+  "function estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) view returns (uint256 amountOut)",
+]);
+
+// ── Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) ──────────────────
+//
+// Mento is the FIRST multi-contract prod-mirror captured as a WHOLE traced GRAPH (16 contracts): the
+// quote/swap path fans out across Broker → BiPoolManager → SortedOracles (+ its median library) +
+// ConstantSumPricingModule + BreakerBox + Reserve + the cUSD stable token, each an EIP-1967 / Celo proxy
+// delegating to an impl. Rather than hand-code 16 storage layouts, harness/mento-snapshot.ts let the EVM
+// enumerate the exact touched set (debug_traceCall prestateTracer on the quote AND swapIn AND the two
+// discovery getters) and dumped {code, touched-storage} per address. So the snapshot's `contracts` is the
+// FULL graph and `storage` is the union of touched slots keyed by ABSOLUTE contract address.
+//
+// TOKEN REPOINTING (the Fluid/Solidly class — repoint the tokens, keep the REAL pricing contracts): cUSD
+// (tokenIn, STABLE, 18) is repointed to a MintableBurnableERC20 and USDC (tokenOut, COLLATERAL, 6) to a
+// MintableERC20, both etched AT THEIR REAL ADDRESSES (the exchange assets are baked into the BiPoolManager's
+// exchange config, so the local tokens MUST live at the real addresses). Mento's Broker.swapIn for a stable
+// tokenIn does `transferFrom(sender, broker, amt)` then `IBurnableERC20(cUSD).burn(amt)` (expects a `true`
+// return — hence the burnable fixture) and for a collateral tokenOut does
+// `reserve.transferExchangeCollateralAsset(USDC, to, out)` (a plain ERC20 safeTransfer from the Reserve). The
+// token ERC20 mechanics are NOT part of Mento's bucket/oracle pricing — the quote is already wei-exact with
+// the real contracts — so repointing preserves 100% of the pricing fidelity while making the token movements
+// executable offline (proven: a full swapIn against this etch received USDC == the captured mainnet
+// getAmountOut probe, wei-exact).
+//
+// transferOut GATING RECONSTRUCTION (disclosed): the captured swapIn TRACE reverts at transferIn (insufficient
+// allowance), so it never reaches transferOut — the Reserve's collateral-release gating (isExchangeSpender,
+// isCollateralAsset, a per-asset spending limit) is NOT in the captured touched-storage set. The etch
+// reconstructs exactly three Reserve mapping slots (empirically located in the mento-core Reserve layout,
+// pinned below) so the REAL transferExchangeCollateralAsset executes. Two of the three are set to their
+// VERIFIED on-chain values (FAITHFUL to mainnet reality, independently confirmed at the pinned Celo block):
+// isCollateralAsset(USDC)=true (slot 25) and isExchangeSpender(Broker)=true (slot 20) are BOTH already `true`
+// on the real Reserve — reconstructing them is a replay of the real state, not a fabrication. ONLY the third,
+// collateralAssetSpendingLimit(USDC)=<permissive> (slot 26), is a PERMISSIVE SUBSTITUTION: the real Reserve's
+// live value is 0 (its daily-ratio mechanism gates differently and its running-total/last-reset accounting is
+// not captured), so the etch sets a permissive limit to let the collateral release through. All three are
+// boolean/limit GATING, NOT pricing — they do not touch the bucket/oracle math (the quote is wei-exact without
+// them), so the released AMOUNT is still the REAL BiPoolManager quote to the wei.
+
+/** One contract in the Mento graph bytecode snapshot (harness/mento-snapshot.ts `contracts[]`). */
+export interface MentoContractBytecode {
+  address: Hex;
+  role: string;
+  runtime: Hex;
+  runtimeSha256?: Hex;
+  implementation?: Hex;
+  touchedSlots: number;
+}
+
+/** Mento graph bytecode snapshot (harness/mento-snapshot.ts). */
+export interface MentoBytecodeSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  source: string;
+  broker: Hex;
+  biPoolManager: Hex;
+  exchangeId: Hex;
+  contracts: MentoContractBytecode[];
+}
+
+/** Mento graph state snapshot (harness/mento-snapshot.ts). */
+export interface MentoStateSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  blockTimestamp: string;
+  source: string;
+  broker: Hex;
+  exchangeProvider: Hex;
+  exchangeId: Hex;
+  tokenIn: Hex;
+  tokenOut: Hex;
+  tokenInSymbol: string;
+  tokenOutSymbol: string;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
+  tokenInIsStable: boolean;
+  tokenOutIsCollateral: boolean;
+  onCharter: boolean;
+  sortedOracles: Hex;
+  reserve: Hex;
+  breakerBox: Hex;
+  pricingModule: Hex;
+  referenceRateFeedID: Hex;
+  reserveUSDC: string;
+  /** transferOut gating (see the section header) — recorded by the recapture; reconstructed by the etch. */
+  reserveIsExchangeSpender?: boolean;
+  reserveCollateralSpendingLimit?: string;
+  probe: { amountIn: string; amountOut: string };
+  ladder: { cap: string; cumIn: string[]; cumOut: string[] };
+  /** The union touched storage per contract (absolute slot → value), set verbatim on each etched contract. */
+  storage: Record<string, Record<string, Hex>>;
+}
+
+/** Load a Mento `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadMentoSnapshots(name: string): {
+  bytecode: MentoBytecodeSnapshot;
+  state: MentoStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as MentoBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as MentoStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Mento bytecode-graph integrity (NO RPC): re-hash EVERY contract runtime in the graph and match
+ * its capture-time sha256 anchor. Returns per-contract {address, role, expected, actual, ok}. A reviewer with
+ * no RPC key can run this to prove the checked-in blobs are the pinned-block mainnet code, byte-for-byte.
+ */
+export function verifyMentoBytecodeIntegrity(bytecode: MentoBytecodeSnapshot): {
+  contracts: { address: Hex; role: string; expected?: Hex; actual: Hex; ok: boolean }[];
+  allOk: boolean;
+} {
+  const contracts = bytecode.contracts.map((c) => {
+    const actual = runtimeSha256(c.runtime);
+    return {
+      address: c.address,
+      role: c.role,
+      expected: c.runtimeSha256,
+      actual,
+      ok: !c.runtimeSha256 || c.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { contracts, allOk: contracts.every((c) => c.ok) };
+}
+
+/** A minimal test-client surface for the Mento block-timestamp pin (anvil_setTime + mine). */
+type MentoTimeClient = {
+  request: (args: { method: string; params: unknown[] }) => Promise<unknown>;
+  mine: (a: { blocks: number }) => Promise<void>;
+};
+
+/**
+ * Pin the anvil block clock to `state.blockTimestamp` and mine one block. BiPoolManager.getAmountOut and
+ * swapIn simulate a bucket refresh off `block.timestamp - lastBucketUpdate` (refresh only every
+ * referenceRateResetFrequency), so pinning to the captured block ts reproduces the captured quote EXACTLY.
+ * Uses `anvil_setTime` (can jump BACKWARD — a fresh anvil's genesis clock is at wall-time, PAST the captured
+ * Celo ts). Call AFTER etching and BEFORE the first quote/cook, on EVERY fresh anvil.
+ */
+export async function pinMentoBlockTimestamp(
+  testClient: MentoTimeClient,
+  state: { blockTimestamp: string },
+): Promise<bigint> {
+  const ts = BigInt(state.blockTimestamp);
+  // anvil_setTime sets the NEXT block's timestamp; mining once lands a block AT ts (then subsequent blocks
+  // advance by ~1s, still within the same refresh window, so the quote stays bit-exact).
+  await testClient.request({ method: "anvil_setTime", params: [Number(ts)] });
+  await testClient.mine({ blocks: 1 });
+  return ts;
+}
+
+/**
+ * The three Reserve mapping-slot indices the transferOut gating reconstruction sets (mento-core Reserve
+ * storage layout; located empirically + pinned). See the section header for why they are reconstructed (the
+ * captured swapIn trace reverts at transferIn, so transferOut gating is not in the touched set). These are
+ * GATING (bool/limit), NOT pricing. Exposed so a future recapture that DOES reach transferOut can diff them.
+ */
+export const MENTO_RESERVE_GATING_SLOTS = {
+  /** mapping isCollateralAsset(address) → bool. */
+  isCollateralAsset: 25n,
+  /** mapping isExchangeSpender(address) → bool. */
+  isExchangeSpender: 20n,
+  /** mapping collateralAssetSpendingLimit(address) → uint256 (a per-asset limit). */
+  collateralAssetSpendingLimit: 26n,
+} as const;
+
+/** keccak256(abi.encode(address key, uint256 slot)) — a Solidity mapping(address=>_) storage key. */
+function mentoMappingSlot(key: Hex, slot: bigint): Hex {
+  return keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [getAddress(key), slot]));
+}
+
+export interface EtchedMentoGraph {
+  /** Broker (BrokerProxy) — the discovery/getAmountOut/swapIn/approve target (captured mainnet address). */
+  broker: Hex;
+  /** The exchange provider (BiPoolManager) — a getAmountOut/swapIn arg + getExchanges discovery target. */
+  exchangeProvider: Hex;
+  /** The resolved bytes32 exchangeId for the cUSD/USDC pair. */
+  exchangeId: Hex;
+  /** The Reserve proxy (funded with local USDC so a collateral-out swapIn can pay out). */
+  reserve: Hex;
+  /** tokenIn (cUSD, STABLE) — a MintableBurnableERC20 etched at the real cUSD address. */
+  tokenIn: Hex;
+  /** tokenOut (USDC, COLLATERAL) — a MintableERC20 etched at the real USDC address. */
+  tokenOut: Hex;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
+  /** Number of contracts etched (the whole graph). */
+  contractCount: number;
+  /** Number of storage slots reconstructed (captured touched slots + the transferOut gating slots). */
+  slotCount: number;
+  /** The pinned block timestamp the test must pin the clock to. */
+  blockTimestamp: bigint;
+}
+
+/**
+ * Stand up the captured REAL Mento V2 quote/swap contract GRAPH on the local anvil, OFFLINE. (Proven a full
+ * swapIn against this etch receives USDC == the captured mainnet getAmountOut probe, wei-exact — see the
+ * section header + harness/mento-snapshot.ts's anchor.)
+ *
+ *   1. Repoint the tokens: MintableBurnableERC20 for cUSD (stable, 18) + MintableERC20 for USDC (collateral,
+ *      6), etched AT THEIR REAL ADDRESSES (the exchange assets are baked into the BiPoolManager config).
+ *   2. setCode EVERY captured contract runtime at its captured address (the whole 16-contract graph).
+ *   3. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (incl. the buckets /
+ *      oracle rate / breaker mode / getExchanges enumeration arrays).
+ *   4. Reconstruct the three Reserve transferOut gating slots (see MENTO_RESERVE_GATING_SLOTS) so the REAL
+ *      transferExchangeCollateralAsset executes (disclosed gating, not pricing).
+ *   5. Fund the etched Reserve with local USDC (the collateral a swapIn releases) + optional caller headroom
+ *      in the from-token (cUSD). NOTE: pin the clock with pinMentoBlockTimestamp after this, before the first
+ *      quote/cook.
+ */
+export async function etchMentoGraph(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: MentoBytecodeSnapshot; state: MentoStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint; reserveFund?: bigint } = {},
+): Promise<EtchedMentoGraph> {
+  const { bytecode, state } = snapshots;
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const broker = getAddress(state.broker) as Hex;
+  const provider = getAddress(state.exchangeProvider) as Hex;
+  const reserve = getAddress(state.reserve) as Hex;
+  const tokenIn = getAddress(state.tokenIn) as Hex; // real cUSD address (STABLE)
+  const tokenOut = getAddress(state.tokenOut) as Hex; // real USDC address (COLLATERAL)
+
+  // 1. Repoint the tokens: capture the burnable + plain runtimes, etch each at its real address + seed
+  //    decimals. cUSD is STABLE (burned in transferIn) → burnable; USDC is COLLATERAL (Reserve safeTransfer)
+  //    → plain. The exchange assets are BiPoolManager immutables ⇒ the local tokens MUST live at the reals.
+  const burnScratch = await deployBurnableToken(walletClient, publicClient, "mento-cUSD-scratch", "SCUSD", state.tokenInDecimals);
+  const burnRuntime = await publicClient.getCode({ address: burnScratch });
+  if (!burnRuntime || burnRuntime === "0x") throw new Error("failed to capture MintableBurnableERC20 runtime");
+  const plainScratch = await deployToken(walletClient, publicClient, "mento-USDC-scratch", "SUSDC", state.tokenOutDecimals);
+  const plainRuntime = await publicClient.getCode({ address: plainScratch });
+  if (!plainRuntime || plainRuntime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  await testClient.setCode({ address: tokenIn, bytecode: burnRuntime });
+  await testClient.setStorageAt({ address: tokenIn, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(state.tokenInDecimals)) });
+  await testClient.setCode({ address: tokenOut, bytecode: plainRuntime });
+  await testClient.setStorageAt({ address: tokenOut, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(state.tokenOutDecimals)) });
+
+  // 2. setCode EVERY captured contract runtime at its captured address (skip the two token addresses — they
+  //    were repointed above; the graph's cUSD entry is the real proxy runtime, which we DON'T want).
+  const tokenSet = new Set([tokenIn.toLowerCase(), tokenOut.toLowerCase()]);
+  for (const c of bytecode.contracts) {
+    const addr = getAddress(c.address) as Hex;
+    if (tokenSet.has(addr.toLowerCase())) continue;
+    await testClient.setCode({ address: addr, bytecode: c.runtime });
+  }
+
+  // 3. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (skip the repointed
+  //    token addresses — their captured proxy slots don't apply to the local ERC20 layout).
+  let slotCount = 0;
+  for (const [addr, slots] of Object.entries(state.storage)) {
+    if (tokenSet.has(addr.toLowerCase())) continue;
+    const a = getAddress(addr) as Hex;
+    for (const [slot, value] of Object.entries(slots)) {
+      await testClient.setStorageAt({ address: a, index: slot as Hex, value });
+      slotCount++;
+    }
+  }
+
+  // 4. Reconstruct the three Reserve transferOut gating slots (disclosed gating, not pricing) so the REAL
+  //    collateral release executes. Set a permissive spending limit (100× the captured probe out) — the
+  //    RELEASED amount is still the REAL BiPoolManager quote to the wei.
+  const probeOut = BigInt(state.probe.amountOut);
+  const spendLimit = probeOut * 100n > 0n ? probeOut * 100n : 10n ** 30n;
+  await testClient.setStorageAt({ address: reserve, index: mentoMappingSlot(tokenOut, MENTO_RESERVE_GATING_SLOTS.isCollateralAsset), value: word(1n) });
+  await testClient.setStorageAt({ address: reserve, index: mentoMappingSlot(broker, MENTO_RESERVE_GATING_SLOTS.isExchangeSpender), value: word(1n) });
+  await testClient.setStorageAt({ address: reserve, index: mentoMappingSlot(tokenOut, MENTO_RESERVE_GATING_SLOTS.collateralAssetSpendingLimit), value: word(spendLimit) });
+  slotCount += 3;
+
+  // 5. Fund the etched Reserve with local USDC (the collateral released by a swapIn) + caller headroom in the
+  //    from-token (cUSD). The Reserve holds the collateral the exchange pays out; fund it generously.
+  const reserveFund = opts.reserveFund ?? probeOut * 1000n;
+  await mint(walletClient, publicClient, tokenOut, reserve, reserveFund);
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    broker,
+    exchangeProvider: provider,
+    exchangeId: state.exchangeId as Hex,
+    reserve,
+    tokenIn,
+    tokenOut,
+    tokenInDecimals: state.tokenInDecimals,
+    tokenOutDecimals: state.tokenOutDecimals,
+    contractCount: bytecode.contracts.length,
+    slotCount,
+    blockTimestamp: BigInt(state.blockTimestamp),
+  };
+}
+
+/** Mento V2 read surface (the discovery getters + the on-chain solver quote — the REAL verified interface). */
+export const mentoBrokerReadAbi = parseAbi([
+  "function getExchangeProviders() view returns (address[])",
+  "function getAmountOut(address exchangeProvider, bytes32 exchangeId, address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256)",
+  "function swapIn(address exchangeProvider, bytes32 exchangeId, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin) returns (uint256)",
+]);
+
+/** BiPoolManager (exchange provider) discovery read surface. */
+export const mentoExchangeProviderReadAbi = parseAbi([
+  "function getExchanges() view returns ((bytes32 exchangeId, address[] assets)[])",
+]);
+
+// ── Fermi / propAMM (gattaca-com/propamm FermiSwapper — an Obric-style oracle-priced proactive AMM) ─────────
+//
+// Fermi is the FIRST oracle-priced proactive AMM captured as a real-code multi-contract GRAPH whose PRICING
+// RESERVE lives in a SEPARATE vault (not the router). The quote/swap path (verified by trace) is:
+//   quoteAmounts / fermiSwapWithAllowances (FermiSwapper 0xb1076fE3…)
+//     -> oracle store getState/getSwapState (0xe514A3c4…)  [reads a per-feed price/config/last-update store]
+//       -> feed helper getState (0xDa7AfeeD…)              [returns (timestamp, packed price) — the stale gate]
+//       -> token.balanceOf(VAULT 0x585d4472…)              [the RESERVE the curve prices off — NOT the router]
+//   the SWAP then does token.transferFrom(VAULT, taker, out) + token.transferFrom(taker, VAULT, in), resolving
+//   the VAULT (payer/payee) from FermiSwapper storage SLOT 3.
+//
+// WHY the snapshot carries a VAULT + router slots 0..3 + an EIP-7702 EOA designator beyond the QUOTE
+// access-list (the QUOTE access-list surfaces only the oracle store slot 2, the feed helper, and the token
+// balanceOf reads):
+//   · The QUOTE reads token.balanceOf(VAULT) — so the VAULT must HOLD the captured reserves offline (funded via
+//     the local MintableERC20 mint), and the router's slot 3 must point at it. The router's OWN token balances
+//     are dust and are NOT the pricing reserve (an early capture misdiagnosed them as "reserves").
+//   · The SWAP does transferFrom(VAULT, taker, out) — so the VAULT must have APPROVED the router (mainnet grants
+//     a max allowance); the harness sets the local token's allowance[vault][router] slot to max.
+//   · The quote/swap path touches an EIP-7702 delegated EOA (0x4838b1…) via EXTCODESIZE/BALANCE. An empty
+//     (codeless) account makes the FermiSwapper branch to a 0 quote, so the harness etches the captured 24-byte
+//     0xef0100||delegate designator (the account is then code-bearing; the delegate itself is never CALLed on
+//     the quote path, so its code is not required — only the designator's presence).
+//
+// TOKEN REPOINTING (the Fluid/Mento class — repoint the tokens, keep the REAL pricing contracts): WETH/USDC/
+// WBTC are repointed to local MintableERC20s etched AT THEIR REAL ADDRESSES (the oracle-store feed configs are
+// keyed by the real token addresses, so the local tokens MUST live at the reals). The ERC20 mechanics are NOT
+// part of Fermi's oracle/curve pricing — the quote is wei-exact with the real oracle contracts regardless — so
+// repointing preserves 100% of the pricing fidelity while making the token movements executable offline
+// (PROVEN: a full fermiSwapWithAllowances against this etch received USDC == the captured mainnet quote, wei-
+// exact, and the whole probe ladder reproduces bit-for-bit — see harness/fermi-snapshot.ts's anchor).
+//
+// BLOCK.TIMESTAMP: the oracle store gates freshness on block.timestamp ≤ feed.lastUpdate + maxAge; the price/
+// config slots are byte-identical fresh-vs-stale (only the clock gates), so PINNING block.timestamp to the
+// captured fresh ts reproduces the EXACT real quote (no price is fabricated). Call pinFermiBlockTimestamp AFTER
+// etching and BEFORE the first quote/cook, on EVERY fresh anvil.
+
+/** One contract in the Fermi graph bytecode snapshot (harness/fermi-snapshot.ts `contracts[]`). */
+export interface FermiContractBytecode {
+  address: Hex;
+  role: string;
+  runtime: Hex;
+  runtimeSha256?: Hex;
+  codeSizeBytes: number;
+}
+
+/** Fermi graph bytecode snapshot (harness/fermi-snapshot.ts). */
+export interface FermiBytecodeSnapshot {
+  chain: string;
+  fermiSwapper: Hex;
+  block: string;
+  blockTimestamp: string;
+  note?: string;
+  contracts: FermiContractBytecode[];
+}
+
+/** Fermi graph state snapshot (harness/fermi-snapshot.ts). */
+export interface FermiStateSnapshot {
+  chain: string;
+  fermiSwapper: Hex;
+  block: string;
+  blockTimestamp: string;
+  staleUpdateSelector: string;
+  target: { tokenIn: Hex; tokenOut: Hex; inSym: string; outSym: string };
+  second: { tokenIn: Hex; tokenOut: Hex; inSym: string; outSym: string } | null;
+  tokens: Record<string, { address: Hex; symbol: string; decimals: number }>;
+  /** The union touched storage per contract (absolute slot → value), set verbatim on each etched contract. */
+  contractSlots: Record<string, { role: string; slots: Record<string, Hex> }>;
+  /** The RESERVE VAULT (FermiSwapper slot 3): the harness funds it + grants it a max router allowance. */
+  vault: {
+    address: Hex;
+    role: string;
+    reserves: Record<string, string>;
+    allowanceToRouter: Record<string, string>;
+  };
+  /** The EIP-7702 EOA touched via EXTCODESIZE/BALANCE — the harness etches its 24-byte designator. */
+  eoa7702: { address: Hex; designator: Hex; delegate: Hex } | null;
+  probe: {
+    target: { pair: string; ladder: { amountIn: string; amountOut: string }[] };
+    second: { pair: string; ladder: { amountIn: string; amountOut: string }[] } | null;
+  };
+}
+
+/** Load a Fermi `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadFermiSnapshots(name: string): {
+  bytecode: FermiBytecodeSnapshot;
+  state: FermiStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as FermiBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as FermiStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Fermi bytecode-graph integrity (NO RPC): re-hash EVERY contract runtime in the graph (FermiSwapper
+ * + oracle store + feed helper + reserve vault + the 7702 EOA designator + the token proxies) and match its
+ * capture-time sha256 anchor. A reviewer with no RPC key can run this to prove the checked-in blobs are the
+ * pinned-block mainnet code, byte-for-byte.
+ */
+export function verifyFermiBytecodeIntegrity(bytecode: FermiBytecodeSnapshot): {
+  contracts: { address: Hex; role: string; expected?: Hex; actual: Hex; ok: boolean }[];
+  allOk: boolean;
+} {
+  const contracts = bytecode.contracts.map((c) => {
+    const actual = runtimeSha256(c.runtime);
+    return {
+      address: c.address,
+      role: c.role,
+      expected: c.runtimeSha256,
+      actual,
+      ok: !c.runtimeSha256 || c.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { contracts, allOk: contracts.every((c) => c.ok) };
+}
+
+/** A minimal test-client surface for the Fermi block-timestamp pin (anvil_setTime + interval + mine). */
+type FermiTimeClient = {
+  request: (args: { method: string; params: unknown[] }) => Promise<unknown>;
+  setBlockTimestampInterval: (a: { interval: number }) => Promise<void>;
+  mine: (a: { blocks: number }) => Promise<void>;
+};
+
+/**
+ * Pin the anvil block clock to `state.blockTimestamp` and hold it (zero block-time interval) so the next
+ * quote/cook — and every subsequent mined block through the cook — sees exactly the captured fresh ts. The
+ * FermiSwapper's oracle store gates freshness on block.timestamp ≤ feed.lastUpdate + maxAge; at the captured ts
+ * the feed is fresh and the quote is the real on-chain value. Uses `anvil_setTime` (can jump BACKWARD — a fresh
+ * anvil's genesis clock is wall-time, PAST the pinned ts) + a zero interval so the setup mints + the cook do
+ * not drift the clock past the stale window. Call AFTER etching and BEFORE the first quote/cook, on EVERY fresh
+ * anvil.
+ */
+export async function pinFermiBlockTimestamp(
+  testClient: FermiTimeClient,
+  state: { blockTimestamp: string },
+): Promise<bigint> {
+  const ts = BigInt(state.blockTimestamp);
+  await testClient.request({ method: "anvil_setTime", params: [Number(ts)] });
+  await testClient.setBlockTimestampInterval({ interval: 0 });
+  await testClient.mine({ blocks: 1 });
+  return ts;
+}
+
+/** The local MintableERC20 allowance[owner][spender] storage slot (nested mapping at slot 5). */
+function fermiAllowanceSlot(owner: Hex, spender: Hex): Hex {
+  const inner = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [getAddress(owner), 5n]));
+  return keccak256(encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [getAddress(spender), inner]));
+}
+
+export interface EtchedFermiGraph {
+  /** FermiSwapper (the discovery/quoteAmounts/fermiSwapWithAllowances/approve target — captured mainnet address). */
+  fermiSwapper: Hex;
+  /** The reserve vault (funded with the captured reserves; approves the router; payer/payee for the swap). */
+  vault: Hex;
+  /** tokenIn/tokenOut for the target pair — local MintableERC20s etched at the REAL token addresses. */
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** The second quotable pair's from-token (WBTC) for the split cell — local MintableERC20 at the real address. */
+  secondTokenIn: Hex | null;
+  decimalsByAddress: Record<string, number>;
+  /** Number of contracts etched (the whole graph) + storage slots reconstructed. */
+  contractCount: number;
+  slotCount: number;
+  /** The pinned block timestamp the test must pin the clock to. */
+  blockTimestamp: bigint;
+}
+
+/**
+ * Stand up the captured REAL Fermi / propAMM quote/swap contract GRAPH on the local anvil, OFFLINE. (Proven a
+ * full fermiSwapWithAllowances against this etch receives tokenOut == the captured mainnet quote, wei-exact,
+ * and the whole probe ladder reproduces bit-for-bit — see the section header + harness/fermi-snapshot.ts.)
+ *
+ *   1. Repoint the tokens: a MintableERC20 etched AT EACH REAL token address (WETH/USDC/WBTC) + its decimals.
+ *      For each token, set allowance[vault][router] = MAX (the vault's real max approval to the router, so the
+ *      swap's transferFrom(vault, taker, out) lands).
+ *   2. setCode EVERY captured contract runtime at its captured address (FermiSwapper + oracle store + feed
+ *      helper + reserve vault + the EIP-7702 EOA designator + the token proxies — the token addresses are
+ *      SKIPPED here, they were repointed in step 1).
+ *   3. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (incl. the FermiSwapper
+ *      config slots 0..3 — slot 3 is the vault the swap resolves the payer from — + the oracle store's per-feed
+ *      price/config/last-update slots + the feed helper's packed (ts,price) slots).
+ *   4. Fund the VAULT with the captured reserves (the pricing reserve the quote reads via balanceOf(vault) +
+ *      the inventory the swap pays out) + optional caller headroom in the from-token(s). NOTE: pin the clock
+ *      with pinFermiBlockTimestamp after this, before the first quote/cook (the oracle staleness gate).
+ */
+export async function etchFermiGraph(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: FermiBytecodeSnapshot; state: FermiStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedFermiGraph> {
+  const { bytecode, state } = snapshots;
+  const acct = (opts.minter ?? walletClient.account) as Account;
+  const MAX = (1n << 256n) - 1n;
+
+  const fermiSwapper = getAddress(state.fermiSwapper) as Hex;
+  const vault = getAddress(state.vault.address) as Hex;
+  const tokenIn = getAddress(state.target.tokenIn) as Hex;
+  const tokenOut = getAddress(state.target.tokenOut) as Hex;
+  const secondTokenIn = state.second ? (getAddress(state.second.tokenIn) as Hex) : null;
+
+  // The token addresses (repointed) + their decimals.
+  const decimalsByAddress: Record<string, number> = {};
+  for (const t of Object.values(state.tokens)) decimalsByAddress[getAddress(t.address).toLowerCase()] = t.decimals;
+  const tokenSet = new Set(Object.values(state.tokens).map((t) => getAddress(t.address).toLowerCase()));
+
+  // 1. Repoint the tokens: capture a MintableERC20 runtime, etch at each real address + seed decimals + set the
+  //    vault→router max allowance (the swap pulls the output from the vault).
+  const scratch = await deployToken(walletClient, publicClient, "fermi-scratch", "FSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  for (const t of Object.values(state.tokens)) {
+    const addr = getAddress(t.address) as Hex;
+    await testClient.setCode({ address: addr, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: addr, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(t.decimals)) });
+    await testClient.setStorageAt({ address: addr, index: fermiAllowanceSlot(vault, fermiSwapper), value: word(MAX) });
+  }
+
+  // 2. setCode EVERY captured contract runtime at its captured address (skip the repointed token addresses).
+  for (const c of bytecode.contracts) {
+    const addr = getAddress(c.address) as Hex;
+    if (tokenSet.has(addr.toLowerCase())) continue;
+    await testClient.setCode({ address: addr, bytecode: c.runtime });
+  }
+
+  // 3. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (skip the repointed
+  //    token addresses — their captured proxy slots don't apply to the local ERC20 layout).
+  let slotCount = 0;
+  for (const [addr, entry] of Object.entries(state.contractSlots)) {
+    if (tokenSet.has(addr.toLowerCase())) continue;
+    const a = getAddress(addr) as Hex;
+    for (const [slot, value] of Object.entries(entry.slots)) {
+      await testClient.setStorageAt({ address: a, index: slot as Hex, value });
+      slotCount++;
+    }
+  }
+
+  // 4. Fund the VAULT with the captured reserves (the pricing reserve + the swap-payout inventory) + optional
+  //    caller headroom in the from-token(s).
+  for (const [sym, reserve] of Object.entries(state.vault.reserves)) {
+    const tok = state.tokens[sym];
+    if (!tok) continue;
+    await mint(walletClient, publicClient, getAddress(tok.address) as Hex, vault, BigInt(reserve));
+  }
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+    if (secondTokenIn) await mint(walletClient, publicClient, secondTokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    fermiSwapper,
+    vault,
+    tokenIn,
+    tokenOut,
+    secondTokenIn,
+    decimalsByAddress,
+    contractCount: bytecode.contracts.length,
+    slotCount,
+    blockTimestamp: BigInt(state.blockTimestamp),
+  };
+}
+
+/** Fermi / propAMM (FermiSwapper) read surface — the REAL verified interface (the quote/swap/aliveness path). */
+export const fermiSwapperReadAbi = parseAbi([
+  "function quoteAmounts(address tokenIn, address tokenOut, int256 amountSpecified) view returns (uint256 amountIn, uint256 amountOut)",
+  "function isActive(address a, address b) view returns (bool)",
+  "function fermiSwapWithAllowances(address tokenIn, address tokenOut, int256 amountSpecified, uint256 amountCheck, address recipient) returns (uint256, uint256)",
 ]);

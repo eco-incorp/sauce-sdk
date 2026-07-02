@@ -1499,7 +1499,11 @@ function main(
   // the DexT1 pool has NO getAmountOut view (its own estimate is a REVERT, FluidDexSwapResult, which this
   // interpreter can't try/catch), so read the LIVE amountOut from the periphery DexReservesResolver's
   // estimateSwapIn(dex, swap0to1, +Σ, 0) (it does the pool's revert-decode in Solidity and returns a plain
-  // uint256 for the exact-in leg). swap0to1 is the pool's own token0()==tokenIn orientation. APPROVE the
+  // uint256 for the exact-in leg). NB this is a plain CALL, NOT a staticcall: the real FluidDexT1 pool WRITES
+  // STATE on the ADDRESS_DEAD estimate path before it reverts with the result, so a STATICCALL would revert
+  // and the resolver's catch would return 0 (proven by ecoswap.fluid.prodmirror.evm.test.ts) — IFluidDexResolver.json
+  // marks estimateSwapIn `nonpayable` for exactly this; the internal revert rolls back any state, so the CALL
+  // is side-effect-free in effect. swap0to1 is the pool's own token0()==tokenIn orientation. APPROVE the
   // pool for the awarded input (Fluid PULLS via safeTransferFrom inside swapIn — approve-first, like
   // Fermi/Wombat/Curve, unlike the transfer-first WOOFi/Solidly path), then call
   // pool.swapIn(swap0to1, +Σ, amountOutMin, to) with amountOutMin == the just-quoted out (the exact-in

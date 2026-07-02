@@ -59,6 +59,13 @@ export const sauceRouterArtifact = loadArtifact(join(ARTIFACTS, "SauceRouter.jso
 export const erc20Artifact = loadArtifact(
   join(FIXTURES, "MintableERC20.sol", "MintableERC20.json"),
 );
+/** MintableERC20 + a `burn(uint256)`/`burn(address,uint256)` surface (returns bool). Used to repoint a Mento
+ *  STABLE token (cUSD): the Broker's transferIn for a stable tokenIn does `transferFrom(sender, broker)` then
+ *  `IBurnableERC20(token).burn(amount)` (expecting a `true` return) — a plain MintableERC20 has no burn, so
+ *  swapIn reverts. This carries EXACTLY that surface; the token ERC20 semantics are not part of Mento pricing. */
+export const mintableBurnableErc20Artifact = loadArtifact(
+  join(FIXTURES, "MintableBurnableERC20.sol", "MintableBurnableERC20.json"),
+);
 export const helperArtifact = loadArtifact(
   join(FIXTURES, "V3LiquidityHelper.sol", "V3LiquidityHelper.json"),
 );
@@ -481,6 +488,21 @@ export async function deployToken(
   return deployContract(walletClient, publicClient, {
     abi: erc20Artifact.abi,
     bytecode: erc20Artifact.bytecode,
+    args: [name, symbol, decimals],
+  });
+}
+
+/** Deploy a MintableBurnableERC20 (mint + burn(uint256)/burn(address,uint256) → bool). */
+export async function deployBurnableToken(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  name: string,
+  symbol: string,
+  decimals = 18,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: mintableBurnableErc20Artifact.abi,
+    bytecode: mintableBurnableErc20Artifact.bytecode,
     args: [name, symbol, decimals],
   });
 }

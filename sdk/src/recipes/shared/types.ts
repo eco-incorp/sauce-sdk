@@ -654,7 +654,9 @@ export interface EcoFermi {
 export interface EcoFluid {
   /** DexT1 pool address — the swapIn/approve target AND the resolver `dex_` arg. */
   address: Hex;
-  /** DexReservesResolver address — the estimateSwapIn staticcall target (the live quote view). */
+  /** DexReservesResolver address — the estimateSwapIn CALL target (NOT a staticcall: the real FluidDexT1
+   *  pool writes state on the ADDRESS_DEAD estimate path before reverting, so a STATICCALL returns 0 — see
+   *  ecoswap.fluid.prodmirror.evm.test.ts + IFluidDexResolver.json's `nonpayable` mutability). */
   resolver: Hex;
   /** true ⇒ tokenIn is the pool's token0 (swap0to1 = true); false ⇒ tokenIn is token1. */
   swap0to1: boolean;
