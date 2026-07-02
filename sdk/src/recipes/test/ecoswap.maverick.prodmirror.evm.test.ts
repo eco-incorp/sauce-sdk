@@ -2,10 +2,10 @@
  * EcoSwap Maverick V2 (bin-based directional AMM, CALLBACK pool) PROD-MIRROR — REAL BYTECODE, NO FORK,
  * OFFLINE.
  *
- * The Maverick analogue of ecoswap.dodo.prodmirror.evm.test.ts. Unlike ecoswap.maverick.evm.test.ts
- * (which deploys a MOCK MaverickV2Pool.sol fixture that ALWAYS calls the callback), this test stands up
- * the GENUINE Maverick V2 Pool bytecode captured from BSC mainnet and runs against it, with NO fork and
- * NO RPC at run time (etch + setStorageAt, seconds).
+ * The Maverick analogue of ecoswap.dodo.prodmirror.evm.test.ts. Like ecoswap.maverick.evm.test.ts (which
+ * deploys a MOCK MaverickV2Pool.sol fixture) this exercises the engine `_swapMaverickV2` + callback path —
+ * but against the GENUINE Maverick V2 Pool bytecode captured from BSC mainnet, with NO fork and NO RPC at
+ * run time (etch + setStorageAt, seconds).
  *
  * MECHANISM (mirrors the repo's real-runtime etch, generalised in harness/etch-pool.ts):
  *   CAPTURE (one-time, harness/maverick-snapshot.ts, uses the RPC key):
@@ -21,21 +21,21 @@
  *     ZERO in storage — so they cannot be repointed by a storage overwrite; the Wombat/WOOFi immutable-
  *     token pattern); setCode the REAL quoter + the REAL pool at their captured addresses; setStorageAt
  *     the captured bin/tick window verbatim; and stand up a tiny Maverick factory shim (lookup) at the
- *     captured factory address. The swap then runs the GENUINE pool bytecode.
+ *     captured factory address. The swap then runs the GENUINE pool bytecode. The engine deployed by the
+ *     harness (deployStack / deployV12Stack) is the one in sdk/src/artifacts — the FIXED engine.
  *
  * ═══════════════════════════════════════════════════════════════════════════════════════════════════
- * CENTRAL FINDING (this is why a prod-mirror matters — the mock HID it): the engine's `_swapMaverickV2`
- * calls `pool.swap(recipient, params, "")` with EMPTY callback data. The REAL Maverick V2 Pool is a
- * DUAL-MODE pool: with EMPTY data it takes the PRE-PAY (transfer-first) path and NEVER invokes a callback
- * (its runtime contains ZERO occurrences of the `maverickV2SwapCallback` selector 0x733db10b — verified);
- * only with NON-EMPTY data does it call back. So against the REAL bytecode the engine's callback never
- * fires, the input is never delivered, and the pool reverts `PoolTokenNotSolvent(reserveB+amountIn,
- * reserveB, tokenB)` (selector 0x39de6df5). The MOCK MaverickV2Pool.sol calls the callback
- * UNCONDITIONALLY, which is exactly why ecoswap.maverick.evm.test.ts passes on the mock but the engine
- * path CANNOT execute the real pool. This is a genuine, unfixed ENGINE bug (engine `../sauce` HEAD
- * e8a4c6e9: `pool.swap(recipient, maverickParams, "")`); the one-line fix is to pass NON-EMPTY data so
- * the real pool takes its callback branch. THIS TEST SURFACES + PINS THE BUG (assertion (c1)) and proves
- * the real bytecode + math are wei-exact via the pool's OWN canonical pre-pay swap (assertion (c2)).
+ * REAL ENGINE-CALLBACK EXECUTION (the FIXED engine — ../sauce PR #193). The engine's `_swapMaverickV2`
+ * now calls `pool.swap(recipient, params, hex"01")` with NON-EMPTY data (which selects the REAL Maverick
+ * V2 Pool's CALLBACK funding branch — the pool sends output first, then re-enters our
+ * `maverickV2SwapCallback(IERC20 tokenIn, uint256 amountIn, uint256 amountOut, bytes data)` to PULL the
+ * input, authenticated via the transient expected-pool context), and passes a per-direction full-range
+ * tickLimit (type(int32).max for tokenA-in, type(int32).min for tokenB-in — matching Maverick's own
+ * router). The captured real pool runtime DOES contain the 4-arg callback selector 0x67ca7c91 (verified),
+ * so against the REAL bytecode the callback fires, the input is delivered, and the swap COMPLETES. (The
+ * PREVIOUS broken engine sent EMPTY data + tickLimit:0 + a wrong 3-arg callback signature, so the real
+ * pool reverted PoolTokenNotSolvent — this test used to PIN that revert. The fix is now live in the
+ * artifacts, so this test asserts the REAL swap through the engine callback path instead.)
  * ═══════════════════════════════════════════════════════════════════════════════════════════════════
  *
  * CENTRAL VERIFICATION (this file asserts all explicitly):
@@ -45,34 +45,28 @@
  *       reproduces the captured probe quotes.
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds). Proven with
  *       poisoned *_RPC_URL.
- *   (c1) ENGINE-PATH BUG (documented + pinned) — EcoSwap through the PRODUCTION FactoryType.MaverickV2Factory
- *       discovery path surfaces the real pool + prepares the sampled MaverickV2 segments (asserted), but the
- *       cook REVERTS with the real pool's `PoolTokenNotSolvent` (selector 0x39de6df5) because the engine
- *       passes empty callback data. The revert selector is decoded + asserted so a future engine fix
- *       (non-empty data) flips this cell to a full swap and the assertion catches the regression.
- *   (c2) REAL-EXECUTION WEI-EXACT — the awarded Σ share (from the neutral oracle ecoswap.optimal.ts
- *       optimalSplit, seeded from the REAL captured tick book via the SHARED buildMaverickSegments) is
- *       executed through the REAL pool's OWN canonical pre-pay swap (transfer the input to the pool, then
- *       pool.swap(recipient, {…, exactOutput:false, tickLimit:0}, "") — the exact path the real contract
- *       implements). The real executed output == the REAL MaverickV2Quoter's calculateSwap(awarded) view
- *       BIT-FOR-BIT (real == real), and the awarded input == oracle.totalInput to the WEI (the split is
- *       exact-on-grid). This proves the real bytecode + the oracle agree using ONLY real code — no mock,
- *       no substitute swap math.
+ *   (c) REAL ENGINE-CALLBACK SWAP, WEI-EXACT — EcoSwap through the PRODUCTION FactoryType.MaverickV2Factory
+ *       discovery path surfaces the real pool + prepares the sampled MaverickV2 segments (asserted), then
+ *       COOKs through the FIXED engine `_swapMaverickV2` → the REAL pool's `maverickV2SwapCallback`. The
+ *       cook SUCCEEDS; the caller receives the output and the pool pulls exactly the input via the callback.
+ *       The received dy == the REAL MaverickV2Quoter's calculateSwap(awarded Σ) view BIT-FOR-BIT (real ==
+ *       real, the engine-independent ground truth), == the neutral oracle's awarded input (exact-on-grid),
+ *       and the awarded input == amountIn to the WEI (single venue, full fill within the reachable window).
+ *       This exercises the GENUINE captured pool bytecode's callback funding branch — no mock, no pre-pay.
  *
  * HONEST fidelity notes:
- *   • ENGINE CALLBACK PATH: NOT exercised (it reverts against real bytecode — see (c1)); (c2) uses the
- *     real pool's pre-pay path, which is what the real contract does with empty data. This is disclosed,
- *     not hidden — the callback path is engine-broken for real Maverick V2, and the test PINS that.
  *   • OFF-CHAIN REPLAY DIVERGENCE: the off-chain `maverick-math.ts` getDy diverges from the REAL pool's
  *     bin math by a FEW WEI at the ~13th significant digit (a port-rounding difference: getDy(1000 USDC)
  *     = 1000382022226312194616 vs the real pool/quoter 1000382022226308903686, Δ≈3.3e-9 tokens). So the
  *     ground-truth realized dy is the REAL quoter (real == real, bit-exact); the off-chain getDy is
- *     asserted only within a tight relative bound (Δ < 1e-9 of out), NOT to the wei. The SPLIT input is
+ *     asserted only within a tight relative bound (Δ < 1e-12 of out), NOT to the wei. The SPLIT input is
  *     exact (single venue ⇒ awarded == amountIn exactly).
- *   • ENGINE tickLimit=0 GATE: tokenA=USDT, tokenB=USDC, activeTick=+7, so ONLY tokenB-in (USDC→USDT,
- *     walking DOWN toward tick 0) is executable; discovery gates the pool to tokenB-in. 1000 USDC is a
- *     captured probe size that FULLY consumes within the tick-7→0 payout window (~8963 USDT reserve), so
- *     the awarded Σ is a full fill (spent == amountIn), NOT a tickLimit partial.
+ *   • ENGINE tickLimit: the FIXED engine passes a full-range per-direction tickLimit. tokenA=USDT,
+ *     tokenB=USDC, activeTick=+7 ⇒ the engine-executable trade is tokenB-in (USDC→USDT, walking DOWN);
+ *     discovery still gates the pool to tokenB-in. 1000 USDC is a captured probe size that FULLY consumes
+ *     within a handful of ticks of the active tick (well before tick 0), so the executed dy is identical
+ *     whether the engine's tickLimit is 0 or type(int32).min — verified: the REAL quoter returns the same
+ *     (in, out) for both — and it is a full fill (spent == amountIn), NOT a tickLimit partial.
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; v12 skipped in "both" when the artifacts
  * are absent). No state cache — etch+setStorage is a few seconds.
@@ -83,7 +77,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseAbi, type Account, type Hex } from "viem";
+import { type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -129,39 +123,6 @@ import {
 
 const SNAP_NAME = "bsc-maverick-USDTUSDC";
 const ENGINE_CELLS = engineCells();
-
-/** cook() ABI for the engine-path revert simulation. */
-const COOK_ABI = parseAbi(["function cook(bytes[] ingredients) payable returns (bytes returnData)"]);
-
-/**
- * The REAL Maverick V2 Pool.swap surface. The canonical Maverick V2 Pool is a DUAL-MODE pool: with EMPTY
- * `data` it takes the PRE-PAY (transfer-first) path (the input must already sit in the pool); with
- * NON-EMPTY `data` it calls `maverickV2SwapCallback` on msg.sender. (c2) drives the pre-pay path — the
- * exact path the REAL contract implements for the empty data the engine passes.
- */
-const maverickPoolSwapAbi = parseAbi([
-  "function swap(address recipient, (uint256 amount, bool tokenAIn, bool exactOutput, int32 tickLimit) params, bytes data) returns (uint256 amountIn, uint256 amountOut)",
-]);
-
-/** PoolTokenNotSolvent(uint256 internalReserve, uint256 tokenBalance, address token) — the real pool's
- *  solvency-check error the engine's empty-data callback path triggers (keccak selector). */
-const POOL_TOKEN_NOT_SOLVENT_SELECTOR = "0x39de6df5";
-
-/** Pull the raw revert data (0x…) out of a viem ContractFunctionExecutionError, if present. */
-function extractRevertData(e: unknown): Hex | undefined {
-  let cur: unknown = e;
-  for (let i = 0; i < 8 && cur; i++) {
-    const anyCur = cur as { data?: unknown; raw?: unknown; cause?: unknown; signature?: unknown };
-    const d = (anyCur.data ?? anyCur.raw) as { data?: string } | string | undefined;
-    if (typeof d === "string" && d.startsWith("0x") && d.length >= 10) return d as Hex;
-    if (d && typeof d === "object" && typeof d.data === "string" && d.data.startsWith("0x")) return d.data as Hex;
-    cur = anyCur.cause;
-  }
-  // Fall back to scraping the message for a "custom error 0x…" or "Details: … 0x…" fragment.
-  const msg = (e as Error)?.message ?? "";
-  const m = msg.match(/custom error (0x[0-9a-fA-F]{8,})/) ?? msg.match(/0x39de6df5[0-9a-fA-F]*/);
-  return m ? (m[1] ?? m[0]) as Hex : undefined;
-}
 
 describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL bytecode, no fork, offline", () => {
   const snaps = loadMaverickSnapshots(SNAP_NAME);
@@ -373,8 +334,9 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    // Engine-executable direction: tokenIn = USDC (tokenB), tokenOut = USDT (tokenA). activeTick=+7, so a
-    // tokenB-in swap walks DOWN toward tickLimit=0 (the only direction the engine's tickLimit=0 fills).
+    // Direction: tokenIn = USDC (tokenB), tokenOut = USDT (tokenA). activeTick=+7, so a tokenB-in swap
+    // walks DOWN in tick. The FIXED engine passes full-range tickLimit (type(int32).min for tokenB-in),
+    // so the swap is not capped; this trade consumes within a few ticks of the active tick regardless.
     const tokenIn = etched.tokenB; // USDC
     const tokenOut = etched.tokenA; // USDT
 
@@ -418,11 +380,11 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
     // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Maverick venue seeded from the REAL captured tick book via
     // the SHARED buildMaverickSegments. Pure off-chain math (computed BEFORE any execution), so the awarded
     // Σ is known ahead. Single venue ⇒ the whole amountIn is awarded to it (asserted below).
-    // NOTE (scope): this is a single-venue wei-exactness + engine-bug-pinning proof, NOT a multi-venue SPLIT
+    // NOTE (scope): this is a single-venue real-engine-callback wei-exactness proof, NOT a multi-venue SPLIT
     // proof — with one venue optimalSplit trivially awards the whole amountIn, so `awarded == amountIn` holds
     // by construction, not by allocation logic. Multi-venue split behavior (marginal-price equalization across
     // pools) is covered by the multi-pool prod-mirrors (e.g. ecoswap.v2v3v4 / ecoswap.allpools). Do NOT read
-    // this cell as a split test; its strength is the real-vs-real wei-exact dy anchor below.
+    // this cell as a split test; its strength is the real-vs-real wei-exact dy anchor through the engine below.
     const optPools: OptimalPool[] = [{ maverick: op, feePpm: op.feePpm }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
     const awarded = oracle.perPoolInput[0] ?? 0n;
@@ -434,7 +396,9 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
 
     // The REAL MaverickV2Quoter's OWN calculateSwap view for the KNOWN awarded Σ — the engine-independent,
     // BIT-EXACT ground truth for the executed dy of the awarded slice, on the PRE-swap state (the real
-    // Solidity bin swap math). tokenB-in, tickLimit=0. calculateSwap is state-mutating in signature → simulate.
+    // Solidity bin swap math). tokenB-in, tickLimit=0 (the trade consumes before tick 0, so the tickLimit
+    // is immaterial — the FIXED engine's full-range type(int32).min yields the identical (in, out)).
+    // calculateSwap is state-mutating in signature → simulate.
     const quoterSim = await c.publicClient.simulateContract({
       address: etched.quoter, abi: maverickQuoterAbi, functionName: "calculateSwap",
       args: [etched.pool, awarded, false, false, 0],
@@ -443,94 +407,61 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
     assert.equal(quoterIn, awarded, "REAL quoter consumes the full awarded input (no tickLimit partial)");
     assert.ok(quoterOut > 0n, "REAL quoter returns a positive dy for the awarded Σ");
 
-    // ── (c1) ENGINE-PATH BUG — the production cook REVERTS against the REAL bytecode. ──
-    // The engine `_swapMaverickV2` calls pool.swap(recipient, params, "") with EMPTY data. The REAL Maverick
-    // V2 Pool takes its PRE-PAY branch on empty data and NEVER invokes maverickV2SwapCallback (its runtime
-    // has ZERO occurrences of selector 0x733db10b — see the file header + the harness capture note), so the
-    // engine's callback never fires, the input is never delivered, and the pool reverts PoolTokenNotSolvent
-    // (selector 0x39de6df5). We assert the cook FAILS + moves no tokenIn on BOTH engines, and — when the
-    // engine surfaces the inner revert (v1 bubbles it up verbatim; the v12 Pot masks the delegatecall bubble
-    // to 0x) — that it is EXACTLY the real pool's solvency error (not an unrelated failure). A future engine
-    // fix (non-empty data) will make cook succeed → the receipt status assertion flips and this cell fails
-    // loudly, prompting an update to exercise the callback path.
-    const inBeforeEngine = await balanceOf(c.publicClient, tokenIn, caller);
-    let engineRevertData: Hex | undefined;
-    try {
-      await c.publicClient.simulateContract({
-        address: target, abi: COOK_ABI, functionName: "cook", args: [bytecodes], account: caller, gas: 1_900_000_000n,
-      });
-      assert.fail("engine cook() unexpectedly SUCCEEDED against the REAL Maverick V2 pool — the empty-data callback bug may be fixed; update (c1) to exercise the callback path");
-    } catch (e) {
-      engineRevertData = extractRevertData(e);
-    }
-    // When the inner revert is surfaced (v1), it MUST be the real pool's PoolTokenNotSolvent. The v12 Pot
-    // delegatecalls the Huff runtime → SauceRouter and bubbles a masked 0x, so the selector is only checked
-    // when a real 8-byte selector is present (never silently skipped for v1, where it always is).
-    if (engineRevertData && !engineRevertData.toLowerCase().startsWith("0x00000000")) {
-      assert.ok(
-        engineRevertData.toLowerCase().startsWith(POOL_TOKEN_NOT_SOLVENT_SELECTOR),
-        `engine cook reverts with the REAL pool's PoolTokenNotSolvent (${POOL_TOKEN_NOT_SOLVENT_SELECTOR}); got ${engineRevertData.slice(0, 10)}`,
-      );
-    }
-    // The on-chain cook receipt is a revert on BOTH engines, and no state moved (atomic revert — nothing spent).
-    const cookReceipt = await cook(c.walletClient, c.publicClient, target, bytecodes).then((r) => r.receipt);
-    assert.equal(cookReceipt.status, "reverted", "the on-chain cook receipt is a revert (engine empty-data callback bug)");
+    // ── (c) REAL ENGINE-CALLBACK SWAP, WEI-EXACT — cook the production EcoSwap through the FIXED engine. ──
+    // The engine `_swapMaverickV2` calls pool.swap(recipient, params, hex"01") with NON-EMPTY data, which
+    // selects the REAL Maverick V2 Pool's CALLBACK funding branch: the pool sends output first, then
+    // re-enters our maverickV2SwapCallback(tokenIn, amountIn, amountOut, data) to PULL the input. This runs
+    // the GENUINE captured pool bytecode (the callback selector 0x67ca7c91 is present in the real runtime),
+    // so the swap COMPLETES against real code — no mock, no pre-pay substitute. We assert the cook SUCCEEDS
+    // and the caller's received dy == the REAL quoter's calculateSwap(awarded) BIT-FOR-BIT (real == real).
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const poolInBefore = await balanceOf(c.publicClient, tokenIn, etched.pool);
+    const poolOutBefore = await balanceOf(c.publicClient, tokenOut, etched.pool);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
     assert.equal(
-      inBeforeEngine - (await balanceOf(c.publicClient, tokenIn, caller)),
-      0n,
-      "the reverted cook moved no tokenIn (atomic revert)",
+      receipt.status,
+      "success",
+      "the production cook SUCCEEDS through the FIXED engine _swapMaverickV2 → real maverickV2SwapCallback",
     );
 
-    // ── (c2) REAL-EXECUTION WEI-EXACT — the awarded slice through the REAL pool's OWN pre-pay swap. ──
-    // This is the exact path the REAL Maverick V2 contract implements for empty data: transfer the input to
-    // the pool, then pool.swap(recipient, {amount, tokenAIn:false, exactOutput:false, tickLimit:0}, "").
-    // NO mock, NO substitute math — the GENUINE captured pool bytecode computes the output. We execute the
-    // KNOWN awarded Σ and assert the real output == the REAL quoter view BIT-FOR-BIT (real == real).
-    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-    const poolInBefore = await balanceOf(c.publicClient, tokenIn, etched.pool);
-    // Pre-pay: deliver the awarded input to the pool (the real contract's empty-data expectation).
-    await mint(c.walletClient, c.publicClient, tokenIn, etched.pool, awarded);
-    const swapSim = await c.publicClient.simulateContract({
-      address: etched.pool, abi: maverickPoolSwapAbi, functionName: "swap",
-      args: [caller, { amount: awarded, tokenAIn: false, exactOutput: false, tickLimit: 0 }, "0x"],
-      account: caller,
-    });
-    const [realIn, realOut] = swapSim.result as readonly [bigint, bigint];
-    const swapHash = await c.walletClient.writeContract(swapSim.request);
-    await c.publicClient.waitForTransactionReceipt({ hash: swapHash });
-
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const poolIn = (await balanceOf(c.publicClient, tokenIn, etched.pool)) - poolInBefore;
+    const poolOut = poolOutBefore - (await balanceOf(c.publicClient, tokenOut, etched.pool));
 
-    // The REAL pool consumed exactly the awarded input (full fill) and paid the REAL quoter's dy, BIT-EXACT.
-    assert.equal(realIn, awarded, "REAL pool.swap consumed the full awarded input (spent == awarded, wei-exact)");
-    assert.equal(poolIn, awarded, "the REAL pool received exactly the awarded input (pre-pay delivery == spent)");
-    assert.equal(received, realOut, "caller received the REAL pool.swap output");
-    // REAL == REAL, to the WEI: the executed output == the REAL MaverickV2Quoter calculateSwap(awarded).
+    // The engine pulled exactly the awarded input via the callback and the pool paid the REAL dy.
+    assert.equal(spent, awarded, "the engine spent exactly the awarded input (callback pull, wei-exact)");
+    assert.equal(poolIn, awarded, "the REAL pool received exactly the awarded input via maverickV2SwapCallback");
+    assert.equal(poolOut, received, "the REAL pool paid out exactly what the caller received");
+    // REAL == REAL, to the WEI: the executed dy through the engine callback == the REAL MaverickV2Quoter's
+    // calculateSwap(awarded). The engine-independent ground truth is the real bin swap math (the quoter),
+    // and the genuine pool bytecode computed the same value under the engine's callback funding path.
     assert.equal(received, quoterOut, "received == REAL MaverickV2Quoter calculateSwap(awarded Σ) — BIT-EXACT (real == real)");
-    assert.ok(received > 0n, "non-zero fill through the REAL Maverick V2 bin swap math");
+    assert.ok(received > 0n, "non-zero fill through the REAL Maverick V2 bin swap math (engine callback path)");
 
     // HONEST off-chain-replay divergence: the off-chain maverick-math.ts getDy is a PORT of the bin math and
     // diverges from the REAL pool by a few wei at the ~13th significant digit (a port-rounding difference). It
-    // is the SPLIT driver (awarded input is exact), NOT the dy ground truth — so we assert getDy ONLY within a
-    // relative bound, never to the wei. The wei-exact dy check is (real == real) above. The OBSERVED divergence
-    // is ~3.3e-15 relative (Δ≈3.3e6 wei on ~1e21 out); the bound below (Δ < 1e-12 of the output) sits ~3 orders
-    // of magnitude above that, so it stays green today yet still catches a real regression that widens the
-    // port-rounding gap (the earlier 1e-9 bound was ~6 orders too loose to catch one).
+    // is the SPLIT driver (awarded input is exact — it seeded the oracle above), NOT the dy ground truth — so
+    // we assert getDy ONLY within a relative bound, never to the wei. The wei-exact dy check is (real == real)
+    // above. The OBSERVED divergence is ~3.3e-15 relative (Δ≈3.3e6 wei on ~1e21 out); the bound below (Δ <
+    // 1e-12 of the output) sits ~3 orders of magnitude above that, so it stays green today yet still catches a
+    // real regression that widens the port-rounding gap.
     const offOut = getDy(op, awarded);
     const diff = offOut > received ? offOut - received : received - offOut;
     assert.ok(diff * 1_000_000_000_000n < received, `off-chain getDy within 1e-12 of the real dy (Δ=${diff}, out=${received})`);
 
     const ms = Date.now() - t0;
     console.log(
-      `  [maverick-prod-mirror:${engine}] (c1) engine cook REVERTS PoolTokenNotSolvent (empty-data callback bug); ` +
-        `(c2) REAL pre-pay swap WEI-EXACT vs real quoter — spent=${realIn} received=${received} ` +
-        `(quoterOut=${quoterOut}, awarded=${awarded}, offGetDy=${offOut} Δ=${diff}); wall-clock ${ms} ms (no fork, no RPC)`,
+      `  [maverick-prod-mirror:${engine}] REAL engine-callback swap WEI-EXACT vs real quoter — ` +
+        `spent=${spent} received=${received} (quoterOut=${quoterOut}, awarded=${awarded}, ` +
+        `oracle=${oracle.totalInput}, offGetDy=${offOut} Δ=${diff}); wall-clock ${ms} ms (no fork, no RPC)`,
     );
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`REAL Maverick V2 bytecode [${engine}] — engine empty-data callback bug pinned + real pre-pay swap wei-exact vs quoter, offline`, { skip }, async () => {
+    it(`REAL Maverick V2 bytecode [${engine}] — real engine-callback swap wei-exact vs quoter + oracle, offline`, { skip }, async () => {
       await runProdMirror(engine);
     });
   }

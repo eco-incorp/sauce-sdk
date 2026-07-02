@@ -6,8 +6,13 @@ interface IERC20Min {
     function balanceOf(address) external view returns (uint256);
 }
 
+/// @notice The REAL Maverick V2 swap callback surface (4 args), matching the FIXED engine
+/// `maverickV2SwapCallback(IERC20 tokenIn, uint256 amountIn, uint256 amountOut, bytes data)`. The engine's
+/// callback transfers `amountIn` of the input token to msg.sender (the pool). Passed the token here as
+/// `address` (== `IERC20` at the ABI level) so this mock compiles standalone.
 interface IMaverickV2SwapCallback {
-    function maverickV2SwapCallback(uint256 amountToPay, uint256 amountOut, bytes calldata data) external;
+    function maverickV2SwapCallback(address tokenIn, uint256 amountIn, uint256 amountOut, bytes calldata data)
+        external;
 }
 
 /// @notice Faithful minimal Maverick V2 (bin-based directional AMM) pool for local EVM tests of the
@@ -19,16 +24,23 @@ interface IMaverickV2SwapCallback {
 /// `getDy(pool, amountIn)` to the wei, and `calculateSwap` (the on-chain quoter analogue) returns the
 /// SAME (amountIn, amountOut) — the wei-exact-in-dy gate.
 ///
-/// The engine `_swapMaverickV2` is CALLBACK-based: it reads this pool's `tokenA()`, sets tokenAIn, and
-/// calls `swap(recipient, SwapParams{amount, tokenAIn, exactOutput:false, tickLimit:0}, "")`. This
-/// fixture's `swap` walks the tick book computing (amountIn, amountOut) at the PRE-swap state, then
-/// re-enters the caller via `maverickV2SwapCallback(amountIn, amountOut, data)` to PULL the input, then
-/// transfers the output to `recipient`. Pre-funded with both sides' reserves.
+/// DUAL-MODE swap, matching the REAL Maverick V2 Pool (and the FIXED engine `_swapMaverickV2`): the engine
+/// reads this pool's `tokenA()`, sets tokenAIn, and calls `swap(recipient, SwapParams{amount, tokenAIn,
+/// exactOutput:false, tickLimit: tokenAIn ? type(int32).max : type(int32).min}, hex"01")` with NON-EMPTY
+/// `data`. Non-empty data selects the CALLBACK funding branch: the pool walks the tick book computing
+/// (amountIn, amountOut) at the PRE-swap state, pays `amountOut` of the output token to `recipient` FIRST,
+/// then re-enters the caller via `maverickV2SwapCallback(tokenIn, amountIn, amountOut, data)` and REQUIRES
+/// its own input-token balance grew by `amountIn` (reverting `PoolTokenNotSolvent` otherwise — the real
+/// pool's solvency check). With EMPTY data it takes the PRE-PAY branch (the input must already sit in the
+/// pool; no callback). Pre-funded with both sides' reserves.
 ///
-/// ENGINE tickLimit=0 CONSTRAINT: the engine hardcodes `tickLimit: 0`. This fixture applies exactly that
-/// limit in its walk (a tokenA-in swap stops once currentTick > 0; a tokenB-in swap once currentTick < 0),
-/// matching real Maverick. So the pool must be seeded with its active tick <= 0 for tokenA-in swaps (or
-/// >= 0 for tokenB-in) or the swap fills nothing — see maverick-math.ts.
+/// ENGINE tickLimit: the FIXED engine passes `type(int32).max` for a tokenA-in swap and `type(int32).min`
+/// for a tokenB-in swap (full-range, matching Maverick's own router). This fixture's walk honors ANY
+/// tickLimit the engine passes WITHOUT capping short of it (a tokenA-in swap stops once currentTick >
+/// tickLimit; a tokenB-in swap once currentTick < tickLimit — with type(int32).max/min those bounds are
+/// never the binding constraint, so the walk runs until the input is consumed or the seeded book ends).
+/// The trades the tests run fully consume within a handful of ticks near the active tick, well before any
+/// tickLimit boundary — so the executed dy equals off-chain `getDy` (which walks the same book) to the wei.
 contract MaverickV2Pool {
     uint256 private constant ONE = 1e18;
     uint256 private constant ONE_SQUARED = ONE * ONE;
@@ -467,8 +479,20 @@ contract MaverickV2Pool {
         gasEstimate = 0;
     }
 
-    /// @notice The engine `_swapMaverickV2` surface (callback-based). Compute the (amountIn, amountOut) at
-    /// the current state, re-enter the caller to PULL the input, then transfer the output to `recipient`.
+    /// @notice PoolTokenNotSolvent — the real Maverick V2 Pool's solvency-check error, thrown when the
+    /// callback did not deliver the expected input. `internalReserve` is what the pool's input balance
+    /// SHOULD be (pre-balance + amountIn); `tokenBalance` is what it actually is; `token` is the input.
+    error PoolTokenNotSolvent(uint256 internalReserve, uint256 tokenBalance, address token);
+
+    /// @notice The REAL Maverick V2 Pool `swap` surface (dual-mode), matching the FIXED engine
+    /// `_swapMaverickV2`. Compute the (amountIn, amountOut) at the current state, honoring the engine's
+    /// per-direction tickLimit (type(int32).max/min ⇒ full range). Then:
+    ///   • NON-EMPTY data (the engine's callback funding mode — it passes hex"01"): pay `amountOut` of the
+    ///     output token to `recipient` FIRST, then re-enter the caller's `maverickV2SwapCallback(tokenIn,
+    ///     amountIn, amountOut, data)` to PULL the input, and REQUIRE the pool's input balance grew by
+    ///     exactly `amountIn` (revert PoolTokenNotSolvent otherwise — the real pool's solvency guard).
+    ///   • EMPTY data (the pre-pay branch): the input must ALREADY sit in the pool (delivered before the
+    ///     call); require solvency, then pay the output. No callback fires.
     /// exactOutput is ignored (the engine always passes false); state is NOT advanced (the single-swap EVM
     /// test snapshots fresh each run, so the on-chain output matches getDy on the initial state to the wei).
     function swap(address recipient, SwapParams calldata params, bytes calldata data)
@@ -476,10 +500,29 @@ contract MaverickV2Pool {
         returns (uint256 amountIn, uint256 amountOut)
     {
         (amountIn, amountOut) = _simulate(params.amount, params.tokenAIn, params.tickLimit);
-        // Pull the input from the caller (the engine) via the Maverick callback.
-        IMaverickV2SwapCallback(msg.sender).maverickV2SwapCallback(amountIn, amountOut, data);
-        // Pay the output to the recipient.
+
+        address inToken = params.tokenAIn ? _tokenA : _tokenB;
         address outToken = params.tokenAIn ? _tokenB : _tokenA;
+
+        // Snapshot the pool's input balance BEFORE any callback so the solvency check measures exactly
+        // what the callback (or the pre-pay) delivered.
+        uint256 inBalanceBefore = IERC20Min(inToken).balanceOf(address(this));
+
+        // Pay the output to the recipient FIRST (the real pool sends output, then calls back for input).
         if (amountOut > 0) IERC20Min(outToken).transfer(recipient, amountOut);
+
+        // NON-EMPTY data ⇒ callback funding mode: the caller (the engine) delivers the input via the
+        // callback. EMPTY data ⇒ pre-pay mode: the input must already sit in the pool (no callback).
+        if (data.length > 0) {
+            IMaverickV2SwapCallback(msg.sender).maverickV2SwapCallback(inToken, amountIn, amountOut, data);
+        }
+
+        // Solvency guard: the pool's input balance MUST have grown by exactly `amountIn` (whether the
+        // callback funded it or the caller pre-paid). This is the real pool's PoolTokenNotSolvent check.
+        uint256 inBalanceAfter = IERC20Min(inToken).balanceOf(address(this));
+        uint256 expected = inBalanceBefore + amountIn;
+        if (inBalanceAfter < expected) {
+            revert PoolTokenNotSolvent(expected, inBalanceAfter, inToken);
+        }
     }
 }

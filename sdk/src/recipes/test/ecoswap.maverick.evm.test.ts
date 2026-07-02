@@ -7,9 +7,10 @@
  * an EcoSwap whose static-segment cursor consumes Maverick segments (segKind 8) and executes them via the
  * unified swap(SwapParams{poolType:7}) → live `_swapMaverickV2`. Maverick is a CALLBACK pool: the engine
  * reads the pool's tokenA(), sets tokenAIn, calls pool.swap(recipient, SwapParams{amount, tokenAIn,
- * exactOutput:false, tickLimit:0}, ""), and the pool re-enters the engine's `maverickV2SwapCallback` to
- * PULL the input mid-swap — so it MUST execute through the engine Router (NOT the callback-free path).
- * Then asserts:
+ * exactOutput:false, tickLimit: tokenAIn ? type(int32).max : type(int32).min}, hex"01") — NON-EMPTY data
+ * selects the pool's callback funding mode — and the pool re-enters the engine's `maverickV2SwapCallback`
+ * (4-arg: tokenIn, amountIn, amountOut, data) to PULL the input mid-swap — so it MUST execute through the
+ * engine Router (NOT the callback-free path). Then asserts:
  *
  *   (1) SOLO Maverick venue — the on-chain dy the caller receives == off-chain getDy(awarded share) AND
  *       == the fixture's own on-chain MaverickV2Quoter-analogue calculateSwap(awarded) view to the WEI
@@ -28,10 +29,13 @@
  * template exactly as index.ts does and cook it.
  *
  * ENGINE PATH (verified here): Maverick executes through the engine `_swapMaverickV2` + the pool's
- * `maverickV2SwapCallback`. The engine hardcodes `tickLimit: 0`, which caps a tokenA-in swap at tick 0.
- * The fixture is seeded with its active tick at -3 (below 0) so a tokenA-in swap walks UP toward tick 0 —
- * the ONLY config the engine's tickLimit=0 fills (see maverick-math.ts). tokenIn == the pool's tokenA, so
- * the engine's on-chain tokenAIn resolution is true and the swap rises through the tick book.
+ * `maverickV2SwapCallback` (the FIXED engine — ../sauce PR #193 — passes hex"01" + a full-range per-
+ * direction tickLimit type(int32).max/min, and the 4-arg callback funds the pool). The fixture is seeded
+ * with its active tick at -3 so a tokenA-in swap walks UP through the tick book; tokenIn == the pool's
+ * tokenA, so the engine's on-chain tokenAIn resolution is true. The trade (100k against ~1M/tick reserves)
+ * fully consumes within a couple of ticks near the active tick, WELL before any tickLimit boundary — so
+ * the executed dy == off-chain getDy (which walks the same book) == the pool's own calculateSwap to the
+ * wei, whatever tickLimit the engine passes.
  *
  * No fork / no RPC env needed — a local fixture etches the whole stack. Runs on v1 (+ v12 when the v12
  * artifacts are present). Driven by ECO_ENGINE (default v12). Mirrors ecoswap.dodo.evm.test.ts.
@@ -82,7 +86,7 @@ const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 const E18 = 10n ** 18n;
 const FEE = E18 / 1000n; // 0.1% directional fee (1e18-scaled)
 const TICK_SPACING = 10;
-const ACTIVE_TICK = -3; // below 0 so a tokenA-in swap walks UP toward the engine tickLimit=0
+const ACTIVE_TICK = -3; // a tokenA-in swap walks UP from here; the trade consumes within a few ticks
 const ENGINE_CELLS = engineCells();
 
 // The PRODUCTION treeshake define set for a Maverick-only universe (no other segment-bearing protocol):
@@ -204,7 +208,7 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
   }
 
   // Build a symmetric tick book around ACTIVE_TICK (-3..+3), each tick with `reservePerSide` of both
-  // tokens. tokenAIn = true (tokenIn == tokenA), so the swap walks UP from -3 toward the engine tickLimit=0.
+  // tokens. tokenAIn = true (tokenIn == tokenA), so the swap walks UP from -3 (consumes within a few ticks).
   function makeTicks(reservePerSide: bigint): MaverickTick[] {
     const ticks: MaverickTick[] = [];
     for (let t = ACTIVE_TICK - 1; t <= ACTIVE_TICK + 6; t++) {
@@ -262,8 +266,8 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
     const pool = await deployMaverickV2Pool(c.walletClient, c.publicClient, deployParams(op), caller);
     const opOnChain: MaverickPool = { ...op, address: pool };
 
-    // amountIn sized within the reachable depth (the -3..0 walk under tickLimit=0). The merge awards the
-    // WHOLE Σ to this one venue, so the awarded share == the sampled cap and the executed swap is getDy(cap).
+    // amountIn sized within the reachable depth (consumed within a few ticks of the active tick). The merge
+    // awards the WHOLE Σ to this one venue, so the awarded share == the sampled cap and the swap is getDy(cap).
     const amountIn = 100_000n * E18;
     const segRows = maverickSegRows(opOnChain, 0, amountIn);
     assert.ok(segRows.length > 0, "non-empty Maverick segment ladder");
@@ -281,7 +285,8 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
     const poolInBefore = await balanceOf(c.publicClient, tokenIn, pool);
 
     // The fixture's own on-chain calculateSwap view (the MaverickV2Quoter analogue) on the PRE-swap state —
-    // the engine-independent ground truth for the executed dy of the awarded share. tokenAIn=true, tickLimit=0.
+    // the engine-independent ground truth for the executed dy of the awarded share. tokenAIn=true. The
+    // view's tickLimit is immaterial here — the trade consumes before any boundary — so 0 == full-range.
     const onView = (await c.publicClient.readContract({
       address: pool, abi: maverickV2PoolAbi, functionName: "calculateSwap", args: [segSum, true, false, 0],
     })) as readonly [bigint, bigint, bigint];
