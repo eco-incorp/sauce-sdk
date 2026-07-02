@@ -49,7 +49,12 @@ import { ecoSwapReference } from "./ecoswap.reference";
 
 const HUGE = parseEther("1000000000");
 const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec05a2a2" as Hex;
-const MAX_TICKS = 96; // mirror prepare.ts V3_TICK_STEPS hard cap
+// Pin the lens's HARD per-pool tick ceiling to the legacy 96 for these lazy-walk/decode
+// gates so their "scannedForward << 96" assertions stay meaningful. With bandTicks at its
+// LENS_BAND_TICKS=256 default, effTicks = clamp(256/ts, 96, maxTicks=96) = 96 for every pool
+// (HI caps it), i.e. explicitly forcing legacy behavior. (Production uses maxTicks=256 so a
+// tight ts=1 pool can walk the full price band.)
+const MAX_TICKS = 96;
 
 // ENGINE NOTE: the lens is v12-native (runLens compiles to `target` and cooks through
 // that engine — v1 SauceRouter or the V12Pot's Huff runtime, with a target-gated cook

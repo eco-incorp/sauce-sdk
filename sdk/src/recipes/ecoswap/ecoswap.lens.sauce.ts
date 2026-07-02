@@ -56,12 +56,14 @@ import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 // gas scales with ticks ACTUALLY read.
 //
 // ── Compiler-arg layout — scalars bundled into `cfg`, tuples kept separate (v12-native) ──
-// main() takes the 7 SCALARS bundled into one `cfg` tuple plus the 6 tuple-of-tuples
-// params unchanged. The 7 scalars were the problem: as separate params, deep reads of
+// main() takes the 8 SCALARS bundled into one `cfg` tuple plus the 6 tuple-of-tuples
+// params unchanged. The scalars were the problem: as separate params, deep reads of
 // them used depth-sensitive SDUP, which overflows the v12 SDUP16 reference window once
 // the working stack is tall (the big 4-pass body) → "REF position out of range: 17".
 // Bundling them into `cfg` turns each into a heap INDEX read (cfg[i]) at a fixed depth,
-// clearing the overflow on v12.
+// clearing the overflow on v12. bandTicks (cfg[7], the survivorship price-band budget)
+// was added to cfg — NOT as a new param — so main() stays at 7 params (the v12 arg-
+// prologue SDUP window is unchanged).
 //
 // The 6 tuple-of-tuples params are LEFT as separate params on purpose: a top-level
 // tuple-of-tuples param round-trips through a variable correctly on BOTH engines (the
@@ -77,7 +79,20 @@ import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 //   cfg[3]  amountIn   : Uint256 (gross tokenIn; sizes the lazy walk)
 //   cfg[4]  driftTicks : Uint256 (extra boundaries past the stop, each side)
 //   cfg[5]  minRelBps  : Uint256 (survivor floor in bps of Σ in-range capacity)
-//   cfg[6]  maxTicks   : Uint256 (hard cap on forward tick reads per pool)
+//   cfg[6]  maxTicks   : Uint256 (HARD gas ceiling on forward tick reads per pool = the
+//                        clamp HI; sizes every walk loop's bound. Per-pool the walk stops
+//                        EARLIER at effTicks, see cfg[7].)
+//   cfg[7]  bandTicks  : Uint256 (target survivorship PRICE BAND in RAW ticks. The per-pool
+//                        effective tick budget is effTicks = clamp(bandTicks / max(1,ts),
+//                        LO=96, HI=maxTicks): a TIGHT ts (ts=1, the 0.01% stable tier) gets
+//                        MANY boundaries to cover the same % band a wide-ts pool covers in a
+//                        few; a WIDE ts is floored at LO=96 (byte-identical to the prior fixed
+//                        96 window → no wide-ts regression). This makes the IN-RANGE-capacity
+//                        SURVIVORSHIP metric + the deactivation window a fixed price band per
+//                        pool instead of a fixed tick COUNT, so a deep tight-ts stable pool is
+//                        no longer under-measured (its Σ share understated) and dropped by the
+//                        minRelBps filter for a non-liquidity reason. bandTicks=0 ⇒ effTicks=LO
+//                        for every pool (the legacy fixed-96 behavior).)
 //   v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream]
 //                    isAlgebra=1 ⇒ Algebra dynamic-fee fork (Camelot/QuickSwap V3, Ramses V2):
 //                    discover via poolByPair(tokenIn,tokenOut) and read globalState() for
@@ -185,6 +200,34 @@ function stepReal(sqrtReal: Uint256, stepRatio: Uint256, zeroForOne: Uint256): U
   return Math.mulDiv(sqrtReal, stepRatio, Q96);
 }
 
+// Per-pool effective forward tick budget = clamp(bandTicks / max(1,ts), LO, HI).
+// Each walk step advances ONE tickSpacing, so `n` steps span n*ts RAW ticks — a price
+// band of 1.0001^(n*ts). To cover a FIXED raw-tick band `bandTicks` a pool needs
+// n = bandTicks/ts steps: a tight ts=1 pool gets MANY steps, a wide ts gets FEW. LO=96
+// floors the budget at the legacy fixed window (so ts>=10 tiers are byte-identical to the
+// old behavior — no wide-ts regression, wei-exact preserved for them by construction);
+// HI=maxTicks caps the tight-ts budget so the lens gas stays bounded (it is also the outer
+// loop bound below, so effTicks<=maxTicks always). bandTicks=0 ⇒ LO for every pool (legacy).
+// The SOLVER (ecoswap.sauce.ts, PER_POOL=2048 with out-of-window staticcalls) and the neutral
+// ORACLE (ecoswap.optimal.ts, MAX_V3_STEPS=2048 over the SAME adaptiveNet this window ships)
+// both derive their deactivation extreme from the net map the lens emits over THIS budget, so
+// widening the budget widens BOTH in lockstep — survivorship + deactivation stay identical.
+function effTicks(ts: Uint256, bandTicks: Uint256, maxTicks: Uint256): Uint256 {
+  const LO: Uint256 = 96;
+  let denom: Uint256 = ts;
+  if (denom < 1) {
+    denom = 1;
+  }
+  let n: Uint256 = bandTicks / denom;
+  if (n < LO) {
+    n = LO;
+  }
+  if (n > maxTicks) {
+    n = maxTicks;
+  }
+  return n;
+}
+
 function main(
   cfg: Tuple,
   v3Factories: Tuple,
@@ -206,6 +249,7 @@ function main(
   const driftTicks: Uint256 = cfg[4];
   const minRelBps: Uint256 = cfg[5];
   const maxTicks: Uint256 = cfg[6];
+  const bandTicks: Uint256 = cfg[7];
 
   let poolBlob: bytes = abi.encode(tokenIn).slice(0, 0);
   let tickBlob: bytes = abi.encode(tokenIn).slice(0, 0);
@@ -417,7 +461,11 @@ function main(
             let nearRealA3: Uint256 = sqrtA3;
             let cumA3: Uint256 = 0;
             let doneA3: Uint256 = 0;
+            const budA3: Uint256 = effTicks(tsA3, bandTicks, maxTicks);
             for (let ka3 = 0; ka3 < maxTicks; ka3 = ka3 + 1) {
+              if (ka3 >= budA3) {
+                doneA3 = 1;
+              }
               if (doneA3 === 0) {
                 const farRealA3: Uint256 = stepReal(nearRealA3, stepA3, zeroForOne);
                 const nearOIa3: Uint256 = toOutIn(nearRealA3, zeroForOne);
@@ -528,7 +576,11 @@ function main(
           let nearRealA4: Uint256 = sqrtA4;
           let cumA4: Uint256 = 0;
           let doneA4: Uint256 = 0;
+          const budA4: Uint256 = effTicks(tsA4, bandTicks, maxTicks);
           for (let ka4 = 0; ka4 < maxTicks; ka4 = ka4 + 1) {
+            if (ka4 >= budA4) {
+              doneA4 = 1;
+            }
             if (doneA4 === 0) {
               const farRealA4: Uint256 = stepReal(nearRealA4, stepA4, zeroForOne);
               const nearOIa4: Uint256 = toOutIn(nearRealA4, zeroForOne);
@@ -672,7 +724,11 @@ function main(
             let nearRealM: Uint256 = sqrtM;
             let cumInM: Uint256 = 0;
             let doneM: Uint256 = 0;
+            const budM: Uint256 = effTicks(tsM, bandTicks, maxTicks);
             for (let km = 0; km < maxTicks; km = km + 1) {
+              if (km >= budM) {
+                doneM = 1;
+              }
               if (doneM === 0) {
                 const farRealM: Uint256 = stepReal(nearRealM, stepM, zeroForOne);
                 const nearOIM: Uint256 = toOutIn(nearRealM, zeroForOne);
@@ -799,7 +855,11 @@ function main(
           let nearRealM4: Uint256 = sqrtM4;
           let cumInM4: Uint256 = 0;
           let doneM4: Uint256 = 0;
+          const budM4: Uint256 = effTicks(v4tsM, bandTicks, maxTicks);
           for (let km4 = 0; km4 < maxTicks; km4 = km4 + 1) {
+            if (km4 >= budM4) {
+              doneM4 = 1;
+            }
             if (doneM4 === 0) {
               const farRealM4: Uint256 = stepReal(nearRealM4, v4stepM, zeroForOne);
               const nearOIM4: Uint256 = toOutIn(nearRealM4, zeroForOne);
@@ -993,9 +1053,13 @@ function main(
             let nearReal3: Uint256 = sqrt3;
             let cumIn3: Uint256 = 0;
             let scanned3: Uint256 = 0;
-            let stop3: Uint256 = 0;    // hit cumIn>=amountIn OR feeAdj(far)<=floorAdj
+            let stop3: Uint256 = 0;    // hit cumIn>=amountIn OR feeAdj(far)<=floorAdj OR band edge
             let drift3: Uint256 = 0;   // extra ticks emitted after stop
             let done3: Uint256 = 0;
+            // Per-pool forward budget = the fixed PRICE BAND for this ts (clamp(band/ts,96,maxTicks)).
+            // The forward walk force-stops at the band edge (then drifts driftTicks more) so scanned3
+            // and the emitted net window span the SAME band the MEASURE-B survivorship metric used.
+            const bud3: Uint256 = effTicks(ts3, bandTicks, maxTicks);
             for (let k3 = 0; k3 < maxTicks; k3 = k3 + 1) {
               if (done3 === 0) {
                 const argW3: Uint256 = tickArg(curShift3, OFFSET);
@@ -1031,7 +1095,8 @@ function main(
                 }
                 nearReal3 = farReal3;
 
-                // Stop test: covered amountIn OR fell to/below the floor price.
+                // Stop test: covered amountIn OR fell to/below the floor price OR reached the
+                // per-pool band edge (k3+1 forward steps taken == bud3 → stop, then drift).
                 if (stop3 === 0) {
                   const fa3: Uint256 = feeAdj(farOI3, fee3);
                   let hitFloor: Uint256 = 0;
@@ -1045,6 +1110,10 @@ function main(
                   } else {
                     if (hitFloor === 1) {
                       stop3 = 1;
+                    } else {
+                      if (scanned3 >= bud3) {
+                        stop3 = 1;
+                      }
                     }
                   }
                 }
@@ -1174,6 +1243,8 @@ function main(
           let stop4: Uint256 = 0;
           let drift4: Uint256 = 0;
           let done4: Uint256 = 0;
+          // Per-pool forward budget = the fixed PRICE BAND for this ts (see the V3 EMIT walk).
+          const bud4: Uint256 = effTicks(v4ts3, bandTicks, maxTicks);
           for (let k4 = 0; k4 < maxTicks; k4 = k4 + 1) {
             if (done4 === 0) {
               const argW4: Uint256 = tickArg(curShift4, OFFSET);
@@ -1222,6 +1293,10 @@ function main(
                 } else {
                   if (hitFloor4 === 1) {
                     stop4 = 1;
+                  } else {
+                    if (scanned4 >= bud4) {
+                      stop4 = 1;
+                    }
                   }
                 }
               }

@@ -418,13 +418,18 @@ describe("EcoSwap ALL-POOLS prod-mirror (Uni V3 ×4 + Pancake V3 ×4 + V2 + V4; 
     //   Pancake .25%≈ 0.06 WETH (0.00%)   DROP  (always)
     //   V2          ≈    0 WETH           DROP  (always)
     //
-    // The Pancake 0.01% pool sits at a KNIFE-EDGE: its in-range capacity (≈47.2 WETH)
-    // is ≈1.0% of the Σ, right at the 1% floor. The floor is a fraction of Σ, and the
-    // engines compute Σ with marginally different mulDiv/sqrt rounding (v12 Σ≈4701 →
-    // floor≈47.01 → Pancake-100 just OVER → KEPT; v1 Σ≈4741 → floor≈47.41 → just UNDER
-    // → DROPPED). So the survivor set is engine-dependent ONLY for this one borderline
-    // pool: 4 survivors on v12 (the default), 3 on v1. We assert the 3 unambiguous
-    // deep survivors strictly and treat Pancake-100 as the documented borderline.
+    // The Pancake 0.01% pool is a TIGHT-tickSpacing (ts=1) pool. Under the OLD fixed
+    // 96-tick survivorship window (≈0.96% price band at ts=1) its in-range capacity was
+    // UNDER-measured (only ≈47.2 WETH captured, ≈1.0% of Σ), landing it right at the 1%
+    // floor — a v1/v12 knife-edge (dropped on v1, kept on v12) decided by mulDiv/sqrt
+    // rounding, NOT by real liquidity. The per-pool PRICE-BAND survivorship window (a
+    // ts=1 pool now scans clamp(bandTicks/1, 96, maxTicks)=256 boundaries ≈ a 2.6% band)
+    // captures its FULL in-range depth: its Σ share converges by ≈192 ticks, lifting it
+    // to a CLEAN, engine-CONSISTENT survivor — 4 survivors on BOTH v1 and v12, with an
+    // identical Σ (the band fix also removes the cross-engine Σ divergence at this scale).
+    // The assertions below still tolerate either survivor set, but in practice cake100 is
+    // now kept on every engine. This is the tight-ts regression the band fix targets: a
+    // deep stable-tier pool no longer dropped for an arbitrary tick-COUNT reason.
     const cake100Kept = keptCakeFees.includes(100);
     assert.deepEqual(keptUniFees, [500, 3000], "always keeps the two deep Uniswap pools (0.05% + 0.30%)");
     assert.ok(keptCakeFees.includes(500), "always keeps the deep Pancake 0.05% pool");

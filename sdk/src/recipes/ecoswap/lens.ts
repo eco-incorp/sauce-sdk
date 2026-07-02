@@ -67,6 +67,39 @@ const POOL_STRIDE = 13;
 const TICK_STRIDE = 3;
 const ZERO_HOOKS = "0x0000000000000000000000000000000000000000" as Hex;
 
+/**
+ * Legacy per-pool forward-tick window (the clamp LO). A wide-ts pool (ts>=10 → every
+ * standard tier except the 0.01%/ts=1 stable tier) floors here, so it is byte-identical
+ * to the prior fixed 96-tick window — no regression, wei-exact preserved for those tiers
+ * by construction. Exported so callers/tests can reference the floor.
+ */
+export const LENS_WINDOW_LO = 96;
+/**
+ * HARD per-pool gas ceiling on forward tick reads (the clamp HI + the lens outer loop
+ * bound). A ts=1 pool can walk up to this many boundaries to cover the target price band.
+ * 256 raw ticks at ts=1 ≈ a 2.6% band (1.0001^256 ≈ 1.0259); the lens's per-pool staticcall
+ * cost is bounded by this even for the tightest tier. Chosen so the whole read stays under a
+ * live RPC's eth_call gas cap (measured ≈503M gas on v1 — the heavier engine — on the heavy
+ * 10-pool prod-mirror universe with 2 ts=1 pools, vs ≈234M at the legacy fixed-96 window;
+ * production runs on v12 whose Huff-runtime lens read is far cheaper; both under Alchemy's
+ * ~550M cap. See harness/lens-gas-probe.ts.) Override via opts.maxTicks / the
+ * LensCallParams.maxTicks (a live RPC with a lower cap can lower it; a wider band never helps
+ * — the in-range-capacity Σ CONVERGES by ≈192 ticks on the real Base WETH/USDC universe).
+ */
+export const LENS_MAX_TICKS = 256;
+/**
+ * Target survivorship PRICE BAND in RAW ticks. effTicks(ts) = clamp(bandTicks/max(1,ts),
+ * LO, HI). 256 raw ticks ≈ a 2.6% price band: a ts=1 (0.01% stable tier) pool gets
+ * clamp(256,96,256)=256 ticks, a ts=10 pool gets clamp(25,96,256)=96 (== legacy), every
+ * wider tier floors at 96. So a deep tight-ts stable pool is measured across the SAME % band
+ * as the volatile tiers and is no longer under-measured/dropped for an arbitrary tick-count
+ * reason. Verified on the real Base WETH/USDC universe: the Pancake 0.01% (ts=1) pool's true
+ * in-range capacity — ≈1.0% of Σ at the old 96 window, so a v1/v12-engine knife-edge — is
+ * FULLY captured by ≈192 ticks (its Σ share stops growing), lifting it to a clean survivor on
+ * BOTH engines. 256 leaves margin above that convergence point while staying gas-bounded.
+ */
+export const LENS_BAND_TICKS = 256;
+
 const cookAbi = parseAbi([
   "function cook(bytes[] ingredients) payable returns (bytes returnData)",
 ]);
@@ -230,8 +263,21 @@ export interface LensCallParams {
    * disables (every alive pool survives).
    */
   minRelBps?: number;
-  /** Hard cap on forward tick reads per pool (mirrors prepare.ts V3_TICK_STEPS=96). */
+  /**
+   * HARD gas ceiling on forward tick reads per pool (the clamp HI; also the lens's outer
+   * loop bound). Per-pool the walk stops EARLIER at effTicks = clamp(bandTicks/max(1,ts),
+   * 96, maxTicks). Default LENS_MAX_TICKS.
+   */
   maxTicks?: number;
+  /**
+   * Target survivorship PRICE BAND in RAW ticks. The per-pool tick budget is
+   * clamp(bandTicks/max(1,tickSpacing), 96, maxTicks) — a tight ts=1 (0.01% stable
+   * tier) pool gets MANY boundaries to cover the same % band a wide-ts pool covers in a
+   * few, so its IN-RANGE-capacity survivorship metric + deactivation window is a fixed
+   * price band, not a fixed tick count. Wide-ts pools floor at 96 (the legacy fixed
+   * window → no regression). Default LENS_BAND_TICKS. 0 ⇒ every pool floors at 96 (legacy).
+   */
+  bandTicks?: number;
   /**
    * Bytecode target for the lens program: "v1" (prefix, Solidity SauceRouter) or
    * "v12" (postfix, Huff runtime behind a V12Pot). DEFAULT "v12" — the production
@@ -267,25 +313,20 @@ export interface LensCallParams {
 const DEFAULT_LENS_ACCOUNT = "0x0000000000000000000000000000000000000001" as Hex;
 
 /**
- * Compile + invoke the lens via ONE eth_call cook() and decode the raw reads.
- *
- * `cookEntry` is the engine cook entrypoint to run the lens read against: the
- * SauceRouter on v1, the owner's V12Pot on v12 (mirrors harness/engine.ts's
- * cookTarget). It must match `params.target` — a v12 lens program only runs on the
- * Pot. Discovery config is derived from poolConfig: V3Standard factories (each with
- * its own feeTiers), V2Standard factories, and UniswapV4 factories (with stateView).
- * V4 poolIds are precomputed off-chain (keccak of the sorted PoolKey) and passed in.
+ * Compile the lens program to `params.target` bytecode for the given poolConfig +
+ * call params (the shared front half of runLens). Returns the cook ingredient
+ * bytecodes + the resolved account/target. Extracted so both the read-and-decode
+ * path (runLens) and a gas probe (measureLensGas) share ONE compile.
  */
-export async function runLens(
-  client: PublicClient,
-  cookEntry: Hex,
+export function buildLensCook(
   poolConfig: ChainPoolConfig,
   params: LensCallParams,
-): Promise<LensResult> {
+): { bytecodes: Hex[]; account: Hex; target: "v1" | "v12" } {
   const { tokenIn, tokenOut, zeroForOne, amountIn } = params;
   const driftTicks = params.driftTicks ?? 2;
   const minRelBps = params.minRelBps ?? 0;
-  const maxTicks = params.maxTicks ?? 96;
+  const maxTicks = params.maxTicks ?? LENS_MAX_TICKS;
+  const bandTicks = params.bandTicks ?? LENS_BAND_TICKS;
   const target = params.target ?? "v12";
   const account = params.account ?? DEFAULT_LENS_ACCOUNT;
   // Algebra is EXECUTABLE (default on): the engine implements algebraSwapCallback (sauce#186),
@@ -389,11 +430,13 @@ export async function runLens(
   const source = readFileSync(join(__dirname, "ecoswap.lens.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
 
-  // Args: the 7 SCALARS bundled into a single `cfg` tuple (cfg[0..6]) + the 6 tuple-
-  // of-tuples params kept SEPARATE. Bundling only the scalars converts their deep
-  // reads from depth-sensitive SDUP (which overflowed the v12 SDUP16 window at 13
-  // params → "REF position out of range") to fixed-depth heap INDEX, so the lens now
-  // compiles to v12. The tuple params stay separate because folding them into cfg
+  // Args: the 8 SCALARS bundled into a single `cfg` tuple (cfg[0..7], the last being
+  // bandTicks — the survivorship price-band budget) + the 6 tuple-of-tuples params kept
+  // SEPARATE. Bundling only the scalars converts their deep reads from depth-sensitive
+  // SDUP (which overflowed the v12 SDUP16 window at 14 params → "REF position out of
+  // range") to fixed-depth heap INDEX, so the lens now compiles to v12. Adding bandTicks
+  // to cfg (rather than as a new param) keeps main() at 7 params — the arg-prologue SDUP
+  // window is unchanged. The tuple params stay separate because folding them into cfg
   // would make their reads depth-3 nested-arg INDEX through a variable, which reverts
   // on v1 (the nested-tuple descriptor is lost on the round-trip). See the layout
   // comment in ecoswap.lens.sauce.ts.
@@ -409,6 +452,7 @@ export async function runLens(
         BigInt(driftTicks),
         BigInt(minRelBps),
         BigInt(maxTicks),
+        BigInt(bandTicks),
       ],
       // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep] — isAlgebra=1 ⇒ the
       // lens discovers via poolByPair + reads globalState() (price/tick + dynamic fee) instead
@@ -457,6 +501,26 @@ export async function runLens(
 
   const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;
   const bytecodes = segments.map(toHex);
+  return { bytecodes, account, target };
+}
+
+/**
+ * Compile + invoke the lens via ONE eth_call cook() and decode the raw reads.
+ *
+ * `cookEntry` is the engine cook entrypoint to run the lens read against: the
+ * SauceRouter on v1, the owner's V12Pot on v12 (mirrors harness/engine.ts's
+ * cookTarget). It must match `params.target` — a v12 lens program only runs on the
+ * Pot. Discovery config is derived from poolConfig: V3Standard factories (each with
+ * its own feeTiers), V2Standard factories, and UniswapV4 factories (with stateView).
+ * V4 poolIds are precomputed off-chain (keccak of the sorted PoolKey) and passed in.
+ */
+export async function runLens(
+  client: PublicClient,
+  cookEntry: Hex,
+  poolConfig: ChainPoolConfig,
+  params: LensCallParams,
+): Promise<LensResult> {
+  const { bytecodes, account, target } = buildLensCook(poolConfig, params);
 
   // ONE read-only eth_call cook() — the entire discovery + state + tick read.
   // The lens runs up to 4 discovery passes × maxTicks × every pool of staticcalls
@@ -506,6 +570,25 @@ export async function runLens(
   ) as [Hex, Hex];
 
   return decodeLens(poolBlob, tickBlob);
+}
+
+/**
+ * Estimate the on-chain gas of ONE lens cook() for the given params (diagnostics only —
+ * the lens is a read-only eth_call, never mined). Used to bound the gas cost of the
+ * per-pool price-band tick window. Same compile path as runLens.
+ */
+export async function measureLensGas(
+  client: PublicClient,
+  cookEntry: Hex,
+  poolConfig: ChainPoolConfig,
+  params: LensCallParams,
+): Promise<bigint> {
+  const { bytecodes, account } = buildLensCook(poolConfig, params);
+  return client.estimateGas({
+    account,
+    to: cookEntry,
+    data: encodeFunctionData({ abi: cookAbi as Abi, functionName: "cook", args: [bytecodes] }),
+  });
 }
 
 /** Decode the lens poolBlob/tickBlob into LensPool[] with reconstructed net maps. */

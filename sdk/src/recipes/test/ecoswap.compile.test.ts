@@ -290,26 +290,30 @@ describe("ecoswap.lens.sauce.ts", () => {
   const STEP_60 = 79426470787362580746886972461n; // sqrt(1.0001^60)*2^96 (fee 3000)
 
   // main(cfg, v3Factories, v3FeeTiers, v2Factories, v4Factories, v4Specs, v4PoolIds):
-  // the 7 SCALARS bundled into one `cfg` tuple (the EXACT shape lens.ts builds) + the
+  // the 8 SCALARS bundled into one `cfg` tuple (the EXACT shape lens.ts builds) + the
   // 6 tuple-of-tuples params kept separate. Bundling only the scalars clears the v12
-  // SDUP16 overflow (13 separate params → "REF position out of range") while keeping
+  // SDUP16 overflow (14 separate params → "REF position out of range") while keeping
   // the tuple params at the depth-2 access that round-trips on BOTH engines (folding
   // them into cfg would make a depth-3 nested-arg var read that reverts INDEX on v1).
-  // Compile both targets.
+  // The v3Factories rows carry the full [factory,isAlgebra,algTs,algStep,isSlipstream]
+  // 5-field shape so the per-pool effTicks(ts,bandTicks,maxTicks) budget + the Algebra/
+  // Slipstream branches all lower. Compile both targets.
   function compileLens(zeroForOne: bigint, target: "v1" | "v12") {
     const source = readFileSync(join(RECIPE_DIR, "ecoswap.lens.sauce.ts"), "utf-8");
     const result: any = compile(stripTypes(source), {
       baseDirs: [REPO_ROOT, RECIPE_DIR],
       target,
-      // cfg[0..6]: tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minRelBps,maxTicks
-      //   (no absolute floor — relative-depth minRelBps is the sole liquidity gate),
-      //   then v3Factories,v3FeeTiers[fee,stepRatio],v2Factories,v4Factories,
-      //   v4Specs[fee,ts,stepRatio],v4PoolIds as separate tuple params.
+      // cfg[0..7]: tokenIn,tokenOut,zeroForOne,amountIn,driftTicks,minRelBps,maxTicks,
+      //   bandTicks (the per-pool survivorship price-band budget; effTicks =
+      //   clamp(bandTicks/max(1,ts),96,maxTicks)). No absolute floor — relative-depth
+      //   minRelBps is the sole liquidity gate. Then v3Factories,v3FeeTiers[fee,
+      //   stepAsFee,stepAsTs],v2Factories[factory,feePpm],v4Factories,v4Specs[fee,ts,
+      //   stepRatio],v4PoolIds as separate tuple params.
       args: [
-        [TOKEN_IN, TOKEN_OUT, zeroForOne, 1000n, 2n, 100n, 96n],
-        [[FACTORY]],                       // v3Factories
-        [[500n, STEP_10], [3000n, STEP_60]], // v3FeeTiers [fee, stepRatio]
-        [[V2_FACTORY]],                    // v2Factories
+        [TOKEN_IN, TOKEN_OUT, zeroForOne, 1000n, 2n, 100n, 960n, 960n],
+        [[FACTORY, 0n, 0n, 0n, 0n]],       // v3Factories [factory,isAlgebra,algTs,algStep,isSlipstream]
+        [[500n, STEP_10, STEP_10], [3000n, STEP_60, STEP_60]], // v3FeeTiers [fee, stepAsFee, stepAsTs]
+        [[V2_FACTORY, 3000n]],             // v2Factories [factory, feePpm]
         [[POOL_MANAGER, STATE_VIEW]],      // v4Factories
         [[3000n, 60n, STEP_60]],           // v4Specs [fee, tickSpacing, stepRatio]
         [[POOL_ID]],                       // v4PoolIds (1 factory × 1 spec)

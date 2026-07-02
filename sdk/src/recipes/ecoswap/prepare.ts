@@ -38,7 +38,7 @@
  */
 
 import type { PublicClient, Hex } from "viem";
-import { runLens, type LensPool, type LensResult } from "./lens.js";
+import { runLens, LENS_MAX_TICKS, LENS_BAND_TICKS, type LensPool, type LensResult } from "./lens.js";
 import {
   discoverKyberClassicPools,
   discoverCurvePoolsTyped,
@@ -129,13 +129,24 @@ const OFFSET_TICK = 888000;
  */
 const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
 /**
- * Tick boundaries the lens scans per V3 pool in the swap direction (the cache window).
- * Scanned in one eth_call; the on-chain solver walks each pool's frontier from the LIVE
- * spot and reuses the drift-invariant net for boundaries inside this window, staticcalling
- * any boundary past it — so this only bounds how much net the cache ships, not how far the
- * walk reaches. Must be wide enough to cover the cut for the largest expected trade.
+ * HARD per-pool gas ceiling on the tick boundaries the lens scans per V3 pool in the swap
+ * direction (the cache window's max size = the clamp HI). Per-pool the lens actually scans
+ * effTicks = clamp(bandTicks/max(1,ts), 96, V3_TICK_STEPS) boundaries — a FIXED PRICE BAND,
+ * not a fixed COUNT — so a tight ts=1 (0.01% stable tier) pool scans MANY boundaries to
+ * cover the same % band a wide-ts pool covers in a few, while a wide-ts pool floors at 96
+ * (byte-identical to the prior fixed window). Scanned in one eth_call; the on-chain solver
+ * walks each pool's frontier from the LIVE spot and reuses the drift-invariant net for
+ * boundaries inside this window, staticcalling any boundary past it — so this only bounds
+ * how much net the cache ships, not how far the walk reaches. Mirrors lens.ts LENS_MAX_TICKS.
  */
-const V3_TICK_STEPS = 96;
+const V3_TICK_STEPS = LENS_MAX_TICKS;
+/**
+ * Target survivorship PRICE BAND in RAW ticks (the band the in-range-capacity metric + the
+ * deactivation window cover per pool). effTicks = clamp(V3_BAND_TICKS/max(1,ts), 96,
+ * V3_TICK_STEPS). 256 raw ticks ≈ a 2.6% band. Mirrors lens.ts LENS_BAND_TICKS. Override via
+ * ECO_BAND_TICKS; 0 ⇒ every pool floors at 96 (the legacy fixed-96 window).
+ */
+const V3_BAND_TICKS = Number(process.env.ECO_BAND_TICKS ?? LENS_BAND_TICKS);
 /** Cap on direct pools (top-N by liquidity) — bounds on-chain loop + calldata. */
 const MAX_DIRECT_POOLS = Number(process.env.ECO_MAX_POOLS ?? 12);
 /**
@@ -829,12 +840,21 @@ export interface EcoSwapPrepareOpts {
    */
   minRelBps?: number;
   /**
-   * Override the lens forward tick window (default V3_TICK_STEPS = 96). Lets the
-   * adaptive EVM test deliberately prepare a NARROW window so the prepared brackets
-   * under-fill amountIn — then the always-on streaming walk resumes from the frontier
-   * seed to close the gap.
+   * Override the lens HARD forward-tick gas ceiling (the clamp HI + outer loop bound;
+   * default V3_TICK_STEPS = LENS_MAX_TICKS). Per-pool the lens scans effTicks =
+   * clamp(bandTicks/max(1,ts), 96, maxTicks). Lets the adaptive EVM test deliberately
+   * prepare a NARROW window so the prepared brackets under-fill amountIn — then the
+   * always-on streaming walk resumes from the frontier seed to close the gap.
    */
   maxTicks?: number;
+  /**
+   * Override the target survivorship PRICE BAND in RAW ticks (default V3_BAND_TICKS =
+   * LENS_BAND_TICKS). effTicks = clamp(bandTicks/max(1,ts), 96, maxTicks): a tight ts=1
+   * (0.01% stable tier) pool gets many boundaries to cover the same % band a wide-ts pool
+   * covers in a few, so its in-range-capacity survivorship metric + deactivation window is
+   * a fixed price band. 0 ⇒ every pool floors at 96 (legacy fixed window).
+   */
+  bandTicks?: number;
   /**
    * Engine target for the on-chain LENS read (the discovery/state/tick eth_call cook).
    * DEFAULT "v12" — the production engine; the lens is now v12-native (its MEASURE-B
@@ -864,6 +884,7 @@ export async function prepareEcoSwap(
 ): Promise<EcoSwapPrepared> {
   const minRelBps = opts.minRelBps ?? DEFAULT_MIN_REL_BPS;
   const maxTicks = opts.maxTicks ?? V3_TICK_STEPS;
+  const bandTicks = opts.bandTicks ?? V3_BAND_TICKS;
   const target = opts.lensTarget ?? "v12";
   const caller = opts.caller;
   const { tokenIn, tokenOut, amountIn } = config;
@@ -886,6 +907,7 @@ export async function prepareEcoSwap(
     driftTicks: 0, // WS2 §3.3: no reverse/forward drift scan — the solver reads drift LIVE.
     minRelBps,
     maxTicks,
+    bandTicks,
     target,
     account: caller,
     includeAlgebra: true, // Algebra is executable (engine services algebraSwapCallback, sauce#186).
@@ -1370,7 +1392,8 @@ export async function prepareEcoSwap(
         amountIn,
         driftTicks: 0, // like direct pools — the solver reads drift LIVE.
         minRelBps,
-        maxTicks: V3_TICK_STEPS,
+        maxTicks,
+        bandTicks,
         target,
         account: caller,
         includeAlgebra: true, // Algebra is executable (engine services algebraSwapCallback, sauce#186).
