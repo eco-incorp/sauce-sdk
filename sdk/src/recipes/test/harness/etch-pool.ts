@@ -4182,3 +4182,284 @@ export const eulerV1PoolReadAbi = parseAbi([
   "function getLimits(address tokenIn, address tokenOut) view returns (uint256 inLimit, uint256 outLimit)",
   "function computeQuote(address tokenIn, address tokenOut, uint256 amount, bool exactIn) view returns (uint256)",
 ]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Balancer V3 (balancer/balancer-v3-monorepo — Vault singleton + per-chain Router) prod-mirror etch —
+// a WHOLE-GRAPH real-bytecode etch (the Mento class). See harness/balancerv3-snapshot.ts for the capture.
+//
+// The wired Base FactoryType.BalancerV3 pool 0x7ab1… ("Balancer Aave USDC-Aave GHO") is StableSurge-hooked
+// (DYNAMIC fee) + rate-scaled (its swappable tokens are ERC4626 StaticATokenLM WRAPPERS waGHO/waUSDC whose
+// rate = Aave getReserveNormalizedIncome). There is NO closed-form curve the recipe replays off-chain — the
+// price comes from a ~20-contract graph (Router → Vault/VaultExtension → Pool → StableSurgeHook + 2 rate
+// providers → 2 ERC4626 wrappers → Aave Pool + rewards controller + aToken). harness/balancerv3-snapshot.ts
+// let the EVM enumerate the exact touched set (debug_traceCall prestateTracer on the production query AND a
+// REAL successful swap) and dumped {code, touched-storage} per address. So the snapshot's `contracts[]` is the
+// FULL graph and `storage` is the union of touched slots keyed by ABSOLUTE contract address.
+//
+// NO TOKEN REPOINTING (unlike Fluid/Mento). The swappable tokens ARE the ERC4626 wrappers, whose rate is
+// pricing-relevant — so we keep the REAL wrapper bytecode + storage and fund the caller by a REAL transfer
+// from the Vault (impersonated) at etch time. The ONE reconstruction nuance is `_reservesOf` (Vault mapping
+// base slot 8, PERSISTENT, must == balanceOf(vault) at unlock; settle() credits balanceOf-_reservesOf): the
+// etch re-seeds `_reservesOf[token] = balanceOf(vault)` for BOTH tokens after funding, restoring the on-unlock
+// invariant (a replay of real state, not a fabrication — verified: with it seeded, a REAL swap lands the
+// captured mainnet out to the wei). block.timestamp is pinned (the wrapper rate accrues on it).
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** One contract in the Balancer V3 graph bytecode snapshot (harness/balancerv3-snapshot.ts `contracts[]`). */
+export interface BalancerV3ContractBytecode {
+  address: Hex;
+  role: string;
+  runtime: Hex;
+  runtimeSha256?: Hex;
+  touchedSlots: number;
+}
+
+/** Balancer V3 graph bytecode snapshot (harness/balancerv3-snapshot.ts). */
+export interface BalancerV3BytecodeSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  blockTimestamp: string;
+  source: string;
+  vault: Hex;
+  router: Hex;
+  pool: Hex;
+  permit2: Hex;
+  contracts: BalancerV3ContractBytecode[];
+}
+
+/** Balancer V3 graph state snapshot (harness/balancerv3-snapshot.ts). */
+export interface BalancerV3StateSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  blockTimestamp: string;
+  source: string;
+  vault: Hex;
+  router: Hex;
+  pool: Hex;
+  permit2: Hex;
+  tokenIn: Hex;
+  tokenOut: Hex;
+  tokenInSymbol: string;
+  tokenOutSymbol: string;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
+  /** `_reservesOf` reconstruction anchors — mapping base slot 8; the two token slots (verbatim keys). */
+  reservesOfBaseSlot: string;
+  reservesOfSlotIn: Hex;
+  reservesOfSlotOut: Hex;
+  vaultBalanceIn: string;
+  vaultBalanceOut: string;
+  reservesOfIn: string;
+  reservesOfOut: string;
+  /** Wei-exact anchor: the Router.querySwapSingleTokenExactIn ladders, both directions. */
+  probe: {
+    inToOut: { amountIn: string; amountOut: string }[];
+    outToIn: { amountIn: string; amountOut: string }[];
+  };
+  /** The union touched storage per contract (absolute slot → value), set verbatim on each etched contract. */
+  storage: Record<string, Record<string, Hex>>;
+}
+
+/** Load a Balancer V3 `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadBalancerV3Snapshots(name: string): {
+  bytecode: BalancerV3BytecodeSnapshot;
+  state: BalancerV3StateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as BalancerV3BytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as BalancerV3StateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Balancer V3 bytecode-graph integrity (NO RPC): re-hash EVERY contract runtime in the graph and
+ * match its capture-time sha256 anchor. Returns per-contract {address, role, expected, actual, ok} + allOk. A
+ * reviewer with no RPC key can run this to prove the checked-in blobs are the pinned-block mainnet code,
+ * byte-for-byte.
+ */
+export function verifyBalancerV3BytecodeIntegrity(bytecode: BalancerV3BytecodeSnapshot): {
+  contracts: { address: Hex; role: string; expected?: Hex; actual: Hex; ok: boolean }[];
+  allOk: boolean;
+} {
+  const contracts = bytecode.contracts.map((c) => {
+    const actual = runtimeSha256(c.runtime);
+    return {
+      address: c.address,
+      role: c.role,
+      expected: c.runtimeSha256,
+      actual,
+      ok: !c.runtimeSha256 || c.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { contracts, allOk: contracts.every((c) => c.ok) };
+}
+
+/** A minimal test-client surface for the Balancer V3 block-timestamp pin + Vault-impersonation funding. */
+type BalancerV3TimeClient = {
+  request: (args: { method: string; params: unknown[] }) => Promise<unknown>;
+  mine: (a: { blocks: number }) => Promise<void>;
+};
+
+/**
+ * Pin the anvil block clock to `state.blockTimestamp` and mine one block. The ERC4626 wrappers' rate =
+ * Aave getReserveNormalizedIncome, which accrues on `block.timestamp - lastUpdateTimestamp`; pinning to the
+ * captured block ts reproduces the captured probe rate EXACTLY. Uses `anvil_setTime` (can jump BACKWARD — a
+ * fresh anvil's genesis clock is at wall-time, PAST the captured Base ts). Call AFTER etching and BEFORE the
+ * first quote/cook, on EVERY fresh anvil.
+ */
+export async function pinBalancerV3BlockTimestamp(
+  testClient: BalancerV3TimeClient,
+  state: { blockTimestamp: string },
+): Promise<bigint> {
+  const ts = BigInt(state.blockTimestamp);
+  await testClient.request({ method: "anvil_setTime", params: [Number(ts)] });
+  await testClient.mine({ blocks: 1 });
+  return ts;
+}
+
+export interface EtchedBalancerV3Graph {
+  /** Vault (CREATE2 singleton) — holds the pool balances + `_reservesOf`; funded so the swap pays out. */
+  vault: Hex;
+  /** The per-chain single-swap Router — the query/swap/Permit2-approve-spender target (cfg[8] chain-wide). */
+  router: Hex;
+  /** The StablePool address (the swap/query `pool` arg + discovery target). */
+  pool: Hex;
+  /** The canonical Permit2 (the solver hardcodes it; etched real). */
+  permit2: Hex;
+  /** tokenIn (waUSDC, 6d) — the REAL ERC4626 wrapper (kept, not repointed); the caller holds it. */
+  tokenIn: Hex;
+  /** tokenOut (waGHO, 18d) — the REAL ERC4626 wrapper. */
+  tokenOut: Hex;
+  tokenInDecimals: number;
+  tokenOutDecimals: number;
+  /** Number of contracts etched (the whole graph). */
+  contractCount: number;
+  /** Number of storage slots reconstructed (captured touched slots + the 2 re-seeded `_reservesOf` slots). */
+  slotCount: number;
+  /** The pinned block timestamp the test must pin the clock to. */
+  blockTimestamp: bigint;
+  /** The amount of tokenIn the caller was funded with (real transfer from the impersonated Vault). */
+  callerFunded: bigint;
+}
+
+/**
+ * Stand up the captured REAL Balancer V3 quote/swap contract GRAPH on the local anvil, OFFLINE. (Proven: a
+ * full swapSingleTokenExactIn against this etch receives the captured mainnet querySwap out, wei-exact — see
+ * the section header + harness/balancerv3-snapshot.ts's anchor.)
+ *
+ *   1. setCode EVERY captured contract runtime at its captured address (the whole ~20-contract graph:
+ *      Router + Vault + VaultExtension + Pool + StableSurgeHook + 2 rate providers + 2 ERC4626 wrappers +
+ *      their impl + the Aave Pool + rewards controller + aToken + Permit2 + the impls). NO repointing — the
+ *      wrappers ARE the swappable tokens and their rate is pricing-relevant.
+ *   2. setStorageAt the captured touched storage VERBATIM by absolute key, per contract (the Vault's pool
+ *      balance accounting + `_reservesOf`, the wrappers' share state, the Aave indices, the hook config).
+ *   3. Fund the caller with `callerFund` of tokenIn (waUSDC) by a REAL StaticATokenLM transfer from the
+ *      impersonated Vault (the Vault holds the tokens via the captured storage). Uses `rpcUrl` to bind a
+ *      wallet client to the Vault.
+ *   4. RE-SEED `_reservesOf[token] = balanceOf(vault)` for BOTH tokens (mapping base slot 8) AFTER funding —
+ *      the on-unlock invariant settle() relies on (else BalanceNotSettled). A replay of real state.
+ *   5. Fund the Vault with ETH headroom (impersonation gas is paid by anvil).
+ *
+ * NOTE: pin the clock with pinBalancerV3BlockTimestamp after this and before the first quote/cook (the
+ * wrapper rate accrual — see the header).
+ */
+export async function etchBalancerV3Graph(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient & BalancerV3TimeClient,
+  rpcUrl: string,
+  snapshots: { bytecode: BalancerV3BytecodeSnapshot; state: BalancerV3StateSnapshot },
+  opts: { caller: Hex; callerFund: bigint },
+): Promise<EtchedBalancerV3Graph> {
+  // Lazy viem imports (kept local so the harness's default import surface stays lean).
+  const { createWalletClient, http, encodeFunctionData, parseAbi: parseAbiL } = await import("viem");
+  const { bytecode, state } = snapshots;
+
+  const vault = getAddress(state.vault) as Hex;
+  const router = getAddress(state.router) as Hex;
+  const pool = getAddress(state.pool) as Hex;
+  const permit2 = getAddress(state.permit2) as Hex;
+  const tokenIn = getAddress(state.tokenIn) as Hex;
+  const tokenOut = getAddress(state.tokenOut) as Hex;
+
+  // 1. setCode EVERY captured contract runtime at its captured address (the whole graph).
+  for (const c of bytecode.contracts) {
+    await testClient.setCode({ address: getAddress(c.address) as Hex, bytecode: c.runtime });
+  }
+
+  // 2. setStorageAt the captured touched storage VERBATIM by absolute key, per contract.
+  let slotCount = 0;
+  for (const [addr, slots] of Object.entries(state.storage)) {
+    const a = getAddress(addr) as Hex;
+    for (const [slot, value] of Object.entries(slots)) {
+      await testClient.setStorageAt({ address: a, index: slot as Hex, value });
+      slotCount++;
+    }
+  }
+
+  // 3. Fund the caller with tokenIn via a REAL transfer from the impersonated Vault (which holds the tokens
+  //    via the captured storage). The wrapper is REAL StaticATokenLM code — this exercises its genuine
+  //    scaled-share transfer, so the caller's balance is real. Give the Vault generous ETH headroom + send a
+  //    legacy 0-gas-price tx so the impersonated transfer never fails on gas (the StaticATokenLM transfer is
+  //    a heavy op; the anvil chain's base fee is irrelevant with gasPrice 0).
+  await testClient.request({ method: "anvil_setBalance", params: [vault, viemToHex(10_000n * 10n ** 18n)] });
+  await testClient.request({ method: "anvil_impersonateAccount", params: [vault] });
+  const erc20 = parseAbiL(["function transfer(address,uint256) returns (bool)", "function balanceOf(address) view returns (uint256)"]);
+  // Bind the Vault wallet client to the public client's chain so viem estimates EIP-1559 fees correctly (the
+  // anvil chain has a non-zero base fee, so a legacy gasPrice:0 is rejected; the Vault has ample ETH above).
+  const vaultWallet = createWalletClient({ account: vault, chain: publicClient.chain, transport: http(rpcUrl) });
+  // callerFund MUST be ≤ the Vault's tokenIn balance (the Vault is the token source). Fail loudly otherwise.
+  const vaultTokenInBal = (await publicClient.readContract({ address: tokenIn, abi: erc20, functionName: "balanceOf", args: [vault] })) as bigint;
+  if (opts.callerFund > vaultTokenInBal) {
+    throw new Error(`callerFund ${opts.callerFund} exceeds the etched Vault's tokenIn balance ${vaultTokenInBal} (the fund source)`);
+  }
+  const hFund = await vaultWallet.sendTransaction({
+    to: tokenIn,
+    data: encodeFunctionData({ abi: erc20, functionName: "transfer", args: [opts.caller, opts.callerFund] }),
+    account: vault,
+  });
+  const fundRcpt = await publicClient.waitForTransactionReceipt({ hash: hFund });
+  if (fundRcpt.status !== "success") throw new Error("caller funding transfer (impersonated Vault) reverted");
+  await testClient.request({ method: "anvil_stopImpersonatingAccount", params: [vault] });
+
+  // 4. RE-SEED `_reservesOf[token] = balanceOf(vault)` for BOTH tokens AFTER funding (the on-unlock invariant).
+  for (const [tok, slot] of [
+    [tokenIn, state.reservesOfSlotIn],
+    [tokenOut, state.reservesOfSlotOut],
+  ] as [Hex, Hex][]) {
+    const bal = (await publicClient.readContract({ address: tok, abi: erc20, functionName: "balanceOf", args: [vault] })) as bigint;
+    await testClient.setStorageAt({ address: vault, index: slot, value: word(bal) });
+    slotCount++;
+  }
+
+  return {
+    vault,
+    router,
+    pool,
+    permit2,
+    tokenIn,
+    tokenOut,
+    tokenInDecimals: state.tokenInDecimals,
+    tokenOutDecimals: state.tokenOutDecimals,
+    contractCount: bytecode.contracts.length,
+    slotCount,
+    blockTimestamp: BigInt(state.blockTimestamp),
+    callerFunded: opts.callerFund,
+  };
+}
+
+/** Balancer V3 read surface (the discovery getters + the on-chain solver quote — the REAL verified interface). */
+export const balancerV3VaultReadAbi = parseAbi([
+  "function getPoolTokens(address pool) view returns (address[])",
+  "function isPoolRegistered(address pool) view returns (bool)",
+  "function getReservesOf(address token) view returns (uint256)",
+]);
+export const balancerV3RouterReadAbi = parseAbi([
+  "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes userData) view returns (uint256 amountOut)",
+  "function getPermit2() view returns (address)",
+]);

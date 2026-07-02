@@ -228,6 +228,7 @@ export enum EcoBracketKind {
   Fermi = 13, // Fermi / propAMM (gattaca-com/propamm FermiSwap — Obric-style proactive AMM, K=v0²·multX/multY) segment (static, off-chain-sampled via the closed-form replay at a state snapshot; executed CALLBACK-FREE via getAmountOut + approve + swap(tokenIn,tokenOut,amt,minOut,to) — propAMM PULLS via transferFrom)
   Fluid = 14, // Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) segment (static, off-chain-sampled via a LIVE resolver estimateSwapIn ladder at a state snapshot; executed CALLBACK-FREE via estimateSwapIn + approve + swapIn(swap0to1,amt,minOut,to) — Fluid PULLS via transferFrom)
   Mento = 15, // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) segment (static, off-chain-sampled via a LIVE Broker getAmountOut ladder at a bucket snapshot; executed CALLBACK-FREE via getAmountOut + approve BROKER + swapIn(exchangeProvider,exchangeId,tokenIn,tokenOut,amt,minOut) — Mento PULLS via transferFrom into the reserve)
+  BalancerV3 = 16, // Balancer V3 (balancer-v3-monorepo Vault singleton + per-chain Router) segment (static, off-chain-sampled via a LIVE Router querySwapSingleTokenExactIn ladder — rate-provider + dynamic-surge-fee inclusive — at a snapshot; the query is eth_call-ONLY, NOT re-read on-chain; executed CALLBACK-FREE via ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn with minAmountOut=0 — the V3 reentrancy is contained inside Balancer's Router+Vault, never the cooking contract; input PULLED via Permit2)
 }
 
 /**
@@ -709,6 +710,46 @@ export interface EcoMento {
 }
 
 /**
+ * One Balancer V3 (balancer/balancer-v3-monorepo — Vault singleton + per-chain Router) venue to execute,
+ * indexed by an EcoBracket.refIdx (kind === BalancerV3). Balancer V3 pools price off the Vault balances +
+ * rate providers + a possibly-dynamic StableSurge hook fee (NOT xy=k), so they must NOT be routed through
+ * the V2 (_swapV2) path. The deep production pools are surge-hooked + rate-scaled (ERC4626 wrappers), so the
+ * curve cannot be replayed from a static fee — prepare SAMPLES a LIVE `Router.querySwapSingleTokenExactIn`
+ * ladder OFF-CHAIN via eth_call (which bakes in the rate providers + dynamic hook fee) into static segments
+ * (kind BalancerV3). That query is eth_call-ONLY (it demands a static-call context via the Vault's quote()
+ * yet does a state write, so it reverts both under a plain CALL and under a STATICCALL — it is NOT callable
+ * on-chain in a cook). The on-chain solver consumes the static segments through the static-segment cursor and
+ * EXECUTES the awarded Σ share CALLBACK-FREE: the Permit2 two-step approval —
+ * `ERC20(tokenIn).approve(PERMIT2, +Σ)` + `Permit2.approve(tokenIn, ROUTER, uint160(+Σ), expiration)` (the V3
+ * input is pulled via Permit2, the ONE operational difference from V2) — then
+ * `Router.swapSingleTokenExactIn(pool, tokenIn, tokenOut, +Σ, minAmountOut, deadline, false, "")` with
+ * minAmountOut HARDCODED 0 (no per-leg on-chain floor — the query is uncallable, and the solver has no
+ * whole-trade output floor either; a Balancer V3 leg relies on the off-chain split + the integrator's
+ * transaction-level slippage). NO engine SwapPoolType: the V3 reentrancy is fully contained inside Balancer's
+ * own Router + Vault (Vault.unlock re-enters the ROUTER, never the cooking contract; input PULLED via
+ * Permit2.transferFrom, output via Vault.sendTo), so our side sees a single external call that returns —
+ * callback-free, unlike the V4 unlockCallback path. `address` is the POOL (the query/swap `pool` arg);
+ * `router` is the per-chain Router (the swap/Permit2-approve target — threaded chain-wide via the solver cfg,
+ * since one Router serves every V3 pool on a chain); `fromToken`/`toToken` are the swap's token args; feePpm
+ * is the price-ordering coordinate / diagnostic (derived from the ladder — a surge-hooked pool has no single
+ * fee getter). See balancer-v3-math.ts for the SNAPSHOTTED-QUOTE class (rate providers accrue + surge fee
+ * moves; the exec runs exactIn with minAmountOut=0, reproducing the live query for the awarded share).
+ */
+export interface EcoBalancerV3 {
+  /** Vault pool address — the query/swap `pool` arg. */
+  address: Hex;
+  /** The per-chain V3 Router — the query/swap/Permit2-approve target (chain-wide via cfg). */
+  router: Hex;
+  /** The venue's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The venue's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Derived ppm fee (the price-ordering coordinate; the on-chain out is the Router querySwap view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * Off-chain preparation result.
  *
  * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
@@ -837,6 +878,17 @@ export interface EcoSwapPrepared {
    * ⇒ no Mento venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
    */
   mentoPools?: EcoMento[];
+  /**
+   * Balancer V3 (balancer-v3-monorepo Vault singleton + per-chain Router) venues (kind === BalancerV3
+   * brackets reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE
+   * (ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn with minAmountOut=0 —
+   * the querySwapSingleTokenExactIn quote is eth_call-ONLY, NOT re-read on-chain; NO engine SwapPoolType, the
+   * V3 reentrancy is contained inside Balancer's Router+Vault); the V3 marginal is supplied entirely as the
+   * static sampled segments in `brackets` (the LIVE querySwapSingleTokenExactIn ladder at a snapshot). Optional/empty when
+   * no Balancer V3 pools were discovered (omitted ⇒ no Balancer V3 venue, so existing test-side
+   * `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  balancerV3Pools?: EcoBalancerV3[];
   /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
   brackets: EcoBracket[];
   zeroForOne: boolean;

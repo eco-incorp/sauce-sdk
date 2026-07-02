@@ -124,6 +124,23 @@ export const fluidDexPoolArtifact = loadArtifact(
 export const fluidDexResolverArtifact = loadArtifact(
   join(FIXTURES, "FluidDexPool.sol", "FluidDexResolver.json"),
 );
+/** Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) pool + Router + Permit2 — the
+ *  Router holds the pool reserves (the fixture's "Vault") and pulls the input through Permit2, exactly the
+ *  callback-free on-chain flow the recipe hits. */
+export const balancerV3PoolArtifact = loadArtifact(
+  join(FIXTURES, "BalancerV3.sol", "BalancerV3Pool.json"),
+);
+export const balancerV3RouterArtifact = loadArtifact(
+  join(FIXTURES, "BalancerV3.sol", "BalancerV3Router.json"),
+);
+export const permit2Artifact = loadArtifact(
+  join(FIXTURES, "BalancerV3.sol", "Permit2.json"),
+);
+/** Runtime bytecode of the Permit2 fixture — ETCHED at the canonical Permit2 address (the solver hardcodes
+ *  0x0000…78BA3, so the fixture Permit2 must sit there). No constructor / immutables ⇒ etch is exact. */
+export const permit2Runtime = loadDeployedBytecode(
+  join(FIXTURES, "BalancerV3.sol", "Permit2.json"),
+);
 /** Fermi / propAMM (Obric-style proactive AMM) pool — deployed normally (constructor sets tokenX/tokenY +
  *  the settable derived curve state K/base + feePpm). */
 export const fermiPoolArtifact = loadArtifact(
@@ -1326,6 +1343,77 @@ export async function deployFluidDexPool(
     address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
   });
   return { pool, resolver };
+}
+
+// The canonical Permit2 address — the SAME on every chain; the solver hardcodes it, so the fixture Permit2
+// runtime is etched here.
+export const PERMIT2_ADDR = "0x000000000022D473030F116dDEE9F6B43aC78BA3" as Hex;
+
+export const balancerV3PoolAbi = parseAbi([
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+  "function getTokens() view returns (address[])",
+  "function quoteOut(address tokenIn, uint256 amountIn) view returns (uint256)",
+  "function setState(uint256 centerPrice, uint256 feePpm)",
+  "function setCaps(uint256 outCap0, uint256 outCap1)",
+]);
+export const balancerV3RouterAbi = parseAbi([
+  "function vault() view returns (address)",
+  "function getPermit2() view returns (address)",
+  "function getPoolTokens(address pool) view returns (address[])",
+  "function isPoolRegistered(address pool) view returns (bool)",
+  "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes userData) view returns (uint256 amountOut)",
+  "function swapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, uint256 minAmountOut, uint256 deadline, bool wethIsEth, bytes userData) payable returns (uint256 amountOut)",
+]);
+
+/**
+ * Deploy a local Balancer V3 stack — a per-chain Router (which doubles as the reserve-holding "Vault") + a
+ * stable pool — and ETCH the Permit2 fixture at the CANONICAL Permit2 address (the solver hardcodes it). The
+ * Router pulls the swap input through Permit2 (the ONE operational difference from V2) and pays the output
+ * from its own balance, exactly the callback-free on-chain flow the recipe hits. `centerPrice` is 1e18-scaled
+ * (token1-per-token0), `feePpm` 1e6-scaled; the Router (Vault) is funded with `vaultOut` of tokenOut so it
+ * can pay out. Returns { router, pool }. The Permit2 is etched once (idempotent) — call with any deployed
+ * Router. Reuse ONE Router (its address is the chain-wide cfg[8]) across pools by passing an existing
+ * `router`.
+ */
+export async function deployBalancerV3(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+  token0: Hex,
+  token1: Hex,
+  bal0: bigint,
+  bal1: bigint,
+  centerPrice: bigint,
+  feePpm: bigint,
+  tokenOut: Hex,
+  vaultOut: bigint,
+  existingRouter?: Hex,
+  minter?: Account,
+): Promise<{ router: Hex; pool: Hex }> {
+  // Etch the Permit2 fixture runtime at the canonical address (no constructor/immutables ⇒ etch is exact).
+  await testClient.setCode({ address: PERMIT2_ADDR, bytecode: permit2Runtime });
+  const code = await publicClient.getCode({ address: PERMIT2_ADDR });
+  if (!code || code === "0x") throw new Error("failed to etch Permit2 runtime");
+
+  const router =
+    existingRouter ??
+    (await deployContract(walletClient, publicClient, {
+      abi: balancerV3RouterArtifact.abi,
+      bytecode: balancerV3RouterArtifact.bytecode,
+      args: [PERMIT2_ADDR],
+    }));
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: balancerV3PoolArtifact.abi,
+    bytecode: balancerV3PoolArtifact.bytecode,
+    args: [token0, token1, bal0, bal1, centerPrice, feePpm],
+  });
+  // Fund the Router (the fixture's Vault) with the output reserve so the swap can pay out.
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenOut, abi: erc20Abi as Abi, functionName: "transfer", args: [router, vaultOut], account: acct,
+  });
+  return { router, pool };
 }
 
 // The REAL Mento V2 surface the fixtures mirror: the BiPoolManager exchange provider (getExchanges +

@@ -77,6 +77,12 @@ import {
   type MentoPool,
 } from "../shared/mento-math";
 import {
+  getAmountOut as balancerV3GetAmountOut,
+  buildBalancerV3Segments,
+  balancerV3SampleInputs,
+  type BalancerV3Pool,
+} from "../shared/balancer-v3-math";
+import {
   getDy as balancerGetDy,
   buildBalancerStableSegments,
   type BalancerStablePool,
@@ -2093,6 +2099,124 @@ describe("Mento V2 (Celo Broker + BiPoolManager bucket-priced exchange) — quot
       cumIn, cumOut, feePpm: Number(SPREADPPM), source: "kat-cap",
     };
     const segs = buildMentoSegments(p, amountIn);
+    const covered = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.ok(segs.every((s) => s.effOut > 0n), "every segment has a positive out (none past the cap)");
+    assert.equal(covered, capBoundary, "covered input == the cap boundary (the tradeable prefix)");
+    assert.ok(covered < amountIn, "the cap truncates the covered input below amountIn");
+  });
+});
+
+// ── Balancer V3 (balancer-v3-monorepo Vault + per-chain Router) query-ladder + StableMath parity ──
+//
+// The real Balancer V3 deep pools are StableSurge-hooked + rate-scaled, so the split is priced off a LIVE
+// `Router.querySwapSingleTokenExactIn` ladder discovery samples (rate-provider + dynamic-surge-fee inclusive
+// — see balancer-v3-math.ts). There is no static-fee closed form to KAT for a surge pool, so this pins (a)
+// the LADDER machinery — `getAmountOut` interpolates the (cumIn, cumOut) points, `buildBalancerV3Segments`
+// differences them into a descending-marginal partition — AND (b) that V3 shares V2's amplified StableMath by
+// SYNTHESIZING the sampled query ladder with the SHARED V2 `getDy` (the V3 StableMath is byte-for-byte
+// identical: AMP_PRECISION=1e3, same computeInvariant/computeOutGivenExactIn), mirroring what the Router
+// would return for a PLAIN (non-surge, unit-rate) V3 stable pool. So the ladder itself is a genuine
+// StableMath known-answer, and the sampler/segment machinery is pinned on top of it. The real BASE ladder
+// (cast-verified: 100e6 waUSDC → 107.786… waGHO; 1000e6 → 1077.86…, linear) is exercised by the on-chain +
+// prod-mirror EVM tests, where the query surface is the ground truth.
+describe("Balancer V3 (Vault + per-chain Router) — query-ladder interpolation + sampler + V2 StableMath parity", () => {
+  const E18 = 10n ** 18n;
+  const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
+  // A 2-token unit-rate PLAIN stable pool (no BPT in V3, no surge, scaling factors 1e18) at A=1000, 0.005%
+  // swap fee (5e13 WAD — the real Base pool's static fee) — the shared V2 StableMath IS the V3 math, so
+  // `getDy` synthesizes exactly what querySwapSingleTokenExactIn returns for such a pool.
+  const AMP = 1000n * 1000n; // A·AMP_PRECISION (getAmplificationParameter()[0] form)
+  const SWAP_FEE_WAD = 50_000_000_000_000n; // 5e13 = 0.005%
+  const stablePool: BalancerStablePool = {
+    poolType: 4,
+    address: Z,
+    i: 0,
+    j: 1,
+    amp: AMP,
+    balances: [20_000_000n * E18, 20_000_000n * E18], // deep near-1:1 (18-dec both legs)
+    scalingFactors: [E18, E18], // unit rate, 18-dec ⇒ no scale
+    swapFeeWad: SWAP_FEE_WAD,
+    source: "kat",
+  };
+
+  // The Router query for a plain V3 stable pool == the shared V2 StableMath getDy (identical invariant).
+  function xToY(dx: bigint): bigint {
+    return balancerGetDy(stablePool, dx);
+  }
+
+  function ladderPool(amountIn: bigint): BalancerV3Pool {
+    const cumIn = balancerV3SampleInputs(amountIn);
+    const cumOut = cumIn.map(xToY);
+    return {
+      address: Z, router: Z, tokenIn: Z, tokenOut: Z,
+      cumIn, cumOut, feePpm: 50, source: "kat",
+    };
+  }
+
+  it("query ladder == V2 StableMath getDy (V3 shares the amplified StableSwap invariant)", () => {
+    // A genuine StableMath known-answer: a 100k slice into a deep A=1000 near-1:1 pool loses only the 0.005%
+    // fee + a tiny curvature term (out just below in), and the curve is convex (marginal descends with size).
+    const dx = 100_000n * E18;
+    const dy = xToY(dx);
+    assert.ok(dy < dx, "out below in (fee + curvature)");
+    assert.ok(dy > (dx * 9994n) / 10000n, "deep A=1000 pool: within ~0.06% of par at 100k on a 20M pool");
+    // Convex: doubling the input yields LESS than double the output (the marginal worsens).
+    assert.ok(xToY(2n * dx) < 2n * dy, "convex stable curve: marginal descends with size");
+  });
+
+  it("getAmountOut — exact at a ladder point, interpolated between, fee-adjusted", () => {
+    const amountIn = 100_000n * E18;
+    const p = ladderPool(amountIn);
+    const i = p.cumIn.length - 1;
+    assert.equal(balancerV3GetAmountOut(p, p.cumIn[i]), p.cumOut[i], "exact at the last ladder point");
+    const small = p.cumIn[0];
+    const outSmall = balancerV3GetAmountOut(p, small);
+    assert.ok(outSmall < small && outSmall > (small * 999n) / 1000n, "near-1:1 minus fee on a small V3 slice");
+    const out = balancerV3GetAmountOut(p, amountIn);
+    assert.ok(out < amountIn && out > (amountIn * 99n) / 100n, "large trade: below par by fee + curvature");
+    const mid = (p.cumIn[0] + p.cumIn[1]) / 2n;
+    const interp = balancerV3GetAmountOut(p, mid);
+    assert.ok(interp >= p.cumOut[0] && interp <= p.cumOut[1], "interpolated between neighbouring points");
+  });
+
+  it("buildBalancerV3Segments — covers amountIn, descending (flat) marginals, partition of the ladder", () => {
+    const amountIn = 100_000n * E18;
+    const p = ladderPool(amountIn);
+    const segs = buildBalancerV3Segments(p, amountIn);
+    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    for (let i = 1; i < segs.length; i++) {
+      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals non-increasing");
+    }
+    const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
+    assert.equal(sumOut, balancerV3GetAmountOut(p, amountIn), "Σ segment effOut == getAmountOut(amountIn)");
+  });
+
+  it("liquidity-limit cap: discovery truncates the ladder; segments stay a clean partition", () => {
+    // A query that returns 0 past some size (a buffer/liquidity limit or an un-queryable large size) →
+    // discoverBalancerV3PoolsTyped keeps only the strictly-positive non-decreasing PREFIX. Replay a synthetic
+    // cap and build over the truncated descriptor.
+    const amountIn = 100_000n * E18;
+    const rawIn = balancerV3SampleInputs(amountIn);
+    const CAP = 40_000n * E18; // quotes past this size "revert"/return 0
+    const rawOut = rawIn.map((x) => (x > CAP ? 0n : xToY(x)));
+    assert.ok(rawOut.some((o) => o === 0n), "some samples past the cap quote 0");
+    const cumIn: bigint[] = [];
+    const cumOut: bigint[] = [];
+    let prev = 0n;
+    for (let i = 0; i < rawIn.length; i++) {
+      if (rawOut[i] <= prev) break;
+      cumIn.push(rawIn[i]);
+      cumOut.push(rawOut[i]);
+      prev = rawOut[i];
+    }
+    assert.ok(cumIn.length > 0 && cumIn.length < rawIn.length, "prefix truncated below the cap");
+    const capBoundary = cumIn[cumIn.length - 1];
+    const p: BalancerV3Pool = {
+      address: Z, router: Z, tokenIn: Z, tokenOut: Z, cumIn, cumOut, feePpm: 50, source: "kat-cap",
+    };
+    const segs = buildBalancerV3Segments(p, amountIn);
     const covered = segs.reduce((a, s) => a + s.capacity, 0n);
     assert.ok(segs.every((s) => s.effOut > 0n), "every segment has a positive out (none past the cap)");
     assert.equal(covered, capBoundary, "covered input == the cap boundary (the tradeable prefix)");

@@ -74,6 +74,7 @@ import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
+import { buildBalancerV3Segments, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -245,6 +246,16 @@ export interface OptimalPool {
    * `mento` is set.
    */
   mento?: MentoPool;
+  /**
+   * Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) venue — when present this pool
+   * is a BALANCER-V3 venue (NOT any of the above). The oracle enumerates its segments via the SHARED sampler
+   * (buildBalancerV3Segments) from the venue's LIVE Router querySwapSingleTokenExactIn ladder (the same
+   * (cumIn, cumOut) points prepare sampled), so the split is exact-on-grid vs prepare's segments (one shared
+   * ladder). The Balancer V3 marginalOI is the post-fee + post-rate execution price (the query folds the
+   * static fee + any dynamic surge-hook fee + rate scaling in); adjNear == adjFar == marginalOI. All the
+   * other venue fields are ignored when `balancerV3` is set.
+   */
+  balancerV3?: BalancerV3Pool;
 }
 
 /**
@@ -707,6 +718,22 @@ function mentoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
   return segs;
 }
 
+/**
+ * Enumerate one Balancer V3 (balancer-v3-monorepo — Vault + per-chain Router) venue's segments via the
+ * SHARED sampler (buildBalancerV3Segments) over the venue's LIVE Router querySwapSingleTokenExactIn ladder
+ * (the same (cumIn, cumOut) points prepare sampled), so the oracle and prepare emit the IDENTICAL segment
+ * grid from the SAME sampled query snapshot (single source), making the split exact-on-grid. The Balancer V3
+ * marginalOI is the post-fee + post-rate execution price (the query folds the static fee + any dynamic
+ * surge-hook fee + rate scaling in); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function balancerV3Segments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildBalancerV3Segments(p.balancerV3!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
 // ── Route-leg frontier enumeration + route event walk ────────
 //
 // A route leg's frontier is the SAME constant-L bracket chain a direct pool walks — we reuse
@@ -931,7 +958,12 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   const allSegs: Segment[] = [];
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
-    if (p.mento) {
+    if (p.balancerV3) {
+      // Balancer V3 (Vault + per-chain Router) venue: sampled-segment enumeration via the shared sampler over
+      // the venue's LIVE querySwapSingleTokenExactIn ladder (the same bound prepare samples → identical grid
+      // → exact-on-grid split).
+      allSegs.push(...balancerV3Segments(p, i, amountIn));
+    } else if (p.mento) {
       allSegs.push(...mentoSegments(p, i, amountIn));
     } else if (p.fluid) {
       allSegs.push(...fluidSegments(p, i, amountIn));

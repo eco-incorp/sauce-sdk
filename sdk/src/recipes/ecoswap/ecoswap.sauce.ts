@@ -13,6 +13,8 @@ import { IFermiPool } from "./IFermiPool.json";
 import { IFluidDexPool } from "./IFluidDexPool.json";
 import { IFluidDexResolver } from "./IFluidDexResolver.json";
 import { IMentoBroker } from "./IMentoBroker.json";
+import { IBalancerV3Router } from "./IBalancerV3Router.json";
+import { IPermit2 } from "./IPermit2.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
 //
@@ -238,6 +240,7 @@ const HAS_WOOFI: boolean = true;
 const HAS_FERMI: boolean = true;
 const HAS_FLUID: boolean = true;
 const HAS_MENTO: boolean = true;
+const HAS_BALANCER_V3: boolean = true;
 
 function main(
   cfg: Tuple,
@@ -264,6 +267,15 @@ function main(
   // hand-build a shorter cfg (no Mento) stay valid; production always emits it (index.ts).
   let mentoBroker: Address = 0;
   if (cfg.length > 7) { mentoBroker = cfg[7]; }
+  // cfg[8] = the chain-wide Balancer V3 Router address (0 when no Balancer V3 venue). Balancer V3's Vault is
+  // a CREATE2 singleton (same on every chain) but the Router DIFFERS per chain, so the per-chain Router is
+  // threaded here — the per-slice quote (querySwapSingleTokenExactIn), the Permit2 allowance spender, and the
+  // swap (swapSingleTokenExactIn) all target it; the per-venue POOL travels in the segs row (venue =
+  // segs[5]). One Router serves every V3 pool on the chain. OPTIONAL 9th cfg field — guarded by cfg.length so
+  // the many venue EVM tests that hand-build a shorter cfg (no Balancer V3) stay valid; production always
+  // emits it (index.ts).
+  let balancerV3Router: Address = 0;
+  if (cfg.length > 8) { balancerV3Router = cfg[8]; }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -287,6 +299,14 @@ function main(
   // execution computes the realized output on the VIRTUAL reserves with the LIVE feeInPrecision
   // at full 1e18 precision (the genuine Kyber getAmountOut), so the swap lands + conserves.
   const KYBER_PRECISION: Uint256 = 10 ** 18;
+  // Balancer V3 exec constants. The input is pulled via Permit2 (the ONE operational difference from V2):
+  // ERC20.approve(PERMIT2) then Permit2.approve(tokenIn, ROUTER, uint160 amt, uint48 expiration) before the
+  // Router.swapSingleTokenExactIn. PERMIT2 is the canonical Uniswap singleton — the SAME address on every
+  // EVM chain (cast-verified via Router.getPermit2()). B3_DEADLINE is a large constant far in the future (the
+  // swap's deadline arg); B3_EXPIRATION (uint48) caps the Permit2 allowance validity (also far future).
+  const PERMIT2: Address = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+  const B3_DEADLINE: Uint256 = 2 ** 64;
+  const B3_EXPIRATION: Uint256 = 2 ** 47;
   // Run-until-filled budget. PER_POOL bounds each pool's single from-live-spot walk (it MUST equal
   // the optimal oracle's MAX_V3_STEPS and the reference's PER_POOL EXACTLY, so the split is
   // wei-exact EVEN WHEN THE CAP BINDS). SAFETY dominates the SUM of all per-pool reaches plus the
@@ -347,6 +367,8 @@ function main(
   let mtinp: Tuple = new Array(segs.length); // Mento V2 per-venue Σ input
   let mtven: Tuple = new Array(segs.length); // Mento V2 venue exchangeProvider address (segs[5])
   let mtxid: Tuple = new Array(segs.length); // Mento V2 venue exchangeId (bytes32-as-uint256, segs[6])
+  let b3inp: Tuple = new Array(segs.length); // Balancer V3 per-venue Σ input
+  let b3ven: Tuple = new Array(segs.length); // Balancer V3 venue (Vault pool) address (segs[5])
   // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
   // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
   // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
@@ -564,7 +586,7 @@ function main(
       // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
       // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
       // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO) &&segCur < segs.length) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&segCur < segs.length) {
         const sg: Tuple = segs[segCur];
         const sNear: Uint256 = sg[2];
         const sFar: Uint256 = sg[3];
@@ -886,7 +908,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&bestKind === 1) {
             // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
             // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -980,6 +1002,18 @@ function main(
                                       mtinp[sIdx] = mtinp[sIdx] + stake;
                                       mtven[sIdx] = sVenue;
                                       mtxid[sIdx] = sg[6];
+                                    } else {
+                                      // segKind 14 — Balancer V3 (balancer-v3-monorepo Vault + per-chain
+                                      // Router): callback-free, executed below via querySwapSingleTokenExactIn
+                                      // (minAmountOut) + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) +
+                                      // Router.swapSingleTokenExactIn (the V3 input is PULLED via Permit2, the
+                                      // one operational difference from V2; the reentrancy is contained inside
+                                      // Balancer's Router+Vault, never this cooking contract). sVenue (segs[5])
+                                      // is the Vault POOL; the chain-wide Router is cfg[8].
+                                      if (HAS_BALANCER_V3 && sKind === 14) {
+                                        b3inp[sIdx] = b3inp[sIdx] + stake;
+                                        b3ven[sIdx] = sVenue;
+                                      }
                                     }
                                   }
                                 }
@@ -1567,6 +1601,57 @@ function main(
         token.approve(mentoBroker, mtamt);
         IMentoBroker.at(mentoBroker).swapIn(mtprov, mtid, tokenIn, tokenOut, mtamt, mtOut);
       }
+    }
+  }
+  }
+  // Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) → CALLBACK-FREE (NO engine
+  // SwapPoolType). A V3 pool prices off the Vault balances + rate providers + a possibly-dynamic StableSurge
+  // hook fee — canonical on-chain state, NOT xy=k — so the engine's _swapV2 would mis-price it. The split is
+  // priced OFF-CHAIN in prepare by sampling the Router's querySwapSingleTokenExactIn(pool, tokenIn, tokenOut,
+  // +cumIn, sender, "") ladder via eth_call (it bakes in the rate providers + dynamic surge fee, so it is the
+  // robust quote for both plain and surge pools). That query is eth_call-ONLY: it CANNOT be re-read on-chain
+  // inside the cook (it demands a static-call context via the Vault's quote() — reverts NotStaticCall under a
+  // plain CALL, and its internal unlock() state write reverts under a STATICCALL). So on-chain we execute the
+  // awarded `b3amt` as a straight exact-in swap with minAmountOut = 0 (no per-leg on-chain floor — see the
+  // per-leg comment below). The ONE operational difference from V2 is that the input is pulled via Permit2, so
+  // approve in TWO steps: ERC20.approve(PERMIT2, +Σ) then Permit2.approve(tokenIn, ROUTER, uint160(+Σ),
+  // expiration) — the allowance the Router consumes. Then call Router.swapSingleTokenExactIn(pool, tokenIn,
+  // tokenOut, +Σ, 0, deadline, false, "") — exactIn, so the Vault computes the out from the awarded input.
+  // wethIsEth=false keeps it pure-ERC20. compute-then-pull already transferred `cum` (incl. each Balancer V3
+  // share) into this contract above, so the Permit2 pull draws from this contract's balance and the out lands
+  // here (to == msg.sender == self). The V3 reentrancy is fully contained inside Balancer's own Router + Vault
+  // (Vault.unlock re-enters the ROUTER, never this cooking contract; input PULLED via Permit2.transferFrom,
+  // output via Vault.sendTo), so it is callback-free — no engine change (unlike the V4 unlockCallback path the
+  // engine must service).
+  if (HAS_BALANCER_V3) {
+  // Empty `bytes` for the swap userData arg (the ABI `bytes` tail is a length-0 dynamic blob). Same idiom the
+  // V2/Kyber callback-free path uses for pool.swap's empty data.
+  const b3Empty: bytes = abi.encode(tokenIn).slice(0, 0);
+  for (let k = 0; k < segs.length; k = k + 1) {
+    const b3amt: Uint256 = b3inp[k];
+    if (b3amt > 0) {
+      const b3pool: Address = b3ven[k];
+      // NO on-chain re-quote — minAmountOut is HARDCODED 0 for the Balancer V3 leg. Balancer V3's
+      // `querySwapSingleTokenExactIn` CANNOT be called on-chain inside a cook: it is `nonpayable` and routes
+      // through the Vault's `quote()`, which DEMANDS a static-call context — so under a plain CALL it reverts
+      // NotStaticCall() 0x67f84ab2 ("a state-changing transaction was initiated in a context that only allows
+      // static calls"), yet it INTERNALLY unlock()s the Vault, a state write, so under a STATICCALL it reverts
+      // the static-call state-change guard. Both fire — the query is an eth_call-only surface, unusable as an
+      // on-chain minAmountOut source (unlike Fluid's estimateSwapIn, which self-reverts and so runs under a
+      // plain CALL). The split is ALREADY priced off the sampled ladder at prepare, so we execute the awarded
+      // `b3amt` as a straight exact-in swap with minAmountOut = 0 for THIS leg: exactIn means the Vault computes
+      // the out from the awarded input. There is NO per-leg on-chain floor here (and the solver has NO
+      // whole-trade output floor either — main() just returns the final tokenOut balance, it does not
+      // require(outBal >= min)); a Balancer V3 leg relies ENTIRELY on the off-chain snapshot split (priced off
+      // the same live query ladder the oracle segments) plus whatever transaction-level slippage the integrator
+      // enforces around cook(). This differs from Fluid/Mento, which DO re-quote on-chain (self-reverting
+      // views) and pass that as a per-leg minOut; Balancer V3's query is not callable, so no per-leg minOut
+      // exists. Permit2 two-step: ERC20.approve(PERMIT2) then Permit2.approve(token, ROUTER, uint160 amt, uint48
+      // exp). wethIsEth = 0 (false — pure ERC20). The compiler ABI-encodes the uint256 0 as the
+      // `bool`/`uint160`/`uint48` args (BYTE_N truncation to width).
+      token.approve(PERMIT2, b3amt);
+      IPermit2.at(PERMIT2).approve(tokenIn, balancerV3Router, b3amt, B3_EXPIRATION);
+      IBalancerV3Router.at(balancerV3Router).swapSingleTokenExactIn(b3pool, tokenIn, tokenOut, b3amt, 0, B3_DEADLINE, 0, b3Empty);
     }
   }
   }

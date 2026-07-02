@@ -232,6 +232,19 @@ function mentoBrokerAddr(prepared: EcoSwapPrepared): bigint {
   return first ? BigInt(first.broker) : 0n;
 }
 
+/**
+ * The chain-wide Balancer V3 Router address (the querySwapSingleTokenExactIn quote + swapSingleTokenExactIn +
+ * Permit2-approve-spender target the on-chain solver uses for every Balancer V3 slice) — carried as `cfg[8]`.
+ * Balancer V3's Vault is a CREATE2 singleton (same on all chains) but the Router DIFFERS per chain, so the
+ * per-chain Router is threaded here; all V3 pools on a chain share one Router, so take the first prepared V3
+ * venue's router; 0 when no V3 venue (the guard folds the branch away under treeshake, so the 0 is never
+ * dereferenced). The per-venue POOL travels in the segs row (venue = segs[5]).
+ */
+function balancerV3RouterAddr(prepared: EcoSwapPrepared): bigint {
+  const first = prepared.balancerV3Pools?.[0];
+  return first ? BigInt(first.router) : 0n;
+}
+
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const curves = prepared.curves ?? [];
   const lbs = prepared.lbs ?? [];
@@ -246,6 +259,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const fermiPools = prepared.fermiPools ?? [];
   const fluidPools = prepared.fluidPools ?? [];
   const mentoPools = prepared.mentoPools ?? [];
+  const balancerV3Pools = prepared.balancerV3Pools ?? [];
   return prepared.brackets
     .filter(
       (b) =>
@@ -261,7 +275,8 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.WOOFi ||
         b.kind === EcoBracketKind.Fermi ||
         b.kind === EcoBracketKind.Mento ||
-        b.kind === EcoBracketKind.Fluid,
+        b.kind === EcoBracketKind.Fluid ||
+        b.kind === EcoBracketKind.BalancerV3,
     )
     .slice()
     .sort((a, b) => {
@@ -283,6 +298,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isFermi = b.kind === EcoBracketKind.Fermi;
       const isFluid = b.kind === EcoBracketKind.Fluid;
       const isMento = b.kind === EcoBracketKind.Mento;
+      const isBalancerV3 = b.kind === EcoBracketKind.BalancerV3;
       // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable, 7
       // EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap, 10 WOOFi — kinds 4/5/7/9/10 are callback-free (the
       // pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap + approve +
@@ -301,7 +317,12 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // exchangeId in the 7th `venueAux` column (segs[6]); the broker is chain-wide via cfg[7]). Kinds 1/3/6/8
       // go through the engine (1 = swap poolType 3 Curve StableSwap, 3 = poolType 5 DODO, 6 = poolType 4
       // BalancerV2, 8 = poolType 7 MaverickV2 — a CALLBACK pool via maverickV2SwapCallback).
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : 0n;
+      // segKind 14 = Balancer V3 (balancer-v3-monorepo Vault + per-chain Router; refIdx → prepared
+      // .balancerV3Pools[]; venue = the Vault POOL). Callback-free: querySwapSingleTokenExactIn (minAmountOut)
+      // + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn (the V3 input is
+      // PULLED via Permit2; the reentrancy is contained inside Balancer's Router+Vault, never the cooking
+      // contract). The chain-wide Router is cfg[8].
+      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
       const venue = isCurve
         ? BigInt(curves[b.refIdx].address)
         : isLb
@@ -328,7 +349,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                               ? BigInt(fluidPools[b.refIdx].address)
                               : isMento
                                 ? BigInt(mentoPools[b.refIdx].exchangeProvider)
-                                : 0n;
+                                : isBalancerV3
+                                  ? BigInt(balancerV3Pools[b.refIdx].address)
+                                  : 0n;
       // venueAux (segs[6]) — the per-segment auxiliary 256-bit value. Non-zero ONLY for Mento (the bytes32
       // exchangeId, threaded as a uint256 so the 256-bit value survives intact — it must NOT be truncated).
       // Every other kind pads 0; the on-chain solver reads segs[6] only inside the Mento (segKind 13) branch.
@@ -380,6 +403,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0;
   const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0;
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0;
+  const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -399,6 +423,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_FERMI,
     HAS_FLUID,
     HAS_MENTO,
+    HAS_BALANCER_V3,
   };
 }
 
@@ -490,6 +515,7 @@ export async function ecoSwap(
         BigInt(directCount),
         fluidResolverAddr(prepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
         mentoBrokerAddr(prepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
+        balancerV3RouterAddr(prepared), // cfg[8] — chain-wide Balancer V3 Router (0 when no Balancer V3 venue)
       ],
       poolTuples,
       netCache,
@@ -652,6 +678,7 @@ export async function quoteEcoSwap(
         BigInt(directCount),
         fluidResolverAddr(usePrepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
         mentoBrokerAddr(usePrepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
+        balancerV3RouterAddr(usePrepared), // cfg[8] — chain-wide Balancer V3 Router (0 when no Balancer V3 venue)
       ],
       poolTuples,
       netCache,

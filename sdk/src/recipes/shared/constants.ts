@@ -92,6 +92,28 @@ export enum FactoryType {
   CurveCryptoRegistry = "curve-crypto-registry",
   /** Balancer V2: pool address → getPoolId() → Vault.swap() */
   BalancerV2 = "balancer-v2",
+  /**
+   * Balancer V3 (balancer/balancer-v3-monorepo — the successor to V2; deep stable/surge depth on
+   * Ethereum/Base/Arbitrum and Beets on Sonic). Discovery is KNOWN-POOL-ADDRESS based (like V2 / EulerSwap /
+   * Fluid): the FactoryConfig `address` is the CREATE2 Vault singleton
+   * (0xbA1333333333a1BA1108E8412f11850A5C319bA9, SAME on all chains) and the candidate pool addresses are
+   * carried per-config in `balancerV3Pools`, with the per-chain single-swap Router in `balancerV3Router`.
+   * `discoverBalancerV3PoolsTyped` reads `Vault.getPoolTokens(pool)` to keep pools trading BOTH tokenIn and
+   * tokenOut (V3 has NO BPT in the swappable token list, unlike V2 ComposableStable) and SAMPLES a LIVE
+   * ladder via the Router's `querySwapSingleTokenExactIn(pool, tokenIn, tokenOut, +amountIn, sender, "")`
+   * (which bakes in the rate providers AND any dynamic StableSurge hook fee — the robust surface for both
+   * plain and surge pools). The curve is priced OFF-CHAIN into sampled segments from that ladder.
+   * CALLBACK-FREE: executed in SauceScript (a live query staticcall for minAmountOut + ERC20.approve(PERMIT2)
+   * + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn). The V3 reentrancy is fully contained inside
+   * Balancer's own Router + Vault (Vault.unlock re-enters the ROUTER, never the cooking contract — the input
+   * is PULLED via Permit2.transferFrom, the output arrives via Vault.sendTo), so it is callback-free and
+   * needs NO engine change (contrast V4's unlockCallback, which the engine MUST service). SNAPSHOTTED-QUOTE
+   * class (rate providers accrue + surge fee moves as the pool re-balances — treat the query as a snapshot;
+   * the exec re-reads the live query as minAmountOut). Verified: Vault 0xbA13…bA9 on all chains; Routers
+   * Base 0x3f17…DC10, Ethereum 0xAE56…8Ea2, Arbitrum 0xEAed…CF2E, Sonic 0x93db…Dae5; Permit2
+   * 0x0000…78BA3 (canonical, all chains). See balancer-v3-math.ts + LIQUIDITY_SOURCES_FEASIBILITY.md.
+   */
+  BalancerV3 = "balancer-v3",
   /** DODO V2 (DVMFactory): getDODOPool(base, quote) → address[] → sellBase/sellQuote */
   DODOZoo = "dodo-zoo",
   /** Trader Joe LB: getLBPairInformation(tokenX, tokenY, binStep) */
@@ -296,6 +318,27 @@ export interface FactoryConfig {
    */
   balancerStablePools?: Hex[];
   /**
+   * Balancer V3 (BalancerV3 factory type) only: a KNOWN list of Balancer V3 pool addresses to probe for the
+   * pair. Balancer V3 has NO pair→pool getter (the `address` on a BalancerV3 entry is the CREATE2 Vault
+   * singleton 0xbA13…bA9, shared on all chains), so discovery is known-pool-address based —
+   * `discoverBalancerV3PoolsTyped` reads `Vault.getPoolTokens(pool)`, keeps the pools trading BOTH tokenIn
+   * and tokenOut (V3 has NO BPT in the swappable set, unlike V2), and SAMPLES a LIVE ladder via the Router's
+   * `querySwapSingleTokenExactIn` (which bakes in rate providers + any dynamic surge-hook fee). PRODUCTION
+   * populates this from the Balancer V3 pool index / subgraph; the EVM test injects the locally-deployed
+   * fixture pool address directly. Omitted/empty ⇒ no Balancer V3 pools surfaced (the discovery gap is
+   * filled by config, no engine change). Requires `balancerV3Router` to be set.
+   */
+  balancerV3Pools?: Hex[];
+  /**
+   * Balancer V3 (BalancerV3 factory type) only: the per-chain single-swap Router (RouterCommon-based, with
+   * swapSingleTokenExactIn / querySwapSingleTokenExactIn). UNLIKE the Vault (a CREATE2 singleton, the same
+   * on every chain), the Router address DIFFERS per chain — Base 0x3f17…DC10, Ethereum 0xAE56…8Ea2, Arbitrum
+   * 0xEAed…CF2E, Sonic 0x93db…Dae5 — so it MUST be per-chain config. Both the off-chain discovery sampling
+   * quote and the on-chain per-slice exec quote/swap go through this Router; one Router serves every V3 pool
+   * on the chain (threaded chain-wide via the solver cfg). Required when `balancerV3Pools` is non-empty.
+   */
+  balancerV3Router?: Hex;
+  /**
    * EulerSwap (EulerSwap factory type) only: a KNOWN list of EulerSwap pool addresses to probe for the
    * pair. The EulerSwap factory has NO pair→pool getter and no enumeration (only `deployedPools` +
    * PoolDeployed events), so discovery is known-pool-address based — `discoverEulerSwapPoolsTyped` reads
@@ -341,6 +384,22 @@ export interface FactoryConfig {
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */
 export const V2_DEFAULT_FEE_PPM = 3000;
+
+/**
+ * Canonical Uniswap Permit2 singleton — SAME address on every EVM chain (cast-verified via
+ * Balancer V3 Router.getPermit2() on Base/ETH/Arbitrum/Sonic). The Balancer V3 exec path pulls its
+ * input through Permit2: the cooking contract ERC20.approve(PERMIT2, share) then
+ * Permit2.approve(tokenIn, ROUTER, uint160(share), expiration) before Router.swapSingleTokenExactIn.
+ */
+export const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3" as Hex;
+
+/**
+ * The CREATE2 Balancer V3 Vault singleton — the SAME address on every chain (cast-verified: code present
+ * on Base/Ethereum/Arbitrum/Sonic). On a `FactoryType.BalancerV3` entry the FactoryConfig `address` is this
+ * Vault (used only for `isPoolRegistered` / `getPoolTokens`); the per-chain Router (which drives the swap)
+ * is `FactoryConfig.balancerV3Router`.
+ */
+export const BALANCER_V3_VAULT = "0xbA1333333333a1BA1108E8412f11850A5C319bA9" as Hex;
 
 /**
  * KyberSwap Classic / DMM fee precision: feeInPrecision (from getTradeInfo) is scaled by
@@ -417,6 +476,23 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     { address: "0x87DD13Dd25a1DBde0E1EdcF5B8Fa6cfff7eABCaD" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
     // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
     { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
+    // Balancer V3 (Vault singleton 0xbA13…bA9 + per-chain Router; callback-free typed path via Permit2).
+    // This is the Base V3 depth the config-audit flagged as MISSING under the V2-only Balancer wiring (the
+    // Base V2 stable pools are dust). Known-pool-address discovery: `balancerV3Pools` = V3 pool addresses
+    // (probed via Vault.getPoolTokens), `balancerV3Router` = the Base single-swap Router. On-chain verified
+    // at block 48120153: isPoolRegistered=true, getPoolTokens = [waGHO 0x88b1…, waUSDC 0xC768…], staticFee
+    // 5e13, StableSurge-hooked (0xb200…f007), and querySwapSingleTokenExactIn(pool, waUSDC, waGHO, 100e6) →
+    // 107.79 waGHO (surge-fee-inclusive; reverse 100e18 waGHO → 92.65 waUSDC). The querySwap surface bakes in
+    // the rate providers + dynamic surge fee, so the sampled ladder is robust for this SURGE pool (a static
+    // StableMath replay could NOT price it). The swappable tokens are the ERC4626 WRAPPERS (waGHO/waUSDC),
+    // NOT raw GHO/USDC — reachable only when the wrappers are among the discovery baseTokens/route hops.
+    // poolType UniV2 is INERT for Balancer V3 (discovery keys off factoryType; V3 executes callback-free via
+    // its own EcoBalancerV3 path, never a UniV2 router swap) — a placeholder, not a UniV2 claim.
+    { address: "0xbA1333333333a1BA1108E8412f11850A5C319bA9" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.BalancerV3, label: "Balancer V3",
+      balancerV3Router: "0x3f170631ed9821Ca51A59D996aB095162438DC10" as Hex,
+      balancerV3Pools: [
+        "0x7ab124ec4029316c2a42f713828ddf2a192b36db" as Hex, // Aave USDC-Aave GHO (waUSDC/waGHO, StableSurge)
+      ] },
     // Balancer V2 / Fluid / EulerSwap / Fermi on Base: LEFT EMPTY + FLAGGED (verified, none is a deep
     // both-baseToken stable venue):
     //  · Balancer V2 — the deepest V2 stable pools holding baseTokens are dust: USDC/USDbC/axlUSDC
@@ -464,6 +540,23 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
         balancerStablePools: [
           "0x8353157092ED8Be69a9DF8F95af097bbF33Cb2aF" as Hex, // GHO/USDT/USDC ComposableStable
           "0x06Df3b2bbB68adc8B0e302443692037ED9f91b42" as Hex, // Balancer USD Stable Pool (DAI/USDC/USDT)
+        ] },
+      // Balancer V3 (Vault singleton 0xbA13…bA9 + per-chain Router; callback-free typed path via Permit2).
+      // Known-pool-address discovery: `balancerV3Pools` = V3 pool addresses (probed via Vault.getPoolTokens),
+      // `balancerV3Router` = the Ethereum single-swap Router (querySwapSingleTokenExactIn quotes — INCLUDES
+      // the rate providers + any StableSurge dynamic fee, the robust surface for the boosted/wrapped legs).
+      // On-chain verified at block 25447676: isPoolRegistered=true, getPoolTokens = [waUSDT 0x7Bc3…, waGHO
+      // 0xC71E…, waUSDC 0xD4fa…] (all WITH_RATE ERC4626 wrappers), and querySwapSingleTokenExactIn(pool,
+      // waUSDC, waUSDT, 100e6) → 100.85 waUSDT. NOTE the pool's swappable tokens are the ERC4626 WRAPPERS
+      // (waUSDC/waUSDT/waGHO), NOT the raw stablecoins — reachable only when the wrappers are among the
+      // discovery baseTokens/route hops; the raw-USDC/USDT legs go through the wrapper's ERC4626
+      // deposit/redeem, out of the direct-swap scope. poolType UniV2 is INERT for Balancer V3 (discovery keys
+      // off factoryType; V3 executes callback-free via its own EcoBalancerV3 path, never a UniV2 router swap)
+      // — a placeholder, not a UniV2 claim.
+      { address: "0xbA1333333333a1BA1108E8412f11850A5C319bA9" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.BalancerV3, label: "Balancer V3",
+        balancerV3Router: "0xAE563E3f8219521950555F5962419C8919758Ea2" as Hex,
+        balancerV3Pools: [
+          "0x85b2b559bc2d21104c4defdd6efca8a20343361d" as Hex, // Aave GHO/USDT/USDC (waGHO/waUSDT/waUSDC)
         ] },
       // Fluid DEX (Instadapp FluidDexT1 — Liquidity-Layer re-centering AMM; callback-free typed path).
       // Known-pool-address discovery: `fluidPools` = FluidDexT1 pool addresses, `fluidResolver` = the
@@ -574,6 +667,14 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
           "0x1533A3278f3F9141d5F820A184EA4B017fce2382" as Hex, // USDT-USDC.e-DAI StablePool
           "0x423A1323c871aBC9d89EB06855bF5347048Fc4A5" as Hex, // Balancer Stable 4pool (native USDC/DAI/USDT/USDC.e)
         ] },
+      // Balancer V3 (Vault singleton 0xbA13…bA9 + Arbitrum Router 0xEAed…CF2E; callback-free typed path via
+      // Permit2). On-chain verified: the Vault singleton is present on Arbitrum and the Router's
+      // getPermit2() = the canonical Permit2. The TYPE + Router are wired so a known deep Arbitrum V3 stable
+      // pool drops in by address alone (populate `balancerV3Pools` from the Balancer V3 subgraph — LEFT
+      // EMPTY here pending a verified deep both-baseToken-wrapper pool, same convention as the empty V2
+      // Balancer entries). poolType UniV2 is INERT for Balancer V3 — a placeholder.
+      { address: "0xbA1333333333a1BA1108E8412f11850A5C319bA9" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.BalancerV3, label: "Balancer V3",
+        balancerV3Router: "0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E" as Hex },
       // Fluid DEX (FluidDexT1 typed path). On-chain verified: DexFactory.getDexAddress → getDexTokens (via
       // DexResolver 0x11D80…) → dexId3 0x3C04…CDa7 is USDC(0xaf88…, native)/USDT(0xFd08…) — both baseTokens;
       // estimateSwapIn deep (1M USDC → 1.0003M USDT).
@@ -769,6 +870,24 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // tokenIn/tokenOut ∈ pool tokens filter never matches. No V2-Vault base-token stable pool with real
       // depth → left empty. (V3-Vault support would be needed to reach the deep pools — out of scope.)
       { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Beets (Balancer V2 Vault)" },
+      // Beets Balancer V3 (Vault singleton 0xbA13…bA9 + Sonic Router 0x93db…Dae5; callback-free typed path
+      // via Permit2). This wires the V3-Vault path the prior V2-only Beets entry documented it could NOT
+      // reach — the deep Sonic Beets "STABLE" pools (0x3d71ad28…, 0x43026d48… "Boosted Stable Rings", …) are
+      // Balancer V3 pools (they REVERT getPoolId(), so the V2 Vault.getPoolTokens path can't add them). On-
+      // chain verified: isPoolRegistered(0x43026d…)=true, getPoolTokens = [0x7870…, 0xd3DC…] (boosted/wrapped
+      // legs), Sonic Router.getPermit2() = the canonical Permit2. NOTE: like the Base/ETH V3 pools, the
+      // swappable tokens are BOOSTED/WRAPPED wrappers (smsUSD/vgUSDC-class), NOT the wired baseTokens
+      // (wS/USDC/USDT), so a base-token EcoSwap won't route through them until the wrappers are among the
+      // discovery baseTokens/route hops — AND this specific "Boosted Stable Rings" pool needs its ERC4626
+      // buffers initialized for the single-swap Router query (a plain querySwapSingleTokenExactIn against it
+      // reverted with a buffer error at read time). The TYPE + Router are wired so a directly-queryable deep
+      // Sonic V3 stable pool drops in by address alone. poolType UniV2 is INERT (discovery keys off
+      // factoryType; V3 executes callback-free via its own EcoBalancerV3 path) — a placeholder.
+      { address: "0xbA1333333333a1BA1108E8412f11850A5C319bA9" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.BalancerV3, label: "Beets (Balancer V3)",
+        balancerV3Router: "0x93db4682A40721e7c698ea0a842389D10FA8Dae5" as Hex,
+        balancerV3Pools: [
+          "0x43026d483f42fb35efe03c20b251142d022783f2" as Hex, // Boosted Stable Rings (boosted/wrapped legs)
+        ] },
     ],
     baseTokens: [
       "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38" as Hex, // wS (wrapped Sonic, native)

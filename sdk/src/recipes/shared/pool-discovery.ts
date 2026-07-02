@@ -36,6 +36,11 @@ import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
 import { type FluidPool, fluidSampleInputs, FLUID_FEE_SCALE } from "./fluid-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
+import {
+  type BalancerV3Pool,
+  balancerV3SampleInputs,
+  BALANCER_V3_FEE_SCALE,
+} from "./balancer-v3-math.js";
 import { type EulerSwapPool, eulerFeeToPpm } from "./eulerswap-math.js";
 import {
   getSqrtPrice as getMaverickSqrtPrice,
@@ -351,6 +356,30 @@ const mentoBrokerAbi = parseAbi([
 const mentoExchangeProviderAbi = parseAbi([
   "struct Exchange { bytes32 exchangeId; address[] assets; }",
   "function getExchanges() external view returns (Exchange[])",
+]);
+
+// Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) read surface for the EcoSwap
+// TYPED path — the REAL VERIFIED interface (Vault 0xbA1333333333a1BA1108E8412f11850A5C319bA9 on every
+// chain; Routers Base 0x3f17…DC10 / ETH 0xAE56…8Ea2 / Arb 0xEAed…CF2E / Sonic 0x93db…Dae5). Discovery is
+// known-pool-address based (V3 has no pair→pool getter):
+//   Vault.getPoolTokens(pool) view -> address[]  (the swappable tokens; V3 has NO BPT in the list, unlike V2)
+//   Router.querySwapSingleTokenExactIn(pool, tokenIn, tokenOut, amountIn, sender, userData) -> uint256
+//     — declared external (NOT view), eth_call-ONLY: it routes through the Vault's quote() (unlock()s in
+//       QUERY mode + rolls back), which demands a static-call context, so it reverts both under a plain CALL
+//       (NotStaticCall) and under a STATICCALL (its unlock() state write) — NOT callable on-chain in a cook.
+//       INCLUDES rate providers + any dynamic StableSurge hook fee (the robust quote surface for plain AND
+//       surge pools). Discovery samples it over [0, amountIn] via eth_call. The on-chain exec does NOT re-read
+//       it: it Permit2-approves + swapSingleTokenExactIn with minAmountOut=0 (callback-free — the V3
+//       reentrancy is contained inside Balancer's Router+Vault, never the cooking contract).
+const balancerV3VaultAbi = parseAbi([
+  "function getPoolTokens(address pool) external view returns (address[])",
+]);
+// querySwapSingleTokenExactIn is declared `external` (NOT view) on-chain — it unlock()s the Vault in
+// QUERY mode and rolls back — but is fully callable via eth_call. Declared `view` HERE so viem's
+// `readContract` (an eth_call) can drive it for the off-chain sampling ladder (like Fluid's
+// estimateSwapIn, marked view for the same reason); no state persists.
+const balancerV3RouterAbi = parseAbi([
+  "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes userData) external view returns (uint256 amountOut)",
 ]);
 
 // ── KyberSwap Classic / DMM ──────────────────────────────────
@@ -2467,6 +2496,126 @@ export async function discoverMentoPoolsTyped(
       }
     } catch {
       // Broker/provider read failed (not a Mento Broker, or unsupported pair) — skip.
+    }
+  }
+  return out;
+}
+
+// ── Balancer V3 discovery ────────────────────────────────────
+
+/**
+ * Discover Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) pools for the pair AS
+ * TYPED `BalancerV3Pool` descriptors (the EcoSwap callback-free path). Balancer V3 pools price off the Vault
+ * balances + rate providers + a possibly-dynamic StableSurge hook fee (NOT xy=k), so they must NOT be priced
+ * through the V2 synthetic-sqrt path. Discovery is KNOWN-POOL-ADDRESS based (V3 has no pair→pool getter): the
+ * `FactoryConfig.address` for a BalancerV3 entry is the CREATE2 Vault (shared on all chains), the candidate
+ * pool addresses are in `FactoryConfig.balancerV3Pools`, and the per-chain single-swap Router is
+ * `FactoryConfig.balancerV3Router`.
+ *
+ * A pool is kept only when it trades BOTH tokenIn and tokenOut — read via `Vault.getPoolTokens(pool)` (V3 has
+ * NO BPT in the swappable token list, unlike V2 ComposableStable). The deep production pools are surge-hooked
+ * + rate-scaled, so the curve cannot be replayed from a static fee; instead this SAMPLES a LIVE ladder via
+ * the Router's `querySwapSingleTokenExactIn(pool, tokenIn, tokenOut, +amountIn, sender, "")` via eth_call
+ * (which bakes in the rate providers + dynamic hook fee — the robust surface; the query is eth_call-ONLY, not
+ * callable on-chain). `buildBalancerV3Segments` then differences that ladder into segments (shared with the
+ * oracle). Execution is CALLBACK-FREE: the solver Permit2-approves (ERC20.approve(PERMIT2) +
+ * Permit2.approve(ROUTER)), then calls `Router.swapSingleTokenExactIn` with minAmountOut=0 (the query is NOT
+ * re-read on-chain) — the V3 reentrancy is contained inside Balancer's Router+Vault (never the cooking
+ * contract), so no engine change.
+ *
+ * `amountIn` sizes the ladder range. Mirrors `discoverFluidPoolsTyped` / `discoverMentoPoolsTyped` —
+ * off-chain discovery + state reads, returning the venue descriptor EcoSwap prepare consumes directly (the
+ * on-chain lens does not understand Balancer V3).
+ */
+export async function discoverBalancerV3PoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  balancerV3Configs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<BalancerV3Pool[]> {
+  if (balancerV3Configs.length === 0 || amountIn <= 0n) return [];
+
+  const sampleIn = balancerV3SampleInputs(amountIn);
+  if (sampleIn.length === 0) return [];
+
+  const inLc = tokenIn.toLowerCase();
+  const outLc = tokenOut.toLowerCase();
+  const out: BalancerV3Pool[] = [];
+  const seen = new Set<string>();
+  for (const cfg of balancerV3Configs) {
+    const vault = cfg.address;
+    const router = cfg.balancerV3Router;
+    if (!router) continue; // a BalancerV3 entry MUST carry the per-chain Router.
+    for (const pool of cfg.balancerV3Pools ?? []) {
+      const key = pool.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try {
+        // Keep only a pool trading BOTH tokenIn and tokenOut (V3 has no BPT in the swappable set).
+        const tokens = (await client
+          .readContract({ address: vault, abi: balancerV3VaultAbi, functionName: "getPoolTokens", args: [pool] })
+          .catch(() => [])) as readonly Hex[];
+        const set = new Set(tokens.map((t) => t.toLowerCase()));
+        if (!set.has(inLc) || !set.has(outLc)) continue;
+
+        // Sample the LIVE quote ladder via the Router's querySwapSingleTokenExactIn (rate-provider +
+        // dynamic-surge-fee inclusive). sender = ZERO_ADDRESS (the query needs no tokens/approvals);
+        // userData = "0x".
+        const quotes = await Promise.all(
+          sampleIn.map((amt) =>
+            client
+              .readContract({
+                address: router,
+                abi: balancerV3RouterAbi,
+                functionName: "querySwapSingleTokenExactIn",
+                args: [pool, tokenIn, tokenOut, amt, ZERO_ADDRESS as Hex, "0x" as Hex],
+              })
+              .then((r) => r as bigint)
+              .catch(() => 0n),
+          ),
+        );
+
+        // Keep only the strictly-positive, non-decreasing prefix of the ladder (a zero/failed quote =
+        // buffer/liquidity limit or an un-queryable pool; a non-increasing out = degenerate).
+        const cumIn: bigint[] = [];
+        const cumOut: bigint[] = [];
+        let prevOut = 0n;
+        for (let i = 0; i < sampleIn.length; i++) {
+          const o = quotes[i];
+          if (o <= prevOut) break;
+          cumIn.push(sampleIn[i]);
+          cumOut.push(o);
+          prevOut = o;
+        }
+        if (cumOut.length === 0 || cumOut[0] <= 0n) continue; // pair not tradeable / no out
+
+        // Derive an effective fee (ppm) from the shallowest slice for price-ordering / diagnostics only (a
+        // surge-hooked pool has no single fee getter; the query folds fee + rate scaling in). PAR-PAIR
+        // heuristic — for a non-par pair (differing decimals / non-1:1 rate) the shortfall vs 1:1 is not the
+        // fee, so this is best-effort and 0 when it can't be inferred. The real merge coordinate is
+        // marginalOI from the ladder dy in buildBalancerV3Segments (shared by prepare + oracle).
+        let feePpm = 0;
+        const in0 = cumIn[0];
+        const out0 = cumOut[0];
+        if (in0 > 0n && out0 > 0n && out0 < in0) {
+          const shortfall = ((in0 - out0) * BALANCER_V3_FEE_SCALE) / in0;
+          if (shortfall > 0n && shortfall < BALANCER_V3_FEE_SCALE) feePpm = Number(shortfall);
+        }
+
+        out.push({
+          address: pool,
+          router,
+          tokenIn,
+          tokenOut,
+          cumIn,
+          cumOut,
+          feePpm,
+          source: `${cfg.label} (Balancer V3)`,
+        });
+      } catch {
+        // Pool/router read failed (not a live V3 pool, paused, or unsupported pair) — skip.
+      }
     }
   }
   return out;
