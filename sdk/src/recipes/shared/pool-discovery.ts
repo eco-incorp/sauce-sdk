@@ -42,7 +42,6 @@ import {
   getTickL,
   tickSqrtPrices,
   maverickFeeToPpm,
-  MAVERICK_ENGINE_TICK_LIMIT,
   type MaverickPool,
   type MaverickTick,
 } from "./maverick-math.js";
@@ -2969,12 +2968,13 @@ const MAVERICK_TICK_WINDOW = Number(process.env.ECO_MAVERICK_TICK_WINDOW ?? 40);
  * EcoSwap prepare consumes directly (the on-chain lens does not understand Maverick). Factory path:
  * lookup(tokenA, tokenB, 0, N) over BOTH token orderings (Maverick's lookup is order-dependent).
  *
- * ENGINE tickLimit=0 GATE. The engine `_swapMaverickV2` hardcodes `tickLimit: 0`, which caps/reverts a
- * swap whose active tick is on the wrong side of tick 0 for its direction (a tokenA-in swap must walk UP
- * toward tick 0, so activeTick must be <= 0; a tokenB-in swap must walk DOWN toward tick 0, so activeTick
- * must be >= 0). Discovery DROPS a pool whose live active tick sits on the wrong side for its direction —
- * the engine swap would revert (PoolCurrentTickBeyondSwapLimit) or fail to fill. Documented in
- * maverick-math.ts (MAVERICK_ENGINE_TICK_LIMIT) and reported as the engine gap.
+ * ENGINE tickLimit — FULL RANGE. The FIXED engine `_swapMaverickV2` (../sauce PR #193) passes a
+ * per-direction FULL-RANGE tickLimit (`tokenAIn ? type(int32).max : type(int32).min`), so a swap fills
+ * across the WHOLE live tick book bounded only by liquidity — for ANY active-tick side (the fill may cross
+ * tick 0 freely). Discovery therefore surfaces EVERY discovered liquid Maverick pool regardless of which
+ * side of tick 0 its active tick sits on; there is NO active-tick side gate. (The OLD engine hardcoded
+ * `tickLimit: 0` and needed a discovery-side gate to drop far-side pools — both vestiges were removed.)
+ * The off-chain bin-walk in maverick-math.ts mirrors the same full-range bound (`engineTickLimit`).
  */
 export async function discoverMaverickV2PoolsTyped(
   tokenIn: Hex,
@@ -3023,10 +3023,10 @@ export async function discoverMaverickV2PoolsTyped(
           const tickSpacing = Number(tsRaw);
           if (tickSpacing <= 0) continue;
 
-          // ENGINE tickLimit=0 GATE: tokenA-in walks UP → activeTick must be <= 0; tokenB-in walks DOWN
-          // → activeTick must be >= 0. A pool on the wrong side would revert / not fill through the engine.
-          if (tokenAIn && activeTick > MAVERICK_ENGINE_TICK_LIMIT) continue;
-          if (!tokenAIn && activeTick < MAVERICK_ENGINE_TICK_LIMIT) continue;
+          // No active-tick side gate: the FIXED engine `_swapMaverickV2` (../sauce PR #193) passes a
+          // per-direction FULL-RANGE tickLimit (type(int32).max/min), so a swap fills across the whole live
+          // tick book regardless of which side of tick 0 the active tick sits on. Every discovered liquid
+          // pool is executable — surface them all. (The OLD tickLimit=0 engine required a here-dropped gate.)
 
           // Directional fee for THIS swap direction.
           const feeWad = (await client.readContract({

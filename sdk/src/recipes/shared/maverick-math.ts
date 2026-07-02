@@ -353,14 +353,13 @@ export interface MaverickTick {
  * the DIRECTIONAL fee for THIS direction (feeAIn if tokenAIn, else feeBIn). `ticks` are the live
  * per-tick reserves around the active tick, in ASCENDING tick order.
  *
- * ENGINE tickLimit CONSTRAINT. The engine hardcodes `tickLimit: 0`. Real Maverick treats tickLimit as
- * "the furthest tick the swap will execute in" (type(int32).max/min for no limit). tickLimit=0 caps a
- * tokenA-in (price-rising) swap AT tick 0 and reverts if the pool's active tick already exceeds 0
- * (PoolCurrentTickBeyondSwapLimit). So the engine path only fills correctly for a tokenA-in swap whose
- * active tick is <= 0 (walking UP toward tick 0), or a tokenB-in swap whose active tick is >= 0
- * (walking DOWN toward tick 0). buildMaverickSegments applies the SAME tickLimit=0 in its walk (so the
- * sampler and the engine agree), and prepare/discovery gate a pool OUT of the executable set when the
- * live active tick sits on the wrong side of 0 for its direction (the swap would revert / not fill).
+ * ENGINE tickLimit. The FIXED engine (../sauce PR #193) passes a per-direction FULL-RANGE tickLimit —
+ * `type(int32).max` for a tokenA-in (price-rising) swap, `type(int32).min` for a tokenB-in (price-falling)
+ * swap — i.e. Maverick's "no limit" sentinel. The swap fills across the WHOLE live tick book, bounded only
+ * by available liquidity, for ANY active-tick side (the fill may cross tick 0 freely). buildMaverickSegments
+ * applies the SAME full-range per-direction bound in its walk (`engineTickLimit(tokenAIn)`), so the sampler
+ * and the engine agree bit-for-bit — and discovery surfaces every liquid pool regardless of active-tick side
+ * (the OLD `tickLimit: 0` cap + its discovery gate are gone).
  */
 export interface MaverickPool {
   /** Always SwapPoolType.MaverickV2 (=7) — execution dispatches via swap(SwapParams{poolType:7}). */
@@ -388,11 +387,23 @@ export interface MaverickPool {
 }
 
 /**
- * The engine's hardcoded swap tick limit. `_swapMaverickV2` always passes `tickLimit: 0`, so a
- * tokenA-in swap stops at tick 0 (price rising toward tick 0) and a tokenB-in swap stops at tick 0
- * (price falling toward tick 0). The sampler applies the SAME limit so its output matches the engine.
+ * The engine's per-direction FULL-RANGE swap tick limit. The FIXED `_swapMaverickV2` (../sauce PR #193)
+ * passes `tickLimit: tokenAIn ? type(int32).max : type(int32).min`, i.e. no artificial cap — a tokenA-in
+ * swap walks UP unbounded (up to int32.max) and a tokenB-in swap walks DOWN unbounded (down to int32.min),
+ * bounded only by available liquidity / MAX_TICK. The sampler applies the SAME per-direction bound so its
+ * output matches the engine even when the fill crosses tick 0.
+ *
+ * (Historical: the OLD engine hardcoded `tickLimit: 0`, capping every swap at tick 0 and dropping pools on
+ * the far side of 0. Both vestiges — the discovery gate and this cap — were removed once the engine went
+ * full-range.)
  */
-export const MAVERICK_ENGINE_TICK_LIMIT = 0;
+export const MAVERICK_ENGINE_TICK_LIMIT_MAX = 2_147_483_647; // type(int32).max — tokenA-in upper bound
+export const MAVERICK_ENGINE_TICK_LIMIT_MIN = -2_147_483_648; // type(int32).min — tokenB-in lower bound
+
+/** The engine tickLimit for a given swap direction (full range). tokenA-in walks UP → max; tokenB-in DOWN → min. */
+export function engineTickLimit(tokenAIn: boolean): number {
+  return tokenAIn ? MAVERICK_ENGINE_TICK_LIMIT_MAX : MAVERICK_ENGINE_TICK_LIMIT_MIN;
+}
 
 /** Fixed tick-walk bound (mirrors the reference TICK_SEARCH_LIMIT). No unbounded loop. */
 const TICK_SEARCH_LIMIT = 200;
@@ -401,16 +412,19 @@ const TICK_SEARCH_LIMIT = 200;
  * Walk the pool's live ticks in the swap direction, replaying `computeSwapExactIn` per tick, and
  * return the exact tokens-out for `amountIn` tokenIn AND the tokenIn actually consumed (which may be
  * LESS than `amountIn` when the tick limit / available liquidity binds). Mirrors Maverick
- * `Pool.swap`'s tick loop (via the yldfi `simulateSwapExactIn` reference) with the ENGINE tickLimit=0.
+ * `Pool.swap`'s tick loop (via the yldfi `simulateSwapExactIn` reference) with the ENGINE's per-direction
+ * FULL-RANGE tickLimit (type(int32).max/min — ../sauce PR #193).
  *
  * Direction: tokenA-in walks tick UP (+1 per step), price rises; tokenB-in walks tick DOWN (-1),
- * price falls. The loop breaks when the tick crosses `tickLimit` (the engine's 0), matching how the
- * engine's swap terminates — so `getDy` returns exactly what the engine swap consumes/pays.
+ * price falls. The default `tickLimit` is the engine's full-range bound FOR THIS DIRECTION
+ * (`engineTickLimit(tokenAIn)`), so the walk is bounded only by liquidity / MAX_TICK — matching how the
+ * full-range engine swap terminates, INCLUDING when the fill crosses tick 0. So `getDy` returns exactly
+ * what the engine swap consumes/pays.
  */
 export function simulateMaverickExactIn(
   pool: MaverickPool,
   amountIn: bigint,
-  tickLimit: number = MAVERICK_ENGINE_TICK_LIMIT,
+  tickLimit: number = engineTickLimit(pool.tokenAIn),
 ): { amountIn: bigint; amountOut: bigint } {
   if (amountIn <= 0n) return { amountIn: 0n, amountOut: 0n };
   const { tokenAIn, tickSpacing, fee, protocolFeeD3 } = pool;
@@ -427,8 +441,10 @@ export function simulateMaverickExactIn(
 
   let iterations = 0;
   while (remainingIn > 0n && iterations < TICK_SEARCH_LIMIT) {
-    // Engine tickLimit gate: a tokenA-in swap stops once the tick exceeds the limit; tokenB-in once
-    // it falls below. This is the on-chain `_swapMaverickV2` tickLimit=0 behaviour.
+    // Engine tickLimit gate: a tokenA-in swap stops once the tick exceeds the limit; tokenB-in once it
+    // falls below. This mirrors the on-chain `_swapMaverickV2` gate; with the default per-direction
+    // full-range bound (type(int32).max/min) it never binds before liquidity / MAX_TICK — so the walk
+    // crosses tick 0 freely, exactly like the fixed engine.
     if (tokenAIn && currentTick > tickLimit) break;
     if (!tokenAIn && currentTick < tickLimit) break;
 
@@ -482,18 +498,19 @@ export function simulateMaverickExactIn(
 
 /**
  * getDy(pool, amountIn) — the EXACT tokens-out the Maverick pool pays for `amountIn` tokenIn, walking
- * the live tick book with the engine's tickLimit=0. This is the sampler's per-slice output AND the
- * value the EVM test cross-checks against the on-chain MaverickV2Quoter.calculateSwap(amountIn). The
- * realized dy from the engine swap equals this (the quoter IS the swap math).
+ * the live tick book with the engine's per-direction full-range tickLimit. This is the sampler's per-slice
+ * output AND the value the EVM test cross-checks against the on-chain MaverickV2Quoter.calculateSwap(amountIn).
+ * The realized dy from the engine swap equals this (the quoter IS the swap math).
  */
 export function getDy(pool: MaverickPool, amountIn: bigint): bigint {
   return simulateMaverickExactIn(pool, amountIn).amountOut;
 }
 
 /**
- * maxInput(pool) — the largest tokenIn the pool can absorb under the engine tickLimit=0 (the point at
- * which the walk stops consuming). prepare caps the sampled range at this so no segment promises depth
- * the engine swap cannot fill (a tokenIn slice beyond it would be left unspent + terminal-refunded).
+ * maxInput(pool) — the largest tokenIn the pool can absorb under the engine's full-range tickLimit (the
+ * point at which the walk stops consuming — now bounded only by liquidity / MAX_TICK, not tick 0). prepare
+ * caps the sampled range at this so no segment promises depth the engine swap cannot fill (a tokenIn slice
+ * beyond it would be left unspent + terminal-refunded).
  */
 export function maxInput(pool: MaverickPool, probe: bigint): bigint {
   return simulateMaverickExactIn(pool, probe).amountIn;
@@ -524,8 +541,9 @@ export const MAVERICK_SAMPLES = Number(process.env.ECO_MAVERICK_SAMPLES ?? 24);
  * Sample a Maverick V2 pool into M descending-marginal segments over [0, min(amountIn, maxInput)].
  *
  * BOUND BY THE TICK-LIMIT DEPTH: the sampled range is capped at the pool's `maxInput` (the tokenIn the
- * engine swap can consume before tickLimit=0 stops it) so no segment promises depth the engine cannot
- * fill. Geometric-ish cumulative inputs (∝ s^2 — denser near 0 where the curve is steepest), each
+ * engine swap can consume before it runs out of liquidity — the full-range tickLimit no longer stops it
+ * at tick 0) so no segment promises depth the engine cannot fill. Geometric-ish cumulative inputs
+ * (∝ s^2 — denser near 0 where the curve is steepest), each
  * replayed through getDy on the READ tick book (NO extra RPC — pure bigint). Each increment becomes a
  * (capacity=Δin, effOut=Δout, marginalOI) segment. The samples are monotone in input so the marginals
  * are naturally descending (a convex out(in)); a non-decreasing marginal (rounding noise near
@@ -542,7 +560,7 @@ export function buildMaverickSegments(
   samples: number = MAVERICK_SAMPLES,
 ): MaverickSegment[] {
   if (amountIn <= 0n) return [];
-  // Cap at the depth the engine tickLimit=0 walk can actually consume.
+  // Cap at the depth the engine's full-range walk can actually consume (bounded by liquidity, not tick 0).
   const consumable = maxInput(pool, amountIn);
   const cap = consumable > 0n && consumable < amountIn ? consumable : amountIn;
   if (cap <= 0n) return [];

@@ -93,6 +93,7 @@ import {
   getTickL as maverickGetTickL,
   getSqrtPrice as maverickGetSqrtPrice,
   tickSqrtPrices as maverickTickSqrtPrices,
+  simulateMaverickExactIn as maverickSimulate,
   type MaverickPool,
   type MaverickTick,
 } from "../shared/maverick-math";
@@ -2404,19 +2405,21 @@ describe("EulerSwap (Euler vault-backed AMM, v1 + v2 share the curve) — comput
 //
 // Pins the off-chain bin swap-math replay (getDy + buildMaverickSegments) BEFORE the local-EVM test,
 // so a regression in the closed-form bigint math (getTickL, the within-tick computeSwapExactIn
-// drain/partial, the directional fee, the multi-tick walk under the engine tickLimit=0) is caught
-// without anvil. The wei-exact bound is documented in maverick-math.ts: the SPLIT is exact-on-grid vs
-// the oracle (one shared sampler) and the realized dy is the ENGINE swap, cross-checked against the
-// on-chain MaverickV2Quoter.calculateSwap in ecoswap.maverick.evm.test.ts. These vectors are the
-// deterministic getDy outputs for a fixed tick book (regenerate only on an intentional math change).
+// drain/partial, the directional fee, the multi-tick walk under the engine's per-direction FULL-RANGE
+// tickLimit) is caught without anvil. The wei-exact bound is documented in maverick-math.ts: the SPLIT is
+// exact-on-grid vs the oracle (one shared sampler) and the realized dy is the ENGINE swap, cross-checked
+// against the on-chain MaverickV2Quoter.calculateSwap in ecoswap.maverick.evm.test.ts. These vectors are
+// the deterministic getDy outputs for a fixed tick book (regenerate only on an intentional math change).
 //
-// The book: tokenA-in from a NEGATIVE active tick (-3) with symmetric per-tick reserves, walking UP
-// toward the engine tickLimit=0 (the ONLY tokenA-in config the engine's hardcoded tickLimit=0 fills —
-// see maverick-math.ts). Deep enough (ticks -3..0 × 500k each side) that a ≤100k trade fills within the
-// window; a 2M trade saturates at the book's B liquidity (the tick-limit depth bound the sampler caps at).
-// Reserves are >= 2^78 wei so the getTickL precision-bump path is NOT taken (the normal deep-pool regime
-// the on-chain fixture matches bit-for-bit — the bumped-small-reserve path is a Solidity-overflow edge the
-// deep regime avoids, exactly as real Maverick WETH/USDC ticks hold >> 2^78 wei).
+// The book: tokenA-in from a NEGATIVE active tick (-3) with symmetric per-tick reserves, walking UP.
+// The FIXED engine (../sauce PR #193) passes a per-direction FULL-RANGE tickLimit (type(int32).max/min),
+// so the walk is bounded only by liquidity — it crosses tick 0 freely and fills ANY active-tick side (a
+// SEPARATE cross-tick-0 cell below pins that). Deep enough (ticks -3..3 × 500k each side) that a ≤100k
+// trade fills within a couple of ticks; a huge trade saturates at the book's B liquidity (the depth bound
+// the sampler caps at — now the liquidity bound, not tick 0). Reserves are >= 2^78 wei so the getTickL
+// precision-bump path is NOT taken (the normal deep-pool regime the on-chain fixture matches bit-for-bit —
+// the bumped-small-reserve path is a Solidity-overflow edge the deep regime avoids, exactly as real
+// Maverick WETH/USDC ticks hold >> 2^78 wei).
 describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampler", () => {
   const E18 = 10n ** 18n;
   const Z = ("0x" + "11".repeat(20)) as `0x${string}`;
@@ -2448,10 +2451,12 @@ describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampl
     assert.equal(maverickGetDy(p, 100_000n * E18), 100_144_979_733_943_102_081_541n);
   });
 
-  it("tick-limit depth bound — a swap saturates at the book's out-side liquidity up to tick 0", () => {
+  it("depth bound — a swap saturates at the book's out-side liquidity (full-range, bounded by liquidity)", () => {
     const p = pool();
-    // The reachable ticks (-3..0) hold their B, but the walk stops at tick 0 (engine tickLimit=0), so a
-    // huge input drains only the reachable B (here 1.5M across the traversed ticks up to the limit).
+    // A huge input drains the reachable B across the traversed ticks and saturates at the book's available
+    // out-side liquidity (here 1.5M) — the bound is now LIQUIDITY, not tick 0 (the full-range walk crosses
+    // tick 0 and keeps consuming until the reachable B is exhausted). The cross-tick-0 cell below shows the
+    // walk genuinely fills ticks past 0 that the OLD tickLimit=0 cap would have skipped.
     assert.equal(maverickGetDy(p, 2_000_000n * E18), 1_500_000n * E18);
   });
 
@@ -2471,12 +2476,58 @@ describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampl
     assert.equal(sumOut, maverickGetDy(p, sumCap), "Σ segment effOut == getDy(sumCap)");
   });
 
-  it("depth bound — the sampler caps at the tick-limit-consumable input, not amountIn", () => {
+  it("depth bound — the sampler caps at the liquidity-consumable input, not amountIn", () => {
     const p = pool();
     // amountIn (10,000,000) far exceeds the reachable depth ⇒ the sampler caps at the input the engine
-    // swap can actually consume before tickLimit=0 stops it.
+    // swap can actually consume before it runs out of liquidity (the full-range tickLimit no longer stops
+    // it at tick 0 — the cap is now the book's depth).
     const segs = buildMaverickSegments(p, 10_000_000n * E18);
     const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
     assert.ok(sumCap > 0n && sumCap < 10_000_000n * E18, "segments cover only the reachable depth, not the full amountIn");
+  });
+
+  // ── CROSS-TICK-0 (the case the OLD tickLimit=0 cap hid) ──
+  // The FIXED engine passes a per-direction FULL-RANGE tickLimit, so a tokenA-in swap walks UP THROUGH
+  // tick 0 whenever its optimal fill needs the liquidity there. The OLD engine hardcoded tickLimit=0 and
+  // its off-chain mirror stopped at tick 0 — under-filling (and the discovery gate dropped far-side pools
+  // entirely). This cell pins that the full-range off-chain walk (getDy — the neutral-oracle/prepare
+  // source) is STRICTLY GREATER than the old tickLimit=0 walk on a fill that crosses tick 0, and matches
+  // the on-chain engine swap to the wei (asserted in ecoswap.maverick.evm.test.ts).
+  it("cross-tick-0 — full-range walk fills PAST tick 0 (> the old tickLimit=0 cap), wei-exact", () => {
+    // active tick -1 with SHALLOW ticks -1,0 (300k) and DEEP ticks 1,2 (3M): a 1M tokenA-in trade drains
+    // -1 and 0 (300k out each = 600k) then MUST cross into tick 1 for the rest — the exact walk the old
+    // cap forbade (it broke after tick 0). The full-range walk touches ticks -1, 0 AND 1.
+    const crossPool: MaverickPool = (() => {
+      const reserves: Record<number, bigint> = {
+        [-1]: 300_000n * E18, [0]: 300_000n * E18, [1]: 3_000_000n * E18, [2]: 3_000_000n * E18,
+      };
+      const ticks: MaverickTick[] = Object.entries(reserves).map(([t, r]) => ({
+        tick: Number(t), reserveA: r, reserveB: r,
+      }));
+      const AT = -1;
+      const { sqrtLowerPrice, sqrtUpperPrice } = maverickTickSqrtPrices(TICK_SPACING, AT);
+      const active = ticks.find((t) => t.tick === AT)!;
+      const activeL = maverickGetTickL(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+      const poolSqrtPrice = maverickGetSqrtPrice(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice, activeL);
+      return {
+        poolType: 7, address: Z, tokenAIn: true, activeTick: AT, poolSqrtPrice,
+        tickSpacing: TICK_SPACING, fee: E18 / 1000n, protocolFeeD3: 0n, ticks,
+        feePpm: 1000, source: "kat-cross",
+      };
+    })();
+
+    const CROSS = 1_000_000n * E18;
+
+    // Full-range getDy (the default per-direction FULL-RANGE tickLimit): the fill crosses tick 0 into
+    // tick 1. Hand-pinned from the closed-form replay (regenerate only on an intentional math change).
+    const fullOut = maverickGetDy(crossPool, CROSS);
+    assert.equal(fullOut, 698_750_305_283_429_197_466_694n, "full-range getDy crosses tick 0 into tick 1");
+
+    // The OLD engine tickLimit=0 walk stops after tick 0 → saturates at the -1,0 out-side liquidity (600k).
+    const cappedOut = maverickSimulate(crossPool, CROSS, 0).amountOut;
+    assert.equal(cappedOut, 600_000n * E18, "the old tickLimit=0 walk saturates at ticks -1,0 (600k)");
+
+    // The vestige removal STRICTLY increases the fill: full-range fills past tick 0, the old cap could not.
+    assert.ok(fullOut > cappedOut, "full-range fill > old tickLimit=0 cap (the case the cap hid)");
   });
 });

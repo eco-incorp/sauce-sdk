@@ -253,6 +253,145 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
     };
   }
 
+  // Off-chain MaverickPool descriptor for an ARBITRARY active tick + per-tick reserve map (tokenIn == tokenA).
+  // Seeds the walk's starting price from the active tick's reserves — the same construction discovery uses.
+  // Used by the cross-tick-0 cells (which the OLD tickLimit=0 engine could not fill / dropped at discovery).
+  function offPoolAt(address: Hex, activeTick: number, reserves: Record<number, bigint>): MaverickPool {
+    const ticks: MaverickTick[] = Object.entries(reserves)
+      .map(([t, r]) => ({ tick: Number(t), reserveA: r, reserveB: r }))
+      .sort((a, b) => a.tick - b.tick);
+    const { sqrtLowerPrice, sqrtUpperPrice } = tickSqrtPrices(TICK_SPACING, activeTick);
+    const active = ticks.find((t) => t.tick === activeTick)!;
+    const activeL = getTickL(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+    const poolSqrtPrice = getSqrtPrice(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice, activeL);
+    return {
+      poolType: 7,
+      address,
+      tokenAIn: true,
+      activeTick,
+      poolSqrtPrice,
+      tickSpacing: TICK_SPACING,
+      fee: FEE,
+      protocolFeeD3: 0n,
+      ticks,
+      feePpm: Number((FEE * 1_000_000n) / E18),
+      source: "local-fixture",
+    };
+  }
+
+  // ── Shared cross-tick-0 cell body ──
+  // Deploys `op` (a pool the OLD tickLimit=0 engine mishandled), drives ONE EcoSwap over its PRODUCTION
+  // buildMaverickSegments ladder, and asserts the on-chain fill == full-range getDy(consumed) == the
+  // fixture's own full-range calculateSwap to the WEI — the wei-exactness the old cap hid.
+  //
+  // Two vestige facts are cross-checked against the FIXTURE's own view (the engine-independent ground truth,
+  // parametrized by tickLimit — the fixture honors whatever the caller passes, mirroring the OLD vs FIXED
+  // engine): `opts.minReceivedFloor` is a value the OLD tickLimit=0 walk could NOT exceed on this pool
+  // (0 for an active tick above 0 that the walk breaks on immediately; the tick -1 single-tick out-liquidity
+  // for a fill that crosses the tick-0 boundary into tick 0) — the executed fill must be STRICTLY GREATER,
+  // proving the removal changes the number, not just that a swap lands. `opts.assertViewBeatsCap` (default
+  // true) additionally asserts the fixture's full-range calculateSwap STRICTLY exceeds its tickLimit=0
+  // calculateSwap on the SAME sampled input (only true when the sampled ladder itself reaches past tick 0 —
+  // the boundary-crossing cell whose ladder stops AT tick 0 sets it false and relies on minReceivedFloor).
+  async function runCrossTick0(
+    engine: Engine,
+    op0: MaverickPool,
+    amountIn: bigint,
+    opts: { minReceivedFloor: bigint; assertViewBeatsCap?: boolean },
+  ): Promise<void> {
+    await reset();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const pool = await deployMaverickV2Pool(c.walletClient, c.publicClient, deployParams(op0), caller);
+    const op: MaverickPool = { ...op0, address: pool };
+
+    const segRows = maverickSegRows(op, 0, amountIn);
+    assert.ok(segRows.length > 0, "non-empty Maverick segment ladder (full-range: the pool is executable)");
+    const segSum = segRows.reduce((a, r) => a + r[1], 0n);
+
+    const { bytecodes } = compileSauce(
+      solverSrc, maverickArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+    );
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    await assertPreCook(caller, target, amountIn, [{ pool, expectedOut: getDy(op, segSum) }]);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const poolInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+
+    // The fixture's own calculateSwap views on the SAME sampled input — full-range (engine passes
+    // type(int32).max for tokenA-in) vs the OLD tickLimit=0 cap. The engine-independent ground truth.
+    const onViewFull = (await c.publicClient.readContract({
+      address: pool, abi: maverickV2PoolAbi, functionName: "calculateSwap",
+      args: [segSum, true, false, 2_147_483_647],
+    })) as readonly [bigint, bigint, bigint];
+    const onViewOldCap = (await c.publicClient.readContract({
+      address: pool, abi: maverickV2PoolAbi, functionName: "calculateSwap",
+      args: [segSum, true, false, 0],
+    })) as readonly [bigint, bigint, bigint];
+    if (opts.assertViewBeatsCap ?? true) {
+      assert.ok(
+        onViewFull[1] > onViewOldCap[1],
+        `fixture full-range view ${onViewFull[1]} > tickLimit=0 view ${onViewOldCap[1]} (the case the cap hid)`,
+      );
+    }
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "cross-tick-0 Maverick cook() must succeed");
+
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+    const poolIn = (await balanceOf(c.publicClient, tokenIn, pool)) - poolInBefore;
+
+    assert.equal(spent, onViewFull[0], "spent == the input the full-range Maverick swap consumed");
+    assert.equal(poolIn, onViewFull[0], "the Maverick pool received the consumed input via the callback");
+
+    // WEI-EXACT-IN-DY across tick 0: the on-chain executed dy == off-chain full-range getDy(consumed) ==
+    // the fixture's own full-range calculateSwap view. NO tolerance.
+    assert.equal(received, getDy(op, spent), "received == full-range getDy(share) to the wei (cross-tick-0)");
+    assert.equal(received, onViewFull[1], "received == full-range calculateSwap view to the wei");
+    // The fill fills PAST what the OLD tickLimit=0 walk could reach on this pool.
+    assert.ok(
+      received > opts.minReceivedFloor,
+      `received ${received} > old tickLimit=0 reach ${opts.minReceivedFloor} (the case the cap hid)`,
+    );
+
+    console.log(
+      `  [Maverick cross-0:${engine}] activeTick=${op.activeTick} spent=${spent} received=${received} ` +
+        `(old-cap reach<=${opts.minReceivedFloor}; == full-range getDy == calculateSwap to the wei)`,
+    );
+  }
+
+  // ── (A) tokenA-in fill that walks THROUGH the tick-0 boundary (active -1, uniform book) ──
+  // active tick -1 (< 0, so the OLD discovery gate KEPT it), uniform 500k/tick over ticks -2..3. A 600k
+  // tokenA-in trade drains tick -1's out-side liquidity (500k) then crosses the tick-0 boundary INTO tick 0
+  // for the remainder — the fill spans BOTH sides of tick 0. The received (~599.5k) therefore exceeds tick
+  // -1's single-tick out-liquidity (500k), proving the fill walked THROUGH tick 0; wei-exact vs getDy +
+  // calculateSwap. (The sampled ladder itself stops AT the tick-0 boundary — the marginal is smooth there —
+  // so the fixture full-range vs tickLimit=0 views TIE on this input; the crossing is proven by the 500k
+  // floor, not by a view delta. assertViewBeatsCap:false.)
+  async function runCrossThroughTick0(engine: Engine): Promise<void> {
+    const reserves: Record<number, bigint> = {};
+    for (let t = -2; t <= 3; t++) reserves[t] = 500_000n * E18;
+    const op = offPoolAt(("0x" + "00".repeat(20)) as Hex, -1, reserves);
+    // Crossing the tick-0 boundary from tick -1 ⇒ received must exceed tick -1's single-tick out-liq (500k).
+    await runCrossTick0(engine, op, 600_000n * E18, { minReceivedFloor: 500_000n * E18, assertViewBeatsCap: false });
+  }
+
+  // ── (B) tokenA-in pool with active tick ABOVE 0 (previously DROPPED by the discovery gate) ──
+  // active tick +2 for a tokenA-in swap: the OLD discovery gate DROPPED this pool (tokenAIn && activeTick
+  // > 0) and the OLD off-chain walk + tickLimit=0 engine returned 0 (they broke immediately, 2 > 0). The
+  // FIXED full-range engine surfaces it and fills it wei-exact (walks UP from +2). This is the pool the
+  // vestige removal RE-ENABLES; the fixture full-range view STRICTLY beats its tickLimit=0 view (0).
+  async function runAboveTick0(engine: Engine): Promise<void> {
+    const reserves: Record<number, bigint> = {};
+    for (let t = 0; t <= 6; t++) reserves[t] = 500_000n * E18;
+    const op = offPoolAt(("0x" + "00".repeat(20)) as Hex, 2, reserves);
+    // The old tickLimit=0 walk breaks immediately (activeTick 2 > 0) → ZERO fill; the pool was also dropped.
+    await runCrossTick0(engine, op, 800_000n * E18, { minReceivedFloor: 0n });
+  }
+
   // ── (1) SOLO Maverick venue — received == getDy(share) to the WEI ──
   async function runSolo(engine: Engine): Promise<void> {
     await reset();
@@ -421,6 +560,12 @@ describe("EcoSwap Maverick V2 (bin-based directional AMM, local fixture) — eng
     });
     it(`Maverick solo treeshake [${engine}] — production define set lands a non-zero Maverick fill`, { skip }, async () => {
       await runSoloTreeshake(engine);
+    });
+    it(`Maverick cross-through-tick-0 [${engine}] — full-range fill walks past tick 0, wei-exact`, { skip }, async () => {
+      await runCrossThroughTick0(engine);
+    });
+    it(`Maverick above-tick-0 [${engine}] — previously-dropped active>0 pool now fills wei-exact`, { skip }, async () => {
+      await runAboveTick0(engine);
     });
   }
 });

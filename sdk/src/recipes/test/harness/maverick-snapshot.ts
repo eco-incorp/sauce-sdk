@@ -90,7 +90,11 @@ const STABLES = [USDC, USDT] as const;
 // How many ticks on each side of the active tick to capture (matches ECO_MAVERICK_TICK_WINDOW default).
 const TICK_WINDOW = Number(process.env.ECO_MAVERICK_TICK_WINDOW ?? 40);
 
-// The engine `_swapMaverickV2` hardcoded tick limit (mirrors maverick-math.ts MAVERICK_ENGINE_TICK_LIMIT).
+// The OLD-engine tick limit this capture picked its direction under (the engine was later made full-range —
+// ../sauce PR #193; maverick-math.ts now exports MAVERICK_ENGINE_TICK_LIMIT_MAX/_MIN). Kept as-is: the
+// checked-in BSC snapshot was captured with a tokenB-in direction (activeTick 7 >= 0) that the old engine
+// could already fill, so it stays a valid full wei-exact real swap under the full-range engine too — no
+// recapture needed. This tool only documents how that frozen snapshot was taken.
 const ENGINE_TICK_LIMIT = 0;
 
 // Verified real Maverick V2 Pool storage layout (BSC pool, matched against getState/getTick/getBin):
