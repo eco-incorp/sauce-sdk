@@ -64,6 +64,39 @@ export const LB_FEE_PRECISION = 10n ** 18n;
 /** LB basis-point denominator for the bin-step factor (binStep is in bps of 1e4). */
 export const LB_BASIS_POINT_MAX = 10_000n;
 
+/** Ceiling division ⌈a/b⌉ for a,b > 0 (LB's `Math512Bits`/`Uint256x256Math` round-up). */
+export function ceilDiv(a: bigint, b: bigint): bigint {
+  if (a <= 0n) return 0n;
+  return (a + b - 1n) / b;
+}
+
+/**
+ * LB per-bin GROSS input to FULLY drain `outReserve` at a fixed bin price, EXACTLY as the LB v2.2
+ * `LBPair.getSwapOut`/`swap` (`Bin.getAmounts` + `FeeHelper.getFeeAmount`) computes it — the two
+ * ROUND-UP divisions that make the off-chain replay bit-for-bit with the real contract:
+ *
+ *   amountInToBin = ⌈outReserve · 2^128 / price⌉          (swapForY: X to drain the bin's Y)
+ *                 = ⌈outReserve · price / 2^128⌉          (swapForX: Y to drain the bin's X)   (rounded up)
+ *   feeAmount     = ⌈amountInToBin · fee / (PRECISION − fee)⌉        (FeeHelper.getFeeAmount — fee ADDED on top)
+ *   grossIn       = amountInToBin + feeAmount
+ *
+ * The fee in LB is charged ON TOP of the amount that reaches the bin (getFeeAmount, not getFeeAmountFrom),
+ * and both the price division and the fee division round UP — so a swapper pays `grossIn` to receive the
+ * full `outReserve`. The earlier floor-based approximation undershot `grossIn` by ~1–2 wei/bin, so spending
+ * it left the last wei of a bin undrained (verified against the real Arbitrum LBPair: the ceil form matches
+ * `getSwapOut` to the WEI across the whole window; the floor form was ~2 wei/bin short). Returns 0 for a
+ * non-positive/degenerate bin.
+ */
+export function lbGrossToDrain(outReserve: bigint, price128: bigint, swapForY: boolean, fee: bigint): bigint {
+  if (outReserve <= 0n || price128 <= 0n) return 0n;
+  const amountInToBin = swapForY
+    ? ceilDiv(outReserve * SCALE_128, price128) // X to drain reserveY
+    : ceilDiv(outReserve * price128, SCALE_128); // Y to drain reserveX
+  if (amountInToBin <= 0n) return 0n;
+  const feeAmount = ceilDiv(amountInToBin * fee, LB_FEE_PRECISION - fee);
+  return amountInToBin + feeAmount;
+}
+
 /** Integer square root (Babylonian) — bit-identical to curve-math / ecoswap.math `isqrt`. */
 export function isqrt(x: bigint): bigint {
   if (x <= 0n) return 0n;
@@ -222,26 +255,12 @@ export function buildLbSegments(pool: LbPool, amountIn: bigint): LbSegment[] {
     const bin = byId.get(id)!;
     const price128 = getPriceFromId(id, pool.binStep); // Y-per-X, 128.128
 
-    // out reserve (in the OUT token) and the input (in the IN token) to drain it at the bin price.
-    let outReserve: bigint;
-    let capacityIn: bigint;
-    if (pool.swapForY) {
-      // out = Y, in = X. amountInX = amountY / price (128.128): X = (Y · 2^128) / price.
-      outReserve = bin.reserveY;
-      if (outReserve <= 0n || price128 <= 0n) continue;
-      capacityIn = (outReserve * SCALE_128) / price128;
-    } else {
-      // out = X, in = Y. amountInY = amountX · price (128.128): Y = (X · price) / 2^128.
-      outReserve = bin.reserveX;
-      if (outReserve <= 0n || price128 <= 0n) continue;
-      capacityIn = (outReserve * price128) / SCALE_128;
-    }
-    if (capacityIn <= 0n) continue;
-
-    // Gross the input up by the fee so `capacityIn` of NET input drains `outReserve`.
-    // fee is taken on the gross input: net = gross·(1−fee). To drain outReserve we need
-    // net == capacityIn ⇒ gross = capacityIn · PRECISION / (PRECISION − fee).
-    const grossIn = (capacityIn * LB_FEE_PRECISION) / (LB_FEE_PRECISION - fee);
+    // out reserve (in the OUT token) and the GROSS input (in the IN token) to fully drain it at the
+    // bin price — computed with LB's exact ROUND-UP price + fee divisions (lbGrossToDrain), so the
+    // segment `capacity` is bit-for-bit the real LBPair's gross-to-drain (see lbGrossToDrain's doc).
+    const outReserve = pool.swapForY ? bin.reserveY : bin.reserveX;
+    if (outReserve <= 0n || price128 <= 0n) continue;
+    const grossIn = lbGrossToDrain(outReserve, price128, pool.swapForY, fee);
     if (grossIn <= 0n) continue;
 
     // out-per-in MARGINAL (post-fee): effOut / grossIn, in out/in sqrt space.
@@ -289,20 +308,21 @@ export function getSwapOut(pool: LbPool, amountIn: bigint): bigint {
     const outReserve = pool.swapForY ? bin.reserveY : bin.reserveX;
     if (outReserve <= 0n) continue;
 
-    // Max NET input this bin can absorb (drains the full out reserve at the bin price).
-    const maxNetIn = pool.swapForY
-      ? (outReserve * SCALE_128) / price128
-      : (outReserve * price128) / SCALE_128;
-    if (maxNetIn <= 0n) continue;
-    const maxGrossIn = (maxNetIn * LB_FEE_PRECISION) / (LB_FEE_PRECISION - fee);
+    // GROSS input to fully drain this bin — LB's exact round-up (lbGrossToDrain), bit-for-bit with
+    // the real LBPair. (The old floor form was ~1–2 wei/bin short, so it over-reported the output.)
+    const maxGrossIn = lbGrossToDrain(outReserve, price128, pool.swapForY, fee);
+    if (maxGrossIn <= 0n) continue;
 
     if (remaining >= maxGrossIn) {
       // Fully drain this bin.
       out += outReserve;
       remaining -= maxGrossIn;
     } else {
-      // Partial fill: net = gross·(1−fee); out = net · price (swapForY) or net / price.
-      const netIn = (remaining * (LB_FEE_PRECISION - fee)) / LB_FEE_PRECISION;
+      // Partial fill (LB v2.2, verified against the real pair): the fee is taken FROM the remaining
+      // input with a round-UP (`FeeHelper.getFeeAmountFrom`), and the swap-out floors the price mul:
+      //   fee = ⌈remaining · fee / PRECISION⌉ ; netIn = remaining − fee ; out = ⌊netIn · price / 2^128⌋.
+      const feeAmt = ceilDiv(remaining * fee, LB_FEE_PRECISION);
+      const netIn = remaining - feeAmt;
       const binOut = pool.swapForY
         ? (netIn * price128) / SCALE_128
         : (netIn * SCALE_128) / price128;

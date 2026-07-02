@@ -1478,6 +1478,9 @@ export async function prepareEcoSwap(
     solidlyStables.length === 0 &&
     wombats.length === 0 &&
     balancerStables.length === 0 &&
+    maverickPools.length === 0 &&
+    cryptoSwaps.length === 0 &&
+    eulerSwaps.length === 0 &&
     wooFiPools.length === 0 &&
     fermiPools.length === 0 &&
     fluidPools.length === 0 &&

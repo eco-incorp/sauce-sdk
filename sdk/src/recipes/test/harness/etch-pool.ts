@@ -2289,4 +2289,701 @@ export const curveCryptoRegistryShimAbi = parseAbi([
   "function fee_receiver() view returns (address)",
 ]);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Maverick V2 (bin-based directional AMM, CALLBACK pool) prod-mirror etch — ADDITIVE extension.
+//
+// A Maverick V2 Pool is a SELF-CONTAINED runtime (NOT an EIP-1167 clone, NOT a proxy) — like a
+// WooPPV2/Curve pool it holds its own swap/tick logic. So the etch is a 2-contract graph: the pool +
+// the MaverickV2Quoter (the wei-exact `calculateSwap` ground truth the test cross-checks against). The
+// SAME etch-runtime mechanism applies — setCode the REAL runtimes at their captured addresses,
+// setStorageAt the captured active-bin/tick WINDOW verbatim — with ONE wrinkle unique to Maverick:
+//
+//   • TOKENS ARE IMMUTABLES baked into the pool BYTECODE, not storage. The captured runtime embeds
+//     tokenA (USDT) and tokenB (USDC) at MANY code positions (verified: 12 occurrences each in the
+//     runtime, ZERO in any storage slot) — Solidity inlines an immutable at each use site. So the test
+//     CANNOT repoint the tokens by overwriting a storage scalar (the Solidly token0-slot trick). It
+//     must etch a local MintableERC20 runtime AT EACH REAL token address (USDT + USDC) and seed its
+//     `decimals` slot — exactly the Wombat/WOOFi immutable-token pattern. The pool then moves the LOCAL
+//     (storage-backed) tokens while its immutable tokenA()/tokenB() still name the real addresses.
+//
+// Maverick is a CALLBACK pool: the engine `_swapMaverickV2` (SwapPoolType 7) reads the pool's tokenA(),
+// sets tokenAIn, calls pool.swap(recipient, SwapParams{amount, tokenAIn, exactOutput:false, tickLimit:0},
+// "") and the pool RE-ENTERS the engine's `maverickV2SwapCallback` to PULL the input mid-swap. The real
+// Maverick V2 Pool.swap does NOT check the factory/CREATE2 during the swap (it trusts msg.sender — the
+// engine — to pay via the callback), so a non-canonical locally-etched pool is accepted exactly like the
+// V3/V4 local-pool cases. The FACTORY is needed ONLY for discovery: FactoryType.MaverickV2Factory reads
+// lookup(tokenA, tokenB, 0, N) → the pool. We setCode a tiny read-only factory shim at the captured
+// factory address returning [pool] for the pair; the pool's own factory() immutable is irrelevant to the
+// swap. NO factory graph rebuild.
+//
+// ENGINE tickLimit=0 GATE (documented in maverick-math.ts): the engine hardcodes tickLimit:0, so only the
+// tokenB-in direction (USDC→USDT, activeTick=+7 walking DOWN toward 0) is executable for this pool;
+// discovery gates it to tokenB-in. The captured quoter probes (100/1000/5000 USDC) all FULLY consume
+// within the tick-7→0 reachable payout window (~8963 USDT of output reserve), so the trade lands exactly.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** Maverick bytecode snapshot: the self-contained pool runtime + dependency runtimes (the quoter). */
+export interface MaverickBytecodeSnapshot {
+  chain: string;
+  block: string;
+  pool: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  isMinimalProxy: boolean;
+  /** Every contract beyond the pool the swap / quote path touches — here the MaverickV2Quoter. */
+  dependencies?: DependencyBytecode[];
+}
+
+/** One decoded tick (per-tick reserves + referenced bin ids) from the captured active-tick window. */
+export interface MaverickTickSnapshot {
+  tick: number;
+  reserveA: string;
+  reserveB: string;
+  totalSupply: string;
+  binIdsByTick: number[];
+}
+
+/** One decoded bin from the captured window. */
+export interface MaverickBinSnapshot {
+  binId: number;
+  mergeBinBalance: string;
+  tickBalance: string;
+  totalSupply: string;
+  kind: number;
+  tick: number;
+  mergeId: number;
+}
+
+/** Maverick state snapshot (written by harness/maverick-snapshot.ts). */
+export interface MaverickStateSnapshot {
+  chain: string;
+  chainId?: number;
+  block: string;
+  pool: Hex;
+  factory: Hex;
+  factoryOnPool?: Hex;
+  quoter: Hex;
+  tokenA: Hex; // USDT (== tokenOut in the engine-executable tokenB-in direction)
+  tokenB: Hex; // USDC (== tokenIn)
+  tokenASymbol: string;
+  tokenBSymbol: string;
+  tokenADecimals: number;
+  tokenBDecimals: number;
+  tickSpacing: number;
+  feeAIn: string;
+  feeBIn: string;
+  protocolFeeRatioD3: number;
+  engineTickLimit: number;
+  engineExecutableDirection: string;
+  engineTokenAIn: boolean;
+  state: {
+    reserveA: string;
+    reserveB: string;
+    activeTick: number;
+    binCounter: number;
+    isLocked: boolean;
+    lastTimestamp: number;
+    lastTwaD8: string;
+    lastLogPriceD8: string;
+  };
+  tickWindow: { lo: number; hi: number; window: number };
+  ticks: MaverickTickSnapshot[];
+  bins: MaverickBinSnapshot[];
+  storageLayout: {
+    stateSlots: number[];
+    ticksBaseSlot: number;
+    tickWords: number;
+    binsBaseSlot: number;
+    binWords: number;
+  };
+  probes: {
+    direction: string;
+    tokenAIn: boolean;
+    amountIn: string;
+    amountInUsed: string;
+    amountOut: string;
+    gasEstimate: string;
+  }[];
+  /** Raw storage window (slot -> value) for deterministic setStorageAt reconstruction. */
+  storage: Record<string, Hex>;
+}
+
+/** Load a Maverick `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadMaverickSnapshots(name: string): {
+  bytecode: MaverickBytecodeSnapshot;
+  state: MaverickStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as MaverickBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as MaverickStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the Maverick bytecode integrity (NO RPC): re-hash the pool + every dependency runtime (the
+ * quoter) and match each capture-time sha256 anchor. Returns pool (via verifyBytecodeIntegrity's shape)
+ * + per-dependency {name, expected, actual, ok}.
+ */
+export function verifyMaverickBytecodeIntegrity(bytecode: MaverickBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  dependencies: { name: string; expected?: Hex; actual: Hex; ok: boolean }[];
+} {
+  const base = verifyBytecodeIntegrity(bytecode);
+  const dependencies = (bytecode.dependencies ?? []).map((d) => {
+    const actual = runtimeSha256(d.runtime);
+    return {
+      name: d.name,
+      expected: d.runtimeSha256,
+      actual,
+      ok: !d.runtimeSha256 || d.runtimeSha256.toLowerCase() === actual.toLowerCase(),
+    };
+  });
+  return { pool: base.pool, dependencies };
+}
+
+/** lookup(address,address,uint256,uint256) selector (production FactoryType.MaverickV2Factory discovery). */
+const MAVERICK_LOOKUP_SELECTOR = "e262790d";
+
+/**
+ * A minimal read-only Maverick V2 FACTORY shim: lookup(tokenA,tokenB,startIndex,endIndex) → the single
+ * reproduced pool as a one-element address[]; every other selector → an empty address[]. We setCode this
+ * at the captured factory address and store the pool at slot0. NO Solidity compile, NO write tx.
+ *
+ * ABI return for a one-element address[]: head offset 0x20, then [length=1, pool] — 3 words. Empty array:
+ * [0x20, 0] — 2 words. The shim answers lookup UNCONDITIONALLY (address/index-agnostic): the test stands
+ * up exactly ONE Maverick pool for the pair, and discovery queries BOTH token orderings + de-dupes on the
+ * pool address, so replying the SAME pool to both orderings is correct (the second is dropped by the
+ * `seen` set). This mirrors buildDodoFactoryShimRuntime's getDODO array reply, retargeted to `lookup`.
+ */
+export function buildMaverickFactoryShimRuntime(): Hex {
+  const bytes = (h: string) => h.length / 2;
+  const header = "60003560e01c"; // sel = shr(0xe0, calldataload(0))
+  const cmp = (sel: string, dest: number) =>
+    "8063" + sel + "1461" + dest.toString(16).padStart(4, "0") + "57"; // DUP1 PUSH4 sel EQ PUSH2 dest JUMPI
+  // Empty-array body (fallthrough): mstore(0,0x20) mstore(0x20,0) return(0,0x40)
+  const emptyBody = "6020600052" + "6000602052" + "604060" + "00f3";
+  // lookup body (JUMPDEST): mstore(0,0x20) mstore(0x20,1) mstore(0x40,sload(0)) return(0,0x60)
+  const lookupBody =
+    "5b" + "6020600052" + "6001602052" + "600054604052" + "606060" + "00f3";
+
+  const dispatchLen = bytes(header) + bytes(cmp(MAVERICK_LOOKUP_SELECTOR, 0)) + bytes(emptyBody);
+  const lookupDest = dispatchLen; // lookup JUMPDEST sits right after the empty-array fallthrough
+  const code = header + cmp(MAVERICK_LOOKUP_SELECTOR, lookupDest) + emptyBody + lookupBody;
+  return ("0x" + code) as Hex;
+}
+
+export interface EtchedMaverickPool {
+  /** The Maverick V2 pool address (the lookup / swap(SwapParams{poolType:7}) target). */
+  pool: Hex;
+  /** The MaverickV2Quoter address (etched with the real quoter runtime at its captured address). */
+  quoter: Hex;
+  /** The Maverick V2 factory shim (lookup) — point a poolConfig MaverickV2Factory factory here. */
+  factory: Hex;
+  /** The local MintableERC20s etched AT the REAL token addresses (immutables in the pool bytecode). */
+  tokenA: Hex; // USDT (== tokenOut for tokenB-in)
+  tokenB: Hex; // USDC (== tokenIn)
+  /** Captured pool-wide fields, echoed for the test. */
+  reserveA: bigint;
+  reserveB: bigint;
+  activeTick: number;
+  tickSpacing: number;
+  feeAIn: bigint;
+  feeBIn: bigint;
+  protocolFeeRatioD3: number;
+}
+
+/**
+ * Stand up the captured REAL Maverick V2 pool + its MaverickV2Quoter on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it at EACH REAL token address (tokenA=USDT,
+ *      tokenB=USDC) and seed the `decimals` slot — the pool bakes tokenA/tokenB as IMMUTABLES, so the
+ *      local token MUST live at the real address for the pool's immutable getters + transfers to resolve.
+ *   2. setCode the REAL MaverickV2Quoter runtime at its captured address (self-contained — calculateSwap
+ *      takes the pool as an ARGUMENT and CALLs only it, no further dependency).
+ *   3. setCode the Maverick factory shim at the captured factory address; store the pool at slot0 (so
+ *      lookup(tokenA,tokenB,0,N) → [pool] for the production discovery path).
+ *   4. setCode the REAL pool runtime at its captured address; setStorageAt the captured active-bin/tick
+ *      WINDOW VERBATIM (State slots + _ticks[int32]×3 words per live tick + _bins[uint32]×2 words per
+ *      referenced bin). The pool's getState/getTick/getBin then read the mainnet-identical bin state.
+ *   5. Fund the pool with the captured reserveA (USDT, the output side) + reserveB (USDC) so pool.swap
+ *      can pay out tokenOut and the callback-pulled tokenIn lands in the pool; + caller headroom in USDC.
+ *
+ * The swap path then runs the GENUINE pool bytecode: swap() walks the reconstructed tick book and
+ * re-enters maverickV2SwapCallback to pull the input, and calculateSwap(pool, amount, tokenAIn=false, ...)
+ * returns the mainnet-identical dy for the captured window.
+ */
+export async function etchMaverickPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: MaverickBytecodeSnapshot; state: MaverickStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedMaverickPool> {
+  const { bytecode, state } = snapshots;
+  if (bytecode.isMinimalProxy) {
+    throw new Error("etchMaverickPool expects a self-contained pool snapshot (not a proxy)");
+  }
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const poolAddress = getAddress(bytecode.pool.address) as Hex;
+  const factory = getAddress(state.factory) as Hex;
+  const quoterDep = (bytecode.dependencies ?? []).find((d) => d.name === "maverickV2Quoter");
+  if (!quoterDep) throw new Error("Maverick snapshot missing the maverickV2Quoter dependency runtime");
+  const quoter = getAddress(quoterDep.address) as Hex;
+  const tokenA = getAddress(state.tokenA) as Hex; // USDT
+  const tokenB = getAddress(state.tokenB) as Hex; // USDC
+  const reserveA = BigInt(state.state.reserveA);
+  const reserveB = BigInt(state.state.reserveB);
+
+  // 1. Capture a local MintableERC20 runtime, then etch it at EACH real token address (immutables in
+  //    the pool bytecode → the local token must live at the real addr). Seed the `decimals` slot.
+  const scratch = await deployToken(walletClient, publicClient, "maverick-scratch", "MSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  for (const [tok, dec] of [
+    [tokenA, state.tokenADecimals],
+    [tokenB, state.tokenBDecimals],
+  ] as [Hex, number][]) {
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(dec)) });
+  }
+
+  // 2. Etch the REAL MaverickV2Quoter at its captured address.
+  await testClient.setCode({ address: quoter, bytecode: quoterDep.runtime });
+
+  // 3. Maverick factory shim at the captured factory address; store the pool at slot0.
+  await testClient.setCode({ address: factory, bytecode: buildMaverickFactoryShimRuntime() });
+  await testClient.setStorageAt({ address: factory, index: slotHex(0), value: addrWord(poolAddress) });
+
+  // 4. Etch the REAL pool runtime + replay the captured active-bin/tick storage window VERBATIM.
+  await testClient.setCode({ address: poolAddress, bytecode: bytecode.pool.runtime });
+  for (const [slot, value] of Object.entries(state.storage)) {
+    await testClient.setStorageAt({ address: poolAddress, index: slot as Hex, value });
+  }
+
+  // 5. Fund the pool's reserves (so pool.swap pays out tokenOut + the callback-pulled tokenIn lands) +
+  //    caller headroom in the input token (USDC / tokenB).
+  await mint(walletClient, publicClient, tokenA, poolAddress, reserveA);
+  await mint(walletClient, publicClient, tokenB, poolAddress, reserveB);
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenB, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool: poolAddress,
+    quoter,
+    factory,
+    tokenA,
+    tokenB,
+    reserveA,
+    reserveB,
+    activeTick: state.state.activeTick,
+    tickSpacing: state.tickSpacing,
+    feeAIn: BigInt(state.feeAIn),
+    feeBIn: BigInt(state.feeBIn),
+    protocolFeeRatioD3: state.protocolFeeRatioD3,
+  };
+}
+
+/** Maverick V2 pool read surface (the getters the test + discovery + oracle read on the REAL pool). */
+export const maverickPoolReadAbi = parseAbi([
+  "function tokenA() external view returns (address)",
+  "function tokenB() external view returns (address)",
+  "function tickSpacing() external view returns (uint256)",
+  "function fee(bool tokenAIn) external view returns (uint256)",
+  "function factory() external view returns (address)",
+  "function getState() external view returns ((uint128 reserveA, uint128 reserveB, int64 lastTwaD8, int64 lastLogPriceD8, uint40 lastTimestamp, int32 activeTick, bool isLocked, uint32 binCounter, uint8 protocolFeeRatioD3) state)",
+  "function getTick(int32 tick) external view returns ((uint128 reserveA, uint128 reserveB, uint128 totalSupply, uint32[4] binIdsByTick) tickState)",
+  "function getBin(uint32 binId) external view returns ((uint128 mergeBinBalance, uint128 tickBalance, uint128 totalSupply, uint8 kind, int32 tick, uint32 mergeId) bin)",
+]);
+
+/** MaverickV2Quoter read surface — calculateSwap is the wei-exact ground truth (state-mutating sig → simulate). */
+export const maverickQuoterAbi = parseAbi([
+  "function calculateSwap(address pool, uint128 amount, bool tokenAIn, bool exactOutput, int32 tickLimit) external returns (uint256 amountIn, uint256 amountOut, uint256 gasEstimate)",
+]);
+
+/** Maverick V2 factory shim read surface (lookup). */
+export const maverickFactoryShimAbi = parseAbi([
+  "function lookup(address tokenA, address tokenB, uint256 startIndex, uint256 endIndex) external view returns (address[] pools)",
+]);
+
 export { erc20Abi };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Trader Joe (LFJ) Liquidity Book v2.2 LBPair prod-mirror etch — ADDITIVE extension.
+//
+// An LB v2.2 LBPair is an LFJ IMMUTABLE-ARGS CLONE (Clones-with-immutable-args), NOT an EIP-1167 minimal
+// proxy: the 97-byte proxy runtime delegatecalls a fixed IMPLEMENTATION and APPENDS the immutable args
+// (tokenX, tokenY, binStep) to the calldata:
+//   363d3d373d3d3d3d61002c806035363936013d73<impl:20>5af43d3d93803e603357fd5bf3<tokenX:20><tokenY:20><binStep:2>
+// So (like the V4 StateView→PoolManager etch) the impl MUST live at its captured address, and tokenX/tokenY
+// are BAKED INTO THE PROXY BYTECODE (NOT storage) — the offline test therefore etches local MintableERC20s
+// AT the real tokenX/tokenY addresses (the Wombat-underlying pattern), so the immutable args stay valid and
+// the pair moves local (storage-backed) tokens. The bin RESERVES + fee params DO live in storage (the LBPair
+// `_bins` mapping at base slot 7, plus the packed param slots 0..11 and the `_tree` bitmap at base slot 8),
+// reconstructed VERBATIM via setStorageAt.
+//
+// DEPENDENCY GRAPH the getSwapOut staticcall + transfer+swap path touches (offline, all etched REAL code):
+//   LBPair proxy (97-byte clone) → delegatecall → LBPair IMPLEMENTATION (all bin/fee/swap math).
+// The pair reads NOTHING else on the quote/swap path (fee params are self-contained in its packed storage;
+// tokenX/tokenY/binStep are the clone's immutable args). The factory is used ONLY off-chain by discovery
+// (getLBPairInformation) — reproduced by a tiny read-only shim at the captured factory address; it is NOT on
+// the swap path, so its runtime is not captured/etched (a shim is the faithful stand-in for the discovery read).
+//
+// TWO OUTPUT-RELEVANT reconstruction choices, both disclosed + proven output-EQUIVALENT to the neutral oracle:
+//   1. block.timestamp is PINNED to the capture ts in the test (like WOOFi). LB v2.2 getSwapOut/swap call
+//      `_parameters.updateReferences(block.timestamp)`, which underflows if block.timestamp < timeOfLastUpdate
+//      — the pin keeps the fee path deterministic at the captured instant.
+//   2. The packed param slot 4's `variableFeeControl` field [bits 54..78) is ZEROED at etch time
+//      (neutralizeVariableFee). LB's total fee = baseFee + variableFee, where the variable (volatility)
+//      surcharge is a TRANSIENT, swap-path-dependent term (it accrues per bin crossed) that the off-chain
+//      snapshot model (lb-math.ts) omits — the same fixed-base-fee snapshot assumption the recipe makes for
+//      V3 tiers / Curve fee. Setting variableFeeControl=0 makes the real pair's total fee == its base fee
+//      (baseFactor·binStep·1e10) for ANY swap path, so the executed dy == lb-math.ts getSwapOut to the WEI
+//      (verified: with vfc=0 + the ceil per-bin math the real LBPair getSwapOut matches lb-math across the
+//      whole reconstructed window, both directions). ALL OTHER params (baseFactor, binStep, reserves, tree)
+//      are byte-identical to mainnet — only the transient volatility surcharge (which the snapshot cannot
+//      faithfully reproduce off-chain) is neutralized. This is the LB analogue of DODO's resolved-mtFeeRate
+//      scalar and WOOFi's CL round shims: the ONE piece of transient state a static snapshot can't carry.
+
+/** LB v2.2 packed pair parameters bit layout (slot 4) — the fields we touch (variableFeeControl only). */
+const LB_VFC_BIT_LO = 54n;
+const LB_VFC_BIT_HI = 78n; // variableFeeControl occupies [54, 78)
+/** LBPair `_bins` mapping base slot + `_tree` (TreeMath.TreeUint24) struct base slot (verified at capture). */
+const LB_TREE_BASE_SLOT = 8;
+
+/** One captured window bin's `_bins` mapping slot + packed (reserveY<<128 | reserveX) value. */
+export interface LbBinStorageEntry {
+  slot: Hex;
+  value: Hex;
+}
+
+/** The captured `_tree` bitmap slots (level0 single word + level1/level2 mapping groups). */
+export interface LbTreeStorage {
+  level0: LbBinStorageEntry;
+  level1: Record<string, LbBinStorageEntry>; // keyed by (id >> 16)
+  level2: Record<string, LbBinStorageEntry>; // keyed by (id >> 8)
+}
+
+/** LB bytecode snapshot: pair proxy (immutable-args clone) + LBPair implementation runtime. */
+export interface LbBytecodeSnapshot {
+  chain: string;
+  chainId?: number;
+  block: string;
+  blockTimestamp?: string;
+  pair: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  implementation: { address: Hex; runtime: Hex; runtimeSha256?: Hex };
+  isImmutableArgsClone: boolean;
+  immutableArgs: {
+    tokenX: Hex;
+    tokenY: Hex;
+    binStep: number;
+    argsHex: Hex;
+    argsByteOffset: number;
+  };
+  dependencies?: DependencyBytecode[];
+}
+
+/** LB state snapshot (written by harness/lb-snapshot.ts). */
+export interface LbStateSnapshot {
+  chain: string;
+  chainId?: number;
+  block: string;
+  blockTimestamp: string;
+  pair: Hex;
+  factory: Hex;
+  factoryType: string;
+  implementation: Hex;
+  tokenX: Hex;
+  tokenY: Hex;
+  tokenXSymbol: string;
+  tokenYSymbol: string;
+  decimalsX: number;
+  decimalsY: number;
+  binStep: number;
+  activeId: number;
+  reserveX: string;
+  reserveY: string;
+  staticFeeParameters: {
+    baseFactor: number;
+    filterPeriod: number;
+    decayPeriod: number;
+    reductionFactor: number;
+    variableFeeControl: number;
+    protocolShare: number;
+    maxVolatilityAccumulator: number;
+  };
+  variableFeeParameters: {
+    volatilityAccumulator: number;
+    volatilityReference: number;
+    idReference: number;
+    timeOfLastUpdate: number;
+  } | null;
+  binWindow: { lo: number; hi: number; bins: { id: number; reserveX: string; reserveY: string }[] };
+  probe: {
+    swapForY: { amountIn: string; amountInLeft: string; amountOut: string; fee: string };
+    swapForX: { amountIn: string; amountInLeft: string; amountOut: string; fee: string };
+  };
+  binsMappingSlot: number;
+  paramStorage: Record<string, Hex>;
+  binStorage: Record<string, LbBinStorageEntry>;
+  treeBaseSlot: number;
+  treeStorage: LbTreeStorage;
+}
+
+/** Load an LB `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadLbSnapshots(name: string): {
+  bytecode: LbBytecodeSnapshot;
+  state: LbStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as LbBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as LbStateSnapshot;
+  return { bytecode, state };
+}
+
+/**
+ * Verify the LB bytecode integrity (NO RPC): re-hash the pair proxy + LBPair impl and match each capture-time
+ * sha256 anchor. Returns pool/implementation in verifyBytecodeIntegrity's shape (the shared assertion helper).
+ * NOTE the snapshot names the pair field `pair` (not `pool`), so we adapt to the shared PoolBytecodeSnapshot.
+ */
+export function verifyLbBytecodeIntegrity(bytecode: LbBytecodeSnapshot): {
+  pool: { expected?: Hex; actual: Hex; ok: boolean };
+  implementation: { expected?: Hex; actual: Hex; ok: boolean };
+} {
+  const poolActual = runtimeSha256(bytecode.pair.runtime);
+  const implActual = runtimeSha256(bytecode.implementation.runtime);
+  return {
+    pool: {
+      expected: bytecode.pair.runtimeSha256,
+      actual: poolActual,
+      ok: !bytecode.pair.runtimeSha256 || bytecode.pair.runtimeSha256.toLowerCase() === poolActual.toLowerCase(),
+    },
+    implementation: {
+      expected: bytecode.implementation.runtimeSha256,
+      actual: implActual,
+      ok:
+        !bytecode.implementation.runtimeSha256 ||
+        bytecode.implementation.runtimeSha256.toLowerCase() === implActual.toLowerCase(),
+    },
+  };
+}
+
+/** Zero the `variableFeeControl` field (bits [54,78)) in the packed LB param slot-4 word. See the block
+ *  comment above for WHY (neutralize the transient volatility surcharge the static snapshot can't carry). */
+export function neutralizeVariableFee(slot4: Hex): Hex {
+  const v = BigInt(slot4);
+  const mask = ((1n << LB_VFC_BIT_HI) - 1n) ^ ((1n << LB_VFC_BIT_LO) - 1n);
+  return word(v & ~mask);
+}
+
+/** getLBPairInformation(address,address,uint256) selector (production FactoryType.TraderJoeLB discovery). */
+const GET_LB_PAIR_INFORMATION_SELECTOR = "704037bd";
+
+/**
+ * A minimal read-only LB v2.2 FACTORY shim: getLBPairInformation(tokenX, tokenY, binStep) returns the ABI
+ * 4-tuple (binStep, LBPair, createdByOwner=false, ignoredForRouting=false) IFF the calldata binStep (3rd arg,
+ * calldata offset 0x44) equals the captured binStep at slot0; otherwise (any other binStep / any other
+ * selector) it returns the ALL-ZERO 4-tuple (pair == address(0)) — which discovery treats as "no pair for
+ * this step" and skips. Token args are IGNORED (getLBPairInformation is order-independent, and the test stands
+ * up exactly ONE pair) — the binStep gate is what makes discovery surface the pair for its true step only,
+ * exactly matching the real factory's per-step lookup. NO Solidity compile, NO write tx.
+ *
+ * slot0 = the captured binStep ; slot1 = the pair address. Hand-assembled with an offset-exact JUMPDEST.
+ */
+export function buildLbFactoryShimRuntime(): Hex {
+  const bytes = (h: string) => h.length / 2;
+  // header: sel = shr(0xe0, calldataload(0))
+  const header = "60003560e01c"; // PUSH1 0 CALLDATALOAD PUSH1 0xe0 SHR
+  // DUP1 PUSH4 <sel> EQ PUSH2 <dest> JUMPI
+  const cmp = (sel: string, dest: number) =>
+    "8063" + sel + "1461" + dest.toString(16).padStart(4, "0") + "57";
+  // ZERO 4-tuple body (fallthrough — unknown selector / non-matching binStep):
+  //   PUSH1 0x80 PUSH1 0 RETURN  (return 0x80 bytes of zero-initialised memory — MSTORE nothing)
+  const zeroBody = "608060" + "00f3";
+  // MATCH body (getLBPairInformation with the captured binStep):
+  //   mstore(0x00, sload(0))   // binStep
+  //   mstore(0x20, sload(1))   // pair
+  //   mstore(0x40, 0) mstore(0x60, 0) implicit (memory is zero) — but MSTORE to be explicit
+  //   return(0, 0x80)
+  // and BEFORE the tuple, gate on calldataload(0x44) == sload(0): if not equal, jump to zeroBody.
+  //   JUMPDEST
+  //   PUSH1 0x44 CALLDATALOAD  PUSH1 0 SLOAD  EQ  ISZERO  PUSH2 <zeroDest> JUMPI
+  //   PUSH1 0 SLOAD PUSH1 0 MSTORE
+  //   PUSH1 1 SLOAD PUSH1 0x20 MSTORE
+  //   PUSH1 0x80 PUSH1 0 RETURN
+  // (memory 0x40/0x60 stay zero → createdByOwner=false, ignoredForRouting=false.)
+  const zeroBodyLen = 1 + bytes(zeroBody); // +JUMPDEST prefix on the zero body target
+  const dispatchLen = bytes(header) + bytes(cmp(GET_LB_PAIR_INFORMATION_SELECTOR, 0)) + bytes(zeroBody);
+  // Layout: [header][cmp → matchDest][zeroBody fallthrough]  then  [zeroDest JUMPDEST + zeroBody][matchDest body]
+  // We need TWO zero exits: the plain fallthrough (no JUMPDEST needed — control just falls in) AND a
+  // jump target for the binStep-mismatch. Simplest: put a JUMPDEST'd zero body AFTER the match body and
+  // fall through to a copy for the selector-miss. To keep offsets exact, structure as:
+  //   header
+  //   cmp(sel → MATCH)
+  //   zeroBody                      (selector miss → return zero, no JUMPDEST)
+  //   MATCH: JUMPDEST ... EQ ISZERO PUSH2 ZERO JUMPI ... return tuple
+  //   ZERO:  JUMPDEST zeroBody      (binStep miss → return zero)
+  const matchDest = dispatchLen;
+  // MATCH body assembly (compute its length to place ZERO after it):
+  //   5b 6044 35 6000 54 14 15 61<zero>57 6000 54 600052 6001 54 602052 608060 00f3
+  const gateHead = "5b" + "604435" + "600054" + "1415"; // JUMPDEST; cdl(0x44); sload0; EQ; ISZERO
+  const gateJumpiPrefix = "61"; // PUSH2 <zeroDest>
+  const gateJumpiSuffix = "57"; // JUMPI
+  const tupleBody = "600054600052" + "600154602052" + "608060" + "00f3";
+  const matchLen = bytes(gateHead) + 1 + 2 + 1 + bytes(tupleBody); // gateHead + PUSH2 + 2 + JUMPI + tuple
+  const zeroDest = matchDest + matchLen;
+  const code =
+    header +
+    cmp(GET_LB_PAIR_INFORMATION_SELECTOR, matchDest) +
+    zeroBody +
+    gateHead +
+    gateJumpiPrefix +
+    zeroDest.toString(16).padStart(4, "0") +
+    gateJumpiSuffix +
+    tupleBody +
+    "5b" +
+    zeroBody;
+  void zeroBodyLen;
+  return ("0x" + code) as Hex;
+}
+
+export interface EtchedLbPool {
+  /** The LBPair proxy address (the discovery + swap target). */
+  pool: Hex;
+  /** The LBPair implementation address (etched with the real impl runtime at its captured address). */
+  impl: Hex;
+  /** The LB v2.2 factory shim (getLBPairInformation) — point a poolConfig TraderJoeLB factory here. */
+  factory: Hex;
+  /** The local MintableERC20s etched AT the real tokenX/tokenY addresses (immutable-args constraint). */
+  tokenX: Hex;
+  tokenY: Hex;
+  binStep: number;
+  baseFactor: number;
+  activeId: number;
+  reserveX: bigint;
+  reserveY: bigint;
+}
+
+/**
+ * Stand up the captured REAL Trader Joe LB v2.2 pair on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, then etch it at EACH real token address (tokenX + tokenY) and
+ *      seed the `decimals` slot — the clone bakes tokenX/tokenY as IMMUTABLE ARGS in the proxy bytecode, so
+ *      the local tokens MUST live at the real addresses (the Wombat-underlying constraint).
+ *   2. setCode the LB v2.2 factory shim at the captured factory address; store binStep@slot0, pair@slot1.
+ *   3. setCode the REAL LBPair impl at its captured address + the REAL 97-byte immutable-args proxy at the
+ *      pool address (the proxy hard-codes the impl address, so the impl MUST sit at its captured address).
+ *   4. setStorageAt the pair VERBATIM: the packed param slots (0..11, with variableFeeControl NEUTRALIZED in
+ *      slot 4 — see the block comment), the `_bins` mapping slots for the window, and the `_tree` bitmap slots
+ *      (level0 + level1/level2 groups) — REQUIRED so the pair's findFirstRight/Left bin walk crosses bins
+ *      (without the tree it drains ONLY the active bin).
+ *   5. Fund the pair's tokenX/tokenY balances with the captured reserves (so swap() can pay out) + caller
+ *      headroom.
+ *
+ * The swap path then runs the GENUINE LBPair bytecode: getSwapOut(amountIn, swapForY) returns the mainnet-
+ * identical amountOut for the captured bins (base fee only, vfc neutralized), and swap(swapForY, to) transfers
+ * real (local) tokens. The engine `_swapTraderJoeLB` is callback-free (transfer-first + pool.swap).
+ */
+export async function etchLbPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: LbBytecodeSnapshot; state: LbStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedLbPool> {
+  const { bytecode, state } = snapshots;
+  if (!bytecode.isImmutableArgsClone) {
+    throw new Error("etchLbPool expects an LB immutable-args clone snapshot (pair + implementation)");
+  }
+  const acct = (opts.minter ?? walletClient.account) as Account;
+
+  const tokenX = getAddress(state.tokenX) as Hex;
+  const tokenY = getAddress(state.tokenY) as Hex;
+  const poolAddress = getAddress(bytecode.pair.address) as Hex;
+  const impl = getAddress(bytecode.implementation.address) as Hex;
+  const factory = getAddress(state.factory) as Hex;
+  const reserveX = BigInt(state.reserveX);
+  const reserveY = BigInt(state.reserveY);
+
+  // 1. Local MintableERC20 runtime → etch at EACH real token address (immutable-args constraint), seed decimals.
+  const scratch = await deployToken(walletClient, publicClient, "lb-scratch", "LBSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  for (const [tok, dec] of [
+    [tokenX, state.decimalsX],
+    [tokenY, state.decimalsY],
+  ] as [Hex, number][]) {
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({ address: tok, index: slotHex(ERC20_DECIMALS_SLOT), value: word(BigInt(dec)) });
+  }
+
+  // 2. LB factory shim at the captured factory address; store binStep@slot0, pair@slot1.
+  await testClient.setCode({ address: factory, bytecode: buildLbFactoryShimRuntime() });
+  await testClient.setStorageAt({ address: factory, index: slotHex(0), value: word(BigInt(state.binStep)) });
+  await testClient.setStorageAt({ address: factory, index: slotHex(1), value: addrWord(poolAddress) });
+
+  // 3. Etch the REAL impl at its captured address + the REAL immutable-args proxy at the pool address.
+  await testClient.setCode({ address: impl, bytecode: bytecode.implementation.runtime });
+  await testClient.setCode({ address: poolAddress, bytecode: bytecode.pair.runtime });
+
+  // 4. Reconstruct storage: packed params (vfc neutralized in slot 4), _bins window, _tree bitmap.
+  const setPool = (slot: number, value: Hex) =>
+    testClient.setStorageAt({ address: poolAddress, index: slotHex(slot), value });
+  for (const [k, v] of Object.entries(state.paramStorage)) {
+    const value = Number(k) === 4 ? neutralizeVariableFee(v) : v;
+    await setPool(Number(k), value);
+  }
+  for (const entry of Object.values(state.binStorage)) {
+    await testClient.setStorageAt({ address: poolAddress, index: entry.slot, value: entry.value });
+  }
+  await testClient.setStorageAt({ address: poolAddress, index: state.treeStorage.level0.slot, value: state.treeStorage.level0.value });
+  for (const e of Object.values(state.treeStorage.level1)) {
+    await testClient.setStorageAt({ address: poolAddress, index: e.slot, value: e.value });
+  }
+  for (const e of Object.values(state.treeStorage.level2)) {
+    await testClient.setStorageAt({ address: poolAddress, index: e.slot, value: e.value });
+  }
+
+  // 5. Fund the pair's reserves (so swap() can pay out) + caller headroom.
+  await mint(walletClient, publicClient, tokenX, poolAddress, reserveX);
+  await mint(walletClient, publicClient, tokenY, poolAddress, reserveY);
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenX, acct.address as Hex, opts.callerFund);
+    await mint(walletClient, publicClient, tokenY, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool: poolAddress,
+    impl,
+    factory,
+    tokenX,
+    tokenY,
+    binStep: state.binStep,
+    baseFactor: state.staticFeeParameters.baseFactor,
+    activeId: state.activeId,
+    reserveX,
+    reserveY,
+  };
+}
+
+/** LB pair read surface (the getters the test + discovery + oracle read on the REAL pair). */
+export const lbPairReadAbi = parseAbi([
+  "function getTokenX() view returns (address)",
+  "function getTokenY() view returns (address)",
+  "function getActiveId() view returns (uint24 activeId)",
+  "function getBinStep() view returns (uint16 binStep)",
+  "function getBin(uint24 id) view returns (uint128 binReserveX, uint128 binReserveY)",
+  "function getReserves() view returns (uint128 reserveX, uint128 reserveY)",
+  "function getStaticFeeParameters() view returns (uint16 baseFactor, uint16 filterPeriod, uint16 decayPeriod, uint16 reductionFactor, uint24 variableFeeControl, uint16 protocolShare, uint24 maxVolatilityAccumulator)",
+  "function getSwapOut(uint128 amountIn, bool swapForY) view returns (uint128 amountInLeft, uint128 amountOut, uint128 fee)",
+]);
+
+/** LB v2.2 factory shim read surface (getLBPairInformation). */
+export const lbFactoryShimAbi = parseAbi([
+  "function getLBPairInformation(address tokenX, address tokenY, uint256 binStep) view returns (uint256 binStep2, address LBPair, bool createdByOwner, bool ignoredForRouting)",
+]);

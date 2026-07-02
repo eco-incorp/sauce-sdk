@@ -11,10 +11,21 @@ interface IERC20Min {
 ///
 /// Reproduces the LB v2.1/v2.2 discrete-bin constant-sum swap math BIT-FOR-BIT with the off-chain
 /// bigint replay in `sdk/src/recipes/shared/lb-math.ts` (the SAME `getPriceFromId` 128.128 pow,
-/// the constant-sum per-bin drain, and the static base fee `baseFactor * binStep * 1e10` netted on
-/// the per-bin input). So `swap(swapForY, to)` sends EXACTLY the off-chain `getSwapOut(amountIn)`
-/// to the wei — the wei-exact LB gate. The variable/volatility fee is omitted (a transient
-/// surcharge that resets between blocks), matching the off-chain snapshot assumption.
+/// the constant-sum per-bin drain, and the static base fee `baseFactor * binStep * 1e10`). So
+/// `swap(swapForY, to)` sends EXACTLY the off-chain `getSwapOut(amountIn)` to the wei — the wei-exact
+/// LB gate. The variable/volatility fee is omitted (a transient surcharge that resets between blocks),
+/// matching the off-chain snapshot assumption.
+///
+/// FEE/ROUNDING (verified against the REAL Arbitrum LBPair, byte-for-byte via the prod-mirror etch):
+/// the LB per-bin math ROUNDS UP both the price division and the fee, exactly as LB v2.2
+/// `Bin.getAmounts` + `FeeHelper.getFeeAmount` do. To fully drain a bin's out reserve:
+///   amountInToBin = ceil(outReserve * 2^128 / price)   [swapForY] / ceil(outReserve * price / 2^128) [swapForX]
+///   feeAmount     = ceil(amountInToBin * fee / (PRECISION - fee))     (fee ADDED on top)
+///   grossToDrain  = amountInToBin + feeAmount
+/// A partial fill takes the fee FROM the input with a round-up: fee = ceil(remaining * fee / PRECISION),
+/// netIn = remaining - fee, out = floor(netIn * price / 2^128). This ceil form (not the earlier floor
+/// approximation, which was ~1-2 wei/bin short) is what makes the fixture AND lb-math.ts wei-exact with
+/// the real contract's getSwapOut across a multi-bin walk.
 ///
 /// The engine `_swapTraderJoeLB` is TRANSFER-FIRST: it reads `getTokenX()`, derives
 /// `swapForY = (tokenIn == tokenX)`, transfers `amountIn` of tokenIn to this pair, then calls
@@ -158,6 +169,28 @@ contract TraderJoeLBPair {
         return uint256(_baseFactor) * uint256(_binStep) * 1e10;
     }
 
+    /// @dev Ceiling division ⌈a/b⌉ (LB rounds these up). a assumed > 0, b > 0.
+    function _ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a == 0 ? 0 : (a + b - 1) / b;
+    }
+
+    /// @dev GROSS input to fully drain `outReserve` at `price128` — LB v2.2 round-up math (see the
+    /// contract doc). swapForY: in = X to drain the bin's Y (amountInToBin = ceil(Y * 2^128 / price));
+    /// swapForX: in = Y to drain the bin's X (amountInToBin = ceil(X * price / 2^128)). feeAmount is
+    /// added on top with a round-up. Bit-for-bit with lb-math.ts `lbGrossToDrain`.
+    function _grossToDrain(uint256 outReserve, uint256 price128, bool swapForY, uint256 fee)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (outReserve == 0 || price128 == 0) return 0;
+        uint256 amountInToBin =
+            swapForY ? _ceilDiv(outReserve * SCALE_128, price128) : _ceilDiv(outReserve * price128, SCALE_128);
+        if (amountInToBin == 0) return 0;
+        uint256 feeAmount = _ceilDiv(amountInToBin * fee, FEE_PRECISION - fee);
+        return amountInToBin + feeAmount;
+    }
+
     /// @notice Off-chain `getSwapOut` analogue (pure view on current state) — the engine-
     /// independent ground truth. Walks bins outward from the active id in the swap direction,
     /// draining each at its fixed price with the base fee on the per-bin input.
@@ -173,14 +206,13 @@ contract TraderJoeLBPair {
                 uint256 outReserve = _binY[id];
                 uint256 price128 = _priceFromId(id);
                 if (outReserve > 0 && price128 > 0) {
-                    uint256 maxNetIn = (outReserve * SCALE_128) / price128;
-                    if (maxNetIn > 0) {
-                        uint256 maxGrossIn = (maxNetIn * FEE_PRECISION) / (FEE_PRECISION - fee);
+                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, true, fee);
+                    if (maxGrossIn > 0) {
                         if (remaining >= maxGrossIn) {
                             out += outReserve;
                             remaining -= maxGrossIn;
                         } else {
-                            uint256 netIn = (remaining * (FEE_PRECISION - fee)) / FEE_PRECISION;
+                            uint256 netIn = remaining - _ceilDiv(remaining * fee, FEE_PRECISION);
                             uint256 binOut = (netIn * price128) / SCALE_128;
                             out += binOut > outReserve ? outReserve : binOut;
                             remaining = 0;
@@ -197,14 +229,13 @@ contract TraderJoeLBPair {
                 uint256 outReserve = _binX[id];
                 uint256 price128 = _priceFromId(id);
                 if (outReserve > 0 && price128 > 0) {
-                    uint256 maxNetIn = (outReserve * price128) / SCALE_128;
-                    if (maxNetIn > 0) {
-                        uint256 maxGrossIn = (maxNetIn * FEE_PRECISION) / (FEE_PRECISION - fee);
+                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, false, fee);
+                    if (maxGrossIn > 0) {
                         if (remaining >= maxGrossIn) {
                             out += outReserve;
                             remaining -= maxGrossIn;
                         } else {
-                            uint256 netIn = (remaining * (FEE_PRECISION - fee)) / FEE_PRECISION;
+                            uint256 netIn = remaining - _ceilDiv(remaining * fee, FEE_PRECISION);
                             uint256 binOut = (netIn * SCALE_128) / price128;
                             out += binOut > outReserve ? outReserve : binOut;
                             remaining = 0;
@@ -234,15 +265,14 @@ contract TraderJoeLBPair {
                 uint256 outReserve = _binY[id];
                 uint256 price128 = _priceFromId(id);
                 if (outReserve > 0 && price128 > 0) {
-                    uint256 maxNetIn = (outReserve * SCALE_128) / price128;
-                    if (maxNetIn > 0) {
-                        uint256 maxGrossIn = (maxNetIn * FEE_PRECISION) / (FEE_PRECISION - fee);
+                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, true, fee);
+                    if (maxGrossIn > 0) {
                         if (remaining >= maxGrossIn) {
                             amountOut += outReserve;
                             remaining -= maxGrossIn;
                             _binY[id] = 0;
                         } else {
-                            uint256 netIn = (remaining * (FEE_PRECISION - fee)) / FEE_PRECISION;
+                            uint256 netIn = remaining - _ceilDiv(remaining * fee, FEE_PRECISION);
                             uint256 binOut = (netIn * price128) / SCALE_128;
                             if (binOut > outReserve) binOut = outReserve;
                             amountOut += binOut;
@@ -269,15 +299,14 @@ contract TraderJoeLBPair {
                 uint256 outReserve = _binX[id];
                 uint256 price128 = _priceFromId(id);
                 if (outReserve > 0 && price128 > 0) {
-                    uint256 maxNetIn = (outReserve * price128) / SCALE_128;
-                    if (maxNetIn > 0) {
-                        uint256 maxGrossIn = (maxNetIn * FEE_PRECISION) / (FEE_PRECISION - fee);
+                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, false, fee);
+                    if (maxGrossIn > 0) {
                         if (remaining >= maxGrossIn) {
                             amountOut += outReserve;
                             remaining -= maxGrossIn;
                             _binX[id] = 0;
                         } else {
-                            uint256 netIn = (remaining * (FEE_PRECISION - fee)) / FEE_PRECISION;
+                            uint256 netIn = remaining - _ceilDiv(remaining * fee, FEE_PRECISION);
                             uint256 binOut = (netIn * SCALE_128) / price128;
                             if (binOut > outReserve) binOut = outReserve;
                             amountOut += binOut;
