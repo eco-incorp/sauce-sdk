@@ -532,12 +532,17 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       { address: "0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
-      // Ramses V3 CL — LEFT as V3Standard and FLAGGED: NOT re-tagged to SlipstreamCL because this
-      // address could NOT be verified as tickSpacing-keyed (getPool(a,b,int24) reverts — the address
-      // 0x07E6…6b45 has NO code on Arbitrum mainnet, i.e. it is a stale/incorrect factory). Both the
-      // fee-keyed V3Standard path and a tickSpacing-keyed path fail against it; the address itself
-      // needs re-verification before this entry can be lit up.
-      { address: "0x07E60782535752be279929e2DFfDd136Db2e6b45" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Ramses V3 CL" },
+      // Ramses CL — LIVE fee-keyed V3Standard factory. On-chain verified on Arbitrum mainnet:
+      //   - The live Ramses CL NonfungiblePositionManager 0xAA277CB7914b7e5514946Da92cb9De332Ce610EF
+      //     returns factory() = 0xAA2cd7477c451E703f3B9Ba5663334914763edF8 (4900-byte proxy → 15KB impl).
+      //   - It is fee-keyed getPool(address,address,uint24): tickSpacing-keyed getPool(a,b,int24) REVERTS
+      //     (bare 0x) → V3Standard, NOT SlipstreamCL. getPool(USDC,USDT,100) → 0x113DFF7d… (real live pool:
+      //     token0=USDC, token1=USDT, fee=100, tickSpacing=1, liquidity≈4.77e10; factory() back-references).
+      //   - Ramses uses NON-standard low fee tiers: getPool(WETH,USDC,·) returns live pools at 50/250/500/
+      //     3000/10000, and getPool(USDC,USDT,·) at 50/100 — so feeTiers override [50,100,250,500,3000,10000]
+      //     (the default [100,500,3000,10000] would miss the deep stable pools at fee=50 and fee=100).
+      // (The prior wired 0x07E6…6b45 was Ramses's HyperEVM factory, dead on Arbitrum — 0 code — now replaced.)
+      { address: "0xAA2cd7477c451E703f3B9Ba5663334914763edF8" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Ramses CL", feeTiers: [50, 100, 250, 500, 3000, 10000] },
       // Chronos CL — LEFT as V3Standard and FLAGGED: NOT re-tagged to SlipstreamCL because
       // getPool(a,b,int24) reverts (bare 0x) against this factory on Arbitrum mainnet, so it does NOT
       // respond as a tickSpacing-keyed CLFactory (nor did the fee-keyed getPool return a pool). Needs
@@ -582,8 +587,13 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // EulerSwap: LEFT EMPTY + FLAGGED (same reason as ethereum — the deployed pools expose the v1
       // getParams() surface and REVERT getDynamicParams() the recipe requires). Fermi: no FermiSwapper
       // deployment on Arbitrum (router 0xb1076fe3… is Ethereum-only). Both intentionally omitted.
-      // DODO V2
-      { address: "0x2A3CE1DebAf2F0F5A0A6dEB64DF95B11a2407d3C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
+      // DODO V2 — corrected to the LIVE Arbitrum DVMFactory (getDODOPool(base,quote)→address[]), matching the
+      // eth 0x72d220cE entry. On-chain verified on Arbitrum: 0xDa4c4411… has code (4517 bytes),
+      // getDODOPool(WETH,USDC) → 10 pools, getDODOPool(USDC,USDT) → 53 pools. The prior wired
+      // 0x2A3CE1DebAf2F0F5A0A6dEB64DF95B11a2407d3C is dead on Arbitrum (0 code) — it is DODO's OPTIMISM
+      // factory address mis-placed in the Arbitrum block. Canonical per-chain DVMFactory from the DODO
+      // contract API (chainId 42161).
+      { address: "0xDa4c4411c55B0785e501332354A036c04833B72b" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // Trader Joe LB
       { address: "0x8e42f2F4101563bF679975178e880FD87d3eFd4e" as Hex, poolType: SwapPoolType.TraderJoeLB, factoryType: FactoryType.TraderJoeLB, label: "Trader Joe LB" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
@@ -617,7 +627,11 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xF1046053aa5682b4F9a81b5481394DA16BE5FF5a" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Velodrome V2" },
       // Curve (MetaRegistry — find_pool_for_coins across all Curve pools).
       { address: "0xc65CB3156225380BEda366610BaB18D5835A1647" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
-      // Balancer V2
+      // Balancer V2 — balancerStablePools LEFT EMPTY + FLAGGED. Balancer V2 on Optimism has drained: the
+      // deepest all-stablecoin ComposableStable verified via Vault.getPoolTokens(getPoolId(pool)) is
+      // 0x9da1…040d9 "Native Stable Beets" (USDC/USDC.e/USDT/DAI) at only ~$530 total, and 0x3736…4de
+      // "Optimistic Steady Beets" at ~$45 — both genuinely all-stablecoin but far too shallow to wire (the
+      // eth/base pools already wired are $35k–$120k). No V2-Vault stable pool worth wiring → left empty.
       { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Balancer V2" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
       { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
@@ -672,8 +686,13 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
           "0x0B1a513ee24972DAEf112bC777a5610d4325C9e7" as Hex, // native USDC/USDT
         ] },
       // EulerSwap + Fermi: LEFT EMPTY + FLAGGED (no EulerSwap v2 stable pool; no FermiSwapper on Polygon).
-      // DODO V2
-      { address: "0x79887f65f83bdf15Bcc8736b5e1Eed0C37B8571d" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
+      // DODO V2 — corrected to the LIVE Polygon DVMFactory (getDODOPool(base,quote)→address[]), matching the
+      // eth 0x72d220cE entry. On-chain verified on Polygon: 0x7988…fE13 has code (4460 bytes),
+      // getDODOPool(WMATIC,USDC.e) → 30 pools. The prior wired 0x79887f65f83bdf15Bcc8736b5e1Eed0C37B8571d is a
+      // CORRUPTED address (right 0x79887f65… prefix, wrong tail) — dead on Polygon (0 code). Canonical
+      // per-chain DVMFactory from the DODO contract API (chainId 137). NOTE: sampled Polygon DODO pools are
+      // near-zero depth, so discovery finds them but the relative-depth filter drops them — correct-but-inert.
+      { address: "0x79887f65f83bdf15Bcc8736b5e5BcDB48fb8fE13" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
       { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
     ],
@@ -739,7 +758,16 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "SwapX Classic (Solidly)" },
       // Shadow Exchange Legacy (Solidly PairFactory, stable + volatile)
       { address: "0x2dA25E7446A70D7be65fd4c053948BEcAA6374c8" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Shadow Exchange Legacy (Solidly)" },
-      // Beets (Beethoven X) — canonical cross-chain Balancer V2 Vault.
+      // Beets (Beethoven X) — canonical cross-chain Balancer V2 Vault. balancerStablePools LEFT EMPTY +
+      // FLAGGED. Sonic Beets has huge stablecoin TVL, but it is NOT reachable through the V2 Vault this entry
+      // wires: (1) the deep "STABLE" pools (0x3d71ad28… smsUSD/vgUSDC ~$247M, 0x0ae7fbbe… ~$1.53M, 0x790fd3e9…
+      // ~$766k) are Balancer V3 pools — they REVERT on getPoolId() on-chain, so discoverBalancerStablePoolsTyped
+      // (getPoolId → V2 Vault.getPoolTokens) cannot add them at all; (2) filtering the Balancer API to
+      // protocolVersion=2, the deepest all-stablecoin V2 ComposableStable is 0xcd4d…1c0c (USDC.e/scUSD) at only
+      // ~$3,217 total, and its scUSD is not a wired baseToken — every deeper V2 "stable" pool holds
+      // yield-bearing wrapper tokens (smsUSD/vgUSDC/msUSD/ghUSDC…) that are not base tokens, so discovery's
+      // tokenIn/tokenOut ∈ pool tokens filter never matches. No V2-Vault base-token stable pool with real
+      // depth → left empty. (V3-Vault support would be needed to reach the deep pools — out of scope.)
       { address: "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex, poolType: SwapPoolType.BalancerV2, factoryType: FactoryType.BalancerV2, label: "Beets (Balancer V2 Vault)" },
     ],
     baseTokens: [

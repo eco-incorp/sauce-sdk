@@ -1876,6 +1876,12 @@ export async function discoverTraderJoeLBPoolsTyped(
 
 // ── Maverick V2 discovery ───────────────────────────────────
 
+// Maverick factory lookup(tokenA,tokenB,startIndex,endIndex) enumeration bounds. The old code fetched a
+// single [0,10) page, silently truncating pairs with >10 Maverick pools. Paginate in bounded pages up to a
+// hard cap so deep pairs are fully enumerated while the walk stays bounded.
+const MAVERICK_LOOKUP_PAGE = Number(process.env.ECO_MAVERICK_LOOKUP_PAGE ?? 50);
+const MAVERICK_LOOKUP_MAX = Number(process.env.ECO_MAVERICK_LOOKUP_MAX ?? 100);
+
 async function discoverMaverickV2Pools(
   tokenIn: Hex,
   tokenOut: Hex,
@@ -1889,12 +1895,20 @@ async function discoverMaverickV2Pools(
     // Try both token orderings — Maverick's lookup is order-dependent
     for (const [tokenA, tokenB] of [[tokenIn, tokenOut], [tokenOut, tokenIn]] as [Hex, Hex][]) {
       try {
-        const addresses = await client.readContract({
-          address: factory.address,
-          abi: maverickFactoryAbi,
-          functionName: "lookup",
-          args: [tokenA, tokenB, 0n, 10n],
-        }) as string[];
+        // Paginate lookup(startIndex,endIndex) so pairs with >10 Maverick pools are not truncated.
+        // Bounded: page of MAVERICK_LOOKUP_PAGE, stop early on a short page, hard-cap at MAVERICK_LOOKUP_MAX.
+        const addresses: string[] = [];
+        for (let start = 0; start < MAVERICK_LOOKUP_MAX; start += MAVERICK_LOOKUP_PAGE) {
+          const end = Math.min(start + MAVERICK_LOOKUP_PAGE, MAVERICK_LOOKUP_MAX);
+          const page = await client.readContract({
+            address: factory.address,
+            abi: maverickFactoryAbi,
+            functionName: "lookup",
+            args: [tokenA, tokenB, BigInt(start), BigInt(end)],
+          }) as string[];
+          addresses.push(...page);
+          if (page.length < end - start) break; // short page → no more pools
+        }
 
         for (const addr of addresses) {
           if (!addr || addr === ZERO_ADDRESS) continue;
@@ -3023,14 +3037,21 @@ export async function discoverMaverickV2PoolsTyped(
       [tokenIn, tokenOut],
       [tokenOut, tokenIn],
     ] as [Hex, Hex][]) {
-      let addresses: string[];
+      // Paginate lookup(startIndex,endIndex) so pairs with >10 Maverick pools are not truncated.
+      // Bounded: page of MAVERICK_LOOKUP_PAGE, stop early on a short page, hard-cap at MAVERICK_LOOKUP_MAX.
+      const addresses: string[] = [];
       try {
-        addresses = (await client.readContract({
-          address: factory.address,
-          abi: maverickFactoryAbi,
-          functionName: "lookup",
-          args: [tA, tB, 0n, 10n],
-        })) as string[];
+        for (let start = 0; start < MAVERICK_LOOKUP_MAX; start += MAVERICK_LOOKUP_PAGE) {
+          const end = Math.min(start + MAVERICK_LOOKUP_PAGE, MAVERICK_LOOKUP_MAX);
+          const page = (await client.readContract({
+            address: factory.address,
+            abi: maverickFactoryAbi,
+            functionName: "lookup",
+            args: [tA, tB, BigInt(start), BigInt(end)],
+          })) as string[];
+          addresses.push(...page);
+          if (page.length < end - start) break; // short page → no more pools
+        }
       } catch {
         continue;
       }
