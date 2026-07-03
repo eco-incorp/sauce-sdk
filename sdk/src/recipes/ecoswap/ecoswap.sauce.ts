@@ -9,6 +9,7 @@ import { IDODOPool } from "./IDODOPool.json";
 import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 import { IWombatPool } from "./IWombatPool.json";
 import { IEulerSwapPool } from "./IEulerSwapPool.json";
+import { IMaverickV2Pool } from "./IMaverickV2Pool.json";
 import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
 import { ICryptoSwapPoolQL } from "./ICryptoSwapPoolQL.json";
 import { ICurveStableSwap } from "./ICurveStableSwap.json";
@@ -443,6 +444,177 @@ function stableOutV2(amp: Uint256, u0: Uint256, u1: Uint256, u2: Uint256, ij: Ui
   return bOut - y - 1;
 }
 
+// ── Maverick V2 (segKind 8) LIVE bin-WALK leaf helpers — mirror shared/maverick-math.ts BIT-FOR-BIT ──
+// The segKind-8 QL branch walks the pool's bin book from its LIVE active tick/price emitting one ladder
+// slice per crossed tick (== buildMaverickWalkLadder ⇒ solver == oracle by construction). These are the
+// per-tick arithmetic primitives; they use ONLY Math.* intrinsics inline (no helper-to-helper call, which
+// the compiler forbids). All are treeshake-dropped unless HAS_MAVERICK lights the qKind===8 branch.
+// Proven wei-exact vs the real MaverickV2Quoter on v1+v12 (test/harness/maverick-onchain-walk.reference).
+
+// two's-complement int32 getTick(tick) ARG from a shifted tick (shiftTick = realTick + MAV_OFFSET). For a
+// NEGATIVE real tick Math.neg yields the FULL 256-bit sign extension (all high bytes 0xff) placed VERBATIM
+// as the 32-byte ABI word — a clean int32 a Solidity 0.7/0.8 callee decodes to the negative tick (the same
+// full-sign-extension the V3 int24 tickArg builds via `| HIGH`). Validated across the sign boundary by the
+// negative/cross-0 fixture cells in ecoswap.maverick.evm.test.ts.
+function mavTickArg(shiftTick: Uint256, OFF: Uint256): Uint256 {
+  if (shiftTick >= OFF) { return shiftTick - OFF; }
+  return Math.neg(OFF - shiftTick);
+}
+
+// |realTick| in tick units from a shifted tick.
+function mavAbs(shiftTick: Uint256, OFF: Uint256): Uint256 {
+  if (shiftTick >= OFF) { return shiftTick - OFF; }
+  return OFF - shiftTick;
+}
+
+// 1 when realTick > 0 (the sqrt-price ladder inverts for a positive tick).
+function mavInv(shiftTick: Uint256, OFF: Uint256): Uint256 {
+  if (shiftTick > OFF) { return 1; }
+  return 0;
+}
+
+// tickSqrtPrice(tickSpacing, tick) — the 1.0001^(tick·tickSpacing) sqrt-price ladder (1e18). absBins =
+// |tick|; invert = (tick > 0). Mirrors TickMath.tickSqrtPrice (the Uniswap 128.128 pow shifted to 1e18).
+function mavTickSqrt(absBins: Uint256, tickSpacing: Uint256, invert: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  const Q128: Uint256 = 2 ** 128;
+  const MAXU: Uint256 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+  const absTick: Uint256 = absBins * tickSpacing;
+  let ratio: Uint256 = Q128;
+  if ((absTick & 0x1) > 0) { ratio = 0xfffcb933bd6fad9d3af5f0b9f25db4d6; }
+  if ((absTick & 0x2) > 0) { ratio = (ratio * 0xfff97272373d41fd789c8cb37ffcaa1c) >> 128; }
+  if ((absTick & 0x4) > 0) { ratio = (ratio * 0xfff2e50f5f656ac9229c67059486f389) >> 128; }
+  if ((absTick & 0x8) > 0) { ratio = (ratio * 0xffe5caca7e10e81259b3cddc7a064941) >> 128; }
+  if ((absTick & 0x10) > 0) { ratio = (ratio * 0xffcb9843d60f67b19e8887e0bd251eb7) >> 128; }
+  if ((absTick & 0x20) > 0) { ratio = (ratio * 0xff973b41fa98cd2e57b660be99eb2c4a) >> 128; }
+  if ((absTick & 0x40) > 0) { ratio = (ratio * 0xff2ea16466c9838804e327cb417cafcb) >> 128; }
+  if ((absTick & 0x80) > 0) { ratio = (ratio * 0xfe5dee046a99d51e2cc356c2f617dbe0) >> 128; }
+  if ((absTick & 0x100) > 0) { ratio = (ratio * 0xfcbe86c7900aecf64236ab31f1f9dcb5) >> 128; }
+  if ((absTick & 0x200) > 0) { ratio = (ratio * 0xf987a7253ac4d9194200696907cf2e37) >> 128; }
+  if ((absTick & 0x400) > 0) { ratio = (ratio * 0xf3392b0822b88206f8abe8a3b44dd9be) >> 128; }
+  if ((absTick & 0x800) > 0) { ratio = (ratio * 0xe7159475a2c578ef4f1d17b2b235d480) >> 128; }
+  if ((absTick & 0x1000) > 0) { ratio = (ratio * 0xd097f3bdfd254ee83bdd3f248e7e785e) >> 128; }
+  if ((absTick & 0x2000) > 0) { ratio = (ratio * 0xa9f746462d8f7dd10e744d913d033333) >> 128; }
+  if ((absTick & 0x4000) > 0) { ratio = (ratio * 0x70d869a156ddd32a39e257bc3f50aa9b) >> 128; }
+  if ((absTick & 0x8000) > 0) { ratio = (ratio * 0x31be135f97da6e09a19dc367e3b6da40) >> 128; }
+  if ((absTick & 0x10000) > 0) { ratio = (ratio * 0x9aa508b5b7e5a9780b0cc4e25d61a56) >> 128; }
+  if ((absTick & 0x20000) > 0) { ratio = (ratio * 0x5d6af8dedbcb3a6ccb7ce618d14225) >> 128; }
+  if ((absTick & 0x40000) > 0) { ratio = (ratio * 0x2216e584f630389b2052b8db590e) >> 128; }
+  if (invert === 1) { ratio = MAXU / ratio; }
+  return (ratio * MAV_ONE) >> 128;
+}
+
+// getTickL — the tick's concentrated-liquidity L from (reserveA,reserveB) + its sqrt bounds (the precision
+// bump + quadratic root). Mirrors TickMath.getTickL.
+function mavGetTickL(rA0: Uint256, rB0: Uint256, lo: Uint256, hi: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  const T78: Uint256 = 2 ** 78;
+  const diff: Uint256 = hi - lo;
+  if (diff === 0) { return 0; }
+  let rA: Uint256 = rA0;
+  let rB: Uint256 = rB0;
+  let pbump: Uint256 = 0;
+  if (rA < T78) { if (rB < T78) { rA = rA << 57; rB = rB << 57; pbump = 57; } }
+  if (rB === 0) { return Math.mulDiv(rA, MAV_ONE, diff) >> pbump; }
+  if (rA === 0) { return Math.mulDiv(Math.mulDiv(rB, lo, MAV_ONE), hi, diff) >> pbump; }
+  const b: Uint256 = (Math.mulDiv(rA, MAV_ONE, hi) + Math.mulDiv(rB, lo, MAV_ONE)) >> 1;
+  const bSq: Uint256 = Math.mulDiv(b, b, MAV_ONE);
+  const aB: Uint256 = Math.mulDiv(rB, rA, MAV_ONE);
+  const inner: Uint256 = bSq + Math.mulDiv(aB, diff, hi);
+  const sqrtInner: Uint256 = Math.sqrt(inner) * 1000000000;
+  return Math.mulDiv(b + sqrtInner, hi, diff) >> pbump;
+}
+
+// getSqrtPrice — seed the walk's starting price from the active tick's reserves (clamped to [lo, hi]).
+function mavSeedSqrt(rA: Uint256, rB: Uint256, lo: Uint256, hi: Uint256, L: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  if (rA === 0) { return lo; }
+  if (rB === 0) { return hi; }
+  const num: Uint256 = rA + Math.mulDiv(L, lo, MAV_ONE);
+  const den: Uint256 = rB + Math.mulDiv(L, MAV_ONE, hi);
+  if (den === 0) { return lo; }
+  const inner: Uint256 = Math.mulDiv(num, MAV_ONE, den);
+  let sp: Uint256 = Math.sqrt(inner * MAV_ONE);
+  if (sp < lo) { sp = lo; }
+  if (sp > hi) { sp = hi; }
+  return sp;
+}
+
+// UNDERFLOW GUARD — 1 iff the tick's FULL output reserve can be drained (the on-chain
+// _remainingBinInputSpaceGivenOutput denominator is positive). getTickL is a documented LOWER bound, so a
+// degenerate tick can drive that denominator non-positive (outOverL >= invFloor(sqrtP) for tokenA-in;
+// sqrtP or mulDown(sqrtP,·)==0 for tokenB-in), which the on-chain drain would REVERT on. Return 0 there so
+// the walk forces the PARTIAL (non-draining) fill instead of dividing by / subtracting into a non-positive
+// denominator. Mirrors computeSwapExactIn's `drainable` gate bit-for-bit (Δ=0 on every validated tick,
+// where the denominator reduces to the strictly-positive tick width).
+function mavDrainable(availOut: Uint256, sqrtP: Uint256, L: Uint256, tokenAIn: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  const ONE_SQ: Uint256 = 1000000000000000000000000000000000000;
+  const outOverL: Uint256 = (availOut * MAV_ONE + L - 1) / L; // divUp(availOut, L)
+  if (tokenAIn === 1) {
+    const invSp: Uint256 = ONE_SQ / sqrtP; // invFloor(sqrtP)
+    if (invSp > outOverL) { return 1; }
+    return 0;
+  }
+  if (sqrtP > outOverL) {
+    const inner: Uint256 = sqrtP - outOverL;
+    if (Math.mulDiv(sqrtP, inner, MAV_ONE) > 0) { return 1; } // mulDown(sqrtP, sqrtP-outOverL) > 0
+  }
+  return 0;
+}
+
+// _remainingBinInputSpaceGivenOutput — the net (pre-fee) input to extract the tick's FULL output reserve.
+// ONLY call when mavDrainable===1 (else the denominator underflows / divides by zero — the guard forces the
+// partial fill).
+function mavDrainIn(availOut: Uint256, sqrtP: Uint256, L: Uint256, tokenAIn: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  const ONE_SQ: Uint256 = 1000000000000000000000000000000000000;
+  const outOverL: Uint256 = (availOut * MAV_ONE + L - 1) / L; // divUp(availOut, L)
+  if (tokenAIn === 1) {
+    const invSp: Uint256 = ONE_SQ / sqrtP; // invFloor(sqrtP)
+    const denom: Uint256 = invSp - outOverL;
+    const p: Uint256 = availOut * sqrtP;
+    let r: Uint256 = p / denom;
+    if (r * denom < p) { r = r + 1; } // mulDivCeil
+    return r;
+  }
+  const den: Uint256 = Math.mulDiv(sqrtP, sqrtP - outOverL, MAV_ONE); // mulDown(sqrtP, sqrtP-outOverL)
+  return (availOut * MAV_ONE + den - 1) / den; // divUp(availOut, den)
+}
+
+// within-tick output for a NON-draining input binAmt (deltaOutErc), min-clamped to availOut.
+function mavOut(binAmt: Uint256, sqrtP: Uint256, L: Uint256, tokenAIn: Uint256, availOut: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  const ONE_SQ: Uint256 = 1000000000000000000000000000000000000;
+  const inOverL: Uint256 = (binAmt * MAV_ONE + L) / (L + 1); // divUp(binAmt, L+1)
+  let out: Uint256 = 0;
+  if (tokenAIn === 1) {
+    const invSp: Uint256 = ONE_SQ / sqrtP; // invFloor
+    out = Math.mulDiv(binAmt, invSp, inOverL + sqrtP);
+  } else {
+    const invCeilSp: Uint256 = (ONE_SQ - 1) / sqrtP + 1; // invCeil
+    out = Math.mulDiv(binAmt, sqrtP, inOverL + invCeilSp);
+  }
+  if (out > availOut) { out = availOut; }
+  return out;
+}
+
+// within-tick end sqrt price for a NON-draining input binAmt (clamped to the tick bounds).
+function mavEndSqrt(binAmt: Uint256, sqrtP: Uint256, L: Uint256, tokenAIn: Uint256, lo: Uint256, hi: Uint256): Uint256 {
+  const MAV_ONE: Uint256 = 1000000000000000000;
+  const ONE_SQ: Uint256 = 1000000000000000000000000000000000000;
+  if (tokenAIn === 1) {
+    let end: Uint256 = sqrtP + Math.mulDiv(binAmt, MAV_ONE, L);
+    if (end > hi) { end = hi; }
+    return end;
+  }
+  const inv: Uint256 = Math.mulDiv(binAmt, MAV_ONE, L) + ONE_SQ / sqrtP;
+  let end: Uint256 = lo;
+  if (inv > 0) { end = ONE_SQ / inv; }
+  if (end < lo) { end = lo; }
+  return end;
+}
+
 // ── Compile-time protocol-presence flags (conditional compilation) ──
 // Each guards the per-protocol-SEPARABLE on-chain code below. index.ts derives each from the
 // prepared universe and passes them as compiler `defines` (with treeshake on) so a cook carries
@@ -798,7 +970,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -913,6 +1085,135 @@ function main(
           if (qj === 0) { b2sfOut = sf0; }
           if (qj === 1) { b2sfOut = sf1; }
           if (qj === 2) { b2sfOut = sf2; }
+        }
+        // Maverick V2 (segKind 8) — LIVE bin-WALK. UNLIKE the geometric quote-difference ladder below (which
+        // no-ops for qKind 8: no branch matches ⇒ q stays 0 ⇒ stop), Maverick has no cumulative-out view, so
+        // it WALKS the pool's bin book on-chain from the LIVE active tick/price, emitting one ladder slice per
+        // crossed tick (capacity = deltaInErc, effOut = deltaOutErc, head = qlSliceHead) DIRECTLY into the
+        // merged stream. Reads fee(tokenAIn) + getState()[5] (activeTick) + getTick(tick)[reserveA,reserveB]
+        // LIVE; qd[1]=tokenAIn, qd[2]=tickSpacing. Replays computeSwapExactIn per tick BIT-FOR-BIT (incl. the
+        // drainable UNDERFLOW guard), so this == buildMaverickWalkLadder ⇒ solver == oracle by construction
+        // (proven wei-exact vs the real MaverickV2Quoter on v1+v12). Emit-capped at QL_S (the merged-stream
+        // per-venue reservation — MUST equal maverick-math.ts MAVERICK_WALK_MAX_SEGMENTS so oracle == solver).
+        if (HAS_MAVERICK && qKind === 8) {
+          const mTokenAIn: Uint256 = qi;   // qd[1] — 1 iff tokenIn == pool tokenA (price rises through ticks)
+          const mTs: Uint256 = qd[2];      // tickSpacing
+          const MAV_ONE: Uint256 = 1000000000000000000;
+          const MAV_OFFSET: Uint256 = 8388608; // 2^23 (> any |tick| within MAX_TICK for tickSpacing>=1)
+          const MAV_HALF: Uint256 = 2 ** 255;
+          const MAXTICK: Uint256 = 322378;
+          const MAV_STEPS: Uint256 = 200;  // walk-iteration bound (== maverick-math TICK_SEARCH_LIMIT)
+          const mFee: Uint256 = IMaverickV2Pool.at(qPool).fee(mTokenAIn === 1);
+          // active tick — the ABI declares getState()[5] as uint256 so the int32 activeTick's SIGN-extended
+          // word passes through verbatim (>= 2^255 ⇒ negative). Recover the OFFSET-shifted tick WITHOUT ever
+          // computing MAV_OFFSET + mAtWord on a negative (mAtWord ~ 2^256 there ⇒ that add overflows and the
+          // engine reverts on overflow) — take the negative branch FIRST: mShift = MAV_OFFSET - |realTick|.
+          const mAtWord: Uint256 = IMaverickV2Pool.at(qPool).getState()[5];
+          let mShift: Uint256 = 0;
+          if (mAtWord >= MAV_HALF) { mShift = MAV_OFFSET - Math.neg(mAtWord); }
+          else { mShift = MAV_OFFSET + mAtWord; }
+          // seed the walk price from the active tick reserves (getSqrtPrice, clamped).
+          const mSeedArg: Uint256 = mavTickArg(mShift, MAV_OFFSET);
+          const mSA: Uint256 = IMaverickV2Pool.at(qPool).getTick(mSeedArg)[0];
+          const mSB: Uint256 = IMaverickV2Pool.at(qPool).getTick(mSeedArg)[1];
+          const mSLo: Uint256 = mavTickSqrt(mavAbs(mShift, MAV_OFFSET), mTs, mavInv(mShift, MAV_OFFSET));
+          const mSHi: Uint256 = mavTickSqrt(mavAbs(mShift + 1, MAV_OFFSET), mTs, mavInv(mShift + 1, MAV_OFFSET));
+          const mSL: Uint256 = mavGetTickL(mSA, mSB, mSLo, mSHi);
+          let mCurSqrt: Uint256 = mavSeedSqrt(mSA, mSB, mSLo, mSHi, mSL);
+          let mCurShift: Uint256 = mShift;
+          let mRemain: Uint256 = amountIn;
+          let mNEmit: Uint256 = 0;
+          let mPrevHead: Uint256 = 0;
+          let mDone: Uint256 = 0;
+          for (let mi = 0; mi < MAV_STEPS; mi = mi + 1) {
+            if (mDone === 0) {
+              if (mNEmit >= QL_S) { mDone = 1; }
+              else {
+                const mAbsB: Uint256 = mavAbs(mCurShift, MAV_OFFSET);
+                if (mAbsB * mTs > MAXTICK) {
+                  mDone = 1;
+                } else {
+                  const mLo: Uint256 = mavTickSqrt(mAbsB, mTs, mavInv(mCurShift, MAV_OFFSET));
+                  const mHi: Uint256 = mavTickSqrt(mavAbs(mCurShift + 1, MAV_OFFSET), mTs, mavInv(mCurShift + 1, MAV_OFFSET));
+                  let mSkip: Uint256 = 0;
+                  if (mCurSqrt < mLo) { mSkip = 1; }
+                  if (mCurSqrt > mHi) { mSkip = 1; }
+                  if (mSkip === 1) {
+                    if (mTokenAIn === 1) { mCurShift = mCurShift + 1; } else { mCurShift = mCurShift - 1; }
+                  } else {
+                    const mArg: Uint256 = mavTickArg(mCurShift, MAV_OFFSET);
+                    const mRA: Uint256 = IMaverickV2Pool.at(qPool).getTick(mArg)[0];
+                    const mRB: Uint256 = IMaverickV2Pool.at(qPool).getTick(mArg)[1];
+                    let mEmpty: Uint256 = 0;
+                    if (mRA === 0) { if (mRB === 0) { mEmpty = 1; } }
+                    if (mEmpty === 1) {
+                      if (mTokenAIn === 1) { mCurShift = mCurShift + 1; } else { mCurShift = mCurShift - 1; }
+                    } else {
+                      const mL: Uint256 = mavGetTickL(mRA, mRB, mLo, mHi);
+                      if (mL === 0) {
+                        if (mTokenAIn === 1) { mCurShift = mCurShift + 1; } else { mCurShift = mCurShift - 1; }
+                      } else {
+                        const mAvailOut: Uint256 = mTokenAIn === 1 ? mRB : mRA;
+                        const mDrainable: Uint256 = mavDrainable(mAvailOut, mCurSqrt, mL, mTokenAIn);
+                        let mDrainIn: Uint256 = 0;
+                        if (mDrainable === 1) {
+                          const mBinIn: Uint256 = mavDrainIn(mAvailOut, mCurSqrt, mL, mTokenAIn);
+                          const mFden: Uint256 = MAV_ONE - mFee;
+                          const mFp: Uint256 = mBinIn * mFee;
+                          let mFbd: Uint256 = mFp / mFden;
+                          if (mFbd * mFden < mFp) { mFbd = mFbd + 1; } // mulDivCeil(binIn, fee, 1-fee)
+                          mDrainIn = mBinIn + mFbd;
+                        }
+                        let mDoPartial: Uint256 = 0;
+                        if (mDrainable === 0) { mDoPartial = 1; }
+                        else { if (mRemain < mDrainIn) { mDoPartial = 1; } }
+                        let mCapIn: Uint256 = 0;
+                        let mOutT: Uint256 = 0;
+                        let mEndS: Uint256 = 0;
+                        if (mDoPartial === 1) {
+                          const mBinFinal: Uint256 = Math.mulDiv(mRemain, MAV_ONE - mFee, MAV_ONE); // mulDown(remaining, 1-fee)
+                          mOutT = mavOut(mBinFinal, mCurSqrt, mL, mTokenAIn, mAvailOut);
+                          mEndS = mavEndSqrt(mBinFinal, mCurSqrt, mL, mTokenAIn, mLo, mHi);
+                          mCapIn = mRemain; // deltaInErc for a partial fill == the whole remaining input
+                        } else {
+                          mOutT = mAvailOut;
+                          mCapIn = mDrainIn;
+                          if (mTokenAIn === 1) { mEndS = mHi; } else { mEndS = mLo; }
+                        }
+                        let mMaxed: Uint256 = 0;
+                        if (mEndS === mHi) { mMaxed = 1; }
+                        if (mEndS === mLo) { mMaxed = 1; }
+                        // EMIT one slice (skipped only on a zero cap/out; the walk still advances).
+                        if (mCapIn > 0) { if (mOutT > 0) {
+                          const mHead: Uint256 = qlSliceHead(mOutT, mCapIn);
+                          if (mHead === 0) { mDone = 1; }
+                          else {
+                            if (mNEmit > 0) { if (mHead >= mPrevHead) { mDone = 1; } } // non-descending guard
+                            if (mDone === 0) {
+                              msRef[msN] = qRef; msCap[msN] = mCapIn;
+                              msNear[msN] = mHead; msFar[msN] = mHead;
+                              msKind[msN] = qKind; msVen[msN] = qPool; msAux[msN] = 0;
+                              msN = msN + 1; mNEmit = mNEmit + 1; mPrevHead = mHead;
+                            }
+                          }
+                        } }
+                        // ADVANCE — skipped when the emit-guard (head==0 / non-descending) stopped the walk.
+                        if (mDone === 0) {
+                          if (mDoPartial === 1) { mRemain = 0; } else { mRemain = mRemain - mDrainIn; }
+                          mCurSqrt = mEndS;
+                          if (mMaxed === 0) { mDone = 1; }
+                          if (mRemain === 0) { mDone = 1; }
+                          if (mDone === 0) {
+                            if (mTokenAIn === 1) { mCurShift = mCurShift + 1; } else { mCurShift = mCurShift - 1; }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
         for (let k = 0; k < QL_S; k = k + 1) {
           if (stop === 0) {
@@ -2165,16 +2466,17 @@ function main(
   // the engine reads the pool's tokenA(), sets tokenAIn, and calls pool.swap(recipient, SwapParams{amount,
   // tokenAIn, exactOutput:false, tickLimit: full-range}, ""); the pool re-enters maverickV2SwapCallback(
   // amountToPay, …) to pull the input from the payer. So the bin math runs INSIDE the pool + engine callback,
-  // and the SwapParams carry NO curve data — the segment merge already used it (exact-on-grid), and the
-  // realized out is the engine swap (cross-checked wei-exact against the on-chain quoter in the EVM test).
-  // amountSpecified is NEGATIVE (the unified exact-in convention; _swapMaverickV2 takes abs()). payer ==
-  // address.self (compute-then-pull transferred `cum`, incl. each Maverick share, above) so the callback's
-  // safeTransfer draws from this contract; recipient == address.self. The poolKey is unused for poolType 7
-  // — zeroed to match the V2-path SwapParams shape. The engine passes the per-direction FULL-RANGE tickLimit
-  // (type(int32).max for tokenA-in, type(int32).min for tokenB-in — ../sauce PR #193), so the swap walks the
-  // whole live tick book bounded only by liquidity (it may cross tick 0); the sampler used the SAME bound
-  // (buildMaverickSegments' maxInput cap) so the awarded Σ fills within the pool's depth (any un-consumed
-  // input is returned by the guarded terminal refund below).
+  // and the SwapParams carry NO curve data — the segKind-8 LIVE bin-walk (the QL stream above) already used
+  // it (the split is exact-on-grid vs the oracle), and the realized out is the engine swap (cross-checked
+  // wei-exact against the on-chain quoter in the prod-mirror test). amountSpecified is NEGATIVE (the unified
+  // exact-in convention; _swapMaverickV2 takes abs()). payer == address.self (compute-then-pull transferred
+  // `cum`, incl. each Maverick share, above) so the callback's safeTransfer draws from this contract;
+  // recipient == address.self. The poolKey is unused for poolType 7 — zeroed to match the V2-path SwapParams
+  // shape. The engine passes the per-direction FULL-RANGE tickLimit (type(int32).max for tokenA-in,
+  // type(int32).min for tokenB-in — ../sauce PR #193), so the swap walks the whole live tick book bounded
+  // only by liquidity (it may cross tick 0); the bin-walk used the SAME bound (its MAXTICK / per-direction
+  // walk) so the awarded Σ fills within the pool's depth (any un-consumed input is returned by the guarded
+  // terminal refund below).
   if (HAS_MAVERICK) {
   for (let m = 0; m < MS_CAP; m = m + 1) {
     const mamt: Uint256 = minp[m];

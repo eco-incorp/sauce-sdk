@@ -69,7 +69,7 @@ import { buildSolidlyStableQLLadder, type SolidlyStablePool } from "../shared/so
 import { buildWombatQLLadder, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableQLLadder, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { buildEulerSwapQLLadder, type EulerSwapPool } from "../shared/eulerswap-math.js";
-import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
+import { buildMaverickWalkLadder, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
@@ -190,12 +190,11 @@ export interface OptimalPool {
   /**
    * Maverick V2 (bin-based directional AMM) pool — when present this pool is a MAVERICK venue (NOT
    * V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer/Euler). The oracle enumerates its segments via the
-   * SHARED bin swap-math replay (buildMaverickSegments) from the live tick book + directional fee +
-   * the engine's per-direction FULL-RANGE tickLimit (type(int32).max/min — ../sauce PR #193), so the
-   * split is exact-on-grid vs prepare's segments (one replay). The
-   * marginal is post-fee (getDy nets the directional fee), so it enters the descending-price merge
-   * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/`balancer`/`eulerSwap` are ignored
-   * when `maverick` is set.
+   * SHARED LIVE bin-WALK (buildMaverickWalkLadder) — the SAME per-tick ladder the on-chain solver's
+   * segKind-8 branch replays from live getState()/getTick(), so the split is solver == oracle by
+   * construction (ONE source). The marginal is post-fee (the drain math nets the directional fee), so it
+   * enters the descending-price merge directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/
+   * `balancer`/`eulerSwap` are ignored when `maverick` is set.
    */
   maverick?: MaverickPool;
   /**
@@ -632,17 +631,18 @@ function eulerSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): S
 }
 
 /**
- * Enumerate one Maverick V2 (bin-based directional AMM) pool's segments via the SHARED bin swap-math
- * replay (buildMaverickSegments) from the live tick book + directional fee + the engine's per-direction
- * FULL-RANGE tickLimit (type(int32).max/min — ../sauce PR #193, i.e. the pool's available liquidity)
- * depth cap. The amountIn caps the sampled range — the same bound prepare samples — so the oracle and
- * prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid. The Maverick
- * marginalOI is the post-fee execution price (getDy nets the directional fee); adjNear == adjFar ==
- * marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Maverick V2 (bin-based directional AMM) pool's segments via the SHARED LIVE bin-WALK
+ * (buildMaverickWalkLadder) — the SAME per-tick ladder the on-chain solver's segKind-8 branch replays from
+ * live getState()/getTick() state, so the oracle and the solver build the IDENTICAL slice set (ONE source ⇒
+ * solver == oracle by construction, wei-exact). Each segment is a genuine crossed tick (the active tick's
+ * partial slice from the live price to its edge, then full-drain slices), emit-capped at
+ * MAVERICK_WALK_MAX_SEGMENTS to match the on-chain merged-stream reservation. The Maverick marginalOI is the
+ * post-fee execution price (the drain math nets the directional fee); adjNear == adjFar == marginalOI.
+ * Awarded as a "pool" venue.
  */
 function maverickSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildMaverickSegments(p.maverick!, amountIn)) {
+  for (const s of buildMaverickWalkLadder(p.maverick!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

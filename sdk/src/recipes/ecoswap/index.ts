@@ -328,6 +328,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   const eulerSwaps = prepared.eulerSwaps ?? [];
   const balancerV3Pools = prepared.balancerV3Pools ?? [];
   const balancerStables = prepared.balancerStables ?? [];
+  const maverickPools = prepared.maverickPools ?? [];
   const curveRows = curves.map((c, refIdx) => [
     BigInt(c.address),
     BigInt(c.i),
@@ -482,6 +483,21 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
       BigInt(n), // qd[9] = non-BPT token count (2 or 3)
     ];
   });
+  // Maverick V2 (bin-based directional AMM) — segKind 8. The solver's segKind-8 branch WALKS the pool's bin
+  // book on-chain from the LIVE active tick/price (Maverick has no cumulative-out view to quote), so the
+  // descriptor ships ONLY the walk seeds: qd[1] = tokenAIn (1 iff tokenIn == the pool's tokenA ⇒ price rises)
+  // and qd[2] = tickSpacing (the bin width exponent). fee(tokenAIn), the active tick, and every per-tick
+  // reserve are read LIVE on-chain (no descriptor slot, so the walk re-anchors to any drift). EXEC is
+  // UNCHANGED — engine poolType 7 (_swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input); the
+  // segKind-8 accumulator (minp/mven, refIdx-keyed) and the poolType-7 dispatch already handle it.
+  const maverickRows = maverickPools.map((m, refIdx) => [
+    BigInt(m.address),
+    m.tokenAIn ? 1n : 0n, // i = tokenAIn (the walk direction bit)
+    BigInt(m.tickSpacing), // j = tickSpacing (the bin-width exponent for the sqrt-price ladder)
+    BigInt(m.feePpm),
+    8n, // segKind = Maverick V2 (on-chain live bin-walk QL; engine _swapMaverickV2 callback on the exec)
+    BigInt(refIdx),
+  ]);
   // PAD every SHORT row from 6 → 10 columns (0-fill) so the qlv tuple is uniform-width and the solver's qd[6..9]
   // read is always in range (only BalV3 (segKind 14) + BalV2 (segKind 6) read qd[6..9]; a uniform width keeps
   // the compiler's INDEX safe on every engine). BalV3 + BalV2 rows are already 10 wide.
@@ -490,25 +506,24 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   return pad10([
     ...curveRows, ...cryptoRows, ...solidlyRows, ...wooFiRows, ...lbRows, ...mentoRows,
     ...dodoRows, ...wombatRows, ...fermiRows, ...eulerRows, ...balancerV3Rows, ...balancerRows,
+    ...maverickRows,
   ]);
 }
 
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   // NOTE: Curve StableSwap (segKind 1), Trader Joe LB (segKind 2), DODO V2 (segKind 3), Solidly STABLE
-  // (segKind 4), Wombat (segKind 5), EulerSwap (segKind 7), Curve CryptoSwap (segKind 9), WOOFi (segKind 10),
-  // Fermi (segKind 11) and Mento V2 (segKind 13) are NOT read here — all ten are QUOTE-LADDER (QL) venues (see
-  // buildQLVenues), built on-chain from live quotes, so they ship no static sampled segments.
-  const maverickPools = prepared.maverickPools ?? [];
+  // (segKind 4), Wombat (segKind 5), EulerSwap (segKind 7), Maverick V2 (segKind 8), Curve CryptoSwap
+  // (segKind 9), WOOFi (segKind 10), Fermi (segKind 11) and Mento V2 (segKind 13) are NOT read here — all are
+  // QUOTE-LADDER (QL) venues (see buildQLVenues), built on-chain from live state, so they ship no static
+  // sampled segments. Maverick's on-chain segKind-8 branch WALKS the bin book live (no off-chain sampling).
   const fluidPools = prepared.fluidPools ?? [];
   return prepared.brackets
     .filter(
       (b) =>
-        // Curve StableSwap / LB / DODO / CryptoSwap / Solidly STABLE / Wombat / EulerSwap / WOOFi / Fermi /
-        // Mento / Balancer V2 / Balancer V3 are NOT here: all twelve are QUOTE-LADDER (QL) venues built
-        // ON-CHAIN in the solver setup (see buildQLVenues) — prepare ships only the descriptor, no sampled
-        // segments. (Balancer V2/V3 replay StableMath on-chain from live Vault state rather than quoting a
-        // live view — their own quotes are eth_call-only.)
-        b.kind === EcoBracketKind.MaverickV2 ||
+        // Only Fluid DEX remains a STATIC sampled-segment venue here. Every other family — Curve StableSwap
+        // (1) / Trader Joe LB (2) / DODO V2 (3) / Solidly STABLE (4) / Wombat (5) / Balancer V2 (6) / EulerSwap
+        // (7) / Maverick V2 (8) / Curve CryptoSwap (9) / WOOFi (10) / Fermi (11) / Mento V2 (13) / Balancer V3
+        // (14) — is a QUOTE-LADDER venue built ON-CHAIN from live state (buildQLVenues), NOT a static segment.
         b.kind === EcoBracketKind.Fluid,
     )
     .slice()
@@ -518,20 +533,11 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       return a.refIdx - b.refIdx;
     })
     .map((b) => {
-      const isMaverick = b.kind === EcoBracketKind.MaverickV2;
       const isFluid = b.kind === EcoBracketKind.Fluid;
-      // Only Maverick V2 (segKind 8, a CALLBACK pool via the engine _swapMaverickV2) and Fluid DEX (segKind 12,
-      // callback-free via the resolver estimate + pool.swapIn) remain STATIC sampled-segment venues here. Every
-      // other family — Curve StableSwap (1) / Trader Joe LB (2) / DODO V2 (3) / Solidly STABLE (4) / Wombat (5)
-      // / Balancer V2 ComposableStable (6) / EulerSwap (7) / Curve CryptoSwap (9) / WOOFi (10) / Fermi (11) /
-      // Mento V2 (13) / Balancer V3 (14) — is a QUOTE-LADDER venue built ON-CHAIN from live state (buildQLVenues),
-      // NOT a static sampled segment.
-      const segKind = isMaverick ? 8n : isFluid ? 12n : 0n;
-      const venue = isMaverick
-                  ? BigInt(maverickPools[b.refIdx].address)
-                  : isFluid
-                    ? BigInt(fluidPools[b.refIdx].address)
-                    : 0n;
+      // Only Fluid DEX (segKind 12, callback-free via the resolver estimate + pool.swapIn) remains a STATIC
+      // sampled-segment venue here. Maverick V2 moved to the QL live bin-walk (segKind 8, buildQLVenues).
+      const segKind = isFluid ? 12n : 0n;
+      const venue = isFluid ? BigInt(fluidPools[b.refIdx].address) : 0n;
       // venueAux (segs[6]) — the per-segment auxiliary 256-bit value. Now that Mento is a QL venue (its
       // exchangeId travels in the qlv descriptor), no STATIC sampled venue uses it, so it is always 0 here;
       // the column is kept to mirror the 7-field seg row the on-chain merge stream expects.

@@ -43,10 +43,14 @@
  *       byte-for-byte, at the captured mainnet addresses. NO mock MaverickV2Pool.sol is in the path.
  *       getState/getTick/getBin reproduce the captured bin state, and the REAL quoter's calculateSwap
  *       reproduces the captured probe quotes.
- *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds). Proven with
- *       poisoned *_RPC_URL.
+ *   (b) WALK MATH == REAL QUOTER at S sizes — the on-chain segKind-8 bin-walk mirrors maverick-math.ts
+ *       (getDy / buildMaverickWalkLadder) bit-for-bit, so getDy(size) == the REAL MaverickV2Quoter to the
+ *       WEI at every captured probe size proves the SPLIT GRID (the live bin-walk) is wei-exact vs the real
+ *       pool's bin math across multi-tick crossings, engine-independently. FAST + OFFLINE — no fork, no RPC
+ *       at run time; per-engine wall-clock logged (seconds).
  *   (c) REAL ENGINE-CALLBACK SWAP, WEI-EXACT — EcoSwap through the PRODUCTION FactoryType.MaverickV2Factory
- *       discovery path surfaces the real pool + prepares the sampled MaverickV2 segments (asserted), then
+ *       discovery path surfaces the real pool + ships the descriptor-only Maverick QL venue (asserted; the
+ *       on-chain segKind-8 branch WALKS the bin book live — no off-chain sampling), then
  *       COOKs through the FIXED engine `_swapMaverickV2` → the REAL pool's `maverickV2SwapCallback`. The
  *       cook SUCCEEDS; the caller receives the output and the pool pulls exactly the input via the callback.
  *       The received dy == the REAL MaverickV2Quoter's calculateSwap(awarded Σ) view BIT-FOR-BIT (real ==
@@ -67,6 +71,18 @@
  *     within a handful of ticks of the active tick (well before tick 0), so the executed dy is identical
  *     whether the engine's tickLimit is 0 or type(int32).min — verified: the REAL quoter returns the same
  *     (in, out) for both — and it is a full fill (spent == amountIn), NOT a tickLimit partial.
+ *   • RESIDUAL RISK — NEGATIVE-TICK REAL-QUOTER PARITY: this captured pool has activeTick=+7 (positive),
+ *     and the trade consumes above tick 0, so the REAL bytecode here NEVER exercises the negative
+ *     getState()[5] decode or the negative getTick(int32) ARG encode across the sign boundary — cell (b)
+ *     compares off-chain getDy vs the real quoter (both positive-tick), and the engine-exec cell (c) is a
+ *     solo venue (received == quoter(awarded) holds for any split). No negative / cross-0 real Maverick
+ *     pool was capturable on BSC/Base at snapshot time (the discoverable stablecoin pools sit at positive
+ *     ticks). So the negative-tick correctness of the on-chain walk (the signed-int32 activeTick decode +
+ *     the negative getTick ARG encode) is validated ONLY against the local-fixture ground truth in
+ *     ecoswap.maverick.evm.test.ts — where the fixture's Solidity decodes int32 correctly and its own
+ *     calculateSwap is the exec ground truth (including a DISTINCT-per-tick-reserve cell so a mis-indexed
+ *     negative getTick read diverges the split), NOT against the REAL MaverickV2Quoter. If a negative /
+ *     cross-0 real pool becomes capturable, add it here to close this gap directly.
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; v12 skipped in "both" when the artifacts
  * are absent). No state cache — etch+setStorage is a few seconds.
@@ -158,7 +174,7 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
   /** A poolConfig with ONLY a MaverickV2Factory factory (the shim) → the production Maverick discovery
    *  path resolves the etched pool via lookup(tokenA,tokenB,0,N); the lens ignores non-V2/V3/V4 factory
    *  types, so no direct pools are surfaced and the Maverick pool rides entirely through
-   *  discoverMaverickV2PoolsTyped → the sampled MaverickV2 brackets. */
+   *  discoverMaverickV2PoolsTyped → the descriptor-only Maverick QL venue (the on-chain bin-walk). */
   function maverickPoolConfig(tokenIn: Hex, tokenOut: Hex): ChainPoolConfig {
     return {
       factories: [
@@ -328,6 +344,27 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
     );
   });
 
+  // ── (b) WALK MATH == REAL QUOTER at S sizes — the corrected-math payoff, no cook needed. ──
+  // The on-chain segKind-8 bin-walk mirrors maverick-math.ts (getDy / buildMaverickWalkLadder) BIT-FOR-BIT
+  // — so proving getDy(op, size) == the REAL MaverickV2Quoter.calculateSwap(size) to the WEI at every
+  // captured probe size proves the on-chain walk (which the SPLIT is built from) is wei-exact vs the real
+  // pool's bin math across multi-tick crossings, engine-independently (no cook — this is the SPLIT-GRID
+  // fidelity that the reference-math fix delivered; the engine-EXEC wei-exactness is (c) below).
+  it("the on-chain bin-walk math (getDy) == the REAL MaverickV2Quoter at every captured probe size", async () => {
+    const op = await offPool(etched.tokenB); // tokenB-in (USDC→USDT), the engine-executable direction
+    for (const p of snaps.state.probes) {
+      const sim = await c.publicClient.simulateContract({
+        address: etched.quoter, abi: maverickQuoterAbi, functionName: "calculateSwap",
+        args: [etched.pool, BigInt(p.amountIn), false, false, 0],
+      });
+      const [qIn, qOut] = sim.result as readonly [bigint, bigint, bigint];
+      const off = getDy(op, qIn); // getDy over the input the quoter actually consumed (a full fill here)
+      assert.equal(qIn, BigInt(p.amountIn), `probe ${p.amountIn} fully consumes (no tickLimit partial)`);
+      assert.equal(off, qOut, `getDy(${p.amountIn}) == REAL quoter calculateSwap to the WEI (Δ=${off > qOut ? off - qOut : qOut - off})`);
+    }
+    console.log(`  [maverick-prod-mirror] on-chain walk math == REAL quoter WEI-EXACT at ${snaps.state.probes.length} probe sizes`);
+  });
+
   // ── (c1) ENGINE-PATH BUG + (c2) REAL-EXECUTION WEI-EXACT — through the production discovery path. ──
   async function runProdMirror(engine: Engine): Promise<void> {
     await setup();
@@ -373,9 +410,14 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
       "the discovered Maverick venue is the REAL etched pool",
     );
     assert.equal(prepared.maverickPools![0].tokenAIn, false, "discovery oriented the venue as tokenB-in (activeTick>=0)");
-    assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.MaverickV2),
-      "MaverickV2 segments present",
+    // Maverick is now a QUOTE-LADDER (QL) venue — descriptor-only (address + tokenAIn + tickSpacing), NO
+    // static sampled brackets (the on-chain segKind-8 branch WALKS the bin book live). Assert the descriptor
+    // carries the walk seeds and ships zero MaverickV2 brackets.
+    assert.ok(prepared.maverickPools![0].tickSpacing > 0, "descriptor carries the bin-walk tickSpacing seed");
+    assert.equal(
+      (prepared.brackets ?? []).filter((b) => b.kind === EcoBracketKind.MaverickV2).length,
+      0,
+      "Maverick ships NO static brackets (it is a live bin-walk QL venue)",
     );
 
     // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Maverick venue seeded from the REAL captured tick book via

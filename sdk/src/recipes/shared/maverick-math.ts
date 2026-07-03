@@ -447,6 +447,18 @@ export function engineTickLimit(tokenAIn: boolean): number {
 const TICK_SEARCH_LIMIT = 200;
 
 /**
+ * Max ladder slices the LIVE bin-WALK emits per pool — the shared budget the ORACLE
+ * (buildMaverickWalkLadder) and the on-chain solver's segKind-8 QL walk BOTH cap at, so the two build
+ * the IDENTICAL slice set (solver == oracle by construction). It EQUALS the on-chain QL slice budget
+ * `QL_S` in ecoswap.sauce.ts (both 8): the merged-stream capacity `MS_CAP = segs + qlv·QL_S` reserves
+ * exactly QL_S rows per QL venue, so a Maverick venue emitting ≤ this many slices never overflows it.
+ * A trade whose reachable depth spans more than this many crossed ticks fills only the first
+ * MAVERICK_WALK_MAX_SEGMENTS ticks in the priced split (the rest is left for other venues / the guarded
+ * terminal refund) — safe (the exec never over-asks) and consistent between the two sides.
+ */
+export const MAVERICK_WALK_MAX_SEGMENTS = 8;
+
+/**
  * Walk the pool's live ticks in the swap direction, replaying `computeSwapExactIn` per tick, and
  * return the exact tokens-out for `amountIn` tokenIn AND the tokenIn actually consumed (which may be
  * LESS than `amountIn` when the tick limit / available liquidity binds). Mirrors Maverick
@@ -540,18 +552,17 @@ export function simulateMaverickExactIn(
  * marginalOI = the QL slice head isqrt(effOut·2^192/capacity)), until the input is consumed, a slice
  * prices non-descending, or a tick runs dry.
  *
- * STATUS — NOT YET WIRED (groundwork for the pending segKind-8 live-walk). TODAY the production path and
- * the neutral oracle both consume the SAMPLED `buildMaverickSegments` below (see this file's header):
- * Maverick executes as a STATIC-segment source (the on-chain solver consumes the prepared segments and
- * dispatches on segKind 8; it does NOT walk the bin book on-chain). This ladder is the TS source-of-truth
- * for the live-walk that WILL replace that sampled path — its on-chain SauceScript twin
- * (test/harness/maverick-onchain-walk.reference.ts.txt) is proven wei-exact (Δ=0) vs the real
- * MaverickV2Quoter on both v1 and v12, but the integration (index.ts buildQLVenues emit + the qKind===8
- * live-walk branch + prepare.ts descriptor-only + the ecoswap.optimal.ts switch to THIS ladder) is the
- * documented follow-up. When it lands, the on-chain solver replays THIS EXACT per-tick loop and the oracle
- * consumes THIS ladder — ONE source ⇒ solver == oracle by construction. Unlike the geometric sampler this
- * walks the REAL bin boundaries, so each segment is a genuine tick crossing (the active tick's partial
- * slice from the live price to its edge, then full-drain slices).
+ * STATUS — WIRED (the segKind-8 LIVE-walk). This ladder is the TS source-of-truth for Maverick's on-chain
+ * live-walk: the neutral oracle (ecoswap.optimal.ts maverickSegments) consumes THIS ladder, and the
+ * on-chain solver's segKind-8 QL branch (ecoswap.sauce.ts) replays THIS EXACT per-tick loop from LIVE
+ * getState()/getTick() state — ONE source ⇒ solver == oracle by construction (its standalone twin
+ * test/harness/maverick-onchain-walk.reference.ts.txt is proven wei-exact, Δ=0, vs the real
+ * MaverickV2Quoter on both v1 and v12). prepare ships Maverick descriptor-only (pool + direction +
+ * tickSpacing); index.ts buildQLVenues emits the segKind-8 QL row; the walk reads fee + activeTick +
+ * per-tick reserves LIVE. Unlike the geometric sampler (`buildMaverickSegments`, retained for the
+ * math-test known-answer vectors) this walks the REAL bin boundaries, so each segment is a genuine tick
+ * crossing (the active tick's partial slice from the live price to its edge, then full-drain slices). The
+ * emit is capped at MAVERICK_WALK_MAX_SEGMENTS to match the on-chain merged-stream reservation.
  *
  * The stop semantics MATCH the shared QL ladder (`buildQLLadder`) and the on-chain QL emit guard: stop on
  * a zero slice, a non-descending head (a Maverick bin book walked in the swap direction is naturally
@@ -559,7 +570,11 @@ export function simulateMaverickExactIn(
  * cumulative input at amountIn. No isotonic backward-merge (that is the geometric sampler's device for
  * bin-straddling samples; a per-tick walk emits at monotone-worsening price directly).
  */
-export function buildMaverickWalkLadder(pool: MaverickPool, amountIn: bigint): MaverickSegment[] {
+export function buildMaverickWalkLadder(
+  pool: MaverickPool,
+  amountIn: bigint,
+  maxSegments: number = MAVERICK_WALK_MAX_SEGMENTS,
+): MaverickSegment[] {
   if (amountIn <= 0n) return [];
   const { tokenAIn, tickSpacing, fee, protocolFeeD3 } = pool;
   const tickLimit = engineTickLimit(tokenAIn);
@@ -576,6 +591,9 @@ export function buildMaverickWalkLadder(pool: MaverickPool, amountIn: bigint): M
 
   let iterations = 0;
   while (remainingIn > 0n && iterations < TICK_SEARCH_LIMIT) {
+    // Emit budget: cap at maxSegments slices so the ladder never exceeds the on-chain merged-stream
+    // reservation (QL_S rows per QL venue). MATCHES the on-chain segKind-8 walk's emit cap byte-for-byte.
+    if (segs.length >= maxSegments) break;
     if (tokenAIn && currentTick > tickLimit) break;
     if (!tokenAIn && currentTick < tickLimit) break;
     const absTick = Math.abs(currentTick) * tickSpacing;

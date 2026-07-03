@@ -72,7 +72,7 @@ import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
-import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
+import { buildMaverickWalkLadder, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableQLLadder, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { estimateExpectedOutput } from "./expected-output.js";
 import {
@@ -805,36 +805,6 @@ function buildEulerSwapBrackets(pool: EulerSwapPool, refIdx: number, amountIn: b
   return brackets;
 }
 
-/**
- * Build Maverick V2 segments for one pool by sampling the bin swap-math replay (NO extra RPC — pure
- * bigint on the read tick book + directional fee, BOUNDED by the engine's per-direction FULL-RANGE
- * tickLimit depth — type(int32).max/min, ../sauce PR #193, i.e. the pool's available liquidity). Each sampled
- * (Δinput, Δoutput) increment becomes a STATIC segment (kind MaverickV2) in unified out/in space, refIdx →
- * the Maverick venue index. The marginal is the POST-FEE execution price (buildMaverickSegments nets the
- * directional fee), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar.
- * Maverick's bin math is OFF-CHAIN ONLY for the split; the on-chain solver EXECUTES the awarded Σ share
- * through the engine (swap poolType 7 → _swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input
- * mid-swap — Maverick is a CALLBACK pool, so it CANNOT be executed callback-free).
- */
-function buildMaverickBrackets(pool: MaverickPool, refIdx: number, amountIn: bigint): EcoBracket[] {
-  const segs = buildMaverickSegments(pool, amountIn);
-  const brackets: EcoBracket[] = [];
-  for (const sm of segs) {
-    brackets.push({
-      kind: EcoBracketKind.MaverickV2,
-      refIdx,
-      sqrtNear: sm.marginalOI,
-      sqrtFar: sm.marginalOI,
-      liquidity: 0n,
-      capacity: sm.capacity,
-      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Maverick directional fee (post-fee dy)
-      sqrtAdjFar: sm.marginalOI,
-      worstMarginalOI: sm.worstMarginalOI,
-    });
-  }
-  return brackets;
-}
-
 /** Round a Balancer swap fee (1e18-WAD) to ppm (the price-ordering coordinate / diagnostics). */
 function balancerFeeToPpm(swapFeeWad: bigint): number {
   return Number((swapFeeWad * 1_000_000n + 5n * 10n ** 17n) / 10n ** 18n);
@@ -1273,32 +1243,34 @@ export async function prepareEcoSwap(
   }
 
   const maverickPools: EcoMaverick[] = [];
-  const maverickBracketSets: EcoBracket[][] = [];
-  // Maverick V2 — factory lookup discovery (lookup(tokenA, tokenB, idx) over both orderings). Maverick is
-  // a BIN-based directional AMM: the bin curve does NOT map to the drift-invariant liquidityNet tick walk,
-  // so it is a SAMPLED-SEGMENT source (like DODO). `discoverMaverickV2PoolsTyped` reads the tick book around
-  // the active tick + the directional fee + tickSpacing and surfaces EVERY liquid pool regardless of which
-  // side of tick 0 its active tick sits on — the FIXED engine (../sauce PR #193) passes a per-direction
-  // FULL-RANGE tickLimit (type(int32).max/min), so there is NO active-tick side gate (the OLD tickLimit=0 cap
-  // + its discovery gate are gone). Sampled OFF-CHAIN; EXECUTED through the engine (swap poolType 7 →
-  // _swapMaverickV2 → maverickV2SwapCallback). NO engine change.
+  // Maverick V2 — factory lookup discovery (lookup(tokenA, tokenB, idx) over both orderings). Maverick is a
+  // BIN-based directional AMM; it is now a QUOTE-LADDER (QL) venue — the on-chain solver's segKind-8 branch
+  // WALKS the pool's bin book LIVE from getState()/getTick() (the reference-math LIVE bin-walk), so prepare
+  // ships ONLY the descriptor (address + tokenAIn direction + tickSpacing; fee + activeTick + per-tick
+  // reserves are read on-chain, so the walk re-anchors to any drift). `discoverMaverickV2PoolsTyped` reads the
+  // tick book around the active tick + directional fee + tickSpacing and surfaces EVERY liquid pool regardless
+  // of which side of tick 0 its active tick sits on (the engine — ../sauce PR #193 — passes a per-direction
+  // FULL-RANGE tickLimit). Discovery SKIPS mixed-decimal pairs (maverick-math is D18-normalized and the reads
+  // feed raw reserves ⇒ wei-exact only for 18/18) so a mis-scaled marginal cannot enter the live path.
+  // buildMaverickWalkLadder is a pure LIVENESS PROBE (drop a pool the walk cannot fill — no reachable liquidity
+  // / degenerate); its slices are NOT pushed (the on-chain walk rebuilds them). EXECUTED through the engine
+  // (swap poolType 7 → _swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input mid-swap — a
+  // CALLBACK pool, so NOT callback-free). NO engine change.
   const maverickFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.MaverickV2Factory);
   if (maverickFactories.length > 0) {
     const maverickRaw = await discoverMaverickV2PoolsTyped(tokenIn, tokenOut, client, maverickFactories);
     for (const mp of maverickRaw) {
-      const refIdx = maverickPools.length;
-      const mb = buildMaverickBrackets(mp, refIdx, amountIn);
-      if (mb.length === 0) continue;
+      // Liveness probe only — the QL ladder is built on-chain from live getState()/getTick(), not from these slices.
+      if (buildMaverickWalkLadder(mp, amountIn).length === 0) continue;
       maverickPools.push({
         address: mp.address,
         tokenAIn: mp.tokenAIn,
+        tickSpacing: mp.tickSpacing,
         feePpm: mp.feePpm,
         source: `${mp.source} (Maverick V2)`,
       });
-      maverickBracketSets.push(mb);
     }
   }
-  for (const set of maverickBracketSets) brackets.push(...set);
 
   // Curve CryptoSwap — crypto/tricrypto Metaregistry lookup (find_pool_for_coins → get_coin_indices,
   // UINT256 i,j). CryptoSwap pools trade on the A-gamma invariant with a dynamic fee AND use uint256
@@ -1758,10 +1730,9 @@ export async function prepareEcoSwap(
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
   // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2, Wombat,
-  // Fermi AND EulerSwap ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT sampled
-  // segments — the on-chain solver builds each ladder live from its quote view — so all ten are reported
-  // below as "QL", not a seg count.
-  const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
+  // Fermi, EulerSwap AND Maverick V2 ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT
+  // sampled segments — the on-chain solver builds each ladder live from its quote view / bin-walk — so they
+  // are reported below as "QL", not a seg count.
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
@@ -1770,9 +1741,9 @@ export async function prepareEcoSwap(
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
       `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
-      `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${balancerV3Pools.length} Balancer-V3 QL, ` +
-      `${brackets.length} sampled segments (` +
-      `${nMaverickSegs} Maverick, ${nFluidSegs} Fluid)`,
+      `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${maverickPools.length} Maverick QL, ` +
+      `${balancerV3Pools.length} Balancer-V3 QL, ` +
+      `${brackets.length} sampled segments (${nFluidSegs} Fluid)`,
   );
 
   const prepared: EcoSwapPrepared = {
