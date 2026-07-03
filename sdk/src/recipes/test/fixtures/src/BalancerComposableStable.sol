@@ -261,6 +261,24 @@ contract BalancerVault {
         return (pool.tokens(), pool.balances(), 0);
     }
 
+    /// Per-token SCALAR view the on-chain QL solver (segKind 6) reads for the live balances — the v12-safe
+    /// path (getPoolTokens nests the balances dyn array in a tuple → garbage on v12). cash == the token's
+    /// registered balance; managed == 0 (no asset manager in the fixture). Mirrors the real Vault's
+    /// getPoolTokenInfo(bytes32,address) surface.
+    function getPoolTokenInfo(bytes32 poolId, address token)
+        external
+        view
+        returns (uint256 cash, uint256 managed, uint256 lastChangeBlock, address assetManager)
+    {
+        BalancerComposableStable pool = BalancerComposableStable(poolAddress[poolId]);
+        address[] memory tks = pool.tokens();
+        uint256[] memory bals = pool.balances();
+        for (uint256 k = 0; k < tks.length; k++) {
+            if (tks[k] == token) return (bals[k], 0, 0, address(0));
+        }
+        return (0, 0, 0, address(0));
+    }
+
     function swap(
         SingleSwap memory singleSwap,
         FundManagement memory funds,

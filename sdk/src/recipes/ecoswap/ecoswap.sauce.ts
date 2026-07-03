@@ -19,6 +19,7 @@ import { IFluidDexResolver } from "./IFluidDexResolver.json";
 import { IMentoBroker } from "./IMentoBroker.json";
 import { IBalancerV3Router } from "./IBalancerV3Router.json";
 import { IBalancerV3Vault } from "./IBalancerV3Vault.json";
+import { IBalancerV2Vault } from "./IBalancerV2Vault.json";
 import { IPermit2 } from "./IPermit2.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
@@ -365,6 +366,82 @@ function stableOut(amp: Uint256, feeWad: Uint256, bIn: Uint256, bOut: Uint256, d
   return bOut - y - 1;
 }
 
+// Balancer V2 ComposableStable (segKind 6) n-token amplified StableSwap out — the LIVE-state replay the QL
+// ladder is built from. Runs in scaled-18 space over the NON-BPT balances (the BPT is excluded off-chain;
+// `u0`/`u1`/`u2` are the UPSCALED non-BPT balances in the pool's REGISTERED non-BPT order, u2==0 ⇒ n=2 else
+// n=3), `inUp` the UPSCALED net input (fee already netted on the RAW input + upscaled in main), `ij` packs the
+// non-BPT in/out indices (i = ij&255, j = (ij/256)&255), `amp` = A·AMP_PRECISION. The invariant D iterates D_P
+// in registered non-BPT order (calculateInvariant, divDown); the out-balance y uses the V2 divUpInt rounding
+// (getTokenBalanceGivenInvariant). This is the V2 form — DISTINCT from the V3 `stableOut` above: V2 rounds the
+// c term divUpInt(inv2, att·PD)·AMP·bOut (NOT the V3 divUpRaw(inv2·AMP, att·PD)·bOut) and the bb term
+// divDown(D,att)·AMP (NOT V3's (D·AMP)/att). Bit-for-bit with balancer-stable-math.ts (the oracle) — same
+// registered-order D_P product (load-bearing for solver==oracle parity AND for matching the real Vault's own
+// onSwap on both engines, spike-verified wei-exact vs Vault.queryBatchSwap for n=3). Each Newton is
+// converged-flag-guarded (no break in SauceScript); 64 iterations is well past StableSwap convergence, so the
+// result is bit-identical to the oracle's 255-iter getDy. Pure arithmetic (no helper-to-helper call), so
+// main()'s qlv loop can call it. Returns the scaled-18 out (main downscales it by the out token's scale).
+function stableOutV2(amp: Uint256, u0: Uint256, u1: Uint256, u2: Uint256, ij: Uint256, inUp: Uint256): Uint256 {
+  const AMP: Uint256 = 1000; // AMP_PRECISION
+  // Guard (mirrors the oracle): a zero balance or zero scaled input returns 0 rather than dividing by zero.
+  if (u0 === 0 || u1 === 0 || inUp === 0) { return 0; }
+  const iIdx: Uint256 = ij & 255;
+  const jIdx: Uint256 = (ij / 256) & 255;
+  let n: Uint256 = 2;
+  if (u2 > 0) { n = 3; }
+  const att: Uint256 = amp * n; // ampTimesTotal = amp * numTokens
+  const sum0: Uint256 = u0 + u1 + u2; // u2==0 for n=2
+
+  // Newton for the invariant D (calculateInvariant, divDown). D_P over the ORIGINAL balances, registered order.
+  let D: Uint256 = sum0;
+  let doneD: Uint256 = 0;
+  for (let it = 0; it < 64; it = it + 1) {
+    if (doneD === 0) {
+      let DP: Uint256 = D;
+      DP = DP * D / (u0 * n);
+      DP = DP * D / (u1 * n);
+      if (n === 3) { DP = DP * D / (u2 * n); }
+      const prevD: Uint256 = D;
+      const numD: Uint256 = (att * sum0 / AMP + DP * n) * D;
+      const denD: Uint256 = (att - AMP) * D / AMP + (n + 1) * DP;
+      D = numD / denD;
+      if (D > prevD) { if (D - prevD <= 1) { doneD = 1; } }
+      else { if (prevD - D <= 1) { doneD = 1; } }
+    }
+  }
+
+  // work balances = original + inUp added to slot i (j != i, so w[j] == u[j] == the out balance).
+  let w0: Uint256 = u0; let w1: Uint256 = u1; let w2: Uint256 = u2;
+  if (iIdx === 0) { w0 = w0 + inUp; }
+  if (iIdx === 1) { w1 = w1 + inUp; }
+  if (iIdx === 2) { w2 = w2 + inUp; }
+  let bOut: Uint256 = w0;
+  if (jIdx === 1) { bOut = w1; }
+  if (jIdx === 2) { bOut = w2; }
+
+  // Newton for the out-token balance y (getTokenBalanceGivenInvariant, V2 divUpInt rounding). P_D over WORK,
+  // registered order; sum excludes the out index j.
+  let PD: Uint256 = n * w0;
+  PD = PD * w1 * n / D;
+  if (n === 3) { PD = PD * w2 * n / D; }
+  const s: Uint256 = w0 + w1 + w2 - bOut;
+  const inv2: Uint256 = D * D;
+  const c: Uint256 = (1 + (inv2 - 1) / (att * PD)) * AMP * bOut; // divUpInt(inv2, att*PD) * AMP * bOut
+  const bb: Uint256 = s + (D / att) * AMP;                       // s + divDown(D, att) * AMP
+  let y: Uint256 = 1 + (inv2 + c - 1) / (D + bb);                // divUpInt(inv2 + c, D + bb)
+  let doneY: Uint256 = 0;
+  for (let jt = 0; jt < 64; jt = jt + 1) {
+    if (doneY === 0) {
+      const prevY: Uint256 = y;
+      y = 1 + (y * y + c - 1) / (2 * y + bb - D); // divUpInt(y^2 + c, 2y + bb - D)
+      if (y > prevY) { if (y - prevY <= 1) { doneY = 1; } }
+      else { if (prevY - y <= 1) { doneY = 1; } }
+    }
+  }
+
+  if (bOut <= y + 1) { return 0; }
+  return bOut - y - 1;
+}
+
 // ── Compile-time protocol-presence flags (conditional compilation) ──
 // Each guards the per-protocol-SEPARABLE on-chain code below. index.ts derives each from the
 // prepared universe and passes them as compiler `defines` (with treeshake on) so a cook carries
@@ -442,6 +519,15 @@ function main(
   // EVM tests that hand-build a shorter cfg (no Balancer V3) stay valid; production always emits it (index.ts).
   let balancerV3Vault: Address = 0;
   if (cfg.length > 10) { balancerV3Vault = cfg[10]; }
+  // cfg[11] = the chain-wide Balancer V2 Vault (the canonical singleton 0xBA12…, SAME on every EVM chain; 0
+  // when no Balancer V2 venue). The BalancerV2 QL branch (segKind 6) reads its LIVE per-token balances via
+  // getPoolTokenInfo(poolId, token) SCALARS (cash+managed — the v12-safe read, unlike getPoolTokens which
+  // nests a dyn array in a tuple). One Vault serves every V2 ComposableStable on a chain. OPTIONAL 12th cfg
+  // field — guarded by cfg.length so venue EVM tests that hand-build a shorter cfg (no Balancer V2) stay
+  // valid; production always emits it (index.ts). (Distinct from cfg[10], the Balancer V3 Vault — a universe
+  // can hold BOTH.)
+  let balancerV2Vault: Address = 0;
+  if (cfg.length > 11) { balancerV2Vault = cfg[11]; }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -691,7 +777,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -736,6 +822,76 @@ function main(
           b3rateOut = IBalancerV3Vault.at(qd[7]).getRate();
           b3decIn = qd[8];
           b3decOut = qd[9];
+        }
+        // Balancer V2 ComposableStable (segKind 6): read the LIVE Vault StableMath state ONCE per venue (the
+        // pool's own quote — Vault.queryBatchSwap — is eth_call-only, so we replay the amplified StableSwap
+        // invariant on-chain, V2 rounding). Balances are SCALARS via getPoolTokenInfo(poolId, token) (cash [0] +
+        // managed [1]) on the Vault (cfg[11]) — the v12-safe read (getPoolTokens nests the balances dyn array in
+        // a tuple ⇒ garbage on v12). The BPT is excluded off-chain: the descriptor ships poolId (qd[6]), the
+        // THIRD non-BPT token address (qd[7]; 0 for a 2-token pool), the packed registered scaling positions
+        // (qd[8] = regPos0 | regPos1<<8 | regPos2<<16) and the non-BPT token count (qd[9] = 2 or 3). The scaling
+        // factors are a BARE array (getScalingFactors on the pool) INLINE-INDEXED by the registered position
+        // (variable index, proven on both engines) — LIVE, so a rate-scaled pool re-anchors. The upscaled non-BPT
+        // balances u0/u1/u2 (registered order) + the in/out scaling + amp + fee are hoisted here; each per-slice q
+        // is then a PURE stableOutV2 compute + up/downscale (0 staticcalls per slice).
+        let b2u0: Uint256 = 0;
+        let b2u1: Uint256 = 0;
+        let b2u2: Uint256 = 0;
+        let b2sfIn: Uint256 = 0;
+        let b2sfOut: Uint256 = 0;
+        let b2amp: Uint256 = 0;
+        let b2fee: Uint256 = 0;
+        let b2ij: Uint256 = 0;
+        if (HAS_BALANCER && qKind === 6) {
+          const B2_WAD: Uint256 = 1000000000000000000;
+          const b2pid: Uint256 = qd[6];
+          const b2third: Address = qd[7];
+          const b2packed: Uint256 = qd[8];
+          const b2n: Uint256 = qd[9];
+          b2amp = IBalancerV2Vault.at(qPool).getAmplificationParameter()[0];
+          b2fee = IBalancerV2Vault.at(qPool).getSwapFeePercentage();
+          b2ij = qi + qj * 256;
+          // Non-BPT index 0: its token address (qi ⇒ tokenIn, qj ⇒ tokenOut, else the third), balance (scalar
+          // cash+managed) and scaling (getScalingFactors()[regPos]). regPos travels packed in qd[8].
+          let a0: Address = b2third;
+          if (qi === 0) { a0 = tokenIn; }
+          if (qj === 0) { a0 = tokenOut; }
+          const r0p: Uint256 = b2packed & 255;
+          const raw0: Uint256 =
+            IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a0)[0] +
+            IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a0)[1];
+          const sf0: Uint256 = IBalancerV2Vault.at(qPool).getScalingFactors()[r0p];
+          b2u0 = raw0 * sf0 / B2_WAD;
+          // Non-BPT index 1.
+          let a1: Address = b2third;
+          if (qi === 1) { a1 = tokenIn; }
+          if (qj === 1) { a1 = tokenOut; }
+          const r1p: Uint256 = (b2packed / 256) & 255;
+          const raw1: Uint256 =
+            IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a1)[0] +
+            IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a1)[1];
+          const sf1: Uint256 = IBalancerV2Vault.at(qPool).getScalingFactors()[r1p];
+          b2u1 = raw1 * sf1 / B2_WAD;
+          // Non-BPT index 2 — only for a 3-token pool (n==3); a 2-token pool leaves u2/sf2 at 0.
+          let sf2: Uint256 = 0;
+          if (b2n === 3) {
+            let a2: Address = b2third;
+            if (qi === 2) { a2 = tokenIn; }
+            if (qj === 2) { a2 = tokenOut; }
+            const r2p: Uint256 = (b2packed / 65536) & 255;
+            const raw2: Uint256 =
+              IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a2)[0] +
+              IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a2)[1];
+            sf2 = IBalancerV2Vault.at(qPool).getScalingFactors()[r2p];
+            b2u2 = raw2 * sf2 / B2_WAD;
+          }
+          // The in/out token scaling (for the input upscale + output downscale below), by non-BPT index.
+          if (qi === 0) { b2sfIn = sf0; }
+          if (qi === 1) { b2sfIn = sf1; }
+          if (qi === 2) { b2sfIn = sf2; }
+          if (qj === 0) { b2sfOut = sf0; }
+          if (qj === 1) { b2sfOut = sf1; }
+          if (qj === 2) { b2sfOut = sf2; }
         }
         for (let k = 0; k < QL_S; k = k + 1) {
           if (stop === 0) {
@@ -882,6 +1038,28 @@ function main(
                   let rateUp: Uint256 = b3rateOut + 1;
                   if (b3rateOut / B3_WAD * B3_WAD === b3rateOut) { rateUp = b3rateOut; }
                   q = outScaled * B3_WAD / (b3decOut * rateUp);
+                }
+              }
+              // Balancer V2 ComposableStable (segKind 6) — COMPUTE, not quote (Vault.queryBatchSwap is
+              // eth_call-only). The cumulative out for total input xNext is getDy: net the swap fee on the RAW
+              // input (mulUp), UPSCALE the net input by the in token's scaling (mulDown), run stableOutV2 (the V2
+              // rounding — solves the invariant D + out-balance y over the NON-BPT upscaled balances), then
+              // DOWNSCALE the scaled-18 out by the out token's scaling (divDown). All reads were hoisted per-venue
+              // above, so this is pure arithmetic. Bit-for-bit with balancer-stable-math.ts getDy ⇒ solver ==
+              // oracle by construction (spike-verified wei-exact vs Vault.queryBatchSwap on v1+v12). The SHARED
+              // differencing/head/emit/sort below is unchanged.
+              if (HAS_BALANCER && qKind === 6) {
+                const B2W: Uint256 = 1000000000000000000;
+                let b2f: Uint256 = 0;
+                if (b2fee > 0) { const b2p: Uint256 = xNext * b2fee; b2f = (b2p - 1) / B2W + 1; } // mulUp on RAW
+                // fee >= input ⇒ zero net (mirrors the oracle getDy amountIn<=0 → 0; guards the checked-SUB underflow).
+                if (b2f >= xNext) { q = 0; }
+                else {
+                  const b2net: Uint256 = xNext - b2f;
+                  const b2inUp: Uint256 = b2net * b2sfIn / B2W; // upscale net input (mulDown)
+                  const b2out: Uint256 = stableOutV2(b2amp, b2u0, b2u1, b2u2, b2ij, b2inUp);
+                  if (b2out === 0) { q = 0; }
+                  else { q = b2out * B2W / b2sfOut; } // downscale to out-token native decimals (divDown)
                 }
               }
               if (q === 0) {

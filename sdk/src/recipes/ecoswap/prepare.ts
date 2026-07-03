@@ -71,7 +71,7 @@ import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
-import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
+import { buildBalancerStableQLLadder, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { estimateExpectedOutput } from "./expected-output.js";
 import {
   MIN_SQRT_RATIO,
@@ -824,34 +824,6 @@ function buildMaverickBrackets(pool: MaverickPool, refIdx: number, amountIn: big
   return brackets;
 }
 
-/**
- * Build Balancer V2 ComposableStable segments for one pool by sampling the bigint StableMath replay (NO
- * extra RPC — pure bigint on the read invariant state). Each sampled (Δinput, Δoutput) increment becomes
- * a STATIC segment (kind BalancerStable) in unified out/in space, refIdx → the Balancer venue index. The
- * marginal is the POST-FEE execution price (getDy nets the swap fee), so it enters the descending-price
- * merge directly as both sqrtAdjNear and sqrtAdjFar. The stable math (A-invariant + BPT exclusion +
- * scaling factors) is OFF-CHAIN ONLY for the split; the on-chain solver executes via the EXISTING engine
- * BalancerV2 dispatch swap(SwapParams{poolType:4}) → _swapBalancerV2 → Vault.swap(GIVEN_IN).
- */
-function buildBalancerStableBrackets(pool: BalancerStablePool, refIdx: number, amountIn: bigint): EcoBracket[] {
-  const segs = buildBalancerStableSegments(pool, amountIn);
-  const brackets: EcoBracket[] = [];
-  for (const sm of segs) {
-    brackets.push({
-      kind: EcoBracketKind.BalancerStable,
-      refIdx,
-      sqrtNear: sm.marginalOI,
-      sqrtFar: sm.marginalOI,
-      liquidity: 0n,
-      capacity: sm.capacity,
-      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Balancer swap fee (post-fee dy)
-      sqrtAdjFar: sm.marginalOI,
-      worstMarginalOI: sm.worstMarginalOI,
-    });
-  }
-  return brackets;
-}
-
 /** Round a Balancer swap fee (1e18-WAD) to ppm (the price-ordering coordinate / diagnostics). */
 function balancerFeeToPpm(swapFeeWad: bigint): number {
   return Number((swapFeeWad * 1_000_000n + 5n * 10n ** 17n) / 10n ** 18n);
@@ -1177,28 +1149,38 @@ export async function prepareEcoSwap(
   }
 
   const balancerStables: EcoBalancerStable[] = [];
-  const balancerBracketSets: EcoBracket[][] = [];
-  // Balancer V2 — known-pool-address discovery (the FactoryConfig.address is the Vault; the per-config
-  // balancerStablePools carries the candidate ComposableStable pools). Sampled like Curve; executed via
-  // the EXISTING engine BalancerV2 dispatch (poolType 4 → _swapBalancerV2 → Vault.swap). NO engine change.
+  // Balancer V2 ComposableStable — known-pool-address discovery (the FactoryConfig.address is the canonical
+  // Vault singleton; the per-config balancerStablePools carries the candidate ComposableStable pools). A
+  // QUOTE-LADDER (QL) LIVE-WALK venue (segKind 6): the on-chain solver reads the LIVE Vault StableMath state at
+  // cook (NON-BPT balances via getPoolTokenInfo SCALARS, scaling via getScalingFactors, amp/fee live) and
+  // REPLAYS the amplified StableSwap invariant (V2 rounding) to build the SAME geometric QL ladder — Balancer's
+  // own quote (Vault.queryBatchSwap) is eth_call-ONLY, so it cannot be quoted from a live view on-chain. So
+  // prepare ships ONLY the descriptor (pool + non-BPT in/out indices + poolId + non-BPT token addresses +
+  // registered scaling positions) — NO off-chain sampled segments (see index.ts buildQLVenues; the oracle
+  // mirrors it via buildBalancerStableQLLadder). Executed via the EXISTING engine BalancerV2 dispatch (poolType
+  // 4 → _swapBalancerV2 → Vault.swap(GIVEN_IN)); NO engine change. Because the ladder is built LIVE on-chain,
+  // the split RE-ANCHORS to cook-time balances + scaling (wei-exact vs the oracle even after adverse drift).
   const balancerVaults = poolConfig.factories.filter((f) => f.factoryType === FactoryType.BalancerV2);
   if (balancerVaults.length > 0) {
     const balRaw = await discoverBalancerStablePoolsTyped(tokenIn, tokenOut, client, balancerVaults);
     for (const bp of balRaw) {
-      const refIdx = balancerStables.length;
-      const bb = buildBalancerStableBrackets(bp, refIdx, amountIn);
-      if (bb.length === 0) continue;
+      // Liveness probe only — the QL ladder is built ON-CHAIN from live StableMath state, not from prepared
+      // segments; a descriptor that quotes no valid slice at the live state is dropped.
+      const qb = buildBalancerStableQLLadder(bp, amountIn);
+      if (qb.length === 0) continue;
       balancerStables.push({
         address: bp.address,
         i: bp.i,
         j: bp.j,
         feePpm: balancerFeeToPpm(bp.swapFeeWad),
         source: bp.source,
+        poolId: bp.poolId!,
+        nonBptTokens: bp.tokens!,
+        nonBptRegPos: bp.regPos!,
+        vault: bp.vault!,
       });
-      balancerBracketSets.push(bb);
     }
   }
-  for (const set of balancerBracketSets) brackets.push(...set);
 
   const eulerSwaps: EcoEulerSwap[] = [];
   // EulerSwap — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE
@@ -1697,7 +1679,6 @@ export async function prepareEcoSwap(
   // Fermi AND EulerSwap ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT sampled
   // segments — the on-chain solver builds each ladder live from its quote view — so all ten are reported
   // below as "QL", not a seg count.
-  const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
   console.log(
@@ -1709,7 +1690,7 @@ export async function prepareEcoSwap(
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
       `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${balancerV3Pools.length} Balancer-V3 QL, ` +
       `${brackets.length} sampled segments (` +
-      `${nBalancerSegs} Balancer-stable, ${nMaverickSegs} Maverick, ${nFluidSegs} Fluid)`,
+      `${nMaverickSegs} Maverick, ${nFluidSegs} Fluid)`,
   );
 
   const prepared: EcoSwapPrepared = {

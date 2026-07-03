@@ -1420,21 +1420,33 @@ export async function discoverBalancerStablePoolsTyped(
         })) as readonly [readonly Hex[], readonly bigint[], bigint];
 
         // Exclude the BPT from the StableMath token set; build the NON-BPT balances/scaling arrays and
-        // map tokenIn/tokenOut to their NON-BPT indices.
+        // map tokenIn/tokenOut to their NON-BPT indices. `regPos` records each non-BPT token's FULL registered
+        // position (the getScalingFactors index the on-chain QL solver inline-reads for its live scaling factor).
         const tks: Hex[] = [];
         const bals: bigint[] = [];
         const scals: bigint[] = [];
+        const regPos: number[] = [];
         for (let k = 0; k < tokens.length; k++) {
           if (k === bptIndex) continue;
           tks.push(tokens[k]);
           bals.push(balances[k]);
           // scalingFactors is aligned with the FULL registered token list (incl. BPT), so index it by k.
           scals.push(scalingRaw[k] ?? WAD_BAL);
+          regPos.push(k);
         }
         const i = tks.findIndex((t) => t.toLowerCase() === inLower);
         const j = tks.findIndex((t) => t.toLowerCase() === outLower);
         if (i < 0 || j < 0) continue; // pool does not hold BOTH non-BPT tokens
-        if (bals[i] <= 0n || bals[j] <= 0n) continue;
+        // Every non-BPT balance must be live: a zero balance divides-by-zero in the StableMath invariant, and
+        // for n=3 a zero THIRD balance would ship n=3 to the oracle (crash) while the solver reads u2=0 as n=2.
+        if (bals.some((b) => b <= 0n)) continue;
+        // SCOPE: the on-chain QL solver's inlined StableMath (ecoswap.sauce.ts `stableOutV2`) + the 10-column
+        // qlv descriptor (poolId + ONE third-token address + packed registered positions + n) cover 2- and
+        // 3-NON-BPT-token pools (the small-n inlined form, spike-verified wei-exact vs the real Vault on both
+        // engines). A pool with >3 non-BPT tokens is EXCLUDED (documented follow-up — it needs an n>3 inlined
+        // form + a wider descriptor); ComposableStable pools are overwhelmingly 2- or 3-asset, so this covers
+        // the deep production universe.
+        if (tks.length > 3) continue;
 
         pools.push({
           poolType: SwapPoolType.BalancerV2,
@@ -1446,6 +1458,10 @@ export async function discoverBalancerStablePoolsTyped(
           scalingFactors: scals,
           swapFeeWad: feeRaw,
           source: `${vault.label} (Balancer ComposableStable)`,
+          poolId,
+          tokens: tks,
+          regPos,
+          vault: vault.address,
         });
       } catch {
         // Pool / Vault read failed (not a stable pool, paused, or unregistered) — skip.

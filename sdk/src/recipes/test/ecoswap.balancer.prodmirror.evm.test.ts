@@ -35,10 +35,13 @@
  *       balances exactly, and getRateProviders confirms the ZERO-rate-provider fidelity (no external
  *       rate-provider dependency — full real-code parity, NO stubs).
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
- *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts optimalSplit,
- *       seeded from the REAL captured invariant state via the SHARED buildBalancerStableSegments) ==
- *       the REAL Vault's OWN pre-swap queryBatchSwap view of the awarded slice, all to the wei. spent ==
- *       awarded is asserted explicitly.
+ *   (c) WEI-EXACT — Balancer V2 is a LIVE-WALK QUOTE-LADDER venue (segKind 6): the solver replays the
+ *       amplified StableSwap invariant ON-CHAIN from live Vault state (getPoolTokenInfo balances /
+ *       getScalingFactors / amp / fee). Asserted: the on-chain replay == the REAL Vault queryBatchSwap at
+ *       EVERY QL ladder point; and the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts,
+ *       priced via the SHARED buildBalancerStableQLLadder) == the REAL Vault's OWN pre-swap queryBatchSwap of
+ *       the awarded slice, all to the wei (spent == awarded asserted explicitly); plus an ADVERSE-DRIFT
+ *       re-anchor (a real Vault.swap moves the balances between prepare and cook — the live read re-prices).
  *
  * HONEST fidelity note: the picked pool has ZERO rate providers, so onSwap makes NO external
  * rate-provider call — the dependency graph is EXACTLY {Vault, pool}, both REAL runtimes captured. NO
@@ -88,7 +91,7 @@ import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/const
 import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
-import { getDy, type BalancerStablePool } from "../shared/balancer-stable-math";
+import { getDy, buildBalancerStableQLLadder, type BalancerStablePool } from "../shared/balancer-stable-math";
 
 const SNAP_NAME = "ethereum-balancer-GHOUSDCUSDT";
 const ENGINE_CELLS = engineCells();
@@ -149,9 +152,9 @@ describe("EcoSwap Balancer V2 ComposableStable prod-mirror — REAL bytecode, no
 
   /** The neutral oracle's BalancerStablePool descriptor for the single reproduced ComposableStable,
    *  seeded from the REAL captured invariant state (the NON-BPT balances / scaling / amp / fee, with the
-   *  BPT at bptIndex excluded). tokenIn = the first NON-BPT token (i), tokenOut = the second (j). This is
-   *  the SAME buildBalancerStableSegments the production prepare uses, so the awarded Σ matches the oracle
-   *  bit-for-bit and getDy replays the real Vault StableMath. */
+   *  BPT at bptIndex excluded). tokenIn is non-BPT index i, tokenOut is non-BPT index j. The oracle prices
+   *  it via the SAME buildBalancerStableQLLadder the on-chain solver replays on-chain from live Vault state,
+   *  so the awarded Σ matches the oracle bit-for-bit and getDy replays the real Vault StableMath. */
   function offPool(state: BalancerStateSnapshot, tokenIn: Hex, tokenOut: Hex): BalancerStablePool {
     // Build the NON-BPT balances/scaling arrays (excluding the BPT at bptIndex), aligned by index.
     const bals: bigint[] = [];
@@ -177,6 +180,50 @@ describe("EcoSwap Balancer V2 ComposableStable prod-mirror — REAL bytecode, no
       swapFeeWad: BigInt(state.swapFeeWad),
       source: "prod-mirror",
     };
+  }
+
+  /** The neutral oracle's BalancerStablePool descriptor built from the pool's LIVE (current-block) Vault
+   *  balances (read via getPoolTokens) — used AFTER a drift so the oracle prices on the moved state exactly as
+   *  the on-chain solver does (which reads getPoolTokenInfo live). Scaling/amp/fee are pool constants (ZERO
+   *  rate providers), so only the balances move. */
+  async function liveOffPool(tokenIn: Hex, tokenOut: Hex): Promise<BalancerStablePool> {
+    const [tokens, balances] = (await c.publicClient.readContract({
+      address: etched.vault, abi: balancerVaultReadAbi, functionName: "getPoolTokens", args: [etched.poolId],
+    })) as readonly [readonly Hex[], readonly bigint[], bigint];
+    const bals: bigint[] = [];
+    const scals: bigint[] = [];
+    const nonBptAddrs: Hex[] = [];
+    for (let k = 0; k < tokens.length; k++) {
+      if (k === snaps.state.bptIndex) continue;
+      bals.push(balances[k]);
+      scals.push(BigInt(snaps.state.scalingFactors[k]));
+      nonBptAddrs.push(tokens[k]);
+    }
+    const i = nonBptAddrs.findIndex((a) => a.toLowerCase() === tokenIn.toLowerCase());
+    const j = nonBptAddrs.findIndex((a) => a.toLowerCase() === tokenOut.toLowerCase());
+    return {
+      poolType: SwapPoolType.BalancerV2, address: etched.pool, i, j,
+      amp: BigInt(snaps.state.amp), balances: bals, scalingFactors: scals,
+      swapFeeWad: BigInt(snaps.state.swapFeeWad), source: "prod-mirror-live",
+    };
+  }
+
+  /** Real Vault.swap(GIVEN_IN) to MOVE the pool's registered balances (the genuine drift for a zero-rate
+   *  ComposableStable — its scaling is constant, so only a balance change re-prices it). Funds+approves the
+   *  caller and lands one GIVEN_IN single swap through the REAL etched Vault. */
+  async function driftViaVaultSwap(assetIn: Hex, assetOut: Hex, amount: bigint): Promise<void> {
+    await mint(c.walletClient, c.publicClient, assetIn, c.account0, amount);
+    await approve(c.walletClient, c.publicClient, assetIn, etched.vault, amount);
+    await c.walletClient.writeContract({
+      address: etched.vault, abi: balancerVaultReadAbi, functionName: "swap",
+      args: [
+        { poolId: etched.poolId, kind: 0, assetIn, assetOut, amount, userData: "0x" as Hex },
+        { sender: c.account0, fromInternalBalance: false, recipient: c.account0, toInternalBalance: false },
+        0n, 2n ** 63n,
+      ],
+      account: c.account0, chain: null,
+    });
+    await c.testClient.mine({ blocks: 1 });
   }
 
   // ── (a) REAL BYTECODE — the etched code IS the captured mainnet runtime, byte-for-byte. ──
@@ -279,6 +326,43 @@ describe("EcoSwap Balancer V2 ComposableStable prod-mirror — REAL bytecode, no
     );
   });
 
+  // ── (a2) The on-chain StableMath replay == the REAL Vault at every QL LADDER POINT (wei-exact). ──
+  // Balancer V2's own quote (Vault.queryBatchSwap) is eth_call-ONLY, so the solver REPLAYS the amplified
+  // StableSwap invariant on-chain. This asserts that replay (via the shared getDy the oracle's
+  // buildBalancerStableQLLadder + the solver's inlined stableOutV2 both mirror bit-for-bit) equals the REAL
+  // Vault's OWN queryBatchSwap at EVERY geometric ladder point — not just the final award — so the whole
+  // price ladder the solver builds on-chain is real-code-exact at all S sizes.
+  it("on-chain StableMath replay == REAL Vault queryBatchSwap at every QL ladder point (wei-exact)", async () => {
+    const tokenIn = etched.tokenIn;
+    const tokenOut = etched.tokenOut;
+    const amountIn = nonBptBalanceOf(snaps.state, tokenIn) / 20n;
+    const op = offPool(snaps.state, tokenIn, tokenOut);
+    const ladder = buildBalancerStableQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "non-empty Balancer QL ladder");
+    // Walk the ladder's CUMULATIVE input points and cross-check getDy(cum) == the REAL Vault queryBatchSwap(cum).
+    let cum = 0n;
+    let points = 0;
+    for (const s of ladder) {
+      cum += s.capacity;
+      const deltas = (await c.publicClient.readContract({
+        address: etched.vault, abi: balancerVaultReadAbi, functionName: "queryBatchSwap",
+        args: [
+          0,
+          [{ poolId: etched.poolId, assetInIndex: 0n, assetOutIndex: 1n, amount: cum, userData: "0x" as Hex }],
+          [tokenIn, tokenOut],
+          { sender: etched.pool, fromInternalBalance: false, recipient: etched.pool, toInternalBalance: false },
+        ],
+      })) as readonly bigint[];
+      const realOut = -deltas[1];
+      assert.equal(
+        getDy(op, cum), realOut,
+        `QL ladder point ${points} (cum=${cum}): on-chain StableMath replay == REAL Vault queryBatchSwap (wei-exact)`,
+      );
+      points++;
+    }
+    console.log(`  [balancer-prod-mirror] on-chain StableMath replay == REAL Vault at ${points} QL ladder points (wei-exact)`);
+  });
+
   // ── (b)+(c) FAST/OFFLINE run through the production discovery path, wei-exact vs the oracle. ──
   async function runProdMirror(engine: Engine): Promise<void> {
     await setup();
@@ -317,15 +401,22 @@ describe("EcoSwap Balancer V2 ComposableStable prod-mirror — REAL bytecode, no
       etched.pool.toLowerCase(),
       "the discovered Balancer venue is the REAL etched pool",
     );
+    // Balancer V2 is now a QUOTE-LADDER (QL) venue (segKind 6): prepare ships ONLY the descriptor (poolId +
+    // non-BPT token addresses + registered scaling positions), NO static sampled brackets — the ladder is built
+    // ON-CHAIN from live Vault StableMath state. Assert the descriptor is complete (the solver reads it live).
     assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.BalancerStable),
-      "Balancer-stable segments present",
+      (prepared.brackets ?? []).every((b) => b.kind !== EcoBracketKind.BalancerStable),
+      "no static Balancer-stable brackets (QL venue — descriptor-only, ladder built on-chain)",
     );
+    const bDesc = prepared.balancerStables![0];
+    assert.equal(bDesc.poolId.toLowerCase(), etched.poolId.toLowerCase(), "descriptor carries the Vault poolId");
+    assert.equal(bDesc.nonBptTokens.length, snaps.state.tokens.length - 1, "descriptor carries all NON-BPT tokens");
+    assert.equal(bDesc.nonBptRegPos.length, bDesc.nonBptTokens.length, "one registered scaling position per non-BPT token");
 
     // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Balancer venue seeded from the REAL captured invariant
-    // state via the SHARED buildBalancerStableSegments. Pure off-chain math (BEFORE the cook), so the
-    // awarded Σ is known ahead — and the engine's static-segment cursor consumes the IDENTICAL grid, so
-    // on-chain spent == oracle.totalInput to the wei.
+    // state, priced via the SHARED buildBalancerStableQLLadder (the IDENTICAL geometric ladder the on-chain
+    // solver replays live). Pure off-chain math (BEFORE the cook), so the awarded Σ is known ahead — and the
+    // solver builds the SAME ladder on-chain, so on-chain spent == oracle.totalInput to the wei.
     const op = offPool(snaps.state, tokenIn, tokenOut);
     const optPools: OptimalPool[] = [{ balancer: op, feePpm: 0 }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
@@ -365,27 +456,19 @@ describe("EcoSwap Balancer V2 ComposableStable prod-mirror — REAL bytecode, no
     assert.equal(vaultIn, spent, "REAL Vault received the FULL input (Balancer's fee accrues in the pool, not routed out)");
 
     // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance.
-    // (Balancer is a SAMPLED-SEGMENT venue: buildBalancerStableSegments samples the StableMath curve on a
-    // squared-index geometric grid capped at amountIn, and the strictly-descending-marginal guard may drop
-    // a final near-saturation slice — so the awarded Σ is the grid's covered capacity, at most amountIn.
-    // The engine's static-segment cursor consumes the IDENTICAL grid, so spent == the oracle's awarded Σ
-    // == oracle.totalInput to the WEI. This is the correct exact-on-grid property for a sampled-segment
-    // source — asserting a full-fill amountIn would be false for any sampled venue, so we assert the grid Σ.)
+    // (Balancer V2 is a QUOTE-LADDER venue: the solver builds a QL_S=8 geometric ladder ON-CHAIN from the
+    // live StableMath state, and the oracle's buildBalancerStableQLLadder builds the IDENTICAL ladder off the
+    // same state — so spent == the oracle's awarded Σ == oracle.totalInput to the WEI. The ladder reaches
+    // amountIn for a deep venue at this sizing, so it is a FULL fill (tail==0), asserted below.)
     assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
     assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
-    // The awarded grid Σ is at most amountIn; the unfilled tail is the Balancer segment-grid remainder (the
-    // strictly-descending-marginal guard's dropped final near-saturation slice), at most ONE slice of the
-    // 24-point ladder. For THIS sizing (~5% of the tokenIn balance, one deep venue) the geometric grid
-    // covers [0, amountIn] and the whole trade allocates to the single pool — so it is a FULL fill (tail==0),
-    // asserted explicitly below (matching the Curve tests' explicit full-fill). We ALSO keep the general
-    // sampled-venue bound as a regression floor (a broken ladder / wrong orientation grossly under-fills and
-    // still fails), tightened to <0.1% since a single dropped slice of a 24-point squared-index grid capped
-    // at amountIn is far under 1% — a full-fill amountIn is the correct assertion HERE, but the bound guards
-    // the general sampled-segment property if a future re-sizing pushes the ladder past saturation.
+    // For THIS sizing (~5% of the tokenIn balance, one deep venue) the QL ladder covers [0, amountIn] and the
+    // whole trade allocates to the single pool — a FULL fill (tail==0), asserted explicitly. The <0.1% bound is
+    // kept as a regression floor (a broken ladder / wrong orientation grossly under-fills and still fails).
     assert.ok(spent <= amountIn, "spent does not exceed amountIn");
     const tail = amountIn - spent;
-    assert.equal(spent, amountIn, `single-venue full-fill: spent == amountIn (grid covers [0, amountIn]); tail=${tail}`);
-    assert.ok(tail * 1000n < amountIn, `unfilled tail is at most one dropped Balancer grid slice (<0.1% of amountIn): tail=${tail}`);
+    assert.equal(spent, amountIn, `single-venue full-fill: spent == amountIn (QL ladder covers [0, amountIn]); tail=${tail}`);
+    assert.ok(tail * 1000n < amountIn, `unfilled tail is at most one QL ladder slice (<0.1% of amountIn): tail=${tail}`);
 
     // The caller-received tokenOut == getDy(spent) (the oracle's realized dy for the awarded Σ) == the REAL
     // Vault's OWN pre-swap queryBatchSwap(spent) view, all to the WEI. NO tolerance. The three-way
@@ -405,6 +488,82 @@ describe("EcoSwap Balancer V2 ComposableStable prod-mirror — REAL bytecode, no
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`runs EcoSwap through the REAL Balancer pool + Vault bytecode [${engine}] — wei-exact vs the neutral oracle, offline`, { skip }, async () => {
       await runProdMirror(engine);
+    });
+  }
+
+  // ── (d) ADVERSE-DRIFT re-anchor — the LIVE balance read re-prices at cook. ──
+  // Balancer V2 is now a LIVE-WALK QL venue: the solver reads the pool's balances LIVE at cook (via
+  // getPoolTokenInfo) and replays the invariant, so a balance move between prepare and cook MUST re-anchor the
+  // fill. Here we prepare+compile at T0, then land a REAL Vault.swap (a big GHO→USDC in the recipe's OWN
+  // direction — an ADVERSE move that worsens the GHO→USDC price), then cook the T0 bytecode. The received
+  // output must equal the oracle rebuilt from the DRIFTED (T1) balances AND the REAL Vault queryBatchSwap at
+  // T1 — and DIFFER from the stale-T0 value (a snapshotted-balance solver would land the T0 number and fail).
+  async function runDrift(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+    const tokenIn = etched.tokenIn; // GHO
+    const tokenOut = etched.tokenOut; // USDC
+
+    // A modest trade (~2% of the GHO balance) so the pool stays deep after the drift and the whole trade still
+    // allocates to it (single venue) — the OUTPUT change is then a clean function of the re-anchored balances.
+    const amountIn = nonBptBalanceOf(snaps.state, tokenIn) / 50n;
+    const poolConfig = balancerPoolConfig(tokenIn, tokenOut);
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn);
+
+    // Prepare + compile at T0 (snapshots nothing balance-side — the solver reads live at cook).
+    const { bytecodes } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(engine, stack, v12), caller, poolConfig, undefined, engine,
+    );
+
+    // The T0 (pre-drift) oracle — what a STALE-balance solver would land for the full amountIn.
+    const opT0 = offPool(snaps.state, tokenIn, tokenOut);
+    const receivedIfStale = getDy(opT0, amountIn);
+
+    // DRIFT: a large GHO→USDC through the REAL Vault (raises the GHO balance, lowers USDC) — the recipe's own
+    // direction, so it worsens the subsequent GHO→USDC price (adverse). ~15% of the GHO balance.
+    await driftViaVaultSwap(tokenIn, tokenOut, nonBptBalanceOf(snaps.state, tokenIn) * 15n / 100n);
+
+    // The T1 (post-drift) oracle + the REAL Vault's OWN queryBatchSwap at T1 — the re-anchored ground truth.
+    const opT1 = await liveOffPool(tokenIn, tokenOut);
+    const onViewT1Deltas = (await c.publicClient.readContract({
+      address: etched.vault, abi: balancerVaultReadAbi, functionName: "queryBatchSwap",
+      args: [
+        0,
+        [{ poolId: etched.poolId, assetInIndex: 0n, assetOutIndex: 1n, amount: amountIn, userData: "0x" as Hex }],
+        [tokenIn, tokenOut],
+        { sender: caller, fromInternalBalance: false, recipient: caller, toInternalBalance: false },
+      ],
+    })) as readonly bigint[];
+    const onViewT1 = -onViewT1Deltas[1];
+    // Sanity: the drift genuinely moved the priced output (adverse ⇒ T1 out < T0 out for the same input).
+    assert.notEqual(onViewT1, receivedIfStale, "drift moved the GHO→USDC output (a stale-balance fill would differ)");
+    assert.ok(onViewT1 < receivedIfStale, "adverse drift worsened the GHO→USDC output");
+
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "drifted cook() must succeed against the REAL Balancer pool + Vault");
+
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+    assert.equal(spent, amountIn, "drift: whole trade still routes to the single deep venue");
+    // RE-ANCHORED: the received output == the oracle rebuilt from the DRIFTED balances == the REAL Vault
+    // queryBatchSwap at T1, to the WEI — and it is NOT the stale-T0 value. Proves the balance is read LIVE.
+    assert.equal(received, getDy(opT1, spent), "received == neutral-oracle getDy at the DRIFTED (T1) balances (re-anchored)");
+    assert.equal(received, onViewT1, "received == REAL Vault queryBatchSwap at the DRIFTED (T1) state (exact-in-dy)");
+    assert.notEqual(received, receivedIfStale, "received != the stale-T0 fill — the LIVE balance read re-anchored the output");
+
+    console.log(
+      `  [balancer-prod-mirror:${engine}:drift] re-anchored: received=${received} (T1 query=${onViewT1}, ` +
+        `stale-T0=${receivedIfStale}, spent=${spent})`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`ADVERSE-DRIFT re-anchor — LIVE balance read between prepare and cook [${engine}]`, { skip }, async () => {
+      await runDrift(engine);
     });
   }
 });

@@ -55,6 +55,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
@@ -140,6 +141,23 @@ export interface BalancerStablePool {
   swapFeeWad: bigint;
   /** Discovery source label. */
   source: string;
+
+  // ── QUOTE-LADDER (QL) live-walk descriptor fields ──────────────────────────────────────────────────────
+  // The on-chain solver (segKind 6) reads the LIVE Vault StableMath state at cook and replays the amplified
+  // StableSwap invariant (V2 rounding) to build its price ladder; the oracle mirrors that ladder BIT-FOR-BIT
+  // via `buildBalancerStableQLLadder` off the fields ABOVE (balances/scalingFactors/amp/swapFeeWad/i/j — read
+  // live at the same block, so oracle == solver by construction even after adverse drift). These extra fields
+  // are what the SOLVER descriptor (buildQLVenues) needs to read that live state on-chain; they are OPTIONAL so
+  // the oracle / existing fixtures that only set the math fields still typecheck.
+  /** The pool's Vault poolId (bytes32) — passed to getPoolTokenInfo(poolId, token) for the live balances. */
+  poolId?: `0x${string}`;
+  /** The NON-BPT token addresses in registered (non-BPT) order — `tokens[i]` is tokenIn, `tokens[j]` tokenOut. */
+  tokens?: `0x${string}`[];
+  /** The FULL registered position of each NON-BPT token (aligned with `balances`/`scalingFactors`/`tokens`) —
+   *  the getScalingFactors() index the solver inline-reads for each non-BPT token's live scaling factor. */
+  regPos?: number[];
+  /** The canonical Balancer V2 Vault singleton (the getPoolTokenInfo target; chain-wide, threaded as cfg[11]). */
+  vault?: `0x${string}`;
 }
 
 /**
@@ -353,4 +371,18 @@ export function buildBalancerStableSegments(
     prevOut = out;
   }
   return segs;
+}
+
+/**
+ * Build one Balancer V2 ComposableStable pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder`
+ * recurrence driven by the StableMath `getDy`, so the oracle/reference stay wei-exact with the on-chain solver
+ * (segKind 6) by construction: the solver builds the IDENTICAL geometric ladder from the SAME live state (live
+ * balances via getPoolTokenInfo, live scaling via getScalingFactors, live amp/fee), replaying the SAME V2
+ * StableMath (`stableOutV2` in ecoswap.sauce.ts, bit-for-bit with this module's getDy). getDy is already
+ * post-fee, so marginalOI IS the execution price (adjNear == adjFar == marginalOI). No prepared segments —
+ * prepare ships only the descriptor. Mirrors `buildBalancerV3QLLadder`; supersedes the static
+ * `buildBalancerStableSegments` (kept only for legacy callers / diagnostics).
+ */
+export function buildBalancerStableQLLadder(pool: BalancerStablePool, amountIn: bigint): BalancerStableSegment[] {
+  return buildQLLadder((dx) => getDy(pool, dx), amountIn) as BalancerStableSegment[];
 }

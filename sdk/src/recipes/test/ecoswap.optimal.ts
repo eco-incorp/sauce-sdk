@@ -67,7 +67,7 @@ import { buildLbQLLadder, type LbPool } from "../shared/lb-math.js";
 import { buildDodoQLLadder, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableQLLadder, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatQLLadder, type WombatPool } from "../shared/wombat-math.js";
-import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
+import { buildBalancerStableQLLadder, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { buildEulerSwapQLLadder, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
@@ -596,15 +596,17 @@ function wombatSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segm
 }
 
 /**
- * Enumerate one Balancer V2 ComposableStable pool's segments via the SHARED bigint StableMath replay
- * (buildBalancerStableSegments) from the live invariant state. The amountIn caps the sampled range —
- * the same bound prepare uses — so the oracle and prepare emit the IDENTICAL segment grid (single
- * source), making the split exact-on-grid. The Balancer marginalOI is the post-fee execution price
- * (getDy nets the swap fee); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Balancer V2 ComposableStable pool's segments via the SHARED QUOTE-LADDER
+ * (buildBalancerStableQLLadder) — the IDENTICAL geometric-slice ladder the on-chain solver (segKind 6) builds
+ * in setup by replaying the amplified StableSwap invariant (V2 rounding) from LIVE Vault state (getPoolTokenInfo
+ * balances / getScalingFactors / amp / fee). Driven by the shared getDy bigint (bit-for-bit with the solver's
+ * inlined stableOutV2), so the oracle and solver stay wei-exact BY CONSTRUCTION (no prepared segments — prepare
+ * ships only the descriptor). The Balancer marginalOI is the post-fee execution price (getDy nets the swap fee);
+ * adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
  */
 function balancerStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildBalancerStableSegments(p.balancer!, amountIn)) {
+  for (const s of buildBalancerStableQLLadder(p.balancer!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

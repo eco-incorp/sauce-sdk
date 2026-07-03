@@ -57,8 +57,8 @@ import {
   maybeDeployV12Stack,
   cookTarget,
 } from "./harness/engine";
-import { MIN_SQRT_RATIO } from "../shared/constants";
-import { getDy, buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math";
+import { MIN_SQRT_RATIO, BALANCER_V2_VAULT } from "../shared/constants";
+import { getDy, buildBalancerStableQLLadder, type BalancerStablePool } from "../shared/balancer-stable-math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
@@ -77,14 +77,16 @@ const BALANCER_ONLY_DEFINES: Record<string, boolean> = {
   HAS_BALANCER: true,
 };
 
-// Balancer-only run: zero direct pools/routes/netCache; the Balancer venues ride entirely inside the
-// segs stream (segKind 6). The solver's 5 compiler args, in index.ts order.
+// Balancer-only run: zero direct pools/routes/netCache/segs; the Balancer venues are QUOTE-LADDER (QL)
+// venues (segKind 6) — their price ladder is built ON-CHAIN in the solver from LIVE Vault StableMath state,
+// so they ride entirely inside the `qlv` descriptor stream. cfg is 12 fields (index.ts order): cfg[11] is
+// the canonical Balancer V2 Vault (the getPoolTokenInfo target); cfg[6..10] are 0 (no Fluid/Mento/BalV3).
 function balancerArgs(
   tokenIn: Hex,
   tokenOut: Hex,
   amountIn: bigint,
   caller: Hex,
-  segs: bigint[][],
+  qlv: bigint[][],
 ): unknown[] {
   return [
     [
@@ -92,41 +94,45 @@ function balancerArgs(
       BigInt(tokenOut),
       amountIn,
       BigInt(caller),
-      MIN_SQRT_RATIO + 1n, // priceLimit (unused by Balancer; the merge ignores it for static segs)
+      MIN_SQRT_RATIO + 1n, // priceLimit (unused by Balancer; the merge ignores it for QL venues)
       0n, // directCount — no direct pools
+      0n, // cfg[6] — Fluid resolver (none)
+      0n, // cfg[7] — Mento Broker (none)
+      0n, // cfg[8] — Balancer V3 Router (none)
+      0n, // cfg[9] — amountOutMin floor (none)
+      0n, // cfg[10] — Balancer V3 Vault (none)
+      BigInt(BALANCER_V2_VAULT), // cfg[11] — Balancer V2 Vault (the live getPoolTokenInfo target)
     ],
     [], // pools
     [], // netCache
     [], // routing
-    segs,
-    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
+    [], // segs — Balancer V2 is a QL venue now (no static sampled segments)
+    qlv,
   ];
 }
 
-// One Balancer venue → its sampled segments as segs rows. refIdx tags the on-chain per-venue accumulator
-// (binp[refIdx]); venue is the POOL address (the engine derives the poolId). Built from the SAME
-// buildBalancerStableSegments the oracle uses, so the awarded Σ == the off-chain share by construction.
-function balancerSegRows(pool: BalancerStablePool, refIdx: number, amountIn: bigint): bigint[][] {
-  return buildBalancerStableSegments(pool, amountIn).map((s) => [
-    BigInt(refIdx),
-    s.capacity,
-    s.marginalOI, // sqrtAdjNear (post-fee; the descending-price sort key)
-    s.marginalOI, // sqrtAdjFar (a Balancer segment is a flat slice)
-    6n, // segKind = Balancer ComposableStable
+// One Balancer venue → its QL descriptor row (segKind 6), mirroring index.ts buildQLVenues for the fixture
+// pool token list [BPT(reg0), tokenIn(reg1), tokenOut(reg2)] (bptIndex 0). qd[1]/qd[2] = the non-BPT
+// invariant-order in/out indices (0/1); qd[6] = poolId; qd[7] = third non-BPT token (0 — 2-token pool);
+// qd[8] = packed registered scaling positions (regPos_in=1 | regPos_out=2<<8 = 513); qd[9] = 2. refIdx tags
+// the on-chain per-venue accumulator (binp[refIdx]). The solver reads the LIVE balances/scaling/amp/fee and
+// replays the SAME StableMath the oracle's buildBalancerStableQLLadder does, so the split matches by construction.
+function balancerQlvRow(pool: BalancerStablePool, refIdx: number, poolId: Hex): bigint[] {
+  // The fixture's NON-BPT tokens are at registered positions 1 and 2 (BPT at reg0). regPos is aligned with
+  // the NON-BPT invariant order [non-BPT0 -> reg1, non-BPT1 -> reg2], INDEPENDENT of the swap direction.
+  const packedReg = 1n | (2n << 8n);
+  return [
     BigInt(pool.address),
-    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
-  ]);
-}
-
-// Interleave + sort segs rows the way index.ts buildSegs does: DESC by sqrtAdjNear, then DESC by
-// sqrtAdjFar, then by refIdx. The on-chain static-segment cursor consumes them in array order, so the
-// global price order MUST be materialized here (multiple venues interleaved).
-function sortSegs(rows: bigint[][]): bigint[][] {
-  return rows.slice().sort((a, b) => {
-    if (a[2] !== b[2]) return a[2] < b[2] ? 1 : -1;
-    if (a[3] !== b[3]) return a[3] < b[3] ? 1 : -1;
-    return Number(a[0] - b[0]);
-  });
+    BigInt(pool.i), // i — tokenIn's non-BPT invariant-order index
+    BigInt(pool.j), // j — tokenOut's non-BPT invariant-order index
+    BigInt(pool.swapFeeWad), // feePpm slot (diagnostic; QL quotes are post-fee)
+    6n, // segKind = Balancer V2 ComposableStable
+    BigInt(refIdx),
+    BigInt(poolId), // qd[6] = Vault poolId
+    0n, // qd[7] = third non-BPT token (none — 2-token pool)
+    packedReg, // qd[8] = packed registered scaling positions
+    2n, // qd[9] = non-BPT token count
+  ];
 }
 
 describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapBalancerV2 exact-in-dy", () => {
@@ -190,6 +196,9 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
       c.walletClient, c.publicClient, c.testClient,
       tokens, scaling, 0, amp, feeWad, bals, vaultFund,
     );
+    const poolId = (await c.publicClient.readContract({
+      address: pool, abi: balancerStablePoolAbi, functionName: "getPoolId",
+    })) as Hex;
     const op: BalancerStablePool = {
       poolType: 4,
       address: pool,
@@ -201,7 +210,7 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
       swapFeeWad: feeWad,
       source: "local-fixture",
     };
-    return { pool, op };
+    return { pool, op, poolId };
   }
 
   // ── (1) SOLO Balancer venue — received == getDy(share) to the WEI ──
@@ -215,17 +224,19 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
     const balOut = 1_200_000n * E18;
     const amp = 1_000_000n; // A=1000
     const feeWad = 4n * 10n ** 14n; // 0.04%
-    const { pool, op } = await deployPool(balIn, balOut, amp, feeWad, 2_000_000n * E18);
+    const { pool, op, poolId } = await deployPool(balIn, balOut, amp, feeWad, 2_000_000n * E18);
 
-    // amountIn == the full sampled ladder cap ⇒ the merge awards the WHOLE Σ to this one venue.
+    // amountIn within the QL ladder's reach ⇒ the merge awards the WHOLE Σ to this one venue. The on-chain QL
+    // ladder (built live from getPoolTokenInfo/getScalingFactors/amp/fee) covers [0, amountIn] for a deep pool.
     const amountIn = 150_000n * E18;
-    const segRows = balancerSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Balancer segment ladder");
-    const segSum = segRows.reduce((a, r) => a + r[1], 0n);
-    assert.equal(segSum, amountIn, "Balancer segments cover the full amountIn");
+    const ladder = buildBalancerStableQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "non-empty Balancer QL ladder");
+    const ladderSum = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(ladderSum, amountIn, "Balancer QL ladder covers the full amountIn");
+    const qlv = [balancerQlvRow(op, 0, poolId)];
 
     const { bytecodes } = compileSauce(
-      solverSrc, balancerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, balancerArgs(tokenIn, tokenOut, amountIn, caller, qlv), ECOSWAP_DIR, engine,
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
@@ -256,6 +267,56 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
     console.log(`  [Balancer solo:${engine}] spent=${spent} received=${received} (== getDy to the wei)`);
   }
 
+  // ── (1r) REVERSE direction — tokenIn is the SECOND non-BPT token (i=1) ──
+  // The on-chain QL replay iterates the D_P product in REGISTERED (non-BPT) order regardless of swap
+  // direction; only the input-slot / out-slot SELECTION is direction-dependent. This cell drives i=1 (sell the
+  // pool's tokenOut, buy its tokenIn) to prove that selection is wei-exact on BOTH engines — the V3 lane found
+  // a v12 divergence when the D_P DIVISIONS were reordered for a token1 input, so we pin that V2's fixed
+  // registered-order product has NO such divergence for i=1 (received == getDy(reverse op) to the wei).
+  async function runReverse(engine: Engine): Promise<void> {
+    await reset();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const balIn = 1_000_000n * E18;
+    const balOut = 1_200_000n * E18;
+    const amp = 1_000_000n;
+    const feeWad = 4n * 10n ** 14n;
+    const { pool, poolId } = await deployPool(balIn, balOut, amp, feeWad, 2_000_000n * E18);
+
+    // Sell the pool's tokenOut, buy its tokenIn → the swap's tokenIn is the SECOND non-BPT token (i=1, j=0).
+    const swapIn = tokenOut;
+    const swapOut = tokenIn;
+    const revOp: BalancerStablePool = {
+      poolType: 4, address: pool, i: 1, j: 0, amp,
+      balances: [balIn, balOut], scalingFactors: [E18, E18], swapFeeWad: feeWad, source: "local-fixture-reverse",
+    };
+    const amountIn = 150_000n * E18;
+    const qlv = [balancerQlvRow(revOp, 0, poolId)];
+
+    const { bytecodes } = compileSauce(
+      solverSrc, balancerArgs(swapIn, swapOut, amountIn, caller, qlv), ECOSWAP_DIR, engine,
+    );
+
+    await approve(c.walletClient, c.publicClient, swapIn, target, amountIn);
+    const inBefore = await balanceOf(c.publicClient, swapIn, caller);
+    const outBefore = await balanceOf(c.publicClient, swapOut, caller);
+    const onViewPre = (await c.publicClient.readContract({
+      address: pool, abi: balancerStablePoolAbi, functionName: "onSwapGivenIn", args: [amountIn, swapIn, swapOut],
+    })) as bigint;
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "reverse-direction Balancer cook() must succeed");
+
+    const spent = inBefore - (await balanceOf(c.publicClient, swapIn, caller));
+    const received = (await balanceOf(c.publicClient, swapOut, caller)) - outBefore;
+    assert.equal(spent, amountIn, "reverse: spent == amountIn (whole trade routed to Balancer)");
+    assert.equal(received, getDy(revOp, spent), "reverse (i=1): received == getDy(share) to the wei (exact-in-dy)");
+    assert.equal(received, onViewPre, "reverse (i=1): received == on-chain onSwapGivenIn view (exact-in-dy)");
+
+    console.log(`  [Balancer reverse i=1:${engine}] spent=${spent} received=${received} (== getDy to the wei)`);
+  }
+
   // ── (1b) SOLO Balancer under the PRODUCTION treeshake define set ──
   // Same trade as runSolo, but compiled with treeshake:true + Balancer-only defines (the exact compile
   // a production Balancer-without-other-segs cook carries). Guards the merge-head guard at the call
@@ -270,14 +331,13 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
     const balOut = 1_200_000n * E18;
     const amp = 1_000_000n;
     const feeWad = 4n * 10n ** 14n;
-    const { pool, op } = await deployPool(balIn, balOut, amp, feeWad, 2_000_000n * E18);
+    const { pool, op, poolId } = await deployPool(balIn, balOut, amp, feeWad, 2_000_000n * E18);
 
     const amountIn = 150_000n * E18;
-    const segRows = balancerSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Balancer segment ladder");
+    const qlv = [balancerQlvRow(op, 0, poolId)];
 
     const { bytecodes } = compileSauce(
-      solverSrc, balancerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, balancerArgs(tokenIn, tokenOut, amountIn, caller, qlv), ECOSWAP_DIR, engine,
       { treeshake: true, defines: BALANCER_ONLY_DEFINES },
     );
 
@@ -309,17 +369,18 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
     // engages BOTH and equalizes their post-fee marginals. The Vault (etched once) holds both pools'
     // payout funds. Low A (steeper) + low fee draws first + more.
     const amountIn = 600_000n * E18;
-    const { pool: poolA, op: opA } = await deployPool(
+    const { pool: poolA, op: opA, poolId: poolIdA } = await deployPool(
       1_000_000n * E18, 1_000_000n * E18, 100_000n /*A=100*/, 1n * 10n ** 14n /*0.01%*/, 2_000_000n * E18,
     );
-    const { pool: poolB, op: opB } = await deployPool(
+    const { pool: poolB, op: opB, poolId: poolIdB } = await deployPool(
       1_000_000n * E18, 1_000_000n * E18, 50_000n /*A=50*/, 4n * 10n ** 14n /*0.04%*/, 2_000_000n * E18,
     );
 
-    const segRows = sortSegs([...balancerSegRows(opA, 0, amountIn), ...balancerSegRows(opB, 1, amountIn)]);
+    // Two QL venues (segKind 6, distinct refIdx); the solver builds + interleaves both ladders on-chain.
+    const qlv = [balancerQlvRow(opA, 0, poolIdA), balancerQlvRow(opB, 1, poolIdB)];
 
     const { bytecodes } = compileSauce(
-      solverSrc, balancerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, balancerArgs(tokenIn, tokenOut, amountIn, caller, qlv), ECOSWAP_DIR, engine,
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
@@ -347,13 +408,15 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
     const expected = getDy(opA, aIn) + getDy(opB, bIn);
     assert.equal(received, expected, "received == Σ getDy(per-venue share) to the wei");
 
-    // MARGINALS EQUALIZE within the grid bound: the post-fee marginal price each venue reaches at its
-    // awarded share agrees to a few ppm (the exact-on-grid bound at M=24).
+    // MARGINALS EQUALIZE within the QL grid bound: the post-fee marginal price each venue reaches at its
+    // awarded share agrees to a fraction of a percent. Balancer V2 is now a QUOTE-LADDER venue whose on-chain
+    // ladder has QL_S=8 geometric slices (coarser than the retired 24-sample static grid), so the equalization
+    // bound is the QL grid granularity (~0.1%) — the documented exact-on-grid property of a coarse live ladder.
     const margA = marginalAt(opA, aIn);
     const margB = marginalAt(opB, bIn);
     const diff = margA > margB ? margA - margB : margB - margA;
     const relPpm = (diff * 1_000_000n) / margA;
-    assert.ok(relPpm <= 200n, `Balancer split marginals equalize (rel ${relPpm} ppm; A ${margA} B ${margB})`);
+    assert.ok(relPpm <= 1000n, `Balancer split marginals equalize on the QL grid (rel ${relPpm} ppm; A ${margA} B ${margB})`);
 
     console.log(
       `  [Balancer split:${engine}] A in=${aIn} B in=${bIn} received=${received} ` +
@@ -394,6 +457,9 @@ describe("EcoSwap Balancer V2 ComposableStable (local fixture) — engine _swapB
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`Balancer solo [${engine}] — received == getDy(share) to the wei (exact-in-dy)`, { skip }, async () => {
       await runSolo(engine);
+    });
+    it(`Balancer reverse i=1 [${engine}] — token1-input StableMath is wei-exact (registered-order D_P)`, { skip }, async () => {
+      await runReverse(engine);
     });
     it(`Balancer solo treeshake [${engine}] — production define set lands a non-zero Balancer fill`, { skip }, async () => {
       await runSoloTreeshake(engine);

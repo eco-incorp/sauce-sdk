@@ -521,13 +521,29 @@ export interface EcoWombat {
 export interface EcoBalancerStable {
   /** Pool address — the swap(SwapParams{poolType:4, pool}) target (engine derives poolId). */
   address: Hex;
-  /** int index of tokenIn into the pool's NON-BPT token set (diagnostic; engine resolves on-chain). */
+  /** int index of tokenIn into the pool's NON-BPT token set (the QL solver's non-BPT invariant-order index). */
   i: number;
-  /** int index of tokenOut into the pool's NON-BPT token set (diagnostic; engine resolves on-chain). */
+  /** int index of tokenOut into the pool's NON-BPT token set (the QL solver's non-BPT invariant-order index). */
   j: number;
-  /** Rounded ppm swap fee (the price-ordering coordinate; the on-chain out is computed by the Vault). */
+  /** Rounded ppm swap fee (the price-ordering coordinate; the on-chain out is computed by the QL replay). */
   feePpm: number;
   source: string;
+
+  // ── QUOTE-LADDER (QL) descriptor (segKind 6) ────────────────────────────────────────────────────────────
+  // Balancer V2 is now a LIVE-WALK QL venue: the on-chain solver reads the LIVE Vault StableMath state at cook
+  // (balances via getPoolTokenInfo scalars, scaling via getScalingFactors, amp/fee live) and replays the
+  // amplified StableSwap invariant to build its price ladder, so the split RE-ANCHORS to cook-time state. These
+  // fields are what buildQLVenues packs into the 10-column qlv descriptor. (The oracle mirrors the ladder off
+  // the same live state via buildBalancerStableQLLadder.)
+  /** The pool's Vault poolId (bytes32) — the getPoolTokenInfo(poolId, token) argument for live balances. */
+  poolId: Hex;
+  /** The NON-BPT token addresses in registered (non-BPT) order (`i`/`j` index into this). */
+  nonBptTokens: Hex[];
+  /** The FULL registered position of each NON-BPT token (aligned with nonBptTokens) — the getScalingFactors
+   *  index the solver inline-reads per non-BPT token for its live scaling factor. */
+  nonBptRegPos: number[];
+  /** The canonical Balancer V2 Vault singleton (the getPoolTokenInfo target; chain-wide, threaded as cfg[11]). */
+  vault: Hex;
 }
 
 /**
