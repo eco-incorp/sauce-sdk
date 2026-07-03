@@ -55,12 +55,12 @@
  *       This exercises the GENUINE captured pool bytecode's callback funding branch — no mock, no pre-pay.
  *
  * HONEST fidelity notes:
- *   • OFF-CHAIN REPLAY DIVERGENCE: the off-chain `maverick-math.ts` getDy diverges from the REAL pool's
- *     bin math by a FEW WEI at the ~13th significant digit (a port-rounding difference: getDy(1000 USDC)
- *     = 1000382022226312194616 vs the real pool/quoter 1000382022226308903686, Δ≈3.3e-9 tokens). So the
- *     ground-truth realized dy is the REAL quoter (real == real, bit-exact); the off-chain getDy is
- *     asserted only within a tight relative bound (Δ < 1e-12 of out), NOT to the wei. The SPLIT input is
- *     exact (single venue ⇒ awarded == amountIn exactly).
+ *   • OFF-CHAIN REPLAY IS WEI-EXACT: the off-chain `maverick-math.ts` getDy now reproduces the REAL pool's
+ *     bin math BIT-FOR-BIT (getDy(1000 USDC) = 1000382022226308903686 == the real pool/quoter, Δ=0) —
+ *     the drain input mirrors the on-chain _remainingBinInputSpaceGivenOutput (reserve-extraction), not the
+ *     old yldfi/ParaSwap price-edge port that diverged ~3.3e6 wei at the ~13th significant digit. So this
+ *     test pins getDy == the REAL quoter TO THE WEI (assert.equal below), the same real == real ground
+ *     truth as the engine-executed dy. The SPLIT input is exact (single venue ⇒ awarded == amountIn).
  *   • ENGINE tickLimit: the FIXED engine passes a full-range per-direction tickLimit. tokenA=USDT,
  *     tokenB=USDC, activeTick=+7 ⇒ the engine-executable trade is tokenB-in (USDC→USDT, walking DOWN);
  *     discovery still gates the pool to tokenB-in. 1000 USDC is a captured probe size that FULLY consumes
@@ -442,16 +442,15 @@ describe("EcoSwap Maverick V2 (bin AMM, callback pool) prod-mirror — REAL byte
     assert.equal(received, quoterOut, "received == REAL MaverickV2Quoter calculateSwap(awarded Σ) — BIT-EXACT (real == real)");
     assert.ok(received > 0n, "non-zero fill through the REAL Maverick V2 bin swap math (engine callback path)");
 
-    // HONEST off-chain-replay divergence: the off-chain maverick-math.ts getDy is a PORT of the bin math and
-    // diverges from the REAL pool by a few wei at the ~13th significant digit (a port-rounding difference). It
-    // is the SPLIT driver (awarded input is exact — it seeded the oracle above), NOT the dy ground truth — so
-    // we assert getDy ONLY within a relative bound, never to the wei. The wei-exact dy check is (real == real)
-    // above. The OBSERVED divergence is ~3.3e-15 relative (Δ≈3.3e6 wei on ~1e21 out); the bound below (Δ <
-    // 1e-12 of the output) sits ~3 orders of magnitude above that, so it stays green today yet still catches a
-    // real regression that widens the port-rounding gap.
+    // WEI-EXACT off-chain replay: the off-chain maverick-math.ts getDy now mirrors the on-chain
+    // _remainingBinInputSpaceGivenOutput (reserve-extraction) bit-for-bit, so it reproduces the REAL pool's
+    // dy TO THE WEI — not the old yldfi/ParaSwap price-edge port that diverged ~3.3e6 wei. This is the tier
+    // that locks the fidelity the reference-math fix delivered: getDy(awarded) == the engine-executed dy ==
+    // the REAL MaverickV2Quoter, all three equal exactly. A regression that reintroduces any per-tick-cross
+    // rounding drift trips this hard equality (the old loose Δ<1e-12 bound would have let ~3.3e6 wei slip).
     const offOut = getDy(op, awarded);
     const diff = offOut > received ? offOut - received : received - offOut;
-    assert.ok(diff * 1_000_000_000_000n < received, `off-chain getDy within 1e-12 of the real dy (Δ=${diff}, out=${received})`);
+    assert.equal(offOut, received, `off-chain getDy == the real dy to the WEI (Δ=${diff}, out=${received})`);
 
     const ms = Date.now() - t0;
     console.log(

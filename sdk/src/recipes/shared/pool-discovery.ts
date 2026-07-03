@@ -3400,6 +3400,20 @@ export async function discoverMaverickV2PoolsTyped(
   if (factories.length === 0) return [];
   const inLower = tokenIn.toLowerCase();
 
+  // MIXED-DECIMAL SKIP GUARD. maverick-math operates in Maverick's internal 1e18-normalized (D18) units
+  // and this discovery feeds RAW reserves + a RAW swap amount into it, so the replay is wei-exact ONLY for
+  // an 18/18-decimal pair (the validated BSC USDT/USDC target). A non-18/18 pool (e.g. WETH/USDC) would
+  // need its reserves AND the swap amount scaled to D18 (and the output de-scaled) — the Curve/Balancer/
+  // Wombat normalization — with the EXACT Maverick scale rounding, which is a separate follow-up. Until that
+  // lands, SKIP non-18/18 pairs here so a discovered mixed-decimal Maverick pool cannot inject a mis-scaled
+  // (~1e-6-off) split marginal into production. The pair's two tokens ARE tokenIn/tokenOut, so their
+  // decimals decide it for every pool this call surfaces.
+  const [decIn, decOut] = await Promise.all([
+    client.readContract({ address: tokenIn, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+    client.readContract({ address: tokenOut, abi: erc20DecimalsAbi, functionName: "decimals" }).then((d) => Number(d)).catch(() => 18),
+  ]);
+  if (decIn !== 18 || decOut !== 18) return [];
+
   const pools: MaverickPool[] = [];
   const seen = new Set<string>();
   for (const factory of factories) {
@@ -3473,6 +3487,11 @@ export async function discoverMaverickV2PoolsTyped(
             allowFailure: true,
           });
 
+          // The reserves are pushed RAW. maverick-math operates in Maverick's internal 1e18-normalized
+          // (D18) units, so this is wei-exact ONLY for an 18/18-decimal pair — which is ENFORCED by the
+          // decimals==18/18 skip guard at the top of this function (a mixed-decimal pool is dropped before
+          // this loop). D18 amount normalization for non-18/18 pairs (the Curve/Balancer/Wombat path, with
+          // the exact Maverick scale rounding) is the follow-up that lifts that guard.
           const ticks: MaverickTick[] = [];
           for (let k = 0; k < tickNums.length; k++) {
             const r = tickResults[k];

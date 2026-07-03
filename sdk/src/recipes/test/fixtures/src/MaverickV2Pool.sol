@@ -369,15 +369,22 @@ contract MaverickV2Pool {
         deltaOutErc = _min(deltaOutErc, availableOutput);
     }
 
-    /// @notice The tokenIn (net of fee) needed to drain a tick to its far edge, verbatim vs
-    /// maverick-math.ts (tokenA-in: L·(sqrtUpper−sqrtPrice); tokenB-in: L·(1/sqrtLower − 1/sqrtPrice)).
-    function _binAmountToDrain(uint256 sqrtPrice, uint256 L, bool tokenAIn, uint256 sqrtLower, uint256 sqrtUpper)
+    /// @notice The tokenIn (net of fee) to extract the tick's FULL stored output reserve — the real
+    /// Maverick SwapMath._remainingBinInputSpaceGivenOutput (reserve-extraction input, NOT the price-edge
+    /// input). getTickL is a lower bound (the *1e9 sits OUTSIDE the sqrt), so L·(edge − price) != the
+    /// stored reserve; only the reserve-extraction form matches the on-chain quoter to the wei on a
+    /// crossed tick. Verbatim vs maverick-math.ts computeSwapExactIn's drain branch.
+    ///   outOverL = divUp(output, L)
+    ///   tokenA-in: mulDivUp(output, sqrtPrice, invFloor(sqrtPrice) − outOverL)
+    ///   tokenB-in: divUp(output, mulDown(sqrtPrice, sqrtPrice − outOverL))
+    function _binAmountToDrain(uint256 sqrtPrice, uint256 L, bool tokenAIn, uint256 output)
         internal
         pure
         returns (uint256)
     {
-        if (tokenAIn) return (L * (sqrtUpper - sqrtPrice)) / ONE;
-        return _clip((L * (ONE_SQUARED / sqrtLower)) / ONE, (L * (ONE_SQUARED / sqrtPrice)) / ONE);
+        uint256 outOverL = L == 0 ? 0 : _divUp(output, L);
+        if (tokenAIn) return _mulDivCeil(output, sqrtPrice, _invFloor(sqrtPrice) - outOverL);
+        return _divUp(output, _mulDown(sqrtPrice, sqrtPrice - outOverL));
     }
 
     function _computeSwapExactIn(
@@ -391,7 +398,7 @@ contract MaverickV2Pool {
             return TickResult(0, 0, amountIn, sqrtPrice, false);
         }
         uint256 availableOutput = tokenAIn ? t.reserveB : t.reserveA;
-        uint256 binAmountIn = _binAmountToDrain(sqrtPrice, t.liquidity, tokenAIn, t.sqrtLower, t.sqrtUpper);
+        uint256 binAmountIn = _binAmountToDrain(sqrtPrice, t.liquidity, tokenAIn, availableOutput);
         uint256 deltaInErcDrain = binAmountIn + _mulDivCeil(binAmountIn, f, ONE - f);
 
         if (amountIn >= deltaInErcDrain) {

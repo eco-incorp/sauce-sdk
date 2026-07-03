@@ -1,0 +1,50 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "tickSpacing",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "fee",
+      "stateMutability": "view",
+      "inputs": [{ "name": "tokenAIn", "type": "bool" }],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "getState",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        { "name": "reserveA", "type": "uint256" },
+        { "name": "reserveB", "type": "uint256" },
+        { "name": "lastTwaD8", "type": "uint256" },
+        { "name": "lastLogPriceD8", "type": "uint256" },
+        { "name": "lastTimestamp", "type": "uint256" },
+        { "name": "activeTick", "type": "uint256" },
+        { "name": "isLocked", "type": "uint256" },
+        { "name": "binCounter", "type": "uint256" },
+        { "name": "protocolFeeRatioD3", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getTick",
+      "stateMutability": "view",
+      "inputs": [{ "name": "tick", "type": "int32" }],
+      "outputs": [
+        { "name": "reserveA", "type": "uint256" },
+        { "name": "reserveB", "type": "uint256" },
+        { "name": "totalSupply", "type": "uint256" },
+        { "name": "bin0", "type": "uint256" },
+        { "name": "bin1", "type": "uint256" },
+        { "name": "bin2", "type": "uint256" },
+        { "name": "bin3", "type": "uint256" }
+      ]
+    }
+  ]
+}

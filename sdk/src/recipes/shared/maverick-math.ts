@@ -19,9 +19,15 @@
  * it consumes the STATIC segments through the existing static-segment cursor and dispatches on
  * segKind 8.
  *
- * SOURCE MIRRORED — the canonical Maverick V2 `SwapMath` + `TickMath` (maverickprotocol/v2-common
- * contracts/libraries; ported bit-for-bit from the yldfi/maverick-v2-math reference, itself a
- * ParaSwap-cross-checked port of the on-chain PoolLib.swap tick loop). The integer routines
+ * SOURCE MIRRORED — the canonical Maverick V2 on-chain math, bit-for-bit from the REAL deployed
+ * Solidity (NOT the yldfi/ParaSwap port, which diverged on the tick-cross drain input): `TickMath` +
+ * `Math` from maverickprotocol/v2-common, and `SwapMath` (computeSwapExactIn +
+ * `_remainingBinInputSpaceGivenOutput`) from the audited MaverickV2 PoolLib. The drain input is the
+ * RESERVE-EXTRACTION input (_remainingBinInputSpaceGivenOutput), NOT the price-edge input the port used:
+ * getTickL is a documented lower bound (the *1e9 sits OUTSIDE the sqrt), so L·(edge − price) != the
+ * tick's stored reserve, and only the reserve-extraction form is wei-exact vs the on-chain
+ * MaverickV2Quoter.calculateSwap on every crossed tick (verified across sizes AND both directions on the
+ * real BSC USDT/USDC pool at two blocks — see the validation note below). The integer routines
  * reproduced here:
  *   - `tickSqrtPrice(tickSpacing, tick)`  — the 1.0001^(tick·tickSpacing) sqrt-price ladder (the
  *     Uniswap-style 128.128 pow shifted to 1e18 fixed point).
@@ -47,11 +53,19 @@
  * on-chain-view-is-the-swap-math standard as DODO's querySell* / Solidly's getAmountOut). The sampler
  * drives only the SPLIT; the realized dy is the engine swap.
  *
+ * DECIMALS: this math operates in Maverick's internal 1e18-normalized (D18) units — sqrtPrice, L and the
+ * tick reserves are all D18. For an 18/18-decimal pool (the wei-exact-validated BSC USDT/USDC target) the
+ * raw token amounts ARE D18, so no scaling is needed. A MIXED-decimal pool (e.g. a 6-decimal token) must
+ * have its reserves AND the swap amount scaled to D18 (×10^(18−decimals)) before entering this math and
+ * the output scaled back — that normalization is the discovery/caller's responsibility (as it is for
+ * Curve/Balancer/Wombat), NOT this library's; discoverMaverickV2PoolsTyped currently feeds RAW reserves,
+ * which is correct only for 18/18 pools (see the recipe TODO).
+ *
  * Sources:
+ *   https://docs.mav.xyz/technical-reference/maverick-v2/v2-contracts/maverick-v2-amm-contracts/poollib/swapmath
  *   https://github.com/maverickprotocol/v2-common/blob/main/contracts/libraries/TickMath.sol
- *   https://github.com/maverickprotocol/v2-common/blob/main/contracts/libraries/PoolLib.sol
- *   https://github.com/maverickprotocol/maverick-v2-examples/blob/main/solidity/src/interfaces/IMaverickV2Pool.sol
- *   https://github.com/yldfi/maverick-v2-math  (bigint reference port: swapMath.ts / tickMath.ts / pool.ts)
+ *   https://github.com/maverickprotocol/v2-common/blob/main/contracts/libraries/Math.sol
+ *   MaverickV2 PoolLib.SwapMath (audited; Omniscia maverick-protocol-amm-implementation, SwapMath-SMH)
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
@@ -267,14 +281,35 @@ export function computeSwapExactIn(
 
   const availableOutput = tokenAIn ? tickData.currentReserveB : tickData.currentReserveA;
 
-  // Input (net of fee) needed to drain the tick to its far edge.
-  let binAmountIn: bigint;
+  // Net input (before fee) to extract the tick's FULL stored output reserve — the real
+  // SwapMath._remainingBinInputSpaceGivenOutput. This is the RESERVE-EXTRACTION input, NOT the
+  // price-edge input: getTickL is a lower bound (the *1e9 sits OUTSIDE the sqrt in TickMath.getTickL),
+  // so L*(edge - price) != the stored reserve; only the reserve-extraction form matches the on-chain
+  // quoter to the wei on every crossed tick. No clamp to the tick edge — endSqrtP legitimately dips
+  // just past the edge because L under-approximates, and clamping collapses back to the wrong edge form.
+  //   outOverL = divUp(output, L)
+  //   tokenA-in: binAmountIn = mulDivUp(output, sqrtPrice, invFloor(sqrtPrice) - outOverL)
+  //   tokenB-in: binAmountIn = divUp(output, mulDown(sqrtPrice, sqrtPrice - outOverL))
+  // getTickL is a documented LOWER bound, so on a pathological/inconsistent tick the L-implied virtual
+  // reserve at the current price can fall below the stored output reserve, driving the drain denominator
+  // (invFloor(sqrtPrice)−outOverL for tokenA-in; sqrtPrice−outOverL for tokenB-in) non-positive — the
+  // on-chain _remainingBinInputSpaceGivenOutput would REVERT on that uint underflow. Guard it: a
+  // non-positive denominator means no finite input fully drains the tick, so we force the partial
+  // (non-draining) fill (the remaining input is consumed within the tick) rather than divide by a
+  // non-positive denominator and emit a negative/garbage drain input. On every validated tick the
+  // denominator reduces to the strictly-positive tick width, so `drainable` stays true there (Δ=0).
+  const outOverL = L === 0n ? 0n : divUp(availableOutput, L);
+  let binAmountIn = 0n;
+  let drainable: boolean;
   if (tokenAIn) {
-    binAmountIn = (L * (sqrtUpperTickPrice - sqrtPrice)) / MAV_ONE;
+    const denom = invFloor(sqrtPrice) - outOverL;
+    drainable = denom > 0n;
+    if (drainable) binAmountIn = mulDivCeil(availableOutput, sqrtPrice, denom);
   } else {
-    const invSqrtPrice = ONE_SQUARED / sqrtPrice;
-    const invSqrtLower = ONE_SQUARED / sqrtLowerTickPrice;
-    binAmountIn = clip((L * invSqrtLower) / MAV_ONE - (L * invSqrtPrice) / MAV_ONE, 0n);
+    const inner = sqrtPrice - outOverL;
+    const denom = inner > 0n ? mulDown(sqrtPrice, inner) : 0n;
+    drainable = denom > 0n;
+    if (drainable) binAmountIn = divUp(availableOutput, denom);
   }
 
   let deltaInErc: bigint;
@@ -282,10 +317,10 @@ export function computeSwapExactIn(
   let excess = 0n;
   let binAmountInFinal: bigint;
 
-  const feeBasisDrain = mulDivCeil(binAmountIn, fee, MAV_ONE - fee);
+  const feeBasisDrain = drainable ? mulDivCeil(binAmountIn, fee, MAV_ONE - fee) : 0n;
   const deltaInErcDrain = binAmountIn + feeBasisDrain;
 
-  if (amountIn < deltaInErcDrain) {
+  if (!drainable || amountIn < deltaInErcDrain) {
     // Not draining — the user's whole input fits within this tick.
     const userBinAmountIn = mulDown(amountIn, MAV_ONE - fee);
     binAmountInFinal = userBinAmountIn;
@@ -497,6 +532,102 @@ export function simulateMaverickExactIn(
   }
 
   return { amountIn: amountIn - remainingIn, amountOut: totalOut };
+}
+
+/**
+ * buildMaverickWalkLadder(pool, amountIn) — the LIVE bin-WALK ladder: walk the tick book from the live
+ * active tick/price, emitting ONE segment per crossed tick (capacity = deltaInErc, effOut = deltaOutErc,
+ * marginalOI = the QL slice head isqrt(effOut·2^192/capacity)), until the input is consumed, a slice
+ * prices non-descending, or a tick runs dry.
+ *
+ * STATUS — NOT YET WIRED (groundwork for the pending segKind-8 live-walk). TODAY the production path and
+ * the neutral oracle both consume the SAMPLED `buildMaverickSegments` below (see this file's header):
+ * Maverick executes as a STATIC-segment source (the on-chain solver consumes the prepared segments and
+ * dispatches on segKind 8; it does NOT walk the bin book on-chain). This ladder is the TS source-of-truth
+ * for the live-walk that WILL replace that sampled path — its on-chain SauceScript twin
+ * (test/harness/maverick-onchain-walk.reference.ts.txt) is proven wei-exact (Δ=0) vs the real
+ * MaverickV2Quoter on both v1 and v12, but the integration (index.ts buildQLVenues emit + the qKind===8
+ * live-walk branch + prepare.ts descriptor-only + the ecoswap.optimal.ts switch to THIS ladder) is the
+ * documented follow-up. When it lands, the on-chain solver replays THIS EXACT per-tick loop and the oracle
+ * consumes THIS ladder — ONE source ⇒ solver == oracle by construction. Unlike the geometric sampler this
+ * walks the REAL bin boundaries, so each segment is a genuine tick crossing (the active tick's partial
+ * slice from the live price to its edge, then full-drain slices).
+ *
+ * The stop semantics MATCH the shared QL ladder (`buildQLLadder`) and the on-chain QL emit guard: stop on
+ * a zero slice, a non-descending head (a Maverick bin book walked in the swap direction is naturally
+ * descending — price worsens monotonically per tick — so this only trips on the terminal edge), and cap
+ * cumulative input at amountIn. No isotonic backward-merge (that is the geometric sampler's device for
+ * bin-straddling samples; a per-tick walk emits at monotone-worsening price directly).
+ */
+export function buildMaverickWalkLadder(pool: MaverickPool, amountIn: bigint): MaverickSegment[] {
+  if (amountIn <= 0n) return [];
+  const { tokenAIn, tickSpacing, fee, protocolFeeD3 } = pool;
+  const tickLimit = engineTickLimit(tokenAIn);
+
+  const byTick = new Map<number, MaverickTick>();
+  for (const t of pool.ticks) byTick.set(t.tick, t);
+
+  const segs: MaverickSegment[] = [];
+  let remainingIn = amountIn;
+  let currentSqrtPrice = pool.poolSqrtPrice;
+  let currentTick = pool.activeTick;
+  const direction = tokenAIn ? 1 : -1;
+  let prevHead = 0n;
+
+  let iterations = 0;
+  while (remainingIn > 0n && iterations < TICK_SEARCH_LIMIT) {
+    if (tokenAIn && currentTick > tickLimit) break;
+    if (!tokenAIn && currentTick < tickLimit) break;
+    const absTick = Math.abs(currentTick) * tickSpacing;
+    if (absTick > MAX_TICK) break;
+
+    const { sqrtLowerPrice, sqrtUpperPrice } = tickSqrtPrices(tickSpacing, currentTick);
+    if (currentSqrtPrice < sqrtLowerPrice || currentSqrtPrice > sqrtUpperPrice) {
+      currentTick += direction;
+      iterations++;
+      continue;
+    }
+    const ts = byTick.get(currentTick);
+    if (!ts || (ts.reserveA === 0n && ts.reserveB === 0n)) {
+      currentTick += direction;
+      iterations++;
+      continue;
+    }
+    const liquidity = getTickL(ts.reserveA, ts.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+    if (liquidity === 0n) {
+      currentTick += direction;
+      iterations++;
+      continue;
+    }
+
+    const result = computeSwapExactIn(
+      currentSqrtPrice,
+      { currentReserveA: ts.reserveA, currentReserveB: ts.reserveB, currentLiquidity: liquidity },
+      remainingIn,
+      tokenAIn,
+      fee,
+      protocolFeeD3,
+      sqrtLowerPrice,
+      sqrtUpperPrice,
+    );
+
+    const capacity = result.deltaInErc;
+    const effOut = result.deltaOutErc;
+    if (capacity > 0n && effOut > 0n) {
+      const head = isqrt((effOut * Q192) / capacity);
+      if (head <= 0n) break;
+      if (segs.length > 0 && head >= prevHead) break; // non-descending guard (mirrors QL emit)
+      segs.push({ capacity, effOut, marginalOI: head, worstMarginalOI: head });
+      prevHead = head;
+    }
+
+    remainingIn = result.excess;
+    currentSqrtPrice = result.endSqrtPrice;
+    if (!result.swappedToMaxPrice || remainingIn === 0n) break;
+    currentTick += direction;
+    iterations++;
+  }
+  return segs;
 }
 
 /**

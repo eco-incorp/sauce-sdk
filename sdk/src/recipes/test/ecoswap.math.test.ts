@@ -2717,10 +2717,11 @@ describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampl
   it("depth bound — a swap saturates at the book's out-side liquidity (full-range, bounded by liquidity)", () => {
     const p = pool();
     // A huge input drains the reachable B across the traversed ticks and saturates at the book's available
-    // out-side liquidity (here 1.5M) — the bound is now LIQUIDITY, not tick 0 (the full-range walk crosses
-    // tick 0 and keeps consuming until the reachable B is exhausted). The cross-tick-0 cell below shows the
-    // walk genuinely fills ticks past 0 that the OLD tickLimit=0 cap would have skipped.
-    assert.equal(maverickGetDy(p, 2_000_000n * E18), 1_500_000n * E18);
+    // out-side liquidity — the reachable B is Σ reserveB over ticks -3..3 = 7 × 500k = 3.5M (the bound is
+    // LIQUIDITY, not tick 0: the full-range walk crosses tick 0 and keeps consuming until the reachable B is
+    // exhausted). The cross-tick-0 cell below shows the walk genuinely fills ticks past 0 that the OLD
+    // tickLimit=0 cap would have skipped.
+    assert.equal(maverickGetDy(p, 5_000_000n * E18), 3_500_000n * E18);
   });
 
   it("buildMaverickSegments — covers min(amountIn,depth), descending marginals, partition of the curve", () => {
@@ -2784,7 +2785,7 @@ describe("Maverick V2 (bin-based directional AMM) — getDy known-answer + sampl
     // Full-range getDy (the default per-direction FULL-RANGE tickLimit): the fill crosses tick 0 into
     // tick 1. Hand-pinned from the closed-form replay (regenerate only on an intentional math change).
     const fullOut = maverickGetDy(crossPool, CROSS);
-    assert.equal(fullOut, 698_750_305_283_429_197_466_694n, "full-range getDy crosses tick 0 into tick 1");
+    assert.equal(fullOut, 998_587_937_811_185_979_092_177n, "full-range getDy crosses tick 0 into tick 1");
 
     // The OLD engine tickLimit=0 walk stops after tick 0 → saturates at the -1,0 out-side liquidity (600k).
     const cappedOut = maverickSimulate(crossPool, CROSS, 0).amountOut;
@@ -3024,13 +3025,18 @@ describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE 
     assert.ok(sumEff(merged) > sumEff(dropped), "DODO: merge fills STRICTLY MORE output than the old drop-guard");
   });
 
-  // ── Maverick: shallow head ticks then a DEEP tick — one sampled slice straddles the cliff, rising ──
+  // ── Maverick: a single-direction walk yields a MONOTONE marginal ladder (the merge no-ops) ──
   //
-  // A Maverick book with near-empty active + next ticks and a huge deep tick just past them: the FIRST
-  // sampled slice drains the shallow head at a poor marginal, and the next slice — reaching the deep
-  // tick — has a MUCH better average marginal (a violation). The old guard kept only the tiny head
-  // slice and discarded the deep tick's millions in liquidity; the merge folds and keeps it.
-  it("Maverick — shallow-then-deep cliff: merge keeps the deep tick the drop discarded (Σeff == getDy)", () => {
+  // A Maverick book with a near-empty active + next tick and a huge deep tick just past them. Under the
+  // REAL Maverick drain math (SwapMath._remainingBinInputSpaceGivenOutput — the reserve-extraction input,
+  // NOT the price-edge input), a single-direction walk's price rises monotonically per crossed tick, so
+  // the fee-adjusted sampled marginal is monotone-DECREASING — the raw ladder needs NO folding and the
+  // isotonic merge is a wei-exact pass-through (merge == drop). The OLD "cliff" (a rising slice the drop
+  // discarded) was an ARTIFACT of the port's wrong edge-price drain on tiny precision-bumped ticks; the
+  // corrected math produces no such cliff. The genuine fold path is exercised by the DODO cell above
+  // (real R-state non-convexity). This cell pins that the corrected Maverick sampler stays a monotone,
+  // wei-exact partition of the curve.
+  it("Maverick — real single-direction walk: monotone marginals, merge is a wei-exact pass-through", () => {
     const TS = 1;
     const AT = 0;
     const Z = ("0x" + "11".repeat(20)) as `0x${string}`;
@@ -3090,11 +3096,15 @@ describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE 
       prevIn = input;
       prevOut = out;
     }
+    // The raw sampled ladder is already monotone-descending under the corrected drain math, so the old
+    // drop-guard keeps EVERY slice — merge and drop are identical (no past-cliff liquidity is discarded
+    // because there is no cliff). This is the correct-math counterpart of the old "merge > drop" claim.
+    for (let i = 1; i < raw.length; i++) {
+      assert.ok(raw[i].marginalOI <= raw[i - 1].marginalOI, "Maverick raw marginals monotone (no cliff under real math)");
+    }
     const dropped = oldDropLadder(raw);
-    assert.ok(mCap > sumCap(dropped), "Maverick: merge covers STRICTLY MORE input than the old drop-guard");
-    assert.ok(sumEff(merged) > sumEff(dropped), "Maverick: merge fills STRICTLY MORE output than the old drop-guard");
-    // The old drop kept only the tiny head slice; the deep tick's millions were discarded.
-    assert.ok(sumCap(dropped) * 100n < mCap, "Maverick: the old drop discarded the deep-tick liquidity");
+    assert.equal(sumCap(dropped), mCap, "Maverick: merge == drop (monotone ladder — nothing folded/discarded)");
+    assert.equal(sumEff(dropped), sumEff(merged), "Maverick: merge == drop output (monotone ladder)");
   });
 });
 
