@@ -1,27 +1,37 @@
 /**
- * EcoSwap Solidly STABLE (sAMM) local-EVM integration — the callback-free exact-in-dy gate.
+ * EcoSwap Solidly STABLE (sAMM) QUOTE-LADDER (QL) local-EVM integration — the callback-free live-walk gate.
  *
- * Stands up a local Solidly stable pool (the SolidlyStablePool.sol fixture, whose x3y+y3x invariant /
- * bounded-Newton getAmountOut mirror the off-chain `solidly-stable-math.ts` replay bit-for-bit),
- * deploys the Sauce engine, and cooks an EcoSwap whose static-segment cursor consumes Solidly-stable
- * segments (segKind 4) and executes them CALLBACK-FREE: an on-chain `pool.getAmountOut(awarded,
- * tokenIn)` staticcall + transfer + `pool.swap(a0, a1, to, "")` (NO engine SwapPoolType — a stable pool
- * is x3y+y3x, NOT xy=k, so it must NOT go through _swapV2). Then asserts:
+ * Solidly STABLE is migrated to the QUOTE-LADDER framework (the same one the Curve StableSwap / CryptoSwap
+ * pilots use): prepare ships ONLY a descriptor [poolAddr, _, _, feePpm, segKind=4, refIdx] — NO off-chain
+ * sampled segments — and the on-chain solver BUILDS each stable venue's price ladder in setup from LIVE
+ * cook-time `getAmountOut(xIn, tokenIn)` (PROBE-THEN-DECODE — getAmountOut can revert on _get_y non-
+ * convergence at a large input — the SAME generalized qlv loop the Curve pilot uses, dispatched on the
+ * descriptor segKind), emits the slices into the merged sampled-segment stream, bounded-insertion-SORTs it
+ * DESC, and the SAME bestKind===1 cursor consumes it. Execution is UNCHANGED (callback-free: on-chain
+ * getAmountOut for the exact out + transfer + pool.swap(a0Out, a1Out, to, "") — a stable pool is x3y+y3x,
+ * NOT xy=k, so it must NOT go through the engine _swapV2). This test stands up local SolidlyStablePool.sol
+ * fixtures (whose x3y+y3x invariant / bounded-Newton getAmountOut mirror the off-chain solidly-stable-math.ts
+ * replay bit-for-bit) + a real V3 pool + a Curve StableSwap fixture, and asserts:
  *
- *   (1) SOLO stable venue — the on-chain dy the caller receives == off-chain getAmountOutStable(awarded
- *       share) AND == the pool's own getAmountOut view to the WEI (the exact-in-dy gate: the pool view
- *       IS the swap math). NO tolerance.
- *   (2) TWO stable venues — ONE EcoSwap splits across both; each leg's received output ==
- *       getAmountOut(its awarded share) to the wei, and the post-fee marginals equalize within the
- *       sampled-grid bound (the documented exact-on-grid standard).
+ *   (1) SOLO QL stable — the on-chain ladder is built from live getAmountOut, covers [0, amountIn], and the
+ *       caller-received dy == off-chain getAmountOutStable(awarded share) == the pool's own on-chain
+ *       getAmountOut view, all to the WEI. NO tolerance.
+ *   (2) QL stable + a live V3 direct pool — the QL sampled-segment stream (bestKind 1) competes against the
+ *       live V3 frontier (bestKind 3) in ONE merge; the per-venue split == the neutral oracle to the WEI
+ *       (Solidly via buildSolidlyStableQLLadder, V3 via v3Segments), both venues funded.
+ *   (3) QL Solidly + QL Curve — TWO QL venues of DIFFERENT segKind (4 + 1) ride ONE qlv; the generalized
+ *       ladder loop builds BOTH on-chain (dispatching the quote per-row on segKind) and INTERLEAVES them in
+ *       the merged-stream sort; each leg received == its own view(share) to the wei, split == oracle.
+ *   (4) ZERO-CACHE QUOTE — a read-only cook (eth_call) builds the ladder LIVE with NO prepared segments
+ *       (only the descriptor) and returns the quote == getAmountOut(amountIn). Proves the QL quote is
+ *       prepare-optional.
+ *   (5) ADVERSE DRIFT — move the stable pool's price with a REAL swap BEFORE cooking; the QL ladder
+ *       re-anchors to the drifted curve at cook time (the Solidly↔V3 split ADAPTS — the drifted stable share
+ *       SHRINKS, V3's grows) and lands the DRIFTED oracle's split to the wei.
  *
- * The stable math is OFF-CHAIN only for the SPLIT: the on-chain solver supplies the curve as STATIC
- * (capacity, marginalOI) segments and never recomputes the invariant. We build the prepared args
- * DIRECTLY (Solidly discovery uses a factory whose addresses are placeholders here), then compile the
- * production solver template exactly as index.ts does and cook it.
- *
- * No fork / no RPC env needed — a local fixture etches the whole stack. Runs on v1 (+ v12 when the v12
- * artifacts are present). Driven by ECO_ENGINE (default v12). Mirrors ecoswap.curve.evm.test.ts.
+ * No fork / no RPC env — local fixtures etch the whole stack. Runs on v1 (+ v12 when the v12 artifacts are
+ * present), driven by ECO_ENGINE. Each cell runs on its OWN fresh anvil (a cooked swap moves the pool
+ * price, so cells must not share pool state). Mirrors ecoswap.crypto.evm.test.ts.
  *
  * Run: pnpm --filter './sdk' test:recipes:evm   (or npx tsx --test this file)
  */
@@ -31,7 +41,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseEther, type Account, type Hex } from "viem";
+import {
+  parseEther,
+  encodeFunctionData,
+  decodeFunctionResult,
+  parseAbi,
+  type Abi,
+  type Account,
+  type Hex,
+} from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -41,75 +59,120 @@ import {
   ensureMulticall3,
   deployStack,
   deploySortedTokens,
+  createAndInitPool,
+  mintPosition,
+  getSlot0,
+  getLiquidity,
   mint,
   approve,
   balanceOf,
+  erc20Abi,
   deploySolidlyStablePool,
   solidlyStableAbi,
+  deployCurveStableSwap,
+  SQRT_PRICE_1_1,
   type DeployedStack,
   type DeployedV12Stack,
 } from "./harness/setup";
 import { type Engine, engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
 import { MIN_SQRT_RATIO } from "../shared/constants";
+import { getSqrtRatioAtTick } from "./ecoswap.math";
+import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
+import { getDy, type CurvePool } from "../shared/curve-math";
 import {
   getAmountOutStable,
-  buildSolidlyStableSegments,
+  buildSolidlyStableQLLadder,
   type SolidlyStablePool,
 } from "../shared/solidly-stable-math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 
+const HUGE = parseEther("1000000000");
 const E18 = 10n ** 18n;
 const ENGINE_CELLS = engineCells();
 
-// Solidly-stable-only run: zero direct pools/routes/netCache; the stable venues ride entirely inside
-// segs (segKind 4). The solver's 5 compiler args, in index.ts order (cfg, pools, netCache, routing, segs).
-function stableArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, segs: bigint[][]): unknown[] {
+// Solidly-stable-only treeshake defines (HAS_SOLIDLY_STABLE lights the on-chain QL ladder build's Solidly
+// quote branch + the segKind-4 accumulator + the callback-free getAmountOut+transfer+swap exec; the live
+// V3 frontier + merge core are unguarded (always on) so a mixed Solidly+V3 universe still walks V3 with
+// HAS_SOLIDLY_STABLE alone). Mirrors index.ts protocolDefines.
+const SOLIDLY_DEFINES: Record<string, boolean> = {
+  HAS_V2: false, HAS_V3: false, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
+  HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: false,
+  HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
+  HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false,
+};
+
+// Solidly + Curve treeshake defines — BOTH QL adapter branches ship so the generalized qlv loop builds
+// both a segKind-4 (Solidly) and a segKind-1 (Curve StableSwap) ladder in one pass. This is the real
+// production define set index.ts would emit for a Solidly+Curve universe.
+const SOLIDLY_CURVE_DEFINES: Record<string, boolean> = {
+  ...SOLIDLY_DEFINES,
+  HAS_CURVE: true,
+  HAS_SOLIDLY_STABLE: true,
+};
+
+// The solver's 6 compiler args (index.ts order): cfg, pools, netCache, routing, segs, qlv.
+//   cfg = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount]
+//   qlv = the QUOTE-LADDER venue descriptors [poolAddr, i, j, feePpm, segKind, refIdx] — NO sampled
+//         values; the solver builds each ladder ON-CHAIN from live views. segs = [] (no static venues).
+function args(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  amountIn: bigint,
+  caller: Hex,
+  directCount: number,
+  pools: bigint[][],
+  qlv: bigint[][],
+): unknown[] {
   return [
-    [
-      BigInt(tokenIn),
-      BigInt(tokenOut),
-      amountIn,
-      BigInt(caller),
-      MIN_SQRT_RATIO + 1n, // priceLimit (unused by static segments)
-      0n, // directCount — no direct pools
-    ],
-    [], // pools
-    [], // netCache
+    [BigInt(tokenIn), BigInt(tokenOut), amountIn, BigInt(caller), MIN_SQRT_RATIO + 1n, BigInt(directCount)],
+    pools,
+    [], // netCache — V3 pool tuples use windowTop=0 (live ticks() staticcall), no cache
     [], // routing
-    segs,
-    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
+    [], // segs — no static (non-QL) sampled venues in this universe
+    qlv,
   ];
 }
 
-// One stable venue → its sampled segments as segs rows. refIdx tags the on-chain per-venue accumulator
-// (sinp[refIdx]); venue is the pool address. Built from the SAME buildSolidlyStableSegments the oracle
-// uses, so the awarded Σ == the off-chain share by construction. segKind = 4.
-function stableSegRows(pool: SolidlyStablePool, refIdx: number, amountIn: bigint): bigint[][] {
-  return buildSolidlyStableSegments(pool, amountIn).map((s) => [
-    BigInt(refIdx),
-    s.capacity,
-    s.marginalOI, // sqrtAdjNear (post-fee; the descending-price sort key)
-    s.marginalOI, // sqrtAdjFar (a stable segment is a flat slice)
-    4n, // segKind = Solidly stable (callback-free)
-    BigInt(pool.address),
-    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
-  ]);
+// One QL Solidly STABLE descriptor: [poolAddr, i, j, feePpm, segKind=4, refIdx]. i/j are UNUSED (Solidly
+// quotes by tokenIn, not a coin index); feePpm is informational (getAmountOut is post-fee — the on-chain
+// head needs no fee-adjust — so the descriptor's fee field is never read by the qlv loop).
+function solidlyDescriptor(pool: Hex, refIdx: number, feePpm: number): bigint[] {
+  return [BigInt(pool), 0n, 0n, BigInt(feePpm), 4n, BigInt(refIdx)];
 }
 
-// Interleave + sort segs rows the way index.ts buildSegs does: DESC by sqrtAdjNear, then DESC by
-// sqrtAdjFar, then by refIdx. The on-chain static-segment cursor consumes them in array order, so the
-// global price order MUST be materialized here.
-function sortSegs(rows: bigint[][]): bigint[][] {
-  return rows.slice().sort((a, b) => {
-    if (a[2] !== b[2]) return a[2] < b[2] ? 1 : -1;
-    if (a[3] !== b[3]) return a[3] < b[3] ? 1 : -1;
-    return Number(a[0] - b[0]);
-  });
+// One QL Curve StableSwap descriptor: [poolAddr, i, j, feePpm10, segKind=1, refIdx].
+function curveDescriptor(pool: Hex, refIdx: number, feePpm10: bigint): bigint[] {
+  return [BigInt(pool), 0n, 1n, feePpm10, 1n, BigInt(refIdx)];
 }
 
-describe("EcoSwap Solidly STABLE (sAMM, local fixture) — callback-free exact-in-dy", () => {
+// A live V3 direct-pool tuple with windowTop=0 (no cache ⇒ the solver staticcalls ticks() for every
+// boundary from the live spot). A single wide V3 position ⇒ constant active L over the walk region, so
+// the live walk matches the oracle's v3Segments (empty net map) bit-for-bit. Mirrors index.ts buildPoolTuple.
+function v3PoolTuple(pool: Hex, feePpm: number, tickSpacing: number, inIsToken0: boolean): bigint[] {
+  return [
+    1n, // poolType = UniV3
+    BigInt(pool),
+    BigInt(feePpm),
+    BigInt(tickSpacing),
+    0n, // hooks
+    BigInt(feePpm),
+    0n, // isV2
+    inIsToken0 ? 1n : 0n,
+    0n, // stateView (V4 only)
+    0n, // poolId (V4 only)
+    getSqrtRatioAtTick(tickSpacing), // stepRatio
+    0n, // windowTopShifted = 0 ⇒ staticcall every boundary (live walk, no cache)
+    0n, // windowBotShifted
+    0n, // extremeShifted
+    0n, // netStart
+    0n, // netCount
+    0n, // isKyber
+  ];
+}
+
+describe("EcoSwap Solidly STABLE QL live-walk (local fixture) — on-chain ladder, exact-in-dy", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
@@ -117,13 +180,7 @@ describe("EcoSwap Solidly STABLE (sAMM, local fixture) — callback-free exact-i
   let tokenIn: Hex; // == token0 (lower address)
   let tokenOut: Hex; // == token1
   let solverSrc: string;
-  // Each cell runs on its OWN fresh anvil + freshly-deployed stack (setup() below): no shared
-  // mutable node state between cells, so there is no snapshot/loadState reset race (the old
-  // revert+re-snapshot dance dropped a cell to a 0-fill; a bare loadState MERGES and drifts each
-  // cell's pool address). reset() just tears the anvil down and rebuilds. See setup().
 
-  // Boot a fresh anvil + deploy the whole stack. Called by before() once and by reset() before
-  // every subsequent cell, tearing the prior anvil down first — so each cell is fully isolated.
   async function setup(): Promise<void> {
     anvil?.stop();
     anvil = await startAnvil();
@@ -134,62 +191,60 @@ describe("EcoSwap Solidly STABLE (sAMM, local fixture) — callback-free exact-i
     tokenIn = tk.token0;
     tokenOut = tk.token1;
     solverSrc = readFileSync(SOLVER, "utf-8");
-
-    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("50000000"));
-    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
-
+    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("500000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("500000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, HUGE);
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, HUGE);
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
   }
 
   before(setup);
-
   after(() => {
     anvil?.stop();
   });
 
-  async function reset(): Promise<void> {
-    await setup();
-  }
-
-  // Off-chain SolidlyStablePool descriptor for the deployed fixture (tokenIn = token0 ⇒ inIsToken0).
+  // Off-chain SolidlyStablePool descriptor for the deployed fixture (tokenIn = token0 ⇒ inIsToken0). The
+  // reserves are the LIVE getReserves — the fixture's getAmountOut prices off stored reserves, so seeding
+  // from them matches the fixture bit-for-bit for both the fresh and the drifted state.
   function offPool(address: Hex, reserveIn: bigint, reserveOut: bigint, feePpm: number): SolidlyStablePool {
     return {
-      address,
-      reserveIn,
-      reserveOut,
-      decIn: E18,
-      decOut: E18,
-      token0: tokenIn,
-      inIsToken0: true,
-      feePpm,
-      source: "local-fixture",
+      address, reserveIn, reserveOut, decIn: E18, decOut: E18,
+      token0: tokenIn, inIsToken0: true, feePpm, source: "local-fixture",
     };
   }
 
-  // ── (1) SOLO stable venue — received == getAmountOut(share) to the WEI ──
+  function offCurvePool(address: Hex, balances: bigint[], a: bigint, fee: bigint): CurvePool {
+    return { poolType: 3, address, i: 0, j: 1, A: a, aPrecision: 100n, balances, rates: [E18, E18], feePpm10: fee, source: "local-fixture" };
+  }
+
+  // Read the fixture's live reserves (reserve0, reserve1).
+  async function reserves(pool: Hex): Promise<[bigint, bigint]> {
+    const r = (await c.publicClient.readContract({
+      address: pool, abi: solidlyStableAbi as Abi, functionName: "getReserves",
+    })) as readonly [bigint, bigint, bigint];
+    return [r[0], r[1]];
+  }
+
+  // ── (1) SOLO QL Solidly — the on-chain ladder is built live; received == getAmountOutStable(share) WEI ──
   async function runSolo(engine: Engine): Promise<void> {
-    await reset();
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    // Imbalanced reserves, fee 0.01% (100 ppm — the canonical sAMM tier).
-    const r0 = 1_000_000n * E18;
-    const r1 = 1_200_000n * E18;
-    const FEE = 100;
-    const pool = await deploySolidlyStablePool(
-      c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FEE), r0, r1, caller,
-    );
+    const r0 = 1_000_000n * E18, r1 = 1_200_000n * E18, FEE = 100; // imbalanced, 0.01% sAMM tier
+    const pool = await deploySolidlyStablePool(c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FEE), r0, r1, caller);
     const op = offPool(pool, r0, r1, FEE);
 
-    // amountIn == the full sampled ladder cap ⇒ the merge awards the WHOLE Σ to this one venue.
     const amountIn = 100_000n * E18;
-    const segRows = stableSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Solidly-stable segment ladder");
-    const segSum = segRows.reduce((a, r) => a + r[1], 0n);
-    assert.equal(segSum, amountIn, "stable segments cover the full amountIn");
+    // The off-chain QL ladder (buildSolidlyStableQLLadder) — the SAME ladder the solver builds on-chain
+    // from live getAmountOut — must cover [0, amountIn] so the solo venue absorbs the whole trade.
+    const ladder = buildSolidlyStableQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "non-empty QL ladder");
+    assert.equal(ladder.reduce((a, s) => a + s.capacity, 0n), amountIn, "QL ladder covers the full amountIn");
 
     const { bytecodes } = compileSauce(
-      solverSrc, stableArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [solidlyDescriptor(pool, 0, FEE)]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: SOLIDLY_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
@@ -197,122 +252,289 @@ describe("EcoSwap Solidly STABLE (sAMM, local fixture) — callback-free exact-i
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
     const poolInBefore = await balanceOf(c.publicClient, tokenIn, pool);
 
-    // The fixture's own on-chain getAmountOut view on the PRE-swap state — the engine-independent
-    // ground truth for the executed dy of `amountIn`.
+    // The fixture's own on-chain getAmountOut view on the PRE-swap state — the engine-independent ground
+    // truth for the executed dy of `amountIn`.
     const onViewPre = (await c.publicClient.readContract({
-      address: pool, abi: solidlyStableAbi, functionName: "getAmountOut", args: [amountIn, tokenIn],
+      address: pool, abi: solidlyStableAbi as Abi, functionName: "getAmountOut", args: [amountIn, tokenIn],
     })) as bigint;
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "solo Solidly-stable cook() must succeed");
+    assert.equal(receipt.status, "success", "solo QL Solidly cook() must succeed");
 
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
     const poolIn = (await balanceOf(c.publicClient, tokenIn, pool)) - poolInBefore;
 
-    assert.equal(spent, amountIn, "spent == amountIn (the whole trade routed to the stable pool)");
-    assert.equal(poolIn, amountIn, "the stable pool received the full input share");
-
-    // WEI-EXACT-IN-DY: the on-chain received tokenOut == off-chain getAmountOutStable(awarded share)
-    // == the pool's own PRE-swap getAmountOut view, all to the WEI. NO tolerance.
-    assert.equal(received, getAmountOutStable(op, spent), "received == getAmountOutStable(share) to the wei");
+    assert.equal(spent, amountIn, "spent == amountIn (whole trade routed to the QL Solidly venue)");
+    assert.equal(poolIn, amountIn, "the Solidly pool received the full input share (transfer-first)");
+    assert.equal(received, getAmountOutStable(op, spent), "received == getAmountOutStable(share) to the wei (exact-in-dy)");
     assert.equal(received, onViewPre, "received == on-chain getAmountOut view (exact-in-dy)");
+    assert.ok(received > 0n, "non-zero Solidly fill through the callback-free transfer+swap path");
 
-    console.log(`  [Solidly solo:${engine}] spent=${spent} received=${received} (== getAmountOut to the wei)`);
+    console.log(
+      `  [QL Solidly solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +
+        `(== getAmountOutStable == getAmountOut to the wei); cook gasUsed=${receipt.gasUsed}`,
+    );
   }
 
-  // ── (2) TWO stable venues — split + per-leg exact-in-dy + marginals equalize ──
-  async function runSplit(engine: Engine): Promise<void> {
-    await reset();
+  // ── (2) QL Solidly + a live V3 direct pool — bestKind 1 vs 3 in ONE merge; split == oracle wei-exact ──
+  async function runSolidlyV3(engine: Engine): Promise<void> {
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    // Two venues at the SAME spot (balanced 1:1) but different fee / depth → different marginal
-    // curves, so the water-fill engages BOTH and equalizes their post-fee marginals.
-    const aR0 = 2_000_000n * E18, aR1 = 2_000_000n * E18, FA = 100; // deep, low fee → draws first + more
-    const bR0 = 1_000_000n * E18, bR1 = 1_000_000n * E18, FB = 500; // shallower, higher fee
-    const poolA = await deploySolidlyStablePool(
-      c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FA), aR0, aR1, caller,
-    );
-    const poolB = await deploySolidlyStablePool(
-      c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FB), bR0, bR1, caller,
-    );
-    const opA = offPool(poolA, aR0, aR1, FA);
-    const opB = offPool(poolB, bR0, bR1, FB);
+    // A SHALLOW-ish stable (500k/side, low 0.01% fee ⇒ draws FIRST) vs a DEEP 1:1 V3 pool (fee 0.3%,
+    // ts 60, ONE wide position ⇒ constant L). The stable curve BENDS below the deep V3's post-fee
+    // marginal within the trade, so the two marginal curves CROSS inside [0, amountIn] and BOTH venues fill.
+    const sR = 500_000n * E18, FEE = 100;
+    const pool = await deploySolidlyStablePool(c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FEE), sR, sR, caller);
+    const op = offPool(pool, sR, sR, FEE);
 
-    const amountIn = 800_000n * E18;
-    const segRows = sortSegs([...stableSegRows(opA, 0, amountIn), ...stableSegRows(opB, 1, amountIn)]);
+    const V3_FEE = 3000, V3_TS = 60;
+    const v3 = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, V3_FEE, SQRT_PRICE_1_1);
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, v3, caller, -60000, 60000, parseEther("3000000"));
+    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, v3);
+    const liquidity = await getLiquidity(c.publicClient, v3);
+    assert.ok(liquidity > 0n, "V3 pool has active liquidity");
 
+    const amountIn = 300_000n * E18;
+    // Neutral oracle: pool[0] = live V3 (empty net ⇒ constant-L walk), pool[1] = QL Solidly.
+    const v3Opt: OptimalPool = { isV2: false, feePpm: V3_FEE, sqrtPriceX96, tick, tickSpacing: V3_TS, liquidity, net: new Map() };
+    const oracle = optimalSplit({
+      pools: [v3Opt, { solidlyStable: op, feePpm: 0 }],
+      amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n,
+    });
+    const oV3 = oracle.perPoolInput[0] ?? 0n;
+    const oSolidly = oracle.perPoolInput[1] ?? 0n;
+    assert.ok(oV3 > 0n && oSolidly > 0n, `oracle splits across V3 + Solidly (V3 ${oV3}, Solidly ${oSolidly})`);
+
+    const pools = [v3PoolTuple(v3, V3_FEE, V3_TS, true)];
+    const qlv = [solidlyDescriptor(pool, 0, FEE)];
     const { bytecodes } = compileSauce(
-      solverSrc, stableArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 1, pools, qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: SOLIDLY_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-    const aInBefore = await balanceOf(c.publicClient, tokenIn, poolA);
-    const bInBefore = await balanceOf(c.publicClient, tokenIn, poolB);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const solidlyInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "two-venue Solidly-stable cook() must succeed");
+    assert.equal(receipt.status, "success", "Solidly+V3 cook() must succeed");
 
-    const aIn = (await balanceOf(c.publicClient, tokenIn, poolA)) - aInBefore;
-    const bIn = (await balanceOf(c.publicClient, tokenIn, poolB)) - bInBefore;
+    const solidlyIn = (await balanceOf(c.publicClient, tokenIn, pool)) - solidlyInBefore;
+    const v3In = (await balanceOf(c.publicClient, tokenIn, v3)) - v3InBefore;
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
 
-    assert.ok(aIn > 0n && bIn > 0n, "both stable venues are funded");
-    assert.ok(aIn > bIn, `deep/low-fee venue A draws more than B (A ${aIn} > B ${bIn})`);
+    assert.ok(solidlyIn > 0n && v3In > 0n, `both venues funded (Solidly ${solidlyIn}, V3 ${v3In})`);
+    assert.equal(v3In, oV3, "V3 awarded input == oracle (wei-exact split)");
+    assert.equal(solidlyIn, oSolidly, "Solidly awarded input == oracle (wei-exact split)");
+    assert.equal(spent, oracle.totalInput, "spent == oracle totalInput (wei-exact)");
+    assert.ok(received > 0n, "caller receives tokenOut");
 
-    // PER-LEG WEI-EXACT-IN-DY: received == getAmountOut_A(aIn) + getAmountOut_B(bIn). NO tolerance.
-    const expected = getAmountOutStable(opA, aIn) + getAmountOutStable(opB, bIn);
-    assert.equal(received, expected, "received == Σ getAmountOut(per-venue share) to the wei");
+    console.log(`  [QL Solidly+V3:${engine}] V3 in=${v3In} Solidly in=${solidlyIn} spent=${spent} received=${received} (split == oracle wei-exact)`);
+  }
 
-    // MARGINALS EQUALIZE within the GRID bound. The SPLIT is exact-on-grid (the awarded inputs equal
-    // the oracle bit-for-bit — checked by the wei-exact gate above), but the realized post-fee marginal
-    // each venue reaches equalizes only to within ONE sampled segment's price width. The sAMM curve is
-    // very FLAT near peg, so a single M=24 segment spans a wider price band than a steeper curve would:
-    // the measured cut gap is ≈2000 ppm at M=24 and converges (≈500 ppm at M=200) as the grid tightens —
-    // the documented exact-on-grid standard (the SPLIT is exact; the marginal equalizes to the grid).
-    const margA = marginalAt(opA, aIn);
-    const margB = marginalAt(opB, bIn);
-    const diff = margA > margB ? margA - margB : margB - margA;
-    const relPpm = margA > 0n ? (diff * 1_000_000n) / margA : 0n;
-    assert.ok(relPpm <= 2500n, `Solidly split marginals equalize on the M=24 grid (rel ${relPpm} ppm; A ${margA} B ${margB})`);
+  // ── (3) QL Solidly + QL Curve — TWO QL venues of DIFFERENT segKind (4 + 1) in ONE qlv; the generalized
+  // loop builds both + INTERLEAVES them in the sort; per-leg exact-in-dy; split == oracle. ──
+  async function runSolidlyCurve(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    // A SHALLOW steep Curve (low A, 0.03% fee ⇒ draws FIRST but bends fast) vs a DEEP Solidly (1M/side,
+    // 0.01% fee ⇒ flatter). The two marginal curves CROSS inside the trade, so BOTH QL venues (segKind
+    // 1 + 4) receive input and their on-chain-built ladders INTERLEAVE in the merged-stream DESC sort.
+    const curveBal = [150_000n * E18, 150_000n * E18];
+    const CURVE_A = 20n, CURVE_FEE = 3_000_000n; // 0.03% (1e10-scaled), steep low-A curve
+    const curve = await deployCurveStableSwap(c.walletClient, c.publicClient, [tokenIn, tokenOut], curveBal, [E18, E18], CURVE_A, CURVE_FEE, caller);
+    const opCurve = offCurvePool(curve, curveBal, CURVE_A, CURVE_FEE);
+
+    const sR = 1_000_000n * E18, FEE = 100;
+    const solidly = await deploySolidlyStablePool(c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FEE), sR, sR, caller);
+    const opSolidly = offPool(solidly, sR, sR, FEE);
+
+    const amountIn = 300_000n * E18;
+    // Neutral oracle: pool[0] = QL Curve (buildCurveQLLadder), pool[1] = QL Solidly (buildSolidlyStableQLLadder).
+    const oracle = optimalSplit({ pools: [{ curve: opCurve, feePpm: 0 }, { solidlyStable: opSolidly, feePpm: 0 }], amountIn, zeroForOne: true });
+    const oCurve = oracle.perPoolInput[0] ?? 0n;
+    const oSolidly = oracle.perPoolInput[1] ?? 0n;
+    assert.ok(oCurve > 0n && oSolidly > 0n, `oracle splits across QL Curve + QL Solidly (Curve ${oCurve}, Solidly ${oSolidly})`);
+
+    // ONE qlv carrying BOTH families: a segKind-1 Curve descriptor + a segKind-4 Solidly descriptor.
+    const qlv = [curveDescriptor(curve, 0, CURVE_FEE), solidlyDescriptor(solidly, 0, FEE)];
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: SOLIDLY_CURVE_DEFINES },
+    );
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const curveInBefore = await balanceOf(c.publicClient, tokenIn, curve);
+    const solidlyInBefore = await balanceOf(c.publicClient, tokenIn, solidly);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "QL Solidly + QL Curve cook() must succeed");
+
+    const curveIn = (await balanceOf(c.publicClient, tokenIn, curve)) - curveInBefore;
+    const solidlyIn = (await balanceOf(c.publicClient, tokenIn, solidly)) - solidlyInBefore;
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+
+    assert.ok(curveIn > 0n && solidlyIn > 0n, `both QL venues funded (Curve ${curveIn}, Solidly ${solidlyIn})`);
+    assert.equal(curveIn, oCurve, "Curve awarded input == oracle (wei-exact split)");
+    assert.equal(solidlyIn, oSolidly, "Solidly awarded input == oracle (wei-exact split)");
+    // PER-LEG WEI-EXACT-IN-DY: received == get_dy_Curve(curveIn) + getAmountOutStable(solidlyIn). NO tolerance.
+    assert.equal(received, getDy(opCurve, curveIn) + getAmountOutStable(opSolidly, solidlyIn), "received == Σ per-venue view(share) to the wei");
 
     console.log(
-      `  [Solidly split:${engine}] A in=${aIn} B in=${bIn} received=${received} ` +
-        `(== Σ getAmountOut to the wei); marginals A=${margA} B=${margB} (${relPpm} ppm)`,
+      `  [QL Curve+Solidly:${engine}] Curve in=${curveIn} Solidly in=${solidlyIn} received=${received} ` +
+        `(two QL segKinds interleaved; split == oracle, dy wei-exact)`,
     );
   }
 
-  // Post-fee out/in marginal price at a cumulative input `share` — a small finite-difference slice of
-  // getAmountOutStable around `share` (the same coordinate the segments carry). Used only to check the
-  // split equalized marginals.
-  function marginalAt(pool: SolidlyStablePool, share: bigint): bigint {
-    if (share <= 0n) return 0n;
-    const eps = share / 1000n > 0n ? share / 1000n : 1n;
-    const lo = share - eps > 0n ? share - eps : 0n;
-    const dIn = share - lo;
-    const dOut = getAmountOutStable(pool, share) - getAmountOutStable(pool, lo);
-    if (dIn <= 0n || dOut <= 0n) return 0n;
-    return isqrt((dOut * (1n << 192n)) / dIn);
-  }
-  function isqrt(x: bigint): bigint {
-    if (x <= 0n) return 0n;
-    let z = x;
-    let y = (z + 1n) / 2n;
-    while (y < z) {
-      z = y;
-      y = (x / y + y) / 2n;
+  // ── (4) ZERO-CACHE QUOTE — a read-only cook builds the ladder LIVE with NO prepared cache/segments. ──
+  const cookCallAbi = parseAbi(["function cook(bytes[] ingredients) payable returns (bytes returnData)"]);
+  function decodeCookUint(ret: Hex, engine: Engine): bigint {
+    if (!ret || ret === "0x") return 0n;
+    if (engine === "v1") {
+      const blob = decodeFunctionResult({ abi: cookCallAbi as Abi, functionName: "cook", data: ret }) as unknown as Hex;
+      const hex = blob.slice(2);
+      return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
     }
-    return z;
+    const hex = ret.slice(2);
+    return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+  }
+
+  async function runZeroCacheQuote(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const r0 = 1_000_000n * E18, r1 = 1_000_000n * E18, FEE = 100;
+    const pool = await deploySolidlyStablePool(c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FEE), r0, r1, caller);
+    const op = offPool(pool, r0, r1, FEE);
+
+    const amountIn = 100_000n * E18;
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [solidlyDescriptor(pool, 0, FEE)]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: SOLIDLY_DEFINES },
+    );
+    // Caller is funded + approved from setup, so a READ-ONLY cook (rolled back) runs the transferFrom +
+    // the QL ladder build + the swap, and returns the solver's tokenOut. NO prepared cache/segments — the
+    // ladder is built from LIVE getAmountOut inside the eth_call (the zero-cache quote).
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const data = encodeFunctionData({ abi: cookCallAbi as Abi, functionName: "cook", args: [bytecodes] });
+    const { data: ret } = await c.publicClient.call({ account: caller, to: target, data, gas: 2_000_000_000n });
+    const quoted = decodeCookUint(ret as Hex, engine);
+
+    assert.equal(quoted, getAmountOutStable(op, amountIn), "zero-cache QUOTE == getAmountOutStable(amountIn) to the wei (ladder built live in the eth_call)");
+    console.log(`  [QL Solidly zero-cache quote:${engine}] quoted=${quoted} (== getAmountOutStable(amountIn), no prepared cache)`);
+  }
+
+  // ── (5) ADVERSE DRIFT — move the Solidly pool's price with a REAL swap BEFORE cooking. Because the QL
+  // ladder is built from LIVE getAmountOut at cook time (no baked snapshot), it RE-ANCHORS to the drifted
+  // curve: the Solidly↔V3 split ADAPTS (the drifted stable share SHRINKS, V3's grows). ──
+  async function runAdverseDriftSplit(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const sR = 500_000n * E18, FEE = 100;
+    const solidly = await deploySolidlyStablePool(c.walletClient, c.publicClient, tokenIn, tokenOut, E18, E18, BigInt(FEE), sR, sR, caller);
+
+    const V3_FEE = 3000, V3_TS = 60;
+    const v3 = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, V3_FEE, SQRT_PRICE_1_1);
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, v3, caller, -60000, 60000, parseEther("3000000"));
+    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, v3);
+    const liquidity = await getLiquidity(c.publicClient, v3);
+
+    const amountIn = 300_000n * E18;
+    const pools = [v3PoolTuple(v3, V3_FEE, V3_TS, true)];
+    const qlv = [solidlyDescriptor(solidly, 0, FEE)];
+    // Bytecode built against the PRE-drift universe — the descriptor carries NO pool prices, so the SAME
+    // bytecode is cooked after drift; only the LIVE getAmountOut the ladder reads changes.
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 1, pools, qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: SOLIDLY_DEFINES },
+    );
+
+    // Baseline (NO drift) oracle split — the stable share the un-drifted universe would award.
+    const v3Opt: OptimalPool = { isV2: false, feePpm: V3_FEE, sqrtPriceX96, tick, tickSpacing: V3_TS, liquidity, net: new Map() };
+    const opPre = offPool(solidly, sR, sR, FEE);
+    const oraclePre = optimalSplit({ pools: [v3Opt, { solidlyStable: opPre, feePpm: 0 }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const solidlySharePre = oraclePre.perPoolInput[1] ?? 0n;
+    assert.ok(solidlySharePre > 0n, "baseline oracle awards the Solidly venue a share");
+
+    // ADVERSE DRIFT: a REAL token0→token1 swap on the stable pool imbalances it (more token0, less
+    // token1) so subsequent token0→token1 swaps price WORSE. The fixture swap is TRANSFER-FIRST: transfer
+    // the drift input, read the exact out on the stored reserves, then swap(0, out, ...) (the K-invariant
+    // holds because out == getAmountOut on those reserves).
+    const driftIn = 100_000n * E18;
+    const driftOut = (await c.publicClient.readContract({
+      address: solidly, abi: solidlyStableAbi as Abi, functionName: "getAmountOut", args: [driftIn, tokenIn],
+    })) as bigint;
+    await c.walletClient.writeContract({
+      address: tokenIn, abi: erc20Abi as Abi, functionName: "transfer", args: [solidly, driftIn], account: caller, chain: null,
+    });
+    await c.walletClient.writeContract({
+      address: solidly, abi: solidlyStableAbi as Abi, functionName: "swap", args: [0n, driftOut, caller, "0x"], account: caller, chain: null,
+    });
+
+    // The DRIFTED oracle — rebuilt from the pool's live post-drift reserves.
+    const [dr0, dr1] = await reserves(solidly);
+    const opDrift = offPool(solidly, dr0, dr1, FEE);
+    const oracleDrift = optimalSplit({ pools: [v3Opt, { solidlyStable: opDrift, feePpm: 0 }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const solidlyShareDrift = oracleDrift.perPoolInput[1] ?? 0n;
+    assert.ok(solidlyShareDrift > 0n, "drifted oracle still awards the Solidly venue a (smaller) share");
+    assert.ok(solidlyShareDrift < solidlySharePre, `adverse drift shrinks the Solidly share (${solidlyShareDrift} < ${solidlySharePre})`);
+
+    // Cook the PRE-drift bytecode against the DRIFTED pool. The QL ladder re-anchors to the live curve.
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const solidlyInBefore = await balanceOf(c.publicClient, tokenIn, solidly);
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "adverse-drift Solidly+V3 cook() must succeed");
+
+    const solidlyIn = (await balanceOf(c.publicClient, tokenIn, solidly)) - solidlyInBefore;
+    const v3In = (await balanceOf(c.publicClient, tokenIn, v3)) - v3InBefore;
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+
+    assert.ok(solidlyIn > 0n && v3In > 0n, "both venues funded post-drift");
+    // RE-ANCHORED: the on-chain split matches the DRIFTED oracle (built from live post-drift state), NOT
+    // the pre-drift baseline — the QL ladder walked the LIVE (drifted) curve.
+    assert.equal(v3In, oracleDrift.perPoolInput[0] ?? 0n, "V3 awarded input == drifted oracle (re-anchored, wei-exact)");
+    assert.equal(solidlyIn, solidlyShareDrift, "Solidly awarded input == drifted oracle (re-anchored, wei-exact)");
+    assert.equal(spent, oracleDrift.totalInput, "spent == drifted oracle totalInput (wei-exact)");
+    assert.ok(solidlyIn < solidlySharePre, `Solidly share ADAPTED down after adverse drift (${solidlyIn} < baseline ${solidlySharePre})`);
+
+    console.log(
+      `  [QL Solidly+V3 adverse-drift:${engine}] baseline Solidly share=${solidlySharePre} → drifted=${solidlyIn} ` +
+        `(V3 grew to ${v3In}); received=${received} (split RE-ANCHORED to live drifted curve)`,
+    );
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`Solidly stable solo [${engine}] — received == getAmountOut(share) to the wei (exact-in-dy)`, { skip }, async () => {
+    it(`QL Solidly solo [${engine}] — on-chain ladder, received == getAmountOutStable(share) wei-exact`, { skip }, async () => {
       await runSolo(engine);
     });
-    it(`Solidly stable split [${engine}] — two venues, per-leg exact-in-dy + marginals equalize`, { skip }, async () => {
-      await runSplit(engine);
+    it(`QL Solidly + V3 [${engine}] — sampled stream vs live frontier, split == oracle wei-exact`, { skip }, async () => {
+      await runSolidlyV3(engine);
+    });
+    it(`QL Solidly + QL Curve [${engine}] — two QL segKinds in one loop, interleave + split == oracle`, { skip }, async () => {
+      await runSolidlyCurve(engine);
+    });
+    it(`QL Solidly zero-cache QUOTE [${engine}] — ladder built live in eth_call, no prepared cache`, { skip }, async () => {
+      await runZeroCacheQuote(engine);
+    });
+    it(`QL Solidly + V3 adverse-drift [${engine}] — split RE-ANCHORS to the live drifted curve`, { skip }, async () => {
+      await runAdverseDriftSplit(engine);
     });
   }
 });

@@ -88,19 +88,22 @@ import { IPermit2 } from "./IPermit2.json";
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
 //   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx] — the QUOTE-LADDER (QL) venue DESCRIPTORS
-//                 (Curve StableSwap segKind 1 + Curve CryptoSwap segKind 9). NO sampled values: prepare
-//                 ships only the descriptor (prepare-optional), and the solver BUILDS each venue's price
-//                 ladder ON-CHAIN in setup from LIVE cook-time state. For k in 0..QL_S-1 it takes a
-//                 geometric cumulative input xNext = cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV,
-//                 derived on-chain, clamped at amountIn), quotes q_k = get_dy(i,j,xNext) via
-//                 PROBE-THEN-DECODE dispatched per-row on segKind (qd[4]) — StableSwap get_dy(int128,
+//                 (Curve StableSwap segKind 1, Curve CryptoSwap segKind 9, Solidly STABLE segKind 4,
+//                 WOOFi segKind 10). NO sampled values: prepare ships only the descriptor (prepare-
+//                 optional), and the solver BUILDS each venue's price ladder ON-CHAIN in setup from LIVE
+//                 cook-time state. For k in 0..QL_S-1 it takes a geometric cumulative input xNext =
+//                 cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV, derived on-chain, clamped at
+//                 amountIn), quotes q_k dispatched per-row on segKind (qd[4]): StableSwap get_dy(int128,
 //                 int128,uint256) for kind 1, CryptoSwap get_dy(uint256,uint256,uint256) for kind 9 (a
-//                 DIFFERENT selector + uint256 coin indices) — where the `.catch` flags a revert ⇒ stop
-//                 (both get_dy families are revert-class: StableSwap on bad state, CryptoSwap on Newton
-//                 non-convergence; the sentinel-catch cannot capture the return VALUE). It then
+//                 DIFFERENT selector + uint256 coin indices), Solidly getAmountOut(xIn,tokenIn) for kind
+//                 4, WOOFi tryQuery(tokenIn,tokenOut,xIn) for kind 10. The revert-class views (get_dy
+//                 families on bad state / Newton non-convergence; Solidly getAmountOut on _get_y non-
+//                 convergence) use PROBE-THEN-DECODE (a `.catch` flags a revert ⇒ stop; the sentinel-catch
+//                 cannot capture the return VALUE); WOOFi tryQuery NEVER reverts (returns 0 on a cap /
+//                 feasibility failure) ⇒ a PLAIN staticcall decoding [0], 0 ⇒ stop. It then
 //                 differences (capacity = xNext-cum, sliceOut = q_k - q_{k-1}) and emits a segment row
 //                 [refIdx, capacity, head, head, segKind, venue] (head = qlSliceHead(sliceOut,capacity);
-//                 both get_dy are post-fee ⇒ no extra fee-adjust) into the SAME merged segment stream
+//                 all four quotes are post-fee ⇒ no extra fee-adjust) into the SAME merged segment stream
 //                 the static `segs` feed. Stops early on a sentinel-0 quote, a non-descending head
 //                 (non-convex guard), or the QL_S cap. Building all slices ONCE from one live read is
 //                 exactly as live as re-quoting per merge step (pool state is frozen until EXEC), so
@@ -578,15 +581,18 @@ function main(
       msAux[msN] = sr[6];
       msN = msN + 1;
     }
-    // 2. Build each QL venue's price ladder ON-CHAIN from LIVE get_dy. ONE qlv loop dispatches the
-    // per-row quote on the descriptor segKind (qd[4]) — Curve StableSwap (kind 1) and Curve CryptoSwap
-    // (kind 9) so far, each adapter branch treeshake-guarded so only active adapters ship. PROBE-THEN-
-    // DECODE the quote (a `.catch` flags a revert; the sentinel-catch cannot capture the return VALUE —
-    // it yields the CALL flag on v1 / returndata length on v12). Everything AFTER obtaining q (the
-    // differencing / head / emit / sort below) is SHARED and adapter-agnostic. All slices are built from
-    // ONE frozen live state, so this is exactly as live as re-quoting per merge step; bounded to
-    // ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO) {
+    // 2. Build each QL venue's price ladder ON-CHAIN from LIVE quotes. ONE qlv loop dispatches the
+    // per-row quote on the descriptor segKind (qd[4]) — Curve StableSwap (kind 1), Curve CryptoSwap
+    // (kind 9), Solidly STABLE (kind 4) and WOOFi (kind 10), each adapter branch treeshake-guarded so
+    // only active adapters ship. The QUOTE is PROBE-THEN-DECODE for any view that CAN revert (Curve /
+    // CryptoSwap get_dy on bad state / Newton non-convergence; Solidly getAmountOut on x3y+y3x _get_y
+    // non-convergence) — a `.catch` flags a revert ⇒ stop (the sentinel-catch cannot capture the return
+    // VALUE: it yields the CALL flag on v1 / returndata length on v12). For a view that NEVER reverts
+    // (WOOFi tryQuery returns 0 on cap/feasibility failure) it is a PLAIN staticcall + treat 0 as stop
+    // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
+    // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
+    // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -609,10 +615,14 @@ function main(
             if (cap === 0) {
               stop = 1;
             } else {
-              // PROBE-THEN-DECODE, dispatched per-row on segKind. The sentinel-catch value is unusable
-              // for capture on both engines — it ONLY flags the revert; the value is the guarded second
-              // call. StableSwap uses int128 coin indices, CryptoSwap uint256 (a DIFFERENT selector);
-              // both get_dy are revert-class so they share the idiom.
+              // QUOTE, dispatched per-row on segKind. PROBE-THEN-DECODE for the revert-class views: the
+              // sentinel-catch value is unusable for capture on both engines — it ONLY flags the revert;
+              // the value is the guarded second call. StableSwap uses int128 coin indices, CryptoSwap
+              // uint256 (a DIFFERENT selector); both get_dy are revert-class. Solidly getAmountOut(xIn,
+              // tokenIn) is a SINGLE-return view that CAN revert on _get_y non-convergence at a large
+              // input, so it too probes-then-decodes. WOOFi tryQuery(tokenIn,tokenOut,xIn) → (amountOut,
+              // swapFee) NEVER reverts (returns 0 on a cap / feasibility failure), so it is a PLAIN
+              // staticcall decoding [0] + treats 0 as stop — no `.catch`, saving a staticcall.
               let ok: Uint256 = 1;
               let q: Uint256 = 0;
               if (HAS_CURVE && qKind === 1) {
@@ -622,6 +632,15 @@ function main(
                 if (HAS_CRYPTO && qKind === 9) {
                   ICryptoSwapPoolQL.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
                   if (ok === 1) { q = ICryptoSwapPoolQL.at(qPool).get_dy(qi, qj, xNext); }
+                } else {
+                  if (HAS_SOLIDLY_STABLE && qKind === 4) {
+                    ISolidlyStablePool.at(qPool).getAmountOut(xNext, tokenIn).catch(() => { ok = 0; });
+                    if (ok === 1) { q = ISolidlyStablePool.at(qPool).getAmountOut(xNext, tokenIn); }
+                  } else {
+                    if (HAS_WOOFI && qKind === 10) {
+                      q = IWooFiPool.at(qPool).tryQuery(tokenIn, tokenOut, xNext);
+                    }
+                  }
                 }
               }
               if (q === 0) {

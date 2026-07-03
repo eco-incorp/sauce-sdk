@@ -13,6 +13,17 @@
     },
     {
       "type": "function",
+      "name": "tryQuery",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "fromToken", "type": "address" },
+        { "name": "toToken", "type": "address" },
+        { "name": "fromAmount", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "toAmount", "type": "uint256" }]
+    },
+    {
+      "type": "function",
       "name": "swap",
       "stateMutability": "nonpayable",
       "inputs": [

@@ -36,9 +36,17 @@
  *       delegate to uncaptured aggregators) — the state snapshot ships their sha256 anchors for the NO-RPC
  *       integrity tripwire, and this is called out HONESTLY below (it is the one non-byte-equal dependency).
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
+ * QUOTE-LADDER (QL). WOOFi is a QL venue now (like Curve StableSwap / CryptoSwap / Solidly): prepare ships
+ * ONLY a descriptor and the on-chain solver BUILDS the price ladder in setup from LIVE tryQuery (the
+ * GRACEFUL WooPPV2 quote — never reverts, this deployment returns the single toAmount). tryQuery/query are
+ * self-contained in {pool, WooracleV2, CL shims} — all etched — so the QL ladder build runs OFFLINE against
+ * the real bytecode; this test asserts the on-chain-built ladder matches the real pool tryQuery at every QL
+ * point AND cooks the QL descriptor with ZERO prepared segments.
+ *
  *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts optimalSplit,
- *       seeded from the REAL captured sPMM state via the SHARED buildWooFiSegments) == the REAL pool's own
- *       pre-swap query() view of the awarded slice, all to the wei. spent == awarded is asserted explicitly.
+ *       seeded from the REAL captured sPMM state via the SHARED buildWooFiQLLadder) == the REAL pool's own
+ *       pre-swap query() view of the awarded slice, all to the wei. The off-chain query replay is proven
+ *       bit-for-bit with the real tryQuery at every QL ladder point. spent == awarded is asserted explicitly.
  *
  * HONEST fee accounting (like DODO, unlike Solidly): WooPPV2 applies its swap fee to the OUTPUT (query()
  * already nets it) and RETAINS the full input — the fee accrues to the pool's `unclaimedFee` (claimed later
@@ -85,10 +93,9 @@ import {
   cookTarget,
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
-import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
-import { query as wooFiQuery, type WooFiPool } from "../shared/woofi-math";
+import { query as wooFiQuery, buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math";
 
 const SNAP_NAME = "arbitrum-woofi-USDTUSDC";
 const ENGINE_CELLS = engineCells();
@@ -332,16 +339,47 @@ describe("EcoSwap WOOFi (WooPPV2 sPMM) prod-mirror — REAL bytecode, no fork, o
       tokenIn.toLowerCase(),
       "discovery oriented the venue fromToken == tokenIn (== base, sellBase)",
     );
-    assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.WOOFi),
-      "WOOFi segments present",
+    // WOOFi is a QUOTE-LADDER (QL) venue now: prepare ships ONLY a descriptor, NO sampled segments (the
+    // on-chain solver builds the ladder live from tryQuery). Assert the stream is empty.
+    assert.equal(
+      (prepared.brackets ?? []).length,
+      0,
+      "WOOFi QL ships NO sampled segments (descriptor-only, ladder built on-chain)",
     );
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one WOOFi venue seeded from the REAL captured sPMM state via the
-    // SHARED buildWooFiSegments. Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known
-    // ahead — and the engine's static-segment cursor consumes the IDENTICAL grid, so on-chain spent ==
-    // oracle.totalInput to the wei.
+    // PRODUCTION QL LADDER, unmasked: buildWooFiQLLadder replays the descriptor off-chain (no RPC) — the
+    // SAME geometric quote ladder the on-chain solver builds in setup from live tryQuery. This is what the
+    // neutral oracle consumes, so the split is wei-exact vs the solver by construction (descriptor only).
     const op = offPool(snaps.state);
+    const ladder = buildWooFiQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "production QL ladder is non-empty");
+
+    // LADDER PARITY — the core gate: at EVERY cumulative QL ladder point the off-chain replay (query on the
+    // captured sPMM state) == the REAL etched WooPPV2's OWN pre-swap tryQuery view (the GRACEFUL quote the
+    // solver's qlv loop reads — this deployment returns the single toAmount) reading the REAL WooracleV2, to
+    // the WEI. These are the EXACT points the on-chain qlv loop quotes, so this pins the whole QL quote path
+    // (the _calc* sPMM integral + the output fee) against the genuine deployed bytecode. (Read BEFORE the
+    // cook — the sell mutates the reserves.) The off-chain `query` MODELS WooPPV2's notionalSwap/maxGamma
+    // caps (via wooFiInputCap, seeded from the captured tokenInfos), returning 0 past a cap — the SAME point
+    // the real tryQuery self-truncates — so this equality holds even if a recapture/resize pushes a cum past
+    // a cap (both sides 0), not only for the within-cap sizing used here.
+    let cum = 0n;
+    let cumOut = 0n;
+    for (const s of ladder) {
+      cum += s.capacity;
+      cumOut += s.effOut;
+      const offChain = wooFiQuery(op, cum);
+      const onChain = (await c.publicClient.readContract({
+        address: etched.pool, abi: wooFiPoolReadAbi, functionName: "tryQuery", args: [tokenIn, tokenOut, cum],
+      })) as bigint;
+      assert.equal(offChain, onChain, `QL ladder parity at cum=${cum}: query == REAL tryQuery (wei-exact)`);
+      assert.equal(cumOut, offChain, `QL ladder partition at cum=${cum}: Σ effOut == query(cum)`);
+    }
+
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one WOOFi venue seeded from the REAL captured sPMM state via the
+    // SHARED buildWooFiQLLadder. Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known
+    // ahead — and the on-chain-built ladder is the IDENTICAL grid, so on-chain spent == oracle.totalInput
+    // to the wei.
     const optPools: OptimalPool[] = [{ woofi: op, feePpm } as OptimalPool];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
     const awarded = oracle.perPoolInput[0] ?? 0n;
@@ -373,23 +411,17 @@ describe("EcoSwap WOOFi (WooPPV2 sPMM) prod-mirror — REAL bytecode, no fork, o
     // routes the input fee to a separate PoolFees contract). Assert the pool netted exactly what was spent.
     assert.equal(poolIn, spent, "REAL WooPPV2 netted the FULL input (fee is taken on the output as unclaimedFee, not the input)");
 
-    // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance. WOOFi is a
-    // SAMPLED-SEGMENT venue (buildWooFiSegments samples the sPMM curve on a squared-index geometric grid
-    // capped at amountIn, dropping any non-descending-marginal slice) — so the awarded Σ is the grid's
-    // covered capacity, at most amountIn. The engine's static-segment cursor consumes the IDENTICAL grid, so
-    // spent == oracle awarded == oracle.totalInput to the wei.
-    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
-    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
-    // WOOFi is a SAMPLED-SEGMENT venue (buildWooFiSegments samples the sPMM curve on a squared-index
-    // geometric grid capped at amountIn, and the strictly-descending-marginal guard drops the final
-    // near-saturation slice) — so the awarded Σ is the grid's covered capacity, a small documented tail
-    // below amountIn, NOT the full amountIn. (A full-fill amountIn assertion would be false for any
-    // sampled-segment source, so we assert the grid Σ, not amountIn — mirroring the DODO prod-mirror.)
-    // Bound the unfilled tail so a regression that grossly under-fills (broken ladder / wrong orientation)
-    // still fails here.
-    assert.ok(spent <= amountIn, "spent does not exceed amountIn");
-    const tail = amountIn - spent;
-    assert.ok(tail * 20n < amountIn, `unfilled tail is the small WOOFi grid remainder (<5% of amountIn): tail=${tail}`);
+    // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance. The QL ladder
+    // covers [0, amountIn] (QL_SEED_DIV=16 forces the clamp on the final slice for a convex sPMM curve), so
+    // the single venue absorbs the whole trade. The on-chain-built ladder is the IDENTICAL grid the oracle
+    // awarded (proven at every point above), so spent == awarded == oracle.totalInput == amountIn.
+    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact)");
+    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact)");
+    // SINGLE-VENUE FULL-FILL: the ~5%-of-reserve sizing keeps the ladder within [0, amountIn] and well
+    // within the pool caps, so the whole trade allocates to the one WOOFi venue. Assert it EXPLICITLY (a
+    // regression that under-fills or splits fails here, not silently). Unlike the pre-QL sampled-segment
+    // path (which dropped a near-saturation tail), the QL ladder covers the full amountIn.
+    assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (no unspent wei, no split)");
 
     // The caller-received tokenOut == query(spent) (the oracle's realized dy for the awarded Σ) == the REAL
     // pool's OWN pre-swap query(awarded Σ) view, all to the WEI. NO tolerance. The three-way agreement (TS

@@ -595,13 +595,12 @@ function buildDodoBrackets(pool: DodoPool, refIdx: number, amountIn: bigint): Ec
 }
 
 /**
- * Build Solidly STABLE (sAMM) segments for one pool by sampling the bigint replay (NO extra RPC — pure
- * bigint on the read reserves/decimals/fee). Each sampled (Δinput, Δoutput) increment becomes a STATIC
- * segment (kind SolidlyStable) in unified out/in space, refIdx → the stable venue index. The marginal
- * is the POST-FEE execution price (getAmountOutStable already nets the fee), so it enters the
- * descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The stable curve (x3y+y3x) is
- * OFF-CHAIN ONLY for the split; the on-chain solver executes CALLBACK-FREE (getAmountOut staticcall +
- * transfer + pool.swap).
+ * Sample a Solidly STABLE (sAMM) pool via the bigint replay (NO extra RPC — pure bigint on the read
+ * reserves/decimals/fee). Used ONLY as a LIVENESS PROBE now: Solidly STABLE is a QUOTE-LADDER (QL) venue
+ * (see index.ts buildQLVenues), so the on-chain solver builds its price ladder live from getAmountOut and
+ * prepare ships only the descriptor — a pool that quotes no valid segment here is dropped, but the
+ * returned brackets are NOT pushed to the segment stream. The on-chain solver executes CALLBACK-FREE
+ * (getAmountOut staticcall + transfer + pool.swap; the stable curve is x3y+y3x, NOT xy=k).
  */
 function buildSolidlyStableBrackets(pool: SolidlyStablePool, refIdx: number, amountIn: bigint): EcoBracket[] {
   const segs = buildSolidlyStableSegments(pool, amountIn);
@@ -651,14 +650,13 @@ function buildWombatBrackets(pool: WombatPool, refIdx: number, amountIn: bigint)
 }
 
 /**
- * Build WOOFi (WooPPV2 sPMM) segments for one pool by sampling the closed-form oracle-price replay at a
- * SNAPSHOT (NO extra RPC — pure bigint on the read price/spread/coeff/decimals/feeRate). Each sampled
- * (Δinput, Δoutput) increment becomes a STATIC segment (kind WOOFi) in unified out/in space, refIdx → the
- * WOOFi venue index. The marginal is the POST-FEE execution price (query already nets the swap fee), so it
- * enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The WOOFi curve is
- * OFF-CHAIN ONLY for the split; the on-chain solver executes CALLBACK-FREE (query staticcall + transfer +
- * pool.swap — WooPPV2 is transfer-first). The split is priced at the SNAPSHOT oracle; the executed dy is
- * re-read wei-exact by query at the LIVE oracle (see woofi-math.ts for the oracle-snapshot model).
+ * Sample a WOOFi (WooPPV2 sPMM) pool via the closed-form oracle-price replay at the snapshot (NO extra RPC
+ * — pure bigint on the read price/spread/coeff/decimals/feeRate). Used ONLY as a LIVENESS PROBE now: WOOFi
+ * is a QUOTE-LADDER (QL) venue (see index.ts buildQLVenues), so the on-chain solver builds its price ladder
+ * live from tryQuery and prepare ships only the descriptor — a pool the snapshot sampler cannot quote is
+ * dropped, but the returned brackets are NOT pushed to the segment stream. The on-chain solver executes
+ * CALLBACK-FREE (query for minToAmount + transfer + pool.swap — WooPPV2 is transfer-first, oracle-priced).
+ * Because the ladder is built live at cook time it re-anchors to the LIVE WooracleV2 (no snapshot).
  */
 function buildWooFiBrackets(pool: WooFiPool, refIdx: number, amountIn: bigint): EcoBracket[] {
   const segs = buildWooFiSegments(pool, amountIn);
@@ -1159,16 +1157,20 @@ export async function prepareEcoSwap(
   }
   for (const set of dodoBracketSets) brackets.push(...set);
 
+  // Solidly STABLE (sAMM) — like Curve, it is a QUOTE-LADDER (QL) venue: the on-chain solver builds its
+  // price ladder in setup from LIVE getAmountOut (see ecoswap.sauce.ts / index.ts buildQLVenues), so
+  // prepare ships ONLY the descriptor (address + orientation + fee) — NO off-chain sampled segments.
+  // buildSolidlyStableBrackets is still called as a pure LIVENESS PROBE (a pool that quotes no valid
+  // segment is dropped), but its brackets are NOT pushed to the segment stream.
   const solidlyStables: EcoSolidlyStable[] = [];
-  const solidlyBracketSets: EcoBracket[][] = [];
   const solidlyFactories = poolConfig.factories.filter(
     (f) => f.factoryType === FactoryType.SolidlyV2,
   );
   if (solidlyFactories.length > 0) {
     const stableRaw = await discoverSolidlyStablePoolsTyped(tokenIn, tokenOut, client, solidlyFactories);
     for (const sp of stableRaw) {
-      const refIdx = solidlyStables.length;
-      const sb = buildSolidlyStableBrackets(sp, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
+      const sb = buildSolidlyStableBrackets(sp, solidlyStables.length, amountIn);
       if (sb.length === 0) continue;
       solidlyStables.push({
         address: sp.address,
@@ -1176,10 +1178,8 @@ export async function prepareEcoSwap(
         feePpm: sp.feePpm,
         source: sp.source,
       });
-      solidlyBracketSets.push(sb);
     }
   }
-  for (const set of solidlyBracketSets) brackets.push(...set);
 
   const wombats: EcoWombat[] = [];
   const wombatBracketSets: EcoBracket[][] = [];
@@ -1307,21 +1307,24 @@ export async function prepareEcoSwap(
   }
 
   const wooFiPools: EcoWooFi[] = [];
-  const wooFiBracketSets: EcoBracket[][] = [];
   // WOOFi (WooPPV2 sPMM) — single-pool-per-chain discovery (the FactoryConfig.address is the WooPPV2
-  // pool). WOOFi is ORACLE-PRICED (prices off its WooracleV2 feed), NOT xy=k, so it is a SAMPLED-SEGMENT
-  // source. `discoverWooFiPoolsTyped` reads the pool's quoteToken/wooracle + the base's SNAPSHOT oracle
-  // state (price/spread/coeff) + decimals + feeRate; only a DIRECT base↔quote leg is in scope (base→base
-  // is two legs). Sampled OFF-CHAIN at the snapshot; executed CALLBACK-FREE (query for minToAmount +
-  // transfer + pool.swap — WooPPV2 is transfer-first, computing the sold amount from balanceOf − reserve).
-  // NO engine change. The split is exact-on-grid at the snapshot; the executed dy is wei-exact at the live
-  // oracle (the exogenous prepare→cook oracle move is bps-tiny for stablecoin pairs + amountOutMin-guarded).
+  // pool). WOOFi is ORACLE-PRICED (prices off its WooracleV2 feed), NOT xy=k. Like Curve, it is now a
+  // QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE cook-time
+  // tryQuery (the GRACEFUL, never-reverting quote — returns 0 on a cap/feasibility failure — while the
+  // EXEC still reads the reverting query for the minToAmount), so prepare ships ONLY the descriptor
+  // (address + orientation + fee), NO off-chain sampled segments, and re-anchors to the live oracle at
+  // cook time (no snapshot). `discoverWooFiPoolsTyped` reads the pool's quoteToken/wooracle + the base's
+  // oracle state + decimals + feeRate; only a DIRECT base↔quote leg is in scope (base→base is two legs).
+  // Executed CALLBACK-FREE (query for minToAmount + transfer + pool.swap — WooPPV2 is transfer-first,
+  // computing the sold amount from balanceOf − reserve). NO engine change. buildWooFiBrackets is still
+  // called as a pure LIVENESS PROBE (a pool the snapshot sampler cannot quote — e.g. an infeasible
+  // oracle — is dropped), but its brackets are NOT pushed to the segment stream.
   const woofiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.WOOFi);
   if (woofiConfigs.length > 0) {
     const wooRaw = await discoverWooFiPoolsTyped(tokenIn, tokenOut, client, woofiConfigs);
     for (const wp of wooRaw) {
-      const refIdx = wooFiPools.length;
-      const wb = buildWooFiBrackets(wp, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live tryQuery, not from these brackets.
+      const wb = buildWooFiBrackets(wp, wooFiPools.length, amountIn);
       if (wb.length === 0) continue;
       wooFiPools.push({
         address: wp.address,
@@ -1330,10 +1333,8 @@ export async function prepareEcoSwap(
         feePpm: wp.feePpm,
         source: wp.source,
       });
-      wooFiBracketSets.push(wb);
     }
   }
-  for (const set of wooFiBracketSets) brackets.push(...set);
 
   const fermiPools: EcoFermi[] = [];
   const fermiBracketSets: EcoBracket[][] = [];
@@ -1713,29 +1714,29 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
-  // Curve StableSwap AND Curve CryptoSwap ship as QL (Quote-Ladder) DESCRIPTORS (curves.length /
-  // cryptoSwaps.length), NOT sampled segments — the on-chain solver builds each ladder live from get_dy
-  // — so both are reported below as "QL", not a seg count.
+  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE AND WOOFi ship as QL (Quote-Ladder) DESCRIPTORS
+  // (curves.length / cryptoSwaps.length / solidlyStables.length / wooFiPools.length), NOT sampled
+  // segments — the on-chain solver builds each ladder live from its quote view — so all four are reported
+  // below as "QL", not a seg count.
   const nLbSegs = brackets.filter((b) => b.kind === EcoBracketKind.LB).length;
   const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
-  const nSolidlySegs = brackets.filter((b) => b.kind === EcoBracketKind.SolidlyStable).length;
   const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
-  const nWooFiSegs = brackets.filter((b) => b.kind === EcoBracketKind.WOOFi).length;
   const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
   const nMentoSegs = brackets.filter((b) => b.kind === EcoBracketKind.Mento).length;
   const nBalancerV3Segs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerV3).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
-      `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
+      `${lbs.length} LB, ${dodos.length} DODO, ` +
       `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
+      `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ` +
       `${brackets.length} sampled segments (${nLbSegs} LB, ` +
-      `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi, ` +
+      `${nDodoSegs} DODO, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
+      `${nMaverickSegs} Maverick, ${nFermiSegs} Fermi, ` +
       `${nFluidSegs} Fluid, ${nMentoSegs} Mento, ${nBalancerV3Segs} Balancer-V3)`,
   );
 

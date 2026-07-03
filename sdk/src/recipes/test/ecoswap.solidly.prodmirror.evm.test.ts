@@ -25,11 +25,17 @@
  *       runtime, byte-for-byte. No mock SolidlyStablePool.sol is in the swap path (the
  *       pool/impl addresses are the captured mainnet addresses, running captured code).
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
+ * QUOTE-LADDER (QL). Solidly STABLE is a QL venue now (like Curve StableSwap / CryptoSwap): prepare
+ * ships ONLY a descriptor and the on-chain solver BUILDS the price ladder in setup from LIVE getAmountOut
+ * (PROBE-THEN-DECODE). The Aerodrome getAmountOut is a self-contained view (no delegation), so the QL
+ * ladder build runs OFFLINE against the real bytecode; this test asserts the on-chain-built ladder matches
+ * the real pool getAmountOut at every QL point AND cooks the QL descriptor with ZERO prepared segments.
+ *
  *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts
  *       optimalSplit, seeded from the REAL captured reserves via the SHARED
- *       buildSolidlyStableSegments) == the REAL pool's own pre-swap getAmountOut view, all
- *       to the wei. (getAmountOutStable — the oracle's replay — was proven bit-for-bit with
- *       the real pool's getAmountOut across amounts, so the oracle IS the real curve.)
+ *       buildSolidlyStableQLLadder) == the REAL pool's own pre-swap getAmountOut view, all
+ *       to the wei. (getAmountOutStable — the oracle's replay — is proven bit-for-bit with
+ *       the real pool's getAmountOut at every QL ladder point, so the oracle IS the real curve.)
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the
  * artifacts are absent). No state cache — etch+setStorage is a few seconds.
@@ -69,11 +75,11 @@ import {
   cookTarget,
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
-import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import {
   getAmountOutStable,
+  buildSolidlyStableQLLadder,
   type SolidlyStablePool,
 } from "../shared/solidly-stable-math";
 
@@ -279,10 +285,50 @@ describe("EcoSwap Solidly (Aerodrome sAMM) prod-mirror — REAL bytecode, no for
       "the discovered stable venue is the REAL etched pool",
     );
     assert.equal(prepared.solidlyStables![0].feePpm, feePpm, "discovery normalises the captured factory fee to ppm");
-    assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.SolidlyStable),
-      "Solidly-stable segments present",
+    // Solidly STABLE is a QUOTE-LADDER (QL) venue now: prepare ships ONLY a descriptor, NO sampled
+    // segments (the on-chain solver builds the ladder live from getAmountOut). Assert the stream is empty.
+    assert.equal(
+      (prepared.brackets ?? []).length,
+      0,
+      "Solidly QL ships NO sampled segments (descriptor-only, ladder built on-chain)",
     );
+
+    // PRODUCTION QL LADDER, unmasked: buildSolidlyStableQLLadder replays the discovered descriptor
+    // off-chain (no RPC) — the SAME geometric quote ladder the on-chain solver builds in setup from live
+    // getAmountOut. This is what the neutral oracle consumes, so the split is wei-exact vs the solver by
+    // construction (no prepared segments — descriptor only). Built + parity-checked on the PRE-swap pool.
+    const op = offPool(tokenIn, feePpm);
+    const ladder = buildSolidlyStableQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "production QL ladder is non-empty");
+    const ladderSum = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(ladderSum, amountIn, "production QL ladder covers the full amountIn");
+
+    // LADDER PARITY — the core gate this test exists for: at EVERY cumulative QL ladder point the off-chain
+    // replay (getAmountOutStable on the captured reserves) == the REAL etched Aerodrome pool's OWN
+    // pre-swap getAmountOut view, to the WEI. These are the EXACT points the on-chain qlv loop quotes, so
+    // this pins the whole QL quote path (x3y+y3x invariant + bounded-Newton _get_y + the input-side fee)
+    // against the genuine deployed bytecode: on-chain-built ladder == oracle ladder == solver's, wei-exact.
+    // (Read BEFORE the cook — the swap mutates the reserves, so a post-swap read would quote a moved pool.)
+    let cum = 0n;
+    let cumOut = 0n;
+    for (const s of ladder) {
+      cum += s.capacity;
+      cumOut += s.effOut;
+      const offChain = getAmountOutStable(op, cum);
+      const onChain = (await c.publicClient.readContract({
+        address: etched.pool, abi: solidlyPoolReadAbi, functionName: "getAmountOut", args: [cum, tokenIn],
+      })) as bigint;
+      assert.equal(offChain, onChain, `QL ladder parity at cum=${cum}: getAmountOutStable == REAL getAmountOut (wei-exact)`);
+      assert.equal(cumOut, offChain, `QL ladder partition at cum=${cum}: Σ effOut == getAmountOutStable(cum)`);
+    }
+
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one solidlyStable venue seeded from the REAL captured reserves
+    // via the SHARED buildSolidlyStableQLLadder. The whole amountIn allocates to this single venue (the
+    // ladder covers [0, amountIn]).
+    const optPools: OptimalPool[] = [{ solidlyStable: op, feePpm }];
+    const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
+    const awarded = oracle.perPoolInput[0] ?? 0n;
+    assert.ok(awarded > 0n, "oracle allocates to the reproduced stable venue");
 
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
@@ -303,15 +349,6 @@ describe("EcoSwap Solidly (Aerodrome sAMM) prod-mirror — REAL bytecode, no for
     // input less exactly the captured-fee cut.
     const feeCut = (spent * etched.factoryFee) / 10000n;
     assert.equal(poolIn, spent - feeCut, "REAL pool netted the input less the fee it routed to PoolFees");
-
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one solidlyStable venue seeded from the REAL
-    // captured reserves via the SHARED buildSolidlyStableSegments. The whole amountIn should
-    // allocate to this single venue (the segment ladder covers [0, amountIn]).
-    const op = offPool(tokenIn, feePpm);
-    const optPools: OptimalPool[] = [{ solidlyStable: op, feePpm }];
-    const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
-    const awarded = oracle.perPoolInput[0] ?? 0n;
-    assert.ok(awarded > 0n, "oracle allocates to the reproduced stable venue");
 
     // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI, and the caller-
     // received tokenOut == getAmountOutStable(awarded) (the oracle's realized dy) == the REAL

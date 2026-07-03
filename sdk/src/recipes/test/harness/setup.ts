@@ -1193,6 +1193,7 @@ export const wooFiPoolAbi = parseAbi([
   "function setState(uint256 price, uint256 spread, uint256 coeff, bool feasible)",
   "function sync()",
   "function query(address fromToken, address toToken, uint256 fromAmount) view returns (uint256)",
+  "function tryQuery(address fromToken, address toToken, uint256 fromAmount) view returns (uint256 toAmount)",
   "function swap(address fromToken, address toToken, uint256 fromAmount, uint256 minToAmount, address to, address rebateTo) returns (uint256)",
 ]);
 

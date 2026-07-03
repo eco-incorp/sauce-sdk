@@ -75,6 +75,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -190,10 +191,22 @@ export function wooFiInputCap(pool: WooFiPool, fallbackMax: bigint): bigint {
  * SNAPSHOT oracle state. The realized swap output equals this to the wei when the oracle has not moved
  * (WooPPV2.swap calls the same _calc*). Returns 0 on a zero/negative amount, an infeasible oracle, or a
  * gamma/spread that drives the (1e18 − gamma − spread) factor non-positive (the pool would revert).
+ *
+ * EXEC-TIME CAPS (modeled, not a residual). WooPPV2's shared `_calc*` view path — reached by BOTH the
+ * swap and the on-chain query()/tryQuery() staticcall — require()s notionalSwap <= maxNotionalSwap and
+ * gamma <= maxGamma; the real deployed tryQuery returns 0 past either cap (the QL ladder self-truncates
+ * there). This replay models the SAME bound via the single-source `wooFiInputCap` (also used by
+ * buildWooFiSegments), so the off-chain `query` returns 0 exactly where the on-chain tryQuery does — the
+ * off-chain ladder / neutral oracle stay in lockstep with the solver's live tryQuery even when the geometric
+ * grid would cross a cap, not just for a within-cap size. A 0 cap ⇒ uncapped (the local fixture omits caps ⇒
+ * no truncation; unchanged). `wooFiInputCap`'s floor inversion can differ from the forward require by ≤1 wei
+ * at the exact boundary; no ladder point lands there, and it is the same bound the sampled path already uses.
  */
 export function query(pool: WooFiPool, dx: bigint): bigint {
   if (dx <= 0n) return 0n;
   if (pool.price <= 0n) return 0n;
+  // Self-truncate at the notionalSwap/maxGamma caps (matches the on-chain tryQuery's 0-return past a cap).
+  if (wooFiInputCap(pool, dx) < dx) return 0n;
 
   if (pool.sellBase) {
     // base → quote: _calcQuoteAmountSellBase, then fee off the OUTPUT.
@@ -264,6 +277,22 @@ export const WOOFI_SAMPLES = Number(process.env.ECO_WOOFI_SAMPLES ?? 24);
  * bounds the awardable Σ so the merge never hands a pool more than its query view can price. Mirrors the
  * EulerSwap inLimit bound. (0n caps ⇒ unknown/uncapped ⇒ no truncation, the prior behavior.)
  */
+/**
+ * Build one WOOFi pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the bigint `query`, so the oracle stays wei-exact with the on-chain solver by
+ * construction. The solver builds the IDENTICAL geometric ladder live from the pool's own tryQuery, and
+ * tryQuery's amountOut equals query's toAmount for any FEASIBLE amount (both call the same _calc* sPMM
+ * math — tryQuery merely skips the reverting reserve check that `query` adds), so `query` is the faithful
+ * off-chain model. query is post-fee (it nets the swap fee) so marginalOI IS the execution price. Emits
+ * the same {capacity, effOut, marginalOI} slices the static-segment cursor consumes. The driving `query`
+ * MODELS WooPPV2's exec-time caps (notionalSwap/maxGamma, via `wooFiInputCap`) and returns 0 past them —
+ * the SAME point the on-chain tryQuery self-truncates — so the ladder stops in lockstep with the solver
+ * even when the geometric grid would cross a cap (0 caps ⇒ uncapped ⇒ no truncation, the fixture case).
+ */
+export function buildWooFiQLLadder(pool: WooFiPool, amountIn: bigint): WooFiSegment[] {
+  return buildQLLadder((dx) => query(pool, dx), amountIn);
+}
+
 export function buildWooFiSegments(
   pool: WooFiPool,
   amountIn: bigint,

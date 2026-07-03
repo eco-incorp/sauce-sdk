@@ -65,12 +65,12 @@ import { buildCurveQLLadder, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapQLLadder, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
 import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
-import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
+import { buildSolidlyStableQLLadder, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
-import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
+import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
@@ -150,12 +150,12 @@ export interface OptimalPool {
    */
   dodo?: DodoPool;
   /**
-   * Solidly STABLE (sAMM) pool — when present this pool is a SOLIDLY-STABLE venue (NOT
-   * V2/V3/Curve/LB/DODO). The oracle enumerates its segments via the SHARED bigint replay
-   * (buildSolidlyStableSegments) from the live reserves/decimals/fee, so the split is exact-on-grid
-   * vs prepare's segments (one replay). The marginal is post-fee (getAmountOutStable nets the fee), so
-   * it enters the descending-price merge directly. `isV2`/`curve`/`lb`/`dodo` are ignored when
-   * `solidlyStable` is set.
+   * Solidly STABLE (sAMM) pool — when present this pool is a QUOTE-LADDER (QL) SOLIDLY-STABLE venue (NOT
+   * V2/V3/Curve/LB/DODO). The oracle builds its segments via the SHARED buildSolidlyStableQLLadder replay
+   * — the IDENTICAL geometric quote ladder the on-chain solver builds in setup from live getAmountOut — so
+   * the split is wei-exact vs the solver by construction (no prepared segments). The marginal is post-fee
+   * (getAmountOutStable nets the fee), so it enters the descending-price merge directly. `isV2`/`curve`/
+   * `lb`/`dodo` are ignored when `solidlyStable` is set.
    */
   solidlyStable?: SolidlyStablePool;
   /**
@@ -208,13 +208,13 @@ export interface OptimalPool {
    */
   cryptoSwap?: CryptoSwapPool;
   /**
-   * WOOFi (WooPPV2 sPMM) pool — when present this pool is a WOOFi venue (NOT V2/V3/Curve/LB/DODO/
-   * Solidly/Wombat/Balancer/Euler/Maverick/CryptoSwap). WOOFi is an ORACLE-PRICED synthetic proactive
-   * market maker: the oracle enumerates its segments via the SHARED closed-form sPMM replay
-   * (buildWooFiSegments) from the SNAPSHOT WooracleV2 price/spread/coeff + decimals + feeRate, so the
-   * split is exact-on-grid vs prepare's segments (one replay at the SAME snapshot). The WOOFi marginalOI
-   * is the post-fee execution price (query nets the swap fee); adjNear == adjFar == marginalOI. All the
-   * other venue fields are ignored when `woofi` is set.
+   * WOOFi (WooPPV2 sPMM) pool — when present this pool is a QUOTE-LADDER (QL) WOOFi venue (NOT V2/V3/
+   * Curve/LB/DODO/Solidly/Wombat/Balancer/Euler/Maverick/CryptoSwap). WOOFi is an ORACLE-PRICED synthetic
+   * proactive market maker: the oracle builds its segments via the SHARED buildWooFiQLLadder replay — the
+   * IDENTICAL geometric quote ladder the on-chain solver builds in setup from live tryQuery — so the split
+   * is wei-exact vs the solver by construction (no prepared segments; the ladder prices at the LIVE oracle,
+   * no snapshot). The WOOFi marginalOI is the post-fee execution price (query nets the swap fee); adjNear
+   * == adjFar == marginalOI. All the other venue fields are ignored when `woofi` is set.
    */
   woofi?: WooFiPool;
   /**
@@ -562,15 +562,16 @@ function dodoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segmen
 }
 
 /**
- * Enumerate one Solidly STABLE (sAMM) pool's segments via the SHARED bigint replay
- * (buildSolidlyStableSegments) from the live reserves/decimals/fee. The amountIn caps the sampled
- * range — the same bound prepare uses — so the oracle and prepare emit the IDENTICAL segment grid
- * (single source), making the split exact-on-grid. The stable marginalOI is the post-fee execution
- * price (getAmountOutStable nets the fee); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Solidly STABLE (sAMM) pool's segments via the QUOTE-LADDER live walk
+ * (buildSolidlyStableQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from
+ * live getAmountOut, replayed here through the shared bigint getAmountOutStable so the oracle and solver
+ * stay wei-exact BY CONSTRUCTION (no prepared segments — prepare ships only the descriptor). The stable
+ * marginalOI is ALREADY the post-fee execution price (getAmountOut nets the fee), so adjNear == adjFar ==
+ * marginalOI: it enters the descending-price merge directly with no extra fee-adjust. Awarded as a "pool" venue.
  */
 function solidlyStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildSolidlyStableSegments(p.solidlyStable!, amountIn)) {
+  for (const s of buildSolidlyStableQLLadder(p.solidlyStable!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
@@ -657,16 +658,18 @@ function cryptoSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): 
 }
 
 /**
- * Enumerate one WOOFi (WooPPV2 sPMM) pool's segments via the SHARED closed-form oracle-price replay
- * (buildWooFiSegments) from the SNAPSHOT WooracleV2 price/spread/coeff + decimals + feeRate. The amountIn
- * caps the sampled range — the same bound prepare samples — so the oracle and prepare emit the IDENTICAL
- * segment grid AT THE SAME ORACLE SNAPSHOT (single source), making the split exact-on-grid. The WOOFi
- * marginalOI is the post-fee execution price (query nets the swap fee); adjNear == adjFar == marginalOI.
- * Awarded as a "pool" venue.
+ * Enumerate one WOOFi (WooPPV2 sPMM) pool's segments via the QUOTE-LADDER live walk (buildWooFiQLLadder) —
+ * the SAME geometric-slice ladder the on-chain solver builds in setup from live tryQuery, replayed here
+ * through the shared bigint query so the oracle and solver stay wei-exact BY CONSTRUCTION (no prepared
+ * segments — prepare ships only the descriptor). tryQuery's amountOut equals query's toAmount for any
+ * feasible amount (both call the same _calc* sPMM math), so the query replay is the faithful model of the
+ * on-chain ladder. The WOOFi marginalOI is ALREADY the post-fee execution price (query nets the swap fee),
+ * so adjNear == adjFar == marginalOI. Because the ladder is built live it prices at the LIVE oracle (no
+ * snapshot). Awarded as a "pool" venue.
  */
 function wooFiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildWooFiSegments(p.woofi!, amountIn)) {
+  for (const s of buildWooFiQLLadder(p.woofi!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

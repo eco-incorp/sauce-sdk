@@ -1358,6 +1358,7 @@ export const wooFiPoolReadAbi = parseAbi([
   "function wooracle() view returns (address)",
   "function tokenInfos(address token) view returns (uint192 reserve, uint16 feeRate, uint128 maxGamma, uint128 maxNotionalSwap)",
   "function query(address fromToken, address toToken, uint256 fromAmount) view returns (uint256 toAmount)",
+  "function tryQuery(address fromToken, address toToken, uint256 fromAmount) view returns (uint256 toAmount)",
 ]);
 
 /** WooracleV2 read surface (state / decimals — the sPMM inputs the test cross-checks). */

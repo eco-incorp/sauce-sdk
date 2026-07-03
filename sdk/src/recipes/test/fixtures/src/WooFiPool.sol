@@ -127,6 +127,27 @@ contract WooFiPool {
         revert("BAD_TOKENS");
     }
 
+    /// @notice GRACEFUL quote — the WooRouter/off-chain quote surface (mirrors the real deployed WooPPV2
+    /// tryQuery, which returns the single toAmount). Identical sPMM math to `query`, but NEVER reverts:
+    /// returns 0 on an infeasible oracle or an unsupported token pair (instead of query's revert).
+    /// `toAmount` is bit-identical to `query` for any feasible amount — the same `_calc*` math — so
+    /// EcoSwap's QUOTE-LADDER builds its price ladder off tryQuery with a plain staticcall (0 ⇒ stop),
+    /// while the swap exec still reads the reverting `query` for the minToAmount.
+    function tryQuery(address fromToken, address toToken, uint256 fromAmount)
+        public
+        view
+        returns (uint256 toAmount)
+    {
+        if (!woFeasible || price == 0) return 0;
+        if (fromToken == baseToken && toToken == quoteToken) {
+            return _sellBaseQuote(fromAmount);
+        }
+        if (fromToken == quoteToken && toToken == baseToken) {
+            return _sellQuoteBase(fromAmount);
+        }
+        return 0;
+    }
+
     /// @notice Callback-free swap — the surface EcoSwap calls. WooPPV2 is TRANSFER-FIRST: the caller has
     /// already transferred `fromAmount` in, so this measures the received amount as balanceOf − reserve,
     /// quotes the exact out at the LIVE oracle, checks the minimum, pays out, and updates reserves.

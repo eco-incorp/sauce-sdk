@@ -253,20 +253,32 @@ function balancerV3RouterAddr(prepared: EcoSwapPrepared): bigint {
  * Build the QUOTE-LADDER (QL) venue DESCRIPTOR array — one row per QL venue:
  *   qlv[v] = [poolAddr, i, j, feePpm, segKind, refIdx]
  * NO sampled values — the solver builds each venue's price ladder ON-CHAIN in setup from LIVE
- * cook-time get_dy (prepare-optional: prepare ships only the descriptor). `i`/`j` are the coin indices
- * (Curve int128 / CryptoSwap uint256 — both fit a scalar); `feePpm` is informational (both get_dy are
- * post-fee, so the on-chain head needs no fee-adjust). Two QL families ship today, each with a distinct
- * `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters are INDEPENDENT
- * (0-based into each family's list):
- *   segKind 1 = Curve StableSwap  → bestKind===1 cursor → engine swap(poolType:3) → _swapCurve
+ * cook-time quotes (prepare-optional: prepare ships only the descriptor). `i`/`j` are the coin indices
+ * (Curve int128 / CryptoSwap uint256 — both fit a scalar; UNUSED for Solidly/WOOFi, which quote by
+ * tokenIn/tokenOut, so 0); `feePpm` is informational (every QL quote is post-fee, so the on-chain head
+ * needs no fee-adjust). Four QL families ship today, each with a distinct `segKind` + a SEPARATE
+ * on-chain per-venue accumulator, so their `refIdx` counters are INDEPENDENT (0-based into each family's
+ * list):
+ *   segKind 1  = Curve StableSwap → bestKind===1 cursor → engine swap(poolType:3) → _swapCurve
  *                                   (refIdx → the on-chain `cinp[refIdx]`/`cven[refIdx]` slot).
- *   segKind 9 = Curve CryptoSwap  → callback-free get_dy(uint256,...) + approve + exchange(uint256,...)
+ *   segKind 9  = Curve CryptoSwap → callback-free get_dy(uint256,...) + approve + exchange(uint256,...)
  *                                   (refIdx → the on-chain `cryinp[refIdx]`/`cryven[refIdx]` slot).
+ *   segKind 4  = Solidly STABLE   → callback-free getAmountOut(xIn,tokenIn) + transfer + pool.swap
+ *                                   (refIdx → the on-chain `sinp[refIdx]`/`sven[refIdx]` slot). The QL
+ *                                   quote PROBES-THEN-DECODES getAmountOut (it can revert on _get_y
+ *                                   non-convergence at a large input).
+ *   segKind 10 = WOOFi (WooPPV2)  → callback-free query + transfer + swap (refIdx → the on-chain
+ *                                   `wooinp[refIdx]`/`wooven[refIdx]` slot). The QL quote uses the
+ *                                   GRACEFUL tryQuery(tokenIn,tokenOut,xIn) (never reverts → returns 0
+ *                                   on a cap / feasibility failure), a plain staticcall; the EXEC still
+ *                                   uses the reverting query for the minToAmount.
  * Carried as a SEPARATE top-level compiler param so its reads stay at nesting depth ≤ 2.
  */
 function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   const curves = prepared.curves ?? [];
   const cryptoSwaps = prepared.cryptoSwaps ?? [];
+  const solidlyStables = prepared.solidlyStables ?? [];
+  const wooFiPools = prepared.wooFiPools ?? [];
   const curveRows = curves.map((c, refIdx) => [
     BigInt(c.address),
     BigInt(c.i),
@@ -283,21 +295,35 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
     9n, // segKind = Curve CryptoSwap (uint256 coin indices; callback-free exchange)
     BigInt(refIdx),
   ]);
-  return [...curveRows, ...cryptoRows];
+  const solidlyRows = solidlyStables.map((s, refIdx) => [
+    BigInt(s.address),
+    0n, // i unused (Solidly quotes by tokenIn, not a coin index)
+    0n, // j unused
+    BigInt(s.feePpm),
+    4n, // segKind = Solidly STABLE (getAmountOut; callback-free transfer + swap)
+    BigInt(refIdx),
+  ]);
+  const wooFiRows = wooFiPools.map((w, refIdx) => [
+    BigInt(w.address),
+    0n, // i unused (WOOFi quotes by tokenIn/tokenOut, not a coin index)
+    0n, // j unused
+    BigInt(w.feePpm),
+    10n, // segKind = WOOFi (WooPPV2 sPMM; tryQuery on the ladder, query on the exec)
+    BigInt(refIdx),
+  ]);
+  return [...curveRows, ...cryptoRows, ...solidlyRows, ...wooFiRows];
 }
 
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
-  // NOTE: Curve StableSwap (segKind 1) and Curve CryptoSwap (segKind 9) are NOT read here — both are
-  // QUOTE-LADDER (QL) venues (see buildQLVenues), built on-chain from live get_dy, so they ship no
-  // static sampled segments.
+  // NOTE: Curve StableSwap (segKind 1), Curve CryptoSwap (segKind 9), Solidly STABLE (segKind 4) and
+  // WOOFi (segKind 10) are NOT read here — all four are QUOTE-LADDER (QL) venues (see buildQLVenues),
+  // built on-chain from live quotes, so they ship no static sampled segments.
   const lbs = prepared.lbs ?? [];
   const dodos = prepared.dodos ?? [];
-  const solidlyStables = prepared.solidlyStables ?? [];
   const wombats = prepared.wombats ?? [];
   const balancerStables = prepared.balancerStables ?? [];
   const eulerSwaps = prepared.eulerSwaps ?? [];
   const maverickPools = prepared.maverickPools ?? [];
-  const wooFiPools = prepared.wooFiPools ?? [];
   const fermiPools = prepared.fermiPools ?? [];
   const fluidPools = prepared.fluidPools ?? [];
   const mentoPools = prepared.mentoPools ?? [];
@@ -305,16 +331,15 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   return prepared.brackets
     .filter(
       (b) =>
-        // Curve is NOT here: it is a QUOTE-LADDER (QL) venue built ON-CHAIN from live get_dy in the
-        // solver setup (see buildQLVenues) — prepare ships only the descriptor, no sampled segments.
+        // Curve StableSwap / CryptoSwap / Solidly STABLE / WOOFi are NOT here: all four are QUOTE-LADDER
+        // (QL) venues built ON-CHAIN from live quotes in the solver setup (see buildQLVenues) — prepare
+        // ships only the descriptor, no sampled segments.
         b.kind === EcoBracketKind.LB ||
         b.kind === EcoBracketKind.DODO ||
-        b.kind === EcoBracketKind.SolidlyStable ||
         b.kind === EcoBracketKind.Wombat ||
         b.kind === EcoBracketKind.BalancerStable ||
         b.kind === EcoBracketKind.EulerSwap ||
         b.kind === EcoBracketKind.MaverickV2 ||
-        b.kind === EcoBracketKind.WOOFi ||
         b.kind === EcoBracketKind.Fermi ||
         b.kind === EcoBracketKind.Mento ||
         b.kind === EcoBracketKind.Fluid ||
@@ -329,20 +354,19 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
     .map((b) => {
       const isLb = b.kind === EcoBracketKind.LB;
       const isDodo = b.kind === EcoBracketKind.DODO;
-      const isSolidly = b.kind === EcoBracketKind.SolidlyStable;
       const isWombat = b.kind === EcoBracketKind.Wombat;
       const isBalancer = b.kind === EcoBracketKind.BalancerStable;
       const isEuler = b.kind === EcoBracketKind.EulerSwap;
       const isMaverick = b.kind === EcoBracketKind.MaverickV2;
-      const isWooFi = b.kind === EcoBracketKind.WOOFi;
       const isFermi = b.kind === EcoBracketKind.Fermi;
       const isFluid = b.kind === EcoBracketKind.Fluid;
       const isMento = b.kind === EcoBracketKind.Mento;
       const isBalancerV3 = b.kind === EcoBracketKind.BalancerV3;
-      // segKind: 1 Curve StableSwap (QL — NOT produced here), 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat,
-      // 6 Balancer ComposableStable, 7 EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap (QL — NOT produced
-      // here), 10 WOOFi — kinds 4/5/7/10 are callback-free (the pool view IS the swap math); 4 =
-      // getAmountOut + pool.swap, 5 = quotePotentialSwap + approve + pool.swap (Wombat PULLS via
+      // segKind: 1 Curve StableSwap (QL — NOT produced here), 2 LB, 3 DODO, 4 Solidly stable (QL — NOT
+      // produced here), 5 Wombat, 6 Balancer ComposableStable, 7 EulerSwap, 8 Maverick V2, 9 Curve
+      // CryptoSwap (QL — NOT produced here), 10 WOOFi (QL — NOT produced here) — kinds 4/5/7/10 are
+      // callback-free (the pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 =
+      // quotePotentialSwap + approve + pool.swap (Wombat PULLS via
       // transferFrom), 7 = computeQuote + transfer + pool.swap(...,""), 10 = query + transfer +
       // swap(fromToken,toToken,Σ,minTo,to,rebateTo) (WooPPV2 is
       // transfer-first, oracle-priced sPMM), 11 = getAmountOut + approve + swap(tokenIn,tokenOut,Σ,minOut,to)
@@ -361,16 +385,14 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn (the V3 input is
       // PULLED via Permit2; the reentrancy is contained inside Balancer's Router+Vault, never the cooking
       // contract). The chain-wide Router is cfg[8].
-      // segKind 1 (Curve StableSwap) + 9 (Curve CryptoSwap) are NOT produced here — both are QL venues
-      // built on-chain from live get_dy (buildQLVenues).
-      const segKind = isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
+      // segKind 1 (Curve StableSwap) + 9 (Curve CryptoSwap) + 4 (Solidly STABLE) + 10 (WOOFi) are NOT
+      // produced here — all four are QL venues built on-chain from live quotes (buildQLVenues).
+      const segKind = isLb ? 2n : isDodo ? 3n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
       const venue = isLb
           ? BigInt(lbs[b.refIdx].address)
           : isDodo
             ? BigInt(dodos[b.refIdx].address)
-            : isSolidly
-              ? BigInt(solidlyStables[b.refIdx].address)
-              : isWombat
+            : isWombat
                 ? BigInt(wombats[b.refIdx].address)
                 : isBalancer
                   ? BigInt(balancerStables[b.refIdx].address)
@@ -378,9 +400,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                     ? BigInt(eulerSwaps[b.refIdx].address)
                     : isMaverick
                       ? BigInt(maverickPools[b.refIdx].address)
-                      : isWooFi
-                          ? BigInt(wooFiPools[b.refIdx].address)
-                          : isFermi
+                      : isFermi
                             ? BigInt(fermiPools[b.refIdx].address)
                             : isFluid
                               ? BigInt(fluidPools[b.refIdx].address)

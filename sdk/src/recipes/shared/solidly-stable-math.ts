@@ -49,6 +49,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / dodo-math / ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
@@ -154,6 +155,18 @@ function getYNewton(x0: bigint, xy: bigint, y0: bigint): bigint {
  *   amountInN = amountIn·1e18/decIn                                # net input normalised
  *   y = reserveB − get_y(amountInN + reserveA, xy, reserveB)       # new out-reserve drop, normalised
  *   return y·decOut/1e18                                           # denormalised to tokenOut decimals
+ *
+ * REVERT-DOMAIN NOTE. This bigint replay is unbounded-precision, so it NEVER overflows — it returns 0 only
+ * on a non-positive input, degenerate reserves, or SATURATION (yNew >= y0n ⇒ the out-reserve fully drained).
+ * The on-chain getAmountOut (checked Solidity ≥0.8) can instead REVERT on uint256 overflow at an EXTREME
+ * input, and the solver's PROBE-THEN-DECODE Solidly branch treats that revert as a stop (ok=0 ⇒ q=0). The
+ * two agree wei-exact across the model's domain — which spans every realistic trade — because saturation
+ * fires at an input on the RESERVE scale, orders of magnitude BELOW the input that would overflow the
+ * x3y+y3x arithmetic: the off-chain ladder always stops (return 0) before reaching the on-chain revert
+ * boundary, and the whole-trade amountOutMin floor bounds any residual. The exact overflow input is
+ * fork-implementation-specific (a Solidly fork's _get_y grouping decides which product overflows first), so
+ * it is deliberately NOT modeled here — a single off-chain overflow model could not match every fork
+ * bit-for-bit and would risk breaking the solver==oracle lockstep it aimed to protect.
  */
 export function getAmountOutStable(pool: SolidlyStablePool, dx: bigint): bigint {
   if (dx <= 0n) return 0n;
@@ -216,6 +229,19 @@ export const SOLIDLY_STABLE_SAMPLES = Number(process.env.ECO_SOLIDLY_SAMPLES ?? 
  * `buildCurveSegments` / `buildDodoSegments` (same squared-index geometric grid + isotonic
  * backward-merge).
  */
+/**
+ * Build one Solidly STABLE pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the bigint `getAmountOutStable`, so the oracle stays wei-exact with the
+ * on-chain solver by construction (the solver builds the IDENTICAL geometric ladder live from the pool's
+ * own getAmountOut; getAmountOutStable == that view to the wei). The ladder recurrence is IDENTICAL to
+ * Curve's — ONLY the underlying getDy model differs (x3y+y3x bounded-Newton vs StableSwap). getAmountOut
+ * is post-fee (it nets the pool fee) so marginalOI IS the execution price. Emits the same {capacity,
+ * effOut, marginalOI} slices the static-segment cursor consumes.
+ */
+export function buildSolidlyStableQLLadder(pool: SolidlyStablePool, amountIn: bigint): SolidlyStableSegment[] {
+  return buildQLLadder((dx) => getAmountOutStable(pool, dx), amountIn);
+}
+
 export function buildSolidlyStableSegments(
   pool: SolidlyStablePool,
   amountIn: bigint,
