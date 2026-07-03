@@ -220,10 +220,14 @@ describe("EcoSwap prod-mirror V2 (reproduced Base constant-product pair)", () =>
     const amountIn = reserveIn / 32n;
     const target = cookTarget(PROD_ENGINE, stack, v12);
 
-    // PREPARE against the clean (pre-drift) reserves.
+    // PREPARE against the clean (pre-drift) reserves. slippageBps:0 disables the internal
+    // whole-trade minOut floor: this cell DELIBERATELY drifts the pool ~1/3 of its fill (a large
+    // adverse move) to prove the split RE-ANCHORS to the live drifted reserves — far beyond the
+    // default 0.5% floor, which would (correctly) fire and revert the cook, masking the re-anchor
+    // assertion. The floor's own behavior is covered by ecoswap.floor.evm.test.ts.
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, cookTarget(PROD_ENGINE, stack, v12), caller, poolConfig,
-      undefined, PROD_ENGINE,
+      { slippageBps: 0 }, PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);
     const refV2 = ref.perPoolInput[0] ?? 0n;

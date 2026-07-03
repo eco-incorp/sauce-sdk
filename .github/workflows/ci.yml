@@ -97,11 +97,15 @@ jobs:
         # known-answer math (TickMath, fee-adjust, water-fill conservation).
         run: pnpm --filter './sdk' test:recipes
 
-      - name: Recipes — local EVM tests
+      - name: Recipes — local EVM tests (BOTH engines)
         # *.evm.test.ts only — boots a fresh anvil (NO fork) per file, deploys the real
-        # protocol + Sauce engine bytecode, and cooks the compiled recipe (default v12 engine).
+        # protocol + Sauce engine bytecode, and cooks the compiled recipe on BOTH engines.
+        # ECO_ENGINE=both runs each dual-engine test's v1 (Solidity Router — the deployed live
+        # class) AND v12 (Huff V12Pot) cells, so CI enforces the wei-exact dual-engine parity the
+        # recipes depend on (previously CI ran the v12 default only, and v1-specific regressions —
+        # e.g. a floor firing on an adverse-drift cell — could merge undetected).
         # The BASE_RPC_URL fork tests ({mega,alpha,giga}swap, ecoswap.test.ts) are plain
         # .test.ts and are NOT matched by the *.evm.test.ts glob, so they never run here.
         # Runs with --test-concurrency=1 (set in the test:recipes:evm script) so the per-file
         # anvil/shared-state tests don't contend under node:test's default file parallelism.
-        run: pnpm --filter './sdk' test:recipes:evm
+        run: ECO_ENGINE=both pnpm --filter './sdk' test:recipes:evm
