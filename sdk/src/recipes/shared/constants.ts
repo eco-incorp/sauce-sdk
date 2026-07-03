@@ -2,7 +2,7 @@
  * Chain addresses, swap constants, and per-chain pool discovery configs.
  *
  * Covers all major liquidity sources across supported chains:
- * V3-style (Uniswap V3, PancakeSwap V3, SushiSwap V3, Aerodrome CL, Velodrome CL, KyberSwap Elastic, Ramses V3)
+ * V3-style (Uniswap V3, PancakeSwap V3, SushiSwap V3, Aerodrome CL, Velodrome CL, Ramses V3/CL)
  * Algebra-style (Camelot V3, QuickSwap V3, Ramses V2)
  * V2-style (Uniswap V2, SushiSwap V2, PancakeSwap V2, BaseSwap, Camelot V2, Zyberswap)
  * Solidly V2-style (Aerodrome V2, Velodrome V2, Ramses V2 Legacy, Chronos V1)
@@ -26,7 +26,7 @@ export const BASE_TOKENS = [WETH, USDC, DAI, USDbC] as const;
 
 export enum SwapPoolType {
   UniV2 = 0,       // Constant product AMM (xy=k) — Uniswap V2, SushiSwap, Solidly forks
-  UniV3 = 1,       // Concentrated liquidity — Uniswap V3, PancakeSwap V3, Algebra, KyberSwap
+  UniV3 = 1,       // Concentrated liquidity — Uniswap V3, PancakeSwap V3, Algebra
   UniV4 = 2,       // V4 with hooks
   Curve = 3,       // Curve stable/crypto pools — exchange(i, j, dx, min_dy)
   BalancerV2 = 4,  // Balancer V2 — via Vault singleton
@@ -433,6 +433,22 @@ export function hasPriceLimit(poolType: SwapPoolType): boolean {
  */
 export const PANCAKE_V3_FEE_TIERS = [100, 500, 2500, 10000] as const;
 
+/**
+ * Fee (ppm) → tickSpacing for the discovered fee-keyed V3 forks: the Uniswap standard tiers
+ * (100/500/3000/10000 → 1/10/60/200), Pancake's 2500 → 50, and Ramses CL's non-standard low
+ * tiers 50 → 1 and 250 → 5 (on-chain verified on Arbitrum: getPool(USDC,USDT,50) → a pool with
+ * tickSpacing() == 1). Unknown tiers fall back to 60 — beware: on a fork whose real spacing is
+ * finer, the 60-stride walk overstates per-step capacity ~(60/ts)× and poisons the lens's
+ * relative-depth floor, so REAL tiers must be listed here. THE SINGLE SOURCE for the recipe:
+ * lens.ts is the sole recipe consumer (prepare.ts keeps no copy — tickSpacing flows to it
+ * from the lens rows); keep any duplicate map elsewhere in sync.
+ */
+export const TICK_SPACING_BY_FEE: Record<number, number> = { 50: 1, 100: 1, 250: 5, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+/** TICK_SPACING_BY_FEE lookup with the standard-V3 default of 60 for unknown tiers. */
+export function feeToTickSpacing(fee: number): number {
+  return TICK_SPACING_BY_FEE[fee] ?? 60;
+}
+
 // ── Uniswap V4 (Base) ────────────────────────────────────────
 // Declared above the chain configs so BASE_CHAIN_POOL_CONFIG can reference them.
 
@@ -453,7 +469,7 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     // per-pool fee is READ from fee(). V3-compatible for execution (swapV3 / uniswapV3SwapCallback).
     { address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Aerodrome CL" },
     { address: "0x71524B4f93c58fcbF659783284E38825f0622859" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
-    { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+    // KyberSwap Elastic REMOVED: Elastic is NOT V3-compatible (getPoolState()/its own swap, no slot0) — a queried-tier collision reverts the whole lens eth_call; needs its own FactoryType before re-adding.
     // Algebra dynamic-fee (V3-shaped; poolByPair + globalState). EXECUTABLE — the engine now
     // implements algebraSwapCallback (sauce#186), so an Algebra pool routes as UniV3 / swapV3 and
     // the mid-swap input pull is serviced (see FactoryType.AlgebraV3). PLACEHOLDER address — Base
@@ -521,7 +537,7 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
       { address: "0xbACEB8eC6b9355Dfc0269C18bac9d6E2Bdc29C4F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
-      { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // KyberSwap Elastic REMOVED: Elastic is NOT V3-compatible (getPoolState()/its own swap, no slot0) — a queried-tier collision reverts the whole lens eth_call; needs its own FactoryType before re-adding.
       // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 mainnet deployment.
       { address: "0x000000000004444c5dc75cB358380D2e3dE08A90" as Hex, stateView: "0x7fFE42C4a5DEeA5b0feC41C94C136Cf115597227" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
@@ -624,7 +640,7 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       { address: "0x1af415a1EbA07a4986a52B6f2e7dE7003D82231e" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
-      { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // KyberSwap Elastic REMOVED: Elastic is NOT V3-compatible (getPoolState()/its own swap, no slot0) — a queried-tier collision reverts the whole lens eth_call; needs its own FactoryType before re-adding.
       // Ramses CL — LIVE fee-keyed V3Standard factory. On-chain verified on Arbitrum mainnet:
       //   - The live Ramses CL NonfungiblePositionManager 0xAA277CB7914b7e5514946Da92cb9De332Ce610EF
       //     returns factory() = 0xAA2cd7477c451E703f3B9Ba5663334914763edF8 (4900-byte proxy → 15KB impl).
@@ -719,7 +735,7 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // fee READ from fee() (decoupled from tickSpacing). V3-compatible for execution (swapV3).
       { address: "0xCc0bDDB707055e04e497aB22a59c2aF4391cd12F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Velodrome CL" },
       { address: "0x9c6522117e2ed1fE5bdb72bb0eD5E3f2bdE7DBe0" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
-      { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // KyberSwap Elastic REMOVED: Elastic is NOT V3-compatible (getPoolState()/its own swap, no slot0) — a queried-tier collision reverts the whole lens eth_call; needs its own FactoryType before re-adding.
       // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Optimism deployment.
       { address: "0x9a13F98Cb987694C9F086b1F5eB990EeA8264Ec3" as Hex, stateView: "0xc18a3169788F4F75A170290584ECA6395C75Ecdb" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
@@ -751,7 +767,7 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     factories: [
       // V3 concentrated liquidity (has price limit)
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
-      { address: "0xC7a590291e07B9fe9e64b86c58fD8Fc764308C4A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "KyberSwap Elastic" },
+      // KyberSwap Elastic REMOVED: Elastic is NOT V3-compatible (getPoolState()/its own swap, no slot0) — a queried-tier collision reverts the whole lens eth_call; needs its own FactoryType before re-adding.
       { address: "0x917933899c6a5F8E37F31E19f92CdBFF7e8FF0e2" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
       // Algebra (V3-compatible with dynamic fees)
       { address: "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "QuickSwap V3" },
@@ -820,8 +836,10 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x306F06C147f064A010530292A1EB6737c3e378e4" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, algebraTickSpacing: 60, label: "THENA Fusion" },
       // Maverick V2
       { address: "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e" as Hex, poolType: SwapPoolType.MaverickV2, factoryType: FactoryType.MaverickV2Factory, label: "Maverick V2" },
-      // V2 constant-product. Pancake V2 charges 0.20% (2000 ppm), not the 0.30% default.
-      { address: "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2", v2FeePpm: 2000 },
+      // V2 constant-product. Pancake V2 pairs ENFORCE 0.25% (2500 ppm — the pair's K check is
+      // balanceAdjusted = balance*10000 - amountIn*25), not the 0.30% default. A lower modeled fee
+      // (the pre-fix 2000) over-asks output and the pair K-reverts the whole cook.
+      { address: "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2", v2FeePpm: 2500 },
       // Solidly V2 (volatile + stable pools)
       { address: "0x27DfD2D7b85e0010542da35C6EBcD59E45fc949D" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Thena (Solidly fork)" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).

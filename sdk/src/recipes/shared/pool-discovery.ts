@@ -20,6 +20,7 @@ import {
   TRADER_JOE_BIN_WINDOW,
   TRADER_JOE_DEFAULT_BASE_FACTOR,
   SLIPSTREAM_TICK_SPACINGS,
+  feeToTickSpacing,
   hasPriceLimit,
   type ChainPoolConfig,
   type FactoryConfig,
@@ -131,11 +132,8 @@ const v4StateViewAbi = parseAbi([
   "function getLiquidity(bytes32 poolId) external view returns (uint128 liquidity)",
 ]);
 
-/** Standard Uniswap fee → tickSpacing map (covers V3 + V4 standard tiers). */
-const TICK_SPACING_BY_FEE: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
-function feeToTickSpacing(fee: number): number {
-  return TICK_SPACING_BY_FEE[fee] ?? 60;
-}
+// fee → tickSpacing lives in shared/constants.ts TICK_SPACING_BY_FEE (the single source —
+// includes the non-standard Ramses CL 50→1 / 250→5 tiers a local copy here once missed).
 
 /** V4 poolId = keccak256(abi.encode(PoolKey{currency0,currency1,fee,tickSpacing,hooks})). */
 function computeV4PoolId(

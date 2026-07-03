@@ -33,13 +33,16 @@ import { IPermit2 } from "./IPermit2.json";
 // pools + routeSegments in ONE descending-price merge) — see also ecoswap.solver-reference.ts.
 //
 // THE UNIFIED MODEL (one walk, no two-mode cache-vs-re-anchor split):
-//   A tick's liquidityNet is DRIFT-INVARIANT: the absolute active-L of a tick range does not
-//   change when the spot price moves. So the solver ALWAYS computes sqrt/price on the LIVE grid
-//   (stepReal from the live spot — identical to the oracle's v3Segments/legBrackets) and reuses
-//   the cached NET only: a cache lookup for an in-window boundary, a ticks()/getTickLiquidity()
-//   staticcall for an out-of-window boundary. Same grid, same nets ⇒ wei-exact with the oracle BY
-//   CONSTRUCTION, for ANY drift in EITHER direction. The cache is a pure gas optimization
-//   (windowTop=0 ⇒ every boundary staticcalls ⇒ the 1-RPC quote path with no prepared ticks).
+//   A tick's liquidityNet is invariant under SWAPS: a spot-price move does not change any tick's
+//   net. So the solver ALWAYS computes sqrt/price on the LIVE grid (stepReal from the live spot —
+//   identical to the oracle's v3Segments/legBrackets) and reuses the cached NET only: a cache
+//   lookup for an in-window boundary, a ticks()/getTickLiquidity() staticcall for an out-of-window
+//   boundary. Same grid, same nets ⇒ wei-exact with the oracle BY CONSTRUCTION, for any PRICE
+//   drift in either direction. LIMITATION — swaps only: an LP mint/burn between prepare and cook
+//   DOES change nets, and an in-window boundary is NOT re-read on-chain, so its cached net goes
+//   stale until a re-prepare (out-of-window boundaries staticcall live and are immune). The cache
+//   is a pure gas optimization (windowTop=0 ⇒ every boundary staticcalls ⇒ the 1-RPC quote path
+//   with no prepared ticks).
 //
 // PER-POOL SWAP DIRECTION FROM pd[7]: a route leg's hop direction (zHop) can differ from the
 //   overall swap direction, so the solver drives toOutIn/stepReal/tickArg/seed PER POOL from that
@@ -1408,9 +1411,10 @@ function main(
   // output in the OUT-token slot (tokenIn==token0 ⇒ out is amount1Out; tokenIn==token1 ⇒ out is
   // amount0Out) and EMPTY data — EulerSwap's swap is V2-shaped, so empty data skips the flash callback
   // and the pool sweeps the pre-transferred input + verifies the curve (callback-free). compute-then-
-  // pull already transferred `cum` (incl. each EulerSwap share) into this contract above. The vault-cap
-  // edge (the cap binding between prepare and cook) is guarded: computeQuote re-reads the live limits
-  // and the pre-swap quote of 0 (or a pool decline) leaves the input un-spent for the terminal refund.
+  // pull already transferred `cum` (incl. each EulerSwap share) into this contract above. Vault-cap
+  // edge: computeQuote re-reads the live limits and REVERTS (SwapLimitExceeded / Expired) when the
+  // award exceeds them — that aborts the WHOLE cook, there is NO graceful per-pool skip; only a
+  // literal quote of 0 falls through and leaves the input un-spent for the terminal refund.
   if (HAS_EULER) {
   for (let e = 0; e < segs.length; e = e + 1) {
     const eamt: Uint256 = einp[e];

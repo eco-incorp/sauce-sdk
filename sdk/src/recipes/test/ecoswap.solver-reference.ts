@@ -1,15 +1,21 @@
 /**
  * EcoSwap UNIFIED-WALK reference (pure TypeScript bigint math, EVM-free).
  *
- * Mirrors the on-chain unified solver in `recipes/ecoswap/ecoswap.sauce.ts` bit-for-bit:
- * ONE price-ordered k-way merge where every DIRECT pool has ONE frontier walked from its
- * LIVE spot, deeper, one tickSpacing per step, AND every multi-hop ROUTE is a first-class
- * live-walk venue (NO static segments). Each step picks the highest fee-adjusted out/in head
- * among {each active direct pool's walk head, each active route's composed product head},
- * consumes its segment into the pool/route, and advances ONLY that stream.
+ * Mirrors the on-chain unified solver in `recipes/ecoswap/ecoswap.sauce.ts` bit-for-bit FOR
+ * THE LIVE-WALK UNIVERSE ONLY — direct pools + multi-hop routes. The static SAMPLED-VENUE
+ * segments (`EcoSwapPrepared.brackets`: Curve/LB/DODO/Wombat/…) are NOT modeled here, so the
+ * bit-for-bit claim does not extend to them (the sampled-segment cursor is covered by the
+ * neutral oracle + the EVM tests). Within that scope: ONE price-ordered k-way merge where
+ * every DIRECT pool has ONE frontier walked from its LIVE spot, deeper, one tickSpacing per
+ * step, AND every multi-hop ROUTE is a first-class live-walk venue (NO static segments).
+ * Each step picks the highest fee-adjusted out/in head among {each active direct pool's walk
+ * head, each active route's composed product head}, consumes its segment into the pool/route,
+ * and advances ONLY that stream.
  *
  * THE UNIFIED MODEL — no two-mode cache-vs-re-anchor split, NO static route segments.
- * liquidityNet is drift-invariant, so the walk ALWAYS computes sqrt/price on the LIVE grid
+ * liquidityNet is invariant under SWAP drift (price moves never change a tick's net; an
+ * in-window LP mint/burn DOES — see EcoPool.windowTopShifted for the cache-staleness caveat),
+ * so the walk ALWAYS computes sqrt/price on the LIVE grid
  * (stepReal from the live spot, identical to the neutral oracle ecoswap.optimal.ts v3Segments/
  * legBrackets) and reuses the cached NET only. This reference is CURSOR-MECHANISM-FAITHFUL: it
  * builds the SAME per-pool netCache rows the on-chain pool tuple carries ([shiftedTick, rawNet],
@@ -17,8 +23,8 @@
  * the SAME SETUP drift-down skip, and reads an in-window boundary via that cursor (matching tick ⇒
  * cached net + advance; in-window non-match ⇒ net 0, NO map read) and an out-of-window boundary
  * via the FULL `adaptiveNet` map (the TS analogue of a live ticks()/getTickLiquidity staticcall).
- * Because the grid is the live grid and the nets are the drift-invariant nets, this reference is
- * wei-exact with the neutral oracle BY CONSTRUCTION — same grid, same nets.
+ * Because the grid is the live grid and the nets are the swap-drift-invariant nets, this
+ * reference is wei-exact with the neutral oracle BY CONSTRUCTION — same grid, same nets.
  *
  * PER-POOL DIRECTION (flat universe). Direction is NOT a top-level constant: every pool — direct
  * or leg — drives toOutIn/stepReal/tickArg/SETUP from ITS OWN `inIsToken0` field (== that pool's

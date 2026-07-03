@@ -52,6 +52,7 @@ import {
   FactoryType,
   V2_DEFAULT_FEE_PPM,
   SLIPSTREAM_TICK_SPACINGS,
+  feeToTickSpacing,
   type ChainPoolConfig,
   type FactoryConfig,
 } from "../shared/constants.js";
@@ -138,11 +139,6 @@ function computeV4PoolId(
       [currency0, currency1, fee, tickSpacing, hooks],
     ),
   );
-}
-
-const TICK_SPACING_BY_FEE: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
-function feeToTickSpacing(fee: number): number {
-  return TICK_SPACING_BY_FEE[fee] ?? 60;
 }
 
 /**

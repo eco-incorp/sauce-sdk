@@ -243,27 +243,39 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   });
 
   // CONDITIONAL COMPILATION (the size win) — compile the SAME solver twice: once with every
-  // HAS_* flag true (the all-protocols cook), once with only HAS_V3 true (the rest false). With
-  // treeshake the V3-only build DROPS every per-protocol-separable block (Curve/LB/DODO/Solidly/
-  // Kyber/V2/V4/routes) and every helper reachable only from a dropped branch, so its bytecode is
-  // STRICTLY SMALLER on BOTH engines. The all-true build must also be byte-identical to the
+  // declared HAS_* flag true (the all-protocols cook), once with every flag false (the V3-only
+  // build — the V3 live walk is the unguarded merge core, so it carries NO flag). With treeshake
+  // the V3-only build DROPS every per-protocol-separable block (Curve/LB/DODO/Solidly/Kyber/V2/
+  // V4/Balancer-V3/routes) and every helper reachable only from a dropped branch, so its bytecode
+  // is STRICTLY SMALLER on BOTH engines. The all-true build must also be byte-identical to the
   // no-defines legacy compile (the guards are transparent when their flag is true).
   it("conditional compilation: V3-only is strictly smaller than all-protocols (v1 + v12)", () => {
     const source = readFileSync(SINGLEPASS, "utf-8");
     const stripped = stripTypes(source);
     const args = [cfgTuple(1), pools.slice(0, 1), [netCache[0]], routing, segs];
     const ALL = {
-      HAS_V2: true, HAS_V3: true, HAS_V4: true, HAS_KYBER: true, HAS_ROUTES: true,
+      HAS_V2: true, HAS_V4: true, HAS_KYBER: true, HAS_ROUTES: true,
       HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: true,
       HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
-      HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true,
+      HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true, HAS_BALANCER_V3: true,
     };
     const V3_ONLY = {
-      HAS_V2: false, HAS_V3: true, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
+      HAS_V2: false, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
       HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
       HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
-      HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false,
+      HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false,
     };
+    // GUARD: the define-set keys must exactly equal the HAS_* consts declared in ecoswap.sauce.ts.
+    // A flag declared in the source but missing here keeps its `true` default in EVERY reduced
+    // build — the block silently ships (exactly how HAS_BALANCER_V3 slipped the V3-only cell).
+    // A key here with no matching const is inert noise. Parse the declarations from the source,
+    // annotation-agnostic: the compiler's define fold matches any top-level `const HAS_X = …`
+    // with or without a `: boolean` annotation, so the guard must too.
+    const declaredFlags = [...source.matchAll(/^const (HAS_[A-Z0-9_]+)\b/gm)]
+      .map((m) => m[1])
+      .sort();
+    assert.deepEqual(Object.keys(ALL).sort(), declaredFlags, "ALL keys must exactly match the declared HAS_* consts");
+    assert.deepEqual(Object.keys(V3_ONLY).sort(), declaredFlags, "V3_ONLY keys must exactly match the declared HAS_* consts");
     const size = (r: any): number =>
       (r.bytecode ?? r.bytecodes).reduce((a: number, b: Uint8Array) => a + b.length, 0);
 
