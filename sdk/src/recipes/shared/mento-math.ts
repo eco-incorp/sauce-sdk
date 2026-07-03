@@ -77,6 +77,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -123,8 +124,45 @@ export interface MentoPool {
    * unknown.
    */
   feePpm: number;
+  /**
+   * OPTIONAL closed-form bucket model — the FIXTURE / test-oracle quote source. Present ONLY when the venue's
+   * getAmountOut is a deterministic closed form (the MentoBroker.sol fixture; see `mentoQuoteClosed`). When
+   * set, `buildMentoQLLadder` prices the QL ladder via this exact bigint replay so the neutral oracle stays
+   * wei-exact with the on-chain solver's live `broker.getAmountOut` at every ladder point BY CONSTRUCTION —
+   * the SAME relationship every other QL venue's closed-form replay has (WOOFi `query`, Curve `get_dy`, …).
+   * REAL Mento buckets are NOT a simple closed form (they price off oracle rates + spread over interval-
+   * refreshed pricing buckets exposed only via getAmountOut), so a discovered real venue leaves this UNSET and
+   * uses the sampled `cumIn`/`cumOut` ladder (interpolation) instead; the real prod-mirror asserts the on-chain
+   * ladder against the live Broker view directly, not against this model.
+   */
+  closed?: MentoClosedModel;
   /** Discovery source label. */
   source: string;
+}
+
+/**
+ * Closed-form Mento bucket model (the MentoBroker.sol fixture's `_netOut`, VERBATIM). A re-centered oracle
+ * rate minus a size-dependent bucket-utilization slippage (dx²/depth) minus the swap spread, capped by a
+ * per-direction trading-limit out-cap (past the cap the quote is 0 — the tradeable-range edge). All scales
+ * match the fixture: rates/centerPrice 1e18, spreadPpm 1e6-scaled, depth in tokenIn² units (0 ⇒ no slippage),
+ * outCap in tokenOut units (0 ⇒ unbounded). This is a deliberate stand-in for real Mento's bucket pricing —
+ * used ONLY as the test-fixture / neutral-oracle model, not as a real-Mento replay.
+ */
+export interface MentoClosedModel {
+  /** tokenIn == the exchange's asset0 (asset0 → asset1). */
+  zeroForOne: boolean;
+  /** Oracle rate for asset0 (1e18). */
+  rate0: bigint;
+  /** Oracle rate for asset1 (1e18). */
+  rate1: bigint;
+  /** Re-centering center price (1e18, asset1 per asset0). */
+  centerPrice: bigint;
+  /** Swap spread, 1e6-scaled (0.01% = 100). */
+  spreadPpm: bigint;
+  /** Bucket-utilization slippage depth (larger ⇒ flatter); 0 ⇒ none. */
+  depth: bigint;
+  /** Trading-limit out-cap in the swap direction (0 ⇒ unbounded). */
+  outCap: bigint;
 }
 
 /** Mento fee scale — feePpm is 1e6-scaled (0.01% = 100). */
@@ -189,6 +227,36 @@ export function getAmountOut(pool: MentoPool, dx: bigint): bigint {
 }
 
 /**
+ * mentoQuoteClosed(model, dx) — the closed-form Broker `getAmountOut` for cumulative input `dx`, a
+ * VERBATIM bigint replay of the MentoBroker.sol fixture's `_netOut` (re-centered oracle rate − dx²/depth
+ * utilization slippage − spread, capped by the per-direction out-cap). Bit-for-bit with the on-chain view,
+ * so a QL ladder driven by it (buildMentoQLLadder) is wei-exact with the solver's live `broker.getAmountOut`.
+ * Returns 0 on a non-positive input, a zeroed gross, or a cap breach (the fixture returns 0 past the cap).
+ */
+export function mentoQuoteClosed(m: MentoClosedModel, dx: bigint): bigint {
+  if (dx <= 0n) return 0n;
+  const RATE = 10n ** 18n; // RATE_SCALE (fixture)
+  const SPREAD = 10n ** 6n; // SPREAD_SCALE (fixture)
+  let par: bigint;
+  if (m.zeroForOne) {
+    const g = (dx * m.rate0) / m.rate1;
+    par = (g * m.centerPrice) / RATE;
+  } else {
+    const g2 = (dx * m.rate1) / m.rate0;
+    par = (g2 * RATE) / m.centerPrice;
+  }
+  if (m.depth !== 0n) {
+    const slip = (dx * dx) / m.depth;
+    par = par > slip ? par - slip : 0n;
+  }
+  if (par === 0n) return 0n;
+  const spread = (par * m.spreadPpm) / SPREAD;
+  const net = par > spread ? par - spread : 0n;
+  if (m.outCap !== 0n && net > m.outCap) return 0n;
+  return net;
+}
+
+/**
  * One sampled Mento segment in unified out/in price space — identical shape to a Curve / DODO / WOOFi /
  * Fermi / Fluid segment (a flat [capacity, marginalOI] slice). `capacity` is the Δinput (tokenIn) for this
  * slice, `effOut` the Δoutput, and `marginalOI` the unified out/in sqrt = isqrt(effOut·2^192/capacity) — the
@@ -248,4 +316,29 @@ export function buildMentoSegments(
     if (pool.cumIn[i] >= amountIn) break;
   }
   return segs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTE-LADDER (QL) — the LIVE-WALK Mento venue. The on-chain solver builds this SAME
+// ladder in setup from the LIVE `broker.getAmountOut(provider, exchangeId, tokenIn, tokenOut,
+// xNext)` view (PROBE-THEN-DECODE — getAmountOut can revert on a misconfigured exchange), so
+// prepare ships ONLY the descriptor and the oracle mirrors it BIT-FOR-BIT here. The ladder step is
+// the standard geometric one (cum advances to xNext — Mento absorbs the whole attempt, no partial-
+// fill semantics like LB). The constants MUST equal ecoswap.sauce.ts's QL_* literals.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build one Mento venue's QUOTE-LADDER — the shared `buildQLLadder` recurrence (curve-math.ts) driven by
+ * the venue's getAmountOut model. When the venue carries a closed-form model (the fixture / test oracle) it
+ * uses `mentoQuoteClosed` (a bit-exact replay of the Broker view ⇒ oracle == solver wei-exact by
+ * construction); otherwise it falls back to the sampled-ladder interpolation `getAmountOut` (for a real
+ * venue whose ladder was pre-sampled at these points). getAmountOut is post-spread (the Broker folds the
+ * spread into the quote) so marginalOI IS the execution price. Emits the same {capacity, effOut, marginalOI}
+ * slices the static-segment cursor consumes.
+ */
+export function buildMentoQLLadder(pool: MentoPool, amountIn: bigint): MentoSegment[] {
+  const quote = pool.closed
+    ? (dx: bigint) => mentoQuoteClosed(pool.closed!, dx)
+    : (dx: bigint) => getAmountOut(pool, dx);
+  return buildQLLadder(quote, amountIn);
 }

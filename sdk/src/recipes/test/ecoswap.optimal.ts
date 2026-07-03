@@ -63,7 +63,7 @@ import {
 // the split is exact-on-grid (EXACT for LB — a bin is a flat constant-sum slice).
 import { buildCurveQLLadder, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapQLLadder, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
-import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
+import { buildLbQLLadder, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableQLLadder, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
@@ -73,7 +73,7 @@ import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-mat
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
-import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
+import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3Segments, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
@@ -531,15 +531,16 @@ function curveSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
 }
 
 /**
- * Enumerate one Trader Joe LB pair's segments via the SHARED exact per-bin enumerator
- * (buildLbSegments) from the live bin reserves. The amountIn bounds the outward bin walk — the same
- * bound prepare uses — so the oracle and prepare emit the IDENTICAL segment set, making the split
- * EXACT (a bin is a flat constant-sum slice, so the segment IS the curve). marginalOI is the
- * post-fee bin price; adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Trader Joe LB pair's segments via the QUOTE-LADDER live walk (buildLbQLLadder) — the SAME
+ * geometric-slice ladder the on-chain solver builds in setup from the pair's live getSwapOut(xIn, swapForY),
+ * INCLUDING the amountInLeft cap semantics (each slice is bounded by the LIVE fillable bin capacity
+ * effAbsorbed = xIn − amountInLeft, so the oracle == solver even when the ladder crosses the pool's last
+ * fillable bin — the DoS-fix bound). marginalOI is the post-(base-)fee bin price; adjNear == adjFar ==
+ * marginalOI. Awarded as a "pool" venue.
  */
 function lbSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildLbSegments(p.lb!, amountIn)) {
+  for (const s of buildLbQLLadder(p.lb!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
@@ -707,16 +708,17 @@ function fluidSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
 }
 
 /**
- * Enumerate one Mento V2 (Celo Broker + BiPoolManager) venue's segments via the SHARED sampler
- * (buildMentoSegments) over the venue's LIVE Broker getAmountOut ladder (the same (cumIn, cumOut) points
- * prepare sampled), so the oracle and prepare emit the IDENTICAL segment grid from the SAME sampled bucket
- * snapshot (single source), making the split exact-on-grid. The Mento marginalOI is the post-spread
- * execution price (the Broker getAmountOut folds the spread into the quote); adjNear == adjFar ==
- * marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Mento V2 (Celo Broker + BiPoolManager) venue's segments via the QUOTE-LADDER live walk
+ * (buildMentoQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from the live
+ * broker.getAmountOut view. The ladder is driven by the venue's closed-form bucket model (mentoQuoteClosed,
+ * a bit-exact replay of the fixture Broker's getAmountOut), so the oracle == solver wei-exact BY
+ * CONSTRUCTION (a real venue without a closed model falls back to the sampled-ladder interpolation). The
+ * Mento marginalOI is the post-spread execution price (getAmountOut folds the spread into the quote);
+ * adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
  */
 function mentoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildMentoSegments(p.mento!, amountIn)) {
+  for (const s of buildMentoQLLadder(p.mento!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

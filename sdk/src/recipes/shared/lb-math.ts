@@ -56,6 +56,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { QL_S, QL_RN, QL_RD, QL_SEED_DIV, qlSliceHead } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / curve-math Q192). */
 export const Q192 = 1n << 192n;
@@ -286,17 +287,21 @@ export function buildLbSegments(pool: LbPool, amountIn: bigint): LbSegment[] {
 }
 
 /**
- * Faithful LB `getSwapOut(amountIn, swapForY)` replay — the known-answer reference for the
- * per-bin segment math. Walks bins outward from the active id, draining each bin at its fixed
- * price with the base fee applied to the per-bin input, exactly as the LB pair does (base fee
- * only; variable fee omitted). Returns the total tokenOut for `amountIn`.
+ * Faithful LB `getSwapOut(amountIn, swapForY)` replay returning BOTH the total tokenOut AND the
+ * UNFILLABLE remainder (`amountInLeft`) — the exact shape of the real LB v2.1/v2.2 pair view
+ * `getSwapOut(uint128 amountIn, bool swapForY) → (uint128 amountInLeft, uint128 amountOut, uint128 fee)`.
  *
- * This is the EXACT amount the engine's `pool.swap(swapForY, to)` would produce on a base-fee
- * snapshot, so `Σ buildLbSegments(...).effOut` (over the consumed segments) == getSwapOut to the
- * wei — the known-answer test asserts this equivalence.
+ * Walks bins outward from the active id, draining each bin at its fixed price with the base fee applied
+ * to the per-bin input (base fee only; variable fee omitted). When the bins run out before `amountIn` is
+ * consumed, the leftover `remaining` is the pool's UNFILLABLE input at this snapshot — the LIVE fillable
+ * capacity is `amountIn − amountInLeft`. The QL ladder (buildLbQLLadder) uses that live-capacity bound so
+ * the awarded LB input never exceeds what the transfer-first engine swap can absorb (the DoS fix).
  */
-export function getSwapOut(pool: LbPool, amountIn: bigint): bigint {
-  if (amountIn <= 0n) return 0n;
+export function getSwapOutWithLeft(
+  pool: LbPool,
+  amountIn: bigint,
+): { amountOut: bigint; amountInLeft: bigint } {
+  if (amountIn <= 0n) return { amountOut: 0n, amountInLeft: 0n };
   const fee = baseFee(pool.binStep, pool.baseFactor);
   const byId = new Map<number, { reserveX: bigint; reserveY: bigint }>();
   for (const b of pool.bins) byId.set(b.id, { reserveX: b.reserveX, reserveY: b.reserveY });
@@ -338,7 +343,71 @@ export function getSwapOut(pool: LbPool, amountIn: bigint): bigint {
       remaining = 0n;
     }
   }
-  return out;
+  // `remaining` is the UNFILLABLE input: the bin book ran out before absorbing the whole amountIn.
+  return { amountOut: out, amountInLeft: remaining };
+}
+
+/**
+ * Faithful LB `getSwapOut(amountIn, swapForY)` replay — the known-answer reference for the
+ * per-bin segment math. Returns the total tokenOut for `amountIn` (== the `.amountOut` of
+ * `getSwapOutWithLeft`). The engine's `pool.swap(swapForY, to)` produces this on a base-fee
+ * snapshot, so `Σ buildLbSegments(...).effOut` (over the consumed segments) == getSwapOut to the wei.
+ */
+export function getSwapOut(pool: LbPool, amountIn: bigint): bigint {
+  return getSwapOutWithLeft(pool, amountIn).amountOut;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTE-LADDER (QL) — the LIVE-WALK LB venue. The on-chain solver builds this SAME
+// ladder in setup from the pair's LIVE `getSwapOut(xNext, swapForY)` (a GRACEFUL view —
+// it returns `amountInLeft`, the UNFILLABLE remainder, instead of reverting), so prepare
+// ships ONLY the descriptor and the oracle mirrors it BIT-FOR-BIT here. LB is the one QL
+// family whose ladder step is NOT the plain xNext-cum capacity: the pool absorbs only
+// `effAbsorbed = xNext − amountInLeft` of the gross attempt, so the slice CAPACITY is
+// `effAbsorbed − cum` and `cum` advances to `effAbsorbed` — bounding the awarded LB input to
+// the LIVE fillable bin capacity (so the transfer-first engine exec never over-asks; the
+// OutOfLiquidity-DoS is gone). The constants MUST equal ecoswap.sauce.ts's QL_* literals.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build one LB pair's QUOTE-LADDER via the shared geometric recurrence, INCLUDING the amountInLeft
+ * cap semantics. For k in 0..QL_S-1: geometric GROSS cumulative attempt `xNext = cum*QL_RN/QL_RD +
+ * seed` (clamped at amountIn); quote `(amountOut, amountInLeft) = getSwapOutWithLeft(xNext)`;
+ * `effAbsorbed = xNext − amountInLeft` is the input the pool actually absorbs, so the slice capacity
+ * is `effAbsorbed − cum` (STOP when it is 0 — the pool saturated: no more live bin capacity), the
+ * slice out is `amountOut − prevOut`, and `cum` advances to `effAbsorbed` (NOT xNext). marginalOI is
+ * the post-(base-)fee bin price (getSwapOut nets the base fee), so it enters the descending-price merge
+ * directly with no extra fee-adjust. Bit-for-bit with the on-chain qlv LB branch in ecoswap.sauce.ts.
+ */
+export function buildLbQLLadder(pool: LbPool, amountIn: bigint): MergeSegment[] {
+  if (amountIn <= 0n) return [];
+  let seed = amountIn / QL_SEED_DIV;
+  if (seed <= 0n) seed = 1n;
+  const segs: MergeSegment[] = [];
+  let cum = 0n; // cumulative ABSORBED input (effAbsorbed) — NOT the gross xNext
+  let prevOut = 0n;
+  let prevHead = 0n;
+  for (let k = 0; k < QL_S; k++) {
+    let xNext = (cum * QL_RN) / QL_RD + seed;
+    if (xNext > amountIn) xNext = amountIn;
+    const grossCap = xNext - cum;
+    if (grossCap === 0n) break;
+    const { amountOut, amountInLeft } = getSwapOutWithLeft(pool, xNext);
+    const effAbsorbed = xNext > amountInLeft ? xNext - amountInLeft : 0n;
+    const sliceCap = effAbsorbed > cum ? effAbsorbed - cum : 0n;
+    if (sliceCap === 0n) break; // pool saturated — no more live fillable bin capacity
+    const effOut = amountOut - prevOut;
+    if (effOut <= 0n) break;
+    const marginalOI = qlSliceHead(effOut, sliceCap);
+    // Non-convex guard: a non-descending head ends the ladder here (mirrors the on-chain guard).
+    if (segs.length > 0 && marginalOI >= prevHead) break;
+    segs.push({ capacity: sliceCap, effOut, marginalOI });
+    prevHead = marginalOI;
+    cum = effAbsorbed;
+    prevOut = amountOut;
+    if (effAbsorbed >= amountIn) break;
+  }
+  return segs;
 }
 
 /** Round an LB 1e18-scaled fee to ppm (the price-ordering coordinate / diagnostics). */

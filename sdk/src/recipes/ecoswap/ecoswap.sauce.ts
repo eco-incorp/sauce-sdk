@@ -11,6 +11,7 @@ import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
 import { ICryptoSwapPoolQL } from "./ICryptoSwapPoolQL.json";
 import { ICurveStableSwap } from "./ICurveStableSwap.json";
 import { IWooFiPool } from "./IWooFiPool.json";
+import { ILBPair } from "./ILBPair.json";
 import { IFermiPool } from "./IFermiPool.json";
 import { IFluidDexPool } from "./IFluidDexPool.json";
 import { IFluidDexResolver } from "./IFluidDexResolver.json";
@@ -88,28 +89,35 @@ import { IPermit2 } from "./IPermit2.json";
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
 //   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx] — the QUOTE-LADDER (QL) venue DESCRIPTORS
-//                 (Curve StableSwap segKind 1, Curve CryptoSwap segKind 9, Solidly STABLE segKind 4,
-//                 WOOFi segKind 10). NO sampled values: prepare ships only the descriptor (prepare-
-//                 optional), and the solver BUILDS each venue's price ladder ON-CHAIN in setup from LIVE
-//                 cook-time state. For k in 0..QL_S-1 it takes a geometric cumulative input xNext =
-//                 cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV, derived on-chain, clamped at
-//                 amountIn), quotes q_k dispatched per-row on segKind (qd[4]): StableSwap get_dy(int128,
-//                 int128,uint256) for kind 1, CryptoSwap get_dy(uint256,uint256,uint256) for kind 9 (a
-//                 DIFFERENT selector + uint256 coin indices), Solidly getAmountOut(xIn,tokenIn) for kind
-//                 4, WOOFi tryQuery(tokenIn,tokenOut,xIn) for kind 10. The revert-class views (get_dy
-//                 families on bad state / Newton non-convergence; Solidly getAmountOut on _get_y non-
-//                 convergence) use PROBE-THEN-DECODE (a `.catch` flags a revert ⇒ stop; the sentinel-catch
-//                 cannot capture the return VALUE); WOOFi tryQuery NEVER reverts (returns 0 on a cap /
-//                 feasibility failure) ⇒ a PLAIN staticcall decoding [0], 0 ⇒ stop. It then
-//                 differences (capacity = xNext-cum, sliceOut = q_k - q_{k-1}) and emits a segment row
-//                 [refIdx, capacity, head, head, segKind, venue] (head = qlSliceHead(sliceOut,capacity);
-//                 all four quotes are post-fee ⇒ no extra fee-adjust) into the SAME merged segment stream
-//                 the static `segs` feed. Stops early on a sentinel-0 quote, a non-descending head
-//                 (non-convex guard), or the QL_S cap. Building all slices ONCE from one live read is
-//                 exactly as live as re-quoting per merge step (pool state is frozen until EXEC), so
-//                 the ladder is bounded to <=2*QL_S staticcalls per venue. Everything past obtaining q
-//                 (difference/head/emit/sort) is SHARED across adapters — each later QL lane adds only
-//                 one treeshake-guarded per-segKind quote branch here.
+//                 (Curve StableSwap segKind 1, Trader Joe LB segKind 2, Curve CryptoSwap segKind 9,
+//                 Solidly STABLE segKind 4, WOOFi segKind 10, Mento V2 segKind 13). NO sampled values:
+//                 prepare ships only the descriptor (prepare-optional), and the solver BUILDS each venue's
+//                 price ladder ON-CHAIN in setup from LIVE cook-time state. For k in 0..QL_S-1 it takes a
+//                 geometric cumulative input xNext = cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV,
+//                 derived on-chain, clamped at amountIn), quotes q_k dispatched per-row on segKind (qd[4]):
+//                 StableSwap get_dy(int128,int128,uint256) for kind 1, CryptoSwap get_dy(uint256,uint256,
+//                 uint256) for kind 9 (a DIFFERENT selector + uint256 coin indices), Solidly getAmountOut(
+//                 xIn,tokenIn) for kind 4, WOOFi tryQuery(tokenIn,tokenOut,xIn) for kind 10, Mento
+//                 broker.getAmountOut(provider=qd[0],exchangeId=qd[1],tokenIn,tokenOut,xIn) for kind 13, LB
+//                 pair.getSwapOut(xIn,swapForY=qd[1])→(amountInLeft,amountOut) for kind 2. The revert-class
+//                 views (get_dy families on bad state / Newton non-convergence; Solidly getAmountOut on
+//                 _get_y non-convergence; Mento getAmountOut on a misconfigured exchange) use
+//                 PROBE-THEN-DECODE (a `.catch` flags a revert ⇒ stop; the sentinel-catch cannot capture the
+//                 return VALUE); WOOFi tryQuery + LB getSwapOut NEVER revert (WOOFi returns 0 on a cap /
+//                 feasibility failure ⇒ a PLAIN staticcall decoding [0], 0 ⇒ stop; LB returns amountInLeft,
+//                 the UNFILLABLE remainder). It then differences (capacity = xNext-cum, sliceOut = q_k -
+//                 q_{k-1}) and emits a segment row [refIdx, capacity, head, head, segKind, venue, venueAux]
+//                 (head = qlSliceHead(sliceOut,capacity); every quote is post-fee ⇒ no extra fee-adjust)
+//                 into the SAME merged segment stream the static `segs` feed. LB is the one venue whose
+//                 slice capacity is NOT xNext-cum: the pool absorbs only effAbsorbed = xNext-amountInLeft, so
+//                 its capacity is effAbsorbed-cum and cum advances to effAbsorbed (bounding the awarded LB
+//                 input to the LIVE fillable bin capacity — the transfer-first exec never over-asks). Mento
+//                 emits venueAux = the bytes32 exchangeId. Stops early on a sentinel-0 quote, a zeroed slice
+//                 capacity (LB saturated), a non-descending head (non-convex guard), or the QL_S cap.
+//                 Building all slices ONCE from one live read is exactly as live as re-quoting per merge step
+//                 (pool state is frozen until EXEC), so the ladder is bounded to <=2*QL_S staticcalls per
+//                 venue. Everything past obtaining q (difference/head/emit/sort) is SHARED across adapters —
+//                 each later QL lane adds only one treeshake-guarded per-segKind quote branch here.
 //   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux] — the STATIC
 //                 sampled-segment venue stream (the 13 not-yet-QL-migrated venues: LB / DODO / Solidly
 //                 / … interleaved), pre-sorted DESC sqrtAdjNear. In setup the solver COPIES these rows
@@ -592,7 +600,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -620,11 +628,25 @@ function main(
               // the value is the guarded second call. StableSwap uses int128 coin indices, CryptoSwap
               // uint256 (a DIFFERENT selector); both get_dy are revert-class. Solidly getAmountOut(xIn,
               // tokenIn) is a SINGLE-return view that CAN revert on _get_y non-convergence at a large
-              // input, so it too probes-then-decodes. WOOFi tryQuery(tokenIn,tokenOut,xIn) → (amountOut,
-              // swapFee) NEVER reverts (returns 0 on a cap / feasibility failure), so it is a PLAIN
-              // staticcall decoding [0] + treats 0 as stop — no `.catch`, saving a staticcall.
+              // input, so it too probes-then-decodes. Mento broker.getAmountOut(provider, exchangeId,
+              // tokenIn, tokenOut, xIn) is a plain VIEW that CAN revert (a misconfigured exchange /
+              // trading-limit path), so it also probes-then-decodes; qPool is the exchangeProvider (qd[0])
+              // and qi is the bytes32 exchangeId (qd[1]) — emitted as msVen=provider, msAux=exchangeId so
+              // the segKind-13 accumulator/exec key correctly. WOOFi tryQuery(tokenIn,tokenOut,xIn) NEVER
+              // reverts (returns 0 on a cap / feasibility failure), so it is a PLAIN staticcall decoding
+              // [0] + treats 0 as stop — no `.catch`, saving a staticcall. LB getSwapOut(xIn, swapForY) is
+              // ALSO graceful (a plain view returning [0]=amountInLeft, [1]=amountOut) — see the LB branch
+              // below, which additionally caps the slice at the LIVE fillable bin capacity.
+              //
+              // sliceCapV / cumNextV are the slice capacity + the value cumL advances to. They DEFAULT to
+              // the standard geometric step (cap = xNext-cumL, cumNextV = xNext) which every venue but LB
+              // uses; the LB branch OVERRIDES them with the live-capacity-bounded (effAbsorbed) semantics.
+              // auxV is the 7th (msAux) column — 0 for every venue but Mento (the exchangeId).
               let ok: Uint256 = 1;
               let q: Uint256 = 0;
+              let sliceCapV: Uint256 = cap;
+              let cumNextV: Uint256 = xNext;
+              let auxV: Uint256 = 0;
               if (HAS_CURVE && qKind === 1) {
                 ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
                 if (ok === 1) { q = ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext); }
@@ -637,8 +659,35 @@ function main(
                     ISolidlyStablePool.at(qPool).getAmountOut(xNext, tokenIn).catch(() => { ok = 0; });
                     if (ok === 1) { q = ISolidlyStablePool.at(qPool).getAmountOut(xNext, tokenIn); }
                   } else {
-                    if (HAS_WOOFI && qKind === 10) {
-                      q = IWooFiPool.at(qPool).tryQuery(tokenIn, tokenOut, xNext);
+                    if (HAS_MENTO && qKind === 13) {
+                      // qPool = exchangeProvider (qd[0]); qi = bytes32 exchangeId (qd[1], intact — not
+                      // truncated). PROBE-THEN-DECODE. The exchangeId travels in msAux so the accumulate/
+                      // exec (segKind 13) keys the venue by (provider, exchangeId).
+                      IMentoBroker.at(mentoBroker).getAmountOut(qPool, qi, tokenIn, tokenOut, xNext).catch(() => { ok = 0; });
+                      if (ok === 1) { q = IMentoBroker.at(mentoBroker).getAmountOut(qPool, qi, tokenIn, tokenOut, xNext); }
+                      auxV = qi;
+                    } else {
+                      if (HAS_LB && qKind === 2) {
+                        // qPool = LB pair (qd[0]); qi = swapForY (qd[1], 0/1). getSwapOut is GRACEFUL: it
+                        // returns [0]=amountInLeft (the UNFILLABLE remainder) + [1]=amountOut instead of
+                        // reverting. The pool absorbs effAbsorbed = xNext - amountInLeft, so the slice
+                        // capacity is effAbsorbed - cumL and cumL advances to effAbsorbed — bounding the
+                        // awarded LB input to the LIVE fillable bin capacity (so the transfer-first engine
+                        // exec never over-asks: the OutOfLiquidity-DoS is gone). q = amountOut.
+                        const lbLeft: Uint256 = ILBPair.at(qPool).getSwapOut(xNext, qi)[0];
+                        q = ILBPair.at(qPool).getSwapOut(xNext, qi)[1];
+                        if (xNext > lbLeft) {
+                          const absorbed: Uint256 = xNext - lbLeft;
+                          cumNextV = absorbed;
+                          if (absorbed > cumL) { sliceCapV = absorbed - cumL; } else { sliceCapV = 0; }
+                        } else {
+                          sliceCapV = 0;
+                        }
+                      } else {
+                        if (HAS_WOOFI && qKind === 10) {
+                          q = IWooFiPool.at(qPool).tryQuery(tokenIn, tokenOut, xNext);
+                        }
+                      }
                     }
                   }
                 }
@@ -646,27 +695,33 @@ function main(
               if (q === 0) {
                 stop = 1;
               } else {
-                const sliceOut: Uint256 = q - prevOut;
-                if (sliceOut === 0) {
+                // LB may have driven sliceCapV to 0 (pool saturated: no more live bin capacity) — stop.
+                // Every other venue keeps sliceCapV == cap (> 0, already checked above), so this is a no-op.
+                if (sliceCapV === 0) {
                   stop = 1;
                 } else {
-                  const head: Uint256 = qlSliceHead(sliceOut, cap);
-                  // Non-convex guard: a non-descending head ends this venue's ladder here.
-                  if (nv > 0) { if (head >= prevHead) { stop = 1; } }
-                  if (stop === 0) {
-                    msRef[msN] = qRef;
-                    msCap[msN] = cap;
-                    msNear[msN] = head;
-                    msFar[msN] = head;
-                    msKind[msN] = qKind;
-                    msVen[msN] = qPool;
-                    msAux[msN] = 0;
-                    msN = msN + 1;
-                    nv = nv + 1;
-                    prevHead = head;
-                    cumL = xNext;
-                    prevOut = q;
-                    if (xNext >= amountIn) { stop = 1; }
+                  const sliceOut: Uint256 = q - prevOut;
+                  if (sliceOut === 0) {
+                    stop = 1;
+                  } else {
+                    const head: Uint256 = qlSliceHead(sliceOut, sliceCapV);
+                    // Non-convex guard: a non-descending head ends this venue's ladder here.
+                    if (nv > 0) { if (head >= prevHead) { stop = 1; } }
+                    if (stop === 0) {
+                      msRef[msN] = qRef;
+                      msCap[msN] = sliceCapV;
+                      msNear[msN] = head;
+                      msFar[msN] = head;
+                      msKind[msN] = qKind;
+                      msVen[msN] = qPool;
+                      msAux[msN] = auxV;
+                      msN = msN + 1;
+                      nv = nv + 1;
+                      prevHead = head;
+                      cumL = cumNextV;
+                      prevOut = q;
+                      if (cumNextV >= amountIn) { stop = 1; }
+                    }
                   }
                 }
               }

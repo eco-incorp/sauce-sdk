@@ -59,6 +59,13 @@ contract TraderJoeLBPair {
     // Tracked total reserves (so swap can read the freshly-transferred input by balance delta).
     uint256 private _reserveX;
     uint256 private _reserveY;
+    // The seeded-bin id range [_minId, _maxId] — the OUTWARD-walk bound. The real LBPair walks only
+    // INITIALIZED bins (a tree bitmap); this fixture bounds its linear id walk to the seeded range so an
+    // amountIn that EXCEEDS the pool's fillable capacity returns the UNFILLABLE remainder gracefully in
+    // O(seeded bins) instead of decrementing id toward 0 (~2^23 SLOADs ⇒ OutOfGas). _maxId starts below
+    // _minId so an empty pool has an empty range.
+    uint24 private _minId = type(uint24).max;
+    uint24 private _maxId;
 
     constructor(address tokenX_, address tokenY_, uint16 binStep_, uint16 baseFactor_, uint24 activeId_) {
         _tokenX = tokenX_;
@@ -68,12 +75,15 @@ contract TraderJoeLBPair {
         _activeId = activeId_;
     }
 
-    /// @notice Seed a bin's reserves (test setup mints the constant-sum book). Tracks totals.
+    /// @notice Seed a bin's reserves (test setup mints the constant-sum book). Tracks totals + the seeded id
+    /// range (the outward-walk bound — see _minId/_maxId).
     function setBin(uint24 id, uint256 reserveX, uint256 reserveY) external {
         _reserveX = _reserveX - _binX[id] + reserveX;
         _reserveY = _reserveY - _binY[id] + reserveY;
         _binX[id] = reserveX;
         _binY[id] = reserveY;
+        if (id < _minId) _minId = id;
+        if (id > _maxId) _maxId = id;
     }
 
     // ── Discovery surface (ITraderJoeLBPair + LB v2.1 reads) ──────
@@ -191,61 +201,83 @@ contract TraderJoeLBPair {
         return amountInToBin + feeAmount;
     }
 
-    /// @notice Off-chain `getSwapOut` analogue (pure view on current state) — the engine-
-    /// independent ground truth. Walks bins outward from the active id in the swap direction,
-    /// draining each at its fixed price with the base fee on the per-bin input.
-    function getSwapOut(uint256 amountIn, bool swapForY) public view returns (uint256 out) {
-        if (amountIn == 0) return 0;
-        uint256 fee = _baseFee();
+    /// @notice REAL LB v2.1/v2.2 `getSwapOut(uint128 amountIn, bool swapForY)` surface — the engine-
+    /// independent ground truth AND the on-chain QUOTE-LADDER quote source. Walks bins outward from the
+    /// active id in the swap direction, draining each at its fixed price with the base fee on the per-bin
+    /// input. GRACEFUL: when the bin book runs out before `amountIn` is consumed, the leftover is returned as
+    /// `amountInLeft` (the UNFILLABLE remainder) rather than reverting — the recipe's QL branch caps the
+    /// awarded input at `amountIn - amountInLeft` (the live fillable capacity). Returns
+    /// (amountInLeft, amountOut, fee), matching the real deployed LBPair. Bit-for-bit with lb-math.ts
+    /// `getSwapOutWithLeft`.
+    function getSwapOut(uint128 amountIn, bool swapForY)
+        public
+        view
+        returns (uint128 amountInLeft, uint128 amountOut, uint128 fee)
+    {
+        if (amountIn == 0) return (0, 0, 0);
+        uint256 feeRate = _baseFee();
         uint256 remaining = amountIn;
+        uint256 out;
+        uint256 feePaid;
 
         if (swapForY) {
-            // in = X, out = Y. Consume bins id <= active, DECREASING id.
+            // in = X, out = Y. Consume bins id <= active, DECREASING id — bounded to the seeded range.
             uint24 id = _activeId;
             while (remaining > 0) {
                 uint256 outReserve = _binY[id];
                 uint256 price128 = _priceFromId(id);
                 if (outReserve > 0 && price128 > 0) {
-                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, true, fee);
+                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, true, feeRate);
                     if (maxGrossIn > 0) {
                         if (remaining >= maxGrossIn) {
+                            uint256 toBin = _ceilDiv(outReserve * SCALE_128, price128);
+                            feePaid += maxGrossIn - toBin;
                             out += outReserve;
                             remaining -= maxGrossIn;
                         } else {
-                            uint256 netIn = remaining - _ceilDiv(remaining * fee, FEE_PRECISION);
+                            uint256 feeAmt = _ceilDiv(remaining * feeRate, FEE_PRECISION);
+                            uint256 netIn = remaining - feeAmt;
                             uint256 binOut = (netIn * price128) / SCALE_128;
+                            feePaid += feeAmt;
                             out += binOut > outReserve ? outReserve : binOut;
                             remaining = 0;
                         }
                     }
                 }
-                if (id == 0) break;
+                if (id == 0 || id <= _minId) break; // past the lowest seeded bin ⇒ remaining is UNFILLABLE
                 id--;
             }
         } else {
-            // in = Y, out = X. Consume bins id >= active, INCREASING id.
+            // in = Y, out = X. Consume bins id >= active, INCREASING id — bounded to the seeded range.
             uint24 id = _activeId;
             while (remaining > 0) {
                 uint256 outReserve = _binX[id];
                 uint256 price128 = _priceFromId(id);
                 if (outReserve > 0 && price128 > 0) {
-                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, false, fee);
+                    uint256 maxGrossIn = _grossToDrain(outReserve, price128, false, feeRate);
                     if (maxGrossIn > 0) {
                         if (remaining >= maxGrossIn) {
+                            uint256 toBin = _ceilDiv(outReserve * price128, SCALE_128);
+                            feePaid += maxGrossIn - toBin;
                             out += outReserve;
                             remaining -= maxGrossIn;
                         } else {
-                            uint256 netIn = remaining - _ceilDiv(remaining * fee, FEE_PRECISION);
+                            uint256 feeAmt = _ceilDiv(remaining * feeRate, FEE_PRECISION);
+                            uint256 netIn = remaining - feeAmt;
                             uint256 binOut = (netIn * SCALE_128) / price128;
+                            feePaid += feeAmt;
                             out += binOut > outReserve ? outReserve : binOut;
                             remaining = 0;
                         }
                     }
                 }
-                if (id == type(uint24).max) break;
+                if (id == type(uint24).max || id >= _maxId) break; // past the highest seeded bin ⇒ UNFILLABLE
                 id++;
             }
         }
+        amountInLeft = uint128(remaining);
+        amountOut = uint128(out);
+        fee = uint128(feePaid);
     }
 
     // ── The engine `_swapTraderJoeLB` surface (transfer-first) ────
@@ -283,7 +315,7 @@ contract TraderJoeLBPair {
                     }
                 }
                 if (remaining == 0) break;
-                if (id == 0) break;
+                if (id == 0 || id <= _minId) break; // past the lowest seeded bin (unfillable remainder)
                 id--;
                 _activeId = id;
             }
@@ -317,7 +349,7 @@ contract TraderJoeLBPair {
                     }
                 }
                 if (remaining == 0) break;
-                if (id == type(uint24).max) break;
+                if (id == type(uint24).max || id >= _maxId) break; // past the highest seeded bin (unfillable)
                 id++;
                 _activeId = id;
             }

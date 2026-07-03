@@ -1109,27 +1109,31 @@ export async function prepareEcoSwap(
     }
   }
 
+  // Trader Joe LB — like Curve, it is a QUOTE-LADDER (QL) venue: the on-chain solver builds its price
+  // ladder in setup from the LIVE pair.getSwapOut(xIn, swapForY) view (a GRACEFUL view — returns
+  // amountInLeft instead of reverting — capped at the live fillable bin capacity), so prepare ships ONLY
+  // the descriptor (address + swapForY + fee). buildLbBrackets is still called as a pure LIVENESS PROBE (a
+  // pair with no fillable bins is dropped), but its brackets are NOT pushed to the segment stream. EXEC
+  // stays engine poolType 6 → _swapTraderJoeLB (transfer-first).
   const lbs: EcoLb[] = [];
-  const lbBracketSets: EcoBracket[][] = [];
   const lbFactories = poolConfig.factories.filter(
     (f) => f.factoryType === FactoryType.TraderJoeLB,
   );
   if (lbFactories.length > 0) {
     const lbRaw = await discoverTraderJoeLBPoolsTyped(tokenIn, tokenOut, client, lbFactories);
     for (const lb of lbRaw) {
-      const refIdx = lbs.length;
-      const lbb = buildLbBrackets(lb, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live getSwapOut, not from these brackets.
+      const lbb = buildLbBrackets(lb, lbs.length, amountIn);
       if (lbb.length === 0) continue;
       lbs.push({
         address: lb.address,
         binStep: lb.binStep,
         feePpm: lbFeeToPpm(lb.binStep, lb.baseFactor),
+        swapForY: lb.swapForY,
         source: lb.source,
       });
-      lbBracketSets.push(lbb);
     }
   }
-  for (const set of lbBracketSets) brackets.push(...set);
 
   const dodos: EcoDodo[] = [];
   const dodoBracketSets: EcoBracket[][] = [];
@@ -1407,28 +1411,26 @@ export async function prepareEcoSwap(
   for (const set of fluidBracketSets) brackets.push(...set);
 
   const mentoPools: EcoMento[] = [];
-  const mentoBracketSets: EcoBracket[][] = [];
   // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) — ENUMERABLE
   // discovery via the Broker (FactoryConfig.address = Broker). Mento is a BiPool oracle-priced exchange
   // (the Broker routes to a registered exchange provider that prices off oracle rates + a spread over
-  // interval-updated buckets — canonical on-chain state, NOT xy=k), so it is a SAMPLED-SEGMENT source.
-  // `discoverMentoPoolsTyped` runs the two-step enumeration (Broker.getExchangeProviders →
-  // provider.getExchanges) to map (tokenIn,tokenOut) → (exchangeProvider, exchangeId), then SAMPLES the
-  // Broker's PLAIN getAmountOut VIEW over [0, amountIn] (no revert-decode resolver, unlike Fluid); the split
-  // is built from that ladder (no closed form). Executed CALLBACK-FREE (a live Broker getAmountOut staticcall
-  // for amountOutMin + approve the BROKER + broker.swapIn — Mento PULLS via transferFrom into the reserve, so
-  // approve-first, unlike WOOFi's transfer-first path). NO engine change. SNAPSHOTTED-QUOTE class: the split
-  // is exact-on-grid vs the oracle on the shared sampled ladder; the exec re-reads the live quote
-  // (amountOutMin bounds a bad fill). The buckets refresh only on config.referenceRateResetFrequency (gated
-  // by oracle reports) — the same snapshot assumption the recipe documents for Fluid / Fermi / WOOFi — and
-  // swapIn is subject to TradingLimits + BreakerBox (the terminal refund covers a slice a limit/breaker
-  // rejects before cook).
+  // interval-updated buckets — canonical on-chain state, NOT xy=k). Like Curve, it is now a QUOTE-LADDER
+  // (QL) venue: the on-chain solver builds its price ladder in setup from the LIVE Broker getAmountOut
+  // view (PROBE-THEN-DECODE — see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the
+  // descriptor (broker + exchangeProvider + exchangeId + fee) — NO off-chain sampled segments — and
+  // re-anchors to the live bucket state at cook time. `discoverMentoPoolsTyped` runs the two-step
+  // enumeration (Broker.getExchangeProviders → provider.getExchanges) to map (tokenIn,tokenOut) →
+  // (exchangeProvider, exchangeId), then SAMPLES the Broker getAmountOut view for the liveness probe.
+  // buildMentoBrackets is still called as a pure LIVENESS PROBE (a venue that quotes no valid segment is
+  // dropped), but its brackets are NOT pushed to the segment stream. Executed CALLBACK-FREE (a live Broker
+  // getAmountOut staticcall for amountOutMin + approve the BROKER + broker.swapIn — Mento PULLS via
+  // transferFrom into the reserve, so approve-first, unlike WOOFi's transfer-first path). NO engine change.
   const mentoConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Mento);
   if (mentoConfigs.length > 0) {
     const mentoRaw = await discoverMentoPoolsTyped(tokenIn, tokenOut, client, mentoConfigs, amountIn);
     for (const mp of mentoRaw) {
-      const refIdx = mentoPools.length;
-      const mb = buildMentoBrackets(mp, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live getAmountOut, not from these brackets.
+      const mb = buildMentoBrackets(mp, mentoPools.length, amountIn);
       if (mb.length === 0) continue;
       mentoPools.push({
         broker: mp.broker,
@@ -1439,10 +1441,8 @@ export async function prepareEcoSwap(
         feePpm: mp.feePpm,
         source: mp.source,
       });
-      mentoBracketSets.push(mb);
     }
   }
-  for (const set of mentoBracketSets) brackets.push(...set);
 
   const balancerV3Pools: EcoBalancerV3[] = [];
   const balancerV3BracketSets: EcoBracket[][] = [];
@@ -1714,30 +1714,29 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
-  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE AND WOOFi ship as QL (Quote-Ladder) DESCRIPTORS
-  // (curves.length / cryptoSwaps.length / solidlyStables.length / wooFiPools.length), NOT sampled
-  // segments — the on-chain solver builds each ladder live from its quote view — so all four are reported
-  // below as "QL", not a seg count.
-  const nLbSegs = brackets.filter((b) => b.kind === EcoBracketKind.LB).length;
+  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB AND Mento V2 ship as QL
+  // (Quote-Ladder) DESCRIPTORS (curves/cryptoSwaps/solidlyStables/wooFiPools/lbs/mentoPools .length), NOT
+  // sampled segments — the on-chain solver builds each ladder live from its quote view — so all six are
+  // reported below as "QL", not a seg count.
   const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
   const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
-  const nMentoSegs = brackets.filter((b) => b.kind === EcoBracketKind.Mento).length;
   const nBalancerV3Segs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerV3).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
-      `${lbs.length} LB, ${dodos.length} DODO, ` +
+      `${dodos.length} DODO, ` +
       `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
-      `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ` +
-      `${brackets.length} sampled segments (${nLbSegs} LB, ` +
+      `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
+      `${mentoPools.length} Mento QL, ` +
+      `${brackets.length} sampled segments (` +
       `${nDodoSegs} DODO, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
       `${nMaverickSegs} Maverick, ${nFermiSegs} Fermi, ` +
-      `${nFluidSegs} Fluid, ${nMentoSegs} Mento, ${nBalancerV3Segs} Balancer-V3)`,
+      `${nFluidSegs} Fluid, ${nBalancerV3Segs} Balancer-V3)`,
   );
 
   const prepared: EcoSwapPrepared = {

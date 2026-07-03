@@ -337,6 +337,32 @@ export function qlSliceHead(sliceOut: bigint, capacity: bigint): bigint {
  * or reaching amountIn. Emits (capacity, effOut, marginalOI) segments in the same shape the
  * static-segment cursor consumes — a post-fee get_dy makes marginalOI the execution price directly.
  */
+/**
+ * The GEOMETRIC cumulative-input points `buildQLLadder` queries `getDy` at — `xNext = cum*QL_RN/QL_RD +
+ * seed` (seed = amountIn/QL_SEED_DIV, clamped at amountIn), for k in 0..QL_S-1, ascending. Exposed so a
+ * SAMPLED-quote QL venue (e.g. the real Mento prod-mirror, whose off-chain model is interpolation over a
+ * live-sampled ladder, NOT a closed form) can pre-sample its on-chain view at EXACTLY these points — then
+ * the interpolation is exact AT each ladder point, so the oracle's `buildQLLadder(interp, …)` reproduces the
+ * on-chain solver's live-quote ladder to the wei. (Curve/WOOFi/etc. with a bit-exact closed replay do NOT
+ * need this — their replay matches the live view at any input.)
+ */
+export function qlLadderInputs(amountIn: bigint): bigint[] {
+  if (amountIn <= 0n) return [];
+  let seed = amountIn / QL_SEED_DIV;
+  if (seed <= 0n) seed = 1n;
+  const pts: bigint[] = [];
+  let cum = 0n;
+  for (let k = 0; k < QL_S; k++) {
+    let xNext = (cum * QL_RN) / QL_RD + seed;
+    if (xNext > amountIn) xNext = amountIn;
+    if (xNext <= cum) break;
+    pts.push(xNext);
+    cum = xNext;
+    if (xNext >= amountIn) break;
+  }
+  return pts;
+}
+
 export function buildQLLadder(
   getDy: (dx: bigint) => bigint,
   amountIn: bigint,

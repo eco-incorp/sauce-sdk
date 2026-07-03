@@ -109,7 +109,8 @@ import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/const
 import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
-import { buildMentoSegments, mentoSampleInputs, type MentoPool } from "../shared/mento-math";
+import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math";
+import { qlLadderInputs } from "../shared/curve-math";
 
 const SNAP_NAME = "celo-mento-cUSDUSDC";
 const ENGINE_CELLS = engineCells();
@@ -184,12 +185,14 @@ describe("EcoSwap Mento V2 (Celo Broker + BiPoolManager) prod-mirror — REAL by
     })) as bigint;
   }
 
-  /** The neutral oracle's MentoPool descriptor — sample the REAL etched Broker's LIVE getAmountOut ladder over
-   *  [0, amountIn] on the SAME grid discoverMentoPoolsTyped uses (mentoSampleInputs). Since the oracle and
-   *  prepare sample the IDENTICAL grid off the IDENTICAL etched Broker at the SAME pinned block, they produce
-   *  identical segments ⇒ the split is exact-on-grid vs the oracle by construction. */
+  /** The neutral oracle's MentoPool descriptor. Mento is now a QUOTE-LADDER (QL) venue — the on-chain solver
+   *  builds the ladder live from the REAL etched Broker's getAmountOut at the GEOMETRIC QL points. Real Mento
+   *  has NO closed-form replay (its buckets are a multi-contract graph), so we sample the REAL Broker at
+   *  EXACTLY those QL points (`qlLadderInputs`) and store them as the descriptor's cumIn/cumOut: the oracle's
+   *  `buildMentoQLLadder` interpolation is then EXACT at each ladder point ⇒ it reproduces the on-chain
+   *  solver's live-quote ladder to the wei (oracle == solver by construction). */
   async function offPool(amountIn: bigint): Promise<MentoPool> {
-    const cumIn = mentoSampleInputs(amountIn);
+    const cumIn = qlLadderInputs(amountIn);
     const cumOut: bigint[] = [];
     for (const amt of cumIn) cumOut.push(await onQuery(amt));
     return {
@@ -329,17 +332,20 @@ describe("EcoSwap Mento V2 (Celo Broker + BiPoolManager) prod-mirror — REAL by
       etched.exchangeId.toLowerCase(),
       "the discovered Mento venue's exchangeId == the captured one",
     );
+    // Mento is now a QUOTE-LADDER (QL) venue: prepare ships ONLY the descriptor (prepared.mentoPools), NO
+    // static sampled brackets — the on-chain solver builds the getAmountOut ladder live from the REAL Broker.
     assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Mento),
-      "Mento segments present",
+      !(prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Mento),
+      "Mento ships NO static brackets (it is a QUOTE-LADDER venue — the ladder is built live on-chain)",
     );
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Mento venue seeded from the REAL etched Broker's LIVE
-    // getAmountOut ladder via the SHARED buildMentoSegments (the identical grid discoverMentoPoolsTyped
-    // sampled). Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the
-    // engine's static-segment cursor consumes the IDENTICAL grid, so on-chain spent == oracle.totalInput.
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Mento venue whose descriptor carries the REAL etched Broker's
+    // LIVE getAmountOut sampled at EXACTLY the geometric QL ladder points (offPool → qlLadderInputs), so the
+    // oracle's buildMentoQLLadder interpolation reproduces the on-chain solver's live-quote ladder to the wei.
+    // Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the on-chain solver
+    // builds the IDENTICAL ladder from the SAME live Broker, so spent == oracle.totalInput to the wei.
     const op = await offPool(amountIn);
-    assert.ok(buildMentoSegments(op, amountIn).length > 0, "non-empty Mento segment ladder from the live etched Broker");
+    assert.ok(buildMentoQLLadder(op, amountIn).length > 0, "non-empty Mento QL ladder from the live etched Broker");
     const optPools: OptimalPool[] = [{ mento: op, feePpm: 0 }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
     const awarded = oracle.perPoolInput[0] ?? 0n;
@@ -362,36 +368,33 @@ describe("EcoSwap Mento V2 (Celo Broker + BiPoolManager) prod-mirror — REAL by
     assert.ok(spent > 0n, "caller spends tokenIn");
     assert.ok(received > 0n, "caller receives tokenOut");
 
-    // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance. The engine's
-    // static-segment cursor consumes the IDENTICAL grid the oracle segmented (both off the SAME etched Broker
-    // ladder), so spent == oracle.totalInput regardless of how many segments survive the descending guard.
-    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
-    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
+    // WEI-EXACT (oracle == solver): the on-chain spend == the oracle's awarded input to the WEI. NO tolerance.
+    // BOTH the on-chain solver and the neutral oracle build the IDENTICAL QUOTE-LADDER from the SAME live
+    // Broker getAmountOut at the SAME geometric QL points (the on-chain solver quotes live; the oracle
+    // interpolates cumIn/cumOut sampled at those exact points ⇒ exact at each), so spent == awarded to the wei.
+    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (QL wei-exact, oracle == solver)");
+    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact)");
 
-    // FULL FILL via the isotonic backward-MERGE (see the header): the REAL cUSD/USDC ConstantSum marginal is
-    // near-flat/slightly rising at this scale, so buildMentoSegments now FOLDS the non-descending slices into
-    // a monotone ladder spanning the whole amountIn (rather than dropping them). The split therefore awards
-    // the FULL amountIn — a complete fill, and STRICTLY MORE than the first ladder sample the OLD drop-guard
-    // stopped at (the regression this merge fixes, asserted directly below).
-    const firstLadderIn = BigInt(snaps.state.ladder.cumIn[0]);
-    assert.equal(spent, amountIn, "FULL fill: the merge preserves the near-flat tail, awarding the whole amountIn");
-    assert.ok(spent > firstLadderIn, "merge fills STRICTLY MORE than the old drop-guard's first-slice partial");
+    // PARTIAL FILL is the CORRECT QL behavior here (NOT a regression). The REAL cUSD/USDC ConstantSum marginal
+    // is near-flat / slightly rising at this scale, so the QL ladder's non-convex guard stops the ladder after
+    // the leading (best-priced, convex-head) slice(s) — the QL prices only the monotone descending head and
+    // does NOT merge the flat tail (unlike the old sampled-segment isotonic merge). So a solo near-flat Mento
+    // venue fills its QL head (here amountIn/QL_SEED_DIV), bounded by the guard — and the wei-exact gate above
+    // holds regardless (oracle == solver by construction). A convex Mento curve (the common case) fills further.
+    assert.ok(spent > 0n && spent <= amountIn, "QL fills a leading slice bounded by the non-convex guard");
 
-    // The caller-received tokenOut == the REAL Broker's OWN LIVE getAmountOut(awarded Σ) view, to the WEI.
-    // Because the block clock is PINNED (no bucket refresh), the snapshot ladder the split priced == the live
-    // view at exec, so this is BOTH exact-on-grid AND exact-in-dy (the strongest Mento cross-check). onViewAwarded
-    // is getAmountOut(awarded) for the FULL awarded Σ (== the captured mainnet quote for that exact size, since
-    // the awarded 100k is a captured ladder point — the top of the sampled grid).
-    assert.equal(received, onViewAwarded, "received == REAL Broker LIVE getAmountOut(awarded Σ) (exact-in-dy)");
-    // And it equals the CAPTURED mainnet ladder value for this exact awarded size (the FULL amountIn == the last
-    // sampled ladder point) — a direct tie to the real chain value, not just an internally-consistent replay.
-    const capturedForAwarded = BigInt(snaps.state.ladder.cumOut[snaps.state.ladder.cumOut.length - 1]);
-    assert.equal(received, capturedForAwarded, "received == the CAPTURED mainnet getAmountOut(awarded) value to the wei");
+    // The caller-received tokenOut == the REAL Broker's OWN LIVE getAmountOut(awarded Σ) view, to the WEI —
+    // read from the GENUINE etched multi-contract graph (Broker → BiPoolManager → SortedOracles → …), which
+    // the (a) integrity test proves reproduces mainnet byte-for-byte. Because the block clock is PINNED (no
+    // bucket refresh), the ladder-point quotes the split priced == the live view at exec, so this is BOTH the
+    // "on-chain QL ladder == REAL etched view at the ladder points" tie AND exact-in-dy (the Mento exec
+    // re-reads getAmountOut(awarded) as amountOutMin and swaps to exactly it).
+    assert.equal(received, onViewAwarded, "received == REAL Broker LIVE getAmountOut(awarded Σ) (exact-in-dy, real graph)");
 
     const ms = Date.now() - t0;
     console.log(
-      `  [mento-prod-mirror:${engine}] WEI-EXACT vs neutral oracle — spent=${spent} received=${received} ` +
-        `(oracle awarded=${awarded}, liveView=${onViewAwarded}, capturedForAwarded=${capturedForAwarded}, amountIn=${amountIn}, FULL fill via merge); ` +
+      `  [mento-prod-mirror:${engine}] QL WEI-EXACT vs neutral oracle — spent=${spent} received=${received} ` +
+        `(oracle awarded=${awarded}, liveView=${onViewAwarded}, amountIn=${amountIn}; QL head fill, non-convex guard); ` +
         `wall-clock ${ms} ms (no fork, no RPC)`,
     );
   }

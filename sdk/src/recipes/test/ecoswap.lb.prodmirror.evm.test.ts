@@ -377,9 +377,16 @@ describe("EcoSwap Trader Joe LB v2.2 prod-mirror — REAL bytecode, no fork, off
       "the discovered LB venue is the REAL etched pair",
     );
     assert.equal(prepared.lbs![0].binStep, etched.binStep, "discovery read the real binStep");
+    assert.equal(
+      prepared.lbs![0].swapForY,
+      tokenIn.toLowerCase() === etched.tokenX.toLowerCase(),
+      "discovery read the real swapForY (tokenIn == tokenX)",
+    );
+    // LB is now a QUOTE-LADDER (QL) venue: prepare ships ONLY the descriptor (prepared.lbs), NO static
+    // sampled brackets — the on-chain solver builds the getSwapOut ladder live from the REAL etched pair.
     assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.LB),
-      "LB segments present in the prepared brackets",
+      !(prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.LB),
+      "LB ships NO static brackets (it is a QUOTE-LADDER venue — the ladder is built live on-chain)",
     );
 
     // NEUTRAL ORACLE (ecoswap.optimal.ts) — one LB venue seeded from the REAL captured bins via the SHARED

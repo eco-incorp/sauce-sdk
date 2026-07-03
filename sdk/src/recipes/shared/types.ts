@@ -429,6 +429,12 @@ export interface EcoLb {
   binStep: number;
   /** Rounded ppm base fee (the price-ordering coordinate; the on-chain out is computed by the pair). */
   feePpm: number;
+  /**
+   * Swap direction bit — true when tokenIn == the pair's tokenX (getTokenX()). The QL descriptor carries it
+   * (qd[1]) so the on-chain ladder's getSwapOut(xIn, swapForY) reads the pair in the right direction (the
+   * engine _swapTraderJoeLB exec resolves it independently on-chain from getTokenX()).
+   */
+  swapForY: boolean;
   source: string;
 }
 

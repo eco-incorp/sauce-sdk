@@ -1584,7 +1584,7 @@ export const lbPairAbi = parseAbi([
   "function getBin(uint24 id) view returns (uint128 binReserveX, uint128 binReserveY)",
   "function getReserves() view returns (uint128 reserveX, uint128 reserveY)",
   "function getStaticFeeParameters() view returns (uint16 baseFactor, uint16 filterPeriod, uint16 decayPeriod, uint16 reductionFactor, uint24 variableFeeControl, uint16 protocolShare, uint24 maxVolatilityAccumulator)",
-  "function getSwapOut(uint256 amountIn, bool swapForY) view returns (uint256)",
+  "function getSwapOut(uint128 amountIn, bool swapForY) view returns (uint128 amountInLeft, uint128 amountOut, uint128 fee)",
   "function setBin(uint24 id, uint256 reserveX, uint256 reserveY)",
   "function swap(bool swapForY, address to) returns (bytes32 amountsOut)",
 ]);
