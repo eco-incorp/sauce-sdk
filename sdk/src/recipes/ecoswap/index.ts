@@ -516,6 +516,7 @@ export async function ecoSwap(
         fluidResolverAddr(prepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
         mentoBrokerAddr(prepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
         balancerV3RouterAddr(prepared), // cfg[8] — chain-wide Balancer V3 Router (0 when no Balancer V3 venue)
+        prepared.minOut ?? 0n, // cfg[9] — internal whole-trade amountOutMin FLOOR (0 ⇒ no floor)
       ],
       poolTuples,
       netCache,
@@ -679,6 +680,7 @@ export async function quoteEcoSwap(
         fluidResolverAddr(usePrepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
         mentoBrokerAddr(usePrepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
         balancerV3RouterAddr(usePrepared), // cfg[8] — chain-wide Balancer V3 Router (0 when no Balancer V3 venue)
+        0n, // cfg[9] — amountOutMin floor: 0 on a QUOTE (a read-only quote must never floor-revert)
       ],
       poolTuples,
       netCache,

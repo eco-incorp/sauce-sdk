@@ -515,6 +515,70 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
     );
   }
 
+  // Phase 3c — the INTERNAL amountOutMin FLOOR (cfg[9]). Two cooks against the SAME fresh pools:
+  //   (1) the PRODUCTION path (minOut = expectedTotalOut*(1 - default 0.5% slip)): a wei-exact
+  //       fill must NOT false-revert — the cook succeeds AND the realized out clears the floor
+  //       (floor sits strictly below expected). Proves the floor never trips a legitimate fill.
+  //   (2) a floor set ABOVE the achievable output (opts.minOut) → the cook REVERTS. Proves the
+  //       terminal require actually fires. Both on the selected engine (v1 AND v12).
+  async function runPhase3c(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const amountIn = parseEther("5000");
+    const caller = c.account0;
+
+    // (1) Production floor (default slip) must NOT false-revert a wei-exact fill.
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const good = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      anvil.rpcUrl,
+      cookTarget(engine, stack, v12),
+      caller,
+      poolConfig,
+      undefined, // default slippageBps (0.5%) ⇒ a real, > 0 floor
+      engine,
+    );
+    assert.ok((good.prepared.minOut ?? 0n) > 0n, "production emits a > 0 amountOutMin floor");
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt: okReceipt } = await cook(c.walletClient, c.publicClient, target, good.bytecodes);
+    assert.equal(okReceipt.status, "success", "floored cook (default slip) must NOT false-revert");
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.ok(received > 0n, "caller received tokenOut");
+    assert.ok(
+      received >= (good.prepared.minOut ?? 0n),
+      `wei-exact fill clears the floor: received ${received} >= minOut ${good.prepared.minOut}`,
+    );
+
+    // (2) A floor ABOVE the achievable output must REVERT the cook. Set minOut to 2× the realized
+    // out (unreachable) via the explicit override, re-prepare + compile, and cook the SAME pools.
+    await resetPools();
+    const tooHigh = received * 2n;
+    const bad = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      anvil.rpcUrl,
+      cookTarget(engine, stack, v12),
+      caller,
+      poolConfig,
+      { minOut: tooHigh }, // explicit floor above anything the split can produce
+      engine,
+    );
+    assert.equal(bad.prepared.minOut, tooHigh, "override sets the floor verbatim (cfg[9])");
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    let reverted = false;
+    try {
+      const { receipt: badReceipt } = await cook(c.walletClient, c.publicClient, target, bad.bytecodes);
+      reverted = badReceipt.status === "reverted";
+    } catch {
+      // writeContract/estimation rejected the reverting tx — also counts as "the floor fired".
+      reverted = true;
+    }
+    assert.ok(reverted, "cook MUST revert when minOut exceeds the achievable output");
+
+    console.log(
+      `  [P3c:${engine}] floor OK: received=${received} >= minOut=${good.prepared.minOut}; forced minOut=${tooHigh} reverted=${reverted}`,
+    );
+  }
+
   // ── Engine matrix ────────────────────────────────────────────
   // The SAME compiled solver runs on the selected engine(s): v1 cooks the prefix
   // bytecode through the Solidity SauceRouter; v12 (the DEFAULT) cooks the postfix
@@ -540,6 +604,13 @@ describe("EcoSwap end-to-end (multi-pool split)", () => {
       { skip },
       async () => {
         await runPhase3b(engine);
+      },
+    );
+    it(
+      `Phase 3c [${engine}] — amountOutMin floor: wei-exact fill clears it; an over-high floor reverts`,
+      { skip },
+      async () => {
+        await runPhase3c(engine);
       },
     );
   }

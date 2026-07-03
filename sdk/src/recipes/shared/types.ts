@@ -896,4 +896,22 @@ export interface EcoSwapPrepared {
   priceLimit: bigint;
   /** Sum of route-segment capacities (diagnostic; direct-pool depth is read live). */
   expectedInputCovered: bigint;
+  /**
+   * Whole-trade slippage tolerance (bps) applied to derive `minOut` (the internal
+   * amountOutMin floor). Default 50 (0.5%); 0 disables the floor. Diagnostic — the
+   * solver receives only the resulting `minOut` (cfg[9]).
+   */
+  slippageBps?: number;
+  /**
+   * The internal whole-trade amountOutMin FLOOR the on-chain solver self-enforces
+   * (cfg[9]): `expectedTotalOut * (10000 - slippageBps) / 10000`, where expectedTotalOut
+   * is a CONSERVATIVE (lower-bound) off-chain estimate of the split's output. Defense-in-
+   * depth — a legitimate wei-exact fill always clears it. 0 ⇒ no floor (the pre-floor,
+   * byte-identical solver behavior). Optional so existing test-side `EcoSwapPrepared`
+   * literals stay additive-compatible (absent ⇒ index.ts emits minOut 0). NOTE: this is
+   * NOT a tight `slippageBps` band around the realized fill — the estimate is a loose lower
+   * bound (much looser in the common no-net-window live-walk path), so the floor guards a
+   * GROSS shortfall; callers wanting a tight whole-trade minimum should enforce their own.
+   */
+  minOut?: bigint;
 }

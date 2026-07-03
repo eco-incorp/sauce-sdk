@@ -70,6 +70,7 @@ import { buildBalancerV3Segments, type BalancerV3Pool } from "../shared/balancer
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
+import { estimateExpectedOutput } from "./expected-output.js";
 import {
   MIN_SQRT_RATIO,
   MAX_SQRT_RATIO,
@@ -165,6 +166,22 @@ const MAX_HOPS = Math.max(2, Number(process.env.ECO_MAX_HOPS ?? 3));
  * and logged. Override with ECO_MAX_ROUTES.
  */
 const MAX_ROUTES = Number(process.env.ECO_MAX_ROUTES ?? 8);
+/**
+ * Default whole-trade slippage tolerance (bps) for the internal amountOutMin FLOOR the solver
+ * self-enforces (defense-in-depth). `minOut = expectedTotalOut * (10000 - slipBps) / 10000`,
+ * where `expectedTotalOut` is a CONSERVATIVE (lower-bound) off-chain estimate of the split's
+ * whole-trade output (estimateExpectedOutput) — so the floor sits strictly below any legitimate
+ * wei-exact fill and only fires on a genuine shortfall. Default 50 bps (0.5%); override with
+ * ECO_SLIPPAGE_BPS, or per-call via prepareEcoSwap `opts.slippageBps`.
+ *
+ * NOTE: `slipBps` is the band around the ESTIMATE, not a guaranteed band around the realized
+ * fill. Because the estimate is a conservative lower bound (and much looser in the common
+ * no-net-window live-walk path — see estimateExpectedOutput's TIGHTNESS CAVEAT), the effective
+ * floor is often well below `expected*(1 - slipBps)`. This internal floor is defense-in-depth
+ * against a GROSS shortfall; integrators wanting a tight whole-trade minimum should enforce their
+ * own around cook() (or pass an explicit `opts.minOut`).
+ */
+const DEFAULT_SLIPPAGE_BPS = Number(process.env.ECO_SLIPPAGE_BPS ?? 50);
 /**
  * Engine `_swapV2` hardcodes the constant-product fee at 0.3% (997/1000) for
  * EVERY V2 pool, ignoring the discovered fee tier. So all V2 brackets are pinned
@@ -904,6 +921,23 @@ export interface EcoSwapPrepareOpts {
    * MUST originate from the Pot owner — callers pass the cook caller here.
    */
   caller?: Hex;
+  /**
+   * Whole-trade slippage tolerance (bps) for the solver's INTERNAL amountOutMin floor
+   * (defense-in-depth; the caller should still enforce its own min around cook()). The
+   * floor is `minOut = expectedTotalOut * (10000 - slippageBps) / 10000`, where
+   * expectedTotalOut is a CONSERVATIVE lower-bound estimate of the split's output — so it
+   * NEVER false-reverts a legitimate wei-exact fill. Default DEFAULT_SLIPPAGE_BPS
+   * (ECO_SLIPPAGE_BPS env or 50 = 0.5%). Set 0 to disable the internal floor (minOut 0 ⇒
+   * byte-identical to the pre-floor solver behavior).
+   */
+  slippageBps?: number;
+  /**
+   * EXPLICIT whole-trade amountOutMin floor (wei of tokenOut) — when set, it OVERRIDES the
+   * `slippageBps`-derived estimate entirely and is used as `minOut` verbatim. For a caller
+   * that already computed its own minimum (e.g. from an external quote), or a test asserting
+   * the floor fires. Unset ⇒ the estimate path (the normal defense-in-depth floor).
+   */
+  minOut?: bigint;
 }
 
 export async function prepareEcoSwap(
@@ -919,6 +953,7 @@ export async function prepareEcoSwap(
   const minRelBps = opts.minRelBps ?? DEFAULT_MIN_REL_BPS;
   const maxTicks = opts.maxTicks ?? V3_TICK_STEPS;
   const bandTicks = opts.bandTicks ?? V3_BAND_TICKS;
+  const slippageBps = opts.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
   const target = opts.lensTarget ?? "v12";
   const caller = opts.caller;
   const { tokenIn, tokenOut, amountIn } = config;
@@ -1618,7 +1653,7 @@ export async function prepareEcoSwap(
       `${nFluidSegs} Fluid, ${nMentoSegs} Mento, ${nBalancerV3Segs} Balancer-V3)`,
   );
 
-  return {
+  const prepared: EcoSwapPrepared = {
     pools,
     routes,
     // Curve/LB/DODO are SAMPLED-SEGMENT venues — their curve math is off-chain only, sampled (LB:
@@ -1644,5 +1679,23 @@ export async function prepareEcoSwap(
     zeroForOne,
     priceLimit,
     expectedInputCovered: 0n,
+    slippageBps,
+    // The internal whole-trade amountOutMin FLOOR (cfg[9]) the on-chain solver self-enforces.
+    // expectedTotalOut is a CONSERVATIVE (lower-bound) off-chain estimate of the split's output
+    // (estimateExpectedOutput walks each pool's frontier over the shipped net window + values the
+    // sampled brackets exactly, omitting deeper-than-window liquidity and routes ⇒ never over-
+    // counts). So `minOut = expectedTotalOut * (10000 - slippageBps) / 10000` sits strictly below
+    // any legitimate wei-exact fill and only fires on a genuine shortfall. slippageBps 0 ⇒ minOut
+    // 0 ⇒ the floor is disabled (byte-identical to the pre-floor solver). When the estimate is 0
+    // (no estimable venue) minOut is 0 too — the safe (no-floor) default.
+    minOut: 0n,
   };
+  if (opts.minOut !== undefined) {
+    // Explicit override — used verbatim (a caller-supplied min, or a test forcing the floor).
+    prepared.minOut = opts.minOut;
+  } else if (slippageBps > 0) {
+    const expectedTotalOut = estimateExpectedOutput(prepared, amountIn);
+    prepared.minOut = (expectedTotalOut * BigInt(10_000 - slippageBps)) / 10_000n;
+  }
+  return prepared;
 }

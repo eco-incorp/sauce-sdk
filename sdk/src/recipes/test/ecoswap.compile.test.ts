@@ -65,10 +65,13 @@ const segs: bigint[][] = [[0n, 10n ** 17n, 1n << 96n, 1n << 96n, 1n, SEG_VENUE, 
 
 /**
  * Build the `cfg` scalar tuple index.ts emits:
- *   cfg = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount].
+ *   cfg = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, ...extra].
+ * `extra` appends the OPTIONAL trailing scalars (cfg[6..9]: fluidResolver, mentoBroker,
+ * balancerV3Router, minOut) — omitted ⇒ the short (6-field) cfg the venue/mix tests hand-build,
+ * which exercises the cfg.length guards (each optional field defaults 0).
  */
-function cfgTuple(directCount: number): bigint[] {
-  return [WETH, USDC, 10n ** 18n, CALLER, PRICE_LIMIT, BigInt(directCount)];
+function cfgTuple(directCount: number, extra: bigint[] = []): bigint[] {
+  return [WETH, USDC, 10n ** 18n, CALLER, PRICE_LIMIT, BigInt(directCount), ...extra];
 }
 
 // ── The unified-walk merge solver — ecoswap.sauce.ts ─────────────────
@@ -91,10 +94,11 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     routingArg: bigint[][],
     directCount: number,
     segsArg: bigint[][] = segs,
+    cfgExtra: bigint[] = [],
   ) {
     const source = readFileSync(SINGLEPASS, "utf-8");
     const stripped = stripTypes(source);
-    const args = [cfgTuple(directCount), poolsArg, netCacheArg, routingArg, segsArg];
+    const args = [cfgTuple(directCount, cfgExtra), poolsArg, netCacheArg, routingArg, segsArg];
 
     const v1: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args });
     const v12: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args, target: "v12" });
@@ -108,6 +112,15 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
 
   it("compiles a 2-V3-pool fixture (v1 + v12)", () => {
     compileBoth(pools, netCache, routing, 2);
+  });
+
+  it("compiles the FULL 10-field cfg incl. minOut>0 — floor guard (v1 + v12)", () => {
+    // Production emits the full cfg (index.ts): cfg[6]=fluidResolver, [7]=mentoBroker,
+    // [8]=balancerV3Router, [9]=minOut. Compiling with a NON-ZERO minOut exercises the terminal
+    // `if (minOut > 0) { if (outBal < minOut) throw ... }` branch codegen on BOTH engines and
+    // confirms the extra scalar does NOT disturb the v12 arg-prologue SDUP window (cfg is still
+    // ONE tuple). The 6-field short-cfg cells above already prove the cfg.length guards.
+    compileBoth(pools, netCache, routing, 2, segs, [0n, 0n, 0n, 10n ** 15n]);
   });
 
   // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1) plus the

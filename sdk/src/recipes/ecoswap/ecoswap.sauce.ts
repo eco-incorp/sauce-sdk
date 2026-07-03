@@ -57,10 +57,14 @@ import { IPermit2 } from "./IPermit2.json";
 //   guarded terminal refund returns the only possible leftover (the limit-price edge).
 //
 // Inputs (precomputed off-chain in prepare.ts; layout built by index.ts buildPoolUniverseAndRouting):
-//   cfg         = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount] — ONE scalar
-//                 tuple (the lens trick: keeps main() at 4 params so the v12 arg-prologue SDUP
-//                 window stays small). directCount = number of leading universe entries that are
-//                 DIRECT venues (== prepared.pools.length); entries [directCount, …) are leg-only.
+//   cfg         = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, fluidResolver?,
+//                 mentoBroker?, balancerV3Router?, minOut?] — ONE scalar tuple (the lens trick:
+//                 keeps main() at 4 params so the v12 arg-prologue SDUP window stays small).
+//                 directCount = number of leading universe entries that are DIRECT venues (==
+//                 prepared.pools.length); entries [directCount, …) are leg-only. cfg[6..9] are
+//                 OPTIONAL trailing scalars (guarded by cfg.length): the chain-wide Fluid resolver,
+//                 Mento broker, Balancer-V3 router, and cfg[9] = the internal whole-trade
+//                 amountOutMin FLOOR (0 ⇒ no floor ⇒ byte-identical to the pre-floor solver).
 //   pools[i]    = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0,
 //                  stateView, poolId, stepRatio, windowTopShifted, windowBotShifted,
 //                  extremeShifted, netStart, netCount, isKyber] — the FLAT POOL UNIVERSE
@@ -276,6 +280,15 @@ function main(
   // emits it (index.ts).
   let balancerV3Router: Address = 0;
   if (cfg.length > 8) { balancerV3Router = cfg[8]; }
+  // cfg[9] = the internal whole-trade amountOutMin FLOOR (defense-in-depth). 0 ⇒ NO floor: the
+  // solver just returns the final tokenOut balance exactly as before (this is the SPLIT / priced
+  // path — unchanged, wei-exact). When > 0 a TERMINAL require (finalOut >= minOut) reverts the whole
+  // cook on a shortfall; production (index.ts) sets it to expectedTotalOut*(1 - slip), which sits
+  // strictly BELOW any legitimate wei-exact fill so it never false-reverts. OPTIONAL 10th cfg field —
+  // guarded by cfg.length so the many venue EVM tests that hand-build a shorter cfg stay valid (minOut
+  // defaults 0 ⇒ byte-identical to the pre-floor solver); production always emits it (index.ts).
+  let minOut: Uint256 = 0;
+  if (cfg.length > 9) { minOut = cfg[9]; }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -1640,13 +1653,14 @@ function main(
       // on-chain minAmountOut source (unlike Fluid's estimateSwapIn, which self-reverts and so runs under a
       // plain CALL). The split is ALREADY priced off the sampled ladder at prepare, so we execute the awarded
       // `b3amt` as a straight exact-in swap with minAmountOut = 0 for THIS leg: exactIn means the Vault computes
-      // the out from the awarded input. There is NO per-leg on-chain floor here (and the solver has NO
-      // whole-trade output floor either — main() just returns the final tokenOut balance, it does not
-      // require(outBal >= min)); a Balancer V3 leg relies ENTIRELY on the off-chain snapshot split (priced off
-      // the same live query ladder the oracle segments) plus whatever transaction-level slippage the integrator
-      // enforces around cook(). This differs from Fluid/Mento, which DO re-quote on-chain (self-reverting
-      // views) and pass that as a per-leg minOut; Balancer V3's query is not callable, so no per-leg minOut
-      // exists. Permit2 two-step: ERC20.approve(PERMIT2) then Permit2.approve(token, ROUTER, uint160 amt, uint48
+      // the out from the awarded input. There is NO per-leg on-chain floor here, but the WHOLE-TRADE cfg[9]
+      // amountOutMin floor below (main()'s terminal `if (minOut > 0) require(outBal >= minOut)`) now guards this
+      // Balancer V3 leg too: a shortfall on the aggregate tokenOut reverts the whole cook atomically. So a
+      // Balancer V3 leg relies on the off-chain snapshot split (priced off the same live query ladder the oracle
+      // segments) plus the whole-trade floor plus whatever transaction-level slippage the integrator enforces
+      // around cook(). The per-leg picture still differs from Fluid/Mento, which DO re-quote on-chain (self-
+      // reverting views) and pass that as a per-leg minOut; Balancer V3's query is not callable, so no per-leg
+      // minOut exists (only the whole-trade floor). Permit2 two-step: ERC20.approve(PERMIT2) then Permit2.approve(token, ROUTER, uint160 amt, uint48
       // exp). wethIsEth = 0 (false — pure ERC20). The compiler ABI-encodes the uint256 0 as the
       // `bool`/`uint160`/`uint48` args (BYTE_N truncation to width).
       token.approve(PERMIT2, b3amt);
@@ -1661,6 +1675,16 @@ function main(
   }
   const outToken = IERC20.at(tokenOut);
   const outBal: Uint256 = outToken.balanceOf(address.self);
+  // Internal whole-trade amountOutMin FLOOR (defense-in-depth). minOut == 0 (the default / a quote /
+  // a short hand-built cfg) SKIPS this branch entirely, so the priced path is byte-identical to the
+  // pre-floor solver. When set, revert the whole cook if the realized tokenOut is below the floor —
+  // BEFORE transferring to the caller, so a shortfall unwinds atomically. Same conditional-revert
+  // idiom the recipes use (a guarded `throw`, which compiles to a REVERT on v1 and v12).
+  if (minOut > 0) {
+    if (outBal < minOut) {
+      throw "ecoswap: amountOut below minOut";
+    }
+  }
   outToken.transfer(caller, outBal);
   return outBal;
 }
