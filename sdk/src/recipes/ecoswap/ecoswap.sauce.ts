@@ -8,6 +8,7 @@ import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 import { IWombatPool } from "./IWombatPool.json";
 import { IEulerSwapPool } from "./IEulerSwapPool.json";
 import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
+import { ICurveStableSwap } from "./ICurveStableSwap.json";
 import { IWooFiPool } from "./IWooFiPool.json";
 import { IFermiPool } from "./IFermiPool.json";
 import { IFluidDexPool } from "./IFluidDexPool.json";
@@ -85,8 +86,29 @@ import { IPermit2 } from "./IPermit2.json";
 //                 Leg L pools = universe indices [baseL, baseL+countL); interL = intermediate token
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
-//   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue] — the SAMPLED-SEGMENT
-//                 venue stream (Curve / Trader Joe LB / DODO V2 interleaved), sorted DESC sqrtAdjNear.
+//   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx] — the QUOTE-LADDER (QL) venue DESCRIPTORS
+//                 (Curve StableSwap pilot). NO sampled values: prepare ships only the descriptor
+//                 (prepare-optional), and the solver BUILDS each venue's price ladder ON-CHAIN in
+//                 setup from LIVE cook-time state. For k in 0..QL_S-1 it takes a geometric cumulative
+//                 input xNext = cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV, derived on-chain,
+//                 clamped at amountIn), quotes q_k = get_dy(i,j,xNext) via PROBE-THEN-DECODE (a
+//                 `.catch` flags a revert ⇒ stop; the sentinel-catch cannot capture the return VALUE),
+//                 differences (capacity = xNext-cum, sliceOut = q_k - q_{k-1}), and emits a segment row
+//                 [refIdx, capacity, head, head, segKind, venue] (head = qlSliceHead(sliceOut,capacity);
+//                 Curve get_dy is post-fee ⇒ no extra fee-adjust) into the SAME merged segment stream
+//                 the static `segs` feed. Stops early on a sentinel-0 quote, a non-descending head
+//                 (non-convex guard), or the QL_S cap. Building all slices ONCE from one live read is
+//                 exactly as live as re-quoting per merge step (pool state is frozen until EXEC), so
+//                 the ladder is bounded to <=2*QL_S staticcalls per venue.
+//   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux] — the STATIC
+//                 sampled-segment venue stream (the 13 not-yet-QL-migrated venues: LB / DODO / Solidly
+//                 / … interleaved), pre-sorted DESC sqrtAdjNear. In setup the solver COPIES these rows
+//                 and the ON-CHAIN-BUILT qlv ladders into ONE set of parallel scalar arrays (an
+//                 array-of-tuples is v12-only — SET_INDEX of a tuple reverts on v1), then BOUNDED-
+//                 insertion-SORTs them DESC (sqrtAdjNear, then sqrtAdjFar, then refIdx ASC) into the
+//                 single stream the bestKind===1 cursor consumes. The merge head-scan / cursor /
+//                 accumulators / exec are UNCHANGED in logic — only WHERE the stream comes from (an
+//                 on-chain-built parallel-array stream, not a pre-sorted compiler arg).
 //                 These are STATIC venues: their curve math is OFF-CHAIN ONLY (prepare samples — LB
 //                 EXACTLY enumerates — each into post-fee flat segments), so the solver does NOT
 //                 recompute either curve. It consumes the rows in price order through ONE cursor
@@ -229,6 +251,18 @@ function invertFarFromOut(L: Uint256, nearOI: Uint256, outAmt: Uint256): Uint256
   return nearOI - Math.mulDiv(outAmt, Q96, L);
 }
 
+/**
+ * QUOTE-LADDER slice head — fee-inclusive out/in sqrt-Q96 of one differenced ladder slice:
+ * sqrt(sliceOut·2^192 / capacity). A Curve get_dy is already POST-FEE, so the head needs NO extra
+ * fee-adjust (a QL Curve segment enters the merge with adjNear==adjFar==head). Pure-value (only
+ * Math.* intrinsics — no helper-to-helper call), so it is safe to call from main()'s ladder build.
+ * Bit-for-bit with curve-math.ts / ecoswap.math.ts `qlSliceHead`.
+ */
+function qlSliceHead(sliceOut: Uint256, capacity: Uint256): Uint256 {
+  const Q192: Uint256 = 2 ** 192;
+  return Math.sqrt(Math.mulDiv(sliceOut, Q192, capacity));
+}
+
 // ── Compile-time protocol-presence flags (conditional compilation) ──
 // Each guards the per-protocol-SEPARABLE on-chain code below. index.ts derives each from the
 // prepared universe and passes them as compiler `defines` (with treeshake on) so a cook carries
@@ -258,7 +292,7 @@ const HAS_BALANCER_V3: boolean = true;
 
 function main(
   cfg: Tuple,
-  pools: Tuple, netCache: Tuple, routing: Tuple, segs: Tuple
+  pools: Tuple, netCache: Tuple, routing: Tuple, segs: Tuple, qlv: Tuple
 ): Uint256 {
   // cfg = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount]
   const tokenIn: Address = cfg[0];
@@ -336,9 +370,22 @@ function main(
   // route events (routing.length*PER_POOL extra) so the outer merge loop never itself truncates a
   // fill the per-pool caps would complete.
   const PER_POOL: Uint256 = 2048;
-  // SAFETY dominates every per-pool reach + the route events + ONE merge step per sampled segment
-  // (each static segment is consumed in exactly one step, so + segs.length covers the cursor).
-  const SAFETY: Uint256 = pools.length * PER_POOL * 2 + routing.length * PER_POOL + segs.length;
+  // ── QUOTE-LADDER constants (MUST equal curve-math.ts QL_S / QL_RN / QL_RD / QL_SEED_DIV) ──
+  // QL_S geometric slices per QL venue; xNext = cum*QL_RN/QL_RD + seed, seed = amountIn/QL_SEED_DIV
+  // (clamped at amountIn). QL_SEED_DIV=16 < 19.84 guarantees the clamp engages on the final slice, so
+  // the ladder covers [0, amountIn] in full (a solo QL venue can absorb the whole trade).
+  const QL_S: Uint256 = 8;
+  const QL_RN: Uint256 = 5;
+  const QL_RD: Uint256 = 4;
+  const QL_SEED_DIV: Uint256 = 16;
+  // MS_CAP = the merged sampled-segment stream capacity: the static `segs` rows PLUS up to QL_S rows
+  // per QL descriptor. Upper bound (a ladder may stop early); the parallel-array stream + every
+  // per-venue accumulator size to it, and refIdx keys stay < MS_CAP (an index into a per-kind venue
+  // list). MS_CAP=0 for an all-live universe (no sampled venues) ⇒ the segment machinery is a no-op.
+  const MS_CAP: Uint256 = segs.length + qlv.length * QL_S;
+  // SAFETY dominates every per-pool reach + the route events + ONE merge step per merged segment
+  // (each segment is consumed in exactly one step, so + MS_CAP covers the cursor).
+  const SAFETY: Uint256 = pools.length * PER_POOL * 2 + routing.length * PER_POOL + MS_CAP;
 
   // Per-universe-pool accumulators + the single live frontier state (walked from the live spot).
   let inp: Tuple = new Array(pools.length);
@@ -363,38 +410,54 @@ function main(
   // address is stamped from the row). Sized by the segment-stream length (an upper bound on
   // distinct venues per kind). The three kinds keep SEPARATE arrays (their refIdx counters are
   // independent). cven/lven/dven stay 0 for an unused slot; a >0 input marks a venue to execute.
-  let cinp: Tuple = new Array(segs.length); // Curve per-venue Σ input
-  let cven: Tuple = new Array(segs.length); // Curve venue (exchange() pool) address
-  let linp: Tuple = new Array(segs.length); // LB per-venue Σ input
-  let lven: Tuple = new Array(segs.length); // LB venue (pair) address
-  let dinp: Tuple = new Array(segs.length); // DODO per-venue Σ input
-  let dven: Tuple = new Array(segs.length); // DODO venue (pool) address
-  let sinp: Tuple = new Array(segs.length); // Solidly-stable per-venue Σ input
-  let sven: Tuple = new Array(segs.length); // Solidly-stable venue (pool) address
-  let winp: Tuple = new Array(segs.length); // Wombat per-venue Σ input
-  let wven: Tuple = new Array(segs.length); // Wombat venue (pool) address
-  let binp: Tuple = new Array(segs.length); // Balancer-stable per-venue Σ input
-  let bven: Tuple = new Array(segs.length); // Balancer-stable venue (pool) address
-  let einp: Tuple = new Array(segs.length); // EulerSwap per-venue Σ input
-  let even: Tuple = new Array(segs.length); // EulerSwap venue (pool) address
-  let minp: Tuple = new Array(segs.length); // Maverick V2 per-venue Σ input
-  let mven: Tuple = new Array(segs.length); // Maverick V2 venue (pool) address
-  let cryinp: Tuple = new Array(segs.length); // Curve CryptoSwap per-venue Σ input
-  let cryven: Tuple = new Array(segs.length); // Curve CryptoSwap venue (pool) address
-  let wooinp: Tuple = new Array(segs.length); // WOOFi per-venue Σ input
-  let wooven: Tuple = new Array(segs.length); // WOOFi venue (pool) address
-  let feinp: Tuple = new Array(segs.length); // Fermi/propAMM per-venue Σ input
-  let feven: Tuple = new Array(segs.length); // Fermi/propAMM venue (pool) address
-  let flinp: Tuple = new Array(segs.length); // Fluid DEX per-venue Σ input
-  let flven: Tuple = new Array(segs.length); // Fluid DEX venue (DexT1 pool) address
-  let mtinp: Tuple = new Array(segs.length); // Mento V2 per-venue Σ input
-  let mtven: Tuple = new Array(segs.length); // Mento V2 venue exchangeProvider address (segs[5])
-  let mtxid: Tuple = new Array(segs.length); // Mento V2 venue exchangeId (bytes32-as-uint256, segs[6])
-  let b3inp: Tuple = new Array(segs.length); // Balancer V3 per-venue Σ input
-  let b3ven: Tuple = new Array(segs.length); // Balancer V3 venue (Vault pool) address (segs[5])
-  // Static-segment cursor: segs is pre-sorted DESC by sqrtAdjNear (then adjFar, then refIdx — the
-  // SAME order the merge tie-breaks on), so the cursor only ever advances; a segment is consumed
-  // once. The head candidate for the merge is always segs[segCur] (the next-best-priced slice).
+  let cinp: Tuple = new Array(MS_CAP); // Curve per-venue Σ input
+  let cven: Tuple = new Array(MS_CAP); // Curve venue (exchange() pool) address
+  let linp: Tuple = new Array(MS_CAP); // LB per-venue Σ input
+  let lven: Tuple = new Array(MS_CAP); // LB venue (pair) address
+  let dinp: Tuple = new Array(MS_CAP); // DODO per-venue Σ input
+  let dven: Tuple = new Array(MS_CAP); // DODO venue (pool) address
+  let sinp: Tuple = new Array(MS_CAP); // Solidly-stable per-venue Σ input
+  let sven: Tuple = new Array(MS_CAP); // Solidly-stable venue (pool) address
+  let winp: Tuple = new Array(MS_CAP); // Wombat per-venue Σ input
+  let wven: Tuple = new Array(MS_CAP); // Wombat venue (pool) address
+  let binp: Tuple = new Array(MS_CAP); // Balancer-stable per-venue Σ input
+  let bven: Tuple = new Array(MS_CAP); // Balancer-stable venue (pool) address
+  let einp: Tuple = new Array(MS_CAP); // EulerSwap per-venue Σ input
+  let even: Tuple = new Array(MS_CAP); // EulerSwap venue (pool) address
+  let minp: Tuple = new Array(MS_CAP); // Maverick V2 per-venue Σ input
+  let mven: Tuple = new Array(MS_CAP); // Maverick V2 venue (pool) address
+  let cryinp: Tuple = new Array(MS_CAP); // Curve CryptoSwap per-venue Σ input
+  let cryven: Tuple = new Array(MS_CAP); // Curve CryptoSwap venue (pool) address
+  let wooinp: Tuple = new Array(MS_CAP); // WOOFi per-venue Σ input
+  let wooven: Tuple = new Array(MS_CAP); // WOOFi venue (pool) address
+  let feinp: Tuple = new Array(MS_CAP); // Fermi/propAMM per-venue Σ input
+  let feven: Tuple = new Array(MS_CAP); // Fermi/propAMM venue (pool) address
+  let flinp: Tuple = new Array(MS_CAP); // Fluid DEX per-venue Σ input
+  let flven: Tuple = new Array(MS_CAP); // Fluid DEX venue (DexT1 pool) address
+  let mtinp: Tuple = new Array(MS_CAP); // Mento V2 per-venue Σ input
+  let mtven: Tuple = new Array(MS_CAP); // Mento V2 venue exchangeProvider address (segs[5])
+  let mtxid: Tuple = new Array(MS_CAP); // Mento V2 venue exchangeId (bytes32-as-uint256, segs[6])
+  let b3inp: Tuple = new Array(MS_CAP); // Balancer V3 per-venue Σ input
+  let b3ven: Tuple = new Array(MS_CAP); // Balancer V3 venue (Vault pool) address (segs[5])
+
+  // ── MERGED SAMPLED-SEGMENT STREAM (parallel scalar arrays) ──
+  // The bestKind===1 cursor consumes ONE globally-DESC-sorted segment stream. It is built ON-CHAIN
+  // in setup from BOTH the static `segs` rows (copied) AND the qlv QUOTE-LADDERS (built live), then
+  // bounded-insertion-sorted. Stored as PARALLEL SCALAR arrays (one column per array) because a
+  // NEW_ARRAY of TUPLE rows reverts SET_INDEX on v1 (an array-of-tuples is v12-only). msN = the
+  // actual filled row count (≤ MS_CAP). Columns mirror the old row shape:
+  //   msRef=refIdx, msCap=capacity, msNear=sqrtAdjNear, msFar=sqrtAdjFar, msKind=segKind,
+  //   msVen=venue, msAux=venueAux.
+  let msRef: Tuple = new Array(MS_CAP);
+  let msCap: Tuple = new Array(MS_CAP);
+  let msNear: Tuple = new Array(MS_CAP);
+  let msFar: Tuple = new Array(MS_CAP);
+  let msKind: Tuple = new Array(MS_CAP);
+  let msVen: Tuple = new Array(MS_CAP);
+  let msAux: Tuple = new Array(MS_CAP);
+  let msN: Uint256 = 0;
+  // Merged-stream cursor: msNear/msFar are pre-sorted DESC (then refIdx ASC), so the cursor only ever
+  // advances; a segment is consumed once. The head candidate is always the [segCur] slice (next-best).
   let segCur: Uint256 = 0;
 
   // Per-leg scratch for the N-leg route event (sized to the universe — legCount <= pools.length
@@ -490,6 +553,138 @@ function main(
       netCur[i] = cur;
     }
     lArr[i] = ll;
+  }
+
+  // ── BUILD THE MERGED SAMPLED-SEGMENT STREAM (static segs + live QL ladders, then DESC sort) ──
+  // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
+  // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
+  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&true) {
+    // 1. Copy the static (not-yet-QL-migrated) segments VERBATIM into the parallel-array stream.
+    for (let k = 0; k < segs.length; k = k + 1) {
+      const sr: Tuple = segs[k];
+      msRef[msN] = sr[0];
+      msCap[msN] = sr[1];
+      msNear[msN] = sr[2];
+      msFar[msN] = sr[3];
+      msKind[msN] = sr[4];
+      msVen[msN] = sr[5];
+      msAux[msN] = sr[6];
+      msN = msN + 1;
+    }
+    // 2. Build each QL venue's price ladder ON-CHAIN from LIVE get_dy (Curve StableSwap pilot,
+    // segKind 1). PROBE-THEN-DECODE the quote (a `.catch` flags a revert; the sentinel-catch cannot
+    // capture the return VALUE — it yields the CALL flag on v1 / returndata length on v12). All
+    // slices are built from ONE frozen live state, so this is exactly as live as re-quoting per
+    // merge step; bounded to ≤ 2*QL_S staticcalls per venue.
+    if (HAS_CURVE) {
+      for (let v = 0; v < qlv.length; v = v + 1) {
+        const qd: Tuple = qlv[v];
+        const qPool: Address = qd[0];
+        const qi: Uint256 = qd[1];
+        const qj: Uint256 = qd[2];
+        const qKind: Uint256 = qd[4];
+        const qRef: Uint256 = qd[5];
+        let seed: Uint256 = amountIn / QL_SEED_DIV;
+        if (seed === 0) { seed = 1; }
+        let cumL: Uint256 = 0;
+        let prevOut: Uint256 = 0;
+        let prevHead: Uint256 = 0;
+        let nv: Uint256 = 0;
+        let stop: Uint256 = 0;
+        for (let k = 0; k < QL_S; k = k + 1) {
+          if (stop === 0) {
+            let xNext: Uint256 = Math.mulDiv(cumL, QL_RN, QL_RD) + seed;
+            if (xNext > amountIn) { xNext = amountIn; }
+            const cap: Uint256 = xNext - cumL;
+            if (cap === 0) {
+              stop = 1;
+            } else {
+              // PROBE (revert flag) — the sentinel-catch value is unusable for capture on both engines.
+              let ok: Uint256 = 1;
+              ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
+              let q: Uint256 = 0;
+              if (ok === 1) { q = ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext); }
+              if (q === 0) {
+                stop = 1;
+              } else {
+                const sliceOut: Uint256 = q - prevOut;
+                if (sliceOut === 0) {
+                  stop = 1;
+                } else {
+                  const head: Uint256 = qlSliceHead(sliceOut, cap);
+                  // Non-convex guard: a non-descending head ends this venue's ladder here.
+                  if (nv > 0) { if (head >= prevHead) { stop = 1; } }
+                  if (stop === 0) {
+                    msRef[msN] = qRef;
+                    msCap[msN] = cap;
+                    msNear[msN] = head;
+                    msFar[msN] = head;
+                    msKind[msN] = qKind;
+                    msVen[msN] = qPool;
+                    msAux[msN] = 0;
+                    msN = msN + 1;
+                    nv = nv + 1;
+                    prevHead = head;
+                    cumL = xNext;
+                    prevOut = q;
+                    if (xNext >= amountIn) { stop = 1; }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // 3. Bounded insertion sort over [0, msN) DESC by (msNear, then msFar, then msRef ASC) — the SAME
+    // stable order index.ts buildSegs emits so the cursor sees a global descending-price stream. All
+    // seven columns shift together (parallel arrays). For a single monotone QL ladder this is a
+    // near-no-op; the general sort interleaves multiple QL venues + any static segments correctly.
+    for (let a = 1; a < MS_CAP; a = a + 1) {
+      if (a < msN) {
+        const kRef: Uint256 = msRef[a];
+        const kCap: Uint256 = msCap[a];
+        const kNear: Uint256 = msNear[a];
+        const kFar: Uint256 = msFar[a];
+        const kKind: Uint256 = msKind[a];
+        const kVen: Uint256 = msVen[a];
+        const kAux: Uint256 = msAux[a];
+        let b: Uint256 = a;
+        for (let g = 0; g < MS_CAP; g = g + 1) {
+          if (b > 0) {
+            const pNear: Uint256 = msNear[b - 1];
+            const pFar: Uint256 = msFar[b - 1];
+            const pRef: Uint256 = msRef[b - 1];
+            // key outranks pv (key sorts BEFORE pv in DESC-near, DESC-far, ASC-ref order)?
+            let up: Uint256 = 0;
+            if (kNear > pNear) { up = 1; }
+            else { if (kNear === pNear) {
+              if (kFar > pFar) { up = 1; }
+              else { if (kFar === pFar) { if (kRef < pRef) { up = 1; } } }
+            } }
+            if (up === 1) {
+              msRef[b] = pRef;
+              msCap[b] = msCap[b - 1];
+              msNear[b] = pNear;
+              msFar[b] = pFar;
+              msKind[b] = msKind[b - 1];
+              msVen[b] = msVen[b - 1];
+              msAux[b] = msAux[b - 1];
+              b = b - 1;
+            } else {
+              g = MS_CAP; // key's slot found — force-exit the shift loop
+            }
+          }
+        }
+        msRef[b] = kRef;
+        msCap[b] = kCap;
+        msNear[b] = kNear;
+        msFar[b] = kFar;
+        msKind[b] = kKind;
+        msVen[b] = kVen;
+        msAux[b] = kAux;
+      }
+    }
   }
 
   // ── MERGE: each step, pick the best-priced candidate head (direct pool OR route) and advance it ──
@@ -605,14 +800,13 @@ function main(
       }
       }
 
-      // 1c. sampled segments (Curve/LB/DODO) — ONE cursor over the pre-sorted (DESC adjNear, adjFar)
-      // segs stream. The head is segs[segCur] (next-best slice); its near/far are ALREADY post-fee
-      // out/in (prepare sets sqrtAdjNear==sqrtAdjFar to the post-fee marginal), so they compare
-      // directly. Same tie-break as the pools/routes (near DESC, then far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&segCur < segs.length) {
-        const sg: Tuple = segs[segCur];
-        const sNear: Uint256 = sg[2];
-        const sFar: Uint256 = sg[3];
+      // 1c. sampled segments — ONE cursor over the on-chain-built, DESC-sorted merged stream (static
+      // segs + live QL ladders). The head is the [segCur] slice (next-best); its near/far are ALREADY
+      // post-fee out/in (adjNear==adjFar==the post-fee marginal), so they compare directly. Same
+      // tie-break as the pools/routes (near DESC, then far DESC).
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&segCur < msN) {
+        const sNear: Uint256 = msNear[segCur];
+        const sFar: Uint256 = msFar[segCur];
         if (sNear >= bestPrice) {
           let sw: Uint256 = 0;
           if (sNear > bestPrice) { sw = 1; }
@@ -962,17 +1156,16 @@ function main(
           cum = cum + rtake;
         } else {
           if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&bestKind === 1) {
-            // ── sampled-segment slice (Curve / LB / DODO): a fixed capacity slice at a fixed
-            // post-fee price. Consume segs[segCur], clamp to the remaining global budget, and
+            // ── sampled-segment slice: a fixed capacity slice at a fixed post-fee price. Consume the
+            // [segCur] merged-stream row (parallel arrays), clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
-            // 2 LB → linp/lven, 3 DODO → dinp/dven), stamping the venue address from the row. The
-            // curve math is OFF-CHAIN — this is a pure data-driven slice; the awarded Σ executes
-            // below via the engine swap. Advance the cursor past this segment.
-            const sg: Tuple = segs[segCur];
-            const sIdx: Uint256 = sg[0];
-            const sCap: Uint256 = sg[1];
-            const sKind: Uint256 = sg[4];
-            const sVenue: Address = sg[5];
+            // 2 LB → linp/lven, 3 DODO → dinp/dven), stamping the venue address from the row. For a QL
+            // Curve row this slice was BUILT on-chain from live get_dy; for a static row it came from
+            // the compiler arg — either way the awarded Σ executes below via the engine swap. Advance.
+            const sIdx: Uint256 = msRef[segCur];
+            const sCap: Uint256 = msCap[segCur];
+            const sKind: Uint256 = msKind[segCur];
+            const sVenue: Address = msVen[segCur];
             let stake: Uint256 = sCap;
             if (cum + sCap >= amountIn) { stake = amountIn - cum; }
             if (HAS_CURVE && sKind === 1) {
@@ -1054,7 +1247,7 @@ function main(
                                     if (HAS_MENTO && sKind === 13) {
                                       mtinp[sIdx] = mtinp[sIdx] + stake;
                                       mtven[sIdx] = sVenue;
-                                      mtxid[sIdx] = sg[6];
+                                      mtxid[sIdx] = msAux[segCur];
                                     } else {
                                       // segKind 14 — Balancer V3 (balancer-v3-monorepo Vault + per-chain
                                       // Router): callback-free, executed below via querySwapSingleTokenExactIn
@@ -1327,7 +1520,7 @@ function main(
 
   // Curve StableSwap → poolType 3 (SwapPoolType.Curve) → _swapCurve → exchange(i, j, dx, 0).
   if (HAS_CURVE) {
-  for (let c = 0; c < segs.length; c = c + 1) {
+  for (let c = 0; c < MS_CAP; c = c + 1) {
     const camt: Uint256 = cinp[c];
     if (camt > 0) {
       const cpool: Address = cven[c];
@@ -1342,7 +1535,7 @@ function main(
   }
   // Trader Joe LB → poolType 6 (SwapPoolType.TraderJoeLB) → _swapTraderJoeLB → pair.swap(swapForY, to).
   if (HAS_LB) {
-  for (let l = 0; l < segs.length; l = l + 1) {
+  for (let l = 0; l < MS_CAP; l = l + 1) {
     const lamt: Uint256 = linp[l];
     if (lamt > 0) {
       const lpool: Address = lven[l];
@@ -1357,7 +1550,7 @@ function main(
   }
   // DODO V2 PMM → poolType 5 (SwapPoolType.DODOV2) → _swapDODOV2 → sellBase|sellQuote(to).
   if (HAS_DODO) {
-  for (let d = 0; d < segs.length; d = d + 1) {
+  for (let d = 0; d < MS_CAP; d = d + 1) {
     const damt: Uint256 = dinp[d];
     if (damt > 0) {
       const dpool: Address = dven[d];
@@ -1378,7 +1571,7 @@ function main(
   // slot (tokenIn==token0 ⇒ out is amount1Out; tokenIn==token1 ⇒ out is amount0Out). compute-then-
   // pull already transferred `cum` (incl. each stable share) into this contract above.
   if (HAS_SOLIDLY_STABLE) {
-  for (let q = 0; q < segs.length; q = q + 1) {
+  for (let q = 0; q < MS_CAP; q = q + 1) {
     const samt: Uint256 = sinp[q];
     if (samt > 0) {
       const spool: Address = sven[q];
@@ -1407,7 +1600,7 @@ function main(
   // this contract above, so the approved pull draws from this contract's balance and the out lands
   // here (to == address.self). fromToken/toToken == tokenIn/tokenOut (the swap's own tokens).
   if (HAS_WOMBAT) {
-  for (let w = 0; w < segs.length; w = w + 1) {
+  for (let w = 0; w < MS_CAP; w = w + 1) {
     const wamt: Uint256 = winp[w];
     if (wamt > 0) {
       const wpool: Address = wven[w];
@@ -1432,7 +1625,7 @@ function main(
   // above) and recipient == address.self. The poolKey is unused for poolType 4 (V4 only) — zeroed to
   // match the V2-path SwapParams shape.
   if (HAS_BALANCER) {
-  for (let b = 0; b < segs.length; b = b + 1) {
+  for (let b = 0; b < MS_CAP; b = b + 1) {
     const bamt: Uint256 = binp[b];
     if (bamt > 0) {
       const bpool: Address = bven[b];
@@ -1459,7 +1652,7 @@ function main(
   // award exceeds them — that aborts the WHOLE cook, there is NO graceful per-pool skip; only a
   // literal quote of 0 falls through and leaves the input un-spent for the terminal refund.
   if (HAS_EULER) {
-  for (let e = 0; e < segs.length; e = e + 1) {
+  for (let e = 0; e < MS_CAP; e = e + 1) {
     const eamt: Uint256 = einp[e];
     if (eamt > 0) {
       const epool: Address = even[e];
@@ -1496,7 +1689,7 @@ function main(
   // (buildMaverickSegments' maxInput cap) so the awarded Σ fills within the pool's depth (any un-consumed
   // input is returned by the guarded terminal refund below).
   if (HAS_MAVERICK) {
-  for (let m = 0; m < segs.length; m = m + 1) {
+  for (let m = 0; m < MS_CAP; m = m + 1) {
     const mamt: Uint256 = minp[m];
     if (mamt > 0) {
       const mpool: Address = mven[m];
@@ -1521,7 +1714,7 @@ function main(
   // trips). compute-then-pull already transferred `cum` (incl. each CryptoSwap share) into this
   // contract above, so the approved pull draws from this contract's balance and the out lands here.
   if (HAS_CRYPTO) {
-  for (let x = 0; x < segs.length; x = x + 1) {
+  for (let x = 0; x < MS_CAP; x = x + 1) {
     const cxamt: Uint256 = cryinp[x];
     if (cxamt > 0) {
       const cxpool: Address = cryven[x];
@@ -1549,7 +1742,7 @@ function main(
   // then-pull already transferred `cum` (incl. each WOOFi share) into this contract above, so the transfer
   // draws from this contract's balance and the out lands here (to == address.self; rebateTo == caller).
   if (HAS_WOOFI) {
-  for (let y = 0; y < segs.length; y = y + 1) {
+  for (let y = 0; y < MS_CAP; y = y + 1) {
     const wooamt: Uint256 = wooinp[y];
     if (wooamt > 0) {
       const woopool: Address = wooven[y];
@@ -1574,7 +1767,7 @@ function main(
   // compute-then-pull already transferred `cum` (incl. each Fermi share) into this contract above, so the
   // approved pull draws from this contract's balance and the out lands here (to == self).
   if (HAS_FERMI) {
-  for (let f = 0; f < segs.length; f = f + 1) {
+  for (let f = 0; f < MS_CAP; f = f + 1) {
     const feamt: Uint256 = feinp[f];
     if (feamt > 0) {
       const fepool: Address = feven[f];
@@ -1609,7 +1802,7 @@ function main(
   // from this contract's balance and the out lands here (to == self). DexT1 re-enters its OWN Liquidity
   // layer via operate(), never this cooking contract, so it is callback-free — no engine change.
   if (HAS_FLUID) {
-  for (let g = 0; g < segs.length; g = g + 1) {
+  for (let g = 0; g < MS_CAP; g = g + 1) {
     const flamt: Uint256 = flinp[g];
     if (flamt > 0) {
       const flpool: Address = flven[g];
@@ -1649,7 +1842,7 @@ function main(
   // == self). swapIn re-enters only the Reserve / stable-asset mint-burn, never this cooking contract, so it
   // is callback-free — no engine change.
   if (HAS_MENTO) {
-  for (let h = 0; h < segs.length; h = h + 1) {
+  for (let h = 0; h < MS_CAP; h = h + 1) {
     const mtamt: Uint256 = mtinp[h];
     if (mtamt > 0) {
       const mtprov: Address = mtven[h];
@@ -1687,7 +1880,7 @@ function main(
   // Empty `bytes` for the swap userData arg (the ABI `bytes` tail is a length-0 dynamic blob). Same idiom the
   // V2/Kyber callback-free path uses for pool.swap's empty data.
   const b3Empty: bytes = abi.encode(tokenIn).slice(0, 0);
-  for (let k = 0; k < segs.length; k = k + 1) {
+  for (let k = 0; k < MS_CAP; k = k + 1) {
     const b3amt: Uint256 = b3inp[k];
     if (b3amt > 0) {
       const b3pool: Address = b3ven[k];

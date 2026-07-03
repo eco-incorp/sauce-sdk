@@ -68,8 +68,8 @@ const E18 = 10n ** 18n;
 const ANCHOR = 1 << 23; // LB id of price 1.0
 const ENGINE_CELLS = engineCells();
 
-// LB-only run: zero direct pools/routes/netCache; the LB venues ride entirely inside routeSegs
-// (segKind 2). The solver's 5-arg integration signature, in index.ts order.
+// LB-only run: zero direct pools/routes/netCache; the LB venues ride entirely inside segs
+// (segKind 2). The solver's 6-arg integration signature, in index.ts order.
 function lbArgs(
   tokenIn: Hex,
   tokenOut: Hex,
@@ -77,10 +77,11 @@ function lbArgs(
   caller: Hex,
   segs: bigint[][],
 ): unknown[] {
-  // main(cfg, pools, netCache, routing, segs):
+  // main(cfg, pools, netCache, routing, segs, qlv):
   //   cfg   = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount] — bundled scalars
   //   pools = [] (no direct venue) ; netCache = [] ; routing = [] (no routes)
   //   segs  = the 6-col sampled-segment rows the bestKind===1 cursor consumes (segKind 2 = LB).
+  //   qlv   = [] (no QL Quote-Ladder descriptors — LB is a static sampled venue).
   return [
     [
       BigInt(tokenIn),
@@ -94,6 +95,7 @@ function lbArgs(
     [], // netCache
     [], // routing
     segs,
+    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
   ];
 }
 

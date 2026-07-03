@@ -51,6 +51,17 @@ export function bracketCapacity(L: bigint, sqrtNear: bigint, sqrtFar: bigint, fe
   return (effIn * FEE_DENOM) / BigInt(1_000_000 - feePpm);
 }
 
+/**
+ * QUOTE-LADDER slice head — fee-inclusive out/in sqrt-Q96 of one differenced slice:
+ * isqrt(floor(sliceOut·2^192 / capacity)). A Curve get_dy is POST-FEE, so no extra fee-adjust.
+ * Bit-for-bit with ecoswap.sauce.ts `qlSliceHead` (Math.sqrt(Math.mulDiv(sliceOut, Q192, capacity)))
+ * and curve-math.ts `qlSliceHead` — the single head op-order the solver/oracle/reference all share.
+ */
+export function qlSliceHead(sliceOut: bigint, capacity: bigint): bigint {
+  if (capacity <= 0n || sliceOut <= 0n) return 0n;
+  return isqrt(mulDiv(sliceOut, Q192, capacity));
+}
+
 /** Exact Uniswap V3 TickMath.getSqrtRatioAtTick (real token1/token0 sqrt, Q96). */
 export function getSqrtRatioAtTick(tick: number): bigint {
   const absTick = BigInt(tick < 0 ? -tick : tick);

@@ -249,8 +249,31 @@ function balancerV3RouterAddr(prepared: EcoSwapPrepared): bigint {
   return first ? BigInt(first.router) : 0n;
 }
 
-function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
+/**
+ * Build the QUOTE-LADDER (QL) venue DESCRIPTOR array — one row per QL venue (Curve StableSwap pilot):
+ *   qlv[v] = [poolAddr, i, j, feePpm, segKind, refIdx]
+ * NO sampled values — the solver builds each venue's price ladder ON-CHAIN in setup from LIVE
+ * cook-time get_dy (prepare-optional: prepare ships only the descriptor). `i`/`j` are the int128 coin
+ * indices; `feePpm` is informational (a Curve get_dy is post-fee, so the on-chain head needs no
+ * fee-adjust); `segKind` = 1 (Curve → the bestKind===1 cursor → engine swap(poolType:3) → _swapCurve);
+ * `refIdx` is the per-venue accumulator key (the on-chain `cinp[refIdx]`/`cven[refIdx]` slot, distinct
+ * per venue). Carried as a SEPARATE top-level compiler param so its reads stay at nesting depth ≤ 2.
+ */
+function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   const curves = prepared.curves ?? [];
+  return curves.map((c, refIdx) => [
+    BigInt(c.address),
+    BigInt(c.i),
+    BigInt(c.j),
+    BigInt(c.feePpm),
+    1n, // segKind = Curve
+    BigInt(refIdx),
+  ]);
+}
+
+function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
+  // NOTE: Curve is NOT read here — it is a QUOTE-LADDER (QL) venue (see buildQLVenues), built
+  // on-chain from live get_dy, so it ships no static sampled segments.
   const lbs = prepared.lbs ?? [];
   const dodos = prepared.dodos ?? [];
   const solidlyStables = prepared.solidlyStables ?? [];
@@ -267,7 +290,8 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   return prepared.brackets
     .filter(
       (b) =>
-        b.kind === EcoBracketKind.Curve ||
+        // Curve is NOT here: it is a QUOTE-LADDER (QL) venue built ON-CHAIN from live get_dy in the
+        // solver setup (see buildQLVenues) — prepare ships only the descriptor, no sampled segments.
         b.kind === EcoBracketKind.LB ||
         b.kind === EcoBracketKind.DODO ||
         b.kind === EcoBracketKind.SolidlyStable ||
@@ -289,7 +313,6 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       return a.refIdx - b.refIdx;
     })
     .map((b) => {
-      const isCurve = b.kind === EcoBracketKind.Curve;
       const isLb = b.kind === EcoBracketKind.LB;
       const isDodo = b.kind === EcoBracketKind.DODO;
       const isSolidly = b.kind === EcoBracketKind.SolidlyStable;
@@ -326,10 +349,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn (the V3 input is
       // PULLED via Permit2; the reentrancy is contained inside Balancer's Router+Vault, never the cooking
       // contract). The chain-wide Router is cfg[8].
-      const segKind = isCurve ? 1n : isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
-      const venue = isCurve
-        ? BigInt(curves[b.refIdx].address)
-        : isLb
+      // segKind 1 (Curve) is NOT produced here — Curve is a QL venue built on-chain (buildQLVenues).
+      const segKind = isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
+      const venue = isLb
           ? BigInt(lbs[b.refIdx].address)
           : isDodo
             ? BigInt(dodos[b.refIdx].address)
@@ -494,6 +516,7 @@ export async function ecoSwap(
 
   const { poolTuples, netCache, routing, directCount } = buildPoolUniverseAndRouting(prepared);
   const segs = buildSegs(prepared);
+  const qlv = buildQLVenues(prepared);
   const result = compile(jsSource, {
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
@@ -506,9 +529,10 @@ export async function ecoSwap(
     defines: protocolDefines(prepared),
     // cfg-bundle the SCALARS into ONE tuple (the lens's proven trick — keeps the scalar
     // count out of the arg-prologue SDUP window); the big nested tuples (pools/netCache/
-    // routing/segs) stay SEPARATE top-level params so pool/route/segment field reads stay
+    // routing/segs/qlv) stay SEPARATE top-level params so pool/route/segment field reads stay
     // at nesting depth ≤ 2 (folding them in => depth-3 read => v1 INDEX revert). `segs` is the
-    // sampled-segment venue stream (Curve/LB/DODO) the merge competes via bestKind===1.
+    // STATIC sampled-segment stream (the 13 not-yet-QL venues); `qlv` is the QUOTE-LADDER venue
+    // descriptors (Curve — built on-chain from live get_dy). Both feed the bestKind===1 cursor.
     args: [
       [
         BigInt(config.tokenIn),
@@ -526,6 +550,7 @@ export async function ecoSwap(
       netCache,
       routing,
       segs,
+      qlv,
     ],
   });
 
@@ -666,6 +691,7 @@ export async function quoteEcoSwap(
   const { poolTuples, netCache, routing, directCount } =
     buildPoolUniverseAndRouting(usePrepared);
   const segs = buildSegs(usePrepared);
+  const qlv = buildQLVenues(usePrepared);
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
@@ -690,6 +716,7 @@ export async function quoteEcoSwap(
       netCache,
       routing,
       segs,
+      qlv,
     ],
   });
   const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;

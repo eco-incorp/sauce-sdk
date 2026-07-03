@@ -82,6 +82,7 @@ function wombatArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, 
     [], // netCache
     [], // routing
     segs,
+    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
   ];
 }
 

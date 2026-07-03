@@ -289,6 +289,80 @@ export interface CurveSegment extends MergeSegment {
 /** Default sample count per Curve pool (M). Tunable; M≈16–32 tightens the grid bound. */
 export const CURVE_SAMPLES = Number(process.env.ECO_CURVE_SAMPLES ?? 24);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTE-LADDER (QL) — the LIVE-WALK Curve venue. The on-chain solver builds this
+// SAME ladder in setup from LIVE cook-time get_dy (no prepared segments — prepare
+// ships only the descriptor), so prepare is OPTIONAL (a cache only) and the oracle
+// mirrors it BIT-FOR-BIT here. These constants MUST equal ecoswap.sauce.ts's
+// QL_S / QL_SEED_DIV / QL_RN / QL_RD literals exactly or the split diverges by a wei.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** QL slice count per venue (the ladder depth). The prototype shows no accuracy gain above 8. */
+export const QL_S = 8;
+/** Geometric slice ratio numerator/denominator (r = 5/4 = 1.25 relative step). */
+export const QL_RN = 5n;
+export const QL_RD = 4n;
+/**
+ * Seed divisor: the first slice size AND the additive floor each step is `amountIn / QL_SEED_DIV`.
+ * Chosen so the geometric recurrence `xNext = cum*QL_RN/QL_RD + seed` (clamped at amountIn) REACHES
+ * amountIn within QL_S slices: cum after 8 slices = seed*4*((5/4)^8 - 1) ≈ 19.84·seed, so seed ≥
+ * amountIn/19.84 makes the clamp engage on the final slice ⇒ the ladder covers [0, amountIn] in full
+ * (a solo Curve venue can absorb the whole trade). 16 < 19.84, so coverage is guaranteed for any pool.
+ */
+export const QL_SEED_DIV = 16n;
+
+/**
+ * Fee-inclusive slice head in unified out/in sqrt-Q96: isqrt(floor(sliceOut·2^192 / capacity)).
+ * A Curve get_dy is already POST-FEE, so the head needs no extra fee-adjust. Bit-identical to the
+ * on-chain `qlSliceHead(sliceOut, capacity) = Math.sqrt(Math.mulDiv(sliceOut, Q192, capacity))` and
+ * to ecoswap.math.ts's copy.
+ */
+export function qlSliceHead(sliceOut: bigint, capacity: bigint): bigint {
+  if (capacity <= 0n || sliceOut <= 0n) return 0n;
+  return isqrt((sliceOut * Q192) / capacity);
+}
+
+/**
+ * Build one Curve pool's QUOTE-LADDER — the SAME geometric-slice live walk the on-chain solver
+ * builds in setup, replayed here through the bigint get_dy so the oracle/reference stay wei-exact
+ * with the solver by construction.
+ *
+ * For k in 0..QL_S-1: geometric cumulative input `xNext = cum*QL_RN/QL_RD + seed` (clamped at
+ * amountIn), slice capacity = xNext - cum, sliceOut = get_dy(xNext) - get_dy(cum) (differenced),
+ * head = qlSliceHead(sliceOut, capacity). STOP early on a zero-capacity clamp, a sentinel-0 quote,
+ * a zero slice-out, a non-DESCENDING head (non-convex guard — the merge needs a monotone stream),
+ * or reaching amountIn. Emits (capacity, effOut, marginalOI) segments in the same shape the
+ * static-segment cursor consumes — a Curve get_dy is post-fee so marginalOI IS the execution price.
+ */
+export function buildCurveQLLadder(pool: CurvePool, amountIn: bigint): CurveSegment[] {
+  if (amountIn <= 0n) return [];
+  let seed = amountIn / QL_SEED_DIV;
+  if (seed <= 0n) seed = 1n;
+  const segs: CurveSegment[] = [];
+  let cum = 0n;
+  let prevOut = 0n;
+  let prevHead = 0n;
+  for (let k = 0; k < QL_S; k++) {
+    let xNext = (cum * QL_RN) / QL_RD + seed;
+    if (xNext > amountIn) xNext = amountIn;
+    const capacity = xNext - cum;
+    if (capacity === 0n) break;
+    const q = getDy(pool, xNext);
+    if (q === 0n) break;
+    const effOut = q - prevOut;
+    if (effOut === 0n) break;
+    const marginalOI = qlSliceHead(effOut, capacity);
+    // Non-convex guard: a non-descending head ends the ladder here (mirrors the on-chain guard).
+    if (segs.length > 0 && marginalOI >= prevHead) break;
+    segs.push({ capacity, effOut, marginalOI });
+    prevHead = marginalOI;
+    cum = xNext;
+    prevOut = q;
+    if (xNext >= amountIn) break;
+  }
+  return segs;
+}
+
 /**
  * Sample a Curve pool into M descending-marginal segments over [0, amountIn].
  *

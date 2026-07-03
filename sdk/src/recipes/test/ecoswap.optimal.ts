@@ -61,7 +61,7 @@ import {
 // Curve / LB / DODO segment enumeration — the SINGLE source shared with prepare.ts
 // (buildCurve/Lb/DodoBrackets). The oracle enumerates the SAME segments from true live state, so
 // the split is exact-on-grid (EXACT for LB — a bin is a flat constant-sum slice).
-import { buildCurveSegments, type CurvePool } from "../shared/curve-math.js";
+import { buildCurveQLLadder, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
 import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
@@ -127,11 +127,11 @@ export interface OptimalPool {
 
   // ── Sampled-segment venue live state (Curve / LB / DODO) ──
   /**
-   * Curve StableSwap pool — when present this pool is a CURVE venue (NOT V2/V3). The oracle
-   * enumerates its segments via the SHARED bigint replay (buildCurveSegments) from the live
-   * invariant state, so the split is exact-on-grid vs prepare's segments (one replay). The
-   * marginal is post-fee (get_dy nets the fee), so it enters the descending-price merge directly.
-   * `isV2` is ignored when `curve` is set.
+   * Curve StableSwap pool — when present this pool is a QUOTE-LADDER (QL) venue (NOT V2/V3). The
+   * oracle builds its segments via the SHARED buildCurveQLLadder replay — the IDENTICAL geometric
+   * quote ladder the on-chain solver builds in setup from live get_dy — so the split is wei-exact vs
+   * the solver by construction (no prepared segments). The marginal is post-fee (get_dy nets the
+   * fee), so it enters the descending-price merge directly. `isV2` is ignored when `curve` is set.
    */
   curve?: CurvePool;
   /**
@@ -515,16 +515,16 @@ function v2Segments(p: OptimalPool, poolIdx: number): Segment[] {
 }
 
 /**
- * Enumerate one Curve StableSwap pool's segments via the SHARED bigint replay (buildCurveSegments)
- * from the live invariant state. The amountIn caps the sampled range — the same bound prepare uses
- * — so the oracle and prepare emit the IDENTICAL segment grid (single source), making the split
- * exact-on-grid. The Curve marginalOI is ALREADY the post-fee execution price (get_dy nets the
- * fee), so adjNear == adjFar == marginalOI: it enters the descending-price merge directly with no
- * extra fee-adjust multiply. Awarded as a "pool" venue (perPoolInput[poolIdx]).
+ * Enumerate one Curve StableSwap pool's segments via the QUOTE-LADDER live walk (buildCurveQLLadder)
+ * — the SAME geometric-slice ladder the on-chain solver builds in setup from live get_dy, replayed
+ * here through the shared bigint get_dy so the oracle and solver stay wei-exact BY CONSTRUCTION (no
+ * prepared segments — prepare ships only the descriptor). The Curve marginalOI is ALREADY the
+ * post-fee execution price (get_dy nets the fee), so adjNear == adjFar == marginalOI: it enters the
+ * descending-price merge directly with no extra fee-adjust multiply. Awarded as a "pool" venue.
  */
 function curveSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildCurveSegments(p.curve!, amountIn)) {
+  for (const s of buildCurveQLLadder(p.curve!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

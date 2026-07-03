@@ -131,6 +131,7 @@ function b3Args(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, rout
     [], // netCache
     [], // routing
     segs,
+    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
   ];
 }
 

@@ -40,9 +40,19 @@ import {
   routePartial2,
   routeEventN,
   routePartialN,
+  qlSliceHead,
   type RouteLeg,
 } from "./ecoswap.math";
 import { ecoSwapReference } from "./ecoswap.reference";
+import {
+  buildCurveQLLadder,
+  getDy,
+  QL_S,
+  QL_SEED_DIV,
+  QL_RN,
+  QL_RD,
+  type CurvePool,
+} from "../shared/curve-math";
 import { optimalSplit, type OptimalPool, type OptimalRoute } from "./ecoswap.optimal";
 import { EcoBracketKind, type EcoBracket, type EcoPool, type EcoSwapPrepared } from "../shared/types";
 import { SwapPoolType } from "../shared/constants";
@@ -3201,4 +3211,262 @@ describe("estimateExpectedOutput — merged-bracket partial fill prorates at wor
     assert.ok(est <= exact, "flat partial credit <= exact prorate (isqrt rounds down)");
     assertClose(est, exact, 10n, "flat partial credit ~= exact prorate");
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTE-LADDER (QL) — the Curve live-walk ladder math (known-answer, pure bigint).
+// qlSliceHead + buildCurveQLLadder are the SHARED source the on-chain solver mirrors
+// bit-for-bit; the EVM test (ecoswap.curve.evm.test.ts) proves the on-chain ladder
+// equals this replay to the wei on both engines.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap Curve QUOTE-LADDER math (qlSliceHead + buildCurveQLLadder)", () => {
+  const E18 = 10n ** 18n;
+  // A deep, mildly-imbalanced 2-coin StableSwap (the ecoswap.curve.evm SOLO fixture).
+  const pool: CurvePool = {
+    poolType: 3, address: "0x0000000000000000000000000000000000000C0f",
+    i: 0, j: 1, A: 1000n, aPrecision: 100n,
+    balances: [1_000_000n * E18, 1_200_000n * E18], rates: [E18, E18],
+    feePpm10: 4_000_000n, source: "unit",
+  };
+
+  it("qlSliceHead == isqrt(floor(sliceOut·2^192 / capacity)) on a vector", () => {
+    const cases: Array<[bigint, bigint]> = [
+      [1000n * E18, 1000n * E18],
+      [999n * E18, 1000n * E18],
+      [123456789n, 987654321n],
+      [1n, 1n],
+    ];
+    for (const [out, cap] of cases) {
+      assert.equal(qlSliceHead(out, cap), isqrt((out * Q192) / cap), `qlSliceHead(${out},${cap})`);
+    }
+    assert.equal(qlSliceHead(0n, 1000n), 0n, "zero out ⇒ 0");
+    assert.equal(qlSliceHead(1000n, 0n), 0n, "zero capacity ⇒ 0");
+  });
+
+  it("buildCurveQLLadder: geometric grid, full [0,amountIn] coverage, strictly-descending heads", () => {
+    const amountIn = 150_000n * E18;
+    const ladder = buildCurveQLLadder(pool, amountIn);
+    assert.ok(ladder.length > 0 && ladder.length <= QL_S, `1..${QL_S} slices (got ${ladder.length})`);
+    // Capacities telescope to EXACTLY amountIn (the clamp engages on the final slice, QL_SEED_DIV=16).
+    assert.equal(ladder.reduce((a, s) => a + s.capacity, 0n), amountIn, "Σ capacity == amountIn (full coverage)");
+    // Each slice: head == qlSliceHead(effOut, capacity), and heads strictly DESCEND (convex curve).
+    let prev = 0n;
+    for (let k = 0; k < ladder.length; k++) {
+      const s = ladder[k];
+      assert.equal(s.marginalOI, qlSliceHead(s.effOut, s.capacity), `slice ${k} head == qlSliceHead`);
+      if (k > 0) assert.ok(s.marginalOI < prev, `slice ${k} head strictly < previous (descending)`);
+      prev = s.marginalOI;
+    }
+  });
+
+  it("buildCurveQLLadder replays the geometric recurrence + get_dy differencing exactly", () => {
+    const amountIn = 150_000n * E18;
+    const ladder = buildCurveQLLadder(pool, amountIn);
+    // Reproduce the recurrence independently: xNext = cum*QL_RN/QL_RD + seed (clamp amountIn),
+    // capacity = xNext-cum, effOut = getDy(xNext) - getDy(cum).
+    let seed = amountIn / QL_SEED_DIV;
+    if (seed <= 0n) seed = 1n;
+    let cum = 0n, prevOut = 0n;
+    for (let k = 0; k < ladder.length; k++) {
+      let xNext = (cum * QL_RN) / QL_RD + seed;
+      if (xNext > amountIn) xNext = amountIn;
+      const cap = xNext - cum;
+      const out = getDy(pool, xNext);
+      assert.equal(ladder[k].capacity, cap, `slice ${k} capacity matches recurrence`);
+      assert.equal(ladder[k].effOut, out - prevOut, `slice ${k} effOut matches get_dy differencing`);
+      cum = xNext;
+      prevOut = out;
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTE-LADDER constants — the on-chain solver's ecoswap.sauce.ts literals MUST equal
+// the curve-math.ts exports the oracle/reference read (or the split diverges by a wei),
+// and the geometric recurrence MUST reach amountIn within QL_S slices (solo-venue full
+// coverage). This DIRECTLY guards a future QL_RN/QL_RD/QL_S tune that forgets to re-derive
+// QL_SEED_DIV — the reviewer's "no compile-time equality assertion" gap.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap QUOTE-LADDER constants — sauce.ts literals == curve-math exports + coverage", () => {
+  const SOLVER_SRC = readFileSync(join(__dirname, "..", "ecoswap", "ecoswap.sauce.ts"), "utf-8");
+  const solverLiteral = (name: string): bigint => {
+    const m = SOLVER_SRC.match(new RegExp(`const ${name}: Uint256 = (\\d+);`));
+    assert.ok(m, `ecoswap.sauce.ts declares \`const ${name}: Uint256 = <n>;\``);
+    return BigInt(m![1]);
+  };
+
+  it("QL_S / QL_RN / QL_RD / QL_SEED_DIV literals match the curve-math.ts exports", () => {
+    assert.equal(solverLiteral("QL_S"), BigInt(QL_S), "QL_S");
+    assert.equal(solverLiteral("QL_RN"), QL_RN, "QL_RN");
+    assert.equal(solverLiteral("QL_RD"), QL_RD, "QL_RD");
+    assert.equal(solverLiteral("QL_SEED_DIV"), QL_SEED_DIV, "QL_SEED_DIV");
+  });
+
+  it("the geometric recurrence reaches amountIn within QL_S slices (constants-only, no get_dy)", () => {
+    // cum_{k+1} = cum_k*QL_RN/QL_RD + seed, seed = amountIn/QL_SEED_DIV. The clamp MUST engage on or
+    // before slice QL_S-1 (cum after QL_S slices ≈ seed·4·((5/4)^8-1) ≈ 19.84·seed ⇒ need SEED_DIV<19.84).
+    // If a constant tune breaks this, a SOLO QL venue would under-fill (ladder stops before amountIn).
+    const amountIn = 1_000_000n * 10n ** 18n;
+    let seed = amountIn / QL_SEED_DIV;
+    if (seed <= 0n) seed = 1n;
+    let cum = 0n;
+    let reached = false;
+    for (let k = 0; k < QL_S; k++) {
+      let xNext = (cum * QL_RN) / QL_RD + seed;
+      if (xNext >= amountIn) { reached = true; xNext = amountIn; }
+      cum = xNext;
+    }
+    assert.ok(reached, `cum must reach amountIn within QL_S=${QL_S} slices (QL_SEED_DIV=${QL_SEED_DIV} too large?)`);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTE-LADDER split OPTIMALITY — an INDEPENDENT check that the S=8 geometric ladder
+// approximates the true continuous water-fill optimum (not just that solver==oracle, which
+// is codegen-equivalence). Reproduces scratchpad/ql-curve.mjs: build the Curve ladder via the
+// SHARED buildCurveQLLadder, compete it against a V2 competitor (a geometric ladder over the
+// exact constant-product quote — the SAME recurrence, verified to reproduce buildCurveQLLadder
+// bit-for-bit), water-fill by descending head, then compare the realized total output to the
+// ternary-search continuous optimum. A systematically-suboptimal ladder (bad ratio / S /
+// SEED_DIV) would blow the per-scenario ppm bounds. Pure bigint, no network.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap Curve QUOTE-LADDER split optimality (vs continuous water-fill optimum)", () => {
+  const E18 = 10n ** 18n;
+
+  interface QLSlice {
+    capacity: bigint;
+    effOut: bigint;
+    marginalOI: bigint;
+  }
+
+  // Post-fee constant-product output for `dx` (the V2 competitor's exact quote view).
+  function v2Out(rIn: bigint, rOut: bigint, feePpm: bigint, dx: bigint): bigint {
+    if (dx <= 0n) return 0n;
+    const amtInWithFee = dx * (1_000_000n - feePpm);
+    return (amtInWithFee * rOut) / (rIn * 1_000_000n + amtInWithFee);
+  }
+
+  // Generic geometric ladder over ANY cumulative quote fn — mirrors buildCurveQLLadder's recurrence,
+  // differencing and stop conditions EXACTLY (asserted below to reproduce it bit-for-bit on Curve).
+  function geomLadder(quote: (dx: bigint) => bigint, amountIn: bigint): QLSlice[] {
+    if (amountIn <= 0n) return [];
+    let seed = amountIn / QL_SEED_DIV;
+    if (seed <= 0n) seed = 1n;
+    const segs: QLSlice[] = [];
+    let cum = 0n;
+    let prevOut = 0n;
+    let prevHead = 0n;
+    for (let k = 0; k < QL_S; k++) {
+      let xNext = (cum * QL_RN) / QL_RD + seed;
+      if (xNext > amountIn) xNext = amountIn;
+      const capacity = xNext - cum;
+      if (capacity === 0n) break;
+      const q = quote(xNext);
+      if (q === 0n) break;
+      const effOut = q - prevOut;
+      if (effOut === 0n) break;
+      const marginalOI = qlSliceHead(effOut, capacity);
+      if (segs.length > 0 && marginalOI >= prevHead) break;
+      segs.push({ capacity, effOut, marginalOI });
+      prevHead = marginalOI;
+      cum = xNext;
+      prevOut = q;
+      if (xNext >= amountIn) break;
+    }
+    return segs;
+  }
+
+  // Water-fill: two descending-head ladders, take the higher-head next slice each step (clamp the
+  // last slice to the remaining budget). Returns per-venue awarded input.
+  function qlMerge(cL: QLSlice[], vL: QLSlice[], amountIn: bigint): { curveIn: bigint; v2In: bigint } {
+    let ci = 0;
+    let vi = 0;
+    let curveIn = 0n;
+    let v2In = 0n;
+    let filled = 0n;
+    while (filled < amountIn) {
+      const ch = ci < cL.length ? cL[ci].marginalOI : 0n;
+      const vh = vi < vL.length ? vL[vi].marginalOI : 0n;
+      if (ch === 0n && vh === 0n) break;
+      const takeCurve = ch >= vh;
+      let cap = takeCurve ? cL[ci].capacity : vL[vi].capacity;
+      if (filled + cap > amountIn) cap = amountIn - filled;
+      if (takeCurve) { curveIn += cap; ci++; } else { v2In += cap; vi++; }
+      filled += cap;
+    }
+    return { curveIn, v2In };
+  }
+
+  // True continuous optimum: ternary search on the Curve allocation a ∈ [0, amountIn] maximizing
+  // getDy(curve,a) + v2Out(amountIn-a) (both venues concave ⇒ total concave), refined 1-wei exact.
+  function optimum(cq: (a: bigint) => bigint, vq: (a: bigint) => bigint, amountIn: bigint): bigint {
+    let lo = 0n;
+    let hi = amountIn;
+    const f = (a: bigint): bigint => cq(a) + vq(amountIn - a);
+    while (hi - lo > 2n) {
+      const m1 = lo + (hi - lo) / 3n;
+      const m2 = hi - (hi - lo) / 3n;
+      if (f(m1) < f(m2)) lo = m1; else hi = m2;
+    }
+    let bestT = -1n;
+    for (let a = lo; a <= hi; a++) { const t = f(a); if (t > bestT) bestT = t; }
+    return bestT;
+  }
+
+  const mkCurve = (b0: bigint, b1: bigint, A: bigint, fee: bigint): CurvePool => ({
+    poolType: 3, address: "0x0000000000000000000000000000000000000C0f", i: 0, j: 1, A, aPrecision: 100n,
+    balances: [b0, b1], rates: [E18, E18], feePpm10: fee, source: "unit",
+  });
+
+  // Scenarios from scratchpad/ql-curve.mjs. `maxPpm` is the shortfall ceiling — tuned just above the
+  // MEASURED shortfall of the shipped S=8/SEED_DIV=16 ladder (0 / 0 / 13 / 0 / 355 ppm respectively),
+  // so a systematically-worse ladder (a coarser ratio / smaller S / larger SEED_DIV) fails. Scenario E
+  // is the deep-off-peg 50%-depth stress where an 8-slice ladder is necessarily coarsest.
+  const scenarios: Array<{
+    label: string; curve: CurvePool; rIn: bigint; rOut: bigint; feePpm: bigint; amountIn: bigint; maxPpm: bigint;
+  }> = [
+    { label: "A 100k balanced", curve: mkCurve(10_000_000n * E18, 10_000_000n * E18, 200n, 4_000_000n), rIn: 5_000_000n * E18, rOut: 5_000_000n * E18, feePpm: 3000n, amountIn: 100_000n * E18, maxPpm: 5n },
+    { label: "B 2M off-peg", curve: mkCurve(10_000_000n * E18, 10_000_000n * E18, 200n, 4_000_000n), rIn: 5_000_000n * E18, rOut: 5_000_000n * E18, feePpm: 3000n, amountIn: 2_000_000n * E18, maxPpm: 5n },
+    { label: "C 500k imbalanced A=100", curve: mkCurve(12_000_000n * E18, 8_000_000n * E18, 100n, 4_000_000n), rIn: 3_000_000n * E18, rOut: 3_000_000n * E18, feePpm: 3000n, amountIn: 500_000n * E18, maxPpm: 50n },
+    { label: "D 10k small", curve: mkCurve(10_000_000n * E18, 10_000_000n * E18, 200n, 4_000_000n), rIn: 2_000_000n * E18, rOut: 2_000_000n * E18, feePpm: 3000n, amountIn: 10_000n * E18, maxPpm: 5n },
+    { label: "E 5M deep off-peg A=50", curve: mkCurve(10_000_000n * E18, 10_000_000n * E18, 50n, 4_000_000n), rIn: 8_000_000n * E18, rOut: 8_000_000n * E18, feePpm: 3000n, amountIn: 5_000_000n * E18, maxPpm: 500n },
+  ];
+
+  it("geomLadder reproduces buildCurveQLLadder bit-for-bit (the competitor builder is trustworthy)", () => {
+    for (const sc of scenarios) {
+      const a = buildCurveQLLadder(sc.curve, sc.amountIn);
+      const b = geomLadder((dx) => getDy(sc.curve, dx), sc.amountIn);
+      assert.equal(b.length, a.length, `${sc.label}: same slice count`);
+      for (let k = 0; k < a.length; k++) {
+        assert.equal(b[k].capacity, a[k].capacity, `${sc.label} slice ${k}: capacity`);
+        assert.equal(b[k].effOut, a[k].effOut, `${sc.label} slice ${k}: effOut`);
+        assert.equal(b[k].marginalOI, a[k].marginalOI, `${sc.label} slice ${k}: head`);
+      }
+    }
+  });
+
+  for (const sc of scenarios) {
+    it(`${sc.label}: S=${QL_S} ladder split is within ${sc.maxPpm} ppm of the continuous optimum`, () => {
+      const cq = (a: bigint): bigint => getDy(sc.curve, a);
+      const vq = (a: bigint): bigint => v2Out(sc.rIn, sc.rOut, sc.feePpm, a);
+      const cL = buildCurveQLLadder(sc.curve, sc.amountIn);
+      const vL = geomLadder(vq, sc.amountIn);
+      // Ladders must be strictly descending (the merge relies on it) and cap at QL_S slices.
+      for (const L of [cL, vL]) {
+        assert.ok(L.length > 0 && L.length <= QL_S, `${sc.label}: 1..${QL_S} slices`);
+        for (let k = 1; k < L.length; k++) assert.ok(L[k].marginalOI < L[k - 1].marginalOI, "strictly descending heads");
+      }
+      const { curveIn, v2In } = qlMerge(cL, vL, sc.amountIn);
+      assert.equal(curveIn + v2In, sc.amountIn, `${sc.label}: split covers amountIn exactly`);
+      const qlTotal = cq(curveIn) + vq(v2In);
+      const opt = optimum(cq, vq, sc.amountIn);
+      assert.ok(qlTotal > 0n, "positive realized output");
+      // shortfall vs optimum (>= -rounding). The QL split can never strictly beat the true optimum.
+      const shortPpm = opt > 0n ? ((opt - qlTotal) * 1_000_000n) / opt : 0n;
+      assert.ok(
+        shortPpm <= sc.maxPpm,
+        `${sc.label}: QL total ${qlTotal} is ${shortPpm} ppm below optimum ${opt} (bound ${sc.maxPpm} ppm)`,
+      );
+    });
+  }
 });

@@ -63,8 +63,8 @@ const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 const ONE = DODO_ONE;
 const ENGINE_CELLS = engineCells();
 
-// DODO-only run: zero direct pools/routes/netCache; the DODO venues ride entirely inside routeSegs
-// (segKind 3). The solver's 9 compiler args, in index.ts order.
+// DODO-only run: zero direct pools/routes/netCache; the DODO venues ride entirely inside segs
+// (segKind 3). The solver's 6 compiler args, in index.ts order.
 function dodoArgs(
   tokenIn: Hex,
   tokenOut: Hex,
@@ -72,10 +72,11 @@ function dodoArgs(
   caller: Hex,
   segs: bigint[][],
 ): unknown[] {
-  // The integration (multihop) solver signature is main(cfg, pools, netCache, routing, segs):
+  // The integration (multihop) solver signature is main(cfg, pools, netCache, routing, segs, qlv):
   //   cfg   = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount] — bundled scalars
   //   pools = [] (no direct venue) ; netCache = [] ; routing = [] (no routes)
   //   segs  = the 6-col sampled-segment rows the bestKind===1 cursor consumes (segKind 3 = DODO).
+  //   qlv   = [] (no QL Quote-Ladder descriptors — DODO is a static sampled venue).
   return [
     [
       BigInt(tokenIn),
@@ -89,6 +90,7 @@ function dodoArgs(
     [], // netCache
     [], // routing
     segs,
+    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
   ];
 }
 

@@ -1086,16 +1086,21 @@ export async function prepareEcoSwap(
   // per venue through the engine swap (poolType 3 Curve / 6 LB / 5 DODO).
   const brackets: EcoBracket[] = [];
 
+  // Curve is a QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from
+  // LIVE get_dy (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the descriptor
+  // (address + coin indices i,j + fee) — NO off-chain sampled segments. buildCurveBrackets is still
+  // called as a pure LIVENESS PROBE (a pool that quotes no valid segment is dropped), but its brackets
+  // are NOT pushed to the segment stream. This is the prepare-optional win: the descriptor alone
+  // drives the on-chain ladder, and a zero-cache quote (no prepared brackets) still walks it live.
   const curves: EcoCurve[] = [];
-  const curveBracketSets: EcoBracket[][] = [];
   const curveRegistries = poolConfig.factories.filter(
     (f) => f.factoryType === FactoryType.CurveRegistry,
   );
   if (curveRegistries.length > 0) {
     const curveRaw = await discoverCurvePoolsTyped(tokenIn, tokenOut, client, curveRegistries);
     for (const c of curveRaw) {
-      const refIdx = curves.length;
-      const cb = buildCurveBrackets(c, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
+      const cb = buildCurveBrackets(c, curves.length, amountIn);
       if (cb.length === 0) continue;
       curves.push({
         address: c.address,
@@ -1104,10 +1109,8 @@ export async function prepareEcoSwap(
         feePpm: curveFeeToPpm(c.feePpm10),
         source: `${c.source} (Curve)`,
       });
-      curveBracketSets.push(cb);
     }
   }
-  for (const set of curveBracketSets) brackets.push(...set);
 
   const lbs: EcoLb[] = [];
   const lbBracketSets: EcoBracket[][] = [];
@@ -1710,7 +1713,8 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
-  const nCurveSegs = brackets.filter((b) => b.kind === EcoBracketKind.Curve).length;
+  // Curve ships as QL (Quote-Ladder) DESCRIPTORS (curves.length), NOT sampled segments — the on-chain
+  // solver builds its ladder live from get_dy — so it is reported below as "Curve QL", not a seg count.
   const nLbSegs = brackets.filter((b) => b.kind === EcoBracketKind.LB).length;
   const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
   const nSolidlySegs = brackets.filter((b) => b.kind === EcoBracketKind.SolidlyStable).length;
@@ -1728,7 +1732,7 @@ export async function prepareEcoSwap(
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
       `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
-      `(all pools walked live), ${brackets.length} sampled segments (${nCurveSegs} Curve, ${nLbSegs} LB, ` +
+      `(all pools walked live), ${curves.length} Curve QL, ${brackets.length} sampled segments (${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
       `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi, ` +
       `${nFluidSegs} Fluid, ${nMentoSegs} Mento, ${nBalancerV3Segs} Balancer-V3)`,

@@ -109,6 +109,7 @@ function fermiArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, s
     [], // netCache
     [], // routing
     segs,
+    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
   ];
 }
 
