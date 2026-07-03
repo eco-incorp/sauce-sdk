@@ -77,6 +77,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -184,6 +185,12 @@ export interface EulerSwapPool {
   feeWad: bigint;
   /** Vault input cap (from getLimits — supplyVault.maxDeposit + borrow debt). Bounds the sampler. 0 ⇒ uncapped. */
   inLimit: bigint;
+  /**
+   * Vault OUTPUT cap (from getLimits — the available-cash the pool can pay out). On-chain computeQuote
+   * REVERTS (SwapLimitExceeded)/returns 0 once the quoted out exceeds it, so the QL ladder self-truncates
+   * there; the oracle mirrors that with this bound (see buildEulerSwapQLLadder). 0/undefined ⇒ uncapped.
+   */
+  outLimit?: bigint;
   /** Rounded ppm fee (the price-ordering coordinate / diagnostic). */
   feePpm: number;
   /** Discovery source label. */
@@ -362,4 +369,31 @@ export function buildEulerSwapSegments(
     prevOut = out;
   }
   return segs;
+}
+
+/**
+ * Build one EulerSwap pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the closed-form `computeQuote` bigint replay, so the oracle stays wei-exact
+ * with the on-chain solver BY CONSTRUCTION: the fixture / real pool `computeQuote(tokenIn,tokenOut,xNext,
+ * true)` view mirrors this replay bit-for-bit (see EulerSwapPool.sol + ecoswap.math.ts), so the ladder
+ * reproduces the solver's live `computeQuote` at every geometric step. The quote is post-fee (computeQuote
+ * nets the fee) so marginalOI IS the execution price; adjNear == adjFar == marginalOI (no prepared segments —
+ * prepare ships only the descriptor).
+ *
+ * VAULT-CAP SELF-TRUNCATION. On-chain, `computeQuote` REVERTS (SwapLimitExceeded/Expired) — or, for the
+ * fixture, returns 0 — once xNext exceeds the LIVE vault inLimit or the quoted out exceeds the outLimit; the
+ * solver's probe-then-decode catches that (q=0 ⇒ stop), so the ladder self-truncates at the live cap with NO
+ * separate getLimits call. This mirrors that off-chain: a `dx` past `inLimit`, or an `out` past `outLimit`,
+ * returns 0 ⇒ `buildQLLadder` stops at the SAME point the on-chain ladder does ⇒ oracle == solver even when
+ * the trade crosses the cap. 0/undefined limits ⇒ uncapped (the deep-pool / test path).
+ */
+export function buildEulerSwapQLLadder(pool: EulerSwapPool, amountIn: bigint): EulerSwapSegment[] {
+  const inCap = pool.inLimit > 0n ? pool.inLimit : 0n;
+  const outCap = pool.outLimit && pool.outLimit > 0n ? pool.outLimit : 0n;
+  return buildQLLadder((dx) => {
+    if (inCap > 0n && dx > inCap) return 0n;
+    const out = computeQuote(pool, dx);
+    if (outCap > 0n && out > outCap) return 0n;
+    return out;
+  }, amountIn);
 }

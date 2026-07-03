@@ -41,9 +41,9 @@
  *       == captured, and computeQuote reproduces the captured probe ladder to the WEI.
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
  *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts optimalSplit,
- *       seeded from the captured curve params via the SHARED buildEulerSwapSegments — the identical grid
- *       discoverEulerSwapPoolsTyped samples) == the REAL pool's OWN pre-swap computeQuote view of the awarded
- *       slice, all to the wei. spent == the awarded Σ is asserted explicitly.
+ *       which replays the IDENTICAL QL ladder via the SHARED buildEulerSwapQLLadder — the same live
+ *       computeQuote geometric ladder the on-chain solver walks) == the REAL pool's OWN pre-swap computeQuote
+ *       view of the awarded slice, all to the wei. spent == the awarded Σ is asserted explicitly.
  *
  * HONEST fidelity — FULL-REAL-CODE, NO STUB/SHIM: every contract in the swap path (pool, EulerSwap impl,
  * EVC, both EVaults + all EVK module impls, the EulerRouter oracle + its two ChainlinkOracle adapters +
@@ -56,11 +56,14 @@
  * quoteExactInput delegates to it, and the view IS the swap math EulerSwap.swap enforces), so received ==
  * computeQuote(awarded Σ) to the wei.
  *
- * EULERSWAP IS A SAMPLED-SEGMENT VENUE (like DODO / Wombat): buildEulerSwapSegments samples the f/fInverse
- * curve on a squared-index geometric grid capped at min(amountIn, inLimit), and the strictly-descending
- * guard drops the final near-saturation slice — so the awarded Σ is the grid's covered capacity, a small
- * documented tail below amountIn, NOT the full amountIn. The engine's static-segment cursor consumes the
- * IDENTICAL grid, so spent == the oracle's awarded Σ to the wei (the correct exact-on-grid property).
+ * EULERSWAP IS A QUOTE-LADDER (QL) VENUE (like Curve / DODO / Wombat / Fermi): prepare ships ONLY the
+ * descriptor and the on-chain solver builds each venue's price ladder in setup from LIVE computeQuote
+ * staticcalls (probe-then-decode; the view REVERTS/returns 0 past the live vault cap, so the ladder self-
+ * truncates at the live cap). The neutral oracle replays the IDENTICAL geometric ladder off-chain via the
+ * closed-form buildEulerSwapQLLadder — and this test proves the closed-form computeQuote == the REAL etched
+ * computeQuote at every ladder point (below), so the on-chain ladder == the oracle to the wei. At this
+ * well-within-cap sizing the geometric ladder covers [0, amountIn], so spent == the oracle's awarded Σ ==
+ * amountIn to the wei (single deep venue, full-fill).
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the artifacts are
  * absent). No state cache — etch+setStorage is a few seconds.
@@ -71,7 +74,14 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Account, type Hex } from "viem";
+import {
+  parseAbi,
+  encodeFunctionData,
+  decodeFunctionResult,
+  type Abi,
+  type Account,
+  type Hex,
+} from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -104,7 +114,8 @@ import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/const
 import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
-import { computeQuote, buildEulerSwapSegments, eulerFeeToPpm, type EulerSwapPool } from "../shared/eulerswap-math";
+import { computeQuote, buildEulerSwapQLLadder, eulerFeeToPpm, type EulerSwapPool } from "../shared/eulerswap-math";
+import { qlLadderInputs } from "../shared/curve-math";
 
 const SNAP_NAME = "ethereum-eulerv1-USDCUSDT";
 const ENGINE_CELLS = engineCells();
@@ -174,11 +185,30 @@ describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL byt
     })) as bigint;
   }
 
+  // A read-only cook (eth_call) of the swap bytecodes — builds the QL ladder LIVE and returns the total out
+  // WITHOUT landing the swap. Per-engine return decode: v1 wraps the cook return in a bytes envelope
+  // (simulate/decodeFunctionResult), v12 returns it verbatim; the last 32 bytes are the total out uint.
+  const cookCallAbi = parseAbi(["function cook(bytes[] ingredients) payable returns (bytes returnData)"]);
+  async function zeroCacheQuote(target: Hex, caller: Hex, bytecodes: readonly Hex[], engine: Engine): Promise<bigint> {
+    const data = encodeFunctionData({ abi: cookCallAbi as Abi, functionName: "cook", args: [bytecodes] });
+    const { data: ret } = await c.publicClient.call({ account: caller, to: target, data, gas: 2_000_000_000n });
+    if (!ret || ret === "0x") return 0n;
+    if (engine === "v1") {
+      const blob = decodeFunctionResult({ abi: cookCallAbi as Abi, functionName: "cook", data: ret as Hex }) as unknown as Hex;
+      const hex = blob.slice(2);
+      return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+    }
+    const hex = (ret as Hex).slice(2);
+    return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+  }
+
   /** The neutral oracle's EulerSwapPool descriptor, built from the CAPTURED V1 params + live reserves,
-   *  oriented for tokenIn == asset0 (the captured direction). The oracle segments this via the SHARED
-   *  buildEulerSwapSegments — the IDENTICAL closed-form f/fInverse replay discoverEulerSwapPoolsTyped uses
-   *  — so the split is exact-on-grid vs the oracle by construction, and the off-chain computeQuote replay
-   *  reproduces the pool's on-chain computeQuote to the wei (proven below + in ecoswap.math.ts). */
+   *  oriented for tokenIn == asset0 (the captured direction). The oracle walks this via the SHARED
+   *  buildEulerSwapQLLadder — the IDENTICAL geometric QL ladder the solver builds on-chain from live
+   *  computeQuote (replayed through the closed-form f/fInverse computeQuote, which reproduces the pool's
+   *  on-chain computeQuote to the wei — proven below + in ecoswap.math.ts) — so the split is wei-exact vs
+   *  the solver by construction. `outLimit` mirrors the captured vault output cap so the ladder self-
+   *  truncates at the SAME point the on-chain computeQuote would (a no-op at this well-within-cap sizing). */
   function offPool(state: EulerV1StateSnapshot): EulerSwapPool {
     const p = state.params;
     const inIsToken0 = state.isAsset0In; // true for this pool (tokenIn == asset0 == USDC)
@@ -204,6 +234,7 @@ describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL byt
       concOut: inIsToken0 ? cy : cx,
       feeWad,
       inLimit: BigInt(state.getLimits.inLimit),
+      outLimit: BigInt(state.getLimits.outLimit), // vault output cap — QL self-truncation bound (mirrors on-chain)
       feePpm: eulerFeeToPpm(feeWad), // round-half-up — THE SINGLE SOURCE discovery uses (matches the descriptor)
       source: "prod-mirror",
     };
@@ -329,17 +360,29 @@ describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL byt
     );
     assert.equal(prepared.eulerSwaps![0].inIsToken0, true, "discovery oriented the venue as inIsToken0 (tokenIn == asset0)");
     assert.ok(prepared.eulerSwaps![0].source.includes("v1"), `the discovered venue is tagged v1 (${prepared.eulerSwaps![0].source})`);
-    assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.EulerSwap),
-      "EulerSwap segments present",
+    // EulerSwap is a QUOTE-LADDER venue now: prepare ships ONLY the descriptor (in prepared.eulerSwaps), NO
+    // static sampled brackets — index.ts buildQLVenues emits the segKind-7 descriptor + buildSegs drops Euler.
+    assert.equal(
+      (prepared.brackets ?? []).filter((b) => b.kind === EcoBracketKind.EulerSwap).length,
+      0,
+      "EulerSwap ships NO static brackets (QL descriptor-only)",
     );
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one EulerSwap venue seeded from the CAPTURED curve params via
-    // the SHARED buildEulerSwapSegments (the identical grid discoverEulerSwapPoolsTyped sampled). Pure
-    // off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the engine's
-    // static-segment cursor consumes the IDENTICAL grid, so on-chain spent == oracle.totalInput to the wei.
+    // THE ON-CHAIN QL LADDER == THE REAL ETCHED computeQuote at the S geometric ladder points. The solver
+    // builds its ladder by staticcalling the REAL pool computeQuote at exactly these xNext values, and the
+    // oracle replays the closed-form computeQuote at the same points — so proving the etched view matches the
+    // closed-form replay at every ladder point ties the on-chain ladder to the oracle to the wei.
     const op = offPool(snaps.state);
-    assert.ok(buildEulerSwapSegments(op, amountIn).length > 0, "non-empty EulerSwap segment ladder from the captured params");
+    for (const xNext of qlLadderInputs(amountIn)) {
+      const onView = await onQuote(xNext);
+      assert.equal(computeQuote(op, xNext), onView, `QL ladder point: closed-form computeQuote(${xNext}) == REAL etched computeQuote (wei-exact)`);
+    }
+
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one QL EulerSwap venue seeded from the CAPTURED curve params via
+    // the SHARED buildEulerSwapQLLadder (the identical geometric ladder the solver builds on-chain from live
+    // computeQuote). Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the
+    // solver walks the IDENTICAL live ladder, so on-chain spent == oracle.totalInput to the wei.
+    assert.ok(buildEulerSwapQLLadder(op, amountIn).length > 0, "non-empty QL EulerSwap ladder from the captured params");
     const optPools: OptimalPool[] = [{ eulerSwap: op, feePpm: op.feePpm }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
     const awarded = oracle.perPoolInput[0] ?? 0n;
@@ -349,6 +392,13 @@ describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL byt
     // ground truth for the executed dy of the awarded slice (the periphery quoteExactInput delegates to
     // this view, and the view IS the swap math). The block clock is PINNED (oracle stays fresh).
     const onViewAwarded = await onQuote(awarded);
+
+    // ZERO-CACHE QUOTE — a read-only cook (eth_call) of the SAME bytecodes builds the QL ladder LIVE against
+    // the REAL etched graph with NO prepared segments (prepare shipped descriptor-only) and returns the total
+    // out; it must equal the pre-swap computeQuote(awarded) view to the wei. Proves the ladder is built live
+    // in the read call (no static segment cache).
+    const quoted = await zeroCacheQuote(target, caller, bytecodes, engine);
+    assert.equal(quoted, onViewAwarded, "zero-cache QUOTE == pre-swap computeQuote(awarded) to the wei (ladder built live in the eth_call)");
 
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
@@ -370,12 +420,12 @@ describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL byt
     assert.equal(vaultIn, spent, "REAL EulerSwap vault0 netted the FULL input (fee is folded into the output quote)");
 
     // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance. EulerSwap is a
-    // SAMPLED-SEGMENT venue (like DODO/Wombat), but at this sizing (well left of the output-reserve
-    // saturation) the M=24 grid covers [0, amountIn] with monotone-descending marginals, so the merge awards
-    // the WHOLE amountIn — spent == oracle awarded Σ == oracle.totalInput == amountIn to the WEI.
-    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
-    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
-    assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (grid covers [0, amountIn], one deep venue)");
+    // QUOTE-LADDER venue (like Curve/DODO/Wombat/Fermi), but at this sizing (well left of the output-reserve
+    // saturation) the geometric QL ladder covers [0, amountIn] with monotone-descending marginals, so the
+    // merge awards the WHOLE amountIn — spent == oracle awarded Σ == oracle.totalInput == amountIn to the WEI.
+    assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact)");
+    assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact)");
+    assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (QL ladder covers [0, amountIn], one deep venue)");
 
     // The caller-received tokenOut == the neutral-oracle computeQuote(spent) == the REAL pool's OWN pre-swap
     // computeQuote(awarded Σ) view, all to the WEI. NO tolerance. The three-way agreement (TS oracle replay

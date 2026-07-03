@@ -1,45 +1,40 @@
 /**
- * EcoSwap EulerSwap (Euler vault-backed AMM) local-EVM integration — the callback-free exact-in-dy gate.
+ * EcoSwap EulerSwap (Euler vault-backed AMM, v1+v2) QUOTE-LADDER (QL) local-EVM integration — the live-walk
+ * computeQuote ladder + the callback-free exact-in-dy gate + the vault-cap self-truncation.
  *
- * Covers BOTH EulerSwap versions (v1 + v2 coexist, like Uni V2/V3/V4): the shared curve math + the exec
- * surface (computeQuote/getAssets/swap) are version-agnostic; only DISCOVERY differs (v1 reads
- * curve()+getParams() with a single fee, v2 reads getDynamicParams() with directional fee0/fee1). The
- * fixture exposes both surfaces and defaults to v1 (the shape every real deployed pool exposes), so the
- * cook cells below run on v1 pools; two dedicated discovery cells prove the curve()-discriminated v1 AND
- * v2 detection paths against the deployed fixture.
+ * EulerSwap is migrated to the QUOTE-LADDER framework (the same one Curve / LB / WOOFi / DODO / Wombat /
+ * Fermi use): prepare ships ONLY a descriptor [pool, _, _, feePpm, segKind=7, refIdx] — NO off-chain sampled
+ * segments — and the on-chain solver BUILDS each EulerSwap venue's price ladder in setup from LIVE cook-time
+ * `computeQuote(tokenIn, tokenOut, xNext, true)` (the exact-in dy; PROBE-THEN-DECODE, since computeQuote
+ * REVERTS SwapLimitExceeded/Expired past the live vault inLimit/outLimit). EXEC is UNCHANGED: callback-free —
+ * an on-chain computeQuote staticcall for minOut + transfer + getAssets-oriented `pool.swap(a0,a1,to,"")`
+ * (EulerSwap's swap is V2-shaped; EMPTY data skips the flash callback, so the pool sweeps the pre-transferred
+ * input + verifies the curve — NO engine SwapPoolType, since the asymmetric Euler curve is NOT xy=k).
  *
- * Stands up a local EulerSwap pool (the EulerSwapPool.sol fixture, whose CurveLib.f + QuoteLib.computeQuote
- * exact-in mirror the off-chain `eulerswap-math.ts` replay bit-for-bit), deploys the Sauce engine, and cooks
- * an EcoSwap whose static-segment cursor consumes EulerSwap segments (segKind 7) and executes them
- * CALLBACK-FREE: an on-chain `pool.computeQuote(tokenIn, tokenOut, awarded, true)` staticcall + transfer +
- * `pool.swap(amount0Out, amount1Out, to, "")` (EulerSwap's swap is V2-shaped; EMPTY data skips the flash
- * callback so the pool sweeps the pre-transferred input + verifies the curve — NO engine SwapPoolType, since
- * the asymmetric Euler curve is NOT xy=k). Then asserts:
+ * The oracle prices EulerSwap via buildEulerSwapQLLadder over the SAME geometric ladder points, replayed
+ * through the closed-form `computeQuote` bigint (the fixture computeQuote mirrors it bit-for-bit), INCLUDING
+ * the vault-cap self-truncation — so the oracle reproduces the solver's live computeQuote ladder to the WEI
+ * and the split is wei-exact, even when the trade crosses the cap.
  *
- *   (1) SOLO EulerSwap venue — the on-chain dy the caller receives == off-chain computeQuote(awarded share)
- *       AND == the pool's own computeQuote view to the WEI (the exact-in-dy gate: the periphery
- *       quoteExactInput delegates to this view, and the view IS the swap math). NO tolerance.
- *   (2) TWO EulerSwap venues — ONE EcoSwap splits across both; each leg's received output ==
- *       computeQuote(its awarded share) to the wei, and the post-fee marginals equalize within the
- *       sampled-grid bound (the documented exact-on-grid standard).
- *   (3) TREESHAKE regression cell — compiles the PRODUCTION treeshake define set (HAS_EULER only, all
- *       other segment flags false) and cooks a REAL EulerSwap fill: guards that HAS_EULER was added to the
- *       segment-head price-merge guard (else the segment head is dead under treeshake and the swap lands
- *       ZERO — the bug that bit Balancer). Mirrors ecoswap.balancer.evm.test.ts.
+ *   (1) SOLO QL EulerSwap — ladder built from live computeQuote, covers [0, amountIn], received ==
+ *       computeQuote(amountIn) == the pool's own view, all to the WEI.
+ *   (2) QL EulerSwap + a live V3 direct pool — the QL stream (bestKind 1) vs the live V3 frontier (bestKind 3)
+ *       in ONE merge; the per-venue split == the neutral oracle to the WEI.
+ *   (3) QL EulerSwap + QL Curve — TWO QL venues of DIFFERENT segKind (7 + 1) ride ONE qlv; interleave + split.
+ *   (4) ZERO-CACHE QUOTE — a read-only cook builds the ladder LIVE with NO prepared segments, quote ==
+ *       computeQuote(amountIn) to the wei.
+ *   (5) ADVERSE DRIFT — a REAL swap pushes the EulerSwap pool WORSE BEFORE cooking the pre-drift bytecode; the
+ *       QL ladder reads the LIVE (worse) computeQuote and the EulerSwap↔V3 split RE-ANCHORS (Euler share
+ *       shrinks, V3's grows) to the drifted oracle, wei-exact.
+ *   (6) VAULT-CAP self-truncation — a trade sized so the geometric ladder crosses the LIVE vault output cap;
+ *       the ladder self-truncates (computeQuote returns 0/reverts past the cap), the AWARD is BOUNDED below
+ *       amountIn, the cook SUCCEEDS with NO exec revert (the audit's cap-revert DoS is fixed), and the
+ *       remainder is returned by the guarded terminal refund — spent == the drifted-cap oracle to the WEI.
+ *   (7) DISCOVERY — the real discoverEulerSwapPoolsTyped detects v1 (curve()+getParams()) AND v2
+ *       (getDynamicParams()) and normalizes into the same wei-exact descriptor (a read path, engine-agnostic).
  *
- * The EulerSwap curve is OFF-CHAIN only for the SPLIT: the on-chain solver supplies the curve as STATIC
- * (capacity, marginalOI) segments and never recomputes f/fInverse. We build the prepared args DIRECTLY,
- * then compile the production solver template exactly as index.ts does and cook it.
- *
- * ENGINE PATH (verified here): EulerSwap executes CALLBACK-FREE. EulerSwap's real swap carries the EVC
- * `callThroughEVC` modifier + a vault deposit/withdraw, but with EMPTY data the only re-entry is INTERNAL
- * to Euler (the EVC self-wrap pool→EVC→pool, and the vault pool→EVault) — it NEVER re-enters the cooking
- * contract, so the V3/V4-callback barrier does not apply and the Solidly/Wombat pre-transfer + empty-data
- * swap pattern works. This fixture exercises exactly that surface (V2-style optimistic out + sweep input +
- * curve verify + vault output cap).
- *
- * No fork / no RPC env needed — a local fixture etches the whole stack. Runs on v1 (+ v12 when the v12
- * artifacts are present). Driven by ECO_ENGINE (default v12). Mirrors ecoswap.wombat.evm.test.ts.
+ * No fork / no RPC env — local fixtures etch the whole stack. Runs on v1 (+ v12 when the v12 artifacts are
+ * present), driven by ECO_ENGINE. Each cell runs on its OWN fresh anvil. Mirrors ecoswap.fermi.evm.test.ts.
  *
  * Run: pnpm --filter './sdk' test:recipes:evm   (or npx tsx --test this file)
  */
@@ -49,7 +44,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseEther, type Account, type Hex } from "viem";
+import {
+  parseEther,
+  encodeFunctionData,
+  decodeFunctionResult,
+  parseAbi,
+  type Abi,
+  type Account,
+  type Hex,
+} from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -59,23 +62,33 @@ import {
   ensureMulticall3,
   deployStack,
   deploySortedTokens,
+  createAndInitPool,
+  mintPosition,
+  getSlot0,
+  getLiquidity,
   mint,
   approve,
   balanceOf,
+  erc20Abi,
   deployEulerSwapPool,
   eulerSwapPoolAbi,
+  deployCurveStableSwap,
+  SQRT_PRICE_1_1,
   type EulerSwapParams,
   type DeployedStack,
   type DeployedV12Stack,
 } from "./harness/setup";
 import { type Engine, engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
 import { MIN_SQRT_RATIO, SwapPoolType, FactoryType, type FactoryConfig } from "../shared/constants";
+import { getSqrtRatioAtTick } from "./ecoswap.math";
+import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import { discoverEulerSwapPoolsTyped } from "../shared/pool-discovery";
 import {
   computeQuote,
-  buildEulerSwapSegments,
+  buildEulerSwapQLLadder,
   type EulerSwapPool,
 } from "../shared/eulerswap-math";
+import { getDy as curveGetDy, type CurvePool } from "../shared/curve-math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
@@ -83,65 +96,52 @@ const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 const E18 = 10n ** 18n;
 const CONC = (9n * E18) / 10n; // concentration 0.9 (concentrated near equilibrium)
 const FEE = E18 / 1000n; // 0.1% (1e18-scaled)
+const FEE_PPM = Number((FEE * 1_000_000n) / E18); // 1000
 const ENGINE_CELLS = engineCells();
 
-// The PRODUCTION treeshake define set for an EulerSwap-only universe (no other segment-bearing
-// protocol): index.ts protocolDefines folds every other HAS_* to false. The fast/no-define test path
-// leaves all HAS_* at their source default `true`, masking any merge-head guard that omits HAS_EULER —
-// so this cell compiles with the real treeshaken set and a REAL cook asserts a non-zero EulerSwap fill.
-const EULER_ONLY_DEFINES: Record<string, boolean> = {
+// EulerSwap-only treeshake defines (HAS_EULER lights the on-chain QL ladder build's EulerSwap quote branch +
+// the segKind-7 accumulator + the callback-free exec; the live V3 frontier + merge core are unguarded). This
+// is the exact compile a production EulerSwap-without-other-QL cook carries, so every cell running under it
+// also guards the merge-head price-merge guard (a missing HAS_EULER there strands the QL head → ZERO fill).
+const EULER_DEFINES: Record<string, boolean> = {
   HAS_V2: false, HAS_V3: false, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
   HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
-  HAS_BALANCER: false, HAS_EULER: true,
+  HAS_BALANCER: false, HAS_EULER: true, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
+  HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false,
 };
+// EulerSwap + Curve — BOTH QL adapter branches ship so the qlv loop builds a segKind-7 + a segKind-1 ladder.
+const EULER_CURVE_DEFINES: Record<string, boolean> = { ...EULER_DEFINES, HAS_CURVE: true, HAS_EULER: true };
 
-// EulerSwap-only run: zero direct pools/routes/netCache; the EulerSwap venues ride entirely inside segs
-// (segKind 7). The solver's 5 compiler args, in index.ts order (cfg, pools, netCache, routing, segs).
-function eulerArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, segs: bigint[][]): unknown[] {
+// The solver's 6 compiler args (index.ts order): cfg, pools, netCache, routing, segs, qlv.
+function args(
+  tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex,
+  directCount: number, pools: bigint[][], qlv: bigint[][],
+): unknown[] {
   return [
-    [
-      BigInt(tokenIn),
-      BigInt(tokenOut),
-      amountIn,
-      BigInt(caller),
-      MIN_SQRT_RATIO + 1n, // priceLimit (unused by static segments)
-      0n, // directCount — no direct pools
-    ],
-    [], // pools
-    [], // netCache
-    [], // routing
-    segs,
-    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
+    [BigInt(tokenIn), BigInt(tokenOut), amountIn, BigInt(caller), MIN_SQRT_RATIO + 1n, BigInt(directCount)],
+    pools, [], [], [], qlv,
   ];
 }
 
-// One EulerSwap venue → its sampled segments as segs rows. refIdx tags the on-chain per-venue accumulator
-// (einp[refIdx]); venue is the pool address. Built from the SAME buildEulerSwapSegments the oracle uses,
-// so the awarded Σ == the off-chain share by construction. segKind = 7.
-function eulerSegRows(pool: EulerSwapPool, refIdx: number, amountIn: bigint): bigint[][] {
-  return buildEulerSwapSegments(pool, amountIn).map((s) => [
-    BigInt(refIdx),
-    s.capacity,
-    s.marginalOI, // sqrtAdjNear (post-fee; the descending-price sort key)
-    s.marginalOI, // sqrtAdjFar (an EulerSwap segment is a flat slice)
-    7n, // segKind = EulerSwap (callback-free)
-    BigInt(pool.address),
-    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
-  ]);
+// One QL EulerSwap descriptor: [pool, _, _, feePpm, segKind=7, refIdx]. EulerSwap quotes by tokenIn/tokenOut,
+// so qd[1]/qd[2] are unused; feePpm is informational (computeQuote is post-fee).
+function eulerDescriptor(pool: Hex, refIdx: number, feePpm: number): bigint[] {
+  return [BigInt(pool), 0n, 0n, BigInt(feePpm), 7n, BigInt(refIdx)];
 }
 
-// Interleave + sort segs rows the way index.ts buildSegs does: DESC by sqrtAdjNear, then DESC by
-// sqrtAdjFar, then by refIdx. The on-chain static-segment cursor consumes them in array order, so the
-// global price order MUST be materialized here.
-function sortSegs(rows: bigint[][]): bigint[][] {
-  return rows.slice().sort((a, b) => {
-    if (a[2] !== b[2]) return a[2] < b[2] ? 1 : -1;
-    if (a[3] !== b[3]) return a[3] < b[3] ? 1 : -1;
-    return Number(a[0] - b[0]);
-  });
+// One QL Curve StableSwap descriptor: [poolAddr, i, j, feePpm10, segKind=1, refIdx].
+function curveDescriptor(pool: Hex, refIdx: number, feePpm10: bigint): bigint[] {
+  return [BigInt(pool), 0n, 1n, feePpm10, 1n, BigInt(refIdx)];
 }
 
-describe("EcoSwap EulerSwap (Euler vault-backed AMM, local fixture, v1+v2) — callback-free exact-in-dy", () => {
+function v3PoolTuple(pool: Hex, feePpm: number, tickSpacing: number, inIsToken0: boolean): bigint[] {
+  return [
+    1n, BigInt(pool), BigInt(feePpm), BigInt(tickSpacing), 0n, BigInt(feePpm), 0n,
+    inIsToken0 ? 1n : 0n, 0n, 0n, getSqrtRatioAtTick(tickSpacing), 0n, 0n, 0n, 0n, 0n, 0n,
+  ];
+}
+
+describe("EcoSwap EulerSwap QL live-walk (local fixture, v1+v2) — on-chain computeQuote ladder + callback-free exec", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
@@ -149,15 +149,11 @@ describe("EcoSwap EulerSwap (Euler vault-backed AMM, local fixture, v1+v2) — c
   let tokenIn: Hex; // == token0 (lower address) == the pool's asset0 (x side)
   let tokenOut: Hex; // == token1 == asset1 (y side)
   let solverSrc: string;
-  // Each cell runs on its OWN fresh anvil + freshly-deployed stack (setup() below): no shared
-  // mutable node state between cells, so there is no snapshot/loadState reset race (the old
-  // revert+re-snapshot dance dropped a cell to a 0-fill; a bare loadState MERGES and drifts each
-  // cell's pool address). reset() just tears the anvil down and rebuilds. See setup().
 
-  // Boot a fresh anvil + deploy the whole stack. Called by before() once and by reset() before
-  // every subsequent cell, tearing the prior anvil down first — so each cell is fully isolated.
   async function setup(): Promise<void> {
-    anvil?.stop();
+    const prev = anvil;
+    prev?.stop();
+    await prev?.stopped;
     anvil = await startAnvil();
     c = await makeClients(anvil.rpcUrl);
     await ensureMulticall3(c.publicClient, c.testClient);
@@ -166,275 +162,397 @@ describe("EcoSwap EulerSwap (Euler vault-backed AMM, local fixture, v1+v2) — c
     tokenIn = tk.token0;
     tokenOut = tk.token1;
     solverSrc = readFileSync(SOLVER, "utf-8");
-
-    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("50000000"));
-    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
-
+    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("500000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("500000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, parseEther("1000000000"));
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, parseEther("1000000000"));
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
   }
 
   before(setup);
-
   after(() => {
     anvil?.stop();
   });
 
-  async function reset(): Promise<void> {
-    await setup();
-  }
-
-  // Off-chain EulerSwapPool descriptor for the deployed fixture (tokenIn = asset0, tokenOut = asset1).
-  // The fixture's asset0 == tokenIn, so the swap output is amount1Out (eA0 === tokenIn on-chain).
-  function offPool(address: Hex, rIn: bigint, rOut: bigint, inLimit = 0n): EulerSwapPool {
-    return {
-      address,
-      inIsToken0: true,
-      reserveIn: rIn,
-      reserveOut: rOut,
-      equilIn: rIn, // deploy at equilibrium (reserve == equilibrium reserve)
-      equilOut: rOut,
-      priceIn: E18,
-      priceOut: E18,
-      concIn: CONC,
-      concOut: CONC,
-      feeWad: FEE,
-      inLimit,
-      feePpm: Number((FEE * 1_000_000n) / E18),
-      source: "local-fixture",
-    };
-  }
-
-  // Deploy a fixture EulerSwap pool at equilibrium (reserve == equilibrium), funded to pay out. asset0 ==
-  // tokenIn (x side), asset1 == tokenOut (y side). outCap caps the tokenOut side (the vault available cash).
-  async function deployPool(rIn: bigint, rOut: bigint, outCap1 = 0n, minter?: Account): Promise<Hex> {
+  // Deploy a fixture EulerSwap pool at equilibrium (reserve == equilibrium). asset0 == tokenIn (x side),
+  // asset1 == tokenOut (y side). `outCap1` caps the tokenOut side (the vault available cash); 0 ⇒ uncapped.
+  async function deploy(rIn: bigint, rOut: bigint, outCap1 = 0n): Promise<Hex> {
     const params: EulerSwapParams = {
-      reserve0: rIn,
-      reserve1: rOut,
-      equil0: rIn,
-      equil1: rOut,
-      priceX: E18,
-      priceY: E18,
-      concX: CONC,
-      concY: CONC,
-      fee: FEE,
-      outCap0: 0n,
-      outCap1,
+      reserve0: rIn, reserve1: rOut, equil0: rIn, equil1: rOut,
+      priceX: E18, priceY: E18, concX: CONC, concY: CONC, fee: FEE, outCap0: 0n, outCap1,
     };
-    return deployEulerSwapPool(c.walletClient, c.publicClient, tokenIn, tokenOut, params, minter);
+    return deployEulerSwapPool(c.walletClient, c.publicClient, tokenIn, tokenOut, params, c.walletClient.account as Account);
   }
 
-  // ── (1) SOLO EulerSwap venue — received == computeQuote(share) to the WEI ──
+  // Off-chain EulerSwapPool descriptor for the fixture (tokenIn == asset0). The CLOSED-FORM computeQuote
+  // replay mirrors the fixture's on-chain computeQuote bit-for-bit at ANY input, so buildEulerSwapQLLadder
+  // reproduces the solver's live ladder to the wei ⇒ oracle == solver. `outLimit` mirrors the vault output
+  // cap so the oracle self-truncates at the SAME point the on-chain computeQuote does (the cap case).
+  function offPool(address: Hex, rIn: bigint, rOut: bigint, eqIn: bigint, eqOut: bigint, outLimit = 0n): EulerSwapPool {
+    return {
+      address, inIsToken0: true,
+      reserveIn: rIn, reserveOut: rOut, equilIn: eqIn, equilOut: eqOut,
+      priceIn: E18, priceOut: E18, concIn: CONC, concOut: CONC, feeWad: FEE,
+      inLimit: 0n, outLimit, feePpm: FEE_PPM, source: "local-fixture",
+    };
+  }
+
+  function offCurvePool(address: Hex, balances: bigint[], a: bigint, fee: bigint): CurvePool {
+    return { poolType: 3, address, i: 0, j: 1, A: a, aPrecision: 100n, balances, rates: [E18, E18], feePpm10: fee, source: "local-fixture" };
+  }
+
+  // The fixture's own on-chain computeQuote view (exact-in-dy ground truth). tokenIn == asset0 ⇒ out slot.
+  async function onQuote(pool: Hex, amt: bigint): Promise<bigint> {
+    return (await c.publicClient.readContract({
+      address: pool, abi: eulerSwapPoolAbi as Abi, functionName: "computeQuote", args: [tokenIn, tokenOut, amt, true],
+    })) as bigint;
+  }
+
+  async function liveReserves(pool: Hex): Promise<[bigint, bigint]> {
+    const r = (await c.publicClient.readContract({
+      address: pool, abi: eulerSwapPoolAbi as Abi, functionName: "getReserves",
+    })) as readonly [bigint, bigint, number];
+    return [r[0], r[1]];
+  }
+
+  // ── (1) SOLO QL EulerSwap — the on-chain ladder is built live; received == computeQuote(amountIn) wei ──
   async function runSolo(engine: Engine): Promise<void> {
-    await reset();
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    const rIn = 1_000_000n * E18;
-    const rOut = 1_000_000n * E18;
-    const pool = await deployPool(rIn, rOut, 0n, caller);
-    const op = offPool(pool, rIn, rOut);
+    const r = 1_000_000n * E18;
+    const pool = await deploy(r, r);
+    const op = offPool(pool, r, r, r, r);
 
-    // amountIn == the full sampled ladder cap ⇒ the merge awards the WHOLE Σ to this one venue.
     const amountIn = 100_000n * E18;
-    const segRows = eulerSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty EulerSwap segment ladder");
-    const segSum = segRows.reduce((a, r) => a + r[1], 0n);
-    assert.equal(segSum, amountIn, "EulerSwap segments cover the full amountIn");
+    const ladder = buildEulerSwapQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "non-empty QL EulerSwap ladder");
+    const cover = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(cover, amountIn, "QL EulerSwap ladder covers the full amountIn (pool deep enough, no cap)");
 
     const { bytecodes } = compileSauce(
-      solverSrc, eulerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [eulerDescriptor(pool, 0, FEE_PPM)]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: EULER_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
     const poolInBefore = await balanceOf(c.publicClient, tokenIn, pool);
-
-    // The fixture's own on-chain computeQuote view on the PRE-swap state — the engine-independent ground
-    // truth for the executed dy of `amountIn`.
-    const onViewPre = (await c.publicClient.readContract({
-      address: pool, abi: eulerSwapPoolAbi, functionName: "computeQuote",
-      args: [tokenIn, tokenOut, amountIn, true],
-    })) as bigint;
+    const onViewPre = await onQuote(pool, amountIn);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "solo EulerSwap cook() must succeed");
+    assert.equal(receipt.status, "success", "solo QL EulerSwap cook() must succeed");
 
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
     const poolIn = (await balanceOf(c.publicClient, tokenIn, pool)) - poolInBefore;
 
-    assert.equal(spent, amountIn, "spent == amountIn (the whole trade routed to the EulerSwap pool)");
-    assert.equal(poolIn, amountIn, "the EulerSwap pool swept the full input share");
-
-    // WEI-EXACT-IN-DY: the on-chain received tokenOut == off-chain computeQuote(awarded share) == the
-    // pool's own PRE-swap computeQuote view, all to the WEI. NO tolerance.
-    assert.equal(received, computeQuote(op, spent), "received == computeQuote(share) to the wei");
-    assert.equal(received, onViewPre, "received == on-chain computeQuote view (exact-in-dy)");
-
-    console.log(`  [Euler solo:${engine}] spent=${spent} received=${received} (== computeQuote to the wei)`);
-  }
-
-  // ── (2) TWO EulerSwap venues — split + per-leg exact-in-dy + marginals equalize ──
-  async function runSplit(engine: Engine): Promise<void> {
-    await reset();
-    const target = cookTarget(engine, stack, v12);
-    const caller = c.account0;
-
-    // Two venues at the SAME 1:1 equilibrium but different depth → different marginal curves, so the
-    // water-fill engages BOTH and equalizes their post-fee marginals. A is deeper ⇒ draws first + more.
-    const aR = 3_000_000n * E18; // deep
-    const bR = 1_000_000n * E18; // shallower
-    const poolA = await deployPool(aR, aR, 0n, caller);
-    const poolB = await deployPool(bR, bR, 0n, caller);
-    const opA = offPool(poolA, aR, aR);
-    const opB = offPool(poolB, bR, bR);
-
-    const amountIn = 800_000n * E18;
-    const segRows = sortSegs([...eulerSegRows(opA, 0, amountIn), ...eulerSegRows(opB, 1, amountIn)]);
-
-    const { bytecodes } = compileSauce(
-      solverSrc, eulerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
-    );
-
-    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-    const aInBefore = await balanceOf(c.publicClient, tokenIn, poolA);
-    const bInBefore = await balanceOf(c.publicClient, tokenIn, poolB);
-
-    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "two-venue EulerSwap cook() must succeed");
-
-    const aIn = (await balanceOf(c.publicClient, tokenIn, poolA)) - aInBefore;
-    const bIn = (await balanceOf(c.publicClient, tokenIn, poolB)) - bInBefore;
-    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
-
-    assert.ok(aIn > 0n && bIn > 0n, "both EulerSwap venues are funded");
-    assert.ok(aIn > bIn, `deep venue A draws more than B (A ${aIn} > B ${bIn})`);
-
-    // PER-LEG WEI-EXACT-IN-DY: received == computeQuote_A(aIn) + computeQuote_B(bIn).
-    const expected = computeQuote(opA, aIn) + computeQuote(opB, bIn);
-    assert.equal(received, expected, "received == Σ computeQuote(per-venue share) to the wei");
-
-    // MARGINALS EQUALIZE within the GRID bound. The SPLIT is exact-on-grid (the awarded inputs equal the
-    // oracle bit-for-bit — checked by the wei-exact gate above), but the realized post-fee marginal each
-    // venue reaches equalizes only to within ONE sampled segment's price width (the documented grid bound).
-    const margA = marginalAt(opA, aIn);
-    const margB = marginalAt(opB, bIn);
-    const diff = margA > margB ? margA - margB : margB - margA;
-    const relPpm = margA > 0n ? (diff * 1_000_000n) / margA : 0n;
-    assert.ok(relPpm <= 2500n, `EulerSwap split marginals equalize on the M=24 grid (rel ${relPpm} ppm; A ${margA} B ${margB})`);
+    assert.equal(spent, amountIn, "spent == amountIn (whole trade routed to the QL EulerSwap venue)");
+    assert.equal(poolIn, amountIn, "the EulerSwap pool swept the full input share (transfer + V2-shaped swap)");
+    assert.equal(received, onViewPre, "received == on-chain computeQuote view to the wei");
+    assert.equal(received, computeQuote(op, spent), "received == off-chain computeQuote(share) to the wei (exact-in-dy)");
+    assert.ok(received > 0n, "non-zero EulerSwap fill through the callback-free transfer+swap path");
 
     console.log(
-      `  [Euler split:${engine}] A in=${aIn} B in=${bIn} received=${received} ` +
-        `(== Σ computeQuote to the wei); marginals A=${margA} B=${margB} (${relPpm} ppm)`,
+      `  [QL Euler solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +
+        `(== on-chain computeQuote to the wei); cook gasUsed=${receipt.gasUsed}`,
     );
   }
 
-  // ── (3) SOLO EulerSwap under the PRODUCTION treeshake define set ──
-  // Same trade as runSolo, but compiled with treeshake:true + EulerSwap-only defines (the exact compile a
-  // production EulerSwap-without-other-segs cook carries). Guards the merge-head guard at the call boundary:
-  // if HAS_EULER is absent from the segment-head price-merge guard, under treeshake the EulerSwap head is
-  // never compared, bestKind never hits 1, and the swap lands ZERO (the bug that bit Balancer).
-  async function runSoloTreeshake(engine: Engine): Promise<void> {
-    await reset();
+  // ── (2) QL EulerSwap + a live V3 direct pool — split == oracle wei-exact ──
+  async function runEulerV3(engine: Engine): Promise<void> {
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    const rIn = 1_000_000n * E18;
-    const rOut = 1_000_000n * E18;
-    const pool = await deployPool(rIn, rOut, 0n, caller);
-    const op = offPool(pool, rIn, rOut);
+    // A cheaper (0.1%) EulerSwap vs a DEEP 1:1 V3 (0.30% fee): EulerSwap fills the cheap near region, its
+    // marginal degrades with size below V3's, V3 takes the tail — both fund.
+    const r = 1_000_000n * E18;
+    const pool = await deploy(r, r);
+    const op = offPool(pool, r, r, r, r);
+    const amountIn = 300_000n * E18;
 
-    const amountIn = 100_000n * E18;
-    const segRows = eulerSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty EulerSwap segment ladder");
+    const V3_FEE = 3000, V3_TS = 60;
+    const v3 = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, V3_FEE, SQRT_PRICE_1_1);
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, v3, caller, -60000, 60000, parseEther("3000000"));
+    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, v3);
+    const liquidity = await getLiquidity(c.publicClient, v3);
+    assert.ok(liquidity > 0n, "V3 pool has active liquidity");
 
+    const v3Opt: OptimalPool = { isV2: false, feePpm: V3_FEE, sqrtPriceX96, tick, tickSpacing: V3_TS, liquidity, net: new Map() };
+    const oracle = optimalSplit({ pools: [v3Opt, { eulerSwap: op, feePpm: op.feePpm }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const oV3 = oracle.perPoolInput[0] ?? 0n;
+    const oEuler = oracle.perPoolInput[1] ?? 0n;
+    assert.ok(oV3 > 0n && oEuler > 0n, `oracle splits across V3 + EulerSwap (V3 ${oV3}, Euler ${oEuler})`);
+
+    const pools = [v3PoolTuple(v3, V3_FEE, V3_TS, true)];
+    const qlv = [eulerDescriptor(pool, 0, FEE_PPM)];
     const { bytecodes } = compileSauce(
-      solverSrc, eulerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
-      { treeshake: true, defines: EULER_ONLY_DEFINES },
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 1, pools, qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: EULER_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const eulerInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "treeshaken EulerSwap-only cook() must succeed");
+    assert.equal(receipt.status, "success", "EulerSwap+V3 cook() must succeed");
 
+    const eulerIn = (await balanceOf(c.publicClient, tokenIn, pool)) - eulerInBefore;
+    const v3In = (await balanceOf(c.publicClient, tokenIn, v3)) - v3InBefore;
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
 
-    // The merge MUST have routed the trade to EulerSwap — non-zero spend/receive is the regression gate.
-    assert.ok(spent > 0n, "treeshaken EulerSwap-only: non-zero EulerSwap fill (merge-head guard alive)");
-    assert.equal(spent, amountIn, "spent == amountIn (whole trade routed to EulerSwap)");
-    assert.equal(received, computeQuote(op, spent), "received == computeQuote(share) to the wei (treeshaken path)");
+    assert.ok(eulerIn > 0n && v3In > 0n, `both venues funded (Euler ${eulerIn}, V3 ${v3In})`);
+    assert.equal(v3In, oV3, "V3 awarded input == oracle (wei-exact split)");
+    assert.equal(eulerIn, oEuler, "EulerSwap awarded input == oracle (wei-exact split)");
+    assert.equal(spent, oracle.totalInput, "spent == oracle totalInput (wei-exact)");
+    assert.ok(received > 0n, "caller receives tokenOut");
 
-    console.log(`  [Euler treeshake:${engine}] spent=${spent} received=${received} (production define set)`);
+    console.log(`  [QL Euler+V3:${engine}] V3 in=${v3In} Euler in=${eulerIn} spent=${spent} received=${received} (split == oracle wei-exact)`);
   }
 
-  // ── (4) VAULT-CAP edge — the cap binds, the guarded terminal refund returns the un-spent input ──
-  // The pool's vault output cap is set BELOW the full-fill out, so computeQuote(amountIn) returns 0 (the cap
-  // binds). The recipe's pre-swap computeQuote read sees the 0, the EulerSwap branch does NOT swap, and the
-  // solver's guarded terminal refund returns the pulled input to the caller — the swap stays atomic + safe.
+  // ── (3) QL EulerSwap + QL Curve — TWO QL venues of DIFFERENT segKind (7 + 1) in ONE qlv ──
+  async function runEulerCurve(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    // A deep EulerSwap (draws first over its cheap near region) vs a SHALLOWER Curve (steepens fast and
+    // takes a slice) — both fund, ladders interleave in the merged DESC sort.
+    const r = 1_000_000n * E18;
+    const pool = await deploy(r, r);
+    const op = offPool(pool, r, r, r, r);
+    const amountIn = 120_000n * E18;
+
+    const curveBal = [60_000n * E18, 60_000n * E18];
+    const CURVE_A = 100n, CURVE_FEE = 4_000_000n; // 0.04% (1e10-scaled)
+    const curve = await deployCurveStableSwap(c.walletClient, c.publicClient, [tokenIn, tokenOut], curveBal, [E18, E18], CURVE_A, CURVE_FEE, caller);
+    const opCurve = offCurvePool(curve, curveBal, CURVE_A, CURVE_FEE);
+
+    const oracle = optimalSplit({ pools: [{ curve: opCurve, feePpm: 0 }, { eulerSwap: op, feePpm: op.feePpm }], amountIn, zeroForOne: true });
+    const oCurve = oracle.perPoolInput[0] ?? 0n;
+    const oEuler = oracle.perPoolInput[1] ?? 0n;
+    assert.ok(oCurve > 0n && oEuler > 0n, `oracle splits across QL Curve + QL EulerSwap (Curve ${oCurve}, Euler ${oEuler})`);
+
+    const qlv = [curveDescriptor(curve, 0, CURVE_FEE), eulerDescriptor(pool, 0, FEE_PPM)];
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: EULER_CURVE_DEFINES },
+    );
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const curveInBefore = await balanceOf(c.publicClient, tokenIn, curve);
+    const eulerInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "QL EulerSwap + QL Curve cook() must succeed");
+
+    const curveIn = (await balanceOf(c.publicClient, tokenIn, curve)) - curveInBefore;
+    const eulerIn = (await balanceOf(c.publicClient, tokenIn, pool)) - eulerInBefore;
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+
+    assert.ok(curveIn > 0n && eulerIn > 0n, `both QL venues funded (Curve ${curveIn}, Euler ${eulerIn})`);
+    assert.equal(curveIn, oCurve, "Curve awarded input == oracle (wei-exact split)");
+    assert.equal(eulerIn, oEuler, "EulerSwap awarded input == oracle (wei-exact split)");
+    // PER-LEG WEI-EXACT: received == get_dy_Curve(curveIn) + computeQuote(eulerIn) (both closed-form exact
+    // vs the on-chain views for the awarded shares). NO tolerance.
+    assert.equal(received, curveGetDy(opCurve, curveIn) + computeQuote(op, eulerIn), "received == Σ per-venue view(share) to the wei");
+
+    console.log(
+      `  [QL Curve+Euler:${engine}] Curve in=${curveIn} Euler in=${eulerIn} received=${received} ` +
+        `(two QL segKinds interleaved; split == oracle, dy wei-exact)`,
+    );
+  }
+
+  // ── (4) ZERO-CACHE QUOTE — a read-only cook builds the ladder LIVE with NO prepared cache/segments ──
+  const cookCallAbi = parseAbi(["function cook(bytes[] ingredients) payable returns (bytes returnData)"]);
+  function decodeCookUint(ret: Hex, engine: Engine): bigint {
+    if (!ret || ret === "0x") return 0n;
+    if (engine === "v1") {
+      const blob = decodeFunctionResult({ abi: cookCallAbi as Abi, functionName: "cook", data: ret }) as unknown as Hex;
+      const hex = blob.slice(2);
+      return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+    }
+    const hex = ret.slice(2);
+    return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+  }
+
+  async function runZeroCacheQuote(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const r = 1_000_000n * E18;
+    const pool = await deploy(r, r);
+    const amountIn = 100_000n * E18;
+
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [eulerDescriptor(pool, 0, FEE_PPM)]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: EULER_DEFINES },
+    );
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const data = encodeFunctionData({ abi: cookCallAbi as Abi, functionName: "cook", args: [bytecodes] });
+    const { data: ret } = await c.publicClient.call({ account: caller, to: target, data, gas: 2_000_000_000n });
+    const quoted = decodeCookUint(ret as Hex, engine);
+
+    assert.equal(quoted, await onQuote(pool, amountIn), "zero-cache QUOTE == computeQuote(amountIn) to the wei (ladder built live in the eth_call)");
+    console.log(`  [QL Euler zero-cache quote:${engine}] quoted=${quoted} (== computeQuote(amountIn), no prepared cache)`);
+  }
+
+  // ── (5) ADVERSE DRIFT — a REAL tokenIn→tokenOut swap pushes the EulerSwap pool WORSE BEFORE cooking; the
+  // live QL ladder re-anchors the EulerSwap↔V3 split to the drifted (worse) state. SAME bytecode cooked after. ──
+  async function runDriftSplit(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const r = 1_000_000n * E18;
+    const pool = await deploy(r, r);
+    const opPre = offPool(pool, r, r, r, r);
+    const amountIn = 300_000n * E18;
+
+    const V3_FEE = 3000, V3_TS = 60;
+    const v3 = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, V3_FEE, SQRT_PRICE_1_1);
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, v3, caller, -60000, 60000, parseEther("3000000"));
+    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, v3);
+    const liquidity = await getLiquidity(c.publicClient, v3);
+    const v3Opt: OptimalPool = { isV2: false, feePpm: V3_FEE, sqrtPriceX96, tick, tickSpacing: V3_TS, liquidity, net: new Map() };
+
+    const pools = [v3PoolTuple(v3, V3_FEE, V3_TS, true)];
+    const qlv = [eulerDescriptor(pool, 0, FEE_PPM)];
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 1, pools, qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: EULER_DEFINES },
+    );
+
+    const oraclePre = optimalSplit({ pools: [v3Opt, { eulerSwap: opPre, feePpm: opPre.feePpm }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const eulerSharePre = oraclePre.perPoolInput[1] ?? 0n;
+    assert.ok(eulerSharePre > 0n, "baseline oracle awards the EulerSwap venue a share");
+
+    // ADVERSE DRIFT: a REAL tokenIn→tokenOut swap (add tokenIn, remove tokenOut) pushes the pool along the
+    // curve so subsequent tokenIn→tokenOut computeQuote is WORSE (steeper, more slippage).
+    const drift = 400_000n * E18;
+    const driftOut = await onQuote(pool, drift);
+    await c.publicClient.waitForTransactionReceipt({
+      hash: await c.walletClient.writeContract({
+        address: tokenIn, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, drift], account: caller, chain: c.walletClient.chain,
+      }),
+    });
+    await c.publicClient.waitForTransactionReceipt({
+      hash: await c.walletClient.writeContract({
+        address: pool, abi: eulerSwapPoolAbi as Abi, functionName: "swap", args: [0n, driftOut, caller, "0x"], account: caller, chain: c.walletClient.chain,
+      }),
+    });
+
+    const [r0d, r1d] = await liveReserves(pool);
+    const opDrift = offPool(pool, r0d, r1d, r, r); // live reserves, ORIGINAL equilibrium
+    const oracleDrift = optimalSplit({ pools: [v3Opt, { eulerSwap: opDrift, feePpm: opDrift.feePpm }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const eulerShareDrift = oracleDrift.perPoolInput[1] ?? 0n;
+    assert.ok(eulerShareDrift < eulerSharePre, `drift shrinks the EulerSwap share (${eulerShareDrift} < ${eulerSharePre})`);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const eulerInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "drift cook() SUCCEEDS — EulerSwap ladder re-anchored to the live drifted state");
+
+    const eulerIn = (await balanceOf(c.publicClient, tokenIn, pool)) - eulerInBefore;
+    const v3In = (await balanceOf(c.publicClient, tokenIn, v3)) - v3InBefore;
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+
+    assert.ok(v3In > 0n, "V3 funded post-drift");
+    assert.equal(eulerIn, eulerShareDrift, "EulerSwap awarded input == drifted oracle (re-anchored to the live drifted state)");
+    assert.equal(v3In, oracleDrift.perPoolInput[0] ?? 0n, "V3 awarded input == drifted oracle (re-anchored, wei-exact)");
+    assert.equal(spent, oracleDrift.totalInput, "spent == drifted oracle totalInput (wei-exact)");
+    assert.ok(eulerIn < eulerSharePre, `EulerSwap share ADAPTED down after the drift (${eulerIn} < baseline ${eulerSharePre})`);
+    assert.ok(received > 0n, "caller receives tokenOut");
+
+    console.log(
+      `  [QL Euler+V3 drift:${engine}] baseline Euler share=${eulerSharePre} → re-anchored=${eulerIn} ` +
+        `(V3 grew to ${v3In}); spent=${spent} received=${received}`,
+    );
+  }
+
+  // ── (6) VAULT-CAP self-truncation — the geometric ladder crosses the LIVE vault output cap; the ladder
+  // self-truncates (computeQuote returns 0/reverts past the cap), so the AWARD is BOUNDED below amountIn and
+  // the cook SUCCEEDS with NO exec revert (the audit's cap-revert DoS is fixed). The guarded terminal refund
+  // returns the un-awarded remainder. spent == the cap-truncated oracle to the WEI. ──
   async function runVaultCap(engine: Engine): Promise<void> {
-    await reset();
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    const rIn = 1_000_000n * E18;
-    const rOut = 1_000_000n * E18;
-    // Cap the tokenOut side at 5000e18 — far below the ~99k out of a 100k fill, so the awarded Σ trips it.
-    const outCap = 5_000n * E18;
-    const pool = await deployPool(rIn, rOut, outCap, caller);
-    // Off-chain descriptor WITHOUT the inLimit bound (so the segments promise the full amountIn and the
-    // merge awards it all to this venue) — modeling the cap shrinking AFTER prepare sampled.
-    const op = offPool(pool, rIn, rOut, 0n);
-
+    const r = 1_000_000n * E18;
+    // Output cap far below the ~98.8k out of a 100k full fill — so the ladder crosses it partway.
+    const outCap = 50_000n * E18;
+    const pool = await deploy(r, r, outCap);
+    const op = offPool(pool, r, r, r, r, outCap); // oracle carries the SAME cap → self-truncates identically
     const amountIn = 100_000n * E18;
-    const segRows = eulerSegRows(op, 0, amountIn);
+
+    const ladder = buildEulerSwapQLLadder(op, amountIn);
+    const cover = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.ok(ladder.length > 0, "ladder emits pre-cap slices");
+    assert.ok(cover < amountIn, `the ladder self-truncates below amountIn at the cap (cover ${cover} < ${amountIn})`);
+
+    const oracle = optimalSplit({ pools: [{ eulerSwap: op, feePpm: op.feePpm }], amountIn, zeroForOne: true });
+    const awarded = oracle.perPoolInput[0] ?? 0n;
+    assert.ok(awarded > 0n && awarded < amountIn, `oracle award is bounded by the live cap (${awarded} < ${amountIn})`);
 
     const { bytecodes } = compileSauce(
-      solverSrc, eulerArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [eulerDescriptor(pool, 0, FEE_PPM)]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: EULER_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    // PRE-swap on-chain view of the bounded award (the pool reserves move on the cook, so this must be read
+    // before). awarded < cap ⇒ computeQuote returns the real value (> 0), NOT the 0 the cap yields past it.
+    const onViewAwarded = await onQuote(pool, awarded);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "vault-cap cook() must succeed (guarded refund, no revert)");
+    // THE FIX: the award is bounded by the live cap, so the exec computeQuote never cap-reverts — the cook
+    // SUCCEEDS (the audit's cap-revert DoS is gone).
+    assert.equal(receipt.status, "success", "vault-cap cook() SUCCEEDS — the ladder self-truncated below the cap, no exec revert");
 
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
 
-    // The cap bound ⇒ computeQuote returned 0 ⇒ the EulerSwap branch did NOT swap ⇒ the terminal refund
-    // returned the pulled input. Net: caller's tokenIn unchanged, no tokenOut received, no revert.
-    assert.equal(spent, 0n, "vault-cap: the pulled input was fully refunded (cap bound, no fill)");
-    assert.equal(received, 0n, "vault-cap: no tokenOut received (the EulerSwap branch declined)");
+    assert.equal(spent, awarded, "spent == the cap-truncated oracle award to the wei");
+    assert.ok(spent < amountIn, `award BOUNDED below amountIn (spent ${spent} < ${amountIn}) — the un-awarded input was refunded`);
+    assert.ok(received > 0n, "the truncated EulerSwap slice DID fill (non-zero out)");
+    assert.ok(received <= outCap, `received within the vault output cap (${received} <= ${outCap})`);
+    assert.equal(received, computeQuote(op, spent), "received == computeQuote(awarded) to the wei (exact-in-dy on the bounded award)");
+    assert.equal(received, onViewAwarded, "received == on-chain PRE-swap computeQuote(awarded) view to the wei");
 
-    console.log(`  [Euler vault-cap:${engine}] cap bound ⇒ guarded refund (spent=${spent} received=${received})`);
+    console.log(
+      `  [QL Euler vault-cap:${engine}] cap=${outCap} → ladder self-truncated: spent=${spent} (< amountIn ${amountIn}) ` +
+        `received=${received} (no exec revert — cap-revert DoS fixed)`,
+    );
   }
 
-  // ── DISCOVERY: the REAL discoverEulerSwapPoolsTyped path detects v1 vs v2 via curve() ──
-  // Not a cook — a direct call to the production discovery helper against the deployed fixture, asserting
-  // it (a) reads curve() to pick the version, (b) reads the version's curve-param getter (getParams for v1,
-  // getDynamicParams for v2), (c) normalizes into the SAME tokenIn-oriented EulerSwapPool descriptor whose
-  // off-chain computeQuote replay matches the pool's on-chain view to the wei. Version-parametrized so BOTH
-  // branches are proven to coexist. Engine-independent (a read path), so run once (not per-engine).
+  // ── (7) DISCOVERY: the REAL discoverEulerSwapPoolsTyped path detects v1 vs v2 via curve() ──
   async function runDiscovery(isV1: boolean): Promise<void> {
-    await reset();
-    const rIn = 1_000_000n * E18;
-    const rOut = 1_000_000n * E18;
+    await setup();
+    const r = 1_000_000n * E18;
     const pool = await deployEulerSwapPool(
       c.walletClient, c.publicClient, tokenIn, tokenOut,
-      { reserve0: rIn, reserve1: rOut, equil0: rIn, equil1: rOut, priceX: E18, priceY: E18,
+      { reserve0: r, reserve1: r, equil0: r, equil1: r, priceX: E18, priceY: E18,
         concX: CONC, concY: CONC, fee: FEE, outCap0: 0n, outCap1: 0n },
-      c.account0, isV1,
+      c.walletClient.account as Account, isV1,
     );
 
-    // A FactoryType.EulerSwap config carrying the deployed fixture as a known pool — exactly how the
-    // production ChainPoolConfig wires a real pool by address (constants.ts eulerSwapPools).
     const factory: FactoryConfig = {
       address: "0x00000000000000000000000000000000000000E5" as Hex,
       poolType: SwapPoolType.UniV2, factoryType: FactoryType.EulerSwap,
@@ -449,59 +567,35 @@ describe("EcoSwap EulerSwap (Euler vault-backed AMM, local fixture, v1+v2) — c
     assert.equal(fp.inIsToken0, true, "tokenIn == asset0 orientation");
     assert.equal(fp.feeWad, FEE, "fee read (v1 single / v2 fee0)");
 
-    // The discovered descriptor's off-chain computeQuote == the pool's on-chain computeQuote view — wei
-    // exact, proving discovery captured the curve params correctly (whichever getter it read).
     for (const dx of [1_000n * E18, 10_000n * E18, 100_000n * E18]) {
-      const onView = (await c.publicClient.readContract({
-        address: pool, abi: eulerSwapPoolAbi, functionName: "computeQuote",
-        args: [tokenIn, tokenOut, dx, true],
-      })) as bigint;
+      const onView = await onQuote(pool, dx);
       assert.equal(computeQuote(fp, dx), onView, `discovered ${isV1 ? "v1" : "v2"} pool computeQuote == on-chain view @ ${dx}`);
     }
     console.log(`  [Euler discovery] ${isV1 ? "v1 (curve+getParams)" : "v2 (getDynamicParams)"} pool discovered + wei-exact vs on-chain view`);
   }
 
-  // Post-fee out/in marginal price at a cumulative input `share` — a small finite-difference slice of
-  // computeQuote around `share` (the same coordinate the segments carry). Used only to check the split
-  // equalized marginals.
-  function marginalAt(pool: EulerSwapPool, share: bigint): bigint {
-    if (share <= 0n) return 0n;
-    const eps = share / 1000n > 0n ? share / 1000n : 1n;
-    const lo = share - eps > 0n ? share - eps : 0n;
-    const dIn = share - lo;
-    const dOut = computeQuote(pool, share) - computeQuote(pool, lo);
-    if (dIn <= 0n || dOut <= 0n) return 0n;
-    return isqrt((dOut * (1n << 192n)) / dIn);
-  }
-  function isqrt(x: bigint): bigint {
-    if (x <= 0n) return 0n;
-    let z = x;
-    let y = (z + 1n) / 2n;
-    while (y < z) {
-      z = y;
-      y = (x / y + y) / 2n;
-    }
-    return z;
-  }
-
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`EulerSwap solo [${engine}] — received == computeQuote(share) to the wei (exact-in-dy)`, { skip }, async () => {
+    it(`QL EulerSwap solo [${engine}] — on-chain ladder, received == computeQuote(share) wei-exact`, { skip }, async () => {
       await runSolo(engine);
     });
-    it(`EulerSwap split [${engine}] — two venues, per-leg exact-in-dy + marginals equalize`, { skip }, async () => {
-      await runSplit(engine);
+    it(`QL EulerSwap + V3 [${engine}] — QL stream vs live frontier, split == oracle wei-exact`, { skip }, async () => {
+      await runEulerV3(engine);
     });
-    it(`EulerSwap solo treeshake [${engine}] — production define set lands a non-zero EulerSwap fill`, { skip }, async () => {
-      await runSoloTreeshake(engine);
+    it(`QL EulerSwap + QL Curve [${engine}] — two QL segKinds in one loop, interleave + split == oracle`, { skip }, async () => {
+      await runEulerCurve(engine);
     });
-    it(`EulerSwap vault-cap [${engine}] — cap binds ⇒ guarded terminal refund (no revert)`, { skip }, async () => {
+    it(`QL EulerSwap zero-cache QUOTE [${engine}] — ladder built live in eth_call, no prepared cache`, { skip }, async () => {
+      await runZeroCacheQuote(engine);
+    });
+    it(`QL EulerSwap + V3 adverse drift [${engine}] — split RE-ANCHORS to the live drifted state`, { skip }, async () => {
+      await runDriftSplit(engine);
+    });
+    it(`QL EulerSwap vault-cap [${engine}] — ladder self-truncates, award bounded, NO exec revert (DoS fixed)`, { skip }, async () => {
       await runVaultCap(engine);
     });
   }
 
-  // Discovery is a read path (engine-independent) — run once per version, not per-engine. Proves v1 and
-  // v2 coexist in discoverEulerSwapPoolsTyped (curve()-discriminated), matching how the recipe supports
-  // Uni V2/V3/V4 side by side.
+  // Discovery is a read path (engine-independent) — run once per version, not per-engine.
   it("EulerSwap discovery — v1 pool detected via curve()+getParams(), wei-exact descriptor", async () => {
     await runDiscovery(true);
   });

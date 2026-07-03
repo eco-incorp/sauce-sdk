@@ -68,7 +68,7 @@ import { buildDodoQLLadder, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableQLLadder, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
 import { buildWombatQLLadder, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
-import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
+import { buildEulerSwapQLLadder, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math.js";
@@ -177,13 +177,14 @@ export interface OptimalPool {
    */
   balancer?: BalancerStablePool;
   /**
-   * EulerSwap (Euler vault-backed AMM, v1+v2) pool — when present this pool is an EULERSWAP venue (NOT
-   * V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer). The oracle enumerates its segments via the SHARED
-   * closed-form f/fInverse curve replay (buildEulerSwapSegments) from the live reserves + static curve
-   * params + fee (bounded by the vault inLimit), so the split is exact-on-grid vs prepare's segments (one
-   * replay). The marginal is post-fee (computeQuote nets the fee), so it enters the descending-price merge
-   * directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/`balancer` are ignored when `eulerSwap`
-   * is set.
+   * EulerSwap (Euler vault-backed AMM, v1+v2) pool — when present this pool is a QUOTE-LADDER (QL) EULERSWAP
+   * venue (NOT V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer). The oracle enumerates its segments via the SHARED
+   * QL walk (buildEulerSwapQLLadder — the IDENTICAL geometric ladder the solver builds on-chain from live
+   * computeQuote, replayed through the closed-form f/fInverse computeQuote, INCLUDING the vault-cap self-
+   * truncation), so the split is wei-exact vs the solver by construction (no prepared segments — prepare ships
+   * only the descriptor). The marginal is post-fee (computeQuote nets the fee), so it enters the descending-
+   * price merge directly. `isV2`/`curve`/`lb`/`dodo`/`solidlyStable`/`wombat`/`balancer` are ignored when
+   * `eulerSwap` is set.
    */
   eulerSwap?: EulerSwapPool;
   /**
@@ -609,16 +610,19 @@ function balancerStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigin
 }
 
 /**
- * Enumerate one EulerSwap (Euler vault-backed AMM, v1+v2) pool's segments via the SHARED closed-form
- * f/fInverse curve replay (buildEulerSwapSegments) from the live reserves + static curve params + fee
- * (bounded by the vault inLimit). The amountIn caps the sampled range — the same bound prepare uses — so
- * the oracle and prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid.
- * The EulerSwap marginalOI is the post-fee execution price (computeQuote nets the fee); adjNear == adjFar
- * == marginalOI. Awarded as a "pool" venue.
+ * Enumerate one EulerSwap (Euler vault-backed AMM, v1+v2) pool's segments via the QUOTE-LADDER live walk
+ * (buildEulerSwapQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from live
+ * computeQuote, replayed here through the shared closed-form `computeQuote` bigint (the fixture / real pool
+ * computeQuote view mirrors it bit-for-bit), so the oracle and solver stay wei-exact BY CONSTRUCTION (no
+ * prepared segments — prepare ships only the descriptor). The ladder INCLUDES the vault-cap self-truncation
+ * (a dx past the vault inLimit / an out past the outLimit returns 0), so it stops at the SAME point the
+ * on-chain computeQuote reverts/returns 0 ⇒ oracle == solver even when the trade crosses the cap. The
+ * EulerSwap marginalOI is the post-fee execution price (computeQuote nets the fee); adjNear == adjFar ==
+ * marginalOI. Awarded as a "pool" venue.
  */
 function eulerSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildEulerSwapSegments(p.eulerSwap!, amountIn)) {
+  for (const s of buildEulerSwapQLLadder(p.eulerSwap!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

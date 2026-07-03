@@ -1233,18 +1233,23 @@ export async function prepareEcoSwap(
   for (const set of balancerBracketSets) brackets.push(...set);
 
   const eulerSwaps: EcoEulerSwap[] = [];
-  const eulerBracketSets: EcoBracket[][] = [];
-  // EulerSwap — known-pool-address discovery (the EulerSwap factory has NO pool enumeration, only a
-  // `deployedPools` mapping + PoolDeployed events, so the candidate pool addresses are carried per-config
-  // like Balancer; `discoverEulerSwapPoolsTyped` reads each pool's reserves + curve params + fee + the
-  // vault getLimits inLimit). Sampled OFF-CHAIN (bounded by the vault cap); executed CALLBACK-FREE
-  // (computeQuote + transfer + pool.swap(...,"")). NO engine change.
+  // EulerSwap — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE
+  // computeQuote (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the descriptor
+  // (address + inIsToken0 orientation + fee). Known-pool-address discovery (the EulerSwap factory has NO
+  // pool enumeration, only a `deployedPools` mapping + PoolDeployed events, so the candidate pool addresses
+  // are carried per-config like Balancer; `discoverEulerSwapPoolsTyped` reads each pool's reserves + curve
+  // params + fee). buildEulerSwapBrackets is a pure LIVENESS PROBE (drop a pool that samples no valid
+  // segment); its brackets are NOT pushed to the segment stream. Executed CALLBACK-FREE (a live computeQuote
+  // staticcall for minOut + transfer + getAssets-oriented pool.swap(...,"") — EulerSwap's swap is V2-shaped,
+  // empty data ⇒ no flash callback). The QL ladder self-truncates at the LIVE vault cap (computeQuote reverts
+  // past inLimit/outLimit) with NO getLimits call, so the awarded Σ never cap-reverts on the exec. NO engine
+  // change.
   const eulerFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.EulerSwap);
   if (eulerFactories.length > 0) {
     const eulerRaw = await discoverEulerSwapPoolsTyped(tokenIn, tokenOut, client, eulerFactories);
     for (const ep of eulerRaw) {
-      const refIdx = eulerSwaps.length;
-      const eb = buildEulerSwapBrackets(ep, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live computeQuote, not from these brackets.
+      const eb = buildEulerSwapBrackets(ep, eulerSwaps.length, amountIn);
       if (eb.length === 0) continue;
       eulerSwaps.push({
         address: ep.address,
@@ -1252,10 +1257,8 @@ export async function prepareEcoSwap(
         feePpm: ep.feePpm,
         source: ep.source,
       });
-      eulerBracketSets.push(eb);
     }
   }
-  for (const set of eulerBracketSets) brackets.push(...set);
 
   const maverickPools: EcoMaverick[] = [];
   const maverickBracketSets: EcoBracket[][] = [];
@@ -1712,10 +1715,10 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
-  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2, Wombat AND
-  // Fermi ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT sampled segments — the
-  // on-chain solver builds each ladder live from its quote view — so all nine are reported below as "QL",
-  // not a seg count.
+  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2, Wombat,
+  // Fermi AND EulerSwap ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT sampled
+  // segments — the on-chain solver builds each ladder live from its quote view — so all ten are reported
+  // below as "QL", not a seg count.
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
@@ -1727,7 +1730,7 @@ export async function prepareEcoSwap(
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
       `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
-      `${fermiPools.length} Fermi QL, ` +
+      `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ` +
       `${brackets.length} sampled segments (` +
       `${nBalancerSegs} Balancer-stable, ${nMaverickSegs} Maverick, ` +
       `${nFluidSegs} Fluid, ${nBalancerV3Segs} Balancer-V3)`,

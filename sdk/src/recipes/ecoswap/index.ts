@@ -296,6 +296,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   const dodos = prepared.dodos ?? [];
   const wombats = prepared.wombats ?? [];
   const fermiPools = prepared.fermiPools ?? [];
+  const eulerSwaps = prepared.eulerSwaps ?? [];
   const curveRows = curves.map((c, refIdx) => [
     BigInt(c.address),
     BigInt(c.i),
@@ -385,30 +386,41 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
     11n, // segKind = Fermi (quoteAmounts on the ladder; approve + fermiSwapWithAllowances on the exec)
     BigInt(refIdx),
   ]);
+  // EulerSwap (Euler vault-backed AMM, v1+v2): qd[0]=pool, qd[1..2] unused (Euler quotes by tokenIn/tokenOut).
+  // The QL ladder quotes computeQuote(tokenIn,tokenOut,xNext,true) (probe-then-decode, post-fee — the exact-in
+  // dy). computeQuote REVERTS past the LIVE vault inLimit/outLimit, so the probe self-truncates the ladder at
+  // the live cap (NO getLimits call) — the award is bounded by live capacity, so the exec never cap-reverts.
+  // EXEC stays callback-free (computeQuote minOut + transfer + getAssets-oriented pool.swap(...,"")).
+  const eulerRows = eulerSwaps.map((e, refIdx) => [
+    BigInt(e.address),
+    0n, // i unused (Euler quotes by tokenIn/tokenOut)
+    0n, // j unused
+    BigInt(e.feePpm),
+    7n, // segKind = EulerSwap (computeQuote on the ladder; computeQuote + transfer + pool.swap on the exec)
+    BigInt(refIdx),
+  ]);
   return [
     ...curveRows, ...cryptoRows, ...solidlyRows, ...wooFiRows, ...lbRows, ...mentoRows,
-    ...dodoRows, ...wombatRows, ...fermiRows,
+    ...dodoRows, ...wombatRows, ...fermiRows, ...eulerRows,
   ];
 }
 
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   // NOTE: Curve StableSwap (segKind 1), Trader Joe LB (segKind 2), DODO V2 (segKind 3), Solidly STABLE
-  // (segKind 4), Wombat (segKind 5), Curve CryptoSwap (segKind 9), WOOFi (segKind 10), Fermi (segKind 11)
-  // and Mento V2 (segKind 13) are NOT read here — all nine are QUOTE-LADDER (QL) venues (see buildQLVenues),
-  // built on-chain from live quotes, so they ship no static sampled segments.
+  // (segKind 4), Wombat (segKind 5), EulerSwap (segKind 7), Curve CryptoSwap (segKind 9), WOOFi (segKind 10),
+  // Fermi (segKind 11) and Mento V2 (segKind 13) are NOT read here — all ten are QUOTE-LADDER (QL) venues (see
+  // buildQLVenues), built on-chain from live quotes, so they ship no static sampled segments.
   const balancerStables = prepared.balancerStables ?? [];
-  const eulerSwaps = prepared.eulerSwaps ?? [];
   const maverickPools = prepared.maverickPools ?? [];
   const fluidPools = prepared.fluidPools ?? [];
   const balancerV3Pools = prepared.balancerV3Pools ?? [];
   return prepared.brackets
     .filter(
       (b) =>
-        // Curve StableSwap / LB / DODO / CryptoSwap / Solidly STABLE / Wombat / WOOFi / Fermi / Mento are
-        // NOT here: all nine are QUOTE-LADDER (QL) venues built ON-CHAIN from live quotes in the solver
-        // setup (see buildQLVenues) — prepare ships only the descriptor, no sampled segments.
+        // Curve StableSwap / LB / DODO / CryptoSwap / Solidly STABLE / Wombat / EulerSwap / WOOFi / Fermi /
+        // Mento are NOT here: all ten are QUOTE-LADDER (QL) venues built ON-CHAIN from live quotes in the
+        // solver setup (see buildQLVenues) — prepare ships only the descriptor, no sampled segments.
         b.kind === EcoBracketKind.BalancerStable ||
-        b.kind === EcoBracketKind.EulerSwap ||
         b.kind === EcoBracketKind.MaverickV2 ||
         b.kind === EcoBracketKind.Fluid ||
         b.kind === EcoBracketKind.BalancerV3,
@@ -421,14 +433,13 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
     })
     .map((b) => {
       const isBalancer = b.kind === EcoBracketKind.BalancerStable;
-      const isEuler = b.kind === EcoBracketKind.EulerSwap;
       const isMaverick = b.kind === EcoBracketKind.MaverickV2;
       const isFluid = b.kind === EcoBracketKind.Fluid;
       const isBalancerV3 = b.kind === EcoBracketKind.BalancerV3;
       // segKind: 1 Curve StableSwap (QL — NOT produced here), 2 LB, 3 DODO, 4 Solidly stable (QL — NOT
-      // produced here), 5 Wombat, 6 Balancer ComposableStable, 7 EulerSwap, 8 Maverick V2, 9 Curve
-      // CryptoSwap (QL — NOT produced here), 10 WOOFi (QL — NOT produced here) — kinds 4/5/7/10 are
-      // callback-free (the pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 =
+      // produced here), 5 Wombat, 6 Balancer ComposableStable, 7 EulerSwap (QL — NOT produced here), 8
+      // Maverick V2, 9 Curve CryptoSwap (QL — NOT produced here), 10 WOOFi (QL — NOT produced here) — kinds
+      // 4/5/7/10 are callback-free (the pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 =
       // quotePotentialSwap + approve + pool.swap (Wombat PULLS via
       // transferFrom), 7 = computeQuote + transfer + pool.swap(...,""), 10 = query + transfer +
       // swap(fromToken,toToken,Σ,minTo,to,rebateTo) (WooPPV2 is
@@ -449,20 +460,18 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // PULLED via Permit2; the reentrancy is contained inside Balancer's Router+Vault, never the cooking
       // contract). The chain-wide Router is cfg[8].
       // segKind 1 (Curve StableSwap) + 2 (Trader Joe LB) + 3 (DODO V2) + 4 (Solidly STABLE) + 5 (Wombat) +
-      // 9 (Curve CryptoSwap) + 10 (WOOFi) + 11 (Fermi) + 13 (Mento V2) are NOT produced here — all nine are
-      // QL venues built on-chain from live quotes (buildQLVenues).
-      const segKind = isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isFluid ? 12n : isBalancerV3 ? 14n : 0n;
+      // 7 (EulerSwap) + 9 (Curve CryptoSwap) + 10 (WOOFi) + 11 (Fermi) + 13 (Mento V2) are NOT produced here —
+      // all ten are QL venues built on-chain from live quotes (buildQLVenues).
+      const segKind = isBalancer ? 6n : isMaverick ? 8n : isFluid ? 12n : isBalancerV3 ? 14n : 0n;
       const venue = isBalancer
                   ? BigInt(balancerStables[b.refIdx].address)
-                  : isEuler
-                    ? BigInt(eulerSwaps[b.refIdx].address)
-                    : isMaverick
-                      ? BigInt(maverickPools[b.refIdx].address)
-                      : isFluid
-                              ? BigInt(fluidPools[b.refIdx].address)
-                              : isBalancerV3
-                                ? BigInt(balancerV3Pools[b.refIdx].address)
-                                : 0n;
+                  : isMaverick
+                    ? BigInt(maverickPools[b.refIdx].address)
+                    : isFluid
+                      ? BigInt(fluidPools[b.refIdx].address)
+                      : isBalancerV3
+                        ? BigInt(balancerV3Pools[b.refIdx].address)
+                        : 0n;
       // venueAux (segs[6]) — the per-segment auxiliary 256-bit value. Now that Mento is a QL venue (its
       // exchangeId travels in the qlv descriptor), no STATIC sampled venue uses it, so it is always 0 here;
       // the column is kept to mirror the 7-field seg row the on-chain merge stream expects.

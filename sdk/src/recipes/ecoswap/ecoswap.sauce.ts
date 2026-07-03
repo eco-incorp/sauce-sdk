@@ -604,7 +604,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -722,6 +722,21 @@ function main(
                                 } else {
                                   IDODOPool.at(qPool).querySellQuote(caller, xNext).catch(() => { ok = 0; });
                                   if (ok === 1) { q = IDODOPool.at(qPool).querySellQuote(caller, xNext)[0]; }
+                                }
+                              } else {
+                                if (HAS_EULER && qKind === 7) {
+                                  // EulerSwap (Euler vault-backed AMM, v1+v2; callback-free): the ladder quote is
+                                  // computeQuote(tokenIn, tokenOut, xNext, true) — the exact-in dy out (the exec
+                                  // re-reads the SAME view for the awarded share). REVERT-class: computeQuote
+                                  // REVERTS SwapLimitExceeded/Expired when xNext exceeds the LIVE vault inLimit/
+                                  // outLimit, so PROBE-THEN-DECODE catches it (ok=0 ⇒ q=0 ⇒ stop). The ladder thus
+                                  // self-truncates at the LIVE vault cap with NO separate getLimits call — the
+                                  // awarded Σ is bounded by live capacity, so the exec computeQuote never reverts
+                                  // on the awarded amount (the cap-revert DoS is gone). qi/qj unused (Euler quotes
+                                  // by tokenIn/tokenOut). A pool that returns a literal 0 at/past its cap instead
+                                  // of reverting also stops, via the q===0 gate below.
+                                  IEulerSwapPool.at(qPool).computeQuote(tokenIn, tokenOut, xNext, true).catch(() => { ok = 0; });
+                                  if (ok === 1) { q = IEulerSwapPool.at(qPool).computeQuote(tokenIn, tokenOut, xNext, true); }
                                 }
                               }
                             }
@@ -1782,9 +1797,11 @@ function main(
   // amount0Out) and EMPTY data — EulerSwap's swap is V2-shaped, so empty data skips the flash callback
   // and the pool sweeps the pre-transferred input + verifies the curve (callback-free). compute-then-
   // pull already transferred `cum` (incl. each EulerSwap share) into this contract above. Vault-cap
-  // edge: computeQuote re-reads the live limits and REVERTS (SwapLimitExceeded / Expired) when the
-  // award exceeds them — that aborts the WHOLE cook, there is NO graceful per-pool skip; only a
-  // literal quote of 0 falls through and leaves the input un-spent for the terminal refund.
+  // safety: the QL ladder already self-truncated at the LIVE inLimit/outLimit (the setup probe caught
+  // computeQuote's SwapLimitExceeded/Expired), so the awarded `eamt` is at/below the last valid ladder
+  // point ⇒ strictly within the live cap ⇒ this exec computeQuote cannot cap-revert on the awarded
+  // amount (the cap-revert DoS is gone). A literal 0 quote (a pool returning 0 at its cap) falls
+  // through and leaves the input un-spent for the terminal refund.
   if (HAS_EULER) {
   for (let e = 0; e < MS_CAP; e = e + 1) {
     const eamt: Uint256 = einp[e];
