@@ -40,6 +40,7 @@ import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math
 import {
   type BalancerV3Pool,
   balancerV3SampleInputs,
+  balancerV3StableGetDy,
   BALANCER_V3_FEE_SCALE,
 } from "./balancer-v3-math.js";
 import { type EulerSwapPool, eulerFeeToPpm } from "./eulerswap-math.js";
@@ -371,6 +372,17 @@ const mentoExchangeProviderAbi = parseAbi([
 //       reentrancy is contained inside Balancer's Router+Vault, never the cooking contract).
 const balancerV3VaultAbi = parseAbi([
   "function getPoolTokens(address pool) external view returns (address[])",
+  "function getCurrentLiveBalances(address pool) external view returns (uint256[])",
+  "function getStaticSwapFeePercentage(address pool) external view returns (uint256)",
+  "function getPoolTokenInfo(address pool) external view returns (address[] tokens, (uint8 tokenType, address rateProvider, bool paysYieldFees)[] tokenInfo, uint256[] balancesRaw, uint256[] lastBalancesLiveScaled18)",
+]);
+// The pool's amplification parameter (A·AMP_PRECISION) — read LIVE by the on-chain solver too.
+const balancerV3PoolAbi = parseAbi([
+  "function getAmplificationParameter() external view returns (uint256 value, bool isUpdating, uint256 precision)",
+]);
+// A WITH_RATE token's rate provider — getRate() is a plain uint256 SCALAR (v12-safe; the solver reads it live).
+const balancerV3RateProviderAbi = parseAbi([
+  "function getRate() external view returns (uint256)",
 ]);
 // querySwapSingleTokenExactIn is declared `external` (NOT view) on-chain — it unlock()s the Vault in
 // QUERY mode and rolls back — but is fully callable via eth_call. Declared `view` HERE so viem's
@@ -2550,16 +2562,73 @@ export async function discoverBalancerV3PoolsTyped(
       if (seen.has(key)) continue;
       seen.add(key);
       try {
-        // Keep only a pool trading BOTH tokenIn and tokenOut (V3 has no BPT in the swappable set).
+        // Keep only a pool trading BOTH tokenIn and tokenOut (V3 has no BPT in the swappable set). Orient the
+        // in/out indices off the REGISTERED token order (getCurrentLiveBalances returns balances in this order).
         const tokens = (await client
           .readContract({ address: vault, abi: balancerV3VaultAbi, functionName: "getPoolTokens", args: [pool] })
           .catch(() => [])) as readonly Hex[];
-        const set = new Set(tokens.map((t) => t.toLowerCase()));
-        if (!set.has(inLc) || !set.has(outLc)) continue;
+        const lc = tokens.map((t) => t.toLowerCase());
+        const inIdx = lc.indexOf(inLc);
+        const outIdx = lc.indexOf(outLc);
+        if (inIdx < 0 || outIdx < 0) continue;
 
-        // Sample the LIVE quote ladder via the Router's querySwapSingleTokenExactIn (rate-provider +
-        // dynamic-surge-fee inclusive). sender = ZERO_ADDRESS (the query needs no tokens/approvals);
-        // userData = "0x".
+        // Read the LIVE StableMath state the on-chain solver replays: scaled-18 balances, amp (A·AMP_PRECISION),
+        // static swap fee, and each token's rate provider (from getPoolTokenInfo → getRate). These are ALSO what
+        // the neutral oracle mirrors (buildBalancerV3QLLadder) at the SAME block ⇒ oracle == solver by construction.
+        const [liveBalances, staticFeeWad, ampRes, tokenInfo] = await Promise.all([
+          client.readContract({ address: vault, abi: balancerV3VaultAbi, functionName: "getCurrentLiveBalances", args: [pool] }).then((r) => r as bigint[]),
+          client.readContract({ address: vault, abi: balancerV3VaultAbi, functionName: "getStaticSwapFeePercentage", args: [pool] }).then((r) => r as bigint),
+          client.readContract({ address: pool, abi: balancerV3PoolAbi, functionName: "getAmplificationParameter" }).then((r) => r as readonly [bigint, boolean, bigint]),
+          client.readContract({ address: vault, abi: balancerV3VaultAbi, functionName: "getPoolTokenInfo", args: [pool] }).then((r) => r as readonly [readonly Hex[], readonly { tokenType: number; rateProvider: Hex; paysYieldFees: boolean }[], readonly bigint[], readonly bigint[]]),
+        ]);
+        const amp = ampRes[0];
+        const rpIn = tokenInfo[1][inIdx]?.rateProvider ?? (ZERO_ADDRESS as Hex);
+        const rpOut = tokenInfo[1][outIdx]?.rateProvider ?? (ZERO_ADDRESS as Hex);
+        if (rpIn === ZERO_ADDRESS || rpOut === ZERO_ADDRESS) continue; // no rate provider → the QL replay can't scale
+
+        // Live per-token rates (SCALARS via each rate provider — the v12-safe read; getPoolTokenRates nests a
+        // dyn array in a tuple which decodes to garbage on v12, so read the provider directly).
+        const [rateIn, rateOut, decInRaw, decOutRaw] = await Promise.all([
+          client.readContract({ address: rpIn, abi: balancerV3RateProviderAbi, functionName: "getRate" }).then((r) => r as bigint),
+          client.readContract({ address: rpOut, abi: balancerV3RateProviderAbi, functionName: "getRate" }).then((r) => r as bigint),
+          client.readContract({ address: tokenIn, abi: erc20DecimalsAbi, functionName: "decimals" }).then((r) => Number(r)),
+          client.readContract({ address: tokenOut, abi: erc20DecimalsAbi, functionName: "decimals" }).then((r) => Number(r)),
+        ]);
+        // The scaled-18 QL replay needs a NON-NEGATIVE decimal exponent (10^(18−d)); a >18-decimal token
+        // would be 10^(negative) → RangeError. Such stable-pool tokens are exotic — skip the pool explicitly
+        // rather than relying on the surrounding try/catch to swallow the throw.
+        if (decInRaw > 18 || decOutRaw > 18) continue;
+        const decScaleIn = 10n ** BigInt(18 - decInRaw);
+        const decScaleOut = 10n ** BigInt(18 - decOutRaw);
+
+        const b3: BalancerV3Pool = {
+          address: pool,
+          router,
+          tokenIn,
+          tokenOut,
+          feePpm: 0,
+          source: `${cfg.label} (Balancer V3)`,
+          vault,
+          inIdx,
+          outIdx,
+          amp,
+          staticFeeWad,
+          liveBalances,
+          rateIn,
+          rateOut,
+          decScaleIn,
+          decScaleOut,
+          rpIn,
+          rpOut,
+        };
+
+        // SURGE-EXCLUSION cross-check. This landing quote-ladders the pool with the STATIC-fee StableMath, which
+        // is wei-exact ONLY when the StableSurge hook is INACTIVE (the swap moves the pool toward balance → the
+        // hook returns exactly the static fee). Sample the REAL Router querySwapSingleTokenExactIn ladder and
+        // compare the StableMath replay at those points: if any point diverges beyond a tiny rounding tolerance,
+        // the surge fee is ACTIVE for this direction/size — the static-fee replay can't reproduce it, so EXCLUDE
+        // the pool (documented scope: surge-active pools are a follow-up lane). Same-block reads ⇒ an inactive
+        // surge agrees to a few wei.
         const quotes = await Promise.all(
           sampleIn.map((amt) =>
             client
@@ -2573,26 +2642,29 @@ export async function discoverBalancerV3PoolsTyped(
               .catch(() => 0n),
           ),
         );
-
-        // Keep only the strictly-positive, non-decreasing prefix of the ladder (a zero/failed quote =
-        // buffer/liquidity limit or an un-queryable pool; a non-increasing out = degenerate).
         const cumIn: bigint[] = [];
         const cumOut: bigint[] = [];
         let prevOut = 0n;
+        let surgeActive = false;
         for (let i = 0; i < sampleIn.length; i++) {
-          const o = quotes[i];
-          if (o <= prevOut) break;
+          const truth = quotes[i];
+          if (truth <= prevOut) break; // limit edge / degenerate — stop the ladder here
+          const replay = balancerV3StableGetDy(b3, sampleIn[i]);
+          // tolerance: max(2 wei, 1e-7 relative) — an INACTIVE surge agrees to rounding; an ACTIVE surge fee
+          // diverges by basis points, far outside this.
+          const diff = replay > truth ? replay - truth : truth - replay;
+          const tol = 2n + truth / 10_000_000n;
+          if (diff > tol) { surgeActive = true; break; }
           cumIn.push(sampleIn[i]);
-          cumOut.push(o);
-          prevOut = o;
+          cumOut.push(truth);
+          prevOut = truth;
         }
+        if (surgeActive) continue; // surge-active pool — out of scope for the static-fee QL replay this landing
         if (cumOut.length === 0 || cumOut[0] <= 0n) continue; // pair not tradeable / no out
 
         // Derive an effective fee (ppm) from the shallowest slice for price-ordering / diagnostics only (a
-        // surge-hooked pool has no single fee getter; the query folds fee + rate scaling in). PAR-PAIR
-        // heuristic — for a non-par pair (differing decimals / non-1:1 rate) the shortfall vs 1:1 is not the
-        // fee, so this is best-effort and 0 when it can't be inferred. The real merge coordinate is
-        // marginalOI from the ladder dy in buildBalancerV3Segments (shared by prepare + oracle).
+        // surge-hooked pool has no single fee getter). PAR-PAIR heuristic — 0 when it can't be inferred. The
+        // real merge coordinate is marginalOI from the QL ladder dy (shared by the solver + oracle).
         let feePpm = 0;
         const in0 = cumIn[0];
         const out0 = cumOut[0];
@@ -2600,17 +2672,10 @@ export async function discoverBalancerV3PoolsTyped(
           const shortfall = ((in0 - out0) * BALANCER_V3_FEE_SCALE) / in0;
           if (shortfall > 0n && shortfall < BALANCER_V3_FEE_SCALE) feePpm = Number(shortfall);
         }
-
-        out.push({
-          address: pool,
-          router,
-          tokenIn,
-          tokenOut,
-          cumIn,
-          cumOut,
-          feePpm,
-          source: `${cfg.label} (Balancer V3)`,
-        });
+        b3.feePpm = feePpm;
+        b3.cumIn = cumIn;
+        b3.cumOut = cumOut;
+        out.push(b3);
       } catch {
         // Pool/router read failed (not a live V3 pool, paused, or unsupported pair) — skip.
       }

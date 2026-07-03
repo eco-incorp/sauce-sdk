@@ -68,7 +68,7 @@ import { buildWooFiSegments, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoSegments, type MentoPool } from "../shared/mento-math.js";
-import { buildBalancerV3Segments, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
+import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
@@ -767,38 +767,6 @@ function buildMentoBrackets(pool: MentoPool, refIdx: number, amountIn: bigint): 
 }
 
 /**
- * Build Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) segments for one venue by
- * DIFFERENCING the LIVE Router querySwapSingleTokenExactIn ladder discovery sampled (NO extra RPC — the
- * (cumIn, cumOut) points are on the descriptor). Each (Δinput, Δoutput) slice becomes a STATIC segment (kind
- * BalancerV3) in unified out/in space, refIdx → the Balancer V3 venue index. The marginal is the POST-FEE +
- * POST-RATE execution price (the Vault folds the static fee + any dynamic surge-hook fee + rate scaling into
- * the query), so it enters the descending-price merge directly as both sqrtAdjNear and sqrtAdjFar. The split
- * is priced at the sampled query SNAPSHOT ladder; the on-chain solver executes CALLBACK-FREE (a LIVE Router
- * querySwapSingleTokenExactIn staticcall for minAmountOut + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) +
- * Router.swapSingleTokenExactIn — the V3 input is PULLED via Permit2; the reentrancy is contained inside
- * Balancer's Router+Vault, never the cooking contract). The executed out re-reads the live query at exec (see
- * balancer-v3-math.ts for the SNAPSHOTTED-QUOTE class).
- */
-function buildBalancerV3Brackets(pool: BalancerV3Pool, refIdx: number, amountIn: bigint): EcoBracket[] {
-  const segs = buildBalancerV3Segments(pool, amountIn);
-  const brackets: EcoBracket[] = [];
-  for (const sm of segs) {
-    brackets.push({
-      kind: EcoBracketKind.BalancerV3,
-      refIdx,
-      sqrtNear: sm.marginalOI,
-      sqrtFar: sm.marginalOI,
-      liquidity: 0n,
-      capacity: sm.capacity,
-      sqrtAdjNear: sm.marginalOI, // marginalOI already nets the fee + rate scaling (post-fee dy)
-      sqrtAdjFar: sm.marginalOI,
-      worstMarginalOI: sm.worstMarginalOI,
-    });
-  }
-  return brackets;
-}
-
-/**
  * Build EulerSwap segments for one pool by sampling the closed-form f/fInverse curve replay (NO extra RPC
  * — pure bigint on the read reserves + static curve params + fee, BOUNDED by the vault inLimit). Each
  * sampled (Δinput, Δoutput) increment becomes a STATIC segment (kind EulerSwap) in unified out/in space,
@@ -1446,30 +1414,35 @@ export async function prepareEcoSwap(
   }
 
   const balancerV3Pools: EcoBalancerV3[] = [];
-  const balancerV3BracketSets: EcoBracket[][] = [];
   // Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) — KNOWN-POOL-ADDRESS discovery
   // (FactoryConfig.address = the CREATE2 Vault singleton, FactoryConfig.balancerV3Pools = the pool addresses,
-  // FactoryConfig.balancerV3Router = the per-chain single-swap Router). Balancer V3 pools price off the Vault
-  // balances + rate providers + a possibly-dynamic StableSurge hook fee — canonical on-chain state, NOT xy=k
-  // — so it is a SAMPLED-SEGMENT source. `discoverBalancerV3PoolsTyped` keeps a pool trading BOTH tokenIn and
-  // tokenOut (via Vault.getPoolTokens — V3 has NO BPT in the swappable set) and SAMPLES the Router's
-  // querySwapSingleTokenExactIn view over [0, amountIn] (it bakes in the rate providers + dynamic surge fee —
-  // the robust surface for plain AND surge pools, which a static StableMath replay could NOT price); the split
-  // is built from that ladder. Executed CALLBACK-FREE (a live Router querySwapSingleTokenExactIn staticcall
-  // for minAmountOut + the Permit2 two-step approval — ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) — +
-  // Router.swapSingleTokenExactIn; the V3 input is PULLED via Permit2, the ONE operational difference from V2,
-  // and the reentrancy is fully contained inside Balancer's own Router + Vault, never the cooking contract).
-  // NO engine change (unlike the V4 unlockCallback path). SNAPSHOTTED-QUOTE class: the split is exact-on-grid
-  // vs the oracle on the shared sampled ladder; the exec re-reads the live query (minAmountOut bounds a bad
-  // fill) — the rate providers accrue + the surge fee moves as the pool re-balances (same snapshot assumption
-  // the recipe documents for Fluid / Mento / WOOFi).
+  // FactoryConfig.balancerV3Router = the per-chain single-swap Router). Balancer V3 is a QUOTE-LADDER (QL)
+  // venue — but a SPECIAL one: its querySwapSingleTokenExactIn is eth_call-ONLY (uncallable on-chain in a
+  // cook), so it CANNOT quote-ladder off a live view like Curve/DODO. Instead the on-chain solver reads the
+  // LIVE Vault state (getCurrentLiveBalances / getAmplificationParameter / getStaticSwapFeePercentage + each
+  // token's rateProvider.getRate — all SCALARS / inline-indexed bare arrays, v12-safe) and REPLAYS the
+  // amplified StableSwap invariant (V3 rounding, live rate scaling) in SauceScript to build the SAME geometric
+  // QL ladder (see ecoswap.sauce.ts / index.ts buildQLVenues; the oracle mirrors it via buildBalancerV3QLLadder).
+  // So prepare ships ONLY the descriptor (pool + in/out indices + rate providers + const decimal scales + the
+  // Vault) — NO off-chain sampled segments. `discoverBalancerV3PoolsTyped` keeps a pool trading BOTH tokenIn
+  // and tokenOut (via Vault.getPoolTokens — V3 has NO BPT in the swappable set), reads the live state, and
+  // CROSS-CHECKS the static-fee StableMath replay against the REAL Router query at the sample points — a pool
+  // whose StableSurge hook is ACTIVE for this direction/size (the replay diverges) is EXCLUDED (documented
+  // scope: surge-active pools are a follow-up lane, since static-fee StableMath cannot reproduce an active
+  // surge fee). Executed CALLBACK-FREE (the Permit2 two-step approval — ERC20.approve(PERMIT2) +
+  // Permit2.approve(ROUTER) — + Router.swapSingleTokenExactIn; the V3 input is PULLED via Permit2, the ONE
+  // operational difference from V2, and the reentrancy is fully contained inside Balancer's own Router + Vault,
+  // never the cooking contract). NO engine change (unlike the V4 unlockCallback path). Because the ladder is
+  // built LIVE on-chain, the split RE-ANCHORS to cook-time balances + rates (wei-exact vs the oracle even after
+  // adverse drift), UNLIKE the prior snapshotted-query approach.
   const balancerV3Configs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.BalancerV3);
   if (balancerV3Configs.length > 0) {
     const b3Raw = await discoverBalancerV3PoolsTyped(tokenIn, tokenOut, client, balancerV3Configs, amountIn);
     for (const bp of b3Raw) {
-      const refIdx = balancerV3Pools.length;
-      const bb = buildBalancerV3Brackets(bp, refIdx, amountIn);
-      if (bb.length === 0) continue;
+      // Liveness probe only — the QL ladder is built ON-CHAIN from live StableMath state, not from prepared
+      // segments; a descriptor that quotes no valid slice at the live state is dropped.
+      const qb = buildBalancerV3QLLadder(bp, amountIn);
+      if (qb.length === 0) continue;
       balancerV3Pools.push({
         address: bp.address,
         router: bp.router,
@@ -1477,11 +1450,16 @@ export async function prepareEcoSwap(
         toToken: bp.tokenOut,
         feePpm: bp.feePpm,
         source: bp.source,
+        vault: bp.vault!,
+        inIdx: bp.inIdx!,
+        outIdx: bp.outIdx!,
+        rpIn: bp.rpIn!,
+        rpOut: bp.rpOut!,
+        decScaleIn: bp.decScaleIn!,
+        decScaleOut: bp.decScaleOut!,
       });
-      balancerV3BracketSets.push(bb);
     }
   }
-  for (const set of balancerV3BracketSets) brackets.push(...set);
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1722,7 +1700,6 @@ export async function prepareEcoSwap(
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
-  const nBalancerV3Segs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerV3).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${balancerStables.length} Balancer-stable, ` +
@@ -1730,10 +1707,9 @@ export async function prepareEcoSwap(
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
       `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
-      `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ` +
+      `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${balancerV3Pools.length} Balancer-V3 QL, ` +
       `${brackets.length} sampled segments (` +
-      `${nBalancerSegs} Balancer-stable, ${nMaverickSegs} Maverick, ` +
-      `${nFluidSegs} Fluid, ${nBalancerV3Segs} Balancer-V3)`,
+      `${nBalancerSegs} Balancer-stable, ${nMaverickSegs} Maverick, ${nFluidSegs} Fluid)`,
   );
 
   const prepared: EcoSwapPrepared = {

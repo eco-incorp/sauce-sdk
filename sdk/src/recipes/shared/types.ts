@@ -772,6 +772,28 @@ export interface EcoBalancerV3 {
   /** Derived ppm fee (the price-ordering coordinate; the on-chain out is the Router querySwap view). */
   feePpm: number;
   source: string;
+
+  // ── QUOTE-LADDER (QL) descriptor fields ──────────────────────────────────────────────────────────────
+  // Balancer V3 is a LIVE-WALK QL venue: the on-chain solver reads the LIVE Vault state (balances / amp /
+  // static fee / each token's rate) at cook and replays the amplified StableSwap invariant to build its price
+  // ladder — so prepare ships ONLY this descriptor (no sampled segments). amp + the static fee are read LIVE
+  // (getAmplificationParameter()[0] / getStaticSwapFeePercentage), so they need NO descriptor slot. `vault` is
+  // threaded chain-wide via the solver cfg. buildQLVenues emits [pool, inIdx, outIdx, feePpm, 14, refIdx, rpIn,
+  // rpOut, decScaleIn, decScaleOut].
+  /** CREATE2 Vault singleton (getCurrentLiveBalances / getStaticSwapFeePercentage target; chain-wide cfg[10]). */
+  vault: Hex;
+  /** tokenIn's Vault token index (the getCurrentLiveBalances slot). */
+  inIdx: number;
+  /** tokenOut's Vault token index. */
+  outIdx: number;
+  /** tokenIn rate provider address (the solver's on-chain getRate() target — a scalar, v12-safe). */
+  rpIn: Hex;
+  /** tokenOut rate provider address. */
+  rpOut: Hex;
+  /** CONST tokenIn decimal scaling factor = 10^(18 − tokenIn.decimals). */
+  decScaleIn: bigint;
+  /** CONST tokenOut decimal scaling factor = 10^(18 − tokenOut.decimals). */
+  decScaleOut: bigint;
 }
 
 /**

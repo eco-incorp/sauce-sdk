@@ -18,6 +18,7 @@ import { IFluidDexPool } from "./IFluidDexPool.json";
 import { IFluidDexResolver } from "./IFluidDexResolver.json";
 import { IMentoBroker } from "./IMentoBroker.json";
 import { IBalancerV3Router } from "./IBalancerV3Router.json";
+import { IBalancerV3Vault } from "./IBalancerV3Vault.json";
 import { IPermit2 } from "./IPermit2.json";
 
 // EcoSwap on-chain solver — FLAT-UNIVERSE multihop LIVE walk (direct pools + routes).
@@ -89,10 +90,19 @@ import { IPermit2 } from "./IPermit2.json";
 //                 Leg L pools = universe indices [baseL, baseL+countL); interL = intermediate token
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
-//   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx] — the QUOTE-LADDER (QL) venue DESCRIPTORS
-//                 (Curve StableSwap segKind 1, Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE
-//                 segKind 4, Wombat segKind 5, Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind
-//                 11, Mento V2 segKind 13). DODO is DIRECTIONAL — qd[1] is isSellBase (tokenIn ==
+//   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx, rpIn, rpOut, decScaleIn, decScaleOut] — the
+//                 QUOTE-LADDER (QL) venue DESCRIPTORS, uniform 10-column width (Curve StableSwap segKind 1,
+//                 Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE segKind 4, Wombat segKind 5,
+//                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Mento V2 segKind 13,
+//                 Balancer V3 segKind 14). Columns 6..9 (rpIn/rpOut/decScaleIn/decScaleOut) are used ONLY by
+//                 Balancer V3 (segKind 14) and are 0 for every other venue: BalV3's querySwap is eth_call-ONLY,
+//                 so instead of quoting a live view it REPLAYS the amplified StableSwap invariant on-chain from
+//                 the LIVE Vault state — getCurrentLiveBalances(pool)[i]/[j] (inline-indexed), amp +
+//                 getStaticSwapFeePercentage(pool) (read live, no descriptor slot), and each token's
+//                 rateProvider.getRate() (rpIn=qd[6]/rpOut=qd[7], scalars) — then upscales the input by
+//                 decScaleIn·rateIn (qd[8]) and downscales the out by decScaleOut·computeRateRoundUp(rateOut)
+//                 (qd[9]); qi/qj are the Vault token indices. The Vault is chain-wide (cfg[10]). DODO is
+//                 DIRECTIONAL — qd[1] is isSellBase (tokenIn ==
 //                 pool._BASE_TOKEN_()): the ladder quotes querySellBase(caller,xNext) or querySellQuote(
 //                 caller,xNext) accordingly. NO sampled values:
 //                 prepare ships only the descriptor (prepare-optional), and the solver BUILDS each venue's
@@ -285,6 +295,76 @@ function qlSliceHead(sliceOut: Uint256, capacity: Uint256): Uint256 {
   return Math.sqrt(Math.mulDiv(sliceOut, Q192, capacity));
 }
 
+// Balancer V3 (segKind 14) 2-token amplified StableSwap out — the LIVE-state replay the QL ladder is built
+// from. Runs in scaled-18 space: `bIn`/`bOut` are the LIVE getCurrentLiveBalances (rate+decimal-scaled) of the
+// in/out token, `dxScaled` the UPSCALED input, `amp` = A·AMP_PRECISION (getAmplificationParameter()[0]),
+// `feeWad` the static swap fee (1e18). The static fee is netted on the input (mulUp); the invariant D
+// (ROUND_DOWN) and the out-balance y (V3 divUpRaw rounding) are each Newton-solved with a converged-flag guard
+// (no break in SauceScript). bit-for-bit with balancer-v3-math.ts `balancerV3StableOut2` (oracle) — the
+// bIn-then-bOut D_P product order is load-bearing for that solver==oracle parity. (Solidity computeInvariant
+// iterates D_P in the pool's REGISTERED array order balances[0..n-1]; matching THAT order exactly for a
+// registered-token1 tokenIn was tried but reordering the two integer divisions diverges on the v12 engine at
+// prod scale — a few wei on the reordered Newton — so BOTH sides keep the bIn-then-bOut order, wei-exact vs
+// the pool on the wired large-balance pool and identical on v1+v12. A thin/low-amp inIdx=1 pool can differ by
+// ≤1-2 wei from the pool's own query; documented follow-up, no fund risk.) Pure arithmetic (no helper-to-helper
+// call), so main()'s qlv loop can call it. Returns the scaled-18 out (main downscales it).
+function stableOut(amp: Uint256, feeWad: Uint256, bIn: Uint256, bOut: Uint256, dxScaled: Uint256): Uint256 {
+  const WAD: Uint256 = 1000000000000000000;
+  const AMP: Uint256 = 1000; // AMP_PRECISION
+  // Top guard (mirrors the oracle balancerV3StableOut2): a zero live balance or a zero scaled input returns 0
+  // rather than dividing by zero (D_P divides by bIn/bOut) or underflowing the mulUp (prod-1 on a Uint256).
+  // Not reachable in practice — discovery drops a pool with no positive quote — but keeps the solver
+  // bit-identical to the oracle's guard.
+  if (bIn === 0 || bOut === 0 || dxScaled === 0) { return 0; }
+  let fee: Uint256 = 0;
+  if (feeWad > 0) { const prod: Uint256 = dxScaled * feeWad; fee = (prod - 1) / WAD + 1; } // mulUp
+  const inUp: Uint256 = dxScaled - fee;
+
+  const att: Uint256 = amp * 2; // ampTimesTotal = amp * n
+  const sumB: Uint256 = bIn + bOut;
+
+  // Newton for the invariant D (computeInvariant, ROUND_DOWN).
+  let D: Uint256 = sumB;
+  let doneD: Uint256 = 0;
+  for (let i = 0; i < 64; i = i + 1) {
+    if (doneD === 0) {
+      let DP: Uint256 = D;
+      DP = DP * D / (bIn * 2);
+      DP = DP * D / (bOut * 2);
+      const prevD: Uint256 = D;
+      const numD: Uint256 = (att * sumB / AMP + DP * 2) * D;
+      const denD: Uint256 = (att - AMP) * D / AMP + 3 * DP;
+      D = numD / denD;
+      if (D > prevD) { if (D - prevD <= 1) { doneD = 1; } }
+      else { if (prevD - D <= 1) { doneD = 1; } }
+    }
+  }
+
+  // Newton for the out-token balance y (computeBalance, V3 divUpRaw rounding).
+  const w0: Uint256 = bIn + inUp; // in balance after adding net amountIn
+  const w1: Uint256 = bOut;       // out balance
+  let PD: Uint256 = 2 * w0;
+  PD = PD * w1 * 2 / D;
+  const inv2: Uint256 = D * D;
+  const c: Uint256 = (1 + (inv2 * AMP - 1) / (att * PD)) * w1; // divUpRaw(inv2*AMP, att*PD) * bOut
+  const bb: Uint256 = w0 + (D * AMP) / att;                    // sum + (D*AMP)/att
+  let y: Uint256 = 1 + (inv2 + c - 1) / (D + bb);              // divUpRaw(inv2 + c, D + bb)
+  let doneY: Uint256 = 0;
+  for (let j = 0; j < 64; j = j + 1) {
+    if (doneY === 0) {
+      const prevY: Uint256 = y;
+      const numY: Uint256 = y * y + c;
+      const denY: Uint256 = 2 * y + bb - D;
+      y = 1 + (numY - 1) / denY; // divUpRaw(numY, denY)
+      if (y > prevY) { if (y - prevY <= 1) { doneY = 1; } }
+      else { if (prevY - y <= 1) { doneY = 1; } }
+    }
+  }
+
+  if (bOut <= y + 1) { return 0; }
+  return bOut - y - 1;
+}
+
 // ── Compile-time protocol-presence flags (conditional compilation) ──
 // Each guards the per-protocol-SEPARABLE on-chain code below. index.ts derives each from the
 // prepared universe and passes them as compiler `defines` (with treeshake on) so a cook carries
@@ -355,6 +435,13 @@ function main(
   // defaults 0 ⇒ byte-identical to the pre-floor solver); production always emits it (index.ts).
   let minOut: Uint256 = 0;
   if (cfg.length > 9) { minOut = cfg[9]; }
+  // cfg[10] = the chain-wide Balancer V3 Vault (CREATE2 singleton, SAME on all chains; 0 when no Balancer V3
+  // venue). The BalancerV3 QL branch reads its LIVE state per slice — getCurrentLiveBalances(pool) (inline-
+  // indexed) + getStaticSwapFeePercentage(pool) — to replay the amplified StableSwap invariant on-chain. One
+  // Vault serves every V3 pool on a chain. OPTIONAL 11th cfg field — guarded by cfg.length so the many venue
+  // EVM tests that hand-build a shorter cfg (no Balancer V3) stay valid; production always emits it (index.ts).
+  let balancerV3Vault: Address = 0;
+  if (cfg.length > 10) { balancerV3Vault = cfg[10]; }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -604,7 +691,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -619,6 +706,37 @@ function main(
         let prevHead: Uint256 = 0;
         let nv: Uint256 = 0;
         let stop: Uint256 = 0;
+        // Balancer V3 (segKind 14): read the LIVE Vault StableMath state ONCE per venue (the querySwap view is
+        // eth_call-only, so we replay the amplified StableSwap invariant on-chain instead of quoting a live view).
+        // getCurrentLiveBalances is a BARE dyn array → INLINE-INDEXED [qi]/[qj], NEVER stored (v1 reverts on a
+        // stored dyn array). amp + static fee are read live (no descriptor slot). rateIn/rateOut are SCALARS via
+        // each token's rate provider (qd[6]/qd[7]) — the v12-safe read. decScaleIn/decScaleOut are the const
+        // descriptor factors (qd[8]/qd[9]). All per-slice q are then a PURE stableOut compute + rate scaling, so
+        // BalancerV3 costs ~6 staticcalls per venue TOTAL (0 per slice), cheaper than a per-slice-quote venue.
+        let b3bIn: Uint256 = 0;
+        let b3bOut: Uint256 = 0;
+        let b3amp: Uint256 = 0;
+        let b3fee: Uint256 = 0;
+        let b3rateIn: Uint256 = 0;
+        let b3rateOut: Uint256 = 0;
+        let b3decIn: Uint256 = 0;
+        let b3decOut: Uint256 = 0;
+        if (HAS_BALANCER_V3 && qKind === 14) {
+          // A V3 pool has exactly 2 swappable tokens. Inline-index the bare getCurrentLiveBalances array by
+          // LITERAL 0/1 (a variable index on an inline array return is not exercised; literals are the proven
+          // path) then select in/out by qi (inIdx). Storing the array in a var reverts on v1, so each element
+          // is a separate inline-indexed staticcall.
+          const b3bal0: Uint256 = IBalancerV3Vault.at(balancerV3Vault).getCurrentLiveBalances(qPool)[0];
+          const b3bal1: Uint256 = IBalancerV3Vault.at(balancerV3Vault).getCurrentLiveBalances(qPool)[1];
+          if (qi === 0) { b3bIn = b3bal0; b3bOut = b3bal1; }
+          else { b3bIn = b3bal1; b3bOut = b3bal0; }
+          b3amp = IBalancerV3Vault.at(qPool).getAmplificationParameter()[0];
+          b3fee = IBalancerV3Vault.at(balancerV3Vault).getStaticSwapFeePercentage(qPool);
+          b3rateIn = IBalancerV3Vault.at(qd[6]).getRate();
+          b3rateOut = IBalancerV3Vault.at(qd[7]).getRate();
+          b3decIn = qd[8];
+          b3decOut = qd[9];
+        }
         for (let k = 0; k < QL_S; k = k + 1) {
           if (stop === 0) {
             let xNext: Uint256 = Math.mulDiv(cumL, QL_RN, QL_RD) + seed;
@@ -745,6 +863,25 @@ function main(
                       }
                     }
                   }
+                }
+              }
+              // Balancer V3 (segKind 14) — COMPUTE, not quote (its query is eth_call-only). The cumulative out
+              // for total input xNext is the FULLY RATE-SCALED StableMath: upscale the input (decimal + live
+              // rate, mulDown), run stableOut (which nets the static fee + solves the invariant/out-balance),
+              // then downscale the out (decimal + computeRateRoundUp(rateOut)). Every read was hoisted to ONE
+              // per-venue block above, so this is pure arithmetic. Bit-for-bit with balancer-v3-math.ts
+              // buildBalancerV3QLLadder ⇒ solver == oracle by construction (verified wei-exact vs the real
+              // querySwapSingleTokenExactIn on v1+v12). The SHARED differencing/head/emit/sort below is unchanged.
+              if (HAS_BALANCER_V3 && qKind === 14) {
+                const B3_WAD: Uint256 = 1000000000000000000;
+                const givenScaled: Uint256 = xNext * b3decIn * b3rateIn / B3_WAD;
+                const outScaled: Uint256 = stableOut(b3amp, b3fee, b3bIn, b3bOut, givenScaled);
+                if (outScaled === 0) {
+                  q = 0;
+                } else {
+                  let rateUp: Uint256 = b3rateOut + 1;
+                  if (b3rateOut / B3_WAD * B3_WAD === b3rateOut) { rateUp = b3rateOut; }
+                  q = outScaled * B3_WAD / (b3decOut * rateUp);
                 }
               }
               if (q === 0) {
@@ -2042,13 +2179,15 @@ function main(
       // static calls"), yet it INTERNALLY unlock()s the Vault, a state write, so under a STATICCALL it reverts
       // the static-call state-change guard. Both fire — the query is an eth_call-only surface, unusable as an
       // on-chain minAmountOut source (unlike Fluid's estimateSwapIn, which self-reverts and so runs under a
-      // plain CALL). The split is ALREADY priced off the sampled ladder at prepare, so we execute the awarded
-      // `b3amt` as a straight exact-in swap with minAmountOut = 0 for THIS leg: exactIn means the Vault computes
-      // the out from the awarded input. There is NO per-leg on-chain floor here, but the WHOLE-TRADE cfg[9]
-      // amountOutMin floor below (main()'s terminal `if (minOut > 0) require(outBal >= minOut)`) now guards this
-      // Balancer V3 leg too: a shortfall on the aggregate tokenOut reverts the whole cook atomically. So a
-      // Balancer V3 leg relies on the off-chain snapshot split (priced off the same live query ladder the oracle
-      // segments) plus the whole-trade floor plus whatever transaction-level slippage the integrator enforces
+      // plain CALL). The split's awarded `b3amt` was priced ON-CHAIN this cook — the solver built the ladder by
+      // replaying the live Vault StableMath (getCurrentLiveBalances / amp / static fee / live rates), so the
+      // award already reflects cook-time state; we execute it as a straight exact-in swap with minAmountOut = 0
+      // for THIS leg: exactIn means the Vault computes the out from the awarded input. There is NO per-leg
+      // on-chain floor here, but the WHOLE-TRADE cfg[9] amountOutMin floor below (main()'s terminal
+      // `if (minOut > 0) require(outBal >= minOut)`) now guards this Balancer V3 leg too: a shortfall on the
+      // aggregate tokenOut reverts the whole cook atomically. So a Balancer V3 leg relies on the on-chain
+      // live-state split (the solver's StableMath replay, mirrored bit-for-bit by the oracle) plus the
+      // whole-trade floor plus whatever transaction-level slippage the integrator enforces
       // around cook(). The per-leg picture still differs from Fluid/Mento, which DO re-quote on-chain (self-
       // reverting views) and pass that as a per-leg minOut; Balancer V3's query is not callable, so no per-leg
       // minOut exists (only the whole-trade floor). Permit2 two-step: ERC20.approve(PERMIT2) then Permit2.approve(token, ROUTER, uint160 amt, uint48

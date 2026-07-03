@@ -74,7 +74,7 @@ import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
-import { buildBalancerV3Segments, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
+import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 
 // ── Input: the TRUE live pool state ──────────────────────────
 
@@ -249,12 +249,13 @@ export interface OptimalPool {
   mento?: MentoPool;
   /**
    * Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) venue — when present this pool
-   * is a BALANCER-V3 venue (NOT any of the above). The oracle enumerates its segments via the SHARED sampler
-   * (buildBalancerV3Segments) from the venue's LIVE Router querySwapSingleTokenExactIn ladder (the same
-   * (cumIn, cumOut) points prepare sampled), so the split is exact-on-grid vs prepare's segments (one shared
-   * ladder). The Balancer V3 marginalOI is the post-fee + post-rate execution price (the query folds the
-   * static fee + any dynamic surge-hook fee + rate scaling in); adjNear == adjFar == marginalOI. All the
-   * other venue fields are ignored when `balancerV3` is set.
+   * is a BALANCER-V3 venue (NOT any of the above). The oracle enumerates its segments via the SHARED QL builder
+   * (buildBalancerV3QLLadder) — the IDENTICAL geometric ladder the on-chain solver builds by replaying the
+   * amplified StableSwap invariant (V3 rounding, live rate scaling) from the LIVE Vault state (balances / amp /
+   * static fee / each token's rateProvider.getRate). The venue descriptor carries those live values (read at the
+   * SAME block the solver reads on-chain), so the oracle == the solver to the wei — even after adverse drift.
+   * The Balancer V3 marginalOI is the post-fee + post-rate execution price; adjNear == adjFar == marginalOI. All
+   * the other venue fields are ignored when `balancerV3` is set.
    */
   balancerV3?: BalancerV3Pool;
 }
@@ -730,16 +731,18 @@ function mentoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
 }
 
 /**
- * Enumerate one Balancer V3 (balancer-v3-monorepo — Vault + per-chain Router) venue's segments via the
- * SHARED sampler (buildBalancerV3Segments) over the venue's LIVE Router querySwapSingleTokenExactIn ladder
- * (the same (cumIn, cumOut) points prepare sampled), so the oracle and prepare emit the IDENTICAL segment
- * grid from the SAME sampled query snapshot (single source), making the split exact-on-grid. The Balancer V3
- * marginalOI is the post-fee + post-rate execution price (the query folds the static fee + any dynamic
- * surge-hook fee + rate scaling in); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Balancer V3 (balancer-v3-monorepo — Vault + per-chain Router) venue's segments via the SHARED
+ * QUOTE-LADDER (buildBalancerV3QLLadder) — the IDENTICAL geometric-slice ladder the on-chain solver builds in
+ * setup by replaying the amplified StableSwap invariant (V3 rounding, live rate scaling) from the LIVE Vault
+ * state (getCurrentLiveBalances / amp / static fee / each rate provider's getRate). The venue descriptor
+ * carries those live values (read at the SAME block the solver reads on-chain), so the oracle's ladder ==
+ * the solver's ladder to the wei — even after adverse drift (the split RE-ANCHORS to cook-time state, unlike
+ * the prior snapshotted-query approach). The StableMath out is post-fee + post-rate ⇒ adjNear == adjFar ==
+ * marginalOI. Awarded as a "pool" venue.
  */
 function balancerV3Segments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildBalancerV3Segments(p.balancerV3!, amountIn)) {
+  for (const s of buildBalancerV3QLLadder(p.balancerV3!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
@@ -970,9 +973,10 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
   for (let i = 0; i < pools.length; i++) {
     const p = pools[i];
     if (p.balancerV3) {
-      // Balancer V3 (Vault + per-chain Router) venue: sampled-segment enumeration via the shared sampler over
-      // the venue's LIVE querySwapSingleTokenExactIn ladder (the same bound prepare samples → identical grid
-      // → exact-on-grid split).
+      // Balancer V3 (Vault + per-chain Router) venue: QUOTE-LADDER enumeration via the shared
+      // buildBalancerV3QLLadder — the IDENTICAL geometric ladder the on-chain solver builds by replaying the
+      // amplified StableSwap invariant from LIVE Vault state (balances / amp / static fee / live rates) → the
+      // split RE-ANCHORS to cook-time state, wei-exact vs the solver by construction (even after drift).
       allSegs.push(...balancerV3Segments(p, i, amountIn));
     } else if (p.mento) {
       allSegs.push(...mentoSegments(p, i, amountIn));

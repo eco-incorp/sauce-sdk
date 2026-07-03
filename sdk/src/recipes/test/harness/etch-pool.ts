@@ -4457,8 +4457,20 @@ export const balancerV3VaultReadAbi = parseAbi([
   "function getPoolTokens(address pool) view returns (address[])",
   "function isPoolRegistered(address pool) view returns (bool)",
   "function getReservesOf(address token) view returns (uint256)",
+  // ── QL StableMath live state (the on-chain solver reads these; the oracle mirrors them) ──
+  "function getCurrentLiveBalances(address pool) view returns (uint256[])",
+  "function getStaticSwapFeePercentage(address pool) view returns (uint256)",
+  "function getPoolTokenInfo(address pool) view returns (address[] tokens, (uint8 tokenType, address rateProvider, bool paysYieldFees)[] tokenInfo, uint256[] balancesRaw, uint256[] lastBalancesLiveScaled18)",
 ]);
 export const balancerV3RouterReadAbi = parseAbi([
   "function querySwapSingleTokenExactIn(address pool, address tokenIn, address tokenOut, uint256 exactAmountIn, address sender, bytes userData) view returns (uint256 amountOut)",
   "function getPermit2() view returns (address)",
+]);
+// The pool's amplification parameter (A·AMP_PRECISION) — read LIVE by the QL StableMath replay.
+export const balancerV3PoolReadAbi = parseAbi([
+  "function getAmplificationParameter() view returns (uint256 value, bool isUpdating, uint256 precision)",
+]);
+// A WITH_RATE token's rate provider — getRate() is a plain uint256 SCALAR (v12-safe read).
+export const balancerV3RateProviderReadAbi = parseAbi([
+  "function getRate() view returns (uint256)",
 ]);

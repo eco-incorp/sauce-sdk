@@ -1,174 +1,84 @@
 /**
  * EcoSwap Balancer V3 (balancer/balancer-v3-monorepo — Vault singleton + per-chain Router) local-EVM
- * integration — the callback-free exec (Permit2-pull) + the snapshotted-quote split model.
+ * integration of the on-chain StableMath QUOTE-LADDER (segKind 14) + the callback-free Permit2 exec.
  *
- * Stands up a local Balancer V3 stack — a per-chain Router (which doubles as the reserve-holding "Vault") + a
- * stable pool + the Permit2 fixture ETCHED at the CANONICAL Permit2 address (the solver hardcodes it) — the
- * BalancerV3.sol fixture, which exposes the REAL VERIFIED SURFACE the recipe hits on-chain:
- * `querySwapSingleTokenExactIn(pool, tokenIn, tokenOut, amountIn, sender, userData)` (the LIVE quote — pure
- * view of the pool's stable-math out; used OFF-CHAIN by the test + discovery, NOT on-chain in the cook — see
- * below), `swapSingleTokenExactIn(...)` (the exec leg: PULLS the input via Permit2.transferFrom(sender, Vault,
- * amountIn, tokenIn) then pays amountOut to the sender — the caller is NEVER re-entered, so it is
- * callback-free), `getPermit2()`, `getPoolTokens(pool)`, and the Permit2 `approve`/`transferFrom`. Deploys the
- * Sauce engine and cooks an EcoSwap whose static-segment cursor consumes Balancer V3 segments (segKind 14) and
- * executes them CALLBACK-FREE: the Permit2 TWO-STEP approval (`token.approve(PERMIT2, +awarded)` +
- * `Permit2.approve(tokenIn, ROUTER, +awarded, expiration)`) + `Router.swapSingleTokenExactIn(pool, tokenIn,
- * tokenOut, +awarded, minAmountOut, deadline, false, "")` — minAmountOut HARDCODED 0, because the
- * Router's querySwapSingleTokenExactIn is eth_call-ONLY (it demands a static-call context via the Vault's
- * quote() yet does a state write, so it is uncallable on-chain in a cook) and the solver has no whole-trade
- * output floor. Balancer V3 is NOT xy=k, so the engine's _swapV2 would mis-price it; the V3 reentrancy is
- * fully contained inside Balancer's own Router + Vault (never the cooking contract), so the swap is
- * callback-free and needs NO engine dispatch. Then asserts:
+ * FIXTURE-GAP NOTE (documented scope). Balancer V3 was migrated from a static off-chain-sampled segment source
+ * to a LIVE-WALK QL venue: the on-chain solver now reads the LIVE Vault StableMath state (getCurrentLiveBalances
+ * / getAmplificationParameter / getStaticSwapFeePercentage + each token's rateProvider.getRate) and REPLAYS the
+ * amplified StableSwap invariant on-chain to build its price ladder. The local `BalancerV3.sol` fixture is a
+ * CONSTANT-PRODUCT stub (a convex query proxy) with NO StableMath state surface — it exposes no
+ * getCurrentLiveBalances / amp / static-fee / rate-provider getters — so it CANNOT exercise the migrated QL
+ * path. Rather than rewrite that fixture into a full StableSwap replica (a fourth copy of the math, high risk of
+ * a subtly-wrong fixture masking or false-failing), this test runs the REAL etched Base graph (the same whole-
+ * graph etch the prod-mirror uses — REAL bytecode, real rate-scaled ERC4626 wrappers, seconds to stand up, NO
+ * fork/RPC). The prod-mirror file is the primary wei-exactness + adverse-drift validation; THIS file is the
+ * fast local-EVM INTEGRATION of the production discovery → prepare → compile → cook path across sizes, plus the
+ * treeshake regression. (The constant-product stub is retained in fixtures/ only for reference / any future
+ * exec-surface-only test.)
  *
- *   (1) SOLO Balancer V3 venue — the on-chain dy the caller receives == the Router's own LIVE
- *       `querySwapSingleTokenExactIn(+share)` to the WEI. This is a CROSS-CHECK: because the fixture's swap
- *       returns exactly what its query view returns and the state is fixed, the exactIn fill (minAmountOut=0)
- *       equals the live query for the awarded share — it does NOT mean the exec re-reads the query on-chain
- *       (it does not; minAmountOut is 0). Per-pool input == the whole trade. NO tolerance on the exec gate;
- *       the off-chain ladder interpolation is only a segment/split diagnostic.
- *   (2) TWO Balancer V3 venues — ONE EcoSwap splits across both (sharing ONE Router = ONE chain-wide cfg[8]);
- *       each leg's received output == the LIVE `querySwapSingleTokenExactIn` for its awarded share to the wei,
- *       and the post-fee marginals equalize within the sampled-grid bound.
- *   (3) TREESHAKE regression cell — compiles the PRODUCTION treeshake define set (HAS_BALANCER_V3 only, all
- *       other segment flags false) and cooks a REAL Balancer V3 fill: guards that HAS_BALANCER_V3 was added to
- *       the segment-head price-merge guard + the accumulator branch + the exec block across the guard triple
- *       (else the segment head is dead under treeshake and the swap lands ZERO — the Balancer-class bug).
- *   (4) STATE MOVES between prepare and cook — the split is priced at the SNAPSHOT ladder, then the pool
- *       re-centers (setState) before the cook. The exactIn exec (minAmountOut=0) yields received == the LIVE
- *       `querySwapSingleTokenExactIn(+awarded)` at the MOVED state, demonstrating the snapshotted-quote model:
- *       exact-on-grid at the snapshot, and the realized out tracks the live state at exec (the rate providers
- *       accrue + the surge fee moves — more exogenous than a fee snapshot). NOTE there is NO on-chain floor on
- *       a Balancer V3 leg (minAmountOut=0, no whole-trade output require) — the fill tracks the live state
- *       unconditionally; a Balancer V3 leg relies on the off-chain split + the integrator's transaction-level
- *       slippage, not a per-leg or whole-trade on-chain minOut. Here the move is UP (a strictly better fill),
- *       so received > the snapshot dy.
+ * Asserts, on BOTH engines (v1 + v12, ECO_ENGINE):
+ *   (1) DISCOVERY — the production FactoryType.BalancerV3 path surfaces the venue as a QL DESCRIPTOR: pool +
+ *       in/out Vault indices + BOTH rate providers (via getPoolTokenInfo) + const decimal scales + the CREATE2
+ *       Vault, and ships NO static segments (brackets == []).
+ *   (2) MULTI-SIZE WEI-EXACT — for several trade sizes, the caller-received tokenOut == the neutral oracle
+ *       (optimalSplit over buildBalancerV3QLLadder off the LIVE state) == the REAL Router's LIVE querySwap of
+ *       the awarded slice, all to the wei. Exercises the ladder differencing / head / emit across slice counts.
+ *   (3) TREESHAKE — a Balancer-V3-only universe compiles (treeshake:true) with HAS_BALANCER_V3 as the ONLY live
+ *       segment/QL flag; the cook lands a NON-ZERO fill, guarding that HAS_BALANCER_V3 is wired across the guard
+ *       QUADRUPLE (the qlv outer guard + the per-venue live-state read + the qlv compute branch + the accumulate
+ *       + the exec) — else the QL ladder is dead under treeshake and the swap lands ZERO (the Balancer-class bug).
  *
- * The Balancer V3 math is OFF-CHAIN only for the SPLIT: the on-chain solver supplies the curve as STATIC
- * (capacity, marginalOI) segments (built by differencing a LIVE Router `querySwapSingleTokenExactIn` ladder
- * sampled off-chain) and never recomputes the stable math. We build the prepared args DIRECTLY, then compile
- * the production solver template exactly as index.ts does and cook it.
- *
- * ISOLATED per-cell chain (the fresh-anvil-per-cell pattern all *.evm.test.ts use). No fork / no RPC env
- * needed — a local fixture etches the whole stack. Runs on v1 (+ v12 when the v12 artifacts are present).
- * Driven by ECO_ENGINE (default v12). Mirrors ecoswap.fluid.evm.test.ts.
+ * Callback-free exec UNCHANGED: the Permit2 two-step (ERC20.approve(PERMIT2) + Permit2.approve(ROUTER)) +
+ * Router.swapSingleTokenExactIn (the V3 input is PULLED via Permit2; the reentrancy is contained inside
+ * Balancer's Router+Vault, never the cooking contract).
  *
  * Run: pnpm --filter './sdk' test:recipes:evm   (or npx tsx --test this file)
  */
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { parseEther, type Abi, type Account, type Hex } from "viem";
+import { type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
-import { compileSauce, ECOSWAP_DIR } from "./harness/compile";
 import { cook } from "./harness/cook";
 import {
   ensureMulticall3,
   deployStack,
-  deploySortedTokens,
-  mint,
   approve,
   balanceOf,
-  erc20Abi,
-  deployBalancerV3,
-  balancerV3RouterAbi,
   type DeployedStack,
   type DeployedV12Stack,
 } from "./harness/setup";
-import { type Engine, engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
-import { MIN_SQRT_RATIO } from "../shared/constants";
 import {
-  getAmountOut as b3GetAmountOut,
-  buildBalancerV3Segments,
-  balancerV3SampleInputs,
-  isqrt,
-  type BalancerV3Pool,
-} from "../shared/balancer-v3-math";
+  etchBalancerV3Graph,
+  loadBalancerV3Snapshots,
+  pinBalancerV3BlockTimestamp,
+  balancerV3VaultReadAbi,
+  balancerV3RouterReadAbi,
+  balancerV3PoolReadAbi,
+  balancerV3RateProviderReadAbi,
+  type EtchedBalancerV3Graph,
+} from "./harness/etch-pool";
+import { type Engine, engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
+import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
+import { type EcoBalancerV3 } from "../shared/types";
+import { ecoSwap } from "../ecoswap/index";
+import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
+import { type BalancerV3Pool } from "../shared/balancer-v3-math";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
-
-const E18 = 10n ** 18n;
-// A deep near-1:1 Balancer V3 stable curve: 1:1 center price, 0.005% fee (50, 1e6-scaled — the real Base
-// pool's static fee). Both tokens 18-dec so the split engages both venues on the flat part.
-const FEE_PPM = 50n;
-const CENTER = E18; // 1:1 center price
+const SNAP_NAME = "base-balancerv3-waUSDCwaGHO";
 const ENGINE_CELLS = engineCells();
+const ZERO = "0x0000000000000000000000000000000000000000" as Hex;
 
-// The PRODUCTION treeshake define set for a Balancer-V3-only universe (no other segment-bearing protocol):
-// index.ts protocolDefines folds every other HAS_* to false. The fast/no-define test path leaves all HAS_*
-// at their source default `true`, masking any merge-head guard that omits HAS_BALANCER_V3 — so this cell
-// compiles with the real treeshaken set and a REAL cook asserts a non-zero Balancer V3 fill.
-const B3_ONLY_DEFINES: Record<string, boolean> = {
-  HAS_V2: false, HAS_V3: false, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
-  HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
-  HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
-  HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: true,
-};
+describe("EcoSwap Balancer V3 (on-chain StableMath QL, real etched graph) — discovery + multi-size wei-exact + treeshake", () => {
+  const snaps = loadBalancerV3Snapshots(SNAP_NAME);
 
-// Balancer-V3-only run: zero direct pools/routes/netCache; the V3 venues ride entirely inside segs (segKind
-// 14). The solver's 5 compiler args, in index.ts order (cfg, pools, netCache, routing, segs). cfg[8] carries
-// the chain-wide Balancer V3 Router address (the query/swap/Permit2-approve target). cfg[6]/cfg[7] (Fluid
-// resolver / Mento broker) are 0 (no such venue).
-function b3Args(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, router: Hex, segs: bigint[][]): unknown[] {
-  return [
-    [
-      BigInt(tokenIn),
-      BigInt(tokenOut),
-      amountIn,
-      BigInt(caller),
-      MIN_SQRT_RATIO + 1n, // priceLimit (unused by static segments)
-      0n, // directCount — no direct pools
-      0n, // cfg[6] — Fluid resolver (none)
-      0n, // cfg[7] — Mento broker (none)
-      BigInt(router), // cfg[8] — chain-wide Balancer V3 Router
-    ],
-    [], // pools
-    [], // netCache
-    [], // routing
-    segs,
-    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
-  ];
-}
-
-// One Balancer V3 venue → its sampled segments as segs rows. refIdx tags the on-chain per-venue accumulator
-// (b3inp[refIdx]); venue is the Vault POOL address. Built from the SAME buildBalancerV3Segments the oracle
-// uses, so the awarded Σ == the off-chain share by construction. segKind = 14; a Balancer V3 segment is a
-// flat post-fee slice ⇒ sqrtAdjNear == sqrtAdjFar.
-function b3SegRows(pool: BalancerV3Pool, refIdx: number, amountIn: bigint): bigint[][] {
-  return buildBalancerV3Segments(pool, amountIn).map((s) => [
-    BigInt(refIdx),
-    s.capacity,
-    s.marginalOI, // sqrtAdjNear (post-fee; the descending-price sort key)
-    s.marginalOI, // sqrtAdjFar (a Balancer V3 segment is a flat slice)
-    14n, // segKind = Balancer V3 (callback-free, Permit2-pull)
-    BigInt(pool.address),
-    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
-  ]);
-}
-
-// Interleave + sort segs rows the way index.ts buildSegs does: DESC by sqrtAdjNear, then DESC by sqrtAdjFar,
-// then by refIdx. The on-chain static-segment cursor consumes them in array order.
-function sortSegs(rows: bigint[][]): bigint[][] {
-  return rows.slice().sort((a, b) => {
-    if (a[2] !== b[2]) return a[2] < b[2] ? 1 : -1;
-    if (a[3] !== b[3]) return a[3] < b[3] ? 1 : -1;
-    return Number(a[0] - b[0]);
-  });
-}
-
-describe("EcoSwap Balancer V3 (Vault + per-chain Router, local fixture) — callback-free Permit2 exec + state-snapshot split", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
   let v12: DeployedV12Stack | null = null;
-  let tokenIn: Hex; // == the V3 pool token0
-  let tokenOut: Hex; // == the V3 pool token1
-  let solverSrc: string;
+  let etched: EtchedBalancerV3Graph;
 
   async function setup(): Promise<void> {
     const prev = anvil;
@@ -178,301 +88,226 @@ describe("EcoSwap Balancer V3 (Vault + per-chain Router, local fixture) — call
     c = await makeClients(anvil.rpcUrl);
     await ensureMulticall3(c.publicClient, c.testClient);
     stack = await deployStack(c.walletClient, c.publicClient);
-    const tk = await deploySortedTokens(c.walletClient, c.publicClient);
-    tokenIn = tk.token0;
-    tokenOut = tk.token1;
-    solverSrc = readFileSync(SOLVER, "utf-8");
-
-    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("50000000"));
-    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
-
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    const callerFund = 100_000n * 10n ** BigInt(snaps.state.tokenInDecimals);
+    etched = await etchBalancerV3Graph(
+      c.walletClient,
+      c.publicClient,
+      c.testClient as unknown as Parameters<typeof etchBalancerV3Graph>[2],
+      anvil.rpcUrl,
+      snaps,
+      { caller: c.account0, callerFund },
+    );
+    await pinBalancerV3BlockTimestamp(
+      c.testClient as unknown as Parameters<typeof pinBalancerV3BlockTimestamp>[0],
+      snaps.state,
+    );
   }
 
   before(setup);
-
   after(() => {
     anvil?.stop();
   });
 
-  async function reset(): Promise<void> {
-    await setup();
-  }
-
-  // Assert the pre-cook invariants the compiled args assume: the caller can pay `amountIn` of tokenIn, the
-  // cook target is approved to pull it, and the Router (Vault) holds enough tokenOut to satisfy the out.
-  async function assertPreCook(
-    caller: Hex, target: Hex, amountIn: bigint, router: Hex, expectedOut: bigint,
-  ): Promise<void> {
-    const callerIn = await balanceOf(c.publicClient, tokenIn, caller);
-    assert.ok(callerIn >= amountIn, `caller tokenIn balance ${callerIn} >= amountIn ${amountIn}`);
-    const allowance = (await c.publicClient.readContract({
-      address: tokenIn, abi: erc20Abi as Abi, functionName: "allowance", args: [caller, target],
-    })) as bigint;
-    assert.ok(allowance >= amountIn, `cook target allowance ${allowance} >= amountIn ${amountIn}`);
-    const vaultOut = await balanceOf(c.publicClient, tokenOut, router);
-    assert.ok(vaultOut >= expectedOut, `Router(Vault) tokenOut reserve ${vaultOut} >= expected out ${expectedOut}`);
-  }
-
-  // Off-chain BalancerV3Pool descriptor for a deployed fixture — SAMPLES the Router's LIVE
-  // querySwapSingleTokenExactIn ladder over [0, amountIn] exactly as discovery does.
-  async function offPool(pool: Hex, router: Hex, amountIn: bigint): Promise<BalancerV3Pool> {
-    const cumIn = balancerV3SampleInputs(amountIn);
-    const cumOut: bigint[] = [];
-    for (const amt of cumIn) cumOut.push(await onQuery(pool, router, amt));
+  function balancerV3PoolConfig(tokenIn: Hex, tokenOut: Hex): ChainPoolConfig {
     return {
-      address: pool, router, tokenIn, tokenOut, cumIn, cumOut, feePpm: Number(FEE_PPM), source: "local-fixture",
+      factories: [
+        {
+          address: etched.vault,
+          poolType: SwapPoolType.UniV2, // inert for Balancer V3 — discovery keys off factoryType
+          factoryType: FactoryType.BalancerV3,
+          label: "Local Balancer V3 (etched real graph)",
+          balancerV3Router: etched.router,
+          balancerV3Pools: [etched.pool],
+        },
+      ],
+      feeTiers: [],
+      baseTokens: [tokenIn, tokenOut],
     };
   }
 
-  // The Router's own on-chain querySwapSingleTokenExactIn view — the engine-independent ground truth for the
-  // executed dy. sender = 0x0, userData = "0x".
-  async function onQuery(pool: Hex, router: Hex, amt: bigint): Promise<bigint> {
-    return (await c.publicClient.readContract({
-      address: router, abi: balancerV3RouterAbi as Abi, functionName: "querySwapSingleTokenExactIn",
-      args: [pool, tokenIn, tokenOut, amt, "0x0000000000000000000000000000000000000000", "0x"],
-    })) as bigint;
+  const rd = (address: Hex, abi: Abi, fn: string, args: unknown[] = []): Promise<unknown> =>
+    c.publicClient.readContract({ address, abi, functionName: fn, args });
+
+  async function onQuery(amt: bigint): Promise<bigint> {
+    return (await rd(etched.router, balancerV3RouterReadAbi as Abi, "querySwapSingleTokenExactIn", [
+      etched.pool,
+      etched.tokenIn,
+      etched.tokenOut,
+      amt,
+      ZERO,
+      "0x",
+    ])) as bigint;
   }
 
-  // Deploy a V3 pool (token0=tokenIn, token1=tokenOut) on a Router. Reuse ONE Router (existingRouter) so both
-  // pools share the chain-wide cfg[8], the production shape. Fund the Router (Vault) with `vaultOut` tokenOut.
-  async function deploy(
-    bal0: bigint, bal1: bigint, vaultOut: bigint, minter: Account, existingRouter?: Hex,
-  ): Promise<{ router: Hex; pool: Hex }> {
-    return deployBalancerV3(
-      c.walletClient, c.publicClient, c.testClient, tokenIn, tokenOut, bal0, bal1, CENTER, FEE_PPM,
-      tokenOut, vaultOut, existingRouter, minter,
-    );
+  /** Neutral-oracle BalancerV3Pool from the LIVE Vault StableMath state (the SAME state the solver reads
+   *  on-chain) + the discovered descriptor (indices / rate providers / const decimal scales). */
+  async function liveOracle(descr: EcoBalancerV3): Promise<BalancerV3Pool> {
+    const [bal, fee, ampRes, rateIn, rateOut] = await Promise.all([
+      rd(etched.vault, balancerV3VaultReadAbi as Abi, "getCurrentLiveBalances", [etched.pool]) as Promise<bigint[]>,
+      rd(etched.vault, balancerV3VaultReadAbi as Abi, "getStaticSwapFeePercentage", [etched.pool]) as Promise<bigint>,
+      rd(etched.pool, balancerV3PoolReadAbi as Abi, "getAmplificationParameter") as Promise<readonly [bigint, boolean, bigint]>,
+      rd(descr.rpIn, balancerV3RateProviderReadAbi as Abi, "getRate") as Promise<bigint>,
+      rd(descr.rpOut, balancerV3RateProviderReadAbi as Abi, "getRate") as Promise<bigint>,
+    ]);
+    return {
+      address: descr.address,
+      router: descr.router,
+      tokenIn: etched.tokenIn,
+      tokenOut: etched.tokenOut,
+      feePpm: descr.feePpm,
+      source: "etched",
+      vault: descr.vault,
+      inIdx: descr.inIdx,
+      outIdx: descr.outIdx,
+      amp: ampRes[0],
+      staticFeeWad: fee,
+      liveBalances: bal,
+      rateIn,
+      rateOut,
+      decScaleIn: descr.decScaleIn,
+      decScaleOut: descr.decScaleOut,
+      rpIn: descr.rpIn,
+      rpOut: descr.rpOut,
+    };
   }
 
-  // ── (1) SOLO Balancer V3 venue — received == query(share) == on-chain view to the WEI ──
-  async function runSolo(engine: Engine): Promise<void> {
-    await reset();
-    const target = cookTarget(engine, stack, v12);
-    const caller = c.account0;
-
-    const { router, pool } = await deploy(20_000_000n * E18, 20_000_000n * E18, 2_000_000n * E18, caller);
-
-    const amountIn = 100_000n * E18;
-    const op = await offPool(pool, router, amountIn);
-    const segRows = b3SegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Balancer V3 segment ladder");
-    const segSum = segRows.reduce((a, r) => a + r[1], 0n);
-    assert.equal(segSum, amountIn, "Balancer V3 segments cover the full amountIn");
-
-    const { bytecodes } = compileSauce(
-      solverSrc, b3Args(tokenIn, tokenOut, amountIn, caller, router, segRows), ECOSWAP_DIR, engine,
+  // ── (1) DISCOVERY — the QL descriptor is fully populated + NO static segments. ──
+  it("discovers the Balancer V3 venue as a QL descriptor (rate providers, vault, decimal scales) + no segments", async () => {
+    await setup();
+    const amountIn = 10_000n * 10n ** BigInt(snaps.state.tokenInDecimals);
+    const { prepared } = await ecoSwap(
+      { tokenIn: etched.tokenIn, tokenOut: etched.tokenOut, amountIn },
+      anvil.rpcUrl,
+      cookTarget("v1", stack, v12),
+      c.account0,
+      balancerV3PoolConfig(etched.tokenIn, etched.tokenOut),
     );
-
-    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    await assertPreCook(caller, target, amountIn, router, await onQuery(pool, router, segSum));
-    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
-    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-    const vaultInBefore = await balanceOf(c.publicClient, tokenIn, router);
-
-    const onViewPre = await onQuery(pool, router, amountIn);
-
-    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "solo Balancer V3 cook() must succeed");
-
-    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
-    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
-    const vaultIn = (await balanceOf(c.publicClient, tokenIn, router)) - vaultInBefore;
-
-    assert.equal(spent, amountIn, "spent == amountIn (the whole trade routed to the Balancer V3 pool)");
-    assert.equal(vaultIn, amountIn, "the Router(Vault) received the full input share (Permit2 pull)");
-    assert.equal(received, onViewPre, "received == on-chain querySwapSingleTokenExactIn view (exact-vs-live-query)");
-    assert.ok(received > 0n, "non-zero Balancer V3 fill through the callback-free Permit2 swap path");
-
-    console.log(`  [BalancerV3 solo:${engine}] spent=${spent} received=${received} (== on-chain query to the wei)`);
-  }
-
-  // ── (2) TWO Balancer V3 venues — split + per-leg exact-in-dy + marginals equalize ──
-  async function runSplit(engine: Engine): Promise<void> {
-    await reset();
-    const target = cookTarget(engine, stack, v12);
-    const caller = c.account0;
-
-    // Two venues at the same 1:1 center but DIFFERENT depth (reserve size) → different marginal curves, so the
-    // water-fill engages BOTH and equalizes their post-fee marginals. A (larger reserves) is flatter/deeper.
-    // BOTH pools share ONE Router (the chain-wide cfg[8]) — exactly the production shape (one Router/chain).
-    const a = await deploy(40_000_000n * E18, 40_000_000n * E18, 3_000_000n * E18, caller);
-    const b = await deploy(8_000_000n * E18, 8_000_000n * E18, 3_000_000n * E18, caller, a.router);
-    const router = a.router;
-
-    const amountIn = 200_000n * E18;
-    const opA = await offPool(a.pool, router, amountIn);
-    const opB = await offPool(b.pool, router, amountIn);
-    const segRows = sortSegs([...b3SegRows(opA, 0, amountIn), ...b3SegRows(opB, 1, amountIn)]);
-
-    const { bytecodes } = compileSauce(
-      solverSrc, b3Args(tokenIn, tokenOut, amountIn, caller, router, segRows), ECOSWAP_DIR, engine,
-    );
-
-    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    // The shared Router(Vault) must cover BOTH pools' output — funded 3M+3M above; assert against Σ query.
-    await assertPreCook(caller, target, amountIn, router, await onQuery(a.pool, router, amountIn));
-    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-    const vaultInBefore = await balanceOf(c.publicClient, tokenIn, router);
-
-    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "two-venue Balancer V3 cook() must succeed");
-
-    const vaultIn = (await balanceOf(c.publicClient, tokenIn, router)) - vaultInBefore;
-    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
-
-    assert.ok(vaultIn > 0n, "the shared Router(Vault) received input");
-    // Reconstruct the per-venue awarded shares off the SAME oracle split (the wei-exact gate is `received`).
-    const shareA = solveShare(opA, opB, amountIn);
-    const shareB = amountIn - shareA;
-    assert.ok(shareA > 0n && shareB > 0n, "both Balancer V3 venues are funded");
-    assert.ok(shareA > shareB, `deeper venue A draws more than B (A ${shareA} > B ${shareB})`);
-
-    // PER-LEG EXACT-VS-LIVE-QUERY: received == query_A(shareA) + query_B(shareB) on-chain.
-    const expected = (await onQuery(a.pool, router, shareA)) + (await onQuery(b.pool, router, shareB));
-    assert.equal(received, expected, "received == Σ on-chain query(per-venue share) to the wei");
-
-    // MARGINALS EQUALIZE within the GRID bound.
-    const margA = marginalAt(opA, shareA);
-    const margB = marginalAt(opB, shareB);
-    const diff = margA > margB ? margA - margB : margB - margA;
-    const relPpm = margA > 0n ? (diff * 1_000_000n) / margA : 0n;
-    assert.ok(relPpm <= 3000n, `Balancer V3 split marginals equalize on the M=24 grid (rel ${relPpm} ppm; A ${margA} B ${margB})`);
-
+    assert.equal((prepared.balancerV3Pools ?? []).length, 1, "discovered exactly the 1 etched Balancer V3 venue");
+    const d = prepared.balancerV3Pools![0];
+    assert.equal(d.address.toLowerCase(), etched.pool.toLowerCase(), "descriptor pool == the etched pool");
+    assert.equal(d.router.toLowerCase(), etched.router.toLowerCase(), "descriptor carries the etched Router");
+    assert.equal(d.vault.toLowerCase(), etched.vault.toLowerCase(), "descriptor carries the CREATE2 Vault (cfg[10])");
+    assert.ok(d.rpIn !== ZERO && d.rpOut !== ZERO, "both rate providers discovered via getPoolTokenInfo");
+    assert.notEqual(d.inIdx, d.outIdx, "in/out Vault indices are distinct");
+    // waUSDC 6d → decScaleIn = 1e12; waGHO 18d → decScaleOut = 1.
+    assert.equal(d.decScaleIn, 10n ** BigInt(18 - snaps.state.tokenInDecimals), "decScaleIn = 10^(18-decIn)");
+    assert.equal(d.decScaleOut, 10n ** BigInt(18 - snaps.state.tokenOutDecimals), "decScaleOut = 10^(18-decOut)");
+    assert.equal((prepared.brackets ?? []).length, 0, "NO static sampled segments — BalV3 is descriptor-only QL");
     console.log(
-      `  [BalancerV3 split:${engine}] A share=${shareA} B share=${shareB} received=${received} ` +
-        `(== Σ query to the wei); marginals A=${margA} B=${margB} (${relPpm} ppm)`,
+      `  [BalancerV3 discovery] pool=${d.address} vault=${d.vault} rpIn=${d.rpIn} rpOut=${d.rpOut} ` +
+        `inIdx=${d.inIdx} outIdx=${d.outIdx} decScaleIn=${d.decScaleIn} decScaleOut=${d.decScaleOut}`,
     );
-  }
+  });
 
-  // ── (3) SOLO Balancer V3 under the PRODUCTION treeshake define set ──
-  async function runSoloTreeshake(engine: Engine): Promise<void> {
-    await reset();
+  // ── (2) MULTI-SIZE WEI-EXACT — the QL ladder differencing across slice counts, both engines. ──
+  const SIZES = [10_000n, 50_000n, 100_000n];
+  async function runSize(engine: Engine, sizeUnits: bigint): Promise<void> {
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
-
-    const { router, pool } = await deploy(20_000_000n * E18, 20_000_000n * E18, 2_000_000n * E18, caller);
-
-    const amountIn = 100_000n * E18;
-    const op = await offPool(pool, router, amountIn);
-    const segRows = b3SegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Balancer V3 segment ladder");
-
-    const { bytecodes } = compileSauce(
-      solverSrc, b3Args(tokenIn, tokenOut, amountIn, caller, router, segRows), ECOSWAP_DIR, engine,
-      { treeshake: true, defines: B3_ONLY_DEFINES },
-    );
+    const tokenIn = etched.tokenIn;
+    const tokenOut = etched.tokenOut;
+    const amountIn = sizeUnits * 10n ** BigInt(snaps.state.tokenInDecimals);
+    const poolConfig = balancerV3PoolConfig(tokenIn, tokenOut);
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    await assertPreCook(caller, target, amountIn, router, await onQuery(pool, router, amountIn));
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      anvil.rpcUrl,
+      target,
+      caller,
+      poolConfig,
+      undefined,
+      engine,
+    );
+    const descr = prepared.balancerV3Pools![0];
+    const op = await liveOracle(descr);
+    const oracle = optimalSplit({ pools: [{ balancerV3: op, feePpm: 0 }] as OptimalPool[], amountIn, zeroForOne: true });
+    const awarded = oracle.perPoolInput[0] ?? 0n;
+    assert.ok(awarded > 0n, "oracle allocates to the venue");
+    const onViewAwarded = await onQuery(awarded);
+
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-
+    // Pin the cook's block clock to the SAME fixed timestamp onQuery read (the latest mined block sits at
+    // snaps.state.blockTimestamp from the setup pin, and eth_call reads that block's ts). Without this the
+    // cook mines a NEW block stamped with the drifted wall clock (real seconds elapse during ecoSwap compile),
+    // so the ERC4626 wrapper rate accrues between the query and the cook — a sub-second drift that only exceeds
+    // wei-equality at the largest size. Pinning both to the same ts keeps received == LIVE query wei-exact.
+    await c.testClient.request({ method: "anvil_setTime", params: [Number(snaps.state.blockTimestamp)] });
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "treeshaken Balancer-V3-only cook() must succeed");
-
+    assert.equal(receipt.status, "success", "cook() succeeds against the REAL Balancer V3 bytecode");
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
 
-    assert.ok(spent > 0n, "treeshaken Balancer-V3-only: non-zero fill (guard triple alive)");
-    assert.equal(received, await onQuery(pool, router, spent), "received == on-chain query(share) to the wei (treeshaken path)");
-
-    console.log(`  [BalancerV3 treeshake:${engine}] spent=${spent} received=${received} (production define set)`);
-  }
-
-  // ── (4) STATE MOVES between prepare and cook — exec stays exact-vs-live-query at the moved state ──
-  async function runStateMoves(engine: Engine): Promise<void> {
-    await reset();
-    const target = cookTarget(engine, stack, v12);
-    const caller = c.account0;
-
-    // Fund with EXTRA tokenOut so the moved-state (larger) output is still covered.
-    const { router, pool } = await deploy(20_000_000n * E18, 20_000_000n * E18, 4_000_000n * E18, caller);
-
-    const amountIn = 100_000n * E18;
-    const opSnapshot = await offPool(pool, router, amountIn); // the SNAPSHOT ladder the split is priced at
-    const snapDy = await onQuery(pool, router, amountIn); // the snapshot query for the whole trade
-    const segRows = b3SegRows(opSnapshot, 0, amountIn); // segments PRICED at the snapshot
-    const { bytecodes } = compileSauce(
-      solverSrc, b3Args(tokenIn, tokenOut, amountIn, caller, router, segRows), ECOSWAP_DIR, engine,
-    );
-
-    // The pool RE-CENTERS between prepare (segs above) and cook to a BETTER token1-per-token0 price (center
-    // 1.01× ⇒ more out) — a strictly better fill.
-    const movedCenter = (CENTER * 101n) / 100n;
-    const setHash = await c.walletClient.writeContract({
-      address: pool, abi: (await import("./harness/setup")).balancerV3PoolAbi as Abi, functionName: "setState",
-      args: [movedCenter, FEE_PPM],
-      account: c.walletClient.account as Account, chain: c.walletClient.chain,
-    });
-    await c.publicClient.waitForTransactionReceipt({ hash: setHash });
-
-    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    const liveOut = await onQuery(pool, router, amountIn); // LIVE query at the moved state — the exec ground truth
-    await assertPreCook(caller, target, amountIn, router, liveOut);
-    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
-    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-
-    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "state-moved Balancer V3 cook() must succeed");
-
-    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
-    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
-
-    assert.equal(spent, amountIn, "the whole trade routed to the single Balancer V3 pool");
-    assert.equal(received, liveOut, "received == on-chain LIVE query at the moved state (exact-vs-live-query)");
-    assert.ok(received > snapDy, "moved (re-centered up) state yields more than the snapshot dy");
-
-    console.log(
-      `  [BalancerV3 state-move:${engine}] spent=${spent} received=${received} ` +
-        `(snapshot dy=${snapDy} < live dy — exact-vs-live-query at the moved state)`,
-    );
-  }
-
-  // Post-fee out/in marginal price at a cumulative input `share` — a small finite-difference slice.
-  function marginalAt(pool: BalancerV3Pool, share: bigint): bigint {
-    if (share <= 0n) return 0n;
-    const eps = share / 1000n > 0n ? share / 1000n : 1n;
-    const lo = share - eps > 0n ? share - eps : 0n;
-    const dIn = share - lo;
-    const dOut = b3GetAmountOut(pool, share) - b3GetAmountOut(pool, lo);
-    if (dIn <= 0n || dOut <= 0n) return 0n;
-    return isqrt((dOut * (1n << 192n)) / dIn);
-  }
-
-  // Solve the two-venue water-fill share off the SHARED oracle segment ladders (the same
-  // buildBalancerV3Segments the solver consumes) — a pure off-chain replay of the merge for THIS pair, so we
-  // can name the per-leg shares for the wei-exact gate. Merge both venues' segments in descending marginalOI,
-  // accumulate per-venue capacity until Σ == amountIn.
-  function solveShare(opA: BalancerV3Pool, opB: BalancerV3Pool, amountIn: bigint): bigint {
-    const rows: { idx: number; cap: bigint; m: bigint }[] = [];
-    for (const s of buildBalancerV3Segments(opA, amountIn)) rows.push({ idx: 0, cap: s.capacity, m: s.marginalOI });
-    for (const s of buildBalancerV3Segments(opB, amountIn)) rows.push({ idx: 1, cap: s.capacity, m: s.marginalOI });
-    rows.sort((x, y) => (x.m !== y.m ? (x.m < y.m ? 1 : -1) : 0));
-    let cum = 0n;
-    let shareA = 0n;
-    for (const r of rows) {
-      if (cum >= amountIn) break;
-      let take = r.cap;
-      if (cum + take > amountIn) take = amountIn - cum;
-      if (r.idx === 0) shareA += take;
-      cum += take;
-    }
-    return shareA;
+    assert.ok(spent > 0n && received > 0n, "non-zero fill");
+    assert.equal(spent, awarded, "spent == oracle awarded input (wei-exact)");
+    assert.equal(received, onViewAwarded, "received == REAL Router LIVE querySwap(awarded) (exact-in-dy)");
+    console.log(`  [BalancerV3 size:${engine}:${sizeUnits}k] spent=${spent} received=${received} (wei-exact vs oracle+query)`);
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`BalancerV3 solo [${engine}] — received == query(share) == on-chain view to the wei (exact-vs-live-query)`, { skip }, async () => {
-      await runSolo(engine);
-    });
-    it(`BalancerV3 split [${engine}] — two venues, per-leg exact-vs-live-query + marginals equalize`, { skip }, async () => {
-      await runSplit(engine);
-    });
-    it(`BalancerV3 solo treeshake [${engine}] — production define set lands a non-zero fill`, { skip }, async () => {
-      await runSoloTreeshake(engine);
-    });
-    it(`BalancerV3 state moves [${engine}] — split priced at snapshot, exec exact-vs-live-query at the live state`, { skip }, async () => {
-      await runStateMoves(engine);
+    for (const s of SIZES) {
+      it(`BalancerV3 QL [${engine}] size ${s}k — received == oracle == LIVE query to the wei`, { skip }, async () => {
+        await runSize(engine, s);
+      });
+    }
+  }
+
+  // ── (3) TREESHAKE — a Balancer-V3-only universe treeshakes to HAS_BALANCER_V3 only + lands a non-zero fill. ──
+  async function runTreeshake(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+    const tokenIn = etched.tokenIn;
+    const tokenOut = etched.tokenOut;
+    const amountIn = 25_000n * 10n ** BigInt(snaps.state.tokenInDecimals);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+
+    // The production ecoSwap() compiles with treeshake:true + protocolDefines(prepared); for a Balancer-V3-only
+    // universe that is HAS_BALANCER_V3 as the ONLY live segment/QL flag (every other HAS_* folds away). So this
+    // cook IS the treeshake regression: if HAS_BALANCER_V3 were not wired across the qlv guard / per-venue
+    // live-state read / compute branch / accumulate / exec, the ladder would be dead under treeshake and the
+    // fill would be ZERO.
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      anvil.rpcUrl,
+      target,
+      caller,
+      balancerV3PoolConfig(tokenIn, tokenOut),
+      undefined,
+      engine,
+    );
+    assert.equal(prepared.pools.length, 0, "Balancer-V3-only universe (no direct V2/V3/V4 pools)");
+    assert.equal((prepared.balancerV3Pools ?? []).length, 1, "one QL venue");
+    const op = await liveOracle(prepared.balancerV3Pools![0]);
+    const oracle = optimalSplit({ pools: [{ balancerV3: op, feePpm: 0 }] as OptimalPool[], amountIn, zeroForOne: true });
+    const awarded = oracle.perPoolInput[0] ?? 0n;
+    // Ground-truth query for the awarded share BEFORE the cook (the cook is a real swap that moves the pool).
+    const onViewAwarded = await onQuery(awarded);
+
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    // Pin the cook clock to the fixed snapshot ts (same reason as runSize) so the wrapper rate does not
+    // accrue between onQuery and the cook.
+    await c.testClient.request({ method: "anvil_setTime", params: [Number(snaps.state.blockTimestamp)] });
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "treeshaken Balancer-V3-only cook() must succeed");
+    const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+
+    assert.ok(spent > 0n, "treeshaken Balancer-V3-only: NON-ZERO fill (guard quadruple alive)");
+    assert.equal(spent, awarded, "treeshaken spent == oracle awarded (wei-exact)");
+    assert.equal(received, onViewAwarded, "treeshaken received == LIVE query(share) to the wei");
+    console.log(`  [BalancerV3 treeshake:${engine}] spent=${spent} received=${received} (HAS_BALANCER_V3-only define set)`);
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`BalancerV3 treeshake [${engine}] — Balancer-V3-only define set lands a non-zero QL fill`, { skip }, async () => {
+      await runTreeshake(engine);
     });
   }
 });
