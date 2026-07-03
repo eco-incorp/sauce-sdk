@@ -51,14 +51,16 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
 import { cook } from "./harness/cook";
+import { writeAndWait } from "./harness/deploy";
 import {
   ensureMulticall3,
   deployStack,
+  erc20Abi,
   mint,
   approve,
   balanceOf,
@@ -94,6 +96,12 @@ const ENGINE_CELLS = engineCells();
 function toRState(r: number): RState {
   return r === 1 ? RState.ABOVE_ONE : r === 2 ? RState.BELOW_ONE : RState.ONE;
 }
+
+/** The DSP trade surface (transfer-first, exactly what the engine `_swapDODOV2` calls). */
+const dodoSellAbi = parseAbi([
+  "function sellBase(address to) returns (uint256 receiveQuoteAmount)",
+  "function sellQuote(address to) returns (uint256 receiveBaseAmount)",
+]);
 
 describe("EcoSwap DODO V2 (DSP) prod-mirror — REAL bytecode, no fork, offline", () => {
   const snaps = loadDodoSnapshots(SNAP_NAME);
@@ -261,6 +269,104 @@ describe("EcoSwap DODO V2 (DSP) prod-mirror — REAL bytecode, no fork, offline"
     );
   });
 
+  /** Off-chain DodoPool descriptor read from the pool's LIVE getPMMStateForCall (not the capture) —
+   *  the post-swap re-anchor path prepare.ts takes. */
+  async function liveOffPool(sellBase: boolean): Promise<DodoPool> {
+    const pmm = (await c.publicClient.readContract({
+      address: etched.pool, abi: dodoPoolReadAbi, functionName: "getPMMStateForCall",
+    })) as readonly bigint[];
+    return {
+      poolType: SwapPoolType.DODOV2,
+      address: etched.pool,
+      baseToken: etched.baseToken,
+      quoteToken: etched.quoteToken,
+      sellBase,
+      i: pmm[0], K: pmm[1], B: pmm[2], Q: pmm[3], B0: pmm[4], Q0: pmm[5],
+      R: toRState(Number(pmm[6])),
+      lpFeeRate: etched.lpFeeRate,
+      mtFeeRate: etched.mtFeeRate,
+      feePpm: 0,
+      source: "prod-mirror-live",
+    };
+  }
+
+  /** Assert getDy == the REAL pool's own querySell* at every ladder point, to the WEI. */
+  async function assertLadder(pool: DodoPool, pays: bigint[], label: string): Promise<void> {
+    for (const pay of pays) {
+      const fn = pool.sellBase ? "querySellBase" : "querySellQuote";
+      const view = (await c.publicClient.readContract({
+        address: etched.pool, abi: dodoPoolReadAbi, functionName: fn, args: [c.account0, pay],
+      })) as readonly [bigint, bigint];
+      assert.ok(view[0] > 0n, `${label}: REAL ${fn}(${pay}) yields a real output`);
+      assert.equal(getDy(pool, pay), view[0], `${label}: getDy(${pay}) == REAL ${fn} (wei-exact)`);
+    }
+  }
+
+  // ── QUADRATIC R-state legs vs the REAL bytecode — engine-independent differential ladders. ──
+  //
+  // The captured DSP sits at R == ABOVE_ONE, where the cook path's sellBase (below the boundary)
+  // exercises ONLY the _GeneralIntegrate leg — a replay that mis-solves
+  // _SolveQuadraticFunctionForTrade would sail through the wei-exact cook assert. This cell pins
+  // every QUADRATIC dispatch leg against the REAL etched bytecode at non-round ladder points
+  // (odd divisors → non-terminating wei values stress the rounding directions), then EXECUTES a
+  // real boundary-crossing swap so the BELOW_ONE legs run on genuine post-trade state.
+  it("QUADRATIC R-state legs — off-chain replay == REAL bytecode querySell* at every ladder point", async () => {
+    await setup(); // pristine captured state (the integrity cell shares the before() anvil)
+    const caller = c.account0;
+
+    // (a) ABOVE_ONE sellQuote → _RAboveSellQuoteToken: the PURE quadratic on the captured state.
+    const aboveQuote = await liveOffPool(false);
+    assert.equal(aboveQuote.R, RState.ABOVE_ONE, "captured pool sits at ABOVE_ONE");
+    const q = etched.quoteReserve;
+    await assertLadder(aboveQuote, [q / 97n, q / 13n, q / 3n, (q * 7n) / 9n], "ABOVE_ONE sellQuote (quadratic)");
+
+    // (b) ABOVE_ONE sellBase AT/PAST back-to-one → the two-part backToOneReceiveQuote +
+    // _ROneSellBaseToken quadratic remainder (plus the just-below clamp edge).
+    const aboveBase = await liveOffPool(true);
+    const backToOnePayBase = aboveBase.B0 - aboveBase.B;
+    await assertLadder(
+      aboveBase,
+      [backToOnePayBase - 1n, backToOnePayBase, backToOnePayBase + 1n, (backToOnePayBase * 13n) / 9n, backToOnePayBase * 3n],
+      "ABOVE_ONE sellBase crossing (quadratic remainder)",
+    );
+
+    // (c) EXECUTE a real crossing sellBase on the REAL bytecode (transfer-first — exactly the
+    // engine `_swapDODOV2` surface): realized output == the pre-swap replay, R moves BELOW_ONE.
+    const payBase = (backToOnePayBase * 13n) / 9n;
+    const expectedOut = getDy(aboveBase, payBase);
+    const outBefore = await balanceOf(c.publicClient, etched.quoteToken, caller);
+    await writeAndWait(c.walletClient, c.publicClient, {
+      address: etched.baseToken, abi: erc20Abi as Abi, functionName: "transfer", args: [etched.pool, payBase],
+    });
+    await writeAndWait(c.walletClient, c.publicClient, {
+      address: etched.pool, abi: dodoSellAbi as Abi, functionName: "sellBase", args: [caller],
+    });
+    const received = (await balanceOf(c.publicClient, etched.quoteToken, caller)) - outBefore;
+    assert.equal(received, expectedOut, "REAL executed crossing sellBase == pre-swap getDy (wei-exact)");
+
+    // (d) LIVE BELOW_ONE sellBase → _RBelowSellBaseToken: the pure quadratic on post-trade state.
+    const belowBase = await liveOffPool(true);
+    assert.equal(belowBase.R, RState.BELOW_ONE, "the executed crossing moved R to BELOW_ONE");
+    const b = belowBase.B;
+    await assertLadder(belowBase, [b / 97n, b / 13n, b / 3n], "BELOW_ONE sellBase (quadratic)");
+
+    // (e) LIVE BELOW_ONE sellQuote below/at/past ITS boundary → _RBelowSellQuoteToken
+    // (GeneralIntegrate + clamp) then the two-part _ROneSellQuoteToken quadratic remainder.
+    const belowQuote = await liveOffPool(false);
+    const backToOnePayQuote = belowQuote.Q0 - belowQuote.Q;
+    await assertLadder(
+      belowQuote,
+      [backToOnePayQuote / 3n, backToOnePayQuote - 1n, backToOnePayQuote, backToOnePayQuote + 1n, (backToOnePayQuote * 11n) / 7n],
+      "BELOW_ONE sellQuote crossing",
+    );
+
+    console.log(
+      `  [dodo-prod-mirror] QUADRATIC ladders wei-exact vs REAL bytecode: ABOVE sellQuote ×4, ` +
+        `crossing sellBase ×5, executed crossing (${payBase} base -> ${received} quote), ` +
+        `BELOW sellBase ×3, BELOW sellQuote ×5`,
+    );
+  });
+
   // ── (b)+(c) FAST/OFFLINE run through the production discovery path, wei-exact vs the oracle. ──
   async function runProdMirror(engine: Engine): Promise<void> {
     await setup();
@@ -344,12 +450,12 @@ describe("EcoSwap DODO V2 (DSP) prod-mirror — REAL bytecode, no fork, offline"
 
     // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance.
     // (DODO is a SAMPLED-SEGMENT venue: buildDodoSegments samples the PMM curve on a squared-index
-    // geometric grid capped at amountIn, and the strictly-descending-marginal guard drops the final
-    // near-saturation slice — so the awarded Σ is the grid's covered capacity, a small documented
-    // tail below amountIn, NOT the full amountIn. The engine's static-segment cursor consumes the
-    // IDENTICAL grid, so spent == the oracle's awarded Σ == oracle.totalInput to the WEI. This is
-    // the correct exact-on-grid property for DODO — a full-fill amountIn assertion would be false
-    // for any sampled-segment source, so we assert the grid Σ, not amountIn.)
+    // geometric grid capped at amountIn; the isotonic merge folds non-descending slices but a
+    // zero-output near-saturation slice is dropped — so the awarded Σ is the grid's covered
+    // capacity, which MAY sit a small documented tail below amountIn (here the trade is far from
+    // saturation, so the grid covers amountIn fully). The engine's static-segment cursor consumes
+    // the IDENTICAL grid, so spent == the oracle's awarded Σ == oracle.totalInput to the WEI —
+    // the exact-on-grid property; we assert the grid Σ, not a full amountIn fill.)
     assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
     assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
     // The awarded grid Σ is at most amountIn; the unfilled tail is the DODO segment-grid remainder

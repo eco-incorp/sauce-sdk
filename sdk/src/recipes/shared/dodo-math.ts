@@ -24,18 +24,22 @@
  * the reason DODO is tractable on the wei-exact bar.
  *
  * SOURCE MIRRORED — DODO V2 `PMMPricing` + `DODOMath` + `DecimalMath` (the canonical
- * DODOEX/contractV2 + DODOEX/dodo-smart-contract libraries; the same math the DVM/DSP/DPP pools run):
+ * DODOEX/contractV2 libraries; the same math the DVM/DSP/DPP pools run):
  *   - `DODOMath._GeneralIntegrate(V0, V1, V2, i, k)` — the R!=ONE fair-amount integral.
- *   - `DODOMath._SolveQuadraticFunctionForTrade(Q0, Q1, ideltaB, deltaBSig, k)` — the ONE / R-flip
- *     quadratic solve (the 5-arg signed form; the contractV2 4-arg `(V0,V1,delta,i,K)` wrapper
- *     feeds it `ideltaB = mulFloor(i, delta)` with `deltaBSig=false`).
+ *     `fairAmount = i·(V1−V2)` RAW (1e36-ish units), `V0V0V1V2 = divFloor(V0²/V1, V2)`, one final
+ *     `/(1e36)` — plus the `k==0` shortcut and the `V0 > 0` require.
+ *   - `DODOMath._SolveQuadraticFunctionForTrade(V0, V1, delta, i, k)` — the sell-side quadratic:
+ *     solves for the NEW counter-reserve `V2 = divCeil(−b + √(b²+4(1−k)kV0²), 2(1−k))` and returns
+ *     the RECEIVE amount `V1 − V2` (0 when `V2 > V1`), with the `k==0` (`min(i·delta, V1)`) and
+ *     `k==ONE` (closed-form `V1·temp/(temp+ONE)`, uint256-overflow-guarded temp) special cases.
+ *     `b` is accumulated in RAW units (`part2 = kV0²/V1 + i·delta` vs `(1−k)V1`) and divided by
+ *     ONE once, AFTER the signed subtraction.
  *   - `PMMPricing.sellBaseToken` / `sellQuoteToken` — the R-state dispatch (ONE / ABOVE_ONE /
  *     BELOW_ONE) and the boundary-crossing two-part integration (integrate back to R==ONE, then
- *     `_ROneSell*` the remainder).
- *   - `DecimalMath`: ONE = 1e18; mulFloor(a,b)=a*b/1e18 (== `DecimalMath.mul`); divFloor(a,b)=
- *     a*1e18/b; divCeil(a,b)=ceil(a*1e18/b); reciprocalFloor(t)=1e36/t. `_GeneralIntegrate` uses
- *     mulFloor for `fairAmount`/`penalty`, divCeil for `V0V0V1V2`; the quadratic uses divFloor
- *     (deltaBSig) / divCeil (!deltaBSig) for the final divide. Reproduced bit-for-bit so the
+ *     `_ROneSell*` the remainder). The quadratic legs pass the RAW pay amount + `i` (or `1/i`)
+ *     straight through — there is NO pre-multiplied `mulFloor(i, pay)` step.
+ *   - `DecimalMath`: ONE = 1e18; mulFloor(a,b)=a*b/1e18; divFloor(a,b)=a*1e18/b;
+ *     divCeil(a,b)=ceil(a*1e18/b); reciprocalFloor(t)=1e36/t. Reproduced bit-for-bit so the
  *     off-chain `effOut` equals the engine `_swapDODOV2` realized output to the wei.
  *   - Fees: `receiveAmount` is netted by the LP fee then the MT fee, both `mulFloor(receiveAmount,
  *     rate)` with the rate 1e18-scaled (`_LP_FEE_RATE_` + the MT fee-rate model). The combined fee
@@ -47,11 +51,11 @@
  *
  * Sources:
  *   https://github.com/DODOEX/contractV2/blob/main/contracts/lib/PMMPricing.sol
- *   https://github.com/DODOEX/dodo-smart-contract/blob/master/contracts/lib/DODOMath.sol
+ *   https://github.com/DODOEX/contractV2/blob/main/contracts/lib/DODOMath.sol
  *   https://github.com/DODOEX/contractV2/blob/main/contracts/lib/DecimalMath.sol
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / curve-math / lb-math Q192). */
 export const Q192 = 1n << 192n;
@@ -96,71 +100,111 @@ function reciprocalFloor(t: bigint): bigint {
 
 // ── DODOMath — verbatim ──────────────────────────────────────────────────────
 
+/** uint256 max — mirrors the contract's raw-multiply overflow check in the k==ONE trade solve. */
+const MAX_UINT256 = (1n << 256n) - 1n;
+
 /**
  * `_GeneralIntegrate(V0, V1, V2, i, k)` — DODOMath verbatim.
  *
- *   fairAmount = mulFloor(i, V1 - V2)
- *   V0V0V1V2   = divCeil(V0*V0/V1, V2)
+ *   require(V0 > 0)                      // TARGET_IS_ZERO — replayed as 0 (the pool reverts)
+ *   fairAmount = i * (V1 - V2)           // RAW i·delta — NOT mulFloor'd
+ *   if k == 0: return fairAmount / ONE
+ *   V0V0V1V2   = divFloor(V0*V0/V1, V2)
  *   penalty    = mulFloor(k, V0V0V1V2)
- *   return mulFloor(fairAmount, ONE - k + penalty)
+ *   return (ONE - k + penalty) * fairAmount / ONE2
  *
  * The integral of the PMM marginal price over [V2, V1] with reference reserve V0 and slippage k.
+ * The single final /1e36 (instead of two staged /1e18 floors) is load-bearing for wei-exactness.
  */
 export function generalIntegrate(V0: bigint, V1: bigint, V2: bigint, i: bigint, k: bigint): bigint {
-  const fairAmount = mulFloor(i, V1 - V2);
-  const V0V0V1V2 = divCeil((V0 * V0) / V1, V2);
+  if (V0 <= 0n) return 0n;
+  const fairAmount = i * (V1 - V2);
+  if (k === 0n) return fairAmount / DODO_ONE;
+  const V0V0V1V2 = divFloor((V0 * V0) / V1, V2);
   const penalty = mulFloor(k, V0V0V1V2);
-  return mulFloor(fairAmount, DODO_ONE - k + penalty);
+  return ((DODO_ONE - k + penalty) * fairAmount) / (DODO_ONE * DODO_ONE);
 }
 
 /**
- * `_SolveQuadraticFunctionForTrade(Q0, Q1, ideltaB, deltaBSig, k)` — DODOMath verbatim (the 5-arg
- * signed form). Solves the PMM quadratic for the new reserve, returning the receive amount.
+ * `_SolveQuadraticFunctionForTrade(V0, V1, delta, i, k)` — DODOMath verbatim. Solves the PMM
+ * quadratic for the NEW counter-reserve V2 and returns the RECEIVE amount `V1 - V2` (what the
+ * trader gets out), NOT V2 itself.
  *
- *   kQ02Q1 = mulFloor(k, Q0)*Q0/Q1
- *   b      = mulFloor(ONE - k, Q1)
- *   if deltaBSig: b += ideltaB   else: kQ02Q1 += ideltaB
- *   minusbSig: if b >= kQ02Q1 { b -= kQ02Q1; +true } else { b = kQ02Q1 - b; false }
- *   squareRoot = sqrt( b*b + mulFloor( (ONE-k)*4, mulFloor(k, Q0)*Q0 ) )
- *   denominator = (ONE - k)*2
- *   numerator = minusbSig ? b + squareRoot : squareRoot - b
- *   return deltaBSig ? divFloor(numerator, denominator) : divCeil(numerator, denominator)
+ *   require(V0 > 0); delta == 0 → 0
+ *   k == 0   → min(mulFloor(i, delta), V1)
+ *   k == ONE → temp = i*delta*V1/(V0*V0)  (uint256-overflow-guarded: falls back to
+ *              delta*V1/V0*i/V0 when idelta*V1 wraps); return V1*temp/(temp+ONE)
+ *   else:
+ *     part2 = k*V0/V1*V0 + i*delta        // RAW (1e18·token) units
+ *     bAbs  = (ONE - k) * V1              // RAW
+ *     bSig  = part2 > bAbs (b positive); bAbs = |bAbs - part2| / ONE   // ONE divide AFTER the sub
+ *     squareRoot = sqrt( bAbs² + mulFloor((ONE-k)*4, mulFloor(k, V0)*V0) )
+ *     numerator  = bSig ? squareRoot - bAbs (revert if 0) : bAbs + squareRoot
+ *     V2 = divCeil(numerator, (ONE - k)*2)   // divCeil UNCONDITIONALLY
+ *     return V2 > V1 ? 0 : V1 - V2
  *
- * Note `.sqrt()` here is the plain integer sqrt of a 1e18-scaled square (DODO's `b*b` and the
- * penalty term are already in (1e18)^2 units, so the integer sqrt lands back in 1e18 units).
+ * Note `.sqrt()` here is the plain integer sqrt of a 1e18-scaled square (`bAbs²` and the penalty
+ * term are already in (1e18)² units, so the integer sqrt lands back in 1e18 units). The contract's
+ * reverts (V0 == 0, numerator == 0) are replayed as 0 — a pool whose querySell* would revert
+ * contributes no output, so the sampler awards it nothing.
  */
 export function solveQuadraticForTrade(
-  Q0: bigint,
-  Q1: bigint,
-  ideltaB: bigint,
-  deltaBSig: boolean,
+  V0: bigint,
+  V1: bigint,
+  delta: bigint,
+  i: bigint,
   k: bigint,
 ): bigint {
-  let kQ02Q1 = (mulFloor(k, Q0) * Q0) / Q1;
-  let b = mulFloor(DODO_ONE - k, Q1);
-  let minusbSig: boolean;
-  if (deltaBSig) {
-    b = b + ideltaB;
-  } else {
-    kQ02Q1 = kQ02Q1 + ideltaB;
-  }
-  if (b >= kQ02Q1) {
-    b = b - kQ02Q1;
-    minusbSig = true;
-  } else {
-    b = kQ02Q1 - b;
-    minusbSig = false;
+  if (V0 <= 0n) return 0n;
+  if (delta === 0n) return 0n;
+
+  if (k === 0n) {
+    const out = mulFloor(i, delta);
+    return out > V1 ? V1 : out;
   }
 
-  const penalty = mulFloor((DODO_ONE - k) * 4n, mulFloor(k, Q0) * Q0);
-  const squareRoot = isqrt(b * b + penalty);
+  if (k === DODO_ONE) {
+    // V2 = V1/(1 + i*delta*V1/(V0*V0)) → return V1*temp/(temp+ONE). The contract detects the raw
+    // uint256 wrap of idelta*V1 and falls back to the staged (lossier) divide — mirrored exactly.
+    let temp: bigint;
+    const idelta = i * delta;
+    if (idelta === 0n) {
+      temp = 0n;
+    } else if (idelta * V1 <= MAX_UINT256) {
+      temp = (idelta * V1) / (V0 * V0);
+    } else {
+      temp = (((delta * V1) / V0) * i) / V0;
+    }
+    return (V1 * temp) / (temp + DODO_ONE);
+  }
+
+  // b = kV0²/V1 - i*delta - (1-k)V1; bAbs/bSig accumulate |b| in RAW units, ONE divide after.
+  const part2 = ((k * V0) / V1) * V0 + i * delta;
+  let bAbs = (DODO_ONE - k) * V1;
+  let bSig: boolean;
+  if (bAbs >= part2) {
+    bAbs = bAbs - part2;
+    bSig = false;
+  } else {
+    bAbs = part2 - bAbs;
+    bSig = true;
+  }
+  bAbs = bAbs / DODO_ONE;
+
+  const penalty = mulFloor((DODO_ONE - k) * 4n, mulFloor(k, V0) * V0); // 4(1-k)kV0²
+  const squareRoot = isqrt(bAbs * bAbs + penalty);
 
   const denominator = (DODO_ONE - k) * 2n;
-  const numerator = minusbSig ? b + squareRoot : squareRoot - b;
-  if (denominator === 0n) return 0n;
-  return deltaBSig
-    ? (numerator * DODO_ONE) / denominator // divFloor
-    : divCeilRaw(numerator * DODO_ONE, denominator); // divCeil
+  let numerator: bigint;
+  if (bSig) {
+    numerator = squareRoot - bAbs;
+    if (numerator === 0n) return 0n; // the contract reverts ("should not be zero")
+  } else {
+    numerator = bAbs + squareRoot;
+  }
+
+  const V2 = divCeil(numerator, denominator);
+  return V2 > V1 ? 0n : V1 - V2;
 }
 
 // ── PMMPricing R-state dispatch ──────────────────────────────────────────────
@@ -174,10 +218,10 @@ export const enum RState {
 
 /**
  * `_ROneSellBaseToken(state, payBaseAmount)` — sell base when R == ONE.
- * `_SolveQuadraticFunctionForTrade(Q0, Q0, ideltaB = mulFloor(i, payBase), deltaBSig=false, K)`.
+ * `_SolveQuadraticFunctionForTrade(Q0, Q0, payBase, i, K)`.
  */
 function rOneSellBase(i: bigint, K: bigint, Q0: bigint, payBase: bigint): bigint {
-  return solveQuadraticForTrade(Q0, Q0, mulFloor(i, payBase), false, K);
+  return solveQuadraticForTrade(Q0, Q0, payBase, i, K);
 }
 
 /**
@@ -196,7 +240,7 @@ function rAboveSellBase(
 
 /**
  * `_RBelowSellBaseToken(state, payBaseAmount)` — sell base when R < 1 (quote scarce side).
- * `_SolveQuadraticFunctionForTrade(Q0, Q, ideltaB = mulFloor(i, payBase), deltaBSig=false, K)`.
+ * `_SolveQuadraticFunctionForTrade(Q0, Q, payBase, i, K)`.
  */
 function rBelowSellBase(
   i: bigint,
@@ -205,13 +249,12 @@ function rBelowSellBase(
   Q: bigint,
   payBase: bigint,
 ): bigint {
-  return solveQuadraticForTrade(Q0, Q, mulFloor(i, payBase), false, K);
+  return solveQuadraticForTrade(Q0, Q, payBase, i, K);
 }
 
 /** `_ROneSellQuoteToken` — sell quote when R == ONE. Uses 1/i. */
 function rOneSellQuote(i: bigint, K: bigint, B0: bigint, payQuote: bigint): bigint {
-  const oneOverI = reciprocalFloor(i);
-  return solveQuadraticForTrade(B0, B0, mulFloor(oneOverI, payQuote), false, K);
+  return solveQuadraticForTrade(B0, B0, payQuote, reciprocalFloor(i), K);
 }
 
 /** `_RAboveSellQuoteToken` — sell quote when R > 1. Uses 1/i. */
@@ -222,8 +265,7 @@ function rAboveSellQuote(
   B: bigint,
   payQuote: bigint,
 ): bigint {
-  const oneOverI = reciprocalFloor(i);
-  return solveQuadraticForTrade(B0, B, mulFloor(oneOverI, payQuote), false, K);
+  return solveQuadraticForTrade(B0, B, payQuote, reciprocalFloor(i), K);
 }
 
 /** `_RBelowSellQuoteToken` — sell quote when R < 1. Uses 1/i, GeneralIntegrate. */
@@ -394,7 +436,7 @@ export function getDy(pool: DodoPool, payAmount: bigint): bigint {
  * is ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly
  * (no extra sqrtOneMinusFee multiply, the fee is baked into dy), exactly like Curve / LB segments.
  */
-export interface DodoSegment {
+export interface DodoSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

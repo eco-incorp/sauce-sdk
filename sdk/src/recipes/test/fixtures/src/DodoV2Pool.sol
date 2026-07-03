@@ -110,51 +110,97 @@ contract DodoV2Pool {
         }
     }
 
-    // ── DODOMath — verbatim ───────────────────────────────────────
+    // ── DODOMath — verbatim (contractV2 lib/DODOMath.sol) ─────────
     function _generalIntegrate(uint256 V0, uint256 V1, uint256 V2, uint256 ii, uint256 k)
         internal
         pure
         returns (uint256)
     {
-        uint256 fairAmount = _mul(ii, V1 - V2);
-        uint256 V0V0V1V2 = _divCeil((V0 * V0) / V1, V2);
+        require(V0 > 0, "TARGET_IS_ZERO");
+        uint256 fairAmount = ii * (V1 - V2); // RAW i*delta — one final /ONE2
+        if (k == 0) {
+            return fairAmount / ONE;
+        }
+        uint256 V0V0V1V2 = ((V0 * V0) / V1) * ONE / V2; // divFloor
         uint256 penalty = _mul(k, V0V0V1V2);
-        return _mul(fairAmount, ONE - k + penalty);
+        return ((ONE - k + penalty) * fairAmount) / (ONE * ONE);
     }
 
-    function _solveQuadraticForTrade(uint256 Q0_, uint256 Q1, uint256 ideltaB, bool deltaBSig, uint256 k)
+    /// @dev _SolveQuadraticFunctionForTrade(V0, V1, delta, i, k) — returns the RECEIVE amount
+    /// V1 - V2 (0 when V2 > V1), with the contractV2 k==0 / k==ONE special cases and the
+    /// unconditional divCeil on V2. Checked 0.8 arithmetic == the 0.6.9 SafeMath semantics.
+    function _solveQuadraticForTrade(uint256 V0, uint256 V1, uint256 delta, uint256 ii, uint256 k)
         internal
         pure
         returns (uint256)
     {
-        uint256 kQ02Q1 = (_mul(k, Q0_) * Q0_) / Q1;
-        uint256 b = _mul(ONE - k, Q1);
-        bool minusbSig;
-        if (deltaBSig) {
-            b += ideltaB;
-        } else {
-            kQ02Q1 += ideltaB;
+        require(V0 > 0, "TARGET_IS_ZERO");
+        if (delta == 0) {
+            return 0;
         }
-        if (b >= kQ02Q1) {
-            b -= kQ02Q1;
-            minusbSig = true;
-        } else {
-            b = kQ02Q1 - b;
-            minusbSig = false;
+
+        if (k == 0) {
+            return _mul(ii, delta) > V1 ? V1 : _mul(ii, delta);
         }
-        uint256 penalty = _mul((ONE - k) * 4, _mul(k, Q0_) * Q0_);
-        uint256 squareRoot = _sqrt(b * b + penalty);
+
+        if (k == ONE) {
+            // V2 = V1/(1 + i*delta*V1/V0/V0) → V1 - V2 = V1*temp/(temp+ONE); the contract detects
+            // the raw uint256 wrap of idelta*V1 and falls back to the staged divide.
+            uint256 temp;
+            uint256 idelta = ii * delta;
+            if (idelta == 0) {
+                temp = 0;
+            } else {
+                uint256 prod;
+                unchecked {
+                    prod = idelta * V1;
+                }
+                if (prod / idelta == V1) {
+                    temp = prod / (V0 * V0);
+                } else {
+                    temp = (((delta * V1) / V0) * ii) / V0;
+                }
+            }
+            return (V1 * temp) / (temp + ONE);
+        }
+
+        // b = kV0^2/V1 - i*delta - (1-k)V1 — |b| accumulated RAW, ONE divide after the sub.
+        uint256 part2 = ((k * V0) / V1) * V0 + ii * delta;
+        uint256 bAbs = (ONE - k) * V1;
+        bool bSig;
+        if (bAbs >= part2) {
+            bAbs = bAbs - part2;
+            bSig = false;
+        } else {
+            bAbs = part2 - bAbs;
+            bSig = true;
+        }
+        bAbs = bAbs / ONE;
+
+        uint256 squareRoot = _mul((ONE - k) * 4, _mul(k, V0) * V0); // 4(1-k)kV0^2
+        squareRoot = _sqrt(bAbs * bAbs + squareRoot);
+
         uint256 denominator = (ONE - k) * 2;
-        if (denominator == 0) return 0;
-        uint256 numerator = minusbSig ? b + squareRoot : squareRoot - b;
-        return deltaBSig ? (numerator * ONE) / denominator : _divCeilRaw(numerator * ONE, denominator);
+        uint256 numerator;
+        if (bSig) {
+            numerator = squareRoot - bAbs;
+            require(numerator != 0, "DODOMath: should not be zero");
+        } else {
+            numerator = bAbs + squareRoot;
+        }
+
+        uint256 V2 = _divCeil(numerator, denominator);
+        if (V2 > V1) {
+            return 0;
+        }
+        return V1 - V2;
     }
 
     // ── PMMPricing R-state dispatch — verbatim ────────────────────
     function _sellBaseGross(uint256 payBase) internal view returns (uint256) {
         RState r = _R();
         if (r == RState.ONE) {
-            return _solveQuadraticForTrade(Q0, Q0, _mul(i, payBase), false, K);
+            return _solveQuadraticForTrade(Q0, Q0, payBase, i, K);
         }
         if (r == RState.ABOVE_ONE) {
             uint256 backToOnePayBase = B0 - B;
@@ -166,17 +212,17 @@ contract DodoV2Pool {
                 return backToOneReceiveQuote;
             }
             return backToOneReceiveQuote
-                + _solveQuadraticForTrade(Q0, Q0, _mul(i, payBase - backToOnePayBase), false, K);
+                + _solveQuadraticForTrade(Q0, Q0, payBase - backToOnePayBase, i, K);
         }
         // BELOW_ONE
-        return _solveQuadraticForTrade(Q0, Q, _mul(i, payBase), false, K);
+        return _solveQuadraticForTrade(Q0, Q, payBase, i, K);
     }
 
     function _sellQuoteGross(uint256 payQuote) internal view returns (uint256) {
         RState r = _R();
         uint256 oneOverI = _recip(i);
         if (r == RState.ONE) {
-            return _solveQuadraticForTrade(B0, B0, _mul(oneOverI, payQuote), false, K);
+            return _solveQuadraticForTrade(B0, B0, payQuote, oneOverI, K);
         }
         if (r == RState.BELOW_ONE) {
             uint256 backToOnePayQuote = Q0 - Q;
@@ -188,10 +234,10 @@ contract DodoV2Pool {
                 return backToOneReceiveBase;
             }
             return backToOneReceiveBase
-                + _solveQuadraticForTrade(B0, B0, _mul(oneOverI, payQuote - backToOnePayQuote), false, K);
+                + _solveQuadraticForTrade(B0, B0, payQuote - backToOnePayQuote, oneOverI, K);
         }
         // ABOVE_ONE
-        return _solveQuadraticForTrade(B0, B, _mul(oneOverI, payQuote), false, K);
+        return _solveQuadraticForTrade(B0, B, payQuote, oneOverI, K);
     }
 
     function _netFee(uint256 gross) internal view returns (uint256) {

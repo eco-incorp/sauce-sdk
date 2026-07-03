@@ -50,12 +50,17 @@ const ONE = DODO_ONE; // 1e18 (DODO DecimalMath scale)
 
 // ─────────────────────────────────────────────────────────────
 // An independently-written PMM replay (DIFFERENT structure than dodo-math.ts) — the
-// cross-check for the known-answer pins. DecimalMath / DODOMath / PMMPricing, recomputed here
-// from the canonical formulas so a regression in EITHER path is caught (the pins below were
-// generated from THIS implementation and then verified identical to getDy).
+// cross-check for the known-answer pins. contractV2 DODOMath / PMMPricing / DecimalMath,
+// recomputed here from the canonical formulas so a regression in EITHER path is caught (the pins
+// below were generated from THIS implementation and then verified identical to getDy). Structural
+// differences from the production replay: the quadratic folds -b as ONE SIGNED bigint (production
+// keeps the contract's bAbs/bSig pair), and sellQuote is evaluated as sellBase ON THE MIRRORED
+// STATE (base↔quote, i→1/i, ABOVE↔BELOW — the exact reflection contractV2's sellQuoteToken
+// hand-writes out).
 // ─────────────────────────────────────────────────────────────
 const dmMul = (a: bigint, b: bigint): bigint => (a * b) / ONE;
 const dmCeil = (a: bigint, b: bigint): bigint => (a === 0n ? 0n : (a * ONE - 1n) / b + 1n);
+const dmFloor = (a: bigint, b: bigint): bigint => (a * ONE) / b;
 const dmRecip = (t: bigint): bigint => (ONE * ONE) / t;
 function sqrtInt(x: bigint): bigint {
   if (x <= 0n) return 0n;
@@ -67,34 +72,51 @@ function sqrtInt(x: bigint): bigint {
   }
   return z;
 }
+/** `_GeneralIntegrate` — RAW i·delta, divFloor(V0²/V1, V2), one final /1e36. */
 function generalIntegrateRef(V0: bigint, V1: bigint, V2: bigint, i: bigint, k: bigint): bigint {
-  const fair = dmMul(i, V1 - V2);
-  const v0v0v1v2 = dmCeil((V0 * V0) / V1, V2);
-  const penalty = dmMul(k, v0v0v1v2);
-  return dmMul(fair, ONE - k + penalty);
+  if (V0 <= 0n) return 0n;
+  const fair = i * (V1 - V2);
+  if (k === 0n) return fair / ONE;
+  const mult = ONE - k + dmMul(k, dmFloor((V0 * V0) / V1, V2));
+  return (mult * fair) / (ONE * ONE);
 }
-function solveQuadRef(Q0: bigint, Q1: bigint, ideltaB: bigint, deltaBSig: boolean, k: bigint): bigint {
-  let kQ02Q1 = (dmMul(k, Q0) * Q0) / Q1;
-  let b = dmMul(ONE - k, Q1);
-  let minusbSig: boolean;
-  if (deltaBSig) b += ideltaB;
-  else kQ02Q1 += ideltaB;
-  if (b >= kQ02Q1) {
-    b -= kQ02Q1;
-    minusbSig = true;
-  } else {
-    b = kQ02Q1 - b;
-    minusbSig = false;
+/** `_SolveQuadraticFunctionForTrade(V0, V1, delta, i, k)` — returns the RECEIVE amount V1 − V2,
+ *  V2 = divCeil(−b + √(b²+4(1−k)kV0²), 2(1−k)). Signed -b fold (same |b| floor as the contract's
+ *  unsigned bAbs/bSig pair). k==ONE takes the contract's exact fast path (idelta·V1 never wraps a
+ *  bigint; every vector here is far below 2^256, where the contract takes the same branch). */
+function tradeQuadRef(V0: bigint, V1: bigint, delta: bigint, i: bigint, k: bigint): bigint {
+  if (V0 <= 0n || delta === 0n) return 0n;
+  if (k === 0n) {
+    const out = dmMul(i, delta);
+    return out < V1 ? out : V1;
   }
-  const pen = dmMul((ONE - k) * 4n, dmMul(k, Q0) * Q0);
-  const root = sqrtInt(b * b + pen);
-  const den = (ONE - k) * 2n;
-  if (den === 0n) return 0n;
-  const num = minusbSig ? b + root : root - b;
-  return deltaBSig ? (num * ONE) / den : num === 0n ? 0n : (num * ONE - 1n) / den + 1n;
+  if (k === ONE) {
+    const temp = (i * delta * V1) / (V0 * V0);
+    return (V1 * temp) / (temp + ONE);
+  }
+  const minusB = (ONE - k) * V1 - (((k * V0) / V1) * V0 + i * delta); // RAW units, ONE fold below
+  const bAbs = (minusB >= 0n ? minusB : -minusB) / ONE;
+  const root = sqrtInt(bAbs * bAbs + dmMul((ONE - k) * 4n, dmMul(k, V0) * V0));
+  const num = minusB >= 0n ? bAbs + root : root - bAbs;
+  if (num === 0n) return 0n; // the pool reverts ("should not be zero")
+  const V2 = dmCeil(num, (ONE - k) * 2n);
+  return V2 > V1 ? 0n : V1 - V2;
 }
-function sellBaseGrossRef(p: DodoPool, pay: bigint): bigint {
-  if (p.R === RState.ONE) return solveQuadRef(p.Q0, p.Q0, dmMul(p.i, pay), false, p.K);
+/** The PMM state slice the dispatch reads (mirrorable, unlike the full DodoPool). */
+type PmmRef = { i: bigint; K: bigint; B: bigint; Q: bigint; B0: bigint; Q0: bigint; R: RState };
+/** sellQuote == sellBase on the mirrored state — contractV2's sellQuoteToken is this reflection. */
+function mirrorRef(p: PmmRef): PmmRef {
+  return {
+    i: dmRecip(p.i),
+    K: p.K,
+    B: p.Q,
+    Q: p.B,
+    B0: p.Q0,
+    Q0: p.B0,
+    R: p.R === RState.ABOVE_ONE ? RState.BELOW_ONE : p.R === RState.BELOW_ONE ? RState.ABOVE_ONE : RState.ONE,
+  };
+}
+function sellBaseGrossRef(p: PmmRef, pay: bigint): bigint {
   if (p.R === RState.ABOVE_ONE) {
     const backPay = p.B0 - p.B;
     const backRecv = p.Q - p.Q0;
@@ -103,29 +125,16 @@ function sellBaseGrossRef(p: DodoPool, pay: bigint): bigint {
       return r > backRecv ? backRecv : r;
     }
     if (pay === backPay) return backRecv;
-    return backRecv + solveQuadRef(p.Q0, p.Q0, dmMul(p.i, pay - backPay), false, p.K);
+    return backRecv + tradeQuadRef(p.Q0, p.Q0, pay - backPay, p.i, p.K);
   }
-  return solveQuadRef(p.Q0, p.Q, dmMul(p.i, pay), false, p.K); // BELOW_ONE
-}
-function sellQuoteGrossRef(p: DodoPool, pay: bigint): bigint {
-  const oi = dmRecip(p.i);
-  if (p.R === RState.ONE) return solveQuadRef(p.B0, p.B0, dmMul(oi, pay), false, p.K);
-  if (p.R === RState.BELOW_ONE) {
-    const backPay = p.Q0 - p.Q;
-    const backRecv = p.B - p.B0;
-    if (pay < backPay) {
-      const r = generalIntegrateRef(p.Q0, p.Q + pay, p.Q, oi, p.K);
-      return r > backRecv ? backRecv : r;
-    }
-    if (pay === backPay) return backRecv;
-    return backRecv + solveQuadRef(p.B0, p.B0, dmMul(oi, pay - backPay), false, p.K);
-  }
-  return solveQuadRef(p.B0, p.B, dmMul(oi, pay), false, p.K); // ABOVE_ONE
+  if (p.R === RState.BELOW_ONE) return tradeQuadRef(p.Q0, p.Q, pay, p.i, p.K);
+  return tradeQuadRef(p.Q0, p.Q0, pay, p.i, p.K); // R == ONE
 }
 /** Independent net querySell* (gross − floor(gross·lp) − floor(gross·mt)). */
 function getDyRef(p: DodoPool, pay: bigint): bigint {
   if (pay <= 0n) return 0n;
-  const gross = p.sellBase ? sellBaseGrossRef(p, pay) : sellQuoteGrossRef(p, pay);
+  const s: PmmRef = { i: p.i, K: p.K, B: p.B, Q: p.Q, B0: p.B0, Q0: p.Q0, R: p.R };
+  const gross = sellBaseGrossRef(p.sellBase ? s : mirrorRef(s), pay);
   if (gross <= 0n) return 0n;
   const net = gross - dmMul(gross, p.lpFeeRate) - dmMul(gross, p.mtFeeRate);
   return net > 0n ? net : 0n;
@@ -199,28 +208,39 @@ const P_QUOTE = dodo({
 // equal to the production getDy). The two implementations have a different control structure, so
 // agreement on these literals pins the PMM math in both paths.
 describe("DODO V2 querySell* getDy — known answers (R-state × side)", () => {
-  // Pinned literal expectations (independently recomputed; wei-exact).
+  // Pinned literal expectations (independently recomputed; wei-exact). Hand-anchored sanity:
+  //   - a small trade receives ≈ pay·i (quote out) or ≈ pay/i (base out) NET of fee, i.e. a tiny
+  //     FRACTION of the 100e18-scale reserve — e.g. ONE sellBase 0.1 → 0.0997 (0.1·1·0.997−slip),
+  //     ONE sellQuote 1 → 0.4987 (1/2·0.998−slip);
+  //   - output strictly INCREASES with input within each family;
+  //   - ABOVE sellBase 25 crosses back-to-ONE at 20: 42 (Q−Q0) + ~9.8 quadratic remainder for the
+  //     5 past-boundary base at i=2, netted 0.3% → 51.63.
   const PINS: Array<[string, DodoPool, bigint, bigint]> = [
     // R == ONE, sell base
-    ["ONE sellBase 0.1", P_ONE, ONE / 10n, 99_600_309_977_981_486_454n],
-    ["ONE sellBase 1", P_ONE, ONE, 98_704_005_031_130_904_643n],
-    ["ONE sellBase 5", P_ONE, 5n * ONE, 94_740_957_206_004_584_505n],
-    ["ONE sellBase 25", P_ONE, 25n * ONE, 75_547_178_150_865_020_191n],
-    // R == ABOVE_ONE, sell base
+    ["ONE sellBase 0.1", P_ONE, ONE / 10n, 99_690_022_018_513_548n],
+    ["ONE sellBase 1", P_ONE, ONE, 995_994_968_869_095_359n],
+    ["ONE sellBase 5", P_ONE, 5n * ONE, 4_959_042_793_995_415_497n],
+    ["ONE sellBase 25", P_ONE, 25n * ONE, 24_152_821_849_134_979_811n],
+    // R == ABOVE_ONE, sell base (below the boundary this is the GeneralIntegrate leg)
     ["ABOVE sellBase 0.1", P_ABOVE, ONE / 10n, 221_754_706_616_729_088n],
     ["ABOVE sellBase 1", P_ABOVE, ONE, 2_210_632_098_765_432_099n],
     ["ABOVE sellBase 5", P_ABOVE, 5n * ONE, 10_908_352_941_176_470_585n],
-    ["ABOVE sellBase 25", P_ABOVE, 25n * ONE, 131_815_744_929_127_712_500n],
-    // R == BELOW_ONE, sell base
-    ["BELOW sellBase 0.1", P_BELOW, ONE / 10n, 59_875_446_125_432_403_172n],
-    ["BELOW sellBase 1", P_BELOW, ONE, 59_565_324_265_309_282_017n],
-    ["BELOW sellBase 5", P_BELOW, 5n * ONE, 58_205_815_447_564_970_218n],
-    ["BELOW sellBase 25", P_BELOW, 25n * ONE, 51_868_518_373_584_011_876n],
-    // R == ONE, sell quote
-    ["ONE sellQuote 0.1", P_QUOTE, ONE / 10n, 99_750_102_495_998_343_156n],
-    ["ONE sellQuote 1", P_QUOTE, ONE, 99_301_250_501_439_868_954n],
-    ["ONE sellQuote 5", P_QUOTE, 5n * ONE, 97_311_364_423_180_093_108n],
-    ["ONE sellQuote 25", P_QUOTE, 25n * ONE, 87_497_964_123_477_962_039n],
+    ["ABOVE sellBase 25", P_ABOVE, 25n * ONE, 51_632_255_070_872_287_501n],
+    // ROUNDING TRIPWIRE: a non-round pay where _GeneralIntegrate's exact rounding order (RAW
+    // i·delta + divFloor V0²/V1/V2 + one /1e36 — contractV2) differs by 1 wei from the plausible
+    // staged-mulFloor/divCeil variant. Round pays cancel the truncations; this one does not.
+    ["ABOVE sellBase non-round", P_ABOVE, 27_081_043_269_784_643n, 60_068_844_879_220_590n],
+    // R == BELOW_ONE, sell base (quote scarce → the quadratic leg, priced BELOW i)
+    ["BELOW sellBase 0.1", P_BELOW, ONE / 10n, 34_553_874_567_596_784n],
+    ["BELOW sellBase 1", P_BELOW, ONE, 344_675_734_690_717_940n],
+    ["BELOW sellBase 5", P_BELOW, 5n * ONE, 1_704_184_552_435_029_739n],
+    ["BELOW sellBase 25", P_BELOW, 25n * ONE, 8_041_481_626_415_988_086n],
+    ["BELOW sellBase non-round", P_BELOW, 1_234_567_890_123_456_789n, 425_247_842_587_823_535n],
+    // R == ONE, sell quote (the 1/i side)
+    ["ONE sellQuote 0.1", P_QUOTE, ONE / 10n, 49_897_504_001_656_845n],
+    ["ONE sellQuote 1", P_QUOTE, ONE, 498_749_498_560_131_047n],
+    ["ONE sellQuote 5", P_QUOTE, 5n * ONE, 2_488_635_576_819_906_893n],
+    ["ONE sellQuote 25", P_QUOTE, 25n * ONE, 12_302_035_876_522_037_962n],
   ];
 
   for (const [name, pool, pay, expected] of PINS) {
@@ -237,22 +257,21 @@ describe("DODO V2 querySell* getDy — known answers (R-state × side)", () => {
     assert.equal(getDy(P_ONE, -5n), 0n);
   });
 
-  it("getDy is monotone increasing within the rebalancing region (ABOVE_ONE sell-base)", () => {
-    // P_ABOVE is base-scarce (B<B0): selling base trades into the GeneralIntegrate region that
-    // rebalances toward equilibrium, where more input → strictly more output for pays below the
-    // back-to-ONE boundary (B0−B = 20 base). This is the monotone regime the segment ladder walks.
-    //
-    // (The OTHER states are genuinely NON-monotone for these reserve magnitudes: an R==ONE pool's
-    // _SolveQuadraticFunctionForTrade receive amount PEAKS then declines as the trade is pushed past
-    // the reserve, and the quote-scarce BELOW_ONE sell-base state saturates immediately. That
-    // declining curvature is exactly what the descending-marginal guard in buildDodoSegments
-    // collapses — the segment ladder only ever keeps the strictly-improving prefix — so the merge
-    // stays price-ordered. The literal pins above pin those states' exact values regardless.)
-    let prev = 0n;
-    for (const pay of [ONE / 2n, ONE, 3n * ONE, 8n * ONE, 15n * ONE]) {
-      const out = getDy(P_ABOVE, pay);
-      assert.ok(out > prev, `out strictly increases with pay=${pay}`);
-      prev = out;
+  it("getDy is monotone increasing in every R-state (more input → strictly more output)", () => {
+    // The PMM out(in) curve is one smooth concave curve: more input yields strictly more output in
+    // EVERY R-state (the quadratic legs asymptote to the counter-reserve — V2 → 0 so the receive
+    // V1−V2 → V1 — they never decline). This is the physical sanity a receive-amount regression
+    // (e.g. returning the new reserve V2 instead of V1−V2) breaks instantly.
+    for (const pool of [P_ONE, P_ABOVE, P_BELOW, P_QUOTE]) {
+      let prev = 0n;
+      for (const pay of [ONE / 2n, ONE, 3n * ONE, 8n * ONE, 15n * ONE]) {
+        const out = getDy(pool, pay);
+        assert.ok(out > prev, `out strictly increases with pay=${pay} (${pool.R})`);
+        prev = out;
+      }
+      // ...and never exceeds what the pool can pay out (the out-side reserve).
+      const outReserve = pool.sellBase ? pool.Q : pool.B;
+      assert.ok(getDy(pool, 10_000n * ONE) < outReserve, `saturates below the out reserve (${pool.R})`);
     }
   });
 
@@ -393,9 +412,10 @@ describe("DODO split via the neutral oracle [exact-on-grid]", () => {
   });
 
   it("DODO vs a deeper DODO — the cheaper/deeper venue draws more", () => {
-    // B has a larger target (B0/Q0 = 200 vs 100) → deeper → for a size that splits, it draws more
-    // tokenIn than the shallower, pricier-fee A once A's near segments decay below B's marginal.
-    const amountIn = 40n * ONE;
+    // B has a larger target (B0/Q0 = 200 vs 100) → deeper → past A's near-price advantage (A opens
+    // ~2.22 vs B ~2.08 post-fee, so A drains first) B's flatter curve absorbs the larger share.
+    // The crossover for these curves sits near 50·ONE; 80·ONE is comfortably past it.
+    const amountIn = 80n * ONE;
     const res = optimalSplit({ pools: [optA, optB], amountIn, zeroForOne: true, priceLimit: 0n });
     assert.ok(res.perPoolInput[0] > 0n && res.perPoolInput[1] > 0n, "both funded");
     assert.ok(
