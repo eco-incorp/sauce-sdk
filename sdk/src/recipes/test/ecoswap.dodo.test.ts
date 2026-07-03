@@ -395,13 +395,15 @@ describe("DODO split via the neutral oracle [exact-on-grid]", () => {
       res.perPoolInput[0] > 0n && res.perPoolInput[1] > 0n,
       `both DODO venues funded (interior cut): [${res.perPoolInput}]`,
     );
-    // Fee-adjusted marginals equalize at the cut within the sampled-grid bound (the documented
-    // exact-on-grid standard for a sampled curve — DODO's squared-index grid is coarser than a
-    // tick grid, so the bound is a fraction of a percent, not a few ppm).
+    // Fee-adjusted marginals equalize at the cut within the QUOTE-LADDER grid bound. DODO is now a QL
+    // venue: the oracle (buildDodoQLLadder) and the on-chain solver build the IDENTICAL 8-slice geometric
+    // ladder from the live querySell* view, so the split is wei-exact between them — but the QL grid
+    // (QL_S=8) is coarser than the old M=24 sampler, so the marginals equalize only to within one QL
+    // slice's price width (a documented grid bound, not a few ppm).
     const m0 = res.perPoolMarginalAdj[0];
     const m1 = res.perPoolMarginalAdj[1];
     const diff = m0 > m1 ? m0 - m1 : m1 - m0;
-    const slackPpm = 2000n; // 0.2% grid bound at M=24 on this curvature
+    const slackPpm = 12000n; // QL 8-slice grid bound on this curvature (vs 0.2% at the old M=24)
     assert.ok(
       diff * 1_000_000n <= m0 * slackPpm,
       `marginals equalize within ${slackPpm}ppm: |${m0} - ${m1}| = ${diff}`,

@@ -56,6 +56,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -263,4 +264,16 @@ export function buildWombatSegments(
     prevOut = out;
   }
   return segs;
+}
+
+/**
+ * Build one Wombat pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the bigint `quotePotentialSwap` (the post-haircut coverage-ratio replay), so
+ * the oracle stays wei-exact with the on-chain solver BY CONSTRUCTION: the solver builds the IDENTICAL
+ * geometric ladder live from the pool's own quotePotentialSwap view (whose out `quotePotentialSwap` mirrors
+ * bit-for-bit), differencing at the SAME cumulative-input points. quotePotentialSwap is post-haircut so
+ * marginalOI IS the execution price; adjNear == adjFar == marginalOI.
+ */
+export function buildWombatQLLadder(pool: WombatPool, amountIn: bigint): WombatSegment[] {
+  return buildQLLadder((dx) => quotePotentialSwap(pool, dx), amountIn);
 }

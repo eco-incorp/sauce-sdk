@@ -293,6 +293,9 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   const wooFiPools = prepared.wooFiPools ?? [];
   const lbs = prepared.lbs ?? [];
   const mentoPools = prepared.mentoPools ?? [];
+  const dodos = prepared.dodos ?? [];
+  const wombats = prepared.wombats ?? [];
+  const fermiPools = prepared.fermiPools ?? [];
   const curveRows = curves.map((c, refIdx) => [
     BigInt(c.address),
     BigInt(c.i),
@@ -348,34 +351,65 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
     13n, // segKind = Mento V2 (Broker getAmountOut on the ladder; approve BROKER + swapIn on the exec)
     BigInt(refIdx),
   ]);
-  return [...curveRows, ...cryptoRows, ...solidlyRows, ...wooFiRows, ...lbRows, ...mentoRows];
+  // DODO V2 PMM: qd[0]=pool, qd[1]=isSellBase (0/1, tokenIn == pool._BASE_TOKEN_() — computed in prepare
+  // via discoverDodoV2PoolsTyped's orientation), qd[2] unused. The QL ladder quotes the DIRECTIONAL
+  // querySellBase(caller,xNext)[0] / querySellQuote(caller,xNext)[0] view (probe-then-decode, post-fee);
+  // EXEC stays engine poolType 5 (_swapDODOV2 resolves orientation on-chain from _BASE_TOKEN_()).
+  const dodoRows = dodos.map((d, refIdx) => [
+    BigInt(d.address),
+    d.sellBase ? 1n : 0n, // isSellBase — the on-chain querySell* direction bit
+    0n, // j unused
+    BigInt(d.feePpm),
+    3n, // segKind = DODO V2 (querySell* on the ladder; engine _swapDODOV2 on the exec)
+    BigInt(refIdx),
+  ]);
+  // Wombat (single-sided stableswap): qd[0]=pool, qd[1..2] unused (quotes by fromToken/toToken). The QL
+  // ladder quotes quotePotentialSwap(tokenIn,tokenOut,xNext)[0] (probe-then-decode, post-haircut); EXEC
+  // stays callback-free (approve + pool.swap).
+  const wombatRows = wombats.map((w, refIdx) => [
+    BigInt(w.address),
+    0n, // i unused (Wombat quotes by fromToken/toToken)
+    0n, // j unused
+    BigInt(w.feePpm),
+    5n, // segKind = Wombat (quotePotentialSwap on the ladder; approve + pool.swap on the exec)
+    BigInt(refIdx),
+  ]);
+  // Fermi / propAMM (Obric-style proactive AMM): qd[0]=pool, qd[1..2] unused (quotes by tokenIn/tokenOut).
+  // The QL ladder quotes quoteAmounts(tokenIn,tokenOut,xNext)[1] (probe-then-decode, post-fee — the SECOND
+  // return is the exact-in out); EXEC stays callback-free (approve + fermiSwapWithAllowances).
+  const fermiRows = fermiPools.map((f, refIdx) => [
+    BigInt(f.address),
+    0n, // i unused (Fermi quotes by tokenIn/tokenOut)
+    0n, // j unused
+    BigInt(f.feePpm),
+    11n, // segKind = Fermi (quoteAmounts on the ladder; approve + fermiSwapWithAllowances on the exec)
+    BigInt(refIdx),
+  ]);
+  return [
+    ...curveRows, ...cryptoRows, ...solidlyRows, ...wooFiRows, ...lbRows, ...mentoRows,
+    ...dodoRows, ...wombatRows, ...fermiRows,
+  ];
 }
 
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
-  // NOTE: Curve StableSwap (segKind 1), Trader Joe LB (segKind 2), Solidly STABLE (segKind 4), Curve
-  // CryptoSwap (segKind 9), WOOFi (segKind 10) and Mento V2 (segKind 13) are NOT read here — all six are
-  // QUOTE-LADDER (QL) venues (see buildQLVenues), built on-chain from live quotes, so they ship no static
-  // sampled segments.
-  const dodos = prepared.dodos ?? [];
-  const wombats = prepared.wombats ?? [];
+  // NOTE: Curve StableSwap (segKind 1), Trader Joe LB (segKind 2), DODO V2 (segKind 3), Solidly STABLE
+  // (segKind 4), Wombat (segKind 5), Curve CryptoSwap (segKind 9), WOOFi (segKind 10), Fermi (segKind 11)
+  // and Mento V2 (segKind 13) are NOT read here — all nine are QUOTE-LADDER (QL) venues (see buildQLVenues),
+  // built on-chain from live quotes, so they ship no static sampled segments.
   const balancerStables = prepared.balancerStables ?? [];
   const eulerSwaps = prepared.eulerSwaps ?? [];
   const maverickPools = prepared.maverickPools ?? [];
-  const fermiPools = prepared.fermiPools ?? [];
   const fluidPools = prepared.fluidPools ?? [];
   const balancerV3Pools = prepared.balancerV3Pools ?? [];
   return prepared.brackets
     .filter(
       (b) =>
-        // Curve StableSwap / LB / CryptoSwap / Solidly STABLE / WOOFi / Mento are NOT here: all six are
-        // QUOTE-LADDER (QL) venues built ON-CHAIN from live quotes in the solver setup (see buildQLVenues)
-        // — prepare ships only the descriptor, no sampled segments.
-        b.kind === EcoBracketKind.DODO ||
-        b.kind === EcoBracketKind.Wombat ||
+        // Curve StableSwap / LB / DODO / CryptoSwap / Solidly STABLE / Wombat / WOOFi / Fermi / Mento are
+        // NOT here: all nine are QUOTE-LADDER (QL) venues built ON-CHAIN from live quotes in the solver
+        // setup (see buildQLVenues) — prepare ships only the descriptor, no sampled segments.
         b.kind === EcoBracketKind.BalancerStable ||
         b.kind === EcoBracketKind.EulerSwap ||
         b.kind === EcoBracketKind.MaverickV2 ||
-        b.kind === EcoBracketKind.Fermi ||
         b.kind === EcoBracketKind.Fluid ||
         b.kind === EcoBracketKind.BalancerV3,
     )
@@ -386,12 +420,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       return a.refIdx - b.refIdx;
     })
     .map((b) => {
-      const isDodo = b.kind === EcoBracketKind.DODO;
-      const isWombat = b.kind === EcoBracketKind.Wombat;
       const isBalancer = b.kind === EcoBracketKind.BalancerStable;
       const isEuler = b.kind === EcoBracketKind.EulerSwap;
       const isMaverick = b.kind === EcoBracketKind.MaverickV2;
-      const isFermi = b.kind === EcoBracketKind.Fermi;
       const isFluid = b.kind === EcoBracketKind.Fluid;
       const isBalancerV3 = b.kind === EcoBracketKind.BalancerV3;
       // segKind: 1 Curve StableSwap (QL — NOT produced here), 2 LB, 3 DODO, 4 Solidly stable (QL — NOT
@@ -417,23 +448,17 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn (the V3 input is
       // PULLED via Permit2; the reentrancy is contained inside Balancer's Router+Vault, never the cooking
       // contract). The chain-wide Router is cfg[8].
-      // segKind 1 (Curve StableSwap) + 2 (Trader Joe LB) + 4 (Solidly STABLE) + 9 (Curve CryptoSwap) + 10
-      // (WOOFi) + 13 (Mento V2) are NOT produced here — all six are QL venues built on-chain from live
-      // quotes (buildQLVenues).
-      const segKind = isDodo ? 3n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isFermi ? 11n : isFluid ? 12n : isBalancerV3 ? 14n : 0n;
-      const venue = isDodo
-            ? BigInt(dodos[b.refIdx].address)
-            : isWombat
-                ? BigInt(wombats[b.refIdx].address)
-                : isBalancer
+      // segKind 1 (Curve StableSwap) + 2 (Trader Joe LB) + 3 (DODO V2) + 4 (Solidly STABLE) + 5 (Wombat) +
+      // 9 (Curve CryptoSwap) + 10 (WOOFi) + 11 (Fermi) + 13 (Mento V2) are NOT produced here — all nine are
+      // QL venues built on-chain from live quotes (buildQLVenues).
+      const segKind = isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isFluid ? 12n : isBalancerV3 ? 14n : 0n;
+      const venue = isBalancer
                   ? BigInt(balancerStables[b.refIdx].address)
                   : isEuler
                     ? BigInt(eulerSwaps[b.refIdx].address)
                     : isMaverick
                       ? BigInt(maverickPools[b.refIdx].address)
-                      : isFermi
-                            ? BigInt(fermiPools[b.refIdx].address)
-                            : isFluid
+                      : isFluid
                               ? BigInt(fluidPools[b.refIdx].address)
                               : isBalancerV3
                                 ? BigInt(balancerV3Pools[b.refIdx].address)

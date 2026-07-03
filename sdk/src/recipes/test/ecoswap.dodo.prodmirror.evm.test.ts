@@ -29,9 +29,10 @@
  *       captured PMM state exactly, and querySellBase|Quote reproduce the captured probe quotes.
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
  *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts
- *       optimalSplit, seeded from the REAL captured PMM state via the SHARED buildDodoSegments) ==
- *       the REAL pool's own pre-swap querySellBase view of the awarded slice, all to the wei. spent
- *       == awarded is asserted explicitly.
+ *       optimalSplit, seeded from the REAL captured PMM state via the SHARED buildDodoQLLadder — DODO
+ *       is now a QUOTE-LADDER venue) == the REAL pool's own pre-swap querySellBase view of the awarded
+ *       slice, all to the wei. The on-chain QL ladder == the REAL querySellBase at every geometric
+ *       sample point is asserted explicitly; spent == awarded is asserted explicitly.
  *
  * HONEST fee accounting: unlike Solidly (which routes the swap fee to a separate PoolFees
  * contract, netting the pool's tokenIn delta below `spent`), the DSP applies its LP+MT fee to the
@@ -88,6 +89,7 @@ import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import { getDy, RState, type DodoPool } from "../shared/dodo-math";
+import { qlLadderInputs } from "../shared/curve-math";
 
 const SNAP_NAME = "ethereum-dodo-DAIUSDT";
 const ENGINE_CELLS = engineCells();
@@ -407,15 +409,28 @@ describe("EcoSwap DODO V2 (DSP) prod-mirror — REAL bytecode, no fork, offline"
       "the discovered DODO venue is the REAL etched pool",
     );
     assert.equal(prepared.dodos![0].sellBase, true, "discovery oriented the venue as sellBase (tokenIn == base)");
+    // DODO is now a QUOTE-LADDER (QL) venue: prepare ships ONLY the descriptor (prepared.dodos), NO static
+    // sampled DODO brackets. The on-chain solver builds the price ladder live from the pool's own querySell*.
     assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.DODO),
-      "DODO segments present",
+      !(prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.DODO),
+      "DODO ships as a QL descriptor (no static sampled DODO brackets)",
     );
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one DODO venue seeded from the REAL captured PMM state
-    // via the SHARED buildDodoSegments. This is pure off-chain math (computed BEFORE the cook), so
-    // the awarded Σ is known ahead — and the engine's static-segment cursor consumes the IDENTICAL
-    // grid, so on-chain spent == oracle.totalInput to the wei.
+    // QL LADDER == REAL VIEW at S points: the off-chain buildDodoQLLadder (seeded from the REAL captured
+    // PMM state) queries getDy at the SAME geometric `qlLadderInputs` points the on-chain solver queries
+    // the pool's own querySellBase at — assert they agree to the WEI, tying the ladder to the real DSP curve.
+    const opProbe = offPool(snaps.state);
+    for (const xNext of qlLadderInputs(amountIn)) {
+      const real = (await c.publicClient.readContract({
+        address: etched.pool, abi: dodoPoolReadAbi, functionName: "querySellBase", args: [caller, xNext],
+      })) as readonly [bigint, bigint];
+      assert.equal(getDy(opProbe, xNext), real[0], `QL ladder getDy(${xNext}) == REAL querySellBase[0] at the sample point`);
+    }
+
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one DODO venue seeded from the REAL captured PMM state via the
+    // SHARED buildDodoQLLadder (the IDENTICAL geometric quote ladder the on-chain solver builds live). This
+    // is pure off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the solver's
+    // on-chain-built ladder is wei-exact with it, so on-chain spent == oracle.totalInput to the wei.
     const op = offPool(snaps.state);
     const optPools: OptimalPool[] = [{ dodo: op, feePpm: 0 }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
@@ -449,13 +464,11 @@ describe("EcoSwap DODO V2 (DSP) prod-mirror — REAL bytecode, no fork, offline"
     assert.equal(poolIn, spent, "REAL DSP netted the FULL input (fee is taken on the output, not the input)");
 
     // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance.
-    // (DODO is a SAMPLED-SEGMENT venue: buildDodoSegments samples the PMM curve on a squared-index
-    // geometric grid capped at amountIn; the isotonic merge folds non-descending slices but a
-    // zero-output near-saturation slice is dropped — so the awarded Σ is the grid's covered
-    // capacity, which MAY sit a small documented tail below amountIn (here the trade is far from
-    // saturation, so the grid covers amountIn fully). The engine's static-segment cursor consumes
-    // the IDENTICAL grid, so spent == the oracle's awarded Σ == oracle.totalInput to the WEI —
-    // the exact-on-grid property; we assert the grid Σ, not a full amountIn fill.)
+    // (DODO is a QUOTE-LADDER venue: buildDodoQLLadder walks the PMM curve on the QL_S geometric ladder
+    // capped at amountIn via getDy (querySell*); the on-chain solver builds the IDENTICAL ladder live from
+    // the pool's own querySellBase, so spent == the oracle's awarded Σ == oracle.totalInput to the WEI —
+    // wei-exact by construction. The awarded Σ MAY sit a small documented tail below amountIn near
+    // saturation; here the trade is far from saturation, so the ladder covers amountIn fully.)
     assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
     assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
     // The awarded grid Σ is at most amountIn; the unfilled tail is the DODO segment-grid remainder

@@ -56,6 +56,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / curve-math / lb-math Q192). */
 export const Q192 = 1n << 192n;
@@ -494,6 +495,19 @@ export function buildDodoSegments(
     prevOut = out;
   }
   return segs;
+}
+
+/**
+ * Build one DODO V2 pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the bigint `getDy` (the querySell* net-of-fee replay), so the oracle stays
+ * wei-exact with the on-chain solver BY CONSTRUCTION: the solver builds the IDENTICAL geometric ladder
+ * live from the pool's own querySellBase/querySellQuote view (whose net-of-LP+MT out equals `getDy` to the
+ * wei — the Lane-0-corrected contractV2 math), differencing at the SAME cumulative-input points. getDy is
+ * post-fee so marginalOI IS the execution price; adjNear == adjFar == marginalOI. Directional orientation
+ * (sellBase/sellQuote) is carried on the DodoPool (`sellBase`), matching the qd[1] isSellBase descriptor.
+ */
+export function buildDodoQLLadder(pool: DodoPool, amountIn: bigint): DodoSegment[] {
+  return buildQLLadder((dx) => getDy(pool, dx), amountIn);
 }
 
 /** Round a DODO combined 1e18-scaled fee (lp+mt) to ppm (the price-ordering coordinate / diagnostics). */

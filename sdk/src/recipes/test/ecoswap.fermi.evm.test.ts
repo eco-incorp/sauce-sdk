@@ -1,46 +1,31 @@
 /**
- * EcoSwap Fermi / propAMM (gattaca-com/propamm FermiSwapper — an OBRIC-style proactive AMM) local-EVM
- * integration — the callback-free exec + the snapshotted-quote split model.
+ * EcoSwap Fermi / propAMM (gattaca-com/propamm FermiSwapper — an OBRIC-style proactive AMM) QUOTE-LADDER
+ * (QL) local-EVM integration — the live-walk quoteAmounts ladder + the callback-free exact-in-dy gate.
  *
- * Stands up a local propAMM pool (the FermiPool.sol fixture, which prices internally with the Obric
- * K=v0²·multX/multY closed form + fee off the output but exposes only the REAL FermiSwapper SURFACE:
- * `quoteAmounts(tokenIn, tokenOut, int256)` returning a (amountIn, amountOut) TUPLE and
- * `fermiSwapWithAllowances(tokenIn, tokenOut, int256, amountCheck, recipient)` with a SETTABLE private state),
- * deploys the Sauce engine, and cooks an EcoSwap whose static-segment cursor consumes Fermi segments
- * (segKind 11) and executes them CALLBACK-FREE: an on-chain `quoteAmounts(tokenIn, tokenOut, +awarded)[1]`
- * staticcall (reading the LIVE state, used as amountCheck) + `token.approve(pool, awarded)` +
- * `pool.fermiSwapWithAllowances(tokenIn, tokenOut, +awarded, amountCheck, self)` (propAMM PULLS via
- * transferFrom — approve-first, unlike WOOFi's transfer-first path). Fermi is NOT xy=k, so the engine's
- * _swapV2 would mis-price it; the swap is callback-free, so it needs NO engine dispatch. Then asserts:
+ * Fermi is migrated to the QUOTE-LADDER framework (the same one Curve / LB / WOOFi / DODO / Wombat use):
+ * prepare ships ONLY a descriptor [pool, _, _, feePpm, segKind=11, refIdx] — NO off-chain sampled ladder — and
+ * the on-chain solver BUILDS each Fermi venue's price ladder in setup from LIVE cook-time
+ * `quoteAmounts(tokenIn, tokenOut, +xNext)[1]` (the SECOND return is the exact-in out; PROBE-THEN-DECODE, as
+ * the maker can pause / go stale). EXEC is UNCHANGED: callback-free — an on-chain quoteAmounts staticcall for
+ * amountCheck + approve + `fermiSwapWithAllowances(...)` (propAMM PULLS via transferFrom).
  *
- *   (1) SOLO Fermi venue — the on-chain dy the caller receives == the pool's own LIVE `quoteAmounts(+share)`
- *       to the WEI (the exec re-reads the live quote). Per-pool input == the whole trade. NO tolerance on
- *       the exec gate; the off-chain ladder interpolation is only a segment/split diagnostic.
- *   (2) TWO Fermi venues — ONE EcoSwap splits across both; each leg's received output == the LIVE
- *       `quoteAmounts` for its awarded share to the wei, and the post-fee marginals equalize within the
- *       sampled-grid bound.
- *   (3) TREESHAKE regression cell — compiles the PRODUCTION treeshake define set (HAS_FERMI only, all other
- *       segment flags false) and cooks a REAL Fermi fill: guards that HAS_FERMI was added to the segment-head
- *       price-merge guard + the accumulator branch + the exec block across the guard triple (else the segment
- *       head is dead under treeshake and the swap lands ZERO — the Balancer-class bug).
- *   (4) STATE MOVES between prepare and cook — the split is priced at the SNAPSHOT ladder, then the maker
- *       posts new params (setState) before the cook. The exec stays exact-vs-live-quote (received == the LIVE
- *       `quoteAmounts(+awarded)` at the moved state), demonstrating the snapshotted-quote model: exact-on-grid
- *       at the snapshot, exact-vs-live-quote at exec. The move is bounded/guarded (per-pool amountCheck == the
- *       LIVE quote + the whole-trade amountOutMin + the solver's terminal refund bound a bad fill).
+ * The oracle prices Fermi via buildFermiQLLadder over a ladder SAMPLED AT the geometric `qlLadderInputs`
+ * points (the SAME points the on-chain ladder queries) — interpolation is exact at a sample point, so the
+ * oracle reproduces the solver's live quoteAmounts ladder to the WEI and the split is wei-exact.
  *
- * The Fermi math is OFF-CHAIN only for the SPLIT: the on-chain solver supplies the curve as STATIC
- * (capacity, marginalOI) segments (built by differencing a LIVE `quoteAmounts` ladder sampled off-chain) and
- * never recomputes the propAMM closed form. We build the prepared args DIRECTLY, then compile the production
- * solver template exactly as index.ts does and cook it.
+ *   (1) SOLO QL Fermi — ladder built from live quoteAmounts, covers [0, amountIn], received ==
+ *       quoteAmounts(share)[1] == the pool's own view, all to the WEI.
+ *   (2) QL Fermi + a live V3 direct pool — the QL stream (bestKind 1) vs the live V3 frontier (bestKind 3) in
+ *       ONE merge; the per-venue split == the neutral oracle to the WEI.
+ *   (3) QL Fermi + QL Curve — TWO QL venues of DIFFERENT segKind (11 + 1) ride ONE qlv; interleave + split.
+ *   (4) ZERO-CACHE QUOTE — a read-only cook builds the ladder LIVE with NO prepared segments, quote ==
+ *       quoteAmounts(amountIn)[1] to the wei.
+ *   (5) ADVERSE DRIFT — the maker posts a SHALLOWER curve (setState) BEFORE cooking the pre-drift bytecode;
+ *       the QL ladder reads the LIVE (worse) quoteAmounts and the Fermi↔V3 split RE-ANCHORS (Fermi share
+ *       shrinks, V3's grows) to the drifted oracle, wei-exact.
  *
- * ISOLATED per-cell chain (the fresh-anvil-per-cell pattern all *.evm.test.ts use): every cell runs on its
- * OWN fresh anvil + freshly-deployed engine (setup()), then deploys its Fermi pool + sets approvals and
- * asserts the pre-cook invariants — so the compiled args always match live on-chain state. setup() awaits the
- * prior anvil's `stopped` promise before booting the next (the race-free pattern).
- *
- * No fork / no RPC env needed — a local fixture etches the whole stack. Runs on v1 (+ v12 when the v12
- * artifacts are present). Driven by ECO_ENGINE (default v12). Mirrors ecoswap.woofi.evm.test.ts.
+ * No fork / no RPC env — local fixtures etch the whole stack. Runs on v1 (+ v12 when the v12 artifacts are
+ * present), driven by ECO_ENGINE. Each cell runs on its OWN fresh anvil. Mirrors ecoswap.lb.evm.test.ts.
  *
  * Run: pnpm --filter './sdk' test:recipes:evm   (or npx tsx --test this file)
  */
@@ -50,7 +35,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseEther, type Abi, type Account, type Hex } from "viem";
+import {
+  parseEther,
+  encodeFunctionData,
+  decodeFunctionResult,
+  parseAbi,
+  type Abi,
+  type Account,
+  type Hex,
+} from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -60,86 +53,75 @@ import {
   ensureMulticall3,
   deployStack,
   deploySortedTokens,
+  createAndInitPool,
+  mintPosition,
+  getSlot0,
+  getLiquidity,
   mint,
   approve,
   balanceOf,
-  erc20Abi,
   deployFermiPool,
   fermiPoolAbi,
+  deployCurveStableSwap,
+  SQRT_PRICE_1_1,
   type DeployedStack,
   type DeployedV12Stack,
 } from "./harness/setup";
 import { type Engine, engineCells, maybeDeployV12Stack, cookTarget } from "./harness/engine";
 import { MIN_SQRT_RATIO } from "../shared/constants";
-import { getAmountOut as fermiGetAmountOut, buildFermiSegments, fermiSampleInputs, isqrt, type FermiPool } from "../shared/fermi-math";
+import { getSqrtRatioAtTick } from "./ecoswap.math";
+import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
+import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math";
+import { qlLadderInputs, getDy as curveGetDy, type CurvePool } from "../shared/curve-math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 
 const E18 = 10n ** 18n;
-// A deep near-1:1 propAMM curve: multX==multY (K=v0²), reserveX==targetX (base=v0). fee 0.03% (300,
-// 1e6-scaled). Both tokens 18-dec so the split engages both venues on the flat part of the curve.
-const FEE_PPM = 300n;
+const FEE_PPM = 300n; // 0.03% (1e6-scaled), folded into the quote
 const ENGINE_CELLS = engineCells();
 
-// The PRODUCTION treeshake define set for a Fermi-only universe (no other segment-bearing protocol):
-// index.ts protocolDefines folds every other HAS_* to false. The fast/no-define test path leaves all HAS_*
-// at their source default `true`, masking any merge-head guard that omits HAS_FERMI — so this cell compiles
-// with the real treeshaken set and a REAL cook asserts a non-zero Fermi fill.
-const FERMI_ONLY_DEFINES: Record<string, boolean> = {
+// Fermi-only treeshake defines (HAS_FERMI lights the on-chain QL ladder build's Fermi quote branch + the
+// segKind-11 accumulator + the callback-free exec; the live V3 frontier + merge core are unguarded).
+const FERMI_DEFINES: Record<string, boolean> = {
   HAS_V2: false, HAS_V3: false, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
   HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
   HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
-  HAS_FERMI: true,
+  HAS_FERMI: true, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false,
 };
+// Fermi + Curve — BOTH QL adapter branches ship so the qlv loop builds a segKind-11 + a segKind-1 ladder.
+const FERMI_CURVE_DEFINES: Record<string, boolean> = { ...FERMI_DEFINES, HAS_CURVE: true, HAS_FERMI: true };
 
-// Fermi-only run: zero direct pools/routes/netCache; the Fermi venues ride entirely inside segs (segKind 11).
-// The solver's 5 compiler args, in index.ts order (cfg, pools, netCache, routing, segs).
-function fermiArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, segs: bigint[][]): unknown[] {
+// The solver's 6 compiler args (index.ts order): cfg, pools, netCache, routing, segs, qlv.
+function args(
+  tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex,
+  directCount: number, pools: bigint[][], qlv: bigint[][],
+): unknown[] {
   return [
-    [
-      BigInt(tokenIn),
-      BigInt(tokenOut),
-      amountIn,
-      BigInt(caller),
-      MIN_SQRT_RATIO + 1n, // priceLimit (unused by static segments)
-      0n, // directCount — no direct pools
-    ],
-    [], // pools
-    [], // netCache
-    [], // routing
-    segs,
-    [], // qlv — no QL (Quote-Ladder) descriptors in this static-segment universe
+    [BigInt(tokenIn), BigInt(tokenOut), amountIn, BigInt(caller), MIN_SQRT_RATIO + 1n, BigInt(directCount)],
+    pools, [], [], [], qlv,
   ];
 }
 
-// One Fermi venue → its sampled segments as segs rows. refIdx tags the on-chain per-venue accumulator
-// (feinp[refIdx]); venue is the pool address. Built from the SAME buildFermiSegments the oracle uses, so
-// the awarded Σ == the off-chain share by construction. segKind = 11; a Fermi segment is a flat post-fee
-// slice ⇒ sqrtAdjNear == sqrtAdjFar.
-function fermiSegRows(pool: FermiPool, refIdx: number, amountIn: bigint): bigint[][] {
-  return buildFermiSegments(pool, amountIn).map((s) => [
-    BigInt(refIdx),
-    s.capacity,
-    s.marginalOI, // sqrtAdjNear (post-fee; the descending-price sort key)
-    s.marginalOI, // sqrtAdjFar (a Fermi segment is a flat slice)
-    11n, // segKind = Fermi (callback-free)
-    BigInt(pool.address),
-    0n, // venueAux (segs[6]) — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
-  ]);
+// One QL Fermi descriptor: [pool, _, _, feePpm, segKind=11, refIdx]. Fermi quotes by tokenIn/tokenOut, so
+// qd[1]/qd[2] are unused; feePpm is informational (quoteAmounts is post-fee).
+function fermiDescriptor(pool: Hex, refIdx: number, feePpm: number): bigint[] {
+  return [BigInt(pool), 0n, 0n, BigInt(feePpm), 11n, BigInt(refIdx)];
 }
 
-// Interleave + sort segs rows the way index.ts buildSegs does: DESC by sqrtAdjNear, then DESC by
-// sqrtAdjFar, then by refIdx. The on-chain static-segment cursor consumes them in array order.
-function sortSegs(rows: bigint[][]): bigint[][] {
-  return rows.slice().sort((a, b) => {
-    if (a[2] !== b[2]) return a[2] < b[2] ? 1 : -1;
-    if (a[3] !== b[3]) return a[3] < b[3] ? 1 : -1;
-    return Number(a[0] - b[0]);
-  });
+// One QL Curve StableSwap descriptor: [poolAddr, i, j, feePpm10, segKind=1, refIdx].
+function curveDescriptor(pool: Hex, refIdx: number, feePpm10: bigint): bigint[] {
+  return [BigInt(pool), 0n, 1n, feePpm10, 1n, BigInt(refIdx)];
 }
 
-describe("EcoSwap Fermi / propAMM (Obric-style proactive AMM, local fixture) — Class-A callback-free exact-in-dy + state-snapshot split", () => {
+function v3PoolTuple(pool: Hex, feePpm: number, tickSpacing: number, inIsToken0: boolean): bigint[] {
+  return [
+    1n, BigInt(pool), BigInt(feePpm), BigInt(tickSpacing), 0n, BigInt(feePpm), 0n,
+    inIsToken0 ? 1n : 0n, 0n, 0n, getSqrtRatioAtTick(tickSpacing), 0n, 0n, 0n, 0n, 0n, 0n,
+  ];
+}
+
+describe("EcoSwap Fermi / propAMM QL live-walk (local fixture) — on-chain quoteAmounts ladder + callback-free exec", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;
@@ -149,8 +131,6 @@ describe("EcoSwap Fermi / propAMM (Obric-style proactive AMM, local fixture) —
   let solverSrc: string;
 
   async function setup(): Promise<void> {
-    // Tear the prior anvil down and WAIT for it to fully exit (port released) before booting the next — a
-    // fire-and-forget stop() raced the new startAnvil() under machine load and intermittently flaked a cook.
     const prev = anvil;
     prev?.stop();
     await prev?.stopped;
@@ -162,65 +142,25 @@ describe("EcoSwap Fermi / propAMM (Obric-style proactive AMM, local fixture) —
     tokenIn = tk.token0;
     tokenOut = tk.token1;
     solverSrc = readFileSync(SOLVER, "utf-8");
-
-    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("50000000"));
-    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("50000000"));
-
+    await mint(c.walletClient, c.publicClient, tokenIn, c.account0, parseEther("500000000"));
+    await mint(c.walletClient, c.publicClient, tokenOut, c.account0, parseEther("500000000"));
+    await approve(c.walletClient, c.publicClient, tokenIn, stack.helper, parseEther("1000000000"));
+    await approve(c.walletClient, c.publicClient, tokenOut, stack.helper, parseEther("1000000000"));
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
   }
 
   before(setup);
-
   after(() => {
     anvil?.stop();
   });
 
-  async function reset(): Promise<void> {
-    await setup();
+  // Deploy a Fermi pool (X=tokenIn, Y=tokenOut) funded with X+Y reserves. `v0` sets the near-1:1 curve
+  // (K=v0², base=v0). Larger v0 ⇒ flatter/deeper.
+  async function deploy(v0: bigint, xRes: bigint, yRes: bigint, minter: Account): Promise<Hex> {
+    return deployFermiPool(c.walletClient, c.publicClient, tokenIn, tokenOut, v0 * v0, v0, FEE_PPM, xRes, yRes, minter);
   }
 
-  // Assert the pre-cook invariants the compiled args assume: the caller can pay `amountIn` of tokenIn, the
-  // cook target is approved to pull it, and every pool holds enough tokenOut (Y) to satisfy the out.
-  async function assertPreCook(
-    caller: Hex, target: Hex, amountIn: bigint, pools: { pool: Hex; expectedOut: bigint }[],
-  ): Promise<void> {
-    const callerIn = await balanceOf(c.publicClient, tokenIn, caller);
-    assert.ok(callerIn >= amountIn, `caller tokenIn balance ${callerIn} >= amountIn ${amountIn}`);
-    const allowance = (await c.publicClient.readContract({
-      address: tokenIn, abi: erc20Abi as Abi, functionName: "allowance", args: [caller, target],
-    })) as bigint;
-    assert.ok(allowance >= amountIn, `cook target allowance ${allowance} >= amountIn ${amountIn}`);
-    for (const { pool, expectedOut } of pools) {
-      const poolOut = await balanceOf(c.publicClient, tokenOut, pool);
-      assert.ok(poolOut >= expectedOut, `pool ${pool} tokenOut reserve ${poolOut} >= expected out ${expectedOut}`);
-    }
-  }
-
-  // Off-chain FermiPool descriptor for a deployed fixture — SAMPLES the fixture's LIVE quoteAmounts ladder
-  // over [0, amountIn] exactly as discovery does (no closed-form K/base read; the real router exposes none).
-  async function offPool(address: Hex, amountIn: bigint): Promise<FermiPool> {
-    const cumIn = fermiSampleInputs(amountIn);
-    const cumOut: bigint[] = [];
-    for (const amt of cumIn) cumOut.push(await onQuery(address, amt));
-    return {
-      address, tokenIn, tokenOut, cumIn, cumOut,
-      feePpm: Number(FEE_PPM), source: "local-fixture",
-    };
-  }
-
-  // Deploy a Fermi pool (X=tokenIn, Y=tokenOut) funded with X+Y reserves. `v0` sets the deep near-1:1 curve
-  // (K=v0², base=v0). Reserves must cover the out.
-  async function deploy(v0: bigint, xRes: bigint, yRes: bigint, minter: Account): Promise<{ pool: Hex; K: bigint; base: bigint }> {
-    const K = v0 * v0;
-    const base = v0;
-    const pool = await deployFermiPool(
-      c.walletClient, c.publicClient, tokenIn, tokenOut, K, base, FEE_PPM, xRes, yRes, minter,
-    );
-    return { pool, K, base };
-  }
-
-  // The fixture's own on-chain quoteAmounts view — the engine-independent ground truth for the executed dy.
-  // The real FermiSwapper quote returns a (amountIn, amountOut) TUPLE; take [1] for the exact-in out.
+  // The fixture's own on-chain quoteAmounts view — the engine-independent ground truth. Returns [1] (out).
   async function onQuery(pool: Hex, amt: bigint): Promise<bigint> {
     const r = (await c.publicClient.readContract({
       address: pool, abi: fermiPoolAbi as Abi, functionName: "quoteAmounts", args: [tokenIn, tokenOut, amt],
@@ -228,240 +168,298 @@ describe("EcoSwap Fermi / propAMM (Obric-style proactive AMM, local fixture) —
     return r[1];
   }
 
-  // ── (1) SOLO Fermi venue — received == getAmountOut(share) == on-chain getAmountOut to the WEI ──
+  // Off-chain FermiPool descriptor — SAMPLES the fixture's LIVE quoteAmounts ladder AT the geometric
+  // `qlLadderInputs` points (the SAME points the on-chain QL ladder queries), so buildFermiQLLadder's
+  // interpolation is EXACT at every ladder point ⇒ oracle == solver to the wei.
+  async function offPool(address: Hex, amountIn: bigint): Promise<FermiPool> {
+    const cumIn = qlLadderInputs(amountIn);
+    const cumOut: bigint[] = [];
+    for (const amt of cumIn) cumOut.push(await onQuery(address, amt));
+    return { address, tokenIn, tokenOut, cumIn, cumOut, feePpm: Number(FEE_PPM), source: "local-fixture" };
+  }
+
+  function offCurvePool(address: Hex, balances: bigint[], a: bigint, fee: bigint): CurvePool {
+    return { poolType: 3, address, i: 0, j: 1, A: a, aPrecision: 100n, balances, rates: [E18, E18], feePpm10: fee, source: "local-fixture" };
+  }
+
+  // ── (1) SOLO QL Fermi — the on-chain ladder is built live; received == quoteAmounts(share)[1] wei ──
   async function runSolo(engine: Engine): Promise<void> {
-    await reset();
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
     const V0 = 10_000_000n * E18;
-    const { pool } = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
+    const pool = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
 
-    // amountIn == the full sampled ladder cap ⇒ the merge awards the WHOLE Σ to this one venue.
     const amountIn = 100_000n * E18;
     const op = await offPool(pool, amountIn);
-    const segRows = fermiSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Fermi segment ladder");
-    const segSum = segRows.reduce((a, r) => a + r[1], 0n);
-    assert.equal(segSum, amountIn, "Fermi segments cover the full amountIn");
+    const ladder = buildFermiQLLadder(op, amountIn);
+    assert.ok(ladder.length > 0, "non-empty QL Fermi ladder");
+    const cover = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(cover, amountIn, "QL Fermi ladder covers the full amountIn (pool deep enough)");
 
     const { bytecodes } = compileSauce(
-      solverSrc, fermiArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [fermiDescriptor(pool, 0, Number(FEE_PPM))]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: FERMI_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    await assertPreCook(caller, target, amountIn, [{ pool, expectedOut: await onQuery(pool, segSum) }]);
     const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
     const poolInBefore = await balanceOf(c.publicClient, tokenIn, pool);
-
     const onViewPre = await onQuery(pool, amountIn);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "solo Fermi cook() must succeed");
+    assert.equal(receipt.status, "success", "solo QL Fermi cook() must succeed");
 
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
     const poolIn = (await balanceOf(c.publicClient, tokenIn, pool)) - poolInBefore;
 
-    assert.equal(spent, amountIn, "spent == amountIn (the whole trade routed to the Fermi pool)");
-    assert.equal(poolIn, amountIn, "the Fermi pool received the full input share (approve + pull)");
-
-    // EXACT-VS-LIVE-QUOTE: received == the pool's own LIVE quoteAmounts(+share) view to the wei.
-    assert.equal(received, onViewPre, "received == on-chain quoteAmounts view (exact-vs-live-quote)");
+    assert.equal(spent, amountIn, "spent == amountIn (whole trade routed to the QL Fermi venue)");
+    assert.equal(poolIn, amountIn, "the Fermi pool pulled the full input share (approve + pull)");
+    assert.equal(received, onViewPre, "received == on-chain quoteAmounts view to the wei");
     assert.ok(received > 0n, "non-zero Fermi fill through the callback-free approve+swap path");
 
-    console.log(`  [Fermi solo:${engine}] spent=${spent} received=${received} (== on-chain quoteAmounts to the wei)`);
-  }
-
-  // ── (2) TWO Fermi venues — split + per-leg exact-in-dy + marginals equalize ──
-  async function runSplit(engine: Engine): Promise<void> {
-    await reset();
-    const target = cookTarget(engine, stack, v12);
-    const caller = c.account0;
-
-    // Two venues at the same near-1:1 price but DIFFERENT depth (v0) → different marginal curves, so the
-    // water-fill engages BOTH and equalizes their post-fee marginals. A (larger v0) is flatter/deeper, so it
-    // drives first + more; B (smaller v0) steepens sooner.
-    const V0a = 20_000_000n * E18; // deep/flat
-    const V0b = 5_000_000n * E18; // shallower (steeper)
-    const a = await deploy(V0a, 5_000_000n * E18, 5_000_000n * E18, caller);
-    const b = await deploy(V0b, 5_000_000n * E18, 5_000_000n * E18, caller);
-
-    const amountIn = 200_000n * E18;
-    const opA = await offPool(a.pool, amountIn);
-    const opB = await offPool(b.pool, amountIn);
-    const segRows = sortSegs([...fermiSegRows(opA, 0, amountIn), ...fermiSegRows(opB, 1, amountIn)]);
-
-    const { bytecodes } = compileSauce(
-      solverSrc, fermiArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
-    );
-
-    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    await assertPreCook(caller, target, amountIn, [
-      { pool: a.pool, expectedOut: await onQuery(a.pool, amountIn) },
-      { pool: b.pool, expectedOut: await onQuery(b.pool, amountIn) },
-    ]);
-    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
-    const aInBefore = await balanceOf(c.publicClient, tokenIn, a.pool);
-    const bInBefore = await balanceOf(c.publicClient, tokenIn, b.pool);
-
-    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "two-venue Fermi cook() must succeed");
-
-    const aIn = (await balanceOf(c.publicClient, tokenIn, a.pool)) - aInBefore;
-    const bIn = (await balanceOf(c.publicClient, tokenIn, b.pool)) - bInBefore;
-    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
-
-    assert.ok(aIn > 0n && bIn > 0n, "both Fermi venues are funded");
-    assert.ok(aIn > bIn, `deeper venue A draws more than B (A ${aIn} > B ${bIn})`);
-
-    // PER-LEG EXACT-VS-LIVE-QUOTE: received == quoteAmounts_A(aIn) + quoteAmounts_B(bIn) on-chain.
-    const expected = (await onQuery(a.pool, aIn)) + (await onQuery(b.pool, bIn));
-    assert.equal(received, expected, "received == Σ on-chain quoteAmounts(per-venue share) to the wei");
-
-    // MARGINALS EQUALIZE within the GRID bound (exact-on-grid at the snapshot: the awarded inputs equal the
-    // oracle bit-for-bit — checked by the wei-exact gate above; the realized post-fee marginal equalizes only
-    // to within ONE sampled segment's price width). The propAMM curve is very flat near par, so a single
-    // M=24 segment spans a wide band: the cut gap is a documented grid bound (converges as M grows).
-    const margA = marginalAt(opA, aIn);
-    const margB = marginalAt(opB, bIn);
-    const diff = margA > margB ? margA - margB : margB - margA;
-    const relPpm = margA > 0n ? (diff * 1_000_000n) / margA : 0n;
-    assert.ok(relPpm <= 2500n, `Fermi split marginals equalize on the M=24 grid (rel ${relPpm} ppm; A ${margA} B ${margB})`);
-
     console.log(
-      `  [Fermi split:${engine}] A in=${aIn} B in=${bIn} received=${received} ` +
-        `(== Σ getAmountOut to the wei); marginals A=${margA} B=${margB} (${relPpm} ppm)`,
+      `  [QL Fermi solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +
+        `(== on-chain quoteAmounts to the wei); cook gasUsed=${receipt.gasUsed}`,
     );
   }
 
-  // ── (3) SOLO Fermi under the PRODUCTION treeshake define set ──
-  // Same trade as runSolo, but compiled with treeshake:true + Fermi-only defines (the exact compile a
-  // production Fermi-without-other-segs cook carries). Guards the guard triple: if HAS_FERMI is missing from
-  // the segment-head price-merge guard, the accumulator branch, OR the exec block, under treeshake the Fermi
-  // head is never compared / never accumulated / never swapped and the swap lands ZERO (the Balancer bug).
-  async function runSoloTreeshake(engine: Engine): Promise<void> {
-    await reset();
+  // ── (2) QL Fermi + a live V3 direct pool — split == oracle wei-exact ──
+  async function runFermiV3(engine: Engine): Promise<void> {
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
-    const V0 = 10_000_000n * E18;
-    const { pool } = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
-
+    // A deep/flat Fermi (v0=50M, cheap 0.03% fee) vs a DEEP 1:1 V3 (0.30% fee): the Fermi fills the cheap
+    // near region, its marginal drops below V3's, V3 takes the tail — both fund.
+    const V0 = 50_000_000n * E18;
+    const pool = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
     const amountIn = 100_000n * E18;
     const op = await offPool(pool, amountIn);
-    const segRows = fermiSegRows(op, 0, amountIn);
-    assert.ok(segRows.length > 0, "non-empty Fermi segment ladder");
 
+    const V3_FEE = 3000, V3_TS = 60;
+    const v3 = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, V3_FEE, SQRT_PRICE_1_1);
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, v3, caller, -60000, 60000, parseEther("3000000"));
+    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, v3);
+    const liquidity = await getLiquidity(c.publicClient, v3);
+    assert.ok(liquidity > 0n, "V3 pool has active liquidity");
+
+    const v3Opt: OptimalPool = { isV2: false, feePpm: V3_FEE, sqrtPriceX96, tick, tickSpacing: V3_TS, liquidity, net: new Map() };
+    const oracle = optimalSplit({ pools: [v3Opt, { fermi: op, feePpm: 0 }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const oV3 = oracle.perPoolInput[0] ?? 0n;
+    const oFermi = oracle.perPoolInput[1] ?? 0n;
+    assert.ok(oV3 > 0n && oFermi > 0n, `oracle splits across V3 + Fermi (V3 ${oV3}, Fermi ${oFermi})`);
+
+    const pools = [v3PoolTuple(v3, V3_FEE, V3_TS, true)];
+    const qlv = [fermiDescriptor(pool, 0, Number(FEE_PPM))];
     const { bytecodes } = compileSauce(
-      solverSrc, fermiArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
-      { treeshake: true, defines: FERMI_ONLY_DEFINES },
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 1, pools, qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: FERMI_DEFINES },
     );
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    await assertPreCook(caller, target, amountIn, [{ pool, expectedOut: await onQuery(pool, amountIn) }]);
-    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const fermiInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "treeshaken Fermi-only cook() must succeed");
+    assert.equal(receipt.status, "success", "Fermi+V3 cook() must succeed");
 
+    const fermiIn = (await balanceOf(c.publicClient, tokenIn, pool)) - fermiInBefore;
+    const v3In = (await balanceOf(c.publicClient, tokenIn, v3)) - v3InBefore;
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
 
-    // The merge MUST have routed the trade to Fermi — non-zero spend/receive is the regression gate.
-    assert.ok(spent > 0n, "treeshaken Fermi-only: non-zero Fermi fill (guard triple alive)");
-    assert.equal(received, await onQuery(pool, spent), "received == on-chain quoteAmounts(share) to the wei (treeshaken path)");
+    assert.ok(fermiIn > 0n && v3In > 0n, `both venues funded (Fermi ${fermiIn}, V3 ${v3In})`);
+    assert.equal(v3In, oV3, "V3 awarded input == oracle (wei-exact split)");
+    assert.equal(fermiIn, oFermi, "Fermi awarded input == oracle (wei-exact split)");
+    assert.equal(spent, oracle.totalInput, "spent == oracle totalInput (wei-exact)");
+    assert.ok(received > 0n, "caller receives tokenOut");
 
-    console.log(`  [Fermi treeshake:${engine}] spent=${spent} received=${received} (production define set)`);
+    console.log(`  [QL Fermi+V3:${engine}] V3 in=${v3In} Fermi in=${fermiIn} spent=${spent} received=${received} (split == oracle wei-exact)`);
   }
 
-  // ── (4) STATE MOVES between prepare and cook — exec stays exact-in-dy at the LIVE state ──
-  // The split is priced at the SNAPSHOT state (op captures K/base), the segs are built from it, THEN the
-  // maker posts a new (deeper) state via setState before the cook. The exec re-reads the LIVE state via
-  // getAmountOut, so the received dy == the LIVE getAmountOut(awarded) at the MOVED state (exact-in-dy), NOT
-  // the snapshot dy — the documented Class-A snapshot model: exact-on-grid at the snapshot, exact-in-dy at
-  // the live view. A deeper curve ⇒ LESS slippage ⇒ MORE out; per-pool minOut (== the LIVE getAmountOut)
-  // guards an adverse move. This is the same class as the WOOFi oracle-snapshot / V3 fee-snapshot assumption.
-  async function runStateMoves(engine: Engine): Promise<void> {
-    await reset();
+  // ── (3) QL Fermi + QL Curve — TWO QL venues of DIFFERENT segKind (11 + 1) in ONE qlv ──
+  async function runFermiCurve(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    // A deep/flat cheap Fermi (draws first) vs a SHALLOWER dearer Curve (steepens and takes a slice) — both
+    // fund, ladders interleave in the merged DESC sort.
+    const V0 = 50_000_000n * E18;
+    const pool = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
+    const amountIn = 60_000n * E18;
+    const op = await offPool(pool, amountIn);
+
+    const curveBal = [40_000n * E18, 40_000n * E18];
+    const CURVE_A = 100n, CURVE_FEE = 4_000_000n; // 0.04% (1e10-scaled), dearer than Fermi's 0.03%
+    const curve = await deployCurveStableSwap(c.walletClient, c.publicClient, [tokenIn, tokenOut], curveBal, [E18, E18], CURVE_A, CURVE_FEE, caller);
+    const opCurve = offCurvePool(curve, curveBal, CURVE_A, CURVE_FEE);
+
+    const oracle = optimalSplit({ pools: [{ curve: opCurve, feePpm: 0 }, { fermi: op, feePpm: 0 }], amountIn, zeroForOne: true });
+    const oCurve = oracle.perPoolInput[0] ?? 0n;
+    const oFermi = oracle.perPoolInput[1] ?? 0n;
+    assert.ok(oCurve > 0n && oFermi > 0n, `oracle splits across QL Curve + QL Fermi (Curve ${oCurve}, Fermi ${oFermi})`);
+
+    const qlv = [curveDescriptor(curve, 0, CURVE_FEE), fermiDescriptor(pool, 0, Number(FEE_PPM))];
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: FERMI_CURVE_DEFINES },
+    );
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const curveInBefore = await balanceOf(c.publicClient, tokenIn, curve);
+    const fermiInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "QL Fermi + QL Curve cook() must succeed");
+
+    const curveIn = (await balanceOf(c.publicClient, tokenIn, curve)) - curveInBefore;
+    const fermiIn = (await balanceOf(c.publicClient, tokenIn, pool)) - fermiInBefore;
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
+
+    assert.ok(curveIn > 0n && fermiIn > 0n, `both QL venues funded (Curve ${curveIn}, Fermi ${fermiIn})`);
+    assert.equal(curveIn, oCurve, "Curve awarded input == oracle (wei-exact split)");
+    assert.equal(fermiIn, oFermi, "Fermi awarded input == oracle (wei-exact split)");
+    // PER-LEG WEI-EXACT: received == get_dy_Curve(curveIn) + the LIVE quoteAmounts(fermiIn)[1] (the exec
+    // re-reads the exact live quote for the awarded share; the off-chain getAmountOut ladder is only exact
+    // AT a ladder point, so use the on-chain view for the arbitrary awarded share). NO tolerance.
+    assert.equal(received, curveGetDy(opCurve, curveIn) + (await onQuery(pool, fermiIn)), "received == Σ per-venue view(share) to the wei");
+
+    console.log(
+      `  [QL Curve+Fermi:${engine}] Curve in=${curveIn} Fermi in=${fermiIn} received=${received} ` +
+        `(two QL segKinds interleaved; split == oracle, dy wei-exact)`,
+    );
+  }
+
+  // ── (4) ZERO-CACHE QUOTE — a read-only cook builds the ladder LIVE with NO prepared cache/segments ──
+  const cookCallAbi = parseAbi(["function cook(bytes[] ingredients) payable returns (bytes returnData)"]);
+  function decodeCookUint(ret: Hex, engine: Engine): bigint {
+    if (!ret || ret === "0x") return 0n;
+    if (engine === "v1") {
+      const blob = decodeFunctionResult({ abi: cookCallAbi as Abi, functionName: "cook", data: ret }) as unknown as Hex;
+      const hex = blob.slice(2);
+      return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+    }
+    const hex = ret.slice(2);
+    return hex.length >= 64 ? BigInt("0x" + hex.slice(-64)) : 0n;
+  }
+
+  async function runZeroCacheQuote(engine: Engine): Promise<void> {
+    await setup();
     const target = cookTarget(engine, stack, v12);
     const caller = c.account0;
 
     const V0 = 10_000_000n * E18;
-    // Fund with EXTRA Y so the moved-state (larger) output is still covered.
-    const { pool } = await deploy(V0, 2_000_000n * E18, 4_000_000n * E18, caller);
-
+    const pool = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
     const amountIn = 100_000n * E18;
-    const opSnapshot = await offPool(pool, amountIn); // the SNAPSHOT ladder the split is priced at
-    const snapDy = await onQuery(pool, amountIn); // the snapshot quote for the whole trade (pre-move)
-    const segRows = fermiSegRows(opSnapshot, 0, amountIn); // segments PRICED at the snapshot
+
     const { bytecodes } = compileSauce(
-      solverSrc, fermiArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine,
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 0, [], [fermiDescriptor(pool, 0, Number(FEE_PPM))]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: FERMI_DEFINES },
+    );
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const data = encodeFunctionData({ abi: cookCallAbi as Abi, functionName: "cook", args: [bytecodes] });
+    const { data: ret } = await c.publicClient.call({ account: caller, to: target, data, gas: 2_000_000_000n });
+    const quoted = decodeCookUint(ret as Hex, engine);
+
+    assert.equal(quoted, await onQuery(pool, amountIn), "zero-cache QUOTE == quoteAmounts(amountIn)[1] to the wei (ladder built live in the eth_call)");
+    console.log(`  [QL Fermi zero-cache quote:${engine}] quoted=${quoted} (== quoteAmounts(amountIn)[1], no prepared cache)`);
+  }
+
+  // ── (5) ADVERSE DRIFT — the maker posts a SHALLOWER curve (setState) BEFORE cooking; the live QL ladder
+  // re-anchors the Fermi↔V3 split to the drifted (worse) state. The SAME bytecode is cooked after the drift. ──
+  async function runDriftSplit(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const V0 = 50_000_000n * E18;
+    const pool = await deploy(V0, 2_000_000n * E18, 2_000_000n * E18, caller);
+    const amountIn = 100_000n * E18;
+    const opPre = await offPool(pool, amountIn);
+
+    const V3_FEE = 3000, V3_TS = 60;
+    const v3 = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, V3_FEE, SQRT_PRICE_1_1);
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, v3, caller, -60000, 60000, parseEther("3000000"));
+    const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, v3);
+    const liquidity = await getLiquidity(c.publicClient, v3);
+    const v3Opt: OptimalPool = { isV2: false, feePpm: V3_FEE, sqrtPriceX96, tick, tickSpacing: V3_TS, liquidity, net: new Map() };
+
+    const pools = [v3PoolTuple(v3, V3_FEE, V3_TS, true)];
+    const qlv = [fermiDescriptor(pool, 0, Number(FEE_PPM))];
+    const { bytecodes } = compileSauce(
+      solverSrc, args(tokenIn, tokenOut, amountIn, caller, 1, pools, qlv),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: FERMI_DEFINES },
     );
 
-    // The state MOVES between prepare (segs above) and cook: the maker posts a DEEPER curve (2× v0 ⇒ 4× K,
-    // 2× base) — less slippage per unit, so a strictly better fill.
-    const V0moved = V0 * 2n;
-    const Kmoved = V0moved * V0moved;
-    const baseMoved = V0moved;
-    const setHash = await c.walletClient.writeContract({
-      address: pool, abi: fermiPoolAbi as Abi, functionName: "setState",
-      args: [Kmoved, baseMoved],
-      account: c.walletClient.account as Account, chain: c.walletClient.chain,
+    const oraclePre = optimalSplit({ pools: [v3Opt, { fermi: opPre, feePpm: 0 }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const fermiSharePre = oraclePre.perPoolInput[1] ?? 0n;
+    assert.ok(fermiSharePre > 0n, "baseline oracle awards the Fermi venue a share");
+
+    // ADVERSE DRIFT: the maker posts a SHALLOWER curve (v0/5 ⇒ steeper, more slippage), so the live
+    // quoteAmounts marginal for the same input drops.
+    const V0drift = V0 / 5n;
+    await c.publicClient.waitForTransactionReceipt({
+      hash: await c.walletClient.writeContract({
+        address: pool, abi: fermiPoolAbi as Abi, functionName: "setState",
+        args: [V0drift * V0drift, V0drift], account: caller, chain: c.walletClient.chain,
+      }),
     });
-    await c.publicClient.waitForTransactionReceipt({ hash: setHash });
+
+    const opDrift = await offPool(pool, amountIn); // re-sample the LIVE (shallower) quoteAmounts ladder
+    const oracleDrift = optimalSplit({ pools: [v3Opt, { fermi: opDrift, feePpm: 0 }], amountIn, zeroForOne: true, priceLimit: MIN_SQRT_RATIO + 1n });
+    const fermiShareDrift = oracleDrift.perPoolInput[1] ?? 0n;
+    assert.ok(fermiShareDrift < fermiSharePre, `drift shrinks the Fermi share (${fermiShareDrift} < ${fermiSharePre})`);
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
-    const liveOut = await onQuery(pool, amountIn); // LIVE quoteAmounts at the moved state — the exec ground truth
-    await assertPreCook(caller, target, amountIn, [{ pool, expectedOut: liveOut }]);
-    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
     const outBefore = await balanceOf(c.publicClient, tokenOut, caller);
+    const inBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const fermiInBefore = await balanceOf(c.publicClient, tokenIn, pool);
+    const v3InBefore = await balanceOf(c.publicClient, tokenIn, v3);
 
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
-    assert.equal(receipt.status, "success", "state-moved Fermi cook() must succeed");
+    assert.equal(receipt.status, "success", "drift cook() SUCCEEDS — Fermi ladder re-anchored to the live drifted state");
 
+    const fermiIn = (await balanceOf(c.publicClient, tokenIn, pool)) - fermiInBefore;
+    const v3In = (await balanceOf(c.publicClient, tokenIn, v3)) - v3InBefore;
     const spent = inBefore - (await balanceOf(c.publicClient, tokenIn, caller));
     const received = (await balanceOf(c.publicClient, tokenOut, caller)) - outBefore;
 
-    // EXACT-VS-LIVE-QUOTE at the LIVE (moved) state — NOT the snapshot dy.
-    assert.equal(spent, amountIn, "the whole trade routed to the single Fermi pool");
-    assert.equal(received, liveOut, "received == on-chain LIVE quoteAmounts view at the moved state");
-    // The move was to a deeper curve (less slippage) ⇒ received strictly exceeds the snapshot quote.
-    assert.ok(received > snapDy, "moved (deeper) state yields more than the snapshot dy");
+    assert.ok(v3In > 0n, "V3 funded post-drift");
+    assert.equal(fermiIn, fermiShareDrift, "Fermi awarded input == drifted oracle (re-anchored to the live drifted state)");
+    assert.equal(v3In, oracleDrift.perPoolInput[0] ?? 0n, "V3 awarded input == drifted oracle (re-anchored, wei-exact)");
+    assert.equal(spent, oracleDrift.totalInput, "spent == drifted oracle totalInput (wei-exact)");
+    assert.ok(fermiIn < fermiSharePre, `Fermi share ADAPTED down after the drift (${fermiIn} < baseline ${fermiSharePre})`);
+    assert.ok(received > 0n, "caller receives tokenOut");
 
     console.log(
-      `  [Fermi state-move:${engine}] spent=${spent} received=${received} ` +
-        `(snapshot dy=${snapDy} < live dy — exact-vs-live-quote at the moved state)`,
+      `  [QL Fermi+V3 drift:${engine}] baseline Fermi share=${fermiSharePre} → re-anchored=${fermiIn} ` +
+        `(V3 grew to ${v3In}); spent=${spent} received=${received}`,
     );
-  }
-
-  // Post-fee out/in marginal price at a cumulative input `share` — a small finite-difference slice of
-  // getAmountOut around `share` (the same coordinate the segments carry). Used only to check the split
-  // equalized marginals.
-  function marginalAt(pool: FermiPool, share: bigint): bigint {
-    if (share <= 0n) return 0n;
-    const eps = share / 1000n > 0n ? share / 1000n : 1n;
-    const lo = share - eps > 0n ? share - eps : 0n;
-    const dIn = share - lo;
-    const dOut = fermiGetAmountOut(pool, share) - fermiGetAmountOut(pool, lo);
-    if (dIn <= 0n || dOut <= 0n) return 0n;
-    return isqrt((dOut * (1n << 192n)) / dIn);
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
-    it(`Fermi solo [${engine}] — received == getAmountOut(share) == on-chain view to the wei (exact-in-dy)`, { skip }, async () => {
+    it(`QL Fermi solo [${engine}] — on-chain ladder, received == quoteAmounts(share)[1] wei-exact`, { skip }, async () => {
       await runSolo(engine);
     });
-    it(`Fermi split [${engine}] — two venues, per-leg exact-in-dy + marginals equalize`, { skip }, async () => {
-      await runSplit(engine);
+    it(`QL Fermi + V3 [${engine}] — sampled stream vs live frontier, split == oracle wei-exact`, { skip }, async () => {
+      await runFermiV3(engine);
     });
-    it(`Fermi solo treeshake [${engine}] — production define set lands a non-zero Fermi fill`, { skip }, async () => {
-      await runSoloTreeshake(engine);
+    it(`QL Fermi + QL Curve [${engine}] — two QL segKinds in one loop, interleave + split == oracle`, { skip }, async () => {
+      await runFermiCurve(engine);
     });
-    it(`Fermi state moves [${engine}] — split priced at snapshot, exec exact-in-dy at the live state`, { skip }, async () => {
-      await runStateMoves(engine);
+    it(`QL Fermi zero-cache QUOTE [${engine}] — ladder built live in eth_call, no prepared cache`, { skip }, async () => {
+      await runZeroCacheQuote(engine);
+    });
+    it(`QL Fermi + V3 adverse drift [${engine}] — split RE-ANCHORS to the live drifted state`, { skip }, async () => {
+      await runDriftSplit(engine);
     });
   }
 });

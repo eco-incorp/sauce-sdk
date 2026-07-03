@@ -1,0 +1,30 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "querySellBase",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "trader", "type": "address" },
+        { "name": "payBaseAmount", "type": "uint256" }
+      ],
+      "outputs": [
+        { "name": "receiveQuoteAmount", "type": "uint256" },
+        { "name": "mtFee", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "querySellQuote",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "trader", "type": "address" },
+        { "name": "payQuoteAmount", "type": "uint256" }
+      ],
+      "outputs": [
+        { "name": "receiveBaseAmount", "type": "uint256" },
+        { "name": "mtFee", "type": "uint256" }
+      ]
+    }
+  ]
+}

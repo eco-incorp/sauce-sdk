@@ -4,6 +4,7 @@ import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
 import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IKyberPool } from "./IKyberPool.json";
+import { IDODOPool } from "./IDODOPool.json";
 import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 import { IWombatPool } from "./IWombatPool.json";
 import { IEulerSwapPool } from "./IEulerSwapPool.json";
@@ -89,8 +90,11 @@ import { IPermit2 } from "./IPermit2.json";
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
 //   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx] — the QUOTE-LADDER (QL) venue DESCRIPTORS
-//                 (Curve StableSwap segKind 1, Trader Joe LB segKind 2, Curve CryptoSwap segKind 9,
-//                 Solidly STABLE segKind 4, WOOFi segKind 10, Mento V2 segKind 13). NO sampled values:
+//                 (Curve StableSwap segKind 1, Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE
+//                 segKind 4, Wombat segKind 5, Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind
+//                 11, Mento V2 segKind 13). DODO is DIRECTIONAL — qd[1] is isSellBase (tokenIn ==
+//                 pool._BASE_TOKEN_()): the ladder quotes querySellBase(caller,xNext) or querySellQuote(
+//                 caller,xNext) accordingly. NO sampled values:
 //                 prepare ships only the descriptor (prepare-optional), and the solver BUILDS each venue's
 //                 price ladder ON-CHAIN in setup from LIVE cook-time state. For k in 0..QL_S-1 it takes a
 //                 geometric cumulative input xNext = cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV,
@@ -600,7 +604,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -686,6 +690,42 @@ function main(
                       } else {
                         if (HAS_WOOFI && qKind === 10) {
                           q = IWooFiPool.at(qPool).tryQuery(tokenIn, tokenOut, xNext);
+                        } else {
+                          if (HAS_WOMBAT && qKind === 5) {
+                            // Wombat (single-sided stableswap, callback-free): the ladder quote is
+                            // quotePotentialSwap(fromToken, toToken, xNext)[0] — the post-haircut out. It is
+                            // a REVERT-class view (CASH_NOT_ENOUGH / a paused asset), so PROBE-THEN-DECODE.
+                            // xNext feeds the int256 fromAmount param (positive amounts < 2^255 encode as
+                            // +int256). fromToken/toToken == the swap's own tokens.
+                            IWombatPool.at(qPool).quotePotentialSwap(tokenIn, tokenOut, xNext).catch(() => { ok = 0; });
+                            if (ok === 1) { q = IWombatPool.at(qPool).quotePotentialSwap(tokenIn, tokenOut, xNext)[0]; }
+                          } else {
+                            if (HAS_FERMI && qKind === 11) {
+                              // Fermi / propAMM (Obric-style proactive AMM, callback-free): the ladder quote is
+                              // quoteAmounts(tokenIn, tokenOut, +xNext)[1] — the SECOND return is the exact-in
+                              // out (the exec uses [1] too). REVERT-class (maker pause / stale), so PROBE-THEN-
+                              // DECODE. xNext feeds the int256 amountSpecified (positive ⇒ exact-in).
+                              IFermiPool.at(qPool).quoteAmounts(tokenIn, tokenOut, xNext).catch(() => { ok = 0; });
+                              if (ok === 1) { q = IFermiPool.at(qPool).quoteAmounts(tokenIn, tokenOut, xNext)[1]; }
+                            } else {
+                              if (HAS_DODO && qKind === 3) {
+                                // DODO V2 PMM (engine-executed poolType 5 → _swapDODOV2): the ground-truth ladder
+                                // quote is the pool's OWN querySell* view — DIRECTIONAL. qi (qd[1]) is isSellBase
+                                // (prepare computes tokenIn == pool._BASE_TOKEN_()): 1 ⇒ querySellBase(trader,
+                                // payBase), else ⇒ querySellQuote(trader, payQuote). Both are REVERT-class, so
+                                // PROBE-THEN-DECODE and decode [0] (the receive amount, net of the LP+MT fee).
+                                // The trader is `caller` (cfg[3]) — the exec's _swapDODOV2 fee-rate model keys on
+                                // tx.origin == caller, so this quote's MT fee matches the realized swap's.
+                                if (qi === 1) {
+                                  IDODOPool.at(qPool).querySellBase(caller, xNext).catch(() => { ok = 0; });
+                                  if (ok === 1) { q = IDODOPool.at(qPool).querySellBase(caller, xNext)[0]; }
+                                } else {
+                                  IDODOPool.at(qPool).querySellQuote(caller, xNext).catch(() => { ok = 0; });
+                                  if (ok === 1) { q = IDODOPool.at(qPool).querySellQuote(caller, xNext)[0]; }
+                                }
+                              }
+                            }
+                          }
                         }
                       }
                     }

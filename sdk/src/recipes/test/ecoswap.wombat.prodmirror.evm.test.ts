@@ -87,6 +87,7 @@ import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import { quotePotentialSwap, WAD, type WombatPool } from "../shared/wombat-math";
+import { qlLadderInputs } from "../shared/curve-math";
 
 const SNAP_NAME = "bsc-wombat-USDCUSDT";
 const ENGINE_CELLS = engineCells();
@@ -296,16 +297,38 @@ describe("EcoSwap Wombat (single-sided stableswap) prod-mirror — REAL bytecode
       etched.pool.toLowerCase(),
       "the discovered Wombat venue is the REAL etched pool",
     );
+    // Wombat is now a QUOTE-LADDER (QL) venue: prepare ships ONLY the descriptor (prepared.wombats), NO
+    // static sampled Wombat brackets. The on-chain solver builds the price ladder live from the pool's own
+    // quotePotentialSwap.
     assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Wombat),
-      "Wombat segments present",
+      !(prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Wombat),
+      "Wombat ships as a QL descriptor (no static sampled Wombat brackets)",
     );
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Wombat venue seeded from the REAL captured coverage
-    // state via the SHARED buildWombatSegments. This is pure off-chain math (computed BEFORE the cook),
-    // so the awarded Σ is known ahead — and the engine's static-segment cursor consumes the IDENTICAL
-    // grid, so on-chain spent == oracle.totalInput to the wei.
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Wombat venue seeded from the REAL captured coverage state
+    // via the SHARED buildWombatQLLadder (the IDENTICAL geometric quote ladder the on-chain solver builds
+    // live from quotePotentialSwap). Pure off-chain math (computed BEFORE the cook), so the awarded Σ is
+    // known ahead — and the solver's on-chain-built ladder is wei-exact with it, so on-chain spent ==
+    // oracle.totalInput to the wei.
     const op = offPool(snaps.state);
+
+    // DIRECT S-POINT LADDER PARITY: the bigint quotePotentialSwap MODEL == the REAL etched pool's own
+    // quotePotentialSwap view at EVERY geometric ladder point the on-chain QL solver queries (the SAME
+    // qlLadderInputs points), to the WEI. The model is a bit-exact closed replay (not a sampled
+    // interpolation like Fermi's), so it matches the real view at any input by construction — this asserts
+    // it explicitly rather than only transitively via the wei-exact spent==oracle gate below.
+    for (const x of qlLadderInputs(amountIn)) {
+      const rv = (await c.publicClient.readContract({
+        address: etched.pool, abi: wombatPoolReadAbi, functionName: "quotePotentialSwap",
+        args: [tokenIn, tokenOut, x],
+      })) as readonly [bigint, bigint];
+      assert.equal(
+        quotePotentialSwap(op, x),
+        rv[0],
+        `Wombat quotePotentialSwap MODEL == REAL etched view at ladder point ${x} (wei-exact)`,
+      );
+    }
+
     const optPools: OptimalPool[] = [{ wombat: op, feePpm: op.feePpm }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
     const awarded = oracle.perPoolInput[0] ?? 0n;

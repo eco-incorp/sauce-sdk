@@ -1135,8 +1135,11 @@ export async function prepareEcoSwap(
     }
   }
 
+  // DODO V2 PMM — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE
+  // querySellBase/querySellQuote (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the
+  // descriptor (address + isSellBase orientation + fee). buildDodoBrackets is still called as a pure LIVENESS
+  // PROBE (a pool that quotes no valid segment is dropped), but its brackets are NOT pushed to the seg stream.
   const dodos: EcoDodo[] = [];
-  const dodoBracketSets: EcoBracket[][] = [];
   const dodoZoos = poolConfig.factories.filter((f) => f.factoryType === FactoryType.DODOZoo);
   if (dodoZoos.length > 0) {
     const dodoRaw = await discoverDodoV2PoolsTyped(
@@ -1147,8 +1150,8 @@ export async function prepareEcoSwap(
       caller ?? ZERO_ADDRESS,
     );
     for (const d of dodoRaw) {
-      const refIdx = dodos.length;
-      const db = buildDodoBrackets(d, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live querySell*, not from these brackets.
+      const db = buildDodoBrackets(d, dodos.length, amountIn);
       if (db.length === 0) continue;
       dodos.push({
         address: d.address,
@@ -1156,10 +1159,8 @@ export async function prepareEcoSwap(
         feePpm: d.feePpm,
         source: `${d.source} (DODO V2)`,
       });
-      dodoBracketSets.push(db);
     }
   }
-  for (const set of dodoBracketSets) brackets.push(...set);
 
   // Solidly STABLE (sAMM) — like Curve, it is a QUOTE-LADDER (QL) venue: the on-chain solver builds its
   // price ladder in setup from LIVE getAmountOut (see ecoswap.sauce.ts / index.ts buildQLVenues), so
@@ -1185,14 +1186,17 @@ export async function prepareEcoSwap(
     }
   }
 
+  // Wombat (single-sided stableswap) — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder
+  // in setup from LIVE quotePotentialSwap (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships
+  // ONLY the descriptor (address + fee). buildWombatBrackets is a pure LIVENESS PROBE (drop a pool that
+  // quotes no valid segment); its brackets are NOT pushed to the segment stream.
   const wombats: EcoWombat[] = [];
-  const wombatBracketSets: EcoBracket[][] = [];
   const wombatPools = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Wombat);
   if (wombatPools.length > 0) {
     const wombatRaw = await discoverWombatPoolsTyped(tokenIn, tokenOut, client, wombatPools);
     for (const wp of wombatRaw) {
-      const refIdx = wombats.length;
-      const wb = buildWombatBrackets(wp, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live quotePotentialSwap.
+      const wb = buildWombatBrackets(wp, wombats.length, amountIn);
       if (wb.length === 0) continue;
       wombats.push({
         address: wp.address,
@@ -1201,10 +1205,8 @@ export async function prepareEcoSwap(
         feePpm: wp.feePpm,
         source: wp.source,
       });
-      wombatBracketSets.push(wb);
     }
   }
-  for (const set of wombatBracketSets) brackets.push(...set);
 
   const balancerStables: EcoBalancerStable[] = [];
   const balancerBracketSets: EcoBracket[][] = [];
@@ -1341,23 +1343,21 @@ export async function prepareEcoSwap(
   }
 
   const fermiPools: EcoFermi[] = [];
-  const fermiBracketSets: EcoBracket[][] = [];
-  // Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) — ROUTER discovery (the
-  // FactoryConfig.address is a FermiSwapper router). propAMM prices off its OWN on-chain state, NOT xy=k, so
-  // it is a SAMPLED-SEGMENT source. The router exposes NO curve-state getters, so `discoverFermiPoolsTyped`
-  // checks `isActive` for the pair and SAMPLES a LIVE `quoteAmounts` ladder over [0, amountIn]; the split is
-  // built from that ladder (no closed-form K/base). Executed CALLBACK-FREE (a live quoteAmounts staticcall
-  // for amountCheck + approve + fermiSwapWithAllowances — propAMM PULLS via transferFrom, so approve-first,
-  // unlike WOOFi's transfer-first path). NO engine change. SNAPSHOTTED-QUOTE class: the split is
-  // exact-on-grid vs the oracle on the shared sampled ladder; the exec re-reads the live quote (amountCheck
-  // + amountOutMin bound a bad fill), and the exogenous prepare→cook maker-param update is the same
-  // snapshot assumption the recipe documents for WOOFi / V3 fee / Balancer state.
+  // Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) — QUOTE-LADDER (QL) venue:
+  // the on-chain solver builds its price ladder in setup from LIVE quoteAmounts (see ecoswap.sauce.ts /
+  // index.ts buildQLVenues), so prepare ships ONLY the descriptor (address + fee). ROUTER discovery (the
+  // FactoryConfig.address is a FermiSwapper router); the router exposes NO curve-state getters, so
+  // `discoverFermiPoolsTyped` checks `isActive` and SAMPLES a LIVE `quoteAmounts` ladder as a LIVENESS PROBE.
+  // buildFermiBrackets is a pure probe (drop a pool that quotes no valid segment); its brackets are NOT pushed
+  // to the segment stream. Executed CALLBACK-FREE (a live quoteAmounts staticcall for amountCheck + approve +
+  // fermiSwapWithAllowances — propAMM PULLS via transferFrom, so approve-first, unlike WOOFi's transfer-first
+  // path). NO engine change. The exec re-reads the live quote (amountCheck + amountOutMin bound a bad fill).
   const fermiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Fermi);
   if (fermiConfigs.length > 0) {
     const fermiRaw = await discoverFermiPoolsTyped(tokenIn, tokenOut, client, fermiConfigs, amountIn);
     for (const fp of fermiRaw) {
-      const refIdx = fermiPools.length;
-      const fb = buildFermiBrackets(fp, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain from live quoteAmounts, not from these brackets.
+      const fb = buildFermiBrackets(fp, fermiPools.length, amountIn);
       if (fb.length === 0) continue;
       fermiPools.push({
         address: fp.address,
@@ -1366,10 +1366,8 @@ export async function prepareEcoSwap(
         feePpm: fp.feePpm,
         source: fp.source,
       });
-      fermiBracketSets.push(fb);
     }
   }
-  for (const set of fermiBracketSets) brackets.push(...set);
 
   const fluidPools: EcoFluid[] = [];
   const fluidBracketSets: EcoBracket[][] = [];
@@ -1714,28 +1712,24 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
-  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB AND Mento V2 ship as QL
-  // (Quote-Ladder) DESCRIPTORS (curves/cryptoSwaps/solidlyStables/wooFiPools/lbs/mentoPools .length), NOT
-  // sampled segments — the on-chain solver builds each ladder live from its quote view — so all six are
-  // reported below as "QL", not a seg count.
-  const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
-  const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
+  // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2, Wombat AND
+  // Fermi ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT sampled segments — the
+  // on-chain solver builds each ladder live from its quote view — so all nine are reported below as "QL",
+  // not a seg count.
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
-  const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
   const nBalancerV3Segs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerV3).length;
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
-      `${dodos.length} DODO, ` +
-      `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
+      `${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
       `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
-      `${mentoPools.length} Mento QL, ` +
+      `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
+      `${fermiPools.length} Fermi QL, ` +
       `${brackets.length} sampled segments (` +
-      `${nDodoSegs} DODO, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick, ${nFermiSegs} Fermi, ` +
+      `${nBalancerSegs} Balancer-stable, ${nMaverickSegs} Maverick, ` +
       `${nFluidSegs} Fluid, ${nBalancerV3Segs} Balancer-V3)`,
   );
 

@@ -42,6 +42,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -205,4 +206,17 @@ export function buildFermiSegments(
     if (pool.cumIn[i] >= amountIn) break;
   }
   return segs;
+}
+
+/**
+ * Build one Fermi / propAMM pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the bigint `getAmountOut` (the LINEAR-interpolated live quote ladder), so the
+ * oracle stays wei-exact with the on-chain solver BY CONSTRUCTION *provided the pool's `cumIn` samples the
+ * ladder AT the geometric `qlLadderInputs(amountIn)` points* — then `getAmountOut` is EXACT at each ladder
+ * point (interpolation at a sample point returns the sampled value), so the ladder reproduces the solver's
+ * live `quoteAmounts(tokenIn,tokenOut,+xNext)[1]` at every step. The quote is post-fee (the router folds the
+ * fee into quoteAmounts) so marginalOI IS the execution price; adjNear == adjFar == marginalOI.
+ */
+export function buildFermiQLLadder(pool: FermiPool, amountIn: bigint): FermiSegment[] {
+  return buildQLLadder((dx) => getAmountOut(pool, dx), amountIn);
 }

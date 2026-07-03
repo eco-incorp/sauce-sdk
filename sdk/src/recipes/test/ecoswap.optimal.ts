@@ -64,14 +64,14 @@ import {
 import { buildCurveQLLadder, type CurvePool } from "../shared/curve-math.js";
 import { buildCryptoSwapQLLadder, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
 import { buildLbQLLadder, type LbPool } from "../shared/lb-math.js";
-import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
+import { buildDodoQLLadder, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableQLLadder, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
-import { buildWombatSegments, type WombatPool } from "../shared/wombat-math.js";
+import { buildWombatQLLadder, type WombatPool } from "../shared/wombat-math.js";
 import { buildBalancerStableSegments, type BalancerStablePool } from "../shared/balancer-stable-math.js";
 import { buildEulerSwapSegments, type EulerSwapPool } from "../shared/eulerswap-math.js";
 import { buildMaverickSegments, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
-import { buildFermiSegments, type FermiPool } from "../shared/fermi-math.js";
+import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3Segments, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
@@ -556,7 +556,7 @@ function lbSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[
  */
 function dodoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildDodoSegments(p.dodo!, amountIn)) {
+  for (const s of buildDodoQLLadder(p.dodo!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
@@ -587,7 +587,7 @@ function solidlyStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint
  */
 function wombatSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildWombatSegments(p.wombat!, amountIn)) {
+  for (const s of buildWombatQLLadder(p.wombat!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
@@ -677,15 +677,16 @@ function wooFiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
 }
 
 /**
- * Enumerate one Fermi / propAMM pool's segments via the SHARED sampler (buildFermiSegments) over the pool's
- * LIVE quote ladder (the same (cumIn, cumOut) points prepare sampled), so the oracle and prepare emit the
- * IDENTICAL segment grid from the SAME sampled snapshot (single source), making the split exact-on-grid. The
- * Fermi marginalOI is the post-fee execution price (the router folds the fee into the quote); adjNear ==
- * adjFar == marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Fermi / propAMM pool's segments via the QUOTE-LADDER live walk (buildFermiQLLadder) — the
+ * SAME geometric-slice ladder the on-chain solver builds in setup from live quoteAmounts, replayed here
+ * through the LINEAR-interpolated quote ladder so the oracle and solver stay wei-exact BY CONSTRUCTION when
+ * the pool's `cumIn` samples the ladder at the geometric `qlLadderInputs` points (interpolation is exact at
+ * a sample point). The Fermi marginalOI is the post-fee execution price (the router folds the fee into the
+ * quote); adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
  */
 function fermiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildFermiSegments(p.fermi!, amountIn)) {
+  for (const s of buildFermiQLLadder(p.fermi!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

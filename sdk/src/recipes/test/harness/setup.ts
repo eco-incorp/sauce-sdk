@@ -1017,8 +1017,8 @@ export const dodoAbi = parseAbi([
   "function _BASE_TOKEN_() view returns (address)",
   "function _QUOTE_TOKEN_() view returns (address)",
   "function getPMMStateForCall() view returns (uint256 i, uint256 K, uint256 B, uint256 Q, uint256 B0, uint256 Q0, uint256 R)",
-  "function querySellBase(uint256 payBase) view returns (uint256)",
-  "function querySellQuote(uint256 payQuote) view returns (uint256)",
+  "function querySellBase(address trader, uint256 payBase) view returns (uint256 receiveQuoteAmount, uint256 mtFee)",
+  "function querySellQuote(address trader, uint256 payQuote) view returns (uint256 receiveBaseAmount, uint256 mtFee)",
   "function sellBase(address to) returns (uint256)",
   "function sellQuote(address to) returns (uint256)",
 ]);

@@ -78,11 +78,10 @@ import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import {
-  buildFermiSegments,
-  fermiSampleInputs,
   getAmountOut as fermiGetAmountOut,
   type FermiPool,
 } from "../shared/fermi-math";
+import { qlLadderInputs } from "../shared/curve-math";
 
 const SNAP_NAME = "ethereum-fermi-WETHUSDC";
 const ENGINE_CELLS = engineCells();
@@ -154,12 +153,12 @@ describe("EcoSwap Fermi / propAMM (FermiSwapper oracle-priced proactive AMM) pro
     return r[1];
   }
 
-  /** Build the neutral-oracle FermiPool descriptor by SAMPLING the etched pool's LIVE quote ladder over
-   *  [0, amountIn] — the SAME (cumIn, cumOut) points discoverFermiPoolsTyped samples (and the SAME grid
-   *  buildFermiSegments differences), so the oracle and the recipe emit the IDENTICAL segment grid from ONE
-   *  sampled snapshot → the split is exact-on-grid vs the on-chain solver by construction. */
+  /** Build the neutral-oracle FermiPool descriptor by SAMPLING the etched pool's LIVE quoteAmounts ladder AT
+   *  the geometric `qlLadderInputs` points — the SAME points the on-chain QL solver queries — so
+   *  buildFermiQLLadder's interpolation is EXACT at every ladder point and the oracle reproduces the solver's
+   *  live quoteAmounts ladder to the wei (Fermi is now a QUOTE-LADDER venue). */
   async function offPool(tokenIn: Hex, tokenOut: Hex, amountIn: bigint): Promise<FermiPool> {
-    const cumIn = fermiSampleInputs(amountIn);
+    const cumIn = qlLadderInputs(amountIn);
     const cumOut: bigint[] = [];
     for (const amt of cumIn) cumOut.push(await onQuery(tokenIn, tokenOut, amt));
     // Derive the effective fee ppm from the shallowest slice (the same rule discovery uses) — diagnostic only.
@@ -290,15 +289,18 @@ describe("EcoSwap Fermi / propAMM (FermiSwapper oracle-priced proactive AMM) pro
       tokenIn.toLowerCase(),
       "discovery oriented the venue fromToken == tokenIn",
     );
+    // Fermi is now a QUOTE-LADDER (QL) venue: prepare ships ONLY the descriptor (prepared.fermiPools), NO
+    // static sampled Fermi brackets. The on-chain solver builds the price ladder live from the pool's own
+    // quoteAmounts.
     assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Fermi),
-      "Fermi segments present in the prepared brackets",
+      !(prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Fermi),
+      "Fermi ships as a QL descriptor (no static sampled Fermi brackets)",
     );
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Fermi venue seeded from the pool's OWN live sampled ladder via
-    // the SHARED buildFermiSegments. Pure off-chain math (computed BEFORE the cook) over the SAME grid the
-    // engine's static-segment cursor consumes, so the awarded Σ is known ahead — spent == oracle awarded to
-    // the wei.
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Fermi venue seeded from the pool's OWN live quoteAmounts ladder
+    // (sampled AT the geometric qlLadderInputs points) via the SHARED buildFermiQLLadder — the IDENTICAL ladder
+    // the on-chain solver builds live. Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known
+    // ahead — spent == oracle awarded to the wei.
     const op = await offPool(tokenIn, tokenOut, amountIn);
     const optPools: OptimalPool[] = [{ fermi: op, feePpm: op.feePpm } as OptimalPool];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });

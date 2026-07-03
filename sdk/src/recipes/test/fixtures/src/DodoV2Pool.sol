@@ -240,33 +240,39 @@ contract DodoV2Pool {
         return _solveQuadraticForTrade(B0, B, payQuote, oneOverI, K);
     }
 
-    function _netFee(uint256 gross) internal view returns (uint256) {
-        uint256 lpFee = _mul(gross, lpFeeRate);
-        uint256 mtFee = _mul(gross, mtFeeRate);
-        uint256 net = gross - lpFee - mtFee;
-        return net;
-    }
-
-    /// @notice Off-chain getDy analogue (pure view on current state) — the engine-independent
-    /// ground truth. querySellBase net of LP+MT fee.
-    function querySellBase(uint256 payBase) public view returns (uint256) {
-        if (payBase == 0) return 0;
+    /// @notice The DODO V2 DVM/DSP `querySellBase(address trader, uint256 payBaseAmount)` surface —
+    /// returns (receiveQuoteAmount, mtFee). `trader` selects the MT fee-rate model in the real pool;
+    /// this fixture uses a flat `mtFeeRate`, so it is ignored (any trader gives the same fee — matching
+    /// the engine `_swapDODOV2`, which keys the model on tx.origin). receiveQuoteAmount is net of BOTH
+    /// the LP and MT fee (== the off-chain `getDy`), the engine-independent ground truth.
+    function querySellBase(address, uint256 payBase)
+        public
+        view
+        returns (uint256 receiveQuoteAmount, uint256 mtFee)
+    {
+        if (payBase == 0) return (0, 0);
         uint256 gross = _sellBaseGross(payBase);
-        if (gross == 0) return 0;
-        return _netFee(gross);
+        if (gross == 0) return (0, 0);
+        mtFee = _mul(gross, mtFeeRate);
+        receiveQuoteAmount = gross - _mul(gross, lpFeeRate) - mtFee;
     }
 
-    function querySellQuote(uint256 payQuote) public view returns (uint256) {
-        if (payQuote == 0) return 0;
+    function querySellQuote(address, uint256 payQuote)
+        public
+        view
+        returns (uint256 receiveBaseAmount, uint256 mtFee)
+    {
+        if (payQuote == 0) return (0, 0);
         uint256 gross = _sellQuoteGross(payQuote);
-        if (gross == 0) return 0;
-        return _netFee(gross);
+        if (gross == 0) return (0, 0);
+        mtFee = _mul(gross, mtFeeRate);
+        receiveBaseAmount = gross - _mul(gross, lpFeeRate) - mtFee;
     }
 
     // ── The engine `_swapDODOV2` surface (transfer-first) ─────────
     function sellBase(address to) external returns (uint256 receiveQuoteAmount) {
         uint256 payBase = IERC20Min(_BASE_TOKEN_).balanceOf(address(this)) - B;
-        receiveQuoteAmount = querySellBase(payBase);
+        (receiveQuoteAmount,) = querySellBase(to, payBase);
         // advance state along the curve
         B += payBase;
         Q -= receiveQuoteAmount;
@@ -275,7 +281,7 @@ contract DodoV2Pool {
 
     function sellQuote(address to) external returns (uint256 receiveBaseAmount) {
         uint256 payQuote = IERC20Min(_QUOTE_TOKEN_).balanceOf(address(this)) - Q;
-        receiveBaseAmount = querySellQuote(payQuote);
+        (receiveBaseAmount,) = querySellQuote(to, payQuote);
         B -= receiveBaseAmount;
         Q += payQuote;
         IERC20Min(_BASE_TOKEN_).transfer(to, receiveBaseAmount);
