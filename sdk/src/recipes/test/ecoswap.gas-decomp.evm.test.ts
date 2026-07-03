@@ -57,7 +57,7 @@ import {
   type DeployedV12Stack,
 } from "./harness/setup";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
-import { ecoSwap } from "../ecoswap/index";
+import { ecoSwap, buildSolverArgs, protocolDefines } from "../ecoswap/index";
 import { EcoBracketKind } from "../shared/types";
 import type { EcoSwapPrepared, EcoPool, EcoRoute, EcoBracket } from "../shared/types";
 
@@ -80,87 +80,10 @@ const VARIANTS: Variant[] = [
   { key: "frozen.compute", file: "ecoswap.computeonly.sauce.ts", kind: "compute", shape: "legacy" },
 ];
 
-// ── Compile-arg builders — copied from recipes/ecoswap/index.ts ──
-// The production unified walk and the frozen compute-only reference have different
-// signatures, so there are two builders, both fed the SAME prepared.
-
-// ── UNIFIED-WALK shape (production ecoswap.sauce.ts) ──
-/** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *   stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount] */
-function buildUnifiedPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[] {
-  return [
-    BigInt(p.poolType), BigInt(p.address), BigInt(p.fee), BigInt(p.tickSpacing),
-    BigInt(p.hooks), BigInt(p.feePpm), p.isV2 ? 1n : 0n, p.inIsToken0 ? 1n : 0n,
-    BigInt(p.stateView), BigInt(p.poolId),
-    p.stepRatio ?? 0n, p.windowTopShifted ?? 0n, p.windowBotShifted ?? 0n,
-    p.extremeShifted ?? 0n, BigInt(netStart), BigInt(netCount),
-  ];
-}
-
-function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netCache: bigint[][] } {
-  const netCache: bigint[][] = [];
-  const poolTuples: bigint[][] = [];
-  for (const p of pools) {
-    const rows = p.isV2 ? [] : p.netRows ?? [];
-    const netStart = netCache.length;
-    poolTuples.push(buildUnifiedPoolTuple(p, netStart, rows.length));
-    for (const r of rows) netCache.push([r.shiftedTick, r.rawNet]);
-  }
-  return { poolTuples, netCache };
-}
-
-/**
- * Build the FLAT POOL UNIVERSE + the scalar ROUTING layout — mirrors index.ts
- * buildPoolUniverseAndRouting. The gas-decomp fixture uses baseTokens == the swap pair ⇒ zero
- * routes, so routing is empty here; the shape is kept faithful for a future route fixture.
- */
-function buildUniverseAndRouting(prepared: EcoSwapPrepared): {
-  poolTuples: bigint[][];
-  netCache: bigint[][];
-  routing: bigint[][];
-  directCount: number;
-} {
-  const directCount = prepared.pools.length;
-  const universe: EcoPool[] = [...prepared.pools];
-  const idxByAddr = new Map<string, number>();
-  prepared.pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
-  const routing: bigint[][] = [];
-  for (const route of prepared.routes) {
-    const rt: bigint[] = [BigInt(route.legs.length)];
-    route.legs.forEach((leg, legIdx) => {
-      const idxs: number[] = [];
-      for (const lp of leg.pools) {
-        const key = lp.address.toLowerCase();
-        let idx = idxByAddr.get(key);
-        if (idx === undefined) {
-          idx = universe.length;
-          universe.push(lp);
-          idxByAddr.set(key, idx);
-        }
-        idxs.push(idx);
-      }
-      const base = idxs.length > 0 ? Math.min(...idxs) : 0;
-      const inter =
-        legIdx < route.intermediateTokens.length ? BigInt(route.intermediateTokens[legIdx]) : 0n;
-      rt.push(BigInt(base), BigInt(idxs.length), inter);
-    });
-    routing.push(rt);
-  }
-  const { poolTuples, netCache } = buildPoolsAndNetCache(universe);
-  return { poolTuples, netCache, routing, directCount };
-}
-
-function buildUnifiedArgs(
-  tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, prepared: EcoSwapPrepared,
-): unknown[] {
-  const { poolTuples, netCache, routing, directCount } = buildUniverseAndRouting(prepared);
-  return [
-    [BigInt(tokenIn), BigInt(tokenOut), amountIn, BigInt(caller), prepared.priceLimit, BigInt(directCount)],
-    poolTuples,
-    netCache,
-    routing,
-  ];
-}
+// ── Compile-arg builders ──
+// The production unified-walk shape is IMPORTED from index.ts (buildSolverArgs + protocolDefines) so
+// it can never drift from what a real cook feeds the solver (the old local 4-arg copy went stale
+// through the quote-ladder migration). The frozen compute-only reference keeps its own legacy builder.
 
 // ── LEGACY shape (frozen ecoswap.computeonly.sauce.ts reference) ──
 /** [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId, 0×6] */
@@ -204,13 +127,22 @@ function buildLegacyArgs(
   ];
 }
 
+/**
+ * Arg array + compile options for a variant. The production unified walk uses the IMPORTED
+ * `buildSolverArgs` compiled with the SAME treeshake + protocol defines a real cook carries; the
+ * frozen compute-only reference has no HAS_* guards, so it compiles without defines.
+ */
 function argsForShape(
   shape: "unified" | "legacy",
   tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, prepared: EcoSwapPrepared,
-): unknown[] {
-  return shape === "unified"
-    ? buildUnifiedArgs(tokenIn, tokenOut, amountIn, caller, prepared)
-    : buildLegacyArgs(tokenIn, tokenOut, amountIn, caller, prepared);
+): { args: unknown[]; opts: { treeshake?: boolean; defines?: Record<string, boolean> } } {
+  if (shape === "unified") {
+    return {
+      args: buildSolverArgs(tokenIn, tokenOut, amountIn, caller, prepared),
+      opts: { treeshake: true, defines: protocolDefines(prepared) },
+    };
+  }
+  return { args: buildLegacyArgs(tokenIn, tokenOut, amountIn, caller, prepared), opts: {} };
 }
 
 function reason(e: unknown): string {
@@ -337,7 +269,7 @@ describe("EcoSwap gas decomposition (solver arithmetic vs swaps)", () => {
     );
 
     for (const v of VARIANTS) {
-      const args = argsForShape(v.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
+      const { args, opts } = argsForShape(v.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
       const source = readFileSync(join(ECOSWAP_DIR, v.file), "utf-8");
       const cell = { v1: null as bigint | null, v12: null as bigint | null };
 
@@ -355,7 +287,7 @@ describe("EcoSwap gas decomposition (solver arithmetic vs swaps)", () => {
         await approve(c.walletClient, c.publicClient, tokenIn, cookTarget, AMOUNT_IN);
 
         try {
-          const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, target);
+          const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, target, opts);
           const { receipt } = await cook(c.walletClient, c.publicClient, cookTarget, bytecodes);
           if (receipt.status !== "success") {
             notes.set(`${v.key}/${target}`, `status=${receipt.status}`);

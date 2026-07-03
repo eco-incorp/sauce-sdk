@@ -70,7 +70,7 @@ import {
   type DeployedV12Stack,
 } from "./harness/setup";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
-import { ecoSwap } from "../ecoswap/index";
+import { ecoSwap, buildSolverArgs, protocolDefines } from "../ecoswap/index";
 import { EcoBracketKind } from "../shared/types";
 import type { EcoSwapPrepared, EcoPool, EcoRoute, EcoBracket } from "../shared/types";
 
@@ -109,95 +109,46 @@ const TARGETS: Target[] = ["v1", "v12"];
 // requires strictly-increasing).
 const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
 
-// ── Compile-arg builders — COPIED from recipes/ecoswap/index.ts ──
-// (kept equivalent so the compiler args match what index.ts feeds the solver; do
-//  NOT import — this harness must not mutate shared code.) The production solver and
-//  the frozen reference have DIFFERENT signatures, so there are two builders.
+// Quote-ladder geometric slice count — MUST equal ecoswap.sauce.ts QL_S. The per-venue ladder-build
+// cost is bounded to ≤ 2·QL_S view staticcalls (QL_2S): the revert-class views are probe-then-decode
+// (an unconditional `.catch` PROBE call + a guarded DECODE call = 2 staticcalls/slice), only the
+// graceful single-return views (WOOFi) cost 1/slice = QL_S. Kept here only to render Table 3 of GAS.md.
+const QL_S = 8;
+const QL_2S = 2 * QL_S;
 
-// ── UNIFIED-WALK shape (production `ecoswap.sauce.ts`) ──
-// Pool tuple [10..15] = the per-pool net-cache descriptors; the direct-pool bracket
-// ladder is replaced by a flat per-pool netCache + a static routeSegs array.
+// The 13 QUOTE-LADDER venue families (mirrors buildQLVenues in index.ts). segKind + the per-slice
+// view quote getter + the ladder-build staticcall bound + the on-chain execution path. The revert-class
+// probe-then-decode venues (Curve/…/Euler) cost up to 2·QL_S staticcalls; the graceful WOOFi tryQuery
+// costs QL_S; the three REPLAY families (Balancer V2/V3, Maverick) have no cumulative-out view, so they
+// read a bounded set of LIVE state and replay the curve on-chain.
+const QL_VENUE_ROWS: { venue: string; segKind: number; quote: string; calls: string; exec: string }[] = [
+  { venue: "Curve StableSwap", segKind: 1, quote: "get_dy(i, j, xNext) (probe-decode, revert-class)", calls: `≤ ${QL_2S}`, exec: "swap(poolType 3) → _swapCurve" },
+  { venue: "Curve CryptoSwap", segKind: 9, quote: "get_dy(uint256 i, j, xNext) (probe-decode, revert-class)", calls: `≤ ${QL_2S}`, exec: "approve + exchange (callback-free)" },
+  { venue: "Solidly STABLE", segKind: 4, quote: "getAmountOut(xNext, tokenIn) (probe-decode)", calls: `≤ ${QL_2S}`, exec: "transfer + pool.swap (callback-free)" },
+  { venue: "WOOFi (WooPPV2)", segKind: 10, quote: "tryQuery(tokenIn, tokenOut, xNext) (graceful, 1 call)", calls: `${QL_S}`, exec: "query + transfer + swap (callback-free)" },
+  { venue: "Trader Joe LB", segKind: 2, quote: "getSwapOut(xNext, swapForY) → [0] amountInLeft + [1] out (2 calls)", calls: `≤ ${QL_2S}`, exec: "swap(poolType 6) → _swapTraderJoeLB" },
+  { venue: "Mento V2", segKind: 13, quote: "broker.getAmountOut(provider, id, in, out, xNext) (probe-decode)", calls: `≤ ${QL_2S}`, exec: "approve broker + broker.swapIn" },
+  { venue: "DODO V2", segKind: 3, quote: "querySellBase/Quote(caller, xNext) (probe-decode)", calls: `≤ ${QL_2S}`, exec: "swap(poolType 5) → _swapDODOV2" },
+  { venue: "Wombat", segKind: 5, quote: "quotePotentialSwap(in, out, xNext) (probe-decode)", calls: `≤ ${QL_2S}`, exec: "approve + pool.swap (callback-free)" },
+  { venue: "Fermi / propAMM", segKind: 11, quote: "quoteAmounts(in, out, xNext)[1] (probe-decode)", calls: `≤ ${QL_2S}`, exec: "approve + fermiSwapWithAllowances" },
+  { venue: "EulerSwap", segKind: 7, quote: "computeQuote(in, out, xNext, true) (probe-decode, self-truncating)", calls: `≤ ${QL_2S}`, exec: "computeQuote + transfer + pool.swap" },
+  { venue: "Balancer V3", segKind: 14, quote: "on-chain StableMath replay (no live quote view)", calls: "getCurrentLiveBalances + getAmplificationParameter + getStaticSwapFeePercentage + getRate×2", exec: "Permit2 two-step + swapSingleTokenExactIn" },
+  { venue: "Balancer V2", segKind: 6, quote: "on-chain StableMath replay (no live quote view)", calls: "getPoolTokenInfo×n + getAmplificationParameter + getStaticSwapFeePercentage + getScalingFactors", exec: "swap(poolType 4) → _swapBalancerV2" },
+  { venue: "Maverick V2", segKind: 8, quote: "on-chain live bin-walk (no cumulative-out view)", calls: "per-tick reserve reads across the walked bins", exec: "swap(poolType 7) → maverickV2SwapCallback" },
+];
 
-/**
- * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount]
- */
-function buildUnifiedPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[] {
-  return [
-    BigInt(p.poolType),
-    BigInt(p.address),
-    BigInt(p.fee),
-    BigInt(p.tickSpacing),
-    BigInt(p.hooks),
-    BigInt(p.feePpm),
-    p.isV2 ? 1n : 0n,
-    p.inIsToken0 ? 1n : 0n,
-    BigInt(p.stateView),
-    BigInt(p.poolId),
-    p.stepRatio ?? 0n,
-    p.windowTopShifted ?? 0n,
-    p.windowBotShifted ?? 0n,
-    p.extremeShifted ?? 0n,
-    BigInt(netStart),
-    BigInt(netCount),
-  ];
-}
-
-/** Per-pool tuples + the flat [shiftedTick, rawNet] netCache (per-pool grouped). */
-function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netCache: bigint[][] } {
-  const netCache: bigint[][] = [];
-  const poolTuples: bigint[][] = [];
-  for (const p of pools) {
-    const rows = p.isV2 ? [] : p.netRows ?? [];
-    const netStart = netCache.length;
-    poolTuples.push(buildUnifiedPoolTuple(p, netStart, rows.length));
-    for (const r of rows) netCache.push([r.shiftedTick, r.rawNet]);
-  }
-  return { poolTuples, netCache };
-}
+// ── Compile-arg builders ──
+// The production unified-walk shape is IMPORTED from index.ts (buildSolverArgs + protocolDefines) so
+// it can never drift from what a real cook feeds the solver — the old local copy went stale through
+// the quote-ladder migration (it fed a 4-arg [cfg,pools,netCache,routing] shape while production
+// main() grew to the 6-arg [cfg(12),pools,netCache,routing,segs,qlv] shape, so the unified cook
+// reverted). The frozen unrolled reference keeps its own DIVERGENT legacy builder below.
 
 /**
- * Build the FLAT POOL UNIVERSE + the scalar ROUTING layout — mirrors index.ts
- * buildPoolUniverseAndRouting (the gas fixtures use baseTokens == the swap pair ⇒ zero routes,
- * so routing is empty here, but the shape is kept faithful so a future route fixture lights up).
+ * Production unified-walk arg array — delegates to index.ts `buildSolverArgs`, the SINGLE source of
+ * truth for the current 6-arg shape (`[cfg(12), pools, netCache, routing, segs, qlv]`). Imported (not
+ * re-copied) so it can never drift from what a real cook feeds the solver.
  */
-function buildUniverseAndRouting(prepared: EcoSwapPrepared): {
-  poolTuples: bigint[][];
-  netCache: bigint[][];
-  routing: bigint[][];
-  directCount: number;
-} {
-  const directCount = prepared.pools.length;
-  const universe: EcoPool[] = [...prepared.pools];
-  const idxByAddr = new Map<string, number>();
-  prepared.pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
-  const routing: bigint[][] = [];
-  for (const route of prepared.routes) {
-    const rt: bigint[] = [BigInt(route.legs.length)];
-    route.legs.forEach((leg, legIdx) => {
-      const idxs: number[] = [];
-      for (const lp of leg.pools) {
-        const key = lp.address.toLowerCase();
-        let idx = idxByAddr.get(key);
-        if (idx === undefined) {
-          idx = universe.length;
-          universe.push(lp);
-          idxByAddr.set(key, idx);
-        }
-        idxs.push(idx);
-      }
-      const base = idxs.length > 0 ? Math.min(...idxs) : 0;
-      const inter =
-        legIdx < route.intermediateTokens.length ? BigInt(route.intermediateTokens[legIdx]) : 0n;
-      rt.push(BigInt(base), BigInt(idxs.length), inter);
-    });
-    routing.push(rt);
-  }
-  const { poolTuples, netCache } = buildPoolsAndNetCache(universe);
-  return { poolTuples, netCache, routing, directCount };
-}
-
-/** Production unified-walk arg array (cfg-bundle 4-arg shape: [cfg, pools, netCache, routing]). */
 function buildUnifiedArgs(
   tokenIn: Hex,
   tokenOut: Hex,
@@ -205,13 +156,7 @@ function buildUnifiedArgs(
   caller: Hex,
   prepared: EcoSwapPrepared,
 ): unknown[] {
-  const { poolTuples, netCache, routing, directCount } = buildUniverseAndRouting(prepared);
-  return [
-    [BigInt(tokenIn), BigInt(tokenOut), amountIn, BigInt(caller), prepared.priceLimit, BigInt(directCount)],
-    poolTuples,
-    netCache,
-    routing,
-  ];
+  return buildSolverArgs(tokenIn, tokenOut, amountIn, caller, prepared);
 }
 
 // ── LEGACY shape (frozen `ecoswap.unrolled.sauce.ts` reference) ──
@@ -289,7 +234,12 @@ function buildLegacyArgs(
   ];
 }
 
-/** Pick the arg array the given solver's signature expects. */
+/**
+ * Pick the arg array + compile options the given solver's signature expects. The production unified
+ * walk is compiled with the SAME treeshake + protocol defines a real cook carries (so its bytecode
+ * size / gas reflect the treeshaken production blob, not the un-treeshaken all-protocols one); the
+ * frozen unrolled reference has no HAS_* guards, so it compiles without defines.
+ */
 function argsForShape(
   shape: "unified" | "legacy",
   tokenIn: Hex,
@@ -297,10 +247,14 @@ function argsForShape(
   amountIn: bigint,
   caller: Hex,
   prepared: EcoSwapPrepared,
-): unknown[] {
-  return shape === "unified"
-    ? buildUnifiedArgs(tokenIn, tokenOut, amountIn, caller, prepared)
-    : buildLegacyArgs(tokenIn, tokenOut, amountIn, caller, prepared);
+): { args: unknown[]; opts: { treeshake?: boolean; defines?: Record<string, boolean> } } {
+  if (shape === "unified") {
+    return {
+      args: buildUnifiedArgs(tokenIn, tokenOut, amountIn, caller, prepared),
+      opts: { treeshake: true, defines: protocolDefines(prepared) },
+    };
+  }
+  return { args: buildLegacyArgs(tokenIn, tokenOut, amountIn, caller, prepared), opts: {} };
 }
 
 /** Total compiled blob size in bytes (sum of segment hex lengths). */
@@ -384,13 +338,19 @@ function writeGasMd(): void {
   }
   lines.push("");
   lines.push(
-    "The production solver signature is " +
-      "`main(tokenIn, tokenOut, amountIn, caller, priceLimit, pools, routes, netCache, routeSegs)` " +
-      "— `zeroForOne` is DERIVED on-chain from the token sort order, and the direct-pool " +
-      "bracket ladder is replaced by a per-pool `netCache` (drift-invariant tick nets reused " +
-      "by a live walk) plus a static `routeSegs` array. The frozen unrolled reference keeps " +
-      "the older `…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer " +
-      "the production solver and is kept only as a historical bytecode-size / gas data point.",
+    "The production solver signature is `main(cfg, pools, netCache, routing, segs, qlv)` — a " +
+      "12-scalar `cfg` bundle (tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, plus the " +
+      "chain-wide Fluid resolver / Mento broker / Balancer V3 router+vault / Balancer V2 vault addresses " +
+      "and the internal amountOutMin floor) followed by five nested tuple arrays: the direct-pool " +
+      "`pools`, the drift-invariant per-pool `netCache` (tick nets reused by a live walk), the scalar " +
+      "`routing` layout, the STATIC sampled-segment stream `segs` (Fluid only now), and the QUOTE-LADDER " +
+      "venue descriptors `qlv` (the 13 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/" +
+      "DODO/Wombat/Fermi/Euler/BalV2/BalV3/Maverick — each a UNIFORM 10-column row the solver expands into " +
+      "an on-chain price ladder). `zeroForOne` is DERIVED on-chain from the token sort order. The arg array " +
+      "is assembled by `index.ts` `buildSolverArgs` — IMPORTED by this harness (not re-copied), so the " +
+      "measured shape can never drift from a real cook. The frozen unrolled reference keeps the older " +
+      "`…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer the production solver " +
+      "and is kept only as a historical bytecode-size / gas data point.",
   );
   lines.push("");
   lines.push(
@@ -410,12 +370,13 @@ function writeGasMd(): void {
   lines.push("");
   lines.push(
     "**Same prepared data for both variants.** `ecoSwap(...)` runs the off-chain " +
-      "prepare ONCE; the resulting `prepared` (pools/routes/brackets/net cache/" +
-      "priceLimit) is turned into the compiler-arg array EACH solver's signature " +
-      "expects — the production unified walk gets the `pools`/`netCache`/`routeSegs` " +
-      "shape (builders copied verbatim from `index.ts`), the frozen unrolled reference " +
-      "gets the legacy `pools`/`brackets` shape. Both derive from the same `prepared`, " +
-      "so the only variables are the solver source, its arg shape, and the bytecode target.",
+      "prepare ONCE; the resulting `prepared` is turned into the compiler-arg array EACH " +
+      "solver's signature expects — the production unified walk via the IMPORTED `buildSolverArgs` " +
+      "(so it is byte-identical to a real cook, compiled with the SAME `treeshake` + protocol " +
+      "`defines`), the frozen unrolled reference via its own local legacy builder. Both derive from " +
+      "the same `prepared`, so the only variables are the solver source, its arg shape, and the " +
+      "bytecode target. (This V3-only fixture carries no QL venues, so `segs`/`qlv` are empty here; " +
+      "Table 3 documents the per-venue ladder cost the QL path adds.)",
   );
   lines.push("");
   lines.push(
@@ -498,6 +459,37 @@ function writeGasMd(): void {
   }
   lines.push("");
 
+  // Table 3 — quote-ladder per-venue ladder-build cost (ARCHITECTURAL, not measured on this V3-only
+  // fixture). Every QL family builds its price ladder ON-CHAIN in setup: QL_S geometric slices. The
+  // per-venue bound is ≤ 2·QL_S staticcalls — the revert-class views are PROBE-THEN-DECODE (a probe
+  // `.catch` call + a guarded decode call = 2/slice); only graceful single-return views (WOOFi) cost
+  // 1/slice = QL_S. This is a fixed, per-venue overhead the pre-QL sampled-segment path did NOT carry
+  // on-chain (it shipped the samples statically). The three replay families (Balancer V2/V3, Maverick)
+  // have NO cumulative-out view to quote, so instead they read a BOUNDED set of live Vault/bin state
+  // and replay the curve math on-chain.
+  lines.push(`## Table 3 — quote-ladder per-venue ladder-build cost (QL_S = ${QL_S} slices, ≤ 2·QL_S = ${QL_2S} staticcalls/venue)`);
+  lines.push("");
+  lines.push(
+    "Architectural (derived from the QL framework + `buildQLVenues`), not measured on the V3-only " +
+      "fixture above. Each QL venue expands its 10-column descriptor into an on-chain price ladder of " +
+      `QL_S = ${QL_S} geometric slices. The per-venue upper bound is **≤ 2·QL_S = ${QL_2S}** view staticcalls ` +
+      "(`ecoswap.sauce.ts:135`): the revert-class views are **probe-then-decode** — an unconditional " +
+      "`.catch(() => ok = 0)` PROBE staticcall (the sentinel-catch can only flag a revert, not capture " +
+      "the value) followed by a guarded DECODE staticcall — so a successful slice costs **2** staticcalls, " +
+      `i.e. up to 2·QL_S = ${QL_2S}/venue (a revert stops the ladder early). Only the graceful single-return ` +
+      "views (WOOFi `tryQuery`, which returns 0 rather than reverting) cost **1** staticcall/slice = QL_S = " +
+      `${QL_S}. Trader Joe LB reads \`getSwapOut()[0]\` and \`[1]\` as two separate staticcalls, so it too is ` +
+      "≤ 2·QL_S. The read-only `quoteEcoSwap` (eth_call + stateOverride) runs the SAME ladder but is " +
+      "FREE of the block gas cap — the ladder staticcalls only count against gas on a landed cook().",
+  );
+  lines.push("");
+  lines.push("| QL venue | segKind | ladder quote (per slice, view) | ladder staticcalls | on-chain exec |");
+  lines.push("| --- | ---: | --- | ---: | --- |");
+  for (const r of QL_VENUE_ROWS) {
+    lines.push(`| ${r.venue} | ${r.segKind} | ${r.quote} | ${r.calls} | ${r.exec} |`);
+  }
+  lines.push("");
+
   // Takeaways — assembled from whatever was actually measured this run.
   const arrSize = sizeBytes.get("unified-walk");
   const unrSize = sizeBytes.get("unrolled");
@@ -562,6 +554,19 @@ function writeGasMd(): void {
         .join("; ")}.`,
     );
   }
+  // Live-walk / quote-ladder architecture (always emitted — architectural, not run-dependent).
+  bullets.push(
+    "**Live-walk architecture.** Every venue now LIVE-WALKS: V2/V3/V4 walk a live frontier from the " +
+      "on-chain spot (reusing a drift-invariant per-pool net cache), and the 13 quote-ladder families " +
+      `build a price ladder of QL_S = ${QL_S} slices ON-CHAIN in setup (Table 3). This trades the old static ` +
+      `sampled-segment shipping for on-chain freshness: a QL venue costs up to 2·QL_S = ${QL_2S} view staticcalls at ` +
+      "ladder-build (probe-then-decode revert-class views cost 2/slice — a probe + a guarded decode; the " +
+      "graceful single-return views like WOOFi cost 1/slice = QL_S; the three replay families — Balancer " +
+      "V2/V3, Maverick — instead read a bounded set of live state and replay the curve). The read-only " +
+      "`quoteEcoSwap` runs the identical ladder via " +
+      "eth_call + stateOverride and is FREE of the block gas cap; the ladder staticcalls only count " +
+      "against gas on a landed cook().",
+  );
   if (bullets.length === 0) {
     bullets.push("**Takeaway.** Insufficient measurements this run (see the blockers above).");
   }
@@ -690,14 +695,14 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
       return;
     }
     for (const s of SOLVERS) {
-      const args = argsForShape(s.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
+      const { args, opts } = argsForShape(s.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
       const source = readFileSync(join(ECOSWAP_DIR, s.file), "utf-8");
       const cell: Cell = { v1: null, v12: null };
       for (const target of TARGETS) {
         // Per-cell try/catch: a variant that cannot compile to one target (a real
         // finding) must not abort the rest of the table.
         try {
-          const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, target);
+          const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, target, opts);
           assert.ok(bytecodes.length >= 1, `${s.key}/${target} produced no bytecode`);
           cell[target] = blobBytes(bytecodes);
         } catch (e) {
@@ -727,7 +732,7 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
     const engines: Target[] = v12ExecAvailable ? ["v1", "v12"] : ["v1"];
 
     for (const s of SOLVERS) {
-      const args = argsForShape(s.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
+      const { args, opts } = argsForShape(s.shape, tokenIn, tokenOut, AMOUNT_IN, caller, prepared);
       const source = readFileSync(join(ECOSWAP_DIR, s.file), "utf-8");
       const cell: Cell = execGas.get(s.key) ?? { v1: null, v12: null };
 
@@ -745,7 +750,7 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
         await approve(c.walletClient, c.publicClient, tokenIn, cookTarget, AMOUNT_IN);
 
         try {
-          const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, engine);
+          const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, engine, opts);
           const { receipt } = await cook(c.walletClient, c.publicClient, cookTarget, bytecodes);
           if (receipt.status !== "success") {
             execNotes.set(`${s.key}/${engine}`, `cook() status=${receipt.status}`);

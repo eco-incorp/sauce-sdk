@@ -560,7 +560,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
  * live code is NEVER dropped. The `||`-over-legs/universe reductions default a flag to `true` if
  * the corresponding prepared field is present.
  */
-function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
+export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   // Every pool in the executable universe: direct pools PLUS every route-leg pool (a leg pool is
   // itself an EcoPool the solver walks/executes, so its type must light the matching HAS_* flag).
   const allPools: EcoPool[] = [
@@ -617,6 +617,47 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_MENTO,
     HAS_BALANCER_V3,
   };
+}
+
+/**
+ * Assemble the on-chain solver's compiler-arg array from a `prepared` universe — the SINGLE source
+ * of truth for the `main(cfg, pools, netCache, routing, segs, qlv)` argument shape (6 top-level
+ * args: the 12-scalar cfg bundle + the five nested tuple arrays). `ecoSwap` feeds this straight into
+ * `compile()`; the gas-measurement tests import it so their hand-fed args can never drift from the
+ * production shape (the historical staleness this replaces). `minOut` is taken from `prepared` (0 on
+ * a floor-disabled prepare); a read-only quote overrides cfg[9] to 0 separately.
+ */
+export function buildSolverArgs(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  amountIn: bigint,
+  caller: Hex,
+  prepared: EcoSwapPrepared,
+): unknown[] {
+  const { poolTuples, netCache, routing, directCount } = buildPoolUniverseAndRouting(prepared);
+  const segs = buildSegs(prepared);
+  const qlv = buildQLVenues(prepared);
+  return [
+    [
+      BigInt(tokenIn),
+      BigInt(tokenOut),
+      amountIn,
+      BigInt(caller),
+      prepared.priceLimit,
+      BigInt(directCount),
+      fluidResolverAddr(prepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
+      mentoBrokerAddr(prepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
+      balancerV3RouterAddr(prepared), // cfg[8] — chain-wide Balancer V3 Router (0 when no Balancer V3 venue)
+      prepared.minOut ?? 0n, // cfg[9] — internal whole-trade amountOutMin FLOOR (0 ⇒ no floor)
+      balancerV3VaultAddr(prepared), // cfg[10] — chain-wide Balancer V3 Vault (0 when no Balancer V3 venue)
+      balancerV2VaultAddr(prepared), // cfg[11] — chain-wide Balancer V2 Vault (0 when no Balancer V2 venue)
+    ],
+    poolTuples,
+    netCache,
+    routing,
+    segs,
+    qlv,
+  ];
 }
 
 /**
@@ -680,9 +721,6 @@ export async function ecoSwap(
   const source = readFileSync(join(__dirname, solverFile), "utf-8");
   const jsSource = stripTypes(source);
 
-  const { poolTuples, netCache, routing, directCount } = buildPoolUniverseAndRouting(prepared);
-  const segs = buildSegs(prepared);
-  const qlv = buildQLVenues(prepared);
   const result = compile(jsSource, {
     // REPO_ROOT resolves "./artifacts/*.json"; __dirname resolves "./IUniswapV2Pair.json".
     baseDirs: [REPO_ROOT, __dirname],
@@ -693,33 +731,12 @@ export async function ecoSwap(
     // to the all-protocols cook (the guards are transparent when true).
     treeshake: true,
     defines: protocolDefines(prepared),
-    // cfg-bundle the SCALARS into ONE tuple (the lens's proven trick — keeps the scalar
-    // count out of the arg-prologue SDUP window); the big nested tuples (pools/netCache/
-    // routing/segs/qlv) stay SEPARATE top-level params so pool/route/segment field reads stay
-    // at nesting depth ≤ 2 (folding them in => depth-3 read => v1 INDEX revert). `segs` is the
-    // STATIC sampled-segment stream (the 13 not-yet-QL venues); `qlv` is the QUOTE-LADDER venue
-    // descriptors (Curve — built on-chain from live get_dy). Both feed the bestKind===1 cursor.
-    args: [
-      [
-        BigInt(config.tokenIn),
-        BigInt(config.tokenOut),
-        config.amountIn,
-        BigInt(caller),
-        prepared.priceLimit,
-        BigInt(directCount),
-        fluidResolverAddr(prepared), // cfg[6] — chain-wide Fluid DEX resolver (0 when no Fluid venue)
-        mentoBrokerAddr(prepared), // cfg[7] — chain-wide Mento V2 Broker (0 when no Mento venue)
-        balancerV3RouterAddr(prepared), // cfg[8] — chain-wide Balancer V3 Router (0 when no Balancer V3 venue)
-        prepared.minOut ?? 0n, // cfg[9] — internal whole-trade amountOutMin FLOOR (0 ⇒ no floor)
-        balancerV3VaultAddr(prepared), // cfg[10] — chain-wide Balancer V3 Vault (0 when no Balancer V3 venue)
-        balancerV2VaultAddr(prepared), // cfg[11] — chain-wide Balancer V2 Vault (0 when no Balancer V2 venue)
-      ],
-      poolTuples,
-      netCache,
-      routing,
-      segs,
-      qlv,
-    ],
+    // The 6-arg shape (cfg bundle + pools/netCache/routing/segs/qlv) is assembled by buildSolverArgs
+    // — the ONE place the shape lives (the gas tests import it too). The scalars are cfg-bundled (the
+    // lens's proven trick — keeps the scalar count out of the arg-prologue SDUP window); the big
+    // nested tuples stay SEPARATE top-level params so field reads stay at nesting depth ≤ 2 (folding
+    // them in => depth-3 read => v1 INDEX revert).
+    args: buildSolverArgs(config.tokenIn, config.tokenOut, config.amountIn, caller, prepared),
   });
 
   // This compiler returns { bytecode }; older recipe drafts referenced `bytecodes`.
