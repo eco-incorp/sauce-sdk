@@ -70,7 +70,7 @@
  *   FluidDexT1 0x6d83f60eEac0e50A1250760151E81Db2a278e03a (Etherscan verified)
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -193,7 +193,7 @@ export function getAmountOut(pool: FluidPool, dx: bigint): bigint {
  * — it enters the merge's descending-price sort directly, exactly like Curve / DODO / WOOFi / Fermi /
  * Wombat / Solidly segments.
  */
-export interface FluidSegment {
+export interface FluidSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

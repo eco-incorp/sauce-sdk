@@ -58,6 +58,16 @@ export interface MergeSegment {
   effOut: bigint;
   /** Unified out/in marginal price for this slice = isqrt(effOut · 2^192 / capacity). */
   marginalOI: bigint;
+  /**
+   * OFF-CHAIN-ONLY metadata (never part of the on-chain segment tuple, never read by the solver):
+   * the WORST (lowest) original sub-slice marginal folded into this segment — == `marginalOI` for a
+   * segment that was never merged. A merged segment's blended `marginalOI` averages a worse-priced
+   * early sub-region with a better-priced deep one, so anything valuing a PARTIAL fill of the
+   * segment (the minOut estimator's crossing-slice proration) must use THIS rate to stay a lower
+   * bound — proration at the blended rate over-credits the early region. Maintained by
+   * `pushMonotoneSegment` (min-propagated through fold cascades).
+   */
+  worstMarginalOI?: bigint;
 }
 
 /** Recompute a segment's blended marginalOI from its (summed) capacity + effOut — the builders' formula. */
@@ -67,13 +77,17 @@ function blendedMarginal(capacity: bigint, effOut: bigint): bigint {
 }
 
 /**
- * Fold a slice into the last segment: sum capacity, sum effOut, recompute the blended marginal. Mutates
- * `last` in place (it is the tail of the caller's segs array).
+ * Fold a slice into the last segment: sum capacity, sum effOut, recompute the blended marginal, and
+ * min-propagate the worst original sub-slice marginal (`worst` is the incoming slice's own — its
+ * `worstMarginalOI` when folding a whole segment, its `marginalOI` when folding a fresh slice).
+ * Mutates `last` in place (it is the tail of the caller's segs array).
  */
-function foldInto(last: MergeSegment, cap: bigint, eff: bigint): void {
+function foldInto(last: MergeSegment, cap: bigint, eff: bigint, worst: bigint): void {
+  const lastWorst = last.worstMarginalOI ?? last.marginalOI;
   last.capacity += cap;
   last.effOut += eff;
   last.marginalOI = blendedMarginal(last.capacity, last.effOut);
+  last.worstMarginalOI = lastWorst < worst ? lastWorst : worst;
 }
 
 /**
@@ -93,18 +107,20 @@ function foldInto(last: MergeSegment, cap: bigint, eff: bigint): void {
  *     last two together. The loop terminates (each fold reduces the segment count by one).
  *
  * Total Σcapacity and ΣeffOut over `segs` after the call == before + (cap, eff): NO liquidity discarded.
+ * Each segment additionally carries `worstMarginalOI` — the min original sub-slice marginal it folded
+ * (== its own `marginalOI` when never folded) — off-chain metadata for lower-bound partial valuation.
  */
 export function pushMonotoneSegment(segs: MergeSegment[], cap: bigint, eff: bigint, marginalOI: bigint): void {
   if (marginalOI <= 0n) return;
   if (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI) {
-    segs.push({ capacity: cap, effOut: eff, marginalOI });
+    segs.push({ capacity: cap, effOut: eff, marginalOI, worstMarginalOI: marginalOI });
     return;
   }
   // Violation: fold this slice into the last segment, then cascade the merge backward while the tail
   // still prices better than the segment before it (isotonic PAV).
-  foldInto(segs[segs.length - 1], cap, eff);
+  foldInto(segs[segs.length - 1], cap, eff, marginalOI);
   while (segs.length >= 2 && segs[segs.length - 1].marginalOI > segs[segs.length - 2].marginalOI) {
     const tail = segs.pop()!;
-    foldInto(segs[segs.length - 1], tail.capacity, tail.effOut);
+    foldInto(segs[segs.length - 1], tail.capacity, tail.effOut, tail.worstMarginalOI ?? tail.marginalOI);
   }
 }

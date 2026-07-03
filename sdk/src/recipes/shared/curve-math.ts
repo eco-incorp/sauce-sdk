@@ -33,7 +33,7 @@
  * makes NO extra RPC.
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
@@ -277,7 +277,7 @@ export function getDy(pool: CurvePool, dx: bigint): bigint {
  * enters the merge's descending-price sort directly (no extra sqrtOneMinusFee multiply, the
  * fee is baked into dy). This matches how route segments carry their fee-composed price.
  */
-export interface CurveSegment {
+export interface CurveSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

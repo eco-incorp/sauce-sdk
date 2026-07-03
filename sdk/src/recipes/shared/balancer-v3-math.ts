@@ -74,16 +74,17 @@
  * of the pool balances + rate providers + surge-hook state), so:
  *   - the SPLIT is EXACT-ON-GRID-AT-SNAPSHOT — the oracle segments the SAME sampled ladder, so solver ==
  *     oracle bit-for-bit on that grid;
- *   - per-pool EXECUTION passes minAmountOut = 0 (the query is uncallable on-chain), and the solver's main()
- *     has NO whole-trade output floor either. A Balancer V3 leg therefore has NO on-chain slippage floor: it
- *     relies ENTIRELY on the off-chain snapshot split (priced off the same live query ladder the oracle
- *     segments) plus whatever transaction-level slippage the integrator enforces around cook(). When the pool
- *     state is unchanged between prepare and cook, exactIn reproduces the snapshot out exactly.
+ *   - per-pool EXECUTION passes minAmountOut = 0 (the query is uncallable on-chain), so a Balancer V3 leg
+ *     has NO per-leg on-chain floor. The solver's whole-trade amountOutMin FLOOR (cfg[9], derived off a
+ *     CONSERVATIVE expected-output estimate via `slippageBps`) is the on-chain guard — it bounds a GROSS
+ *     total-output shortfall, but the estimate is loose, so per-leg drift inside that envelope is uncapped;
+ *     a tight bound is still the integrator's transaction-level slippage around cook(). When the pool state
+ *     is unchanged between prepare and cook, exactIn reproduces the snapshot out exactly.
  * The residual is EXOGENOUS: rate-provider rates accrue and the surge fee moves as the pool re-balances
- * between prepare and cook — and (unlike a per-leg minOut source) there is no on-chain guard that bounds that
- * drift, so it is the integrator's transaction-level slippage that protects a Balancer V3 fill. The split is
- * optimal at the snapshot; the exec reproduces the live query for the awarded share at whatever the live
- * state is (the state-moves cell proves received == the LIVE query at the moved state, with minAmountOut=0).
+ * between prepare and cook — bounded on-chain only by the LOOSE whole-trade floor (cfg[9]), never per leg.
+ * The split is optimal at the snapshot; the exec reproduces the live query for the awarded share at whatever
+ * the live state is (the state-moves cell proves received == the LIVE query at the moved state, with
+ * minAmountOut=0).
  *
  * Sources (VERIFIED):
  *   https://github.com/balancer/balancer-v3-monorepo/blob/main/pkg/interfaces/contracts/vault/IRouter.sol  (swapSingleTokenExactIn / querySwapSingleTokenExactIn verbatim)
@@ -95,7 +96,7 @@
  *   directions on the Base pool 0x7ab124ec4029316c2a42f713828ddf2a192b36db.
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -222,7 +223,7 @@ export function getAmountOut(pool: BalancerV3Pool, dx: bigint): bigint {
  * ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly, exactly
  * like Fluid / Mento / Curve / DODO segments.
  */
-export interface BalancerV3Segment {
+export interface BalancerV3Segment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

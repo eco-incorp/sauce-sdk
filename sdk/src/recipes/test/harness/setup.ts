@@ -883,9 +883,10 @@ export const cryptoSwapAbi = parseAbi([
  * Deploy a local Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) 2-coin pool and fund it with
  * its coin balances.
  *
- * Mirrors the canonical tricrypto-ng newton_D/newton_y + twocrypto-ng get_dy/_fee bit-for-bit (matching
- * the off-chain `cryptoswap-math.ts` replay), so `get_dy(i,j,dx)` returns EXACTLY `getDyCrypto(pool, dx)`
- * to the wei and `exchange(i,j,dx,min_dy)` sends that. CryptoSwap uses UINT256 coin indices, so EcoSwap
+ * Mirrors the deployed Twocrypto v2.1.0d family (stableswap-invariant get_y, post-swap-xp dynamic fee,
+ * raw-product xp scaling) bit-for-bit — matching the off-chain `cryptoswap-math.ts` replay — so
+ * `get_dy(i,j,dx)` returns EXACTLY `getDyCrypto(pool, dx)` to the wei and `exchange(i,j,dx,min_dy)`
+ * sends that. CryptoSwap uses UINT256 coin indices, so EcoSwap
  * executes it CALLBACK-FREE (approve + exchange), NOT through the engine. Curve exchange PULLS coin i via
  * transferFrom and transfers coin j out, so the pool must HOLD both coin balances — `minter` transfers
  * each coin's full balance into the pool. `A` is ANN (already A_MULTIPLIER·N^N-scaled); `precisions[k]` =

@@ -62,8 +62,10 @@
  * blocks would if a reset boundary is crossed, and a stale reference rate near a reset boundary can move the
  * realized price vs. an earlier off-chain quote. This residual is EXOGENOUS (like the Fluid layer accruing /
  * the WOOFi oracle moving) and bounded by the conservative amountOutMin. swapIn is also subject to per-
- * exchange TradingLimits + the BreakerBox circuit breakers (a large slice or a tripped breaker reverts even
- * when getAmountOut returned a value); size slices under the limits and rely on the terminal refund.
+ * exchange TradingLimits + the BreakerBox circuit breakers, which getAmountOut does NOT check: the live
+ * quote can succeed while the swapIn a moment later REVERTS (a limit-exceeding slice or a tripped breaker)
+ * — and that revert aborts the WHOLE cook (atomic all-or-nothing); the terminal refund never runs, it is
+ * NOT a per-venue skip. Sizing slices under the limits at prepare time is the only mitigation.
  *
  * Sources (VERIFIED):
  *   https://github.com/mento-protocol/mento-core/blob/main/contracts/swap/Broker.sol            (swapIn / getAmountOut / getExchangeProviders / transferIn / transferOut)
@@ -74,7 +76,7 @@
  *   Celoscan BiPoolManager (verified proxy): https://celoscan.io/address/0x22d9db95e6ae61c104a7b6f6c78d7993b94ec901
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -198,7 +200,7 @@ export function getAmountOut(pool: MentoPool, dx: bigint): bigint {
  * enters the merge's descending-price sort directly, exactly like Curve / DODO / WOOFi / Fermi / Fluid
  * segments.
  */
-export interface MentoSegment {
+export interface MentoSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

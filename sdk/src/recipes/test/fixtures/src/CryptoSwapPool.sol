@@ -7,25 +7,29 @@ interface IERC20Min {
     function balanceOf(address) external view returns (uint256);
 }
 
-/// @notice Faithful Curve CryptoSwap (twocrypto-ng / tricrypto-ng volatile-asset) 2-coin pool for local
-/// EVM tests of EcoSwap's callback-free CryptoSwap path.
+/// @notice Faithful Curve Twocrypto (fxswap / "boom" twocrypto-ng, pool version v2.1.0d) 2-coin pool
+/// for local EVM tests of EcoSwap's callback-free CryptoSwap path.
 ///
-/// Reproduces the canonical curvefi tricrypto-ng `newton_D`/`newton_y` A-gamma invariant + twocrypto-ng
-/// `Twocrypto.get_dy` precisions[]/price_scale scaling + `_fee` dynamic fee BIT-FOR-BIT with the off-chain
-/// bigint replay in `sdk/src/recipes/shared/cryptoswap-math.ts` — the SAME 1e18 fixed-point math, the SAME
-/// bounded-255 Newton loops + convergence tests, the SAME `dy = xp[j] - y - 1` rounding + `dy -= fee*dy/1e10`
-/// dynamic fee. So `get_dy(i, j, dx)` returns EXACTLY the off-chain `getDyCrypto(pool, dx)` to the wei —
-/// the wei-exact-in-dy gate.
+/// Reproduces the DEPLOYED pool family's math BIT-FOR-BIT with the off-chain bigint replay in
+/// `sdk/src/recipes/shared/cryptoswap-math.ts` (both mirror the sourcify-verified mainnet pool +
+/// its StableswapMath, probe-verified against real chain state): the STABLESWAP `get_y`/`newton_D`
+/// invariant with `Ann = A·N` (gamma is stored for ABI parity but IGNORED by the math, exactly like
+/// the deployed `StableswapMath.vy`), the view's RAW-product xp scaling (`dx` joins the RAW balance
+/// FIRST, then ONE `balances·precisions·price_scale/1e18` floor per coin), the `dy = xp[j] - y - 1`
+/// rounding, and the v2.1.0d dynamic fee (`fee_gamma·B/(fee_gamma·B/1e18 + 1e18 - B)` blend)
+/// computed on the POST-swap xp (`xp[j] = y`) — so `get_dy(i, j, dx)` returns EXACTLY the off-chain
+/// `getDyCrypto(pool, dx)` to the wei — the wei-exact-in-dy gate.
 ///
-/// CryptoSwap pools use UINT256 coin indices (exchange(uint256 i, uint256 j, dx, min_dy)), so the engine
-/// `_swapCurve` (exchange(int128,int128,...)) does NOT match them. EcoSwap executes a CryptoSwap pool
-/// CALLBACK-FREE: it reads get_dy(i, j, Σ) for min_dy, APPROVES this pool to pull the input, then calls
-/// exchange(i, j, Σ, min_dy). Curve exchange PULLS the input via transferFrom (like Wombat). This fixture
-/// implements exactly that surface + updates the coin balances (and D) on each exchange.
+/// CryptoSwap pools use UINT256 coin indices (exchange(uint256 i, uint256 j, dx, min_dy)), so the
+/// engine `_swapCurve` (exchange(int128,int128,...)) does NOT match them. EcoSwap executes a
+/// CryptoSwap pool CALLBACK-FREE: it reads get_dy(i, j, Σ) for min_dy, APPROVES this pool to pull
+/// the input, then calls exchange(i, j, Σ, min_dy). Curve exchange PULLS the input via transferFrom
+/// (like Wombat). This fixture implements exactly that surface + updates the coin balances (and D)
+/// on each exchange.
 ///
-/// 2-coin only (coin0/coin1), which is all a single tokenIn→tokenOut swap reads. `A` is stored as ANN
-/// (already A_MULTIPLIER·N^N-scaled, as the crypto pool `A()` reports it). price_scale scales coin1 into
-/// coin0 (the numeraire). The pool HOLDS each coin's balance so it can pay out.
+/// 2-coin only (coin0/coin1), which is all a single tokenIn→tokenOut swap reads. `A` is the pool
+/// `A()` (the math `_amp`; deployed bounds MIN_A = N·A_MULTIPLIER = 2e4, MAX_A = 1e8). price_scale
+/// scales coin1 into coin0 (the numeraire). The pool HOLDS each coin's balance so it can pay out.
 contract CryptoSwapPool {
     uint256 private constant PRECISION = 1e18;
     uint256 private constant FEE_DENOM = 1e10;
@@ -33,8 +37,8 @@ contract CryptoSwapPool {
     uint256 private constant N = 2;
 
     address[2] public coinList;
-    uint256 public A; // ANN (A_MULTIPLIER·N^N-scaled)
-    uint256 public gamma;
+    uint256 public A; // the pool A() == the math _amp (Ann = A*N inside the math)
+    uint256 public gamma; // stored for ABI parity; UNUSED by the fx/boom StableswapMath
     uint256 public price_scale;
     uint256 public D;
     uint256[2] public bal; // native-unit coin balances
@@ -56,6 +60,7 @@ contract CryptoSwapPool {
         uint256 outFee_,
         uint256 feeGamma_
     ) {
+        require(A_ >= N * A_MULTIPLIER, "A<MIN"); // deployed MIN_A (Ann - A_MULTIPLIER must not underflow)
         coinList = coins_;
         precisions = precisions_;
         A = A_;
@@ -77,110 +82,80 @@ contract CryptoSwapPool {
         return bal[i];
     }
 
-    // ── math (mirrors cryptoswap-math.ts / tricrypto-ng, N=2) ─────────────
+    // ── math (mirrors cryptoswap-math.ts / the deployed StableswapMath + Twocrypto v2.1.0d) ──────
 
     function _absDiff(uint256 a, uint256 b) internal pure returns (uint256) {
         return a > b ? a - b : b - a;
     }
 
-    function _isqrt(uint256 x) internal pure returns (uint256) {
-        if (x == 0) return 0;
-        uint256 z = x;
-        uint256 y = (z + 1) / 2;
-        while (y < z) {
-            z = y;
-            y = (x / y + y) / 2;
-        }
-        return y > z ? z : y;
-    }
-
-    /// @notice xp[0] = bal[0]*precisions[0]; xp[1] = bal[1]*precisions[1]*price_scale/1e18 (1e18 space).
+    /// @notice xp[0] = bal[0]*precisions[0]; xp[1] = bal[1]*precisions[1]*price_scale/1e18 — ONE
+    /// raw-product floor per coin (the deployed `_xp`).
     function _xp() internal view returns (uint256[2] memory xp) {
         xp[0] = bal[0] * precisions[0];
         xp[1] = (bal[1] * precisions[1] * price_scale) / PRECISION;
     }
 
-    /// @notice newton_D specialized to N=2 — bit-for-bit with cryptoswap-math.ts newtonD.
+    /// @notice StableswapMath.newton_D (Ann = A*N, gamma ignored) — bit-for-bit with
+    /// cryptoswap-math.ts newtonD. `|Δ| <= 1` convergence, bounded 255.
     function _newtonD(uint256[2] memory x) internal view returns (uint256) {
+        if (x[0] == 0 || x[1] == 0) return 0;
         uint256 S = x[0] + x[1];
-        if (S == 0) return 0;
-        uint256 Dn = N * _isqrt(x[0] * x[1]);
+        uint256 Dn = S;
+        uint256 Ann = A * N;
         for (uint256 it = 0; it < 255; it++) {
+            uint256 D_P = Dn;
+            D_P = (D_P * Dn) / x[0];
+            D_P = (D_P * Dn) / x[1];
+            D_P = D_P / (N * N); // N**N for N=2
             uint256 Dprev = Dn;
-            uint256 K0 = (((PRECISION * N * N * x[0]) / Dn) * x[1]) / Dn;
-            uint256 g1k0 = _absDiff(gamma + PRECISION, K0) + 1;
-            uint256 mul1 = ((((((PRECISION * Dn) / gamma) * g1k0) / gamma) * g1k0) * A_MULTIPLIER) / A;
-            uint256 mul2 = (2 * PRECISION * N * K0) / g1k0;
-            uint256 negFprime = S + (S * mul2) / PRECISION + (mul1 * N) / K0 - (mul2 * Dn) / PRECISION;
-            uint256 Dplus = (Dn * (negFprime + S)) / negFprime;
-            uint256 Dminus = (Dn * Dn) / negFprime;
-            if (PRECISION > K0) {
-                Dminus += (((Dn * (mul1 / negFprime)) / PRECISION) * (PRECISION - K0)) / K0;
-            } else {
-                Dminus -= (((Dn * (mul1 / negFprime)) / PRECISION) * (K0 - PRECISION)) / K0;
-            }
-            Dn = Dplus > Dminus ? Dplus - Dminus : (Dminus - Dplus) / 2;
-            uint256 diff = _absDiff(Dn, Dprev);
-            uint256 bound = Dn > 1e16 ? Dn : 1e16;
-            if (diff * 1e14 < bound) break;
+            Dn = (((Ann * S) / A_MULTIPLIER + D_P * N) * Dn)
+                / (((Ann - A_MULTIPLIER) * Dn) / A_MULTIPLIER + (N + 1) * D_P);
+            if (_absDiff(Dn, Dprev) <= 1) return Dn;
         }
         return Dn;
     }
 
-    /// @notice newton_y specialized to N=2 — bit-for-bit with cryptoswap-math.ts newtonY.
-    function _newtonY(uint256[2] memory x, uint256 Dn, uint256 i) internal view returns (uint256) {
-        uint256 xj = x[1 - i];
-        uint256 K0i = (PRECISION * N * xj) / Dn;
-        uint256 Si = xj;
-        uint256 y = (Dn * Dn) / (xj * N * N);
-        uint256 convLim = xj / 1e14 > Dn / 1e14 ? xj / 1e14 : Dn / 1e14;
-        if (convLim < 100) convLim = 100;
+    /// @notice StableswapMath.get_y (Ann = A*N, gamma ignored) — solve coin i's post-swap balance
+    /// for the moved xp and held D. Bit-for-bit with cryptoswap-math.ts getY.
+    function _getY(uint256[2] memory xp, uint256 Dn, uint256 i) internal view returns (uint256) {
+        uint256 xj = xp[1 - i]; // the moved counterpart coin balance
+        uint256 Ann = A * N;
+        uint256 c = (Dn * Dn) / (xj * N);
+        c = (c * Dn * A_MULTIPLIER) / (Ann * N);
+        uint256 b = xj + (Dn * A_MULTIPLIER) / Ann;
+        uint256 y = Dn;
         for (uint256 it = 0; it < 255; it++) {
             uint256 yPrev = y;
-            uint256 K0 = (K0i * y * N) / Dn;
-            uint256 S = Si + y;
-            uint256 g1k0 = _absDiff(gamma + PRECISION, K0) + 1;
-            uint256 mul1 = ((((((PRECISION * Dn) / gamma) * g1k0) / gamma) * g1k0) * A_MULTIPLIER) / A;
-            uint256 mul2 = PRECISION + (2 * PRECISION * K0) / g1k0;
-            uint256 yfprime = PRECISION * y + S * mul2 + mul1;
-            uint256 dyfprime = Dn * mul2;
-            if (yfprime < dyfprime) {
-                y = yPrev / 2;
-                continue;
-            }
-            yfprime = yfprime - dyfprime;
-            uint256 fprime = yfprime / y;
-            uint256 yMinus = mul1 / fprime;
-            uint256 yPlus = (yfprime + PRECISION * Dn) / fprime + (yMinus * PRECISION) / K0;
-            yMinus += (PRECISION * S) / fprime;
-            y = yPlus < yMinus ? yPrev / 2 : yPlus - yMinus;
-            uint256 diff = _absDiff(y, yPrev);
-            uint256 bound = convLim > y / 1e14 ? convLim : y / 1e14;
-            if (diff < bound) break;
+            y = (y * y + c) / (2 * y + b - Dn);
+            if (_absDiff(y, yPrev) <= 1) return y;
         }
         return y;
     }
 
-    /// @notice _fee(xp) — the dynamic fee (1e10 units) — bit-for-bit with cryptoswap-math.ts cryptoFee.
+    /// @notice _fee(xp) — the v2.1.0d dynamic fee (1e10 units) — bit-for-bit with
+    /// cryptoswap-math.ts cryptoFee (the fee_gamma*B/(fee_gamma*B/1e18 + 1e18 - B) blend).
     function _fee(uint256[2] memory xp) internal view returns (uint256) {
         uint256 S = xp[0] + xp[1];
         if (S == 0) return mid_fee;
-        uint256 f = (((N ** N * PRECISION * xp[0]) / S) * xp[1]) / S;
-        f = (fee_gamma * PRECISION) / (fee_gamma + PRECISION - f);
-        return (mid_fee * f + out_fee * (PRECISION - f)) / PRECISION;
+        uint256 B = (((PRECISION * N * N * xp[0]) / S) * xp[1]) / S;
+        B = (fee_gamma * B) / ((fee_gamma * B) / PRECISION + PRECISION - B);
+        return (mid_fee * B + out_fee * (PRECISION - B)) / PRECISION;
     }
 
     /// @notice Exact tokens-out for `dx` of coin i → coin j, INCLUDING the dynamic fee. Pure view —
-    /// identical to the off-chain getDyCrypto and to what `exchange` enforces.
+    /// identical to the off-chain getDyCrypto and to what `exchange` enforces. Mirrors the deployed
+    /// view's ORDER: dx joins the RAW balance, ONE scaling floor per coin, fee on the POST-swap xp.
     function get_dy(uint256 i, uint256 j, uint256 dx) public view returns (uint256) {
         require(i != j && i < N && j < N, "BAD_COIN");
         if (dx == 0) return 0;
-        uint256[2] memory xp = _xp();
-        uint256 scaleI = i == 0 ? precisions[0] : (precisions[1] * price_scale) / PRECISION;
-        xp[i] = xp[i] + dx * scaleI;
-        uint256 y = _newtonY(xp, D, j);
-        if (xp[j] <= y + 1) return 0;
+        uint256[2] memory raw = [bal[0], bal[1]];
+        raw[i] = raw[i] + dx;
+        uint256[2] memory xp =
+            [raw[0] * precisions[0], (raw[1] * precisions[1] * price_scale) / PRECISION];
+        uint256 y = _getY(xp, D, j);
+        if (y + 1 >= xp[j]) return 0; // deployed view: assert y < xp[j]
         uint256 dy = xp[j] - y - 1;
+        xp[j] = y; // POST-swap xp — the state the dynamic fee is computed on
         if (j > 0) dy = (dy * PRECISION) / price_scale;
         dy = dy / precisions[j];
         uint256 fee = (_fee(xp) * dy) / FEE_DENOM;

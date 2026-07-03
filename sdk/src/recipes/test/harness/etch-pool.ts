@@ -1996,14 +1996,12 @@ export const curveRegistryShimAbi = parseAbi([
 //     ground truth) is ALSO fully self-contained in {pool, MATH} — it does NOT touch the factory — so
 //     it runs offline against the etched real code. (Contrast the StableSwap-NG pool, whose get_dy
 //     delegates to an uncaptured views contract; twocrypto-NG's get_dy is inline + MATH only.)
-//   • FIDELITY CAVEAT (disclosed): the off-chain `cryptoswap-math.ts` A-gamma replay mirrors the
-//     tricrypto-NG newton_D/newton_y specialised to N=2. For THIS pool's live params it does NOT
-//     reproduce the pool's own D()/get_dy to the wei (the twocrypto-NG MATH library and the recorded
-//     A()/gamma() scaling diverge from the tricrypto-NG replay), so the off-chain oracle CANNOT be the
-//     wei-exact ground truth for the real pool. The test therefore uses the pool's OWN on-chain get_dy
-//     view as the exact-in-dy ground truth (the ACTUAL swap math the recipe reads for min_dy) — a
-//     STRONGER cross-check than the off-chain replay, since it is the real Vyper+MATH curve. See the
-//     test's HONEST fidelity note.
+//   • FIDELITY: the off-chain `cryptoswap-math.ts` replay mirrors THIS deployed family (Twocrypto
+//     v2.1.0d — stableswap-invariant get_y + post-swap-xp dynamic fee + raw-product xp scaling) and
+//     reproduces the pool's own get_dy to the wei across the prod-mirror ladder. The test still uses
+//     the pool's OWN on-chain get_dy view as the exact-in-dy ground truth (the ACTUAL swap math the
+//     recipe reads for min_dy) — ground truth by construction, with the replay ladder-parity-pinned
+//     against it.
 // ══════════════════════════════════════════════════════════════════════════════
 
 /** Curve CryptoSwap bytecode snapshot: the self-contained NG pool + the MATH library + factory runtimes. */

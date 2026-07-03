@@ -188,9 +188,10 @@ export interface TerraSwapPrepared {
 // sqrtPriceLimitX96. Instead of relying on the pool to cap its own fill, the
 // on-chain solver runs ONE price-ordered merge where every direct pool walks a
 // single frontier from its LIVE spot, one tickSpacing per step, reusing the
-// drift-invariant per-pool net cache prepare ships — and finds the split that
-// equalises the post-fee marginal execution price across every pool, doing
-// exactly ONE swap per pool (one per hop for routes).
+// swap-drift-invariant per-pool net cache prepare ships (nets survive price
+// moves, NOT an in-window LP mint/burn — see EcoPool.windowTopShifted) — and
+// finds the split that equalises the post-fee marginal execution price across
+// every pool, doing exactly ONE swap per pool (one per hop for routes).
 //
 // Unification insight: a constant-product (V2) pool is mathematically identical
 // to a single Uniswap-V3 liquidity range with L = sqrt(reserveIn * reserveOut).
@@ -207,9 +208,11 @@ export interface EcoSwapConfig {
 /**
  * Bracket kinds (must match the on-chain `kind` tag).
  *
- * `EcoSwapPrepared.brackets` is now always `[]` (routes are first-class live-walk venues,
- * not static off-chain-composed segments), so `Route` is UNUSED by EcoSwap. `V3`/`V2` still
- * tag direct-pool brackets in the test fixtures' bracket builders.
+ * `EcoSwapPrepared.brackets` carries the STATIC SAMPLED-VENUE segments (every kind >= Curve,
+ * referencing the per-venue lists by refIdx); it is `[]` only when no sampled venue was
+ * discovered. Routes contribute NO brackets (they are first-class live-walk venues, not static
+ * off-chain-composed segments), so `Route` is UNUSED by EcoSwap. `V3`/`V2` still tag
+ * direct-pool brackets in the test fixtures' bracket builders.
  */
 export enum EcoBracketKind {
   V3 = 0, // direct concentrated-liquidity bracket (test fixtures)
@@ -223,7 +226,7 @@ export enum EcoBracketKind {
   BalancerStable = 8, // Balancer V2 ComposableStable segment (static, off-chain-sampled via the StableMath A-invariant replay)
   EulerSwap = 9, // EulerSwap (Euler vault-backed AMM, v1+v2) segment (static, off-chain-sampled via the f/fInverse curve replay)
   MaverickV2 = 10, // Maverick V2 (bin-based directional AMM) segment (static, off-chain-sampled via the bin swap-math replay; executed through the engine)
-  CryptoSwap = 11, // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) segment (static, off-chain-sampled via the A-gamma invariant replay; executed CALLBACK-FREE via approve + exchange(uint256,...))
+  CryptoSwap = 11, // Curve Twocrypto (fxswap/boom v2.1.0d) segment (static, off-chain-sampled via the deployed-family invariant replay — see cryptoswap-math.ts; executed CALLBACK-FREE via approve + exchange(uint256,...))
   WOOFi = 12, // WOOFi (WooPPV2 synthetic proactive market maker) segment (static, off-chain-sampled via the sPMM oracle-price replay at a snapshot; executed CALLBACK-FREE via transfer + swap(fromToken,toToken,amt,minTo,to,rebateTo))
   Fermi = 13, // Fermi / propAMM (gattaca-com/propamm FermiSwap — Obric-style proactive AMM, K=v0²·multX/multY) segment (static, off-chain-sampled via the closed-form replay at a state snapshot; executed CALLBACK-FREE via getAmountOut + approve + swap(tokenIn,tokenOut,amt,minOut,to) — propAMM PULLS via transferFrom)
   Fluid = 14, // Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) segment (static, off-chain-sampled via a LIVE resolver estimateSwapIn ladder at a state snapshot; executed CALLBACK-FREE via estimateSwapIn + approve + swapIn(swap0to1,amt,minOut,to) — Fluid PULLS via transferFrom)
@@ -255,6 +258,18 @@ export interface EcoBracket {
   sqrtAdjNear: bigint;
   /** Fee-adjusted sqrt at the far edge (threshold coordinate). */
   sqrtAdjFar: bigint;
+  /**
+   * OFF-CHAIN-ONLY (never shipped in the on-chain segment tuple; the solver does not read it): for a
+   * SAMPLED-SOURCE bracket built from an isotonic-MERGED segment, the WORST original sub-slice
+   * marginal the merge folded in (== the segment's `marginalOI` when it was never folded). The
+   * minOut estimator prorates a PARTIAL fill of the crossing bracket at THIS rate — a merged
+   * segment's blended marginal averages the worse-priced EARLY sub-region with the better-priced
+   * deep one, so linear proration at the blended rate over-credits a partial take and could
+   * false-revert the solver's internal cfg[9] floor. Threaded from
+   * `MergeSegment.worstMarginalOI` (shared/segment-merge.ts) by the sampled-source bracket
+   * builders; absent ⇒ the estimator falls back to the (blended-rate) linear proration.
+   */
+  worstMarginalOI?: bigint;
 }
 
 /** Direct-pool descriptor (live-readable on-chain). */
@@ -283,7 +298,7 @@ export interface EcoPool {
   stateView: Hex;
   /** V4 only: poolId = keccak256(abi.encode(PoolKey)) (0x0 for V2/V3). */
   poolId: Hex;
-  // ── Unified-walk per-pool cache (the live walk reuses the drift-invariant NET) ──
+  // ── Unified-walk per-pool cache (the live walk reuses the swap-drift-invariant NET) ──
   /** floor(sqrt(1.0001^ts)*2^96) = getSqrtRatioAtTick(ts) — the multiplicative step ratio. V3/V4. */
   stepRatio?: bigint;
   /**
@@ -291,8 +306,11 @@ export interface EcoPool {
    * 0 ⇒ NO cache (the quote / 1-RPC path) ⇒ the walk staticcalls every boundary. A boundary
    * within [windowBotShifted, windowTopShifted] reads net from the per-pool netCache (or net
    * 0 if uninitialized); a boundary outside reads net via a ticks()/getTickLiquidity
-   * staticcall. The net VALUE is drift-invariant either way, so the cache is a pure gas
-   * optimization — the solver is wei-exact with the oracle regardless of the window. V3/V4.
+   * staticcall. The net VALUE is invariant under SWAP drift (price moves), so for price
+   * movement the cache is a pure gas optimization and the solver stays wei-exact with the
+   * oracle regardless of the window. LIMITATION: an in-window boundary is NEVER re-read
+   * on-chain, so an LP mint/burn that changes an in-window tick's net between prepare and
+   * cook leaves the cached net STALE (only out-of-window boundaries staticcall live). V3/V4.
    */
   windowTopShifted?: bigint;
   /** DEEPEST scanned tick (shifted) — the bottom of the cache window. V3/V4. */
@@ -332,8 +350,9 @@ export interface EcoPool {
    * OFF-CHAIN-ONLY drift model (reference mirror, ecoswap.solver-reference.ts). The
    * deterministic local tests run live==prepared spot, so these are unset unless a test
    * deliberately models drift. When set, the reference walks the pool's single frontier
-   * FROM this modeled live spot (the cached NET is drift-invariant, so the walk stays
-   * wei-exact with the oracle regardless of the drift):
+   * FROM this modeled live spot (the cached NET is invariant under SWAP drift, so the walk
+   * stays wei-exact with the oracle for any modeled price movement; the windowTopShifted
+   * LP mint/burn staleness caveat applies unchanged):
    *   liveCurRealOverride — REAL sqrt of the modeled live (drifted) price (V2: out/in spot).
    *   liveTickOverride    — modeled live tick (drives the start boundary, mirroring the
    *                         on-chain tickShiftedBase derivation).
@@ -531,7 +550,7 @@ export interface EcoEulerSwap {
 
 /**
  * One Maverick V2 venue to execute, indexed by an EcoBracket.refIdx (kind === MaverickV2). Maverick V2
- * is a BIN-based directional AMM whose bins do NOT map to the drift-invariant liquidityNet tick walk
+ * is a BIN-based directional AMM whose bins do NOT map to the swap-drift-invariant liquidityNet tick walk
  * (bin L is re-derived per tick from (reserveA,reserveB) and the pool has dynamic-distribution kinds),
  * so it is a SAMPLED-SEGMENT source (like DODO): prepare samples its closed-form bin swap-math into
  * static segments (kind MaverickV2) via the off-chain `buildMaverickSegments` replay; the on-chain
@@ -555,8 +574,8 @@ export interface EcoMaverick {
 
 /**
  * One Curve CryptoSwap venue to execute, indexed by an EcoBracket.refIdx (kind === CryptoSwap).
- * Curve CryptoSwap pools (twocrypto-ng / tricrypto-ng volatile-asset pools) trade on the A-gamma
- * invariant with a dynamic fee — NOT xy=k — AND use uint256 coin indices (exchange(uint256 i,
+ * Curve CryptoSwap pools (the fxswap/boom Twocrypto family — see cryptoswap-math.ts) trade on a
+ * price_scale-scaled invariant with a dynamic fee — NOT xy=k — AND use uint256 coin indices (exchange(uint256 i,
  * uint256 j, dx, min_dy)), so the engine `_swapCurve` (which calls exchange(int128,int128,...))
  * does NOT match them. prepare samples the curve OFF-CHAIN into static segments (kind CryptoSwap)
  * via the bounded-Newton bigint replay; the on-chain solver consumes those through the static-
@@ -723,9 +742,9 @@ export interface EcoMento {
  * `ERC20(tokenIn).approve(PERMIT2, +Σ)` + `Permit2.approve(tokenIn, ROUTER, uint160(+Σ), expiration)` (the V3
  * input is pulled via Permit2, the ONE operational difference from V2) — then
  * `Router.swapSingleTokenExactIn(pool, tokenIn, tokenOut, +Σ, minAmountOut, deadline, false, "")` with
- * minAmountOut HARDCODED 0 (no per-leg on-chain floor — the query is uncallable, and the solver has no
- * whole-trade output floor either; a Balancer V3 leg relies on the off-chain split + the integrator's
- * transaction-level slippage). NO engine SwapPoolType: the V3 reentrancy is fully contained inside Balancer's
+ * minAmountOut HARDCODED 0 (no per-leg on-chain floor — the query is uncallable; the whole-trade cfg[9]
+ * amountOutMin floor is the only on-chain bound, and it is a LOOSE gross-shortfall guard, so per-leg drift
+ * relies on the off-chain split + the integrator's transaction-level slippage). NO engine SwapPoolType: the V3 reentrancy is fully contained inside Balancer's
  * own Router + Vault (Vault.unlock re-enters the ROUTER, never the cooking contract; input PULLED via
  * Permit2.transferFrom, output via Vault.sendTo), so our side sees a single external call that returns —
  * callback-free, unlike the V4 unlockCallback path. `address` is the POOL (the query/swap `pool` arg);
@@ -752,10 +771,13 @@ export interface EcoBalancerV3 {
 /**
  * Off-chain preparation result.
  *
- * Direct pools carry per-pool net caches (the drift-invariant tick depth the on-chain
- * unified walk reuses); they ship NO prepare-time sqrt edges. Routes are first-class live-walk
+ * Direct pools carry per-pool net caches (the swap-drift-invariant tick depth the on-chain
+ * unified walk reuses; see EcoPool.windowTopShifted for the in-window LP mint/burn staleness
+ * caveat); they ship NO prepare-time sqrt edges. Routes are first-class live-walk
  * venues (each leg = a set of leg pools, themselves `EcoPool`s with their own net caches); the
- * solver walks them live, so there are NO static route segments — `brackets` is always `[]`.
+ * solver walks them live, so routes ship NO static segments. `brackets` carries ONLY the
+ * sampled-venue segments (Curve/LB/DODO/… — every kind >= Curve); it is `[]` when none were
+ * discovered.
  */
 export interface EcoSwapPrepared {
   pools: EcoPool[];
@@ -837,8 +859,8 @@ export interface EcoSwapPrepared {
    * solver executes the awarded Σ share CALLBACK-FREE (get_dy staticcall for min_dy + approve +
    * pool.exchange(uint256 i, uint256 j, Σ, min_dy) — NO engine SwapPoolType, since crypto pools use
    * uint256 coin indices that the engine's int128 _swapCurve does not match); the CryptoSwap
-   * marginal is supplied entirely as the static sampled segments in `brackets` (the A-gamma
-   * invariant replay). Optional/empty when no CryptoSwap pools were discovered (omitted ⇒ no
+   * marginal is supplied entirely as the static sampled segments in `brackets` (the deployed-family
+   * invariant replay in cryptoswap-math.ts). Optional/empty when no CryptoSwap pools were discovered (omitted ⇒ no
    * CryptoSwap venue, so existing test-side `EcoSwapPrepared` literals stay additive-compatible).
    */
   cryptoSwaps?: EcoCryptoSwap[];
@@ -889,7 +911,11 @@ export interface EcoSwapPrepared {
    * `EcoSwapPrepared` literals stay additive-compatible).
    */
   balancerV3Pools?: EcoBalancerV3[];
-  /** Always `[]` — routes are live-walk venues, not static segments. Kept for shape stability. */
+  /**
+   * The static SAMPLED-VENUE segments (every kind >= Curve; refIdx points into the venue lists
+   * above). Direct pools and routes contribute NONE (live-walk) — `[]` only when no sampled
+   * venue was discovered.
+   */
   brackets: EcoBracket[];
   zeroForOne: boolean;
   /** Real-sqrt-space extreme price limit for the swap calls (direction-dependent). */

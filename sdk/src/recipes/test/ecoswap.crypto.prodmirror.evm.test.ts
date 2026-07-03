@@ -8,10 +8,12 @@
  * swap against them, proving the production discovery + execution path works on the real Vyper contract,
  * with NO fork and NO RPC at run time (etch + setStorageAt, seconds).
  *
- * POOL: crvUSD/WETH twocrypto-NG CryptoSwap (0x6e5492F8…), Ethereum, block 2544xxxx. A self-contained
- * Vyper pool (coins baked as IMMUTABLES) whose get_dy/exchange STATICCALL a split CurveCryptoMathOptimized
- * (a primary 0x79839… the pool calls + a helper 0x35048188… the primary calls) and whose exchange reads
- * factory.fee_receiver(). ALL captured; see the honest fidelity note.
+ * POOL: crvUSD/WETH Twocrypto (0x6e5492F8…), Ethereum, block 2544xxxx — the fxswap/"boom" twocrypto-ng
+ * generation (sourcify-verified, `version() == "v2.1.0d"`, Vyper 0.4.3) the canonical factory deploys:
+ * crypto periphery (price_scale repeg + dynamic fee) over a STABLESWAP invariant. A self-contained
+ * Vyper pool (coins baked as IMMUTABLES) whose get_dy/exchange STATICCALL its storage-held periphery
+ * (MATH = the StableswapMath 0x79839…, VIEW = 0x35048188… — both unverified on-chain, both captured
+ * byte-for-byte) and whose exchange reads factory.fee_receiver(). ALL captured; see the fidelity note.
  *
  * MECHANISM (mirrors the repo's real-runtime etch, generalised in harness/etch-pool.ts):
  *   CAPTURE (one-time, harness/curveCrypto-snapshot.ts, uses the RPC key): eth_getCode the pool's REAL
@@ -19,7 +21,7 @@
  *     debug_traceCall of get_dy — the AUTHORITATIVE source, because the public MATH() getter reports a
  *     DIFFERENT address than the deploy-time-baked immutable the invariant actually calls) + the factory,
  *     into fixtures/snapshots/ethereum-curveCrypto-crvUSDWETH.bytecode.json (WITH sha256 anchors), and the
- *     full A-gamma invariant state + the raw pool/factory storage into .state.json. Block pinned. No
+ *     full invariant state + the raw pool/factory storage into .state.json. Block pinned. No
  *     key/url is ever persisted.
  *   ETCH (this test, OFFLINE): boot a plain anvil (NO fork); setCode the REAL pool runtime at its captured
  *     address (coins restore for free from the runtime immutables); setCode BOTH real MATH runtimes at
@@ -41,25 +43,22 @@
  *       awarded slice (== the actual swap math the recipe reads for min_dy) AND == the neutral oracle's
  *       realized dy, all to the wei. spent == awarded is asserted explicitly.
  *
- * HONEST FIDELITY — the SWAP is 100% real code; the OFF-CHAIN replay is NOT the ground truth here:
+ * FULL PRODUCTION-PATH FIDELITY — the SWAP is 100% real code AND the off-chain replay models it:
  *   • EXECUTION path (100% real): exchange(uint256 i,j,dx,min_dy) — what the recipe calls CALLBACK-FREE —
- *     runs the REAL etched pool + BOTH MATH runtimes end-to-end (newton_D / get_y + the A-gamma dynamic
- *     fee inline, fee_receiver serviced by the shim). The on-chain get_dy view (the recipe's min_dy
- *     source AND this test's ground truth) is ALSO self-contained in {pool, MATH} — it does NOT touch
- *     the factory — so it runs offline against the real code (verified: it reproduces the captured probe
- *     dy AND == exchange to the wei).
- *   • The shared off-chain `cryptoswap-math.ts` A-gamma replay mirrors tricrypto-NG's newton_D/newton_y;
- *     for THIS twocrypto-NG pool's live params it does NOT reproduce the pool's own D()/get_dy (the
- *     twocrypto-NG MATH library and the recorded A()/gamma() scaling diverge from that replay), so the
- *     production `buildCryptoSwapSegments` samples ZERO usable segments and the neutral oracle cannot use
- *     it as the curve. RATHER THAN silently trust a divergent approximation, this test SAMPLES THE REAL
- *     POOL'S OWN on-chain get_dy view into the solver's static segments (the genuine twocrypto-NG curve —
- *     STRICTLY MORE faithful than the tricrypto-NG replay), builds the neutral oracle over the SAME real
- *     samples, and cooks the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts compiles) with
- *     those segs. Production DISCOVERY (discoverCryptoSwapPoolsTyped → find_pool_for_coins → get_coin_indices
- *     [UINT256] → the live A-gamma reads) is exercised end-to-end to RESOLVE + orient the pool; only the
- *     off-chain SAMPLER is swapped for the real-curve one. The wei-exact gate is the real pool's own view,
- *     which is the swap math the recipe executes — a stronger cross-check than the divergent replay.
+ *     runs the REAL etched pool + BOTH periphery runtimes end-to-end (the fx/boom STABLESWAP
+ *     get_y/newton_D + the v2.1.0d dynamic fee inline, fee_receiver serviced by the shim). The on-chain
+ *     get_dy view (the recipe's min_dy source AND this test's ground truth) is ALSO self-contained in
+ *     {pool, VIEW, MATH} — it does NOT touch the factory — so it runs offline against the real code
+ *     (verified: it reproduces the captured probe dy AND == exchange to the wei).
+ *   • The shared off-chain `cryptoswap-math.ts` replay mirrors THIS deployed pool family (the fxswap/
+ *     "boom" Twocrypto v2.1.0d: STABLESWAP get_y/newton_D with Ann = A·N and gamma ignored, the view's
+ *     RAW-product xp scaling, the v2.1.0d dynamic fee on the POST-swap xp) — wei-exact against the
+ *     captured mainnet probes AND, in this test, against the etched real bytecode at EVERY production
+ *     ladder point. So this test runs the FULL production path unmasked: DISCOVERY
+ *     (discoverCryptoSwapPoolsTyped → find_pool_for_coins → get_coin_indices [UINT256] → the live pool
+ *     reads) resolves + orients the pool, the PRODUCTION buildCryptoSwapSegments samples the ladder off
+ *     the discovered descriptor (asserted == the real pool's own get_dy at every cumulative grid point),
+ *     and the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts compiles) cooks it.
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the artifacts
  * are absent). No state cache — etch+setStorage is a few seconds.
@@ -104,71 +103,12 @@ import {
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, MIN_SQRT_RATIO, type ChainPoolConfig } from "../shared/constants";
 import { discoverCryptoSwapPoolsTyped } from "../shared/pool-discovery";
-import { isqrt, Q192, CRYPTOSWAP_SAMPLES } from "../shared/cryptoswap-math";
+import { getDyCrypto, buildCryptoSwapSegments, type CryptoSwapSegment } from "../shared/cryptoswap-math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SNAP_NAME = "ethereum-curveCrypto-crvUSDWETH";
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 const ENGINE_CELLS = engineCells();
-
-/** One real-curve segment: Δin/Δout/marginalOI, sampled from the pool's OWN on-chain get_dy view. */
-interface RealSeg {
-  capacity: bigint; // Δinput
-  effOut: bigint; // Δoutput (real get_dy)
-  marginalOI: bigint; // isqrt(effOut·2^192/capacity) — the descending-price sort key
-}
-
-/**
- * Sample the ETCHED REAL pool's own get_dy into M descending-marginal segments over [0, amountIn] on the
- * SAME squared-index grid production's buildCryptoSwapSegments uses — but sourcing effOut from the REAL
- * twocrypto-NG curve (on-chain get_dy), NOT the divergent off-chain replay. Cumulative get_dy(input) is
- * read once per grid point; each increment is a (capacity=Δin, effOut=Δout, marginalOI) segment. This is
- * the honest, wei-exact curve of the real pool (see the fidelity note). One RPC-free eth_call per point.
- */
-async function sampleRealSegments(
-  c: HarnessClients,
-  pool: Hex,
-  i: bigint,
-  j: bigint,
-  amountIn: bigint,
-  samples: number = CRYPTOSWAP_SAMPLES,
-): Promise<RealSeg[]> {
-  const M = BigInt(samples);
-  const segs: RealSeg[] = [];
-  let prevIn = 0n;
-  let prevOut = 0n;
-  for (let s = 1; s <= samples; s++) {
-    const ss = BigInt(s);
-    const input = (amountIn * ss * ss) / (M * M);
-    if (input <= prevIn) continue;
-    const out = (await c.publicClient.readContract({
-      address: pool,
-      abi: curveCryptoPoolReadAbi,
-      functionName: "get_dy",
-      args: [i, j, input],
-    })) as bigint;
-    if (out <= 0n) continue;
-    const dIn = input - prevIn;
-    const dOut = out - prevOut;
-    if (dIn > 0n && dOut > 0n) {
-      const marginalOI = isqrt((dOut * Q192) / dIn);
-      // NOTE — INTENTIONALLY INDEPENDENT of the production merge. This test does NOT call the shared
-      // buildCryptoSwapSegments (whose off-chain replay diverges from the real twocrypto-NG curve — the
-      // fidelity note in the header). It samples the REAL pool's on-chain get_dy and builds its OWN
-      // ladder, then feeds the SAME ladder to the solver AND uses its Σ as the expectation, so the test
-      // stays self-consistent whatever the ladder policy is. For a deep pool + small trade the real curve
-      // is monotone-descending, so this simple append (== the merge's append branch on a descending
-      // ladder) and the isotonic backward-merge produce the IDENTICAL ladder here. Real-state crypto
-      // MERGE coverage comes from ecoswap.crypto.evm.test.ts (production buildCryptoSwapSegments).
-      if (marginalOI > 0n && (segs.length === 0 || marginalOI <= segs[segs.length - 1].marginalOI)) {
-        segs.push({ capacity: dIn, effOut: dOut, marginalOI });
-      }
-    }
-    prevIn = input;
-    prevOut = out;
-  }
-  return segs;
-}
 
 describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode, no fork, offline", () => {
   const snaps = loadCurveCryptoSnapshots(SNAP_NAME);
@@ -238,11 +178,11 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     ];
   }
 
-  // Real-curve segments as the solver's 7-col segs rows (mirrors index.ts buildSegs + the mock test's
-  // cryptoSegRows). refIdx tags the on-chain per-venue accumulator (cryinp[refIdx]); venue is the pool.
-  // segKind = 9 (Curve CryptoSwap, callback-free); a CryptoSwap segment is a flat post-fee slice ⇒
+  // PRODUCTION-sampled segments as the solver's 7-col segs rows (mirrors index.ts buildSegs + the mock
+  // test's cryptoSegRows). refIdx tags the on-chain per-venue accumulator (cryinp[refIdx]); venue is the
+  // pool. segKind = 9 (Curve CryptoSwap, callback-free); a CryptoSwap segment is a flat post-fee slice ⇒
   // sqrtAdjNear == sqrtAdjFar == marginalOI.
-  function cryptoSegRows(segs: RealSeg[], refIdx: number, pool: Hex): bigint[][] {
+  function cryptoSegRows(segs: CryptoSwapSegment[], refIdx: number, pool: Hex): bigint[][] {
     return segs.map((s) => [
       BigInt(refIdx),
       s.capacity,
@@ -314,8 +254,9 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     assert.equal(b1, etched.balances[1], "balances(1) == captured");
     assert.equal(feeR.toLowerCase(), etched.feeReceiver.toLowerCase(), "fee_receiver() == the captured resolved receiver (via the shim)");
 
-    // The REAL get_dy view — self-contained in {pool, MATH}, no factory — reproduces the captured mainnet
-    // probe dy to the WEI (newton_D / get_y + the A-gamma dynamic fee, ALL through the real MATH library).
+    // The REAL get_dy view — self-contained in {pool, VIEW, MATH}, no factory — reproduces the captured
+    // mainnet probe dy to the WEI (the fx/boom stableswap get_y + the v2.1.0d dynamic fee, ALL through
+    // the real periphery runtimes).
     const dyF = (await c.publicClient.readContract({
       address: etched.pool, abi: curveCryptoPoolReadAbi, functionName: "get_dy", args: [0n, 1n, BigInt(snaps.state.probe.sellCoin0.dx)],
     })) as bigint;
@@ -376,9 +317,8 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     const poolConfig = cryptoPoolConfig(tokenIn, tokenOut);
 
     // Exercise the PRODUCTION CryptoSwap discovery path to RESOLVE + orient the pool (find_pool_for_coins →
-    // get_coin_indices [UINT256] → the live A-gamma reads). This is the same discoverCryptoSwapPoolsTyped
-    // the production prepare() calls; only the off-chain SEGMENT SAMPLER is swapped for the real-curve one
-    // (see the fidelity note — the tricrypto-NG replay does not model this twocrypto-NG pool).
+    // get_coin_indices [UINT256] → the live pool reads). This is the same discoverCryptoSwapPoolsTyped the
+    // production prepare() calls, and the SAME typed descriptor the production sampler consumes below.
     const discovered = await discoverCryptoSwapPoolsTyped(tokenIn, tokenOut, c.publicClient, poolConfig.factories);
     assert.equal(discovered.length, 1, "production discovery surfaced exactly the 1 reproduced CryptoSwap venue");
     assert.equal(discovered[0].address.toLowerCase(), etched.pool.toLowerCase(), "the discovered venue is the REAL etched pool");
@@ -387,27 +327,47 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     assert.equal(discovered[0].A, etched.A, "discovery read the live A off the real pool");
     assert.equal(discovered[0].D, etched.D, "discovery read the live D off the real pool");
 
-    // Sample the REAL pool's own get_dy into the solver's static segments (the genuine twocrypto-NG curve).
-    const realSegs = await sampleRealSegments(c, etched.pool, iBig, jBig, amountIn);
-    assert.ok(realSegs.length > 0, "real-curve segment ladder is non-empty");
+    // PRODUCTION SAMPLER, unmasked: buildCryptoSwapSegments replays the discovered descriptor off-chain
+    // (no RPC) — exactly what prepare() ships the solver.
+    const realSegs = buildCryptoSwapSegments(discovered[0], amountIn);
+    assert.ok(realSegs.length > 0, "production segment ladder is non-empty");
     const segSum = realSegs.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(segSum, amountIn, "production ladder covers the full amountIn");
 
-    // NEUTRAL ORACLE over the SAME real-curve samples: the awarded input Σ each venue receives. With ONE
+    // LADDER PARITY — the core gate this test exists for: at EVERY cumulative ladder point the off-chain
+    // replay (getDyCrypto on the discovered state) == the REAL etched pool's OWN get_dy view, to the WEI.
+    // This pins the whole production quote path (raw-product xp scaling, the fx/boom stableswap get_y,
+    // the v2.1.0d dynamic fee on the post-swap xp) against the genuine deployed bytecode.
+    let cum = 0n;
+    let cumOut = 0n;
+    for (const s of realSegs) {
+      cum += s.capacity;
+      cumOut += s.effOut;
+      const offChain = getDyCrypto(discovered[0], cum);
+      const onChain = (await c.publicClient.readContract({
+        address: etched.pool, abi: curveCryptoPoolReadAbi, functionName: "get_dy", args: [iBig, jBig, cum],
+      })) as bigint;
+      assert.equal(offChain, onChain, `ladder parity at cum=${cum}: getDyCrypto == REAL get_dy (wei-exact)`);
+      assert.equal(cumOut, offChain, `ladder partition at cum=${cum}: Σ effOut == getDyCrypto(cum)`);
+    }
+
+    // NEUTRAL ORACLE over the SAME production segments: the awarded input Σ each venue receives. With ONE
     // venue whose segment ladder covers [0, amountIn], the merge awards the whole covered Σ to it — the
-    // awarded == segSum by construction (no split). (Curve is a SAMPLED-SEGMENT venue; on this deep pool +
-    // small trade the real curve is monotone-descending so segSum == amountIn — see sampleRealSegments.)
+    // awarded == segSum == amountIn by construction (no split).
     const awarded = segSum;
     assert.ok(awarded > 0n, "oracle awards to the reproduced CryptoSwap venue");
 
     // The REAL pool's OWN pre-swap get_dy view for the KNOWN awarded Σ — the engine-independent ground
-    // truth for the executed dy (the ACTUAL swap math the recipe reads for min_dy). This is the real
-    // twocrypto-NG curve, NOT the off-chain replay.
+    // truth for the executed dy (the ACTUAL swap math the recipe reads for min_dy). Already proven ==
+    // the off-chain replay at every ladder point above.
     const onViewPre = (await c.publicClient.readContract({
       address: etched.pool, abi: curveCryptoPoolReadAbi, functionName: "get_dy", args: [iBig, jBig, awarded],
     })) as bigint;
+    assert.equal(onViewPre, getDyCrypto(discovered[0], awarded), "REAL get_dy(awarded) == production replay (wei-exact)");
 
     // Compile the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts compiles) with the
-    // real-curve crypto segs, and cook it — the recipe reads real get_dy for min_dy + runs real exchange.
+    // production-sampled crypto segs, and cook it — the recipe reads real get_dy for min_dy + runs real
+    // exchange.
     const segRows = cryptoSegRows(realSegs, 0, etched.pool);
     const { bytecodes } = compileSauce(solverSrc, cryptoArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine);
 
@@ -437,9 +397,7 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     assert.equal(spent, awarded, "on-chain spent == awarded input (wei-exact-on-grid)");
     // Single-venue full-fill: the ~1%-of-reserve sizing keeps the ladder within [0, amountIn], so the whole
     // trade allocates to the one pool. Assert it EXPLICITLY (a regression that under-fills or splits fails
-    // here, not silently). (For this deep pool + small trade the real-curve ladder is monotone-descending,
-    // so every sampled slice is APPENDED and segSum == amountIn — this test builds its own ladder; see
-    // sampleRealSegments.)
+    // here, not silently). segSum == amountIn was asserted on the production ladder above.
     assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (no unspent wei, no split)");
 
     // The caller-received tokenOut == the REAL pool's OWN pre-swap get_dy view for the awarded Σ, to the

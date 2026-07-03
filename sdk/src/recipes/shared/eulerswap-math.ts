@@ -54,10 +54,12 @@
  * the curve: `EulerSwapPeriphery.getLimits(pool, tokenIn, tokenOut)` returns (inLimit, outLimit). prepare
  * BOUNDS each pool's sampled amountIn by `min(amountIn, inLimit)` so no segment promises depth the vault
  * cannot service. Between prepare and cook the cap can shrink (another swap drew the vault down); the
- * on-chain `computeQuote` view re-reads the LIVE limits and reverts `SwapLimitExceeded` if the awarded
- * share now exceeds them — so the recipe reads `computeQuote` at execution (the exec lever), and the
- * solver's existing GUARDED TERMINAL REFUND (the global leftover sweep) returns any input whose pool
- * declined to fill, leaving the swap atomic and safe. This is the vault-cap guard.
+ * on-chain `computeQuote` view re-reads the LIVE limits and REVERTS (`SwapLimitExceeded`; `Expired` on
+ * a de-activated pool) if the awarded share now exceeds them — and a revert inside the cook aborts the
+ * WHOLE cook (atomic all-or-nothing), NOT a graceful per-pool skip. The ONLY graceful path is a literal
+ * quote of 0 (computeQuote returns 0 ⇒ the solver leaves that share un-spent for the terminal refund).
+ * So the prepare-time `min(amountIn, inLimit)` bound is the real protection; a cap that shrinks below
+ * the award between prepare and cook costs the transaction (a revert), never the funds.
  *
  * WEI-EXACT BOUND. The SPLIT (per-pool awarded input) is EXACT-ON-GRID vs the oracle (both replay the
  * SAME buildEulerSwapSegments grid — one source — so the awarded share matches the oracle bit-for-bit).
@@ -74,7 +76,7 @@
  *   https://github.com/euler-xyz/euler-swap/blob/master/src/EulerSwapPeriphery.sol  (quoteExactInput / getLimits)
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -296,7 +298,7 @@ export function computeQuote(pool: EulerSwapPool, dx: bigint): bigint {
  * ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly (no
  * extra sqrtOneMinusFee multiply), exactly like Curve / LB / DODO / Solidly / Wombat segments.
  */
-export interface EulerSwapSegment {
+export interface EulerSwapSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

@@ -1,8 +1,10 @@
 /**
  * EcoSwap off-chain preparation.
  *
- * Builds the per-pool NET CACHE (the drift-invariant tick depth the on-chain unified
- * walk reuses) for BOTH direct pools and multi-hop route-leg pools. Every pool — direct
+ * Builds the per-pool NET CACHE (the SWAP-drift-invariant tick depth the on-chain unified
+ * walk reuses — liquidityNet survives any price move, but an LP mint/burn inside the scanned
+ * window between prepare and cook goes stale: see EcoPool.windowTopShifted) for BOTH direct
+ * pools and multi-hop route-leg pools. Every pool — direct
  * or leg — ships NO prepare-time sqrt edges: the on-chain solver walks each pool's single
  * frontier from its LIVE spot and computes all sqrt/price on the live grid, consulting the
  * cache only for the net at each scanned boundary (a staticcall avoided). The cache is a
@@ -139,7 +141,7 @@ const DEFAULT_MIN_REL_BPS = Number(process.env.ECO_MIN_REL_BPS ?? 100);
  * not a fixed COUNT — so a tight ts=1 (0.01% stable tier) pool scans MANY boundaries to
  * cover the same % band a wide-ts pool covers in a few, while a wide-ts pool floors at 96
  * (byte-identical to the prior fixed window). Scanned in one eth_call; the on-chain solver
- * walks each pool's frontier from the LIVE spot and reuses the drift-invariant net for
+ * walks each pool's frontier from the LIVE spot and reuses the swap-drift-invariant net for
  * boundaries inside this window, staticcalling any boundary past it — so this only bounds
  * how much net the cache ships, not how far the walk reaches. Mirrors lens.ts LENS_MAX_TICKS.
  */
@@ -314,11 +316,8 @@ function lensToV3Read(p: LensPool): V3Read {
   };
 }
 
-/** Standard Uniswap-V3 fee → tickSpacing mapping (covers the discovered V3 forks). */
-const TICK_SPACING_BY_FEE: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
-function feeToTickSpacing(fee: number): number {
-  return TICK_SPACING_BY_FEE[fee] ?? 60;
-}
+// (fee → tickSpacing lives in shared/constants.ts TICK_SPACING_BY_FEE — the single source;
+// prepare consumes tickSpacing from the lens rows and keeps no local copy.)
 
 // ── Unified-walk per-pool net cache (the only per-pool prepare-time output) ──
 
@@ -326,8 +325,9 @@ const MOD128 = 1n << 128n;
 
 /**
  * Stamp a V3/V4 EcoPool with the unified-walk per-pool cache from its lens read. The on-chain
- * solver walks each pool's live frontier from the LIVE spot and reuses the drift-invariant NET
- * for the scanned window (an in-window staticcall avoided); it computes ALL sqrt/price on the
+ * solver walks each pool's live frontier from the LIVE spot and reuses the SWAP-drift-invariant NET
+ * for the scanned window (an in-window staticcall avoided — so an LP mint/burn in the window after
+ * prepare is NOT re-read; see EcoPool.windowTopShifted); it computes ALL sqrt/price on the
  * live grid. So prepare ships only the NET — never a prepare-time sqrt edge:
  *   - stepRatio        = getSqrtRatioAtTick(ts) (the multiplicative one-ts step).
  *   - windowTopShifted = the shallowest scanned boundary (shifted): the swap-direction first
@@ -501,6 +501,7 @@ function buildCurveBrackets(pool: CurvePool, refIdx: number, amountIn: bigint): 
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Curve fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -529,6 +530,7 @@ function buildCryptoSwapBrackets(pool: CryptoSwapPool, refIdx: number, amountIn:
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the CryptoSwap dynamic fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -560,6 +562,7 @@ function buildLbBrackets(pool: LbPool, refIdx: number, amountIn: bigint): EcoBra
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the LB base fee (post-fee out/in)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -586,6 +589,7 @@ function buildDodoBrackets(pool: DodoPool, refIdx: number, amountIn: bigint): Ec
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the DODO LP+MT fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -613,6 +617,7 @@ function buildSolidlyStableBrackets(pool: SolidlyStablePool, refIdx: number, amo
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the stable fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -640,6 +645,7 @@ function buildWombatBrackets(pool: WombatPool, refIdx: number, amountIn: bigint)
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Wombat haircut (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -668,6 +674,7 @@ function buildWooFiBrackets(pool: WooFiPool, refIdx: number, amountIn: bigint): 
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the WOOFi swap fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -696,6 +703,7 @@ function buildFermiBrackets(pool: FermiPool, refIdx: number, amountIn: bigint): 
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Fermi swap fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -725,6 +733,7 @@ function buildFluidBrackets(pool: FluidPool, refIdx: number, amountIn: bigint): 
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Fluid fee + cap (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -754,6 +763,7 @@ function buildMentoBrackets(pool: MentoPool, refIdx: number, amountIn: bigint): 
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Mento spread (post-spread dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -785,6 +795,7 @@ function buildBalancerV3Brackets(pool: BalancerV3Pool, refIdx: number, amountIn:
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the fee + rate scaling (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -812,6 +823,7 @@ function buildEulerSwapBrackets(pool: EulerSwapPool, refIdx: number, amountIn: b
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the EulerSwap fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -841,6 +853,7 @@ function buildMaverickBrackets(pool: MaverickPool, refIdx: number, amountIn: big
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Maverick directional fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -868,6 +881,7 @@ function buildBalancerStableBrackets(pool: BalancerStablePool, refIdx: number, a
       capacity: sm.capacity,
       sqrtAdjNear: sm.marginalOI, // marginalOI already nets the Balancer swap fee (post-fee dy)
       sqrtAdjFar: sm.marginalOI,
+      worstMarginalOI: sm.worstMarginalOI,
     });
   }
   return brackets;
@@ -1015,7 +1029,7 @@ export async function prepareEcoSwap(
   const v2Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV2);
 
   // ── Build DIRECT pool descriptors + per-pool net caches ──
-  // Every direct pool ships only its drift-invariant NET cache (no prepared sqrt edges): the
+  // Every direct pool ships only its swap-drift-invariant NET cache (no prepared sqrt edges): the
   // on-chain solver walks each pool's LIVE frontier and reuses the net. V2 streams constant-L
   // from live reserves (no tick cache). The single lensToEcoPool builder is reused for routes.
   const pools: EcoPool[] = [];

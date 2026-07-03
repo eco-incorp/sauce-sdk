@@ -54,7 +54,7 @@
  *   https://github.com/balancer/balancer-v2-monorepo/blob/master/pkg/pool-stable/contracts/ComposableStablePool.sol
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
@@ -294,7 +294,7 @@ export function getDy(pool: BalancerStablePool, dx: bigint): bigint {
  * ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly (no
  * extra sqrtOneMinusFee multiply, the fee is baked into dy), exactly like Curve / Solidly / DODO.
  */
-export interface BalancerStableSegment {
+export interface BalancerStableSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

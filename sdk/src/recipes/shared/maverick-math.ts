@@ -54,7 +54,7 @@
  *   https://github.com/yldfi/maverick-v2-math  (bigint reference port: swapMath.ts / tickMath.ts / pool.ts)
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / dodo-math / curve-math Q192). */
 export const Q192 = 1n << 192n;
@@ -528,7 +528,7 @@ export function maxInput(pool: MaverickPool, probe: bigint): bigint {
  * the POST-FEE dy (getDy nets the directional fee), so it is ALREADY the fee-adjusted execution price
  * — it enters the merge's descending sort directly, exactly like Curve / DODO segments.
  */
-export interface MaverickSegment {
+export interface MaverickSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

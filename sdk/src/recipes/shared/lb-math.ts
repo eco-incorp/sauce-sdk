@@ -28,28 +28,34 @@
  * direction bookkeeping collapses to: out-per-in price of the bin = (out reserve drained) per
  * (in consumed). marginalOI = isqrt(price_out_per_in_postfee * 2^192) — the descending-price key.
  *
- * FEE: LB charges a per-bin fee = totalFee · amountIn, where on a STATIC snapshot the base fee
- * is `baseFactor · binStep` scaled by 1e10 over a 1e18 denom (the variable/volatility fee is a
- * transient-state surcharge that resets between blocks — modeled as 0 here, the same fixed-fee
- * snapshot assumption the recipe makes for V3 tiers). The out per unit in is netted by (1−fee),
- * so marginalOI already carries the fee (no extra fee-adjust multiply in the merge).
+ * FEE: LB charges a per-bin fee = totalFee · amountIn. Only the BASE fee (`baseFactor · binStep`
+ * scaled by 1e10 over a 1e18 denom) is modeled — the VARIABLE volatility fee is NOT, and it does
+ * NOT reset per block: the volatility accumulator DECAYS over the pair's filterPeriod/decayPeriod
+ * SECONDS and GROWS with every bin crossed during a swap (including the bins our own fill crosses),
+ * so after recent activity the real total fee can far exceed the base fee and the realized out
+ * undershoots this snapshot. The out per unit in is netted by (1−baseFee), so marginalOI carries
+ * the base fee (no extra fee-adjust multiply in the merge).
  *
  * EXECUTION (engine `_swapTraderJoeLB`): callback-free — the engine transfers `amountIn` to the
  * pair and calls `pool.swap(swapForY, recipient)`; the pair walks its OWN bins internally and
  * sends the out token to the recipient. The engine resolves `swapForY` on-chain from
  * `getTokenX()`, so the recipe passes NO bin/price data to the engine — bins are off-chain
- * ONLY (the segment data), exactly like Curve's off-chain `get_dy`.
+ * ONLY (the segment data), exactly like Curve's off-chain `get_dy`. Because the exec is
+ * transfer-first with NO on-chain re-quote and the awarded share equals the EXACT snapshot bin
+ * capacity, any live bin shrink below the award between prepare and cook makes the pair revert
+ * `LBPair__OutOfLiquidity` — aborting the WHOLE cook (no graceful per-venue skip or partial fill).
  *
  * SOURCE MIRRORED — Trader Joe LB v2.1/v2.2 (`LBPair`): the 128.128 fixed-point bin price from
  * `PriceHelper.getPriceFromId` (`getBase(binStep)^getExponent(id)` via `Uint128x128Math.pow`),
  * the constant-sum bin (`getAmountOutOfBin`), and the fee = `getFeeAmount(amountIn, totalFee)`
- * with `totalFee = baseFee = baseFactor·binStep·1e10`. CryptoSwap-style variable fee is omitted
- * (transient). This is a faithful integer port; the realized swap output is the pair's own
- * computation (engine `pool.swap`), so the snapshot fee only affects the price-ordering
- * coordinate both sides share.
+ * with `totalFee = baseFee = baseFactor·binStep·1e10`. The variable volatility fee is omitted
+ * (see FEE above — a live time-decaying, per-bin-crossed surcharge the snapshot cannot see).
+ * This is a faithful integer port of the BASE-fee curve; the realized swap output is the pair's
+ * own computation (engine `pool.swap`), which charges base + variable — so a live variable fee
+ * shrinks the realized out below the snapshot-priced segments.
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math / curve-math Q192). */
 export const Q192 = 1n << 192n;
@@ -207,7 +213,7 @@ export interface LbPool {
  * a bin is FLAT). Segments are emitted in DESCENDING `marginalOI` order (active bin first — the
  * best-priced bin in the swap direction).
  */
-export interface LbSegment {
+export interface LbSegment extends MergeSegment {
   /** Δinput (tokenIn) to fully drain this bin's out reserve at the bin price. */
   capacity: bigint;
   /** Δoutput (tokenOut) from draining this bin — the bin's out reserve, net of fee. */

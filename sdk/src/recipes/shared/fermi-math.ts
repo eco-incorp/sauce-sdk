@@ -41,7 +41,7 @@
  *   FermiSwapper 0xb1076fe3ab5e28005c7c323bac5ac06a680d452e (Etherscan verified)
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -157,7 +157,7 @@ export function getAmountOut(pool: FermiPool, dx: bigint): bigint {
  * folded into `quoteAmounts`), so it is ALREADY the fee-adjusted execution price — it enters the merge's
  * descending-price sort directly, exactly like Curve / DODO / WOOFi / Wombat / Solidly segments.
  */
-export interface FermiSegment {
+export interface FermiSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

@@ -74,7 +74,7 @@
  *   https://github.com/woonetwork/WooPoolV2/blob/main/contracts/interfaces/IWooracleV2_2.sol  (State{price,spread,coeff,woFeasible})
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -230,7 +230,7 @@ export function query(pool: WooFiPool, dx: bigint): bigint {
  * ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly (no
  * extra sqrtOneMinusFee multiply), exactly like Curve / DODO / Wombat / Solidly segments.
  */
-export interface WooFiSegment {
+export interface WooFiSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

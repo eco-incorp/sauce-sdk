@@ -1,9 +1,10 @@
 /**
- * EcoSwap Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) local-EVM integration — the
- * callback-free exact-in-dy gate.
+ * EcoSwap Curve Twocrypto (fxswap/boom v2.1.0d) local-EVM integration — the callback-free
+ * exact-in-dy gate.
  *
- * Stands up a local Curve CryptoSwap 2-coin pool (the CryptoSwapPool.sol fixture, whose tricrypto-ng
- * newton_D/newton_y A-gamma invariant + twocrypto-ng get_dy/_fee mirror the off-chain
+ * Stands up a local Curve Twocrypto 2-coin pool (the CryptoSwapPool.sol fixture, whose fx/boom
+ * STABLESWAP get_y/newton_D invariant (Ann = A·N, gamma ignored) + raw-product xp scaling +
+ * v2.1.0d post-swap-xp dynamic fee mirror the off-chain
  * `cryptoswap-math.ts` replay bit-for-bit), deploys the Sauce engine, and cooks an EcoSwap whose
  * static-segment cursor consumes CryptoSwap segments (segKind 9) and executes them CALLBACK-FREE: an
  * on-chain `pool.get_dy(i, j, awarded)` staticcall (for min_dy) + approve + `pool.exchange(i, j,
@@ -24,7 +25,7 @@
  *       that bit Balancer). Mirrors ecoswap.maverick.evm.test.ts.
  *
  * The CryptoSwap math is OFF-CHAIN only for the SPLIT: the on-chain solver supplies the curve as
- * STATIC (capacity, marginalOI) segments and never recomputes the A-gamma invariant. We build the
+ * STATIC (capacity, marginalOI) segments and never recomputes the invariant. We build the
  * prepared args DIRECTLY (CryptoSwap discovery uses a registry whose address is a placeholder here),
  * then compile the production solver template exactly as index.ts does and cook it.
  *
@@ -78,10 +79,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 
 const E18 = 10n ** 18n;
-// Canonical volatile-asset A-gamma params. A = ANN (A_MULTIPLIER·N^N·A_raw, A_raw=400000 → 1.6e13);
-// gamma 1.45e14; fee mid 0.05% / out 0.4% / fee_gamma 0.23 (1e10 fee units). price_scale 1:1 (the two
-// local tokens trade near par so the fill engages both venues on the flat part of the crypto curve).
-const ANN = 10000n * 4n * 400000n;
+// fx/boom Twocrypto params. A = the pool A() (the math _amp; Ann = A·N inside — deployed bounds
+// MIN_A = 2e4, MAX_A = 1e8) — 25000 mirrors the captured mainnet crvUSD/WETH pool (amp_true 2.5).
+// gamma 1.45e14 (stored for ABI parity, IGNORED by the fx math); fee mid 0.05% / out 0.4% /
+// fee_gamma 0.23 (1e10 fee units). price_scale 1:1 (the two local tokens trade near par so the
+// fill engages both venues on the flat part of the curve).
+const ANN = 25_000n;
 const GAMMA = 145_000_000_000_000n;
 const MID = 5_000_000n;
 const OUT = 40_000_000n;
@@ -144,7 +147,7 @@ function sortSegs(rows: bigint[][]): bigint[][] {
   });
 }
 
-describe("EcoSwap Curve CryptoSwap (volatile-asset A-gamma, local fixture) — callback-free exact-in-dy", () => {
+describe("EcoSwap Curve Twocrypto (fxswap/boom, local fixture) — callback-free exact-in-dy", () => {
   let anvil: AnvilHandle;
   let c: HarnessClients;
   let stack: DeployedStack;

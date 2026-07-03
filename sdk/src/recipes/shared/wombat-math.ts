@@ -16,7 +16,10 @@
  * potentialOutcome (the pool view == the pool swap math), the pool is approved for the awarded
  * input (Wombat PULLS via transferFrom), and `pool.swap(fromToken, toToken, awarded, minToAmount,
  * to, deadline)` lands the swap. No engine SwapPoolType is needed (Wombat is single-sided
- * stableswap, NOT xy=k, so the V2/UniV2 _swapV2 path mis-prices it).
+ * stableswap, NOT xy=k, so the V2/UniV2 _swapV2 path mis-prices it). NOTE: quotePotentialSwap
+ * itself REVERTS when the pool or either asset is PAUSED (Wombat pauses per-asset) — a pause
+ * landing between prepare and cook therefore aborts the WHOLE cook; there is NO graceful
+ * per-venue skip.
  *
  * SOURCE MIRRORED — the canonical wombat-exchange/v1-core `CoreV2.sol` + `Pool.sol`. Reproduced
  * bit-for-bit (all internal math is WAD = 1e18 signed fixed point; cash/liability are stored in WAD
@@ -52,7 +55,7 @@
  *   https://github.com/wombat-exchange/v1-core/blob/master/contracts/wombat-core/pool/Pool.sol      (quotePotentialSwap / _quoteFrom / swap / haircutRate / ampFactor)
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches the other *-math modules' Q192). */
 export const Q192 = 1n << 192n;
@@ -202,7 +205,7 @@ export function quotePotentialSwap(pool: WombatPool, dx: bigint): bigint {
  * haircut), so it is ALREADY the fee-adjusted execution price — it enters the merge's descending-price
  * sort directly (no extra sqrtOneMinusFee multiply), exactly like Curve / LB / DODO / Solidly segments.
  */
-export interface WombatSegment {
+export interface WombatSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */

@@ -20,7 +20,10 @@
  *   - Sampled-segment venues (Curve/LB/DODO/Solidly/Wombat/Balancer/Euler/Maverick/Crypto/
  *     WOOFi/Fermi/Fluid/Mento/Balancer-V3): each prepared bracket is a FLAT post-fee slice
  *     ({capacity, marginalOI}); its output is capacity*marginalOI^2/2^192 (exact for a flat
- *     slice), prorated on a partial fill.
+ *     slice). A PARTIAL fill of the crossing bracket is valued at the bracket's WORST folded
+ *     sub-slice marginal (worstMarginalOI) when present — an isotonic-MERGED bracket's early
+ *     sub-region is its worse-priced one, so the blended-rate linear prorate would over-credit
+ *     — falling back to the linear prorate for never-merged (truly flat) slices.
  *   - Multi-hop routes: NOT counted (a route only ADDS output; omitting it lowers the floor
  *     → still a lower bound, still safe). Routes are rare and their live composition is best
  *     valued on-chain, not re-derived here.
@@ -100,6 +103,14 @@ interface Slice {
   gross: bigint;
   /** tokenOut produced by fully traversing this slice. */
   effOut: bigint;
+  /**
+   * Sampled-source brackets only: the WORST folded sub-slice marginal of an isotonic-MERGED
+   * segment (EcoBracket.worstMarginalOI). A merged bracket's blended rate averages a worse-priced
+   * EARLY sub-region with a better-priced deep one, so a PARTIAL take must be valued at this rate
+   * to stay a lower bound. Absent ⇒ linear proration (exact for a never-merged flat slice; already
+   * a lower bound for V3/V2 curve slices).
+   */
+  worst?: bigint;
 }
 
 /**
@@ -210,13 +221,14 @@ export function estimateExpectedOutput(prepared: EcoSwapPrepared, amountIn: bigi
   // Sampled-segment venues — each prepared bracket is a FLAT post-fee slice: sqrtAdjNear ==
   // sqrtAdjFar == marginalOI, capacity = gross tokenIn. Exact over-slice output = capacity *
   // marginalOI^2 / 2^192 (out = in * price^2 in unified out/in space). Routes never appear in
-  // `brackets` (always []); every bracket here is a sampled-source segment.
+  // `brackets` (always []); every bracket here is a sampled-source segment. `worst` carries the
+  // merged bracket's worst folded sub-slice marginal for the partial-fill proration below.
   for (const b of prepared.brackets) {
     const m = b.sqrtAdjNear;
     if (b.capacity > 0n && m > 0n) {
       const effOut = mulDiv(b.capacity, m * m, Q192);
       if (effOut > 0n) {
-        slices.push({ adjNear: m, adjFar: b.sqrtAdjFar, gross: b.capacity, effOut });
+        slices.push({ adjNear: m, adjFar: b.sqrtAdjFar, gross: b.capacity, effOut, worst: b.worstMarginalOI });
       }
     }
   }
@@ -241,11 +253,19 @@ export function estimateExpectedOutput(prepared: EcoSwapPrepared, amountIn: bigi
       cum += s.gross;
       out += s.effOut;
     } else {
-      // Partial fill of the crossing slice — prorate the output linearly by input fraction
-      // (a flat slice is exact; a V3 slice's true partial output is slightly higher near the
-      // entry, so the linear prorate is a lower bound → still safe).
+      // Partial fill of the crossing slice. An isotonic-MERGED sampled bracket (worst set,
+      // strictly below the blended rate) is NOT flat inside: its EARLY sub-region is the
+      // worse-priced one, so a linear (blended-rate) prorate would OVER-credit the take — value
+      // it at the segment's worst folded sub-slice marginal instead (out = take · worst² / 2^192,
+      // <= the true curve output over the take → lower bound preserved). Otherwise prorate
+      // linearly by input fraction (a never-merged flat slice is exact; a V3 slice's true partial
+      // output is slightly higher near the entry, so the linear prorate is a lower bound → safe).
       const take = amountIn - cum;
-      out += mulDiv(s.effOut, take, s.gross);
+      if (s.worst !== undefined && s.worst > 0n) {
+        out += mulDiv(take, s.worst * s.worst, Q192);
+      } else {
+        out += mulDiv(s.effOut, take, s.gross);
+      }
       cum = amountIn;
       break;
     }

@@ -11,6 +11,9 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   Q96,
@@ -125,7 +128,10 @@ import {
   getDy as dodoGetDy,
   type DodoPool,
 } from "../shared/dodo-math";
-import { pushMonotoneSegment, isqrt as mergeIsqrt, Q192 as MERGE_Q192 } from "../shared/segment-merge";
+import { pushMonotoneSegment, isqrt as mergeIsqrt, Q192 as MERGE_Q192, type MergeSegment } from "../shared/segment-merge";
+import { estimateExpectedOutput } from "../ecoswap/expected-output";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── tolerance helper ─────────────────────────────────────────
 /**
@@ -2224,22 +2230,24 @@ describe("Balancer V3 (Vault + per-chain Router) — query-ladder interpolation 
   });
 });
 
-// ── Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) known-answer + segment sampler ──────
+// ── Curve Twocrypto (fxswap/boom v2.1.0d) known-answer + segment sampler ─────────────────────────
 //
-// Pins the off-chain A-gamma invariant replay (getDyCrypto + newtonD + buildCryptoSwapSegments) BEFORE
-// the local-EVM test, so a regression in the bounded-Newton bigint math (newton_D / newton_y) or the
-// price_scale/precisions scaling / dynamic fee is caught without anvil. The wei-exact bound is documented
-// in cryptoswap-math.ts: the SPLIT is exact-on-grid vs the oracle (one shared sampler) and the realized dy
-// is exact-in-dy (the pool get_dy view == the pool exchange math). These vectors are the deterministic
-// getDyCrypto outputs for fixed states (regenerate only on an intentional math change). A = ANN
-// (A_MULTIPLIER·N^N·A_raw, A_raw=400000 → 1.6e13); gamma 1.45e14; fee mid 0.05%/out 0.4%/fee_gamma 0.23
-// (1e10 fee units). CryptoSwap coin indices are UINT256 (the callback-free exchange(uint256,...) ABI, NOT
-// the engine's int128 _swapCurve).
-describe("Curve CryptoSwap (volatile-asset A-gamma) — get_dy known-answer + sampler", () => {
+// Pins the off-chain replay (getDyCrypto + newtonD + buildCryptoSwapSegments) BEFORE the local-EVM
+// test, so a regression in the bounded-Newton bigint math (the fx/boom STABLESWAP get_y/newton_D with
+// Ann = A·N, gamma ignored), the RAW-product xp scaling, or the v2.1.0d dynamic fee (post-swap xp) is
+// caught without anvil. The wei-exact bound is documented in cryptoswap-math.ts: the SPLIT is
+// exact-on-grid vs the oracle (one shared sampler) and the realized dy is exact-in-dy (the pool get_dy
+// view == the pool exchange math). These vectors are the deterministic getDyCrypto outputs for fixed
+// states (regenerate only on an intentional math change); the LAST cell replays the CAPTURED MAINNET
+// probes off the prod-mirror snapshot — engine-independent chain truth, no RPC. A = the pool A()
+// (the math _amp; MIN_A = 2e4); gamma 1.45e14 (carried, IGNORED by the fx math); fee mid 0.05%/out
+// 0.4%/fee_gamma 0.23 (1e10 fee units). CryptoSwap coin indices are UINT256 (the callback-free
+// exchange(uint256,...) ABI, NOT the engine's int128 _swapCurve).
+describe("Curve Twocrypto (fxswap/boom) — get_dy known-answer + sampler", () => {
   const E18 = 10n ** 18n;
   const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
-  const ANN = 10000n * 4n * 400000n; // A_MULTIPLIER·N^N·A_raw
-  const GAMMA = 145_000_000_000_000n; // 1.45e14
+  const A = 25_000n; // the pool A() (== the captured crvUSD/WETH pool's; amp_true = A/A_MULTIPLIER = 2.5)
+  const GAMMA = 145_000_000_000_000n; // 1.45e14 — carried for parity, UNUSED by the fx math
   const MID = 5_000_000n; // 0.05% (1e10 units)
   const OUT = 40_000_000n; // 0.4%
   const FEE_GAMMA = 230_000_000_000_000_000n; // 0.23e18
@@ -2247,36 +2255,36 @@ describe("Curve CryptoSwap (volatile-asset A-gamma) — get_dy known-answer + sa
     bal: [bigint, bigint], prec: [bigint, bigint], priceScale: bigint, i = 0, j = 1,
   ): CryptoSwapPool {
     const xp = [bal[0] * prec[0], (bal[1] * prec[1] * priceScale) / E18];
-    const D = cryptoNewtonD(ANN, GAMMA, xp);
+    const D = cryptoNewtonD(A, GAMMA, xp);
     return {
-      address: Z, i, j, A: ANN, gamma: GAMMA, priceScale, D, balances: bal, precisions: prec,
+      address: Z, i, j, A, gamma: GAMMA, priceScale, D, balances: bal, precisions: prec,
       midFee: MID, outFee: OUT, feeGamma: FEE_GAMMA, feePpm: 5, source: "kat",
     };
   }
 
-  it("balanced 1:1 18-dec pool — exact A-gamma get_dy vectors + exact D", () => {
+  it("balanced 1:1 18-dec pool — exact get_dy vectors + exact D", () => {
     const p = pool([1_000_000n * E18, 1_000_000n * E18], [1n, 1n], E18);
-    // D of a balanced 1:1 pool with Σ scaled balances 2e6·1e18 is exactly N·isqrt(x0·x1) fixpoint.
+    // D of a balanced 1:1 pool is EXACTLY the scaled-balance sum (S is the stableswap fixed point).
     assert.equal(p.D, 2_000_000n * E18);
     // Hand-pinned from the bounded-Newton replay (mirrors the CryptoSwapPool fixture bit-for-bit).
-    assert.equal(getDyCrypto(p, 1_000n * E18), 999_499_994_933_332_929_937n);
-    assert.equal(getDyCrypto(p, 10_000n * E18), 9_994_995_877_278_405_356_786n);
-    assert.equal(getDyCrypto(p, 100_000n * E18), 99_886_027_679_301_120_182_982n);
-    // Crypto shape: a small trade returns ~the input net of the 0.05% mid_fee (≈ 0.9995·in) with sub-bps
-    // A-gamma slippage on top — near a stable curve when the pool sits at balance (fee → mid_fee).
+    assert.equal(getDyCrypto(p, 1_000n * E18), 999_214_494_798_726_691_492n);
+    assert.equal(getDyCrypto(p, 10_000n * E18), 9_966_507_647_116_844_290_824n);
+    assert.equal(getDyCrypto(p, 100_000n * E18), 97_146_294_129_449_590_996_881n);
+    // Shape: a small trade returns ~the input net of the 0.05% mid_fee with the amp-2.5 stableswap
+    // slippage on top (the fx/boom invariant is far less amplified than a peg-stable pool).
     const out1k = getDyCrypto(p, 1_000n * E18);
-    assert.ok(out1k < 1_000n * E18 && out1k > 999n * E18, "near-1:1 minus mid_fee on the A-gamma curve");
+    assert.ok(out1k < 1_000n * E18 && out1k > 999n * E18, "near-1:1 minus mid_fee on the amp-2.5 curve");
   });
 
   it("imbalanced pool — exact vector", () => {
     const p = pool([1_200_000n * E18, 1_000_000n * E18], [1n, 1n], E18);
-    assert.equal(getDyCrypto(p, 50_000n * E18), 49_597_742_875_297_523_609_779n);
+    assert.equal(getDyCrypto(p, 50_000n * E18), 46_795_878_125_524_381_801_050n);
   });
 
   it("decimals normalisation — 6-dec out coin (precisions[1]=1e12) denormalises exactly", () => {
     const p = pool([1_000_000n * E18, 1_000_000n * 10n ** 6n], [1n, 10n ** 12n], E18);
-    // 1000 (18-dec) in → ~1000 (6-dec) out net of mid_fee: 999.499995 units.
-    assert.equal(getDyCrypto(p, 1_000n * E18), 999_499_995n);
+    // 1000 (18-dec) in → ~1000 (6-dec) out net of mid_fee: 999.214495 units.
+    assert.equal(getDyCrypto(p, 1_000n * E18), 999_214_495n);
   });
 
   it("price_scale != 1 (coin1 @ 2000·coin0) — both directions economically exact", () => {
@@ -2284,10 +2292,51 @@ describe("Curve CryptoSwap (volatile-asset A-gamma) — get_dy known-answer + sa
     const p = pool([2_000_000n * E18, 1_000n * E18], [1n, 1n], 2000n * E18);
     assert.equal(p.D, 4_000_000n * E18);
     // coin0 → coin1 (USD → ETH): 2000 USD ≈ 1 ETH minus fee/slippage.
-    assert.equal(getDyCrypto(p, 2_000n * E18), 999_499_994_933_332_396n);
+    assert.equal(getDyCrypto(p, 2_000n * E18), 999_214_494_798_726_691n);
     // coin1 → coin0 (ETH → USD): 1 ETH ≈ 2000 USD minus fee/slippage.
     const pr = pool([2_000_000n * E18, 1_000n * E18], [1n, 1n], 2000n * E18, 1, 0);
-    assert.equal(getDyCrypto(pr, 1n * E18), 1_998_999_989_866_664_792_184n);
+    assert.equal(getDyCrypto(pr, 1n * E18), 1_998_428_989_597_453_382_984n);
+  });
+
+  it("price_scale < 1e18 (coin1 CHEAP in coin0) — the raw-product xp scaling regression", () => {
+    // price_scale = 4e14 (1 coin1 = 0.0004 coin0), 18-dec coins, value-balanced 1000:2.5M. A
+    // pre-floored per-unit factor (precisions[1]·price_scale/1e18 = 0) would ZERO xp[1] and kill
+    // every quote — the deployed view scales the RAW product balances·precisions·price_scale/1e18
+    // with ONE floor, which this pins (both directions, exact vectors).
+    const ps = 4n * 10n ** 14n;
+    const p = pool([1_000n * E18, 2_500_000n * E18], [1n, 1n], ps);
+    assert.equal(p.D, 2_000n * E18, "D reflects the REAL (non-zeroed) coin1 depth");
+    // coin0 → coin1: 1 coin0 ≈ 2500 coin1 minus fee/slippage.
+    assert.equal(getDyCrypto(p, 1n * E18), 2_498_036_236_996_816_727_164n);
+    // coin1 → coin0: 2500 coin1 ≈ 1 coin0 minus fee/slippage.
+    const pr = pool([1_000n * E18, 2_500_000n * E18], [1n, 1n], ps, 1, 0);
+    assert.equal(getDyCrypto(pr, 2_500n * E18), 999_214_494_798_726_691n);
+  });
+
+  it("REAL mainnet state — replays the captured crvUSD/WETH probes to the WEI (no RPC)", () => {
+    // The prod-mirror snapshot's pool state + the two get_dy probes recorded from the REAL deployed
+    // bytecode at the pinned block (harness/curveCrypto-snapshot.ts). The replay must reproduce both
+    // bit-for-bit — the engine-independent chain-truth gate for the xp scaling (price_scale 2467.6e18),
+    // the stableswap get_y (A = 25000), the post-swap-xp dynamic fee, and the v2.1.0d fee blend.
+    const snap = JSON.parse(readFileSync(
+      join(__dirname, "fixtures", "snapshots", "ethereum-curveCrypto-crvUSDWETH.state.json"), "utf-8",
+    ));
+    const real: CryptoSwapPool = {
+      address: snap.pool, i: Number(snap.i), j: Number(snap.j),
+      A: BigInt(snap.A), gamma: BigInt(snap.gamma), priceScale: BigInt(snap.priceScale), D: BigInt(snap.D),
+      balances: (snap.balances as string[]).map(BigInt), precisions: (snap.precisions as string[]).map(BigInt),
+      midFee: BigInt(snap.midFee), outFee: BigInt(snap.outFee), feeGamma: BigInt(snap.feeGamma),
+      feePpm: 6, source: "prod-mirror-snapshot",
+    };
+    assert.equal(
+      getDyCrypto(real, BigInt(snap.probe.sellCoin0.dx)), BigInt(snap.probe.sellCoin0.dy),
+      "sell coin0 (crvUSD→WETH) probe == captured mainnet get_dy to the wei",
+    );
+    const realRev: CryptoSwapPool = { ...real, i: Number(snap.j), j: Number(snap.i) };
+    assert.equal(
+      getDyCrypto(realRev, BigInt(snap.probe.sellCoin1.dx)), BigInt(snap.probe.sellCoin1.dy),
+      "sell coin1 (WETH→crvUSD) probe == captured mainnet get_dy to the wei",
+    );
   });
 
   it("buildCryptoSwapSegments — covers amountIn, descending marginals, partition of the curve", () => {
@@ -2732,7 +2781,7 @@ describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE 
         return { cap, effOut, marginalOI: mergeIsqrt((effOut * MERGE_Q192) / cap) };
       });
 
-      const segs: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+      const segs: MergeSegment[] = [];
       let totalCap = 0n;
       let totalEff = 0n;
       for (const s of slices) {
@@ -2749,6 +2798,23 @@ describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE 
       for (const s of segs) {
         assert.equal(s.marginalOI, mergeIsqrt((s.effOut * MERGE_Q192) / s.capacity), "blended marginal formula");
       }
+      // worstMarginalOI metadata: every segment tracks the MIN original sub-slice marginal it folded
+      // (off-chain-only — the estimator's lower-bound partial-proration rate). The raw slices are
+      // consumed in order and capacity is conserved, so each segment's worst == the min of the raw
+      // marginals inside its input band.
+      let rawIdx = 0;
+      for (const s of segs) {
+        let band = 0n;
+        let expectWorst = slices[rawIdx].marginalOI;
+        while (band < s.capacity) {
+          const m = slices[rawIdx].marginalOI;
+          if (m < expectWorst) expectWorst = m;
+          band += slices[rawIdx].cap;
+          rawIdx++;
+        }
+        assert.equal(s.worstMarginalOI, expectWorst, "worstMarginalOI == min folded sub-slice marginal");
+        assert.ok(s.worstMarginalOI! <= s.marginalOI, "worst <= blended");
+      }
     });
 
     it("degenerate slice (marginalOI == 0) is a no-op — nothing discarded, nothing folded", () => {
@@ -2761,12 +2827,14 @@ describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE 
 
     it("already-descending slices are APPENDED unchanged (bit-for-bit the old guard's common path)", () => {
       const scale = MERGE_Q192 / 200n;
-      const segs: { capacity: bigint; effOut: bigint; marginalOI: bigint }[] = [];
+      const segs: MergeSegment[] = [];
       for (const m of [90n, 80n, 70n].map((x) => x * scale)) {
         pushMonotoneSegment(segs, 10n * E18, (10n * E18 * m * m) / MERGE_Q192, m);
       }
       assert.equal(segs.length, 3, "no fold on a descending ladder — appended unchanged");
       assertMonotone(segs, "descending");
+      // A never-merged segment's worstMarginalOI == its own marginal (no folded sub-slices).
+      for (const s of segs) assert.equal(s.worstMarginalOI, s.marginalOI, "worst == own marginal on append");
     });
   });
 
@@ -2954,5 +3022,120 @@ describe("isotonic backward-merge (forced-cliff) — liquidity-preserving MERGE 
     assert.ok(sumEff(merged) > sumEff(dropped), "Maverick: merge fills STRICTLY MORE output than the old drop-guard");
     // The old drop kept only the tiny head slice; the deep tick's millions were discarded.
     assert.ok(sumCap(dropped) * 100n < mCap, "Maverick: the old drop discarded the deep-tick liquidity");
+  });
+});
+
+// ── minOut estimator — lower-bound proration of a MERGED (isotonic-folded) bracket ───────────────
+//
+// The internal cfg[9] amountOutMin floor derives from estimateExpectedOutput, whose contract is a
+// STRICT LOWER BOUND on the realized fill (a legitimate wei-exact fill must NEVER false-revert).
+// An isotonic-MERGED sampled bracket is NOT flat inside: its EARLY sub-region (in input order) is
+// the WORSE-priced one (the fold direction — a violating better-priced deeper slice folds BACKWARD
+// into the worse band before it), so prorating a PARTIAL take linearly at the BLENDED rate credits
+// output the early region does not produce — the over-credit the worstMarginalOI proration fixes.
+// These vectors prove, on a synthetic two-region piecewise-flat curve (chords exact, so "true curve
+// output" is computable in closed form): (a) a partial take of the merged bracket is credited <=
+// the true curve output (and strictly BELOW the old blended-rate prorate, which over-credits);
+// (b) FULL-segment consumption is byte-identical (the crossing-slice branch never fires).
+describe("estimateExpectedOutput — merged-bracket partial fill prorates at worstMarginalOI (lower bound)", () => {
+  const E18 = 10n ** 18n;
+
+  // Two flat regions, WORSE first: region 1 prices m1, region 2 (deeper) prices m2 > m1 — the
+  // discrete cliff that forces the isotonic fold. Marginals derived via the builders' own formula.
+  const scale = MERGE_Q192 / 200n;
+  const m1 = 60n * scale;
+  const m2 = 120n * scale;
+  const cap1 = 10n * E18;
+  const cap2 = 10n * E18;
+  const out1 = (cap1 * m1 * m1) / MERGE_Q192; // exact flat-region outputs (the true curve)
+  const out2 = (cap2 * m2 * m2) / MERGE_Q192;
+
+  /** True curve output for a cumulative take T over the two-region curve (region 1 first). */
+  function trueOut(T: bigint): bigint {
+    if (T <= cap1) return (T * m1 * m1) / MERGE_Q192;
+    return out1 + ((T - cap1) * m2 * m2) / MERGE_Q192;
+  }
+
+  /** Build the MERGED ladder through the real pushMonotoneSegment (one folded segment). */
+  function mergedSegs(): MergeSegment[] {
+    const segs: MergeSegment[] = [];
+    pushMonotoneSegment(segs, cap1, out1, mergeIsqrt((out1 * MERGE_Q192) / cap1));
+    pushMonotoneSegment(segs, cap2, out2, mergeIsqrt((out2 * MERGE_Q192) / cap2)); // violates → folds
+    return segs;
+  }
+
+  /** Wrap the merged segments as the sampled-source brackets prepare ships (flat post-fee slices). */
+  function prepared(segs: MergeSegment[]): EcoSwapPrepared {
+    const brackets: EcoBracket[] = segs.map((s) => ({
+      kind: EcoBracketKind.CryptoSwap,
+      refIdx: 0,
+      sqrtNear: s.marginalOI,
+      sqrtFar: s.marginalOI,
+      liquidity: 0n,
+      capacity: s.capacity,
+      sqrtAdjNear: s.marginalOI,
+      sqrtAdjFar: s.marginalOI,
+      worstMarginalOI: s.worstMarginalOI,
+    }));
+    return { pools: [], routes: [], brackets, zeroForOne: true, priceLimit: 0n, expectedInputCovered: 0n };
+  }
+
+  it("folds into ONE segment carrying the worst sub-slice marginal", () => {
+    const segs = mergedSegs();
+    assert.equal(segs.length, 1, "cliff folded into one merged segment");
+    assert.equal(segs[0].capacity, cap1 + cap2, "capacity conserved");
+    assert.equal(segs[0].effOut, out1 + out2, "effOut conserved");
+    assert.equal(segs[0].worstMarginalOI, mergeIsqrt((out1 * MERGE_Q192) / cap1), "worst == region-1 marginal");
+    assert.ok(segs[0].worstMarginalOI! < segs[0].marginalOI, "worst strictly below the blend");
+  });
+
+  it("(a) partial take of the merged bracket is credited <= the true curve output (blended rate over-credits)", () => {
+    const segs = mergedSegs();
+    const prep = prepared(segs);
+    // Takes ending inside region 1 AND inside region 2 (both strictly inside the merged band).
+    for (const take of [cap1 / 2n, cap1, cap1 + cap2 / 4n]) {
+      const est = estimateExpectedOutput(prep, take);
+      const truth = trueOut(take);
+      const blended = (segs[0].effOut * take) / segs[0].capacity; // the old linear prorate
+      assert.ok(est <= truth, `credited ${est} <= true curve output ${truth} (take ${take})`);
+      assert.ok(est > 0n, "non-degenerate credit");
+      // The over-credit this fixes: inside region 1 the blended-rate prorate EXCEEDS the true
+      // output (the floor could false-revert); the worst-rate credit stays below it.
+      if (take <= cap1) {
+        assert.ok(blended > truth, `blended prorate ${blended} over-credits the true ${truth}`);
+        assert.ok(est < blended, "worst-rate credit strictly below the blended prorate");
+      }
+    }
+  });
+
+  it("(b) full-segment consumption is unchanged (no proration branch — metadata inert)", () => {
+    const segs = mergedSegs();
+    const prep = prepared(segs);
+    const s = segs[0];
+    // amountIn == the full merged capacity ⇒ the slice is consumed WHOLE: the estimator credits the
+    // exact flat-slice value it derives from the shipped {capacity, marginalOI} (the blended rate),
+    // bit-identical to the pre-fix behavior and identical with or without the worstMarginalOI
+    // metadata (the crossing-slice branch never fires).
+    const wholeSlice = (s.capacity * s.marginalOI * s.marginalOI) / MERGE_Q192;
+    const full = estimateExpectedOutput(prep, cap1 + cap2);
+    assert.equal(full, wholeSlice, "full take credits the whole flat slice at the blended rate");
+    assert.ok(full <= out1 + out2, "still a lower bound on the true merged output");
+    const noMeta = prepared(segs.map((x) => ({ ...x, worstMarginalOI: undefined })));
+    assert.equal(estimateExpectedOutput(noMeta, cap1 + cap2), full, "metadata-independent on full consumption");
+    // And beyond the ladder: unchanged too (everything consumed whole).
+    assert.equal(estimateExpectedOutput(prep, 2n * (cap1 + cap2)), full, "over-ask consumes the whole ladder");
+  });
+
+  it("never-merged (truly flat) bracket keeps the exact linear prorate semantics", () => {
+    // A single un-folded segment: worst == marginal; the worst-rate credit and the linear prorate
+    // agree to isqrt rounding, and both stay <= the exact flat-slice output.
+    const segs: MergeSegment[] = [];
+    pushMonotoneSegment(segs, cap1, out1, mergeIsqrt((out1 * MERGE_Q192) / cap1));
+    const prep = prepared(segs);
+    const take = cap1 / 3n;
+    const est = estimateExpectedOutput(prep, take);
+    const exact = (out1 * take) / cap1;
+    assert.ok(est <= exact, "flat partial credit <= exact prorate (isqrt rounds down)");
+    assertClose(est, exact, 10n, "flat partial credit ~= exact prorate");
   });
 });

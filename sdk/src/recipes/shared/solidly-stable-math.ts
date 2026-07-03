@@ -48,7 +48,7 @@
  *   https://github.com/aerodrome-finance/contracts (sAMM Pool.sol — identical math)
  */
 
-import { pushMonotoneSegment } from "./segment-merge.js";
+import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches curve-math / dodo-math / ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
@@ -186,7 +186,7 @@ export function getAmountOutStable(pool: SolidlyStablePool, dx: bigint): bigint 
  * it is ALREADY the fee-adjusted execution price — it enters the merge's descending-price sort directly
  * (no extra sqrtOneMinusFee multiply, the fee is baked into dy), exactly like Curve / LB / DODO segments.
  */
-export interface SolidlyStableSegment {
+export interface SolidlyStableSegment extends MergeSegment {
   /** Δinput (tokenIn) to traverse this slice. */
   capacity: bigint;
   /** Δoutput (tokenOut) over this slice. */
