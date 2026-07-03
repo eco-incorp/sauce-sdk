@@ -297,6 +297,22 @@ export interface FactoryConfig {
    */
   algebraTickSpacing?: number;
   /**
+   * Algebra (AlgebraV3) only: how this fork lays out the DYNAMIC fee in `globalState()`. Algebra forks
+   * DIFFER in word 3, so the lens must decode the fee per-fork or a non-fee word (a timepointIndex up to
+   * 65535 = 6.55%, or a pluginConfig) would poison the survivor filter + merge pricing:
+   *   - `"camelot"` (DEFAULT): Camelot V3 / Ramses V2 (Algebra 1.9) — DIRECTIONAL fees. globalState() =
+   *     (price, tick, feeZto, feeOtz, timepointIndex, …); the fee is word 2 for zeroForOne, word 3 for
+   *     oneForZero. This is the pre-existing behavior (unchanged for existing Camelot/Ramses configs).
+   *   - `"algebra-v1"`: Algebra V1 base (QuickSwap V3, THENA Fusion) — a SINGLE fee. globalState() =
+   *     (price, tick, fee, timepointIndex, communityFee0, communityFee1, unlocked); the fee is ALWAYS
+   *     word 2 (word 3 is the timepointIndex — NOT a fee).
+   *   - `"integral"`: Algebra Integral / V2 (SwapX) — a SINGLE fee. globalState() = (price, tick, lastFee,
+   *     pluginConfig, communityFee, unlocked); the fee is ALWAYS word 2 (word 3 is pluginConfig — NOT a fee).
+   * `"algebra-v1"` and `"integral"` are equivalent to the lens (both single-fee at word 2); the distinct
+   * names document the source layout. Ignored for non-Algebra factories.
+   */
+  algebraFeeLayout?: "camelot" | "algebra-v1" | "integral";
+  /**
    * Slipstream CL (SlipstreamCL factory type) only: the tickSpacings this CLFactory enables. The
    * Slipstream CLFactory keys pools by tickSpacing — `getPool(tokenA, tokenB, int24 tickSpacing)` —
    * so discovery enumerates this list (defaulting to the Slipstream-common `SLIPSTREAM_TICK_SPACINGS`

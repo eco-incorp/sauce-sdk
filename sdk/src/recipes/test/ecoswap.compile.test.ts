@@ -254,13 +254,13 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     const stripped = stripTypes(source);
     const args = [cfgTuple(1), pools.slice(0, 1), [netCache[0]], routing, segs];
     const ALL = {
-      HAS_V2: true, HAS_V4: true, HAS_KYBER: true, HAS_ROUTES: true,
+      HAS_V2: true, HAS_V4: true, HAS_ALGEBRA: true, HAS_KYBER: true, HAS_ROUTES: true,
       HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: true,
       HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
       HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true, HAS_BALANCER_V3: true,
     };
     const V3_ONLY = {
-      HAS_V2: false, HAS_V4: false, HAS_KYBER: false, HAS_ROUTES: false,
+      HAS_V2: false, HAS_V4: false, HAS_ALGEBRA: false, HAS_KYBER: false, HAS_ROUTES: false,
       HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
       HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
       HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false,

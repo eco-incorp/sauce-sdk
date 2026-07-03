@@ -315,12 +315,107 @@ describe("EcoSwap Algebra-fork (local adapter over real V3) — engine algebraSw
     );
   }
 
+  // ── FIX 1b: PER-FORK globalState fee decode ──
+  // Algebra forks lay out the dynamic fee DIFFERENTLY in globalState(): Camelot is DIRECTIONAL
+  // (word 2 zeroForOne / word 3 oneForZero), but Algebra V1 (QuickSwap/THENA) and Integral (SwapX)
+  // carry a SINGLE fee at word 2 — word 3 is a timepointIndex / pluginConfig, NOT a fee. This test
+  // stands up an Algebra pool whose word 2 (feeZto) is the REAL fee (a standard 3000 tier the inner
+  // pool charges) and whose word 3 (feeOtz) is a GARBAGE non-fee value (50000 ppm, a timepointIndex-
+  // like number), configures the fork as `algebra-v1` (single-fee layout), and runs a ONEFORZERO
+  // swap (the direction where a Camelot-directional decode would read word 3). The lens MUST read
+  // word 2 (3000), NOT word 3 (50000) — proving the per-fork decode. Without the fix the default
+  // directional decode would feed feePpm=50000 (6.55%) into the pricing → this assertion catches it.
+  const INNER_FEE = 3000; // a standard enabled tier (globalState word 2 == this real fee)
+  const GARBAGE_OTZ = 50000; // globalState word 3 — a non-fee (timepointIndex-like) value; must be IGNORED
+  async function runFeeLayout(engine: Engine): Promise<void> {
+    await reset();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    // ONEFORZERO: swap token1 → token0 (tokenIn is the HIGHER address). This is the direction a
+    // Camelot-directional decode reads word 3 (feeOtz) for — so the garbage word 3 would leak in
+    // unless the single-fee (algebra-v1) decode correctly pins the fee to word 2.
+    const oneForZeroIn = tokenOut; // == token1 (higher)
+    const oneForZeroOut = tokenIn; // == token0 (lower)
+
+    // feeZto (word 2) = the REAL inner fee (3000); feeOtz (word 3) = GARBAGE (50000).
+    const { pool: alg, inner } = await setupAlgebraPool(
+      c.walletClient, c.publicClient, stack.factory, algebraFactory, stack.helper,
+      tokenIn, tokenOut, INNER_FEE, INNER_FEE, SQRT_PRICE_1_1,
+      [[-12000, 12000, parseEther("400000")]],
+      undefined, GARBAGE_OTZ,
+    );
+    const gs = await getAlgebraGlobalState(c.publicClient, alg);
+    assert.equal(gs.feeZto, INNER_FEE, "word 2 (feeZto) is the real fee");
+    assert.equal(gs.feeOtz, GARBAGE_OTZ, "word 3 (feeOtz) is the garbage non-fee value");
+
+    // Config the fork as SINGLE-FEE (algebra-v1) so the lens reads word 2 for BOTH directions.
+    const poolConfig: ChainPoolConfig = {
+      factories: [
+        {
+          address: algebraFactory,
+          poolType: SwapPoolType.UniV3,
+          factoryType: FactoryType.AlgebraV3,
+          label: "Local Algebra V1",
+          algebraTickSpacing: ALG_TICK_SPACING,
+          algebraFeeLayout: "algebra-v1",
+        },
+      ],
+      feeTiers: [500, 3000, 10000],
+      baseTokens: [oneForZeroIn, oneForZeroOut],
+    };
+
+    const amountIn = parseEther("5000");
+    const callerInBefore = await balanceOf(c.publicClient, oneForZeroIn, caller);
+    const innerInBefore = await balanceOf(c.publicClient, oneForZeroIn, inner);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn: oneForZeroIn, tokenOut: oneForZeroOut, amountIn },
+      anvil.rpcUrl,
+      cookTarget(engine, stack, v12),
+      caller,
+      poolConfig,
+      undefined,
+      engine,
+    );
+
+    assert.equal(prepared.pools.length, 1, "exactly one direct pool (the Algebra pool)");
+    assert.equal(prepared.zeroForOne, false, "oneForZero swap (tokenIn is the higher address)");
+    // THE FIX: the single-fee (algebra-v1) decode reads word 2 (3000), NOT the directional word 3
+    // (50000). A Camelot-directional decode on this oneForZero swap would have surfaced 50000.
+    assert.equal(
+      prepared.pools[0].feePpm,
+      INNER_FEE,
+      `lens read the SINGLE fee from globalState word 2 (${INNER_FEE}), NOT the garbage word 3 (${GARBAGE_OTZ})`,
+    );
+
+    await approve(c.walletClient, c.publicClient, oneForZeroIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "oneForZero Algebra cook() must succeed (globalState fee decode)");
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, oneForZeroIn, caller));
+    const innerIn = (await balanceOf(c.publicClient, oneForZeroIn, inner)) - innerInBefore;
+    // WEI-EXACT: the pool priced at the correct word-2 fee (3000) matches the inner pool's real fee,
+    // so the oracle allocates EXACTLY the on-chain spend.
+    const ref = ecoSwapReference(prepared, amountIn);
+    assert.equal(spent, ref.totalInput, "single-pass: spent == oracle totalInput EXACTLY");
+    assert.equal(innerIn, amountIn, "all of amountIn routed into the Algebra pool (oneForZero)");
+
+    console.log(
+      `  [Algebra fee-layout(algebra-v1):${engine}] word2=${gs.feeZto} word3=${gs.feeOtz} → ` +
+        `prepared feePpm=${prepared.pools[0].feePpm} (read word 2, ignored word 3); spent=${spent}`,
+    );
+  }
+
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`Algebra solo [${engine}] — discover+price+execute: received tokenOut, spent == oracle to the wei`, { skip }, async () => {
       await runSolo(engine);
     });
     it(`Algebra split [${engine}] — splits with a standard V3 pool, per-pool input == oracle to the wei`, { skip }, async () => {
       await runSplit(engine);
+    });
+    it(`Algebra V1 fee layout [${engine}] — lens reads globalState word 2, not the word-3 timepointIndex`, { skip }, async () => {
+      await runFeeLayout(engine);
     });
   }
 });

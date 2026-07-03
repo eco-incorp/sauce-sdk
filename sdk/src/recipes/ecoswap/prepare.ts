@@ -43,6 +43,8 @@ import type { PublicClient, Hex } from "viem";
 import { runLens, LENS_MAX_TICKS, LENS_BAND_TICKS, type LensPool, type LensResult } from "./lens.js";
 import {
   discoverKyberClassicPools,
+  discoverAlgebraPoolAddresses,
+  discoverSolidlyVolatilePoolsTyped,
   discoverCurvePoolsTyped,
   discoverTraderJoeLBPoolsTyped,
   discoverDodoV2PoolsTyped,
@@ -425,7 +427,13 @@ function stampPoolCache(r: V3Read, zeroForOne: boolean, seed: EcoPool): void {
  * leg block executes V2 legs via the engine's hardcoded-0.30% router swap (poolType:0), so the
  * leg geometry must match what executes. V3/V4 (incl. Algebra mapped to V3) always carry p.fee.
  */
-function lensToEcoPool(p: LensPool, zHop: boolean, sourceLabel: string, isDirect: boolean): EcoPool {
+function lensToEcoPool(
+  p: LensPool,
+  zHop: boolean,
+  sourceLabel: string,
+  isDirect: boolean,
+  isAlgebra = false,
+): EcoPool {
   if (p.poolType === SwapPoolType.UniV2) {
     // Constant-product: no tick cache (the solver streams constant-L geometric slices from the
     // LIVE out/in spot; on-chain reads getReserves live). inIsToken0 is the pool's own reserve
@@ -457,6 +465,9 @@ function lensToEcoPool(p: LensPool, zHop: boolean, sourceLabel: string, isDirect
     hooks: isV4 ? p.hooks ?? ZERO_ADDRESS : ZERO_ADDRESS,
     feePpm: p.fee,
     isV2: false,
+    // Algebra dynamic-fee CL forks surface as UniV3 rows (lens); the solver reads globalState() (not
+    // slot0()) for their spot — a real Algebra pool has NO slot0(). V4 is never Algebra.
+    isAlgebra: isAlgebra && !isV4,
     inIsToken0: zHop, // V3/V4 PoolKey orientation = this hop's token sort order (zHop)
     stateView: isV4 ? p.stateView : ZERO_ADDRESS,
     poolId: isV4 ? p.poolId : ZERO_BYTES32,
@@ -958,6 +969,20 @@ export async function prepareEcoSwap(
       `  EcoSwap capped to deepest ${MAX_DIRECT_POOLS} of ${survivors.length} survivor pools (ECO_MAX_POOLS)`,
     );
   }
+  // Algebra survivors: the lens emits an Algebra pool as a UniV3 row (indistinguishable downstream),
+  // so resolve which survivor addresses are Algebra via a light off-chain poolByPair lookup on the
+  // Algebra factories, then stamp EcoPool.isAlgebra on them so the solver reads globalState() (not
+  // slot0()) for their spot. Empty set when the chain carries no Algebra factory (zero extra RPC).
+  const algebraFactories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.AlgebraV3,
+  );
+  const algebraAddrs =
+    algebraFactories.length > 0
+      ? await discoverAlgebraPoolAddresses(tokenIn, tokenOut, client, algebraFactories)
+      : new Set<string>();
+  const isAlgebraPool = (p: LensPool): boolean =>
+    algebraAddrs.size > 0 && algebraAddrs.has(p.address.toLowerCase());
+
   const v3Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV3);
   const v4Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV4);
   // Constant-product (Uniswap-V2-style) pools execute via the unified
@@ -970,7 +995,7 @@ export async function prepareEcoSwap(
   // on-chain solver walks each pool's LIVE frontier and reuses the net. V2 streams constant-L
   // from live reserves (no tick cache). The single lensToEcoPool builder is reused for routes.
   const pools: EcoPool[] = [];
-  for (const p of v3Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V3", true));
+  for (const p of v3Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V3", true, isAlgebraPool(p)));
   for (const p of v4Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V4", true));
   for (const p of v2Raw) pools.push(lensToEcoPool(p, p.inIsToken0, "lens V2", true));
 
@@ -1009,6 +1034,43 @@ export async function prepareEcoSwap(
         spotNearReal: spotOI, // out/in spot (virtual-reserve frontier seed)
         spotActiveL: synthL, // √(vIn·vOut)
         source: `${k.source} (Kyber Classic)`,
+      });
+    }
+  }
+
+  // ── Solidly VOLATILE (vAMM) pools (off-chain discovery — NOT in the lens) ──
+  // A vAMM is a plain xy=k V2 curve with a PER-POOL fee — some of the deepest constant-product venues
+  // on Solidly chains (Aerodrome/Velodrome/Thena/Ramses/SwapX/Shadow). The on-chain lens structurally
+  // EXCLUDES Solidly factories (they expose getPool(a,b,bool), not the getPair(a,b) the lens's V2 path
+  // calls — feeding one to the lens would revert the whole eth_call), so they are discovered here (like
+  // Kyber) via getPool(a,b,false) and appended to the DIRECT V2-family set: each seeds the SAME
+  // constant-L V2 stream the solver/oracle/reference walk (L = √(rIn·rOut), spot out/in = √(rOut/rIn))
+  // from LIVE getReserves, carries its per-pool fee, and executes via the existing callback-free V2
+  // path. Aliveness is the `>0` reserve gate (the lens's relative-depth survivor filter is V2/V3/V4 —
+  // getPair — only; Kyber and Solidly-volatile survive on liveness, matching the Kyber convention).
+  const solidlyVolFactories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.SolidlyV2,
+  );
+  if (solidlyVolFactories.length > 0) {
+    const volRaw = await discoverSolidlyVolatilePoolsTyped(tokenIn, tokenOut, client, solidlyVolFactories);
+    for (const v of volRaw) {
+      if (v.reserveIn <= 0n || v.reserveOut <= 0n) continue;
+      const synthL = isqrt(v.reserveIn * v.reserveOut); // √(rIn·rOut)
+      const spotOI = isqrt((v.reserveOut * Q192) / v.reserveIn); // out/in spot from live reserves
+      pools.push({
+        poolType: SwapPoolType.UniV2,
+        address: v.address,
+        fee: v.feePpm,
+        tickSpacing: 0,
+        hooks: ZERO_ADDRESS,
+        feePpm: v.feePpm,
+        isV2: true,
+        inIsToken0: v.inIsToken0,
+        stateView: ZERO_ADDRESS,
+        poolId: ZERO_BYTES32,
+        spotNearReal: spotOI, // out/in spot (V2 frontier seed)
+        spotActiveL: synthL, // √(rIn·rOut)
+        source: v.source,
       });
     }
   }
@@ -1469,6 +1531,21 @@ export async function prepareEcoSwap(
   // not a correctness one; a same-direction shared edge (WETH↔X used by several paths) still reads
   // once.
   const edgeKey = (a: Hex, b: Hex): string => `${a.toLowerCase()}|${b.toLowerCase()}`;
+  // Algebra survivors on a route edge: like direct pools, an Algebra leg pool surfaces as a UniV3 row
+  // and MUST be stamped isAlgebra so the solver reads globalState() (not slot0()) for it — else the
+  // route cook reverts on the leg's slot0() call. Resolved per edge (memoized), zero RPC when the
+  // chain carries no Algebra factory. Keyed by the SAME directed edgeKey as readEdge.
+  const algebraEdgeCache = new Map<string, Promise<Set<string>>>();
+  const readEdgeAlgebra = (hopIn: Hex, hopOut: Hex): Promise<Set<string>> => {
+    if (algebraFactories.length === 0) return Promise.resolve(new Set<string>());
+    const key = edgeKey(hopIn, hopOut);
+    let pending = algebraEdgeCache.get(key);
+    if (!pending) {
+      pending = discoverAlgebraPoolAddresses(hopIn, hopOut, client, algebraFactories);
+      algebraEdgeCache.set(key, pending);
+    }
+    return pending;
+  };
   const readEdge = (hopIn: Hex, hopOut: Hex): Promise<LensResult> => {
     const key = edgeKey(hopIn, hopOut);
     let pending = edgeCache.get(key);
@@ -1503,7 +1580,10 @@ export async function prepareEcoSwap(
    */
   const buildLeg = async (hopIn: Hex, hopOut: Hex): Promise<EcoLeg | null> => {
     const zHop = hopIn.toLowerCase() < hopOut.toLowerCase(); // THIS leg's hop direction
-    const lens = await readEdge(hopIn, hopOut);
+    const [lens, legAlgebra] = await Promise.all([
+      readEdge(hopIn, hopOut),
+      readEdgeAlgebra(hopIn, hopOut),
+    ]);
     const legPools: EcoPool[] = [];
     for (const p of lens.pools) {
       if (p.poolType === SwapPoolType.UniV2) {
@@ -1511,7 +1591,9 @@ export async function prepareEcoSwap(
         // lens-reported inIsToken0 (hopIn-is-token0 for this leg), NOT the leg's address-sort zHop.
         legPools.push(lensToEcoPool(p, p.inIsToken0, "lens route leg V2", false));
       } else if (p.poolType === SwapPoolType.UniV3) {
-        legPools.push(lensToEcoPool(p, zHop, "lens route leg V3", false));
+        legPools.push(
+          lensToEcoPool(p, zHop, "lens route leg V3", false, legAlgebra.has(p.address.toLowerCase())),
+        );
       } else if (p.poolType === SwapPoolType.UniV4) {
         // Hookless V4 only — the unified swap(SwapParams) leg execution builds a hookless PoolKey.
         const hooks = p.hooks ?? ZERO_ADDRESS;

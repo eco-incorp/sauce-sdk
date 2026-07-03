@@ -119,25 +119,11 @@ contract AlgebraPool {
         return (sp, tk, feeZto, feeOtz, 0, 0, 0, true);
     }
 
-    /// @notice Uniswap-V3-shaped slot0(). A real Algebra pool does NOT expose this (it uses
-    ///         globalState()), and the lens reads globalState() for Algebra rows — but exposing a
-    ///         slot0() proxy here keeps the fixture robust to any V3-shaped read path and makes the
-    ///         adapter a strict superset of both read surfaces. Proxies the inner pool's slot0().
-    function slot0()
-        external
-        view
-        returns (
-            uint160 sqrtPriceX96,
-            int24 tick,
-            uint16 observationIndex,
-            uint16 observationCardinality,
-            uint16 observationCardinalityNext,
-            uint8 feeProtocol,
-            bool unlocked
-        )
-    {
-        return IUniswapV3PoolMin(inner).slot0();
-    }
+    /// @notice A real Algebra pool has NO slot0() — it exposes globalState() (read above) for the
+    ///         spot price/tick. This adapter DELIBERATELY does NOT expose a slot0() proxy: the EcoSwap
+    ///         solver + lens MUST read globalState() for an Algebra pool (isAlgebra), and calling
+    ///         slot0() on a real Algebra pool would revert the whole cook. Omitting it here UN-MASKS
+    ///         that path — if the solver/lens mistakenly fell back to slot0(), the cook would revert.
 
     function liquidity() external view returns (uint128) {
         return IUniswapV3PoolMin(inner).liquidity();

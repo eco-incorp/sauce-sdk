@@ -72,6 +72,11 @@ export const helperArtifact = loadArtifact(
 export const v2FactoryArtifact = loadArtifact(
   join(FIXTURES, "V2Factory.sol", "V2Factory.json"),
 );
+/** Solidly-family factory shim (getPool(a,b,bool)/getFee(pool,bool) registry) — deployed normally.
+ *  EcoSwap discovers Solidly VOLATILE (vAMM) pools off-chain via getPool(a,b,false). */
+export const solidlyFactoryArtifact = loadArtifact(
+  join(FIXTURES, "SolidlyFactory.sol", "SolidlyFactory.json"),
+);
 /** Slipstream CLFactory shim (getPool(a,b,int24) registry) — deployed normally; discovery/lens
  *  resolve tickSpacing-keyed. It points at a REAL @uniswap/v3-core pool (Slipstream is V3-shaped). */
 export const slipstreamFactoryArtifact = loadArtifact(
@@ -815,6 +820,80 @@ export async function deployV2Factory(
     abi: v2FactoryArtifact.abi,
     bytecode: v2FactoryArtifact.bytecode,
   });
+}
+
+/** Solidly-family factory shim ABI (getPool(a,b,bool)/getFee(pool,bool) + setPool/setFee registry). */
+export const solidlyFactoryShimAbi = parseAbi([
+  "function setPool(address tokenA, address tokenB, bool stable, address pool)",
+  "function setFee(address pool, uint256 fee)",
+  "function getPool(address tokenA, address tokenB, bool stable) view returns (address)",
+  "function getFee(address pool, bool stable) view returns (uint256)",
+]);
+
+/** Deploy the Solidly-family registry shim (discovery resolves vAMM pools via getPool(a,b,false)). */
+export async function deploySolidlyFactory(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: solidlyFactoryArtifact.abi,
+    bytecode: solidlyFactoryArtifact.bytecode,
+  });
+}
+
+/**
+ * Stand up a Solidly VOLATILE (vAMM) pool for the EVM tests: a plain xy=k V2Pair (stable()==false)
+ * ETCHED at `pairAddr` at a per-pool fee, funded + synced, then registered on the Solidly shim under
+ * getPool(token0,token1,false) with getFee(pool)=feeBps. The vAMM is discovered OFF-CHAIN by
+ * discoverSolidlyVolatilePoolsTyped and appended to the DIRECT V2-family set (live getReserves seed +
+ * the per-pool fee, executed via the callback-free V2 path). `feePpm` is the pool's real fee (the K
+ * invariant + the callback-free exec use it); `feeBps` is what the factory getFee returns (ppm/100 for
+ * Velodrome/Aerodrome — discovery normalises it back to ppm). Returns the etched pair address.
+ */
+export async function setupSolidlyVolatilePool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+  factory: Hex,
+  pairAddr: Hex,
+  token0: Hex,
+  token1: Hex,
+  reserve0: bigint,
+  reserve1: bigint,
+  feePpm: number,
+  feeBps: number,
+  minter?: Account,
+): Promise<Hex> {
+  await testClient.setCode({ address: pairAddr, bytecode: v2PairRuntime });
+  const code = await publicClient.getCode({ address: pairAddr });
+  if (!code || code === "0x") throw new Error("failed to etch V2Pair runtime (Solidly vAMM)");
+  await writeAndWait(walletClient, publicClient, {
+    address: pairAddr,
+    abi: v2PairAbi as Abi,
+    functionName: "initializeWithFee",
+    args: [token0, token1, BigInt(feePpm)],
+    account: minter,
+  });
+  // Fund both reserves then snapshot via sync().
+  await writeAndWait(walletClient, publicClient, {
+    address: token0, abi: erc20Abi as Abi, functionName: "transfer", args: [pairAddr, reserve0], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pairAddr, reserve1], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: pairAddr, abi: v2PairAbi as Abi, functionName: "sync", args: [], account: minter,
+  });
+  // Register on the Solidly shim: getPool(t0,t1,false) → pair, getFee(pair) → feeBps.
+  await writeAndWait(walletClient, publicClient, {
+    address: factory, abi: solidlyFactoryShimAbi as Abi, functionName: "setPool",
+    args: [token0, token1, false, pairAddr], account: minter,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: factory, abi: solidlyFactoryShimAbi as Abi, functionName: "setFee",
+    args: [pairAddr, BigInt(feeBps)], account: minter,
+  });
+  return pairAddr;
 }
 
 /** Minimal Curve StableSwap fixture ABI (coins/exchange/get_dy + state reads). */
@@ -1847,12 +1926,15 @@ export async function setupAlgebraPool(
   sqrtPriceX96: bigint,
   positions: [number, number, bigint][],
   minter?: Account,
+  dynFeeOtz?: number,
 ): Promise<{ pool: Hex; inner: Hex }> {
   const inner = await createAndInitPool(walletClient, publicClient, factory, token0, token1, innerFee, sqrtPriceX96);
   for (const [lo, hi, L] of positions) {
     await mintPosition(walletClient, publicClient, helper, inner, (minter ?? walletClient.account!).address as Hex, lo, hi, L, minter);
   }
-  // Deploy the adapter and bind it to the inner pool.
+  // Deploy the adapter and bind it to the inner pool. dynFee is globalState word 2 (feeZto); dynFeeOtz
+  // is word 3 (feeOtz), defaulting to dynFee. A test can set them DIFFERENT to exercise the lens's
+  // per-fork fee decode (a V1/Integral fork must read word 2 for BOTH directions — word 3 is not a fee).
   const pool = await deployContract(walletClient, publicClient, {
     abi: algebraPoolArtifact.abi,
     bytecode: algebraPoolArtifact.bytecode,
@@ -1861,7 +1943,7 @@ export async function setupAlgebraPool(
     address: pool,
     abi: algebraPoolAbi as Abi,
     functionName: "initialize",
-    args: [inner, dynFee, dynFee],
+    args: [inner, dynFee, dynFeeOtz ?? dynFee],
     account: minter,
   });
   // Register on the Algebra factory (poolByPair).

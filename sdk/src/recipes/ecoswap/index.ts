@@ -62,7 +62,8 @@ export interface EcoSwapOutput {
 
 /**
  * [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0, stateView, poolId,
- *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber]
+ *  stepRatio, windowTopShifted, windowBotShifted, extremeShifted, netStart, netCount, isKyber,
+ *  isAlgebra]
  * [10..15] are the unified-walk per-pool cache descriptors (V3/V4): the multiplicative step
  * ratio, the cache window bounds (shallowest/deepest scanned tick, shifted; windowTop=0 ⇒ no
  * cache ⇒ staticcall every boundary, the 1-RPC quote path), the deepest INITIALIZED tick (the
@@ -91,6 +92,7 @@ function buildPoolTuple(p: EcoPool, netStart: number, netCount: number): bigint[
     BigInt(netStart), // [14] start row index into the flat netCache for this pool
     BigInt(netCount), // [15] number of initialized-tick rows for this pool (0 ⇒ none)
     p.isKyber ? 1n : 0n, // [16] KyberSwap Classic / DMM (V2-shaped on VIRTUAL reserves); 0 ⇒ plain V2
+    p.isAlgebra ? 1n : 0n, // [17] Algebra dynamic-fee CL: read globalState() (NO slot0) for the spot; 0 ⇒ V3/V4 slot0/StateView
   ];
 }
 
@@ -567,6 +569,11 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
   const HAS_V2 = allPools.some((p) => p.isV2 && p.isKyber !== true);
   const HAS_V4 = allPools.some((p) => p.poolType === SwapPoolType.UniV4);
   const HAS_V3 = allPools.some((p) => !p.isV2 && p.poolType !== SwapPoolType.UniV4);
+  // Algebra dynamic-fee CL (Camelot/QuickSwap V3, Ramses V2, THENA Fusion, SwapX): V3-shaped, so
+  // HAS_V3 covers its tick walk + swapV3 exec; HAS_ALGEBRA lights ONLY the SETUP globalState()
+  // spot-read branch (a real Algebra pool has no slot0(), so slot0() would revert the cook — this
+  // is the un-masked audit finding). An Algebra pool is always isV2 false, so it also lights HAS_V3.
+  const HAS_ALGEBRA = allPools.some((p) => p.isAlgebra === true);
   const HAS_ROUTES = prepared.routes.length > 0;
   const HAS_CURVE = (prepared.curves?.length ?? 0) > 0;
   const HAS_LB = (prepared.lbs?.length ?? 0) > 0;
@@ -586,6 +593,7 @@ function protocolDefines(prepared: EcoSwapPrepared): Record<string, boolean> {
     HAS_V2,
     HAS_V3,
     HAS_V4,
+    HAS_ALGEBRA,
     HAS_KYBER,
     HAS_ROUTES,
     HAS_CURVE,

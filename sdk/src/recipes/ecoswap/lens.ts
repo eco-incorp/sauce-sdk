@@ -458,21 +458,29 @@ export function buildLensCook(
       // by THIS ratio (it has no on-chain TickMath). Algebra v1 forks (Camelot/QuickSwap/Ramses)
       // use a fixed per-factory tickSpacing; configure it via FactoryConfig.algebraTickSpacing
       // (default 60). Standard-V3 rows carry 0 for both (unused — they read the tier's step).
-      // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream]. A
+      // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream, algSingleFee]. A
       // Slipstream row (isSlipstream=1) discovers via getPool(a,b,int24 tickSpacing) — where the
       // tickSpacing is the v3FeeTiers[j][0] value — and reads the pool's OWN fee(). algebraTs/
       // algebraStep are 0 for Slipstream (it reads tickSpacing() live like standard V3 and uses the
       // Slipstream step column v3FeeTiers[j][2]). isAlgebra and isSlipstream are mutually exclusive.
+      // algSingleFee (col 5) is Algebra-only: 1 ⇒ read the DYNAMIC fee from globalState word 2 always
+      // (V1/Integral single fee); 0 ⇒ Camelot directional (word 2 zeroForOne / word 3 oneForZero).
       v3Factories.map((f) => {
         const isAlgebra = f.factoryType === FactoryType.AlgebraV3;
         const isSlipstream = f.factoryType === FactoryType.SlipstreamCL;
         const aTs = isAlgebra ? f.algebraTickSpacing ?? 60 : 0;
+        // Per-fork globalState fee layout (see FactoryConfig.algebraFeeLayout). algSingleFee=1 ⇒ the fee
+        // is ALWAYS word 2 (Algebra V1 / Integral — word 3 is a timepointIndex/pluginConfig, NOT a fee);
+        // 0 ⇒ Camelot-directional (word 2 zeroForOne / word 3 oneForZero). Default "camelot" preserves
+        // the pre-existing directional behavior for existing Camelot/Ramses configs.
+        const algSingleFee = isAlgebra && (f.algebraFeeLayout ?? "camelot") !== "camelot" ? 1n : 0n;
         return [
           BigInt(f.address),
           isAlgebra ? 1n : 0n,
           BigInt(aTs),
           isAlgebra ? stepRatioForSpacing(aTs) : 0n,
           isSlipstream ? 1n : 0n,
+          algSingleFee,
         ];
       }),
       // v3FeeTiers[j] = [value, stepAsFee, stepAsTickSpacing]. For a standard-V3 row the value is a

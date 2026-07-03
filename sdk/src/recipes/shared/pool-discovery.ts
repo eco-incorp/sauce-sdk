@@ -20,6 +20,7 @@ import {
   TRADER_JOE_BIN_WINDOW,
   TRADER_JOE_DEFAULT_BASE_FACTOR,
   SLIPSTREAM_TICK_SPACINGS,
+  V2_DEFAULT_FEE_PPM,
   feeToTickSpacing,
   hasPriceLimit,
   type ChainPoolConfig,
@@ -732,6 +733,41 @@ async function discoverAlgebraPools(
   return pools;
 }
 
+/**
+ * LIGHT Algebra pool-address resolver — poolByPair(tokenA, tokenB) per Algebra factory, returning the
+ * set of Algebra pool addresses (lowercased) for the pair. NO state reads (a single multicall).
+ *
+ * EcoSwap's on-chain LENS surfaces an Algebra pool as a `poolType=UniV3` row, indistinguishable from a
+ * real Uniswap-V3 pool downstream — so prepare can't tell which survivors are Algebra from the lens
+ * output alone. Prepare uses THIS set to stamp `EcoPool.isAlgebra` on the matching survivors, so the
+ * on-chain solver reads globalState() (not slot0()) for their spot in SETUP. Cheap: chains carry 0-2
+ * Algebra factories, so this is one small multicall (the same poolByPair the lens already resolves).
+ */
+export async function discoverAlgebraPoolAddresses(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (factories.length === 0) return out;
+  const results = await client.multicall({
+    contracts: factories.map((f) => ({
+      address: f.address,
+      abi: algebraFactoryAbi,
+      functionName: "poolByPair" as const,
+      args: [tokenIn, tokenOut] as const,
+    })),
+    allowFailure: true,
+  });
+  for (const r of results) {
+    if (r.status === "success" && r.result && r.result !== ZERO_ADDRESS) {
+      out.add((r.result as string).toLowerCase());
+    }
+  }
+  return out;
+}
+
 // ── V2 Standard discovery ───────────────────────────────────
 
 async function discoverV2Pools(
@@ -930,6 +966,112 @@ export async function discoverSolidlyStablePoolsTyped(
       inIsToken0,
       feePpm: solidlyFeeToPpm(feeResults[i].status === "success" ? (feeResults[i].result as bigint) : undefined),
       source: `${valid[i].factory.label} (Solidly stable)`,
+    });
+  }
+  return pools;
+}
+
+/** One discovered Solidly VOLATILE (vAMM) pool — a plain xy=k V2 curve with a PER-POOL fee. */
+export interface SolidlyVolatilePool {
+  address: Hex;
+  /** LIVE reserve of tokenIn / tokenOut (oriented by inIsToken0). */
+  reserveIn: bigint;
+  reserveOut: bigint;
+  /** tokenIn is the pool's token0. */
+  inIsToken0: boolean;
+  /** Per-pool swap fee (ppm) — read from the factory getFee(pool,false); the merge/oracle/exec gross by it. */
+  feePpm: number;
+  source: string;
+}
+
+/**
+ * Discover Solidly VOLATILE (vAMM) pools for the pair — the deepest constant-product venues on Solidly
+ * chains (Aerodrome/Velodrome/Thena/Ramses/SwapX/Shadow), which the on-chain LENS structurally EXCLUDES
+ * (Solidly factories expose getPool(a,b,bool), not the getPair(a,b) the lens's V2 path calls — feeding a
+ * Solidly factory into the lens would revert the whole eth_call). So they are discovered OFF-CHAIN here
+ * (like KyberSwap Classic) and appended to the DIRECT V2-family set in prepare, seeded from LIVE
+ * getReserves (L = √(rIn·rOut), spot out/in = √(rOut/rIn)) and executed via the callback-free V2 path
+ * with the pool's per-pool fee — a vAMM is xy=k, so it live-walks EXACTLY like a UniswapV2 pool.
+ *
+ * Path: getPool(tokenA, tokenB, false) per SolidlyV2 factory → keep pools with `stable()==false`
+ * (defensive: a factory/shim that returns a STABLE pool for the volatile query is filtered out — a vAMM
+ * MUST be non-stable) and reserves > 0. The per-pool fee is read via the factory `getFee(pool, false)`
+ * (normalised bps→ppm by `solidlyFeeToPpm`); on failure it falls back to the canonical 0.30% vAMM tier.
+ */
+export async function discoverSolidlyVolatilePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<SolidlyVolatilePool[]> {
+  if (factories.length === 0) return [];
+
+  const addrResults = await client.multicall({
+    contracts: factories.map((f) => ({
+      address: f.address,
+      abi: solidlyFactoryAbi,
+      functionName: "getPool" as const,
+      args: [tokenIn, tokenOut, false] as const, // volatile (vAMM)
+    })),
+    allowFailure: true,
+  });
+
+  const seen = new Set<string>();
+  const valid: { address: Hex; factory: FactoryConfig }[] = [];
+  for (let i = 0; i < addrResults.length; i++) {
+    const r = addrResults[i];
+    if (r.status !== "success" || !r.result || r.result === ZERO_ADDRESS) continue;
+    const key = (r.result as string).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    valid.push({ address: r.result as Hex, factory: factories[i] });
+  }
+  if (valid.length === 0) return [];
+
+  const [stableResults, token0Results, reserveResults, feeResults] = await Promise.all([
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.address, abi: solidlyStablePoolAbi, functionName: "stable" as const })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.address, abi: solidlyStablePoolAbi, functionName: "token0" as const })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.address, abi: solidlyStablePoolAbi, functionName: "getReserves" as const })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: valid.map((p) => ({ address: p.factory.address, abi: solidlyFactoryAbi, functionName: "getFee" as const, args: [p.address, false] as const })),
+      allowFailure: true,
+    }),
+  ]);
+
+  const pools: SolidlyVolatilePool[] = [];
+  for (let i = 0; i < valid.length; i++) {
+    const st = stableResults[i];
+    const t0 = token0Results[i];
+    const reserves = reserveResults[i];
+    // A vAMM MUST be non-stable: filter out any pool that reports stable()==true (a stable-curve pool
+    // must NOT be modeled as xy=k — it rides discoverSolidlyStablePoolsTyped's x3y+y3x QL path instead).
+    if (st.status !== "success" || st.result === true) continue;
+    if (t0.status !== "success" || reserves.status !== "success") continue;
+    const [reserve0, reserve1] = reserves.result as [bigint, bigint, bigint];
+    if (reserve0 === 0n || reserve1 === 0n) continue;
+    const token0 = t0.result as Hex;
+    const inIsToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
+    pools.push({
+      address: valid[i].address,
+      reserveIn: inIsToken0 ? reserve0 : reserve1,
+      reserveOut: inIsToken0 ? reserve1 : reserve0,
+      inIsToken0,
+      // Real per-pool fee from the factory getFee(pool,false), normalised bps→ppm; on read failure
+      // fall back to the canonical 0.30% vAMM tier (NOT the 0.01% stable default — a wrong fee here
+      // would make the callback-free K-invariant revert on exec).
+      feePpm: feeResults[i].status === "success"
+        ? solidlyFeeToPpm(feeResults[i].result as bigint)
+        : V2_DEFAULT_FEE_PPM,
+      source: `${valid[i].factory.label} (Solidly volatile)`,
     });
   }
   return pools;

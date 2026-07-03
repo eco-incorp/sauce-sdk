@@ -427,14 +427,19 @@ describe("EcoSwap Algebra-CL prod-mirror (reproduced real THENA-Fusion dynamic-f
     const poolConfig = algebraPoolConfig(tokenIn, tokenOut);
     const { tick: preparedTick } = await getSlot0(c.publicClient, repro.pool);
 
-    // PREPARE against the clean (pre-drift) tick state.
+    // PREPARE against the clean (pre-drift) tick state. slippageBps:0 disables the internal
+    // whole-trade amountOutMin floor: this test DELIBERATELY moves the price adversely (a large
+    // boundary-crossing drift) to exercise Phase-B live re-anchoring — exactly the adverse move the
+    // floor (computed on the PRE-drift expected output) guards against. The floor's MEV protection is
+    // orthogonal to the re-anchoring this test proves (split correctness is asserted directly below),
+    // so it is disabled here; the wei-exact + no-drift prod-mirror cases exercise the floor's default.
     const { bytecodes, prepared } = await ecoSwap(
       { tokenIn, tokenOut, amountIn },
       anvil.rpcUrl,
       cookTarget(PROD_ENGINE, stack, v12),
       caller,
       poolConfig,
-      undefined,
+      { slippageBps: 0 },
       PROD_ENGINE,
     );
     const ref = ecoSwapReference(prepared, amountIn);

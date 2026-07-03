@@ -93,11 +93,15 @@ import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 //                        no longer under-measured (its Σ share understated) and dropped by the
 //                        minRelBps filter for a non-liquidity reason. bandTicks=0 ⇒ effTicks=LO
 //                        for every pool (the legacy fixed-96 behavior).)
-//   v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream]
-//                    isAlgebra=1 ⇒ Algebra dynamic-fee fork (Camelot/QuickSwap V3, Ramses V2):
-//                    discover via poolByPair(tokenIn,tokenOut) and read globalState() for
-//                    (price, tick) + the DYNAMIC fee (feeZto for zeroForOne, feeOtz for
-//                    oneForZero) in place of getPool/slot0(). algebraTs/algebraStep are the
+//   v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream, algSingleFee]
+//                    isAlgebra=1 ⇒ Algebra dynamic-fee fork (Camelot/QuickSwap V3, Ramses V2,
+//                    THENA Fusion, SwapX): discover via poolByPair(tokenIn,tokenOut) and read
+//                    globalState() for (price, tick) + the DYNAMIC fee, in place of getPool/slot0().
+//                    The fee word is PER-FORK (algSingleFee, col 5): algSingleFee=0 ⇒ Camelot
+//                    directional (word 2 for zeroForOne, word 3 for oneForZero); algSingleFee=1 ⇒
+//                    Algebra V1/Integral single fee ALWAYS at word 2 (word 3 is a timepointIndex /
+//                    pluginConfig, NOT a fee — decoding it would feed a garbage fee up to 65535 ppm).
+//                    algebraTs/algebraStep are the
 //                    factory's fixed per-pool tickSpacing + its precomputed step ratio (the
 //                    lens has no on-chain TickMath). For isAlgebra=1 the inner v3FeeTiers loop
 //                    runs ONCE (ti===0) — Algebra has one pool per pair, no fee tiers. The tick
@@ -391,6 +395,7 @@ function main(
     const algTsA3: Uint256 = vfa3[2];
     const algStepA3: Uint256 = vfa3[3];
     const isSlipA3: Uint256 = vfa3[4];
+    const algSingleA3: Uint256 = vfa3[5]; // 1 ⇒ Algebra V1/Integral single fee (word 2); 0 ⇒ Camelot directional
     for (let ta3 = 0; ta3 < v3FeeTiers.length; ta3 = ta3 + 1) {
       const fta3: Tuple = v3FeeTiers[ta3];
       let runA3: Uint256 = 1;
@@ -412,9 +417,17 @@ function main(
             // round-tripped through a variable and then indexed (the descriptor is lost). The
             // standard-V3 path already indexes slot0() inline; mirror that for Algebra.
             sqrtA3 = IAlgebraPool.at(poolA3).globalState()[0];
-            feeA3 = zeroForOne === 1
-              ? IAlgebraPool.at(poolA3).globalState()[2]
-              : IAlgebraPool.at(poolA3).globalState()[3];
+            // Per-fork fee: Algebra V1/Integral carry a SINGLE fee at word 2 (word 3 is a
+            // timepointIndex/pluginConfig — NOT a fee); Camelot is DIRECTIONAL (word 2 zeroForOne /
+            // word 3 oneForZero). Decoding word 3 as a fee on a V1/Integral fork would feed a garbage
+            // value (up to 65535 ppm) into the survivor filter + merge pricing.
+            if (algSingleA3 === 1) {
+              feeA3 = IAlgebraPool.at(poolA3).globalState()[2];
+            } else {
+              feeA3 = zeroForOne === 1
+                ? IAlgebraPool.at(poolA3).globalState()[2]
+                : IAlgebraPool.at(poolA3).globalState()[3];
+            }
             stepA3 = algStepA3;
           }
         } else {
@@ -649,6 +662,7 @@ function main(
     const algTsM: Uint256 = vfm[2];
     const algStepM: Uint256 = vfm[3];
     const isSlipM: Uint256 = vfm[4];
+    const algSingleM: Uint256 = vfm[5]; // 1 ⇒ Algebra V1/Integral single fee (word 2); 0 ⇒ Camelot directional
     for (let tm = 0; tm < v3FeeTiers.length; tm = tm + 1) {
       const ftm: Tuple = v3FeeTiers[tm];
       let runM: Uint256 = 1;
@@ -668,9 +682,14 @@ function main(
           // Index globalState() DIRECTLY (NOT via a stored Tuple var) — the v1 engine reverts
           // INDEX on a variable-round-tripped contract-return tuple (see the discovery pass).
           sqrtM = IAlgebraPool.at(poolM).globalState()[0];
-          feeM = zeroForOne === 1
-            ? IAlgebraPool.at(poolM).globalState()[2]
-            : IAlgebraPool.at(poolM).globalState()[3];
+          // Per-fork fee (see the discovery pass): single word 2 for V1/Integral, directional for Camelot.
+          if (algSingleM === 1) {
+            feeM = IAlgebraPool.at(poolM).globalState()[2];
+          } else {
+            feeM = zeroForOne === 1
+              ? IAlgebraPool.at(poolM).globalState()[2]
+              : IAlgebraPool.at(poolM).globalState()[3];
+          }
           stepM = algStepM;
         }
       } else {
@@ -938,6 +957,7 @@ function main(
     const algTs3: Uint256 = vf3[2];
     const algStep3: Uint256 = vf3[3];
     const isSlip3: Uint256 = vf3[4];
+    const algSingle3: Uint256 = vf3[5]; // 1 ⇒ Algebra V1/Integral single fee (word 2); 0 ⇒ Camelot directional
     for (let ti3 = 0; ti3 < v3FeeTiers.length; ti3 = ti3 + 1) {
       const ft3: Tuple = v3FeeTiers[ti3];
       let runE3: Uint256 = 1;
@@ -960,9 +980,14 @@ function main(
           // Index globalState() DIRECTLY (NOT via a stored Tuple var) — the v1 engine reverts
           // INDEX on a variable-round-tripped contract-return tuple (see the discovery pass).
           sqrt3 = IAlgebraPool.at(poolAddr3).globalState()[0];
-          fee3 = zeroForOne === 1
-            ? IAlgebraPool.at(poolAddr3).globalState()[2]
-            : IAlgebraPool.at(poolAddr3).globalState()[3];
+          // Per-fork fee (see the discovery pass): single word 2 for V1/Integral, directional for Camelot.
+          if (algSingle3 === 1) {
+            fee3 = IAlgebraPool.at(poolAddr3).globalState()[2];
+          } else {
+            fee3 = zeroForOne === 1
+              ? IAlgebraPool.at(poolAddr3).globalState()[2]
+              : IAlgebraPool.at(poolAddr3).globalState()[3];
+          }
           step3 = algStep3;
         }
       } else {

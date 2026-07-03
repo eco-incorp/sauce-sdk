@@ -49,6 +49,15 @@ contract V2Pair {
         return (uint112(_reserve0), uint112(_reserve1), 0);
     }
 
+    /// @notice A vAMM (Solidly VOLATILE) pool is a plain xy=k curve — NOT the x3y+y3x stable curve.
+    ///         Solidly-family pools expose stable(); EcoSwap's volatile discovery keeps only
+    ///         stable()==false pools (a stable-curve pool must ride the x3y+y3x QL path instead), so
+    ///         this V2Pair models a vAMM by reporting false. Harmless to non-Solidly V2 tests (they
+    ///         never call it).
+    function stable() external pure returns (bool) {
+        return false;
+    }
+
     /// @notice Snap reserves to current balances (call after funding the pair).
     function sync() external {
         _reserve0 = IERC20Min(token0).balanceOf(address(this));

@@ -292,6 +292,17 @@ export interface EcoPool {
    * differ (getAmountOut on virtual reserves). false ⇒ a plain UniswapV2-style pool.
    */
   isKyber?: boolean;
+  /**
+   * true => Algebra dynamic-fee CL fork (Camelot/QuickSwap V3, Ramses V2, THENA Fusion, SwapX).
+   * V3-shaped (isV2 false) and priced/walked/executed IDENTICALLY to Uniswap V3 (shared
+   * ticks()/liquidity()/swap() selectors, serviced via algebraSwapCallback) — the ONLY difference
+   * is the on-chain SETUP spot read: an Algebra pool has NO slot0(), it exposes globalState()
+   * (price/tick). So the solver reads globalState() in place of slot0() for an isAlgebra pool
+   * (pd[17]===1). undefined/false ⇒ a plain Uniswap-V3 (or V4) pool read via slot0()/StateView.
+   * Set by prepare from the poolByPair Algebra-factory address set (the lens surfaces Algebra as a
+   * UniV3 row, indistinguishable downstream, so isAlgebra is stamped off-chain).
+   */
+  isAlgebra?: boolean;
   /** For V2 live reserve orientation: is tokenIn the pool's token0? */
   inIsToken0: boolean;
   /** V4 only: StateView lens address (0x0 for V2/V3). */

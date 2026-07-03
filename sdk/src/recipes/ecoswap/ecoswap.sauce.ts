@@ -1,6 +1,7 @@
 import { ISauceRouter } from "./artifacts/ISauceRouter.json";
 import { IERC20 } from "./artifacts/IERC20.json";
 import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
+import { IAlgebraPool } from "./IAlgebraPool.json";
 import { IStateViewFull } from "./IStateViewFull.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IKyberPool } from "./IKyberPool.json";
@@ -452,6 +453,11 @@ function stableOutV2(amp: Uint256, u0: Uint256, u1: Uint256, u2: Uint256, ij: Ui
 // The type-agnostic k-way merge core + the live V3/V4 frontier walk are unguarded (always on).
 const HAS_V2: boolean = true;
 const HAS_V4: boolean = true;
+// Algebra dynamic-fee CL (Camelot/QuickSwap V3, Ramses V2, THENA Fusion, SwapX): V3-shaped in
+// every respect the solver touches EXCEPT the SETUP spot read — a real Algebra pool has NO slot0()
+// (it exposes globalState()), so slot0() would revert the whole cook. HAS_ALGEBRA gates ONLY the
+// globalState() spot-read branch; the tick walk (ticks()[1]) + swapV3 exec are shared with V3.
+const HAS_ALGEBRA: boolean = true;
 const HAS_KYBER: boolean = true;
 const HAS_ROUTES: boolean = true;
 const HAS_CURVE: boolean = true;
@@ -709,10 +715,25 @@ function main(
       let srReal: Uint256 = 0;
       let liveTick: Uint256 = 0;
       let liveL: Uint256 = 0;
+      // Algebra flag (pd[17]) — read once, LENGTH-guarded so the many venue EVM tests that
+      // hand-build a 17-field pool tuple (no isAlgebra column) stay valid; production always
+      // emits it (index.ts buildPoolTuple). Mirrors the cfg.length optional-scalar guards.
+      let isAlg: Uint256 = 0;
+      if (HAS_ALGEBRA) { if (pd.length > 17) { isAlg = pd[17]; } }
       if (HAS_V4 && pType === 2) {
         srReal = IStateViewFull.at(pd[8]).getSlot0(pd[9])[0];
         liveTick = IStateViewFull.at(pd[8]).getSlot0(pd[9])[1];
         liveL = IStateViewFull.at(pd[8]).getLiquidity(pd[9]);
+      } else if (HAS_ALGEBRA && isAlg === 1) {
+        // Algebra dynamic-fee CL: read the LIVE spot from globalState() ([0]=price==sqrtPriceX96,
+        // [1]=int24 tick) in place of slot0() — a real Algebra pool has NO slot0() (calling it would
+        // revert the cook). liquidity() shares the V3 selector, and the rest of the frontier walk
+        // (ticks()[1] = liquidityDelta, same int128 layout) is byte-identical to V3. Index
+        // globalState() DIRECTLY per read (NOT via a stored var): the v1 engine loses the
+        // contract-return tuple descriptor on a variable round-trip (mirrors the lens's inline reads).
+        srReal = IAlgebraPool.at(pd[1]).globalState()[0];
+        liveTick = IAlgebraPool.at(pd[1]).globalState()[1];
+        liveL = IAlgebraPool.at(pd[1]).liquidity();
       } else {
         srReal = IUniswapV3PoolFull.at(pd[1]).slot0()[0];
         liveTick = IUniswapV3PoolFull.at(pd[1]).slot0()[1];
