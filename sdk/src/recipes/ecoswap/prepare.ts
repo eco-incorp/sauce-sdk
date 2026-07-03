@@ -1493,19 +1493,24 @@ export async function prepareEcoSwap(
   // swap(poolType:2)) exactly like the direct-pool execution. MAX_HOPS=2 reproduces the prior 2-hop
   // behavior exactly (single interior base token).
   const edgeCache = new Map<string, Promise<LensResult>>();
-  const edgeKey = (a: Hex, b: Hex): string => {
-    const al = a.toLowerCase();
-    const bl = b.toLowerCase();
-    return al < bl ? `${al}|${bl}` : `${bl}|${al}`;
-  };
+  // DIRECTED memo key (hopIn→hopOut). Under driftTicks:0 the lens walks + emits net rows ONLY on
+  // the SWAP-DIRECTION (deep) side of spot, and stampPoolCache windows that SAME side (per the
+  // leg's zHop). An UNORDERED key would let the REVERSE hop reuse a forward read whose net rows lie
+  // on the opposite side of spot, so stampPoolCache's in-window precondition (a reversed window
+  // holding none of those rows) throws → the whole prepareEcoSwap rejects (a default mainnet config
+  // with ≥2 interior base tokens reads at least one interior↔interior edge in both directions and
+  // hits this). Keying by DIRECTION runs one lens read per hop direction, each walking the correct
+  // side, so a reverse edge stamps in-window. One extra lens read per reversed edge — an RPC cost,
+  // not a correctness one; a same-direction shared edge (WETH↔X used by several paths) still reads
+  // once.
+  const edgeKey = (a: Hex, b: Hex): string => `${a.toLowerCase()}|${b.toLowerCase()}`;
   const readEdge = (hopIn: Hex, hopOut: Hex): Promise<LensResult> => {
     const key = edgeKey(hopIn, hopOut);
     let pending = edgeCache.get(key);
     if (!pending) {
-      // The lens read is direction-agnostic in VALUE for survivorship/state (it returns each
-      // pool's slot0 + windowed net regardless of swap orientation; the per-pool zeroForOne only
-      // re-orients the net-row sort + window, which stampPoolCache redoes per leg). So one read
-      // per unordered pair is sufficient; every path touching this edge reuses it.
+      // The lens read is walked in THIS hop's swap direction (zeroForOne below), so it emits net
+      // rows on the deep side stampPoolCache windows for the same direction — the reverse hop keys
+      // a SEPARATE read (see edgeKey). Every path touching this edge in the SAME direction reuses it.
       pending = runLens(client, lensCookEntry, poolConfig, {
         tokenIn: hopIn,
         tokenOut: hopOut,
@@ -1611,6 +1616,68 @@ export async function prepareEcoSwap(
         `additional path(s) — a calldata/loop bound, not a liquidity gate`,
     );
   }
+
+  // ── DISJOINT ROUTE SELECTION (the documented FIRST-LANDING bound) ──
+  // MAX_HOPS ≥ 3 emits routes that SHARE a leg pool: two paths reuse the same WETH↔X pool (same
+  // direction), and both A→X→Y→B and A→Y→X→B traverse the X↔Y pool in OPPOSITE directions. The
+  // universe build (index.ts) dedups leg pools by ADDRESS into ONE universe slot, but the on-chain
+  // route execution accrues per-universe-pool `inp[a]` and reads the whole realized intermediate
+  // balance PER ROUTE — so a shared leg pool double-spends its `inp[a]` (once per route) and a
+  // reversed reuse inverts its V4 PoolKey / reciprocal-prices it in the merge. The neutral oracle
+  // AND the cursor-faithful reference give EACH route-leg pool its OWN independent frontier, so a
+  // shared pool is inconsistent in the MERGE too, not only at exec. Enforce that every leg pool
+  // address is claimed by AT MOST ONE execution context: claim the DIRECT pools first, then walk
+  // routes SHORTEST-HOP-FIRST (DFS order within a hop count) and, per leg, DROP any pool already
+  // claimed; a route whose leg becomes empty is DROPPED, else it is admitted and its surviving pools
+  // are claimed. The universe dedup then never fires (no address appears twice), exec cannot
+  // double-spend or invert, and solver == oracle == reference for routes BY CONSTRUCTION. (Shared-
+  // pool routes with per-route shared-frontier accounting are a later phase — not attempted here.)
+  // NOTE: address-disjointness does NOT cover a shared intermediate TOKEN — two admitted disjoint-
+  // POOL routes can still transit the same token X via different edges (P: A→X→Y→B, Q: A→Z→X→B share
+  // token X with NO common pool, both survive this filter). That case is safe by the on-chain exec
+  // ORDER, not by this filter: routes run fully sequentially (`for r { for leg }`) and each route
+  // both produces AND immediately consumes its intermediate within its own contiguous run, so the
+  // leg>0 whole-balance drain reads balanceOf(X) to 0 before the next route deposits X. A future
+  // exec reorder (e.g. batching all leg0s then all leg1s for gas) would reintroduce the double-read
+  // — the per-route produce-then-consume order in ecoswap.sauce.ts is the load-bearing guarantee.
+  const claimedPools = new Set<string>();
+  for (const p of pools) claimedPools.add(p.address.toLowerCase());
+  const orderedRoutes = routes
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
+    .map((x) => x.r);
+  const disjointRoutes: EcoRoute[] = [];
+  let droppedRouteCount = 0;
+  let droppedLegPoolCount = 0;
+  for (const route of orderedRoutes) {
+    const survivingLegs: EcoLeg[] = [];
+    let admit = true;
+    for (const leg of route.legs) {
+      const keep = leg.pools.filter((lp) => !claimedPools.has(lp.address.toLowerCase()));
+      droppedLegPoolCount += leg.pools.length - keep.length;
+      if (keep.length === 0) {
+        admit = false;
+        break;
+      }
+      survivingLegs.push({ ...leg, pools: keep });
+    }
+    if (!admit) {
+      droppedRouteCount++;
+      continue;
+    }
+    for (const leg of survivingLegs) {
+      for (const lp of leg.pools) claimedPools.add(lp.address.toLowerCase());
+    }
+    disjointRoutes.push({ ...route, legs: survivingLegs });
+  }
+  if (droppedRouteCount > 0 || droppedLegPoolCount > 0) {
+    console.log(
+      `  EcoSwap disjoint-route filter: dropped ${droppedRouteCount} route(s) + ${droppedLegPoolCount} ` +
+        `already-claimed leg pool(s) — first-landing bound (a shared leg pool would double-spend/invert at exec)`,
+    );
+  }
+  routes.length = 0;
+  routes.push(...disjointRoutes);
 
   // The per-pool net cache is an optimization, not a correctness dependency: the on-chain
   // solver reconstructs everything LIVE from each pool's spot read even with no cache (the

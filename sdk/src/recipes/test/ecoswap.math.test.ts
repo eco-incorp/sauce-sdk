@@ -1506,6 +1506,69 @@ describe("N-hop route composition [routeEventN / routePartialN] (3-hop concrete)
 });
 
 // ─────────────────────────────────────────────────────────────
+// 11c. routeEventN — interior L==0 gap leg (walk-through-gap, NO Panic) [defect #4]
+// ─────────────────────────────────────────────────────────────
+// A route leg that sits at an interior dL==0 gap (the walk-through-gap design leaves it ACTIVE with
+// 0 liquidity) fed the route event a leg with L==0. The binding-leg back-propagation divides by an
+// upstream leg's L (invertFarFromOut / the solver Phase B mulDiv), so an L==0 upstream leg was a
+// division-by-zero Panic that reverted the WHOLE cook. The fix: an upstream L==0 leg is treated as
+// "crosses first" (leg i not binding through it), so the LOWEST-INDEX gap leg itself binds with
+// routeIn 0 and advances THROUGH its gap (0 flow) — exactly the direct-pool walk-through-gap, and
+// wei-neutral (0 consumed, no other leg moves) so it stays consistent with the oracle (which elides
+// the gap via a cursor jump in the adjacent real event). invertFarFromGrossIn(_, near, 0, _) must
+// also return `near` EXACTLY (zero input ⇒ zero movement) so a downstream leg does not drift.
+describe("routeEventN — interior L==0 gap leg (walk-through-gap, no Panic) [defect #4]", () => {
+  const near = toOutIn(getSqrtRatioAtTick(0), true); // 2^96 out/in spot
+  const FEE = 3000n;
+  const gapLeg = (): RouteLeg => ({ nearOI: near, farOI: toOutIn(getSqrtRatioAtTick(-60), true), L: 0n, feePpm: FEE });
+  const realLeg = (L: bigint): RouteLeg => ({ nearOI: near, farOI: toOutIn(getSqrtRatioAtTick(-6000), true), L, feePpm: FEE });
+
+  it("invertFarFromGrossIn(L, near, 0) === near (zero input ⇒ zero movement)", () => {
+    for (const L of [10n ** 26n, 10n ** 24n, 4n * 10n ** 23n]) {
+      for (const tick of [0, -100, -6000, 600]) {
+        const n = toOutIn(getSqrtRatioAtTick(tick), true);
+        assert.equal(invertFarFromGrossIn(L, n, 0n, FEE), n, `far==near @ L=${L} tick=${tick}`);
+      }
+    }
+  });
+
+  it("leg0 at an L==0 gap: the gap leg binds with routeIn 0, downstream untouched (no throw)", () => {
+    const legs = [gapLeg(), realLeg(10n ** 26n)];
+    const ev = routeEventN(legs); // MUST NOT throw (was a division-by-zero Panic)
+    assert.equal(ev.bindLeg, 0, "the gap leg binds");
+    assert.equal(ev.routeIn, 0n, "gap event consumes 0 token-A");
+    assert.equal(ev.routeOut, 0n, "gap event produces 0");
+    assert.equal(ev.newFars[0], legs[0].farOI, "binding gap leg advances to its bracket far (crosses the gap boundary)");
+    assert.equal(ev.newFars[1], legs[1].nearOI, "downstream leg unchanged (stays at near)");
+  });
+
+  it("leg1 at an L==0 gap (leg0 real): the gap leg binds, upstream leg not divided-by-zero", () => {
+    const legs = [realLeg(10n ** 26n), gapLeg()];
+    const ev = routeEventN(legs);
+    assert.equal(ev.bindLeg, 1, "the downstream gap leg binds (routeIn 0 < leg0's positive cross)");
+    assert.equal(ev.routeIn, 0n);
+    assert.equal(ev.newFars[0], legs[0].nearOI, "upstream leg unchanged (stays at near)");
+    assert.equal(ev.newFars[1], legs[1].farOI, "binding gap leg advances to its far");
+  });
+
+  it("3-hop with a MIDDLE L==0 gap: the middle leg binds, both divide sites guarded (no throw)", () => {
+    const legs = [realLeg(10n ** 26n), gapLeg(), realLeg(10n ** 26n)];
+    const ev = routeEventN(legs);
+    assert.equal(ev.bindLeg, 1, "the middle gap leg binds");
+    assert.equal(ev.routeIn, 0n);
+    assert.equal(ev.newFars[0], legs[0].nearOI, "upstream unchanged");
+    assert.equal(ev.newFars[2], legs[2].nearOI, "downstream unchanged");
+  });
+
+  it("lowest-index gap leg wins when several legs sit at gaps", () => {
+    const legs = [realLeg(10n ** 26n), gapLeg(), gapLeg()];
+    const ev = routeEventN(legs);
+    assert.equal(ev.bindLeg, 1, "the FIRST (lowest-index) gap leg binds");
+    assert.equal(ev.routeIn, 0n);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
 // 12. optimalSplit: ONE route + ONE direct pool — post-fee marginal EQUALIZES at the cut
 // ─────────────────────────────────────────────────────────────
 //

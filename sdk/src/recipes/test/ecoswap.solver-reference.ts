@@ -527,8 +527,25 @@ function advanceRoute(
     perUniverse[iLeg[i]] +=
       i === 0 ? ev.routeIn : bracketGross(legBr[i].L, legBr[i].nearOI, ev.newFars[i], legBr[i].feePpm);
     if (i === ev.bindLeg) {
-      crossV3Boundary(fr[iLeg[i]], 0n, cursorChecks);
-    } else {
+      const bf = fr[iLeg[i]];
+      if (bf.isV2) {
+        // V2 BINDING leg: a constant-product pool has NO tick to cross — advance the near to the
+        // geometric far at CONSTANT L (no crossV3Boundary: its stepReal would divide by the V2
+        // pool's absent stepRatio). Mirrors the solver's V2-binding Phase C branch + the oracle's
+        // V2 cursor advance. ev.newFars[bindLeg] == the V2 geometric far (out/in).
+        bf.near = ev.newFars[i];
+        if (ev.newFars[i] <= 0n) bf.on = false;
+        bf.steps += 1;
+        if (bf.steps >= PER_POOL) bf.on = false;
+      } else {
+        // The binding leg crosses its boundary. When its L==0 (interior gap) this is the walk-
+        // through-gap advance (0 flow, L updates via net) — routeIn is 0 for this event.
+        crossV3Boundary(bf, 0n, cursorChecks);
+      }
+    } else if (ev.routeIn > 0n) {
+      // Non-binding leg partial-fill — SKIPPED on a zero-flow (interior-gap) event (routeIn==0): a
+      // leg that absorbs nothing must not move (mirrors the solver's routeIn>0 partial guard + the
+      // oracle eliding the gap in the adjacent real event).
       advanceFrontierNearTo(fr[iLeg[i]], ev.newFars[i]);
     }
   }

@@ -156,7 +156,11 @@ function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
   for (const route of prepared.routes) {
     const rt: bigint[] = [BigInt(route.legs.length)];
     route.legs.forEach((leg, legIdx) => {
-      // Append this leg's pools contiguously, deduping any already in the universe.
+      // Append this leg's pools contiguously, deduping any already in the universe. NOTE: prepare's
+      // disjoint-route filter now guarantees every admitted leg pool address is claimed by at most
+      // ONE execution context (no direct/route/reverse-direction collision), so `indexByAddr` never
+      // finds an existing entry here — the dedup is DEAD (kept as a defensive guard so a future
+      // collision would still resolve to one slot rather than double-execute).
       const idxs: number[] = [];
       for (const lp of leg.pools) {
         const key = lp.address.toLowerCase();
@@ -170,8 +174,8 @@ function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
       }
       // Leg pools occupy a contiguous slice ONLY when freshly appended in order; if any were
       // deduped the slice is not contiguous, so emit the explicit [min, count) span and rely on
-      // the contiguous append for the common (no-dedupe) case. For the 2-hop V3-leg landing the
-      // intermediate's pools never collide with the direct set, so the slice is contiguous.
+      // the contiguous append for the common (no-dedupe) case. With the disjoint filter every leg
+      // pool is freshly appended, so the slice is always contiguous (base = first index).
       const base = idxs.length > 0 ? Math.min(...idxs) : 0;
       const count = idxs.length;
       // interL: the intermediate token AFTER this leg (legL.hopOut). Final leg → 0 (its out is

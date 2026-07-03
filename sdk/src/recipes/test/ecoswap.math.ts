@@ -231,6 +231,11 @@ export function bracketOut(L: bigint, nearOI: bigint, farOI: bigint): bigint {
  * far = L*2^96/invLow (0 if degenerate).
  */
 export function invertFarFromGrossIn(L: bigint, nearOI: bigint, grossIn: bigint, feePpm: bigint): bigint {
+  // Zero input ⇒ zero movement: far == near EXACTLY. The reciprocal round-trip
+  // mulDiv(L,Q96, mulDiv(L,Q96,near)) does NOT recover `near` (it rounds to far >= near, off by up
+  // to ~1e5 wei), which would underflow bracketOut/bracketGross (near - far < 0) at the interior
+  // L==0 gap events the routes feed 0 flow through. Special-case it so a gap event moves nothing.
+  if (grossIn === 0n) return nearOI;
   const effIn = mulDiv(grossIn, FEE_DENOM - feePpm, FEE_DENOM);
   const invNear = mulDiv(L, Q96, nearOI);
   const invLow = invNear + effIn;
@@ -272,6 +277,12 @@ function tokenAInputToCrossLeg(legs: RouteLeg[], i: number): bigint {
   let need = bracketGross(li.L, li.nearOI, li.farOI, li.feePpm); // leg i full-cross gross (token T_i)
   for (let j = i - 1; j >= 0; j--) {
     const lj = legs[j];
+    // An upstream leg sitting at an interior L==0 gap (the walk-through-gap design leaves it active
+    // with 0 liquidity) can PRODUCE nothing this bracket, so it must advance THROUGH its own gap
+    // before leg i can bind — leg i is not binding through it. Treat it exactly like "upstream
+    // crosses first" (the -1 sentinel), and bail BEFORE invertFarFromOut divides by lj.L (a 0
+    // divisor Panics on-chain — this is the mirror of the solver Phase B lgL[j]==0 guard).
+    if (lj.L === 0n) return -1n;
     const farj = invertFarFromOut(lj.L, lj.nearOI, need); // leg j far that PRODUCES `need`
     if (farj <= lj.farOI) return -1n; // upstream leg j would cross its OWN tick first ⇒ leg i not binding
     need = bracketGross(lj.L, lj.nearOI, farj, lj.feePpm); // leg j gross input → next-upstream need

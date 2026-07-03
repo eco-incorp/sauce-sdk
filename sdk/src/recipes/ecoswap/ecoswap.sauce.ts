@@ -207,6 +207,13 @@ function bracketOut(L: Uint256, nearOI: Uint256, farOI: Uint256): Uint256 {
 function invertFarFromGrossIn(L: Uint256, nearOI: Uint256, grossIn: Uint256, feePpm: Uint256): Uint256 {
   const Q96: Uint256 = 2 ** 96;
   const FEE_DENOM: Uint256 = 1000000;
+  // Zero input ⇒ zero movement: far == near EXACTLY. The reciprocal round-trip does NOT recover
+  // `near` (it rounds to far >= near), and far > near would UNDERFLOW the uint256 (nearOI - farOI)
+  // in bracketOut/bracketGross at an interior L==0 gap event (a route feeds 0 flow through a
+  // downstream leg). Special-case it so a gap event moves no downstream leg. Mirror ecoswap.math.ts.
+  if (grossIn === 0) {
+    return nearOI;
+  }
   const effIn: Uint256 = Math.mulDiv(grossIn, FEE_DENOM - feePpm, FEE_DENOM);
   const invNear: Uint256 = Math.mulDiv(L, Q96, nearOI);
   const invLow: Uint256 = invNear + effIn;
@@ -782,14 +789,23 @@ function main(
             let crossed: Uint256 = 0;
             for (let q = 0; q < i; q = q + 1) {
               const j: Uint256 = i - 1 - q;
-              // farj that PRODUCES `need` of the downstream input out of leg j (invertFarFromOut).
-              // If it lands at/below leg j's own far, leg j crosses first ⇒ leg i not binding.
-              const prodOut: Uint256 = Math.mulDiv(need, Q96, lgL[j]);
-              if (prodOut >= lgN[j]) { crossed = 1; }
+              // An upstream leg sitting at an interior L==0 gap (the walk-through-gap design leaves
+              // it active with 0 liquidity) can produce NOTHING this bracket, so leg i cannot bind
+              // through it — it must advance THROUGH its own gap first. Treat it as "upstream crosses
+              // first" (crossed=1) and, crucially, guard BEFORE the divide: Math.mulDiv(_, _, 0)
+              // Panics (division by zero) — the lowest-index gap leg is the one that actually binds
+              // (routeIn 0) and it is reached with crossed==0 (its own upstream legs are all L>0).
+              if (lgL[j] === 0) { crossed = 1; }
               else {
-                const farj: Uint256 = lgN[j] - prodOut;
-                if (farj <= lgF[j]) { crossed = 1; }
-                else { need = bracketGross(lgL[j], lgN[j], farj, lgFee[j]); }
+                // farj that PRODUCES `need` of the downstream input out of leg j (invertFarFromOut).
+                // If it lands at/below leg j's own far, leg j crosses first ⇒ leg i not binding.
+                const prodOut: Uint256 = Math.mulDiv(need, Q96, lgL[j]);
+                if (prodOut >= lgN[j]) { crossed = 1; }
+                else {
+                  const farj: Uint256 = lgN[j] - prodOut;
+                  if (farj <= lgF[j]) { crossed = 1; }
+                  else { need = bracketGross(lgL[j], lgN[j], farj, lgFee[j]); }
+                }
               }
             }
             if (crossed === 0) {
@@ -860,8 +876,21 @@ function main(
               const inAmt: Uint256 = L === 0 ? routeIn : bracketGross(lgL[L], lgN[L], lgNF[L], lgFee[L]);
               inp[pI] = inp[pI] + inAmt;
               if (L === bindLeg) {
-                // Advance the binding pool by ONE bracket: cross the boundary tick (net), re-anchor.
                 const db: Tuple = pools[pI];
+                if (db[6] === 1) {
+                  // V2 BINDING leg: a constant-product pool has NO tick to cross — advance the near
+                  // to the geometric far at CONSTANT L (dnL/lArr untouched), exactly the direct-V2
+                  // frontier step and the oracle's V2 cursor advance. NEVER run the V3 tick-cross
+                  // (ticks()/getTickLiquidity + net) on a V2 pair — that staticcall reverts the whole
+                  // cook (the earlier "sized deep enough never to be the binding leg" note was a
+                  // hope, not a guard; a shallow V2 leg CAN be the smallest gross cross ⇒ it binds).
+                  // lgNF[bindLeg] == lgF[bindLeg] == the V2 far (out/in). Mirrors the direct-V2 step.
+                  dnNear[pI] = lgNF[L];
+                  if (lgNF[L] <= 0) { dnOn[pI] = 0; }
+                  dnSteps[pI] = dnSteps[pI] + 1;
+                  if (dnSteps[pI] >= PER_POOL) { dnOn[pI] = 0; }
+                } else {
+                // Advance the binding pool by ONE bracket: cross the boundary tick (net), re-anchor.
                 const zb: Uint256 = zArr[pI];
                 let dL: Uint256 = lgL[L];
                 const dts: Uint256 = db[3];
@@ -909,14 +938,22 @@ function main(
                   else { if (dsh > extB) { pastExt = 1; } }
                   if (pastExt === 1) { dnOn[pI] = 0; }
                 } }
+                }
               } else {
                 // Partial leg: near → lgNF[L] (interior, no cross), keep the bracket far fixed.
                 // V2 leg pool stores near as out/in directly (no real-sqrt grid, no brFar latch).
-                if (pools[pI][6] === 1) {
-                  dnNear[pI] = lgNF[L];
-                } else {
-                  dnNear[pI] = toOutIn(lgNF[L], zArr[pI]);
-                  if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
+                // ZERO-FLOW (interior-gap) event guard: routeIn==0 means the BINDING leg sits at an
+                // L==0 gap and NO token flows this event, so a non-binding leg neither moves nor
+                // absorbs — leave it UNTOUCHED (matches the oracle, which elides the gap via a cursor
+                // jump inside the adjacent real event). Applying lgNF[L] here (== near) would drift a
+                // oneForZero leg's near by the toOutIn round-trip + stray-latch its brFar.
+                if (routeIn > 0) {
+                  if (pools[pI][6] === 1) {
+                    dnNear[pI] = lgNF[L];
+                  } else {
+                    dnNear[pI] = toOutIn(lgNF[L], zArr[pI]);
+                    if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
+                  }
                 }
               }
             }
@@ -1213,6 +1250,12 @@ function main(
           }
         } else {
           // leg L>0: feed the REALIZED input-token balance across the leg's pools (legIn → legOut).
+          // WHOLE-BALANCE DRAIN: reads the ENTIRE balanceOf(legIn) and the last pool takes the
+          // remainder. This is correct ONLY because routes run fully sequentially (the enclosing
+          // `for r`), so each route produces AND consumes its intermediate within its own contiguous
+          // run before the next route deposits the same token. Two admitted disjoint-POOL routes may
+          // still share an intermediate TOKEN via different edges; that safety rests on THIS exec
+          // order, NOT on prepare's disjoint-pool filter — do not batch legs across routes.
           const inBal: Uint256 = IERC20.at(legIn).balanceOf(address.self);
           if (inBal > 0) {
             let lTotal: Uint256 = 0;

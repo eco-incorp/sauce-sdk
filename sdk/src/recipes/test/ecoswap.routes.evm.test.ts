@@ -1418,3 +1418,634 @@ describe("EcoSwap multi-hop route — WEI-EXACT k>=3 MULTI-POOL MIDDLE leg (A->X
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V2-leg BINDS — the SHALLOW-V2 companion to the deep-V2 block above [defect #3]. Here the V2
+// leg0 is SHALLOW and the V3 leg1 EXTREMELY deep, so the V2 leg's 25bp geometric slice is the
+// SMALLEST gross cross every event ⇒ the V2 leg is the BINDING (crossing) leg. Before the fix the
+// route event ran the V3 tick-cross (ticks()/getTickLiquidity + net) on the V2 pair — a staticcall
+// that reverts the whole cook (the "sized deep enough never to bind" note was a hope, not a guard).
+// The fix advances a V2 binding leg by the geometric slice at CONSTANT L (no tick, no net read),
+// mirrored in the reference + the oracle's type-agnostic cursor advance. Asserts the cook does NOT
+// revert and the split is WEI-EXACT vs the oracle, with the V2 leg crossing MANY slices (bound).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap multi-hop route — WEI-EXACT V2-leg BINDS (shallow V2(A->X) is the binding leg)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let base: Hex;
+  let tokenOut: Hex;
+  let directPool: Hex;
+  let leg0v2: Hex; // V2 A->X (etched, SHALLOW ⇒ binds)
+  let leg1v3: Hex; // V3 X->B (deep ⇒ never binds)
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+  const V2_PAIR_ADDR = "0x00000000000000000000000000000000ec02b17d" as Hex;
+  // SHALLOW V2 reserves: small enough that its 25bp slice gross is the smallest cross → it binds.
+  const V2_RESERVE = parseEther("100000");
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+    const v2Factory = await deployV2Factory(c.walletClient, c.publicClient);
+
+    tokenIn = await deployToken(c.walletClient, c.publicClient, "In", "IN");
+    base = await deployToken(c.walletClient, c.publicClient, "Base", "BASE");
+    tokenOut = await deployToken(c.walletClient, c.publicClient, "Out", "OUT");
+
+    const minter = c.account0;
+    for (const t of [tokenIn, base, tokenOut]) {
+      await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+      await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+    }
+
+    // DIRECT A->B pool: SHALLOW (fills first, then overflows into the route at the cut).
+    directPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, directPool, minter, -12000, 12000, parseEther("8000"),
+    );
+
+    // leg0: ETCHED V2 pair (A<->X) at 1:1, SHALLOW reserves ⇒ its 25bp slice is the smallest cross
+    // ⇒ it BINDS each event. setupEtchedV2Pool needs token0<token1; sort A/X by address.
+    const [v2t0, v2t1] = BigInt(tokenIn) < BigInt(base) ? [tokenIn, base] : [base, tokenIn];
+    leg0v2 = await setupEtchedV2Pool(
+      c.walletClient, c.publicClient, c.testClient, v2Factory, V2_PAIR_ADDR,
+      v2t0, v2t1, V2_RESERVE, V2_RESERVE, minter,
+    );
+    // leg1: V3 X->B, EXTREMELY deep ⇒ its one-bracket cross gross dwarfs the V2 slice, so leg1
+    // NEVER binds — the shallow V2 leg is the unambiguous binding leg every event.
+    leg1v3 = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, base, tokenOut, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, leg1v3, minter, -12000, 12000, parseEther("100000000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+        { address: v2Factory, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Local UniV2" },
+      ],
+      feeTiers: [HOP_FEE_A, HOP_FEE_B],
+      baseTokens: [base],
+    };
+
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("1000000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
+
+  async function readInputBalances(pools: EcoPool[], inputToken: Hex[], directCount: number): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const tk = i < directCount ? tokenIn : inputToken[i];
+      out.push(await balanceOf(c.publicClient, tk, pools[i].address));
+    }
+    return out;
+  }
+
+  async function runV2Binds(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    // Large enough that the direct pool fills and a substantial chunk overflows into the route, so
+    // the shallow V2 leg crosses MANY 25bp slices (it BINDS repeatedly) — the code path that
+    // reverted before the fix.
+    const amountIn = parseEther("20000");
+    const caller = c.account0;
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+    );
+
+    assert.equal(prepared.pools.length, 1, "exactly one direct A->B pool");
+    assert.equal(prepared.routes.length, 1, "exactly one route (through base)");
+    const route = prepared.routes[0];
+    assert.equal(route.legs.length, 2, "2-hop route");
+    assert.ok(route.legs[0].pools[0].isV2, "leg0 pool is V2");
+    assert.ok(!route.legs[1].pools[0].isV2, "leg1 pool is V3");
+
+    const { pools, inputToken, directCount } = buildUniverse(prepared);
+    const ref = kwayReference(prepared, amountIn);
+    const optDirect = await liveOptimalDirect(c, prepared);
+    const optRoutes = await liveOptimalRoutes(c, prepared);
+    const opt = optimalSplit({
+      pools: optDirect, routes: optRoutes, amountIn,
+      zeroForOne: prepared.zeroForOne, priceLimit: prepared.priceLimit,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
+    assert.equal(ref.perRouteInput[0], opt.perRouteInput.reduce((a, b) => a + b, 0n), "reference route == oracle (wei-exact)");
+    assert.equal(ref.perPoolInput[0], opt.perPoolInput[0], "reference direct == oracle (wei-exact)");
+
+    const inBefore = await readInputBalances(pools, inputToken, directCount);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    // The core defect-#3 assertion: the V2 binding leg does NOT revert the cook.
+    assert.equal(receipt.status, "success", "V2-BINDS route cook() must succeed (no tick-cross on the V2 pair)");
+
+    const inAfter = await readInputBalances(pools, inputToken, directCount);
+    const delta: bigint[] = inAfter.map((a, i) => a - inBefore[i]);
+    const idxByAddr = new Map<string, number>();
+    pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
+
+    // WEI-EXACT — direct pool + V2 leg0 tokenIn delta.
+    for (let i = 0; i < directCount; i++) {
+      assert.equal(delta[i], opt.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != oracle (wei)`);
+      assert.equal(delta[i], ref.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != reference (wei)`);
+    }
+    const leg0Idx = idxByAddr.get(route.legs[0].pools[0].address.toLowerCase())!;
+    const leg1Idx = idxByAddr.get(route.legs[1].pools[0].address.toLowerCase())!;
+    assert.equal(delta[leg0Idx], ref.perRouteInput[0], `[${engine}] V2 leg0 tokenIn delta != reference route input (wei)`);
+    assert.equal(delta[leg0Idx], opt.perRouteInput.reduce((a, b) => a + b, 0n), `[${engine}] V2 leg0 tokenIn delta != oracle route input (wei)`);
+    assert.ok(delta[leg1Idx] > 0n, `[${engine}] V3 leg1 received the intermediate token`);
+
+    // The V2 leg is the BINDING leg: it must have crossed MANY 25bp geometric slices, i.e. absorbed
+    // far more than a single slice's gross (≈ reserve*0.0025). A share this large can only arise from
+    // the V2 leg binding event after event (the deep V3 leg1 can never cross its own bracket).
+    const oneSliceGross = (V2_RESERVE * 25n) / 10000n; // ≈ reserve * 25bp (pre-fee), the per-slice gross
+    assert.ok(
+      delta[leg0Idx] > oneSliceGross * 4n,
+      `[${engine}] V2 leg absorbed ${delta[leg0Idx]} > 4 slices (${oneSliceGross * 4n}) ⇒ it BOUND (crossed) repeatedly`,
+    );
+
+    assert.ok(delta[0] > 0n, `[${engine}] direct pool engaged`);
+    assert.ok(ref.perRouteInput[0] > 0n, `[${engine}] V2-binds route engaged`);
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (compute-then-pull)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+
+    console.log(
+      `  [ROUTE-V2BINDS ${engine}] direct=${delta[0]} routeIn(V2 leg0)=${delta[leg0Idx]} leg1In=${delta[leg1Idx]} ` +
+        `slices≈${delta[leg0Idx] / oneSliceGross} spent=${spent} received=${received}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`WEI-EXACT V2 leg BINDS (no tick-cross revert) == optimal [${engine}]`, { skip }, async () => {
+      await runV2Binds(engine);
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHARED-EDGE DISJOINT ROUTES — TWO interior base tokens (X, Y) so the DFS emits routes that would
+// SHARE a leg pool (same-direction: A<->X used by A->X->B and A->X->Y->B) AND traverse the X<->Y
+// pool in OPPOSITE directions (A->X->Y->B vs A->Y->X->B). This block proves the three prepare-side
+// fixes at once:
+//   • [#5] DIRECTED memo — prepare READS the X<->Y edge in BOTH directions; with the old unordered
+//     memo the reverse read reused the forward net rows and stampPoolCache threw, rejecting the
+//     whole prepare. Directed memo ⇒ prepareEcoSwap SUCCEEDS.
+//   • [#1/#2] DISJOINT selection — the admitted routes claim every leg pool at most once (the
+//     universe dedup becomes a no-op), so no pool double-spends its inp[] or inverts its PoolKey.
+// Asserts the admitted universe is DISJOINT by address, prepare succeeds, and the cook is WEI-EXACT
+// vs the oracle with spent == Σ pool inputs (no double-spend). Plus an ADVERSE-DRIFT re-anchor case.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap multi-hop route — DISJOINT shared-edge routes (2 interiors, directed memo + no double-spend)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let xTok: Hex;
+  let yTok: Hex;
+  let tokenOut: Hex;
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+  // The route-leg pools we drift in the adverse-drift case.
+  let axPool: Hex; // A<->X
+  let ayPool: Hex; // A<->Y
+
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+
+    tokenIn = await deployToken(c.walletClient, c.publicClient, "In", "IN");
+    xTok = await deployToken(c.walletClient, c.publicClient, "MidX", "MIDX");
+    yTok = await deployToken(c.walletClient, c.publicClient, "MidY", "MIDY");
+    tokenOut = await deployToken(c.walletClient, c.publicClient, "Out", "OUT");
+
+    const minter = c.account0;
+    for (const t of [tokenIn, xTok, yTok, tokenOut]) {
+      await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+      await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+    }
+
+    // DIRECT A->B: SHALLOW (fills first, then overflows into the two 2-hop routes at the cut).
+    const directPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, directPool, minter, -12000, 12000, parseEther("6000"),
+    );
+
+    // A full mesh so the DFS emits A->X->B, A->Y->B (2-hop) AND A->X->Y->B, A->Y->X->B (3-hop) —
+    // the 3-hop routes SHARE leg0 with the 2-hops (A<->X / A<->Y) and traverse X<->Y in BOTH
+    // directions. All 0.30% deep pools at 1:1 so the two 2-hop routes engage symmetrically.
+    axPool = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, xTok, HOP_FEE_B, SQRT_PRICE_1_1);
+    const xbPool = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, xTok, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1);
+    ayPool = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, tokenIn, yTok, HOP_FEE_B, SQRT_PRICE_1_1);
+    const ybPool = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, yTok, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1);
+    const xyPool = await createAndInitPool(c.walletClient, c.publicClient, stack.factory, xTok, yTok, HOP_FEE_B, SQRT_PRICE_1_1);
+    for (const p of [axPool, xbPool, ayPool, ybPool, xyPool]) {
+      await mintPosition(c.walletClient, c.publicClient, stack.helper, p, minter, -12000, 12000, parseEther("400000"));
+    }
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+      ],
+      feeTiers: [HOP_FEE_A, HOP_FEE_B],
+      baseTokens: [xTok, yTok],
+    };
+
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("1000000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
+
+  /** Every executable pool address (direct + every route leg pool) must be UNIQUE (disjoint). */
+  function assertDisjoint(prepared: EcoSwapPrepared): void {
+    const seen = new Map<string, string>();
+    const claim = (addr: string, where: string): void => {
+      const k = addr.toLowerCase();
+      const prev = seen.get(k);
+      assert.equal(prev, undefined, `pool ${addr} claimed by BOTH ${prev} and ${where} (not disjoint)`);
+      seen.set(k, where);
+    };
+    prepared.pools.forEach((p, i) => claim(p.address, `direct[${i}]`));
+    prepared.routes.forEach((r, ri) =>
+      r.legs.forEach((leg, li) => leg.pools.forEach((lp, pi) => claim(lp.address, `route[${ri}].leg[${li}].pool[${pi}]`))),
+    );
+  }
+
+  async function runDisjoint(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const amountIn = parseEther("20000");
+    const caller = c.account0;
+
+    // prepareEcoSwap SUCCEEDING is itself the [#5] directed-memo assertion: the DFS reads the X<->Y
+    // edge in both directions; the old unordered memo threw in stampPoolCache before we got here.
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+    );
+
+    // [#1/#2] The admitted universe is DISJOINT — every leg pool claimed at most once.
+    assertDisjoint(prepared);
+    assert.ok(prepared.routes.length >= 2, `expected >=2 admitted routes (got ${prepared.routes.length})`);
+
+    const { pools, inputToken, directCount } = buildUniverse(prepared);
+    // buildUniverse dedups by address; with disjoint routes it must equal Σ (direct + all leg pools)
+    // with NO collision — i.e. the universe size equals the raw pool count.
+    const rawPoolCount =
+      prepared.pools.length + prepared.routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
+    assert.equal(pools.length, rawPoolCount, "universe has no deduped (shared) pool — disjoint by construction");
+
+    const ref = kwayReference(prepared, amountIn);
+    const optDirect = await liveOptimalDirect(c, prepared);
+    const optRoutes = await liveOptimalRoutes(c, prepared);
+    const opt = optimalSplit({
+      pools: optDirect, routes: optRoutes, amountIn,
+      zeroForOne: prepared.zeroForOne, priceLimit: prepared.priceLimit,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
+    for (let r = 0; r < prepared.routes.length; r++) {
+      assert.equal(ref.perRouteInput[r], opt.perRouteInput[r], `route[${r}] reference input == oracle (wei-exact)`);
+    }
+
+    const inBefore: bigint[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const tk = i < directCount ? tokenIn : inputToken[i];
+      inBefore.push(await balanceOf(c.publicClient, tk, pools[i].address));
+    }
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "disjoint-route cook() must succeed");
+
+    // WEI-EXACT — direct pool tokenIn deltas.
+    for (let i = 0; i < directCount; i++) {
+      const after = await balanceOf(c.publicClient, tokenIn, pools[i].address);
+      assert.equal(after - inBefore[i], ref.perPoolInput[i], `[${engine}] direct[${i}] delta != reference (wei)`);
+    }
+
+    // NO DOUBLE-SPEND — the caller spent EXACTLY Σ (all pool inputs) == reference totalInput. Under
+    // the old shared-edge bug a leg pool would swap its inp[] more than once, so the realized spend
+    // would exceed the computed total (or the intermediate accounting would drift).
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (no double-spend)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+    // Both 2-hop routes engaged (symmetric X/Y legs).
+    const engaged = ref.perRouteInput.filter((x) => x > 0n).length;
+    assert.ok(engaged >= 2, `[${engine}] both disjoint routes engaged (${engaged})`);
+
+    console.log(
+      `  [ROUTE-DISJOINT ${engine}] routes=${prepared.routes.length} routeInputs=[${ref.perRouteInput.join(", ")}] ` +
+        `spent=${spent} received=${received}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`DISJOINT shared-edge routes: directed memo + no double-spend, wei-exact [${engine}]`, { skip }, async () => {
+      await runDisjoint(engine);
+    });
+  }
+
+  // ADVERSE-DRIFT route re-anchor: prepare()+compile() clean, drift a surviving route's leg0 pool
+  // DOWN with a real swap, then cook the PRE-DRIFT bytecodes — the recipe must re-anchor to the LIVE
+  // (drifted) grid at cook and still spend the full amountIn (input-anchored), routing STRICTLY LESS
+  // through the drifted leg while the untouched route picks up the difference.
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`ADVERSE-DRIFT route re-anchor: drifted leg's route share shrinks [${engine}]`, { skip }, async () => {
+      const target = cookTarget(engine, stack, v12);
+      const amountIn = parseEther("20000");
+      const caller = c.account0;
+
+      // Baseline (no drift): record the A<->X leg pool's tokenIn share.
+      await resetPools();
+      const baseline = await ecoSwap(
+        { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+      );
+      const axBefore0 = await balanceOf(c.publicClient, tokenIn, axPool);
+      const callerInBefore0 = await balanceOf(c.publicClient, tokenIn, caller);
+      await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+      const r0 = await cook(c.walletClient, c.publicClient, target, baseline.bytecodes);
+      assert.equal(r0.receipt.status, "success", "baseline cook ok");
+      const baselineAxShare = (await balanceOf(c.publicClient, tokenIn, axPool)) - axBefore0;
+      const baselineSpent = callerInBefore0 - (await balanceOf(c.publicClient, tokenIn, caller));
+      assert.ok(baselineAxShare > 0n, "baseline routes some tokenIn through the A<->X leg");
+
+      // Fresh state: prepare()+compile() clean, drift A<->X DOWN, cook the PRE-DRIFT bytecodes.
+      await resetPools();
+      const { bytecodes } = await ecoSwap(
+        { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+      );
+      const zHop = BigInt(tokenIn) < BigInt(xTok);
+      const axEco: EcoPool = {
+        poolType: SwapPoolType.UniV3, address: axPool, fee: HOP_FEE_B, tickSpacing: 60, hooks: ZERO,
+        feePpm: HOP_FEE_B, isV2: false, inIsToken0: zHop,
+        stateView: ZERO, poolId: ("0x" + "0".repeat(64)) as Hex, source: "drift",
+      };
+      await driftPoolPrice(c, stack.sauceRouter, axEco, tokenIn, xTok, zHop, parseEther("9000"), caller);
+
+      const axBefore1 = await balanceOf(c.publicClient, tokenIn, axPool);
+      const callerInBefore1 = await balanceOf(c.publicClient, tokenIn, caller);
+      await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+      const r1 = await cook(c.walletClient, c.publicClient, target, bytecodes);
+      assert.equal(r1.receipt.status, "success", "pre-drift cook against drifted state ok");
+      const driftedAxShare = (await balanceOf(c.publicClient, tokenIn, axPool)) - axBefore1;
+      const recipeSpent = callerInBefore1 - (await balanceOf(c.publicClient, tokenIn, caller));
+
+      assert.equal(recipeSpent, baselineSpent, `[${engine}] input-anchored: spends the same total as baseline`);
+      assert.ok(
+        driftedAxShare < baselineAxShare,
+        `[${engine}] re-anchor: A<->X leg share shrank under drift (drifted ${driftedAxShare} < baseline ${baselineAxShare})`,
+      );
+
+      console.log(
+        `  [ROUTE-DISJOINT-DRIFT ${engine}] baselineSpent=${baselineSpent} recipeSpent=${recipeSpent} ` +
+          `axShare ${baselineAxShare} -> ${driftedAxShare}`,
+      );
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERIOR L==0 GAP route [defect #4] — a route whose binding leg0 pool has an interior dL==0 gap
+// (two disjoint liquidity bands with an un-initialised region between them). The walk-through-gap
+// design leaves the leg ACTIVE with L==0 in the gap; the next route event's binding-leg back-
+// propagation used to divide by that leg's 0 liquidity (Math.mulDiv(_, Q96, 0) / invertFarFromOut)
+// → a division-by-zero Panic that reverted the whole cook. The fix treats an L==0 leg as the
+// lowest-index binding leg that advances THROUGH its gap with routeIn 0 (0 flow, no other leg
+// moves) — matching the direct-pool walk-through-gap and the oracle (which elides the gap). Asserts
+// the cook does NOT Panic and the split is WEI-EXACT vs the oracle (which walks the same net map).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("EcoSwap multi-hop route — WEI-EXACT interior L==0 GAP (leg0 has a dL==0 gap downstream)", () => {
+  let anvil: AnvilHandle;
+  let c: HarnessClients;
+  let stack: DeployedStack;
+  let v12: DeployedV12Stack | null = null;
+  let tokenIn: Hex;
+  let base: Hex;
+  let tokenOut: Hex;
+  let directPool: Hex;
+  let leg0gap: Hex; // A->X V3 with a two-band interior gap ⇒ binds AND walks a dL==0 gap
+  let leg1: Hex; // X->B V3 deep
+  let poolConfig: ChainPoolConfig;
+  let cleanSnapshot: Hex;
+
+  const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
+
+  before(async () => {
+    anvil = await startAnvil();
+    c = await makeClients(anvil.rpcUrl);
+    await ensureMulticall3(c.publicClient, c.testClient);
+    stack = await deployStack(c.walletClient, c.publicClient);
+
+    tokenIn = await deployToken(c.walletClient, c.publicClient, "In", "IN");
+    base = await deployToken(c.walletClient, c.publicClient, "Base", "BASE");
+    tokenOut = await deployToken(c.walletClient, c.publicClient, "Out", "OUT");
+
+    const minter = c.account0;
+    for (const t of [tokenIn, base, tokenOut]) {
+      await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+      await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+    }
+
+    // DIRECT A->B pool: SHALLOW (fills first, then the route absorbs the overflow and walks the gap).
+    directPool = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, tokenOut, HOP_FEE_B, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, directPool, minter, -12000, 12000, parseEther("6000"),
+    );
+
+    // leg0 (A->X): a 0.05% (ts=10) V3 pool with TWO disjoint liquidity bands and an INTERIOR GAP.
+    // A NEAR band [-100, 100] (modest L, exhausts quickly) and a DEEP band away from spot on BOTH
+    // sides ([-800, -300] and [300, 800]); the un-initialised region between (|tick| in (100, 300))
+    // is a dL==0 gap the binding walk crosses on its way into the deep band. Modest near-band L so
+    // the route pushes leg0 past [±100] into the gap within the trade; the deep bands are the same
+    // fee tier so the leg keeps a competitive head after the gap. Symmetric so either swap direction
+    // (address-order dependent) hits the gap.
+    leg0gap = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, tokenIn, base, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, leg0gap, minter, -100, 100, parseEther("40000"));
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, leg0gap, minter, -800, -300, parseEther("4000000"));
+    await mintPosition(c.walletClient, c.publicClient, stack.helper, leg0gap, minter, 300, 800, parseEther("4000000"));
+
+    // leg1 (X->B): EXTREMELY deep ⇒ never binds; leg0 (with the gap) is the binding leg.
+    leg1 = await createAndInitPool(
+      c.walletClient, c.publicClient, stack.factory, base, tokenOut, HOP_FEE_A, SQRT_PRICE_1_1,
+    );
+    await mintPosition(
+      c.walletClient, c.publicClient, stack.helper, leg1, minter, -12000, 12000, parseEther("100000000"),
+    );
+
+    poolConfig = {
+      factories: [
+        { address: stack.factory, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Local UniV3" },
+      ],
+      feeTiers: [HOP_FEE_A, HOP_FEE_B],
+      baseTokens: [base],
+    };
+
+    await mint(c.walletClient, c.publicClient, tokenIn, minter, parseEther("1000000"));
+    v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
+    if (v12) await approve(c.walletClient, c.publicClient, tokenIn, v12.pot, HUGE);
+
+    cleanSnapshot = await c.testClient.snapshot();
+  });
+
+  after(() => anvil?.stop());
+
+  async function resetPools(): Promise<void> {
+    await c.testClient.revert({ id: cleanSnapshot });
+    cleanSnapshot = await c.testClient.snapshot();
+    await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+  }
+
+  async function readInputBalances(pools: EcoPool[], inputToken: Hex[], directCount: number): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const tk = i < directCount ? tokenIn : inputToken[i];
+      out.push(await balanceOf(c.publicClient, tk, pools[i].address));
+    }
+    return out;
+  }
+
+  async function runGap(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    // Large enough that the route pushes leg0 past the near [±100] band, INTO the dL==0 gap, and out
+    // the far side — the code path that Panicked before the fix.
+    const amountIn = parseEther("20000");
+    const caller = c.account0;
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn }, anvil.rpcUrl, target, caller, poolConfig, { minRelBps: 0 }, engine,
+    );
+
+    assert.equal(prepared.pools.length, 1, "one direct A->B pool");
+    assert.equal(prepared.routes.length, 1, "one route (through base)");
+    const route = prepared.routes[0];
+    assert.equal(route.legs.length, 2, "2-hop route");
+    // leg0's net map must contain the gap structure on the WALK side: the near band's boundary, then
+    // (after an interior dL==0 region) the deep band's two boundaries — so the swap-direction walk
+    // sees [near-band edge] → [dL==0 gap] → [deep band]. A driftTicks:0 lens scans only the swap
+    // side, so this is 3 initialized ticks with a >1-tickSpacing gap between the near-band edge and
+    // the deep band.
+    const gapLegPool = route.legs[0].pools.find((p) => p.address.toLowerCase() === leg0gap.toLowerCase());
+    assert.ok(gapLegPool, "leg0 includes the gapped A<->X pool");
+    const initTicks = [...(gapLegPool!.adaptiveNet ?? new Map<number, bigint>()).entries()]
+      .filter(([, n]) => n !== 0n)
+      .map(([t]) => t)
+      .sort((a, b) => a - b);
+    // ≥2 initialized ticks that bracket a multi-tickSpacing jump == the near-band edge and the deep
+    // band's start, with an interior dL==0 gap between (the deep band's far edge is out-of-window
+    // under driftTicks:0, so only the near boundary of each band is captured — enough for the walk
+    // to know liquidity resumes past the gap).
+    assert.ok(initTicks.length >= 2, `gapped leg net has >=2 initialized ticks (got ${initTicks.length}: ${initTicks})`);
+    const ts0 = gapLegPool!.tickSpacing;
+    const hasGap = initTicks.some((t, i) => i > 0 && t - initTicks[i - 1] > 2 * ts0);
+    assert.ok(hasGap, `leg0 net has an interior multi-tick gap (ticks ${initTicks}, ts=${ts0})`);
+
+    const { pools, inputToken, directCount } = buildUniverse(prepared);
+    const ref = kwayReference(prepared, amountIn); // MUST NOT throw (routeEventN gap guard)
+    const optDirect = await liveOptimalDirect(c, prepared);
+    const optRoutes = await liveOptimalRoutes(c, prepared);
+    const opt = optimalSplit({
+      pools: optDirect, routes: optRoutes, amountIn,
+      zeroForOne: prepared.zeroForOne, priceLimit: prepared.priceLimit,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei-exact)");
+    assert.equal(ref.perRouteInput[0], opt.perRouteInput.reduce((a, b) => a + b, 0n), "reference route == oracle (wei-exact)");
+    assert.equal(ref.perPoolInput[0], opt.perPoolInput[0], "reference direct == oracle (wei-exact)");
+
+    const inBefore = await readInputBalances(pools, inputToken, directCount);
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const callerOutBefore = await balanceOf(c.publicClient, tokenOut, caller);
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    // The core defect-#4 assertion: the interior dL==0 gap does NOT Panic the cook.
+    assert.equal(receipt.status, "success", "L==0-gap route cook() must succeed (no division-by-zero Panic)");
+
+    const inAfter = await readInputBalances(pools, inputToken, directCount);
+    const delta: bigint[] = inAfter.map((a, i) => a - inBefore[i]);
+    const idxByAddr = new Map<string, number>();
+    pools.forEach((p, i) => idxByAddr.set(p.address.toLowerCase(), i));
+
+    for (let i = 0; i < directCount; i++) {
+      assert.equal(delta[i], opt.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != oracle (wei)`);
+      assert.equal(delta[i], ref.perPoolInput[i], `[${engine}] direct pool[${i}] input delta != reference (wei)`);
+    }
+    const leg0Idx = idxByAddr.get(leg0gap.toLowerCase())!;
+    const leg1Idx = idxByAddr.get(route.legs[1].pools[0].address.toLowerCase())!;
+    assert.equal(delta[leg0Idx], ref.perUniversePoolInput[leg0Idx], `[${engine}] gap leg0 input != reference (wei)`);
+    assert.ok(delta[leg1Idx] > 0n, `[${engine}] leg1 received the intermediate token`);
+    assert.equal(delta[leg0Idx], ref.perRouteInput[0], `[${engine}] on-chain route input == reference (wei)`);
+
+    // GAP ENTERED: leg0's post-cook tick moved PAST its ±100 near band into the interior dL==0 gap
+    // region (|tick| > 100), proving the binding walk actually reached the gap the fix guards — not
+    // merely partial-filled the near band. (The direction is address-order dependent; check |tick|.)
+    const { tick: leg0Tick } = await getSlot0(c.publicClient, leg0gap);
+    assert.ok(Math.abs(leg0Tick) > 100, `[${engine}] gap leg0 walked past its near band into the gap (post-cook tick ${leg0Tick})`);
+
+    assert.ok(delta[0] > 0n, `[${engine}] direct pool engaged`);
+    assert.ok(ref.perRouteInput[0] > 0n, `[${engine}] gap route engaged`);
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const received = (await balanceOf(c.publicClient, tokenOut, caller)) - callerOutBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (compute-then-pull)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+
+    console.log(
+      `  [ROUTE-GAP ${engine}] direct=${delta[0]} routeIn(gap leg0)=${delta[leg0Idx]} leg1In=${delta[leg1Idx]} ` +
+        `initTicks=${initTicks} spent=${spent} received=${received}`,
+    );
+  }
+
+  for (const { engine, skip } of ENGINE_CELLS) {
+    it(`WEI-EXACT interior L==0 gap route (no Panic) == optimal [${engine}]`, { skip }, async () => {
+      await runGap(engine);
+    });
+  }
+});
