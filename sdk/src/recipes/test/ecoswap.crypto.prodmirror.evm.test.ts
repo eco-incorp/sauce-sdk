@@ -8,6 +8,14 @@
  * swap against them, proving the production discovery + execution path works on the real Vyper contract,
  * with NO fork and NO RPC at run time (etch + setStorageAt, seconds).
  *
+ * QUOTE-LADDER (QL) — closing the offline COOK gap. CryptoSwap is a QL venue (like Curve StableSwap):
+ * prepare ships ONLY a descriptor and the on-chain solver BUILDS the price ladder in setup from LIVE
+ * get_dy. Unlike Curve's FRAXUSDe prod-mirror (whose get_dy delegates to UNCAPTURED singletons, so its
+ * QL cook is skipped), this Twocrypto v2.1.0d pool's get_dy is SELF-CONTAINED in {pool, VIEW, MATH} —
+ * all etched — so the on-chain QL ladder build runs OFFLINE against the real bytecode. This test COOKS
+ * it via the QL path with ZERO prepared segments (only the descriptor), asserting the on-chain-built
+ * ladder matches the real pool get_dy at every QL point AND lands the neutral oracle's split to the wei.
+ *
  * POOL: crvUSD/WETH Twocrypto (0x6e5492F8…), Ethereum, block 2544xxxx — the fxswap/"boom" twocrypto-ng
  * generation (sourcify-verified, `version() == "v2.1.0d"`, Vyper 0.4.3) the canonical factory deploys:
  * crypto periphery (price_scale repeg + dynamic fee) over a STABLESWAP invariant. A self-contained
@@ -53,12 +61,13 @@
  *   • The shared off-chain `cryptoswap-math.ts` replay mirrors THIS deployed pool family (the fxswap/
  *     "boom" Twocrypto v2.1.0d: STABLESWAP get_y/newton_D with Ann = A·N and gamma ignored, the view's
  *     RAW-product xp scaling, the v2.1.0d dynamic fee on the POST-swap xp) — wei-exact against the
- *     captured mainnet probes AND, in this test, against the etched real bytecode at EVERY production
+ *     captured mainnet probes AND, in this test, against the etched real bytecode at EVERY QL
  *     ladder point. So this test runs the FULL production path unmasked: DISCOVERY
  *     (discoverCryptoSwapPoolsTyped → find_pool_for_coins → get_coin_indices [UINT256] → the live pool
- *     reads) resolves + orients the pool, the PRODUCTION buildCryptoSwapSegments samples the ladder off
- *     the discovered descriptor (asserted == the real pool's own get_dy at every cumulative grid point),
- *     and the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts compiles) cooks it.
+ *     reads) resolves + orients the pool, the PRODUCTION buildCryptoSwapQLLadder replays the descriptor
+ *     off-chain (asserted == the real pool's own get_dy at every QL grid point — the SAME points the
+ *     on-chain qlv loop quotes), and the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts
+ *     compiles) COOKS the QL descriptor, building the ladder ON-CHAIN from the real live get_dy.
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the artifacts
  * are absent). No state cache — etch+setStorage is a few seconds.
@@ -103,7 +112,8 @@ import {
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, MIN_SQRT_RATIO, type ChainPoolConfig } from "../shared/constants";
 import { discoverCryptoSwapPoolsTyped } from "../shared/pool-discovery";
-import { getDyCrypto, buildCryptoSwapSegments, type CryptoSwapSegment } from "../shared/cryptoswap-math";
+import { getDyCrypto, buildCryptoSwapQLLadder } from "../shared/cryptoswap-math";
+import { optimalSplit } from "./ecoswap.optimal";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SNAP_NAME = "ethereum-curveCrypto-crvUSDWETH";
@@ -159,39 +169,32 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     };
   }
 
-  // The solver's 5 compiler args, in index.ts order (cfg, pools, netCache, routing, segs). CryptoSwap-only
-  // run: zero direct pools/routes/netCache; the venue rides entirely inside segs (segKind 9).
-  function cryptoArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, segs: bigint[][]): unknown[] {
+  // The solver's 6 compiler args, in index.ts order (cfg, pools, netCache, routing, segs, qlv). CryptoSwap
+  // is a QUOTE-LADDER (QL) venue now: ZERO prepared segments (segs = []) — the venue rides entirely inside
+  // qlv as a DESCRIPTOR, and the solver builds its price ladder ON-CHAIN from live get_dy at cook time.
+  function cryptoArgs(tokenIn: Hex, tokenOut: Hex, amountIn: bigint, caller: Hex, qlv: bigint[][]): unknown[] {
     return [
       [
         BigInt(tokenIn),
         BigInt(tokenOut),
         amountIn,
         BigInt(caller),
-        MIN_SQRT_RATIO + 1n, // priceLimit (unused by static segments)
+        MIN_SQRT_RATIO + 1n, // priceLimit (unused by QL venues)
         0n, // directCount — no direct pools
       ],
       [], // pools
       [], // netCache
       [], // routing
-      segs,
+      [], // segs — ZERO prepared static segments (the QL cook is prepare-optional)
+      qlv,
     ];
   }
 
-  // PRODUCTION-sampled segments as the solver's 7-col segs rows (mirrors index.ts buildSegs + the mock
-  // test's cryptoSegRows). refIdx tags the on-chain per-venue accumulator (cryinp[refIdx]); venue is the
-  // pool. segKind = 9 (Curve CryptoSwap, callback-free); a CryptoSwap segment is a flat post-fee slice ⇒
-  // sqrtAdjNear == sqrtAdjFar == marginalOI.
-  function cryptoSegRows(segs: CryptoSwapSegment[], refIdx: number, pool: Hex): bigint[][] {
-    return segs.map((s) => [
-      BigInt(refIdx),
-      s.capacity,
-      s.marginalOI, // sqrtAdjNear (post-fee; the descending-price sort key)
-      s.marginalOI, // sqrtAdjFar (a CryptoSwap segment is a flat slice)
-      9n, // segKind = Curve CryptoSwap (callback-free)
-      BigInt(pool),
-      0n, // venueAux — unused for non-Mento kinds; padded to mirror production's 7-col seg shape
-    ]);
+  // One QL CryptoSwap descriptor: [poolAddr, i, j, feePpm, segKind=9, refIdx]. i/j are the UINT256 coin
+  // indices discovery resolved; feePpm is informational (a CryptoSwap get_dy is post-fee — the on-chain
+  // head needs no fee-adjust). NO sampled values: the solver builds the ladder from live get_dy on-chain.
+  function cryptoDescriptor(pool: Hex, i: number, j: number, feePpm: number, refIdx: number): bigint[] {
+    return [BigInt(pool), BigInt(i), BigInt(j), BigInt(feePpm), 9n, BigInt(refIdx)];
   }
 
   // ── (a) REAL BYTECODE — the etched code IS the captured mainnet runtime, byte-for-byte. ──
@@ -327,35 +330,38 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     assert.equal(discovered[0].A, etched.A, "discovery read the live A off the real pool");
     assert.equal(discovered[0].D, etched.D, "discovery read the live D off the real pool");
 
-    // PRODUCTION SAMPLER, unmasked: buildCryptoSwapSegments replays the discovered descriptor off-chain
-    // (no RPC) — exactly what prepare() ships the solver.
-    const realSegs = buildCryptoSwapSegments(discovered[0], amountIn);
-    assert.ok(realSegs.length > 0, "production segment ladder is non-empty");
-    const segSum = realSegs.reduce((a, s) => a + s.capacity, 0n);
-    assert.equal(segSum, amountIn, "production ladder covers the full amountIn");
+    // PRODUCTION QL LADDER, unmasked: buildCryptoSwapQLLadder replays the discovered descriptor off-chain
+    // (no RPC) — the SAME geometric quote ladder the on-chain solver builds in setup from live get_dy. This
+    // is what the neutral oracle consumes, so the split is wei-exact vs the solver by construction.
+    const ladder = buildCryptoSwapQLLadder(discovered[0], amountIn);
+    assert.ok(ladder.length > 0, "production QL ladder is non-empty");
+    const ladderSum = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.equal(ladderSum, amountIn, "production QL ladder covers the full amountIn");
 
-    // LADDER PARITY — the core gate this test exists for: at EVERY cumulative ladder point the off-chain
+    // LADDER PARITY — the core gate this test exists for: at EVERY cumulative QL ladder point the off-chain
     // replay (getDyCrypto on the discovered state) == the REAL etched pool's OWN get_dy view, to the WEI.
-    // This pins the whole production quote path (raw-product xp scaling, the fx/boom stableswap get_y,
-    // the v2.1.0d dynamic fee on the post-swap xp) against the genuine deployed bytecode.
+    // These are the EXACT points the on-chain qlv loop quotes, so this pins the whole QL quote path (raw-
+    // product xp scaling, the fx/boom stableswap get_y, the v2.1.0d dynamic fee on the post-swap xp) against
+    // the genuine deployed bytecode: the on-chain-built ladder == the oracle ladder == the solver's, wei-exact.
     let cum = 0n;
     let cumOut = 0n;
-    for (const s of realSegs) {
+    for (const s of ladder) {
       cum += s.capacity;
       cumOut += s.effOut;
       const offChain = getDyCrypto(discovered[0], cum);
       const onChain = (await c.publicClient.readContract({
         address: etched.pool, abi: curveCryptoPoolReadAbi, functionName: "get_dy", args: [iBig, jBig, cum],
       })) as bigint;
-      assert.equal(offChain, onChain, `ladder parity at cum=${cum}: getDyCrypto == REAL get_dy (wei-exact)`);
-      assert.equal(cumOut, offChain, `ladder partition at cum=${cum}: Σ effOut == getDyCrypto(cum)`);
+      assert.equal(offChain, onChain, `QL ladder parity at cum=${cum}: getDyCrypto == REAL get_dy (wei-exact)`);
+      assert.equal(cumOut, offChain, `QL ladder partition at cum=${cum}: Σ effOut == getDyCrypto(cum)`);
     }
 
-    // NEUTRAL ORACLE over the SAME production segments: the awarded input Σ each venue receives. With ONE
-    // venue whose segment ladder covers [0, amountIn], the merge awards the whole covered Σ to it — the
-    // awarded == segSum == amountIn by construction (no split).
-    const awarded = segSum;
-    assert.ok(awarded > 0n, "oracle awards to the reproduced CryptoSwap venue");
+    // NEUTRAL ORACLE over the SAME QL ladder (buildCryptoSwapQLLadder): the awarded input Σ each venue
+    // receives. With ONE venue whose ladder covers [0, amountIn], the merge awards the whole covered Σ to
+    // it — the awarded == amountIn by construction (single-venue full-fill, asserted on-chain below).
+    const oracle = optimalSplit({ pools: [{ cryptoSwap: discovered[0], feePpm: 0 }], amountIn, zeroForOne: true });
+    const awarded = oracle.perPoolInput[0] ?? 0n;
+    assert.equal(awarded, amountIn, "oracle awards the whole trade to the reproduced CryptoSwap QL venue");
 
     // The REAL pool's OWN pre-swap get_dy view for the KNOWN awarded Σ — the engine-independent ground
     // truth for the executed dy (the ACTUAL swap math the recipe reads for min_dy). Already proven ==
@@ -365,11 +371,13 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     })) as bigint;
     assert.equal(onViewPre, getDyCrypto(discovered[0], awarded), "REAL get_dy(awarded) == production replay (wei-exact)");
 
-    // Compile the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts compiles) with the
-    // production-sampled crypto segs, and cook it — the recipe reads real get_dy for min_dy + runs real
-    // exchange.
-    const segRows = cryptoSegRows(realSegs, 0, etched.pool);
-    const { bytecodes } = compileSauce(solverSrc, cryptoArgs(tokenIn, tokenOut, amountIn, caller, segRows), ECOSWAP_DIR, engine);
+    // Compile the PRODUCTION ecoswap.sauce.ts solver (the same template index.ts compiles) with ZERO
+    // prepared segments — only the QL DESCRIPTOR — and cook it: the solver builds the ladder ON-CHAIN from
+    // the REAL pool's live get_dy (self-contained in {pool, VIEW, MATH}, all etched — so it runs OFFLINE,
+    // the gap Curve's FRAXUSDe prod-mirror could not close), reads real get_dy for min_dy, and runs real
+    // exchange. This is the QL prod-mirror COOK gap, closed against genuine mainnet twocrypto-NG bytecode.
+    const qlv = [cryptoDescriptor(etched.pool, discovered[0].i, discovered[0].j, discovered[0].feePpm, 0)];
+    const { bytecodes } = compileSauce(solverSrc, cryptoArgs(tokenIn, tokenOut, amountIn, caller, qlv), ECOSWAP_DIR, engine);
 
     await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
     await mint(c.walletClient, c.publicClient, tokenIn, caller, amountIn); // ensure headroom
@@ -392,13 +400,13 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     // the transfer-first Solidly path) — so the pool nets the FULL input.
     assert.equal(poolIn, spent, "REAL CryptoSwap pool netted the FULL input (fee is taken on the output dy, not the input)");
 
-    // WEI-EXACT: the on-chain spend == the awarded Σ to the WEI. NO tolerance. The static-segment cursor
-    // consumes the IDENTICAL grid the oracle awarded, so spent == awarded == segSum.
-    assert.equal(spent, awarded, "on-chain spent == awarded input (wei-exact-on-grid)");
+    // WEI-EXACT: the on-chain spend == the awarded Σ to the WEI. NO tolerance. The on-chain-built QL ladder
+    // is the IDENTICAL grid the oracle awarded (proven at every point above), so spent == awarded == ladderSum.
+    assert.equal(spent, awarded, "on-chain spent == awarded input (wei-exact vs oracle)");
     // Single-venue full-fill: the ~1%-of-reserve sizing keeps the ladder within [0, amountIn], so the whole
     // trade allocates to the one pool. Assert it EXPLICITLY (a regression that under-fills or splits fails
-    // here, not silently). segSum == amountIn was asserted on the production ladder above.
-    assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (no unspent wei, no split)");
+    // here, not silently). ladderSum == amountIn was asserted on the production QL ladder above.
+    assert.equal(spent, amountIn, "single-venue full-fill: spent == amountIn (no unspent wei)");
 
     // The caller-received tokenOut == the REAL pool's OWN pre-swap get_dy view for the awarded Σ, to the
     // WEI — the actual swap math the recipe read for min_dy AND executed. NO tolerance. (get_dy MUST be
@@ -409,7 +417,7 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     const ms = Date.now() - t0;
     console.log(
       `  [crypto-prod-mirror:${engine}] WEI-EXACT vs the REAL pool get_dy — spent=${spent} received=${received} ` +
-        `(awarded Σ=${awarded}, realGetDy=${onViewPre}); ${realSegs.length} real-curve segs; ` +
+        `(awarded Σ=${awarded}, realGetDy=${onViewPre}); ${ladder.length} on-chain QL slices; ` +
         `wall-clock ${ms} ms (no fork, no RPC)`,
     );
   }

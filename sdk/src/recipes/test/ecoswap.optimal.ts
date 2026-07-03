@@ -62,7 +62,7 @@ import {
 // (buildCurve/Lb/DodoBrackets). The oracle enumerates the SAME segments from true live state, so
 // the split is exact-on-grid (EXACT for LB — a bin is a flat constant-sum slice).
 import { buildCurveQLLadder, type CurvePool } from "../shared/curve-math.js";
-import { buildCryptoSwapSegments, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
+import { buildCryptoSwapQLLadder, type CryptoSwapPool } from "../shared/cryptoswap-math.js";
 import { buildLbSegments, type LbPool } from "../shared/lb-math.js";
 import { buildDodoSegments, type DodoPool } from "../shared/dodo-math.js";
 import { buildSolidlyStableSegments, type SolidlyStablePool } from "../shared/solidly-stable-math.js";
@@ -199,12 +199,12 @@ export interface OptimalPool {
   maverick?: MaverickPool;
   /**
    * Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) pool — when present this pool is a
-   * CRYPTOSWAP venue (NOT V2/V3/Curve-stable/LB/DODO/Solidly/Wombat/Balancer/Euler/Maverick). The
-   * oracle enumerates its segments via the SHARED bounded-Newton A-gamma replay
-   * (buildCryptoSwapSegments) from the live A/gamma/price_scale/D/balances/fee state, so the split is
-   * exact-on-grid vs prepare's segments (one replay). The CryptoSwap marginalOI is the post-fee
-   * execution price (getDyCrypto nets the dynamic fee); adjNear == adjFar == marginalOI. All the other
-   * venue fields are ignored when `cryptoSwap` is set.
+   * QUOTE-LADDER (QL) CRYPTOSWAP venue (NOT V2/V3/Curve-stable/LB/DODO/Solidly/Wombat/Balancer/Euler/
+   * Maverick). The oracle builds its segments via the SHARED buildCryptoSwapQLLadder replay — the
+   * IDENTICAL geometric quote ladder the on-chain solver builds in setup from live get_dy — so the split
+   * is wei-exact vs the solver by construction (no prepared segments). The CryptoSwap marginalOI is the
+   * post-fee execution price (getDyCrypto nets the dynamic fee); adjNear == adjFar == marginalOI. All the
+   * other venue fields are ignored when `cryptoSwap` is set.
    */
   cryptoSwap?: CryptoSwapPool;
   /**
@@ -640,16 +640,17 @@ function maverickSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Se
 }
 
 /**
- * Enumerate one Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) pool's segments via the SHARED
- * bounded-Newton A-gamma replay (buildCryptoSwapSegments) from the live A/gamma/price_scale/D/balances/
- * fee state. The amountIn caps the sampled range — the same bound prepare samples — so the oracle and
- * prepare emit the IDENTICAL segment grid (single source), making the split exact-on-grid. The CryptoSwap
- * marginalOI is the post-fee execution price (getDyCrypto nets the dynamic fee); adjNear == adjFar ==
- * marginalOI. Awarded as a "pool" venue.
+ * Enumerate one Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) pool's segments via the
+ * QUOTE-LADDER live walk (buildCryptoSwapQLLadder) — the SAME geometric-slice ladder the on-chain solver
+ * builds in setup from live get_dy, replayed here through the shared bigint getDyCrypto so the oracle and
+ * solver stay wei-exact BY CONSTRUCTION (no prepared segments — prepare ships only the descriptor). The
+ * CryptoSwap marginalOI is ALREADY the post-fee execution price (getDyCrypto nets the dynamic fee), so
+ * adjNear == adjFar == marginalOI: it enters the descending-price merge directly with no extra fee-adjust
+ * multiply. Awarded as a "pool" venue.
  */
 function cryptoSwapSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildCryptoSwapSegments(p.cryptoSwap!, amountIn)) {
+  for (const s of buildCryptoSwapQLLadder(p.cryptoSwap!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;
@@ -972,9 +973,9 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
     } else if (p.woofi) {
       allSegs.push(...wooFiSegments(p, i, amountIn));
     } else if (p.cryptoSwap) {
-      // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) venue: sampled-segment enumeration via
-      // the shared bounded-Newton A-gamma replay (capped at amountIn — the same bound prepare samples →
-      // identical grid → exact-on-grid split).
+      // Curve CryptoSwap (twocrypto/tricrypto-ng volatile-asset) venue: QUOTE-LADDER enumeration via the
+      // shared buildCryptoSwapQLLadder (the IDENTICAL geometric ladder the solver builds on-chain from
+      // live get_dy → wei-exact split by construction).
       allSegs.push(...cryptoSwapSegments(p, i, amountIn));
     } else if (p.maverick) {
       // Maverick V2 (bin-based directional AMM) venue: sampled-segment enumeration via the shared bin

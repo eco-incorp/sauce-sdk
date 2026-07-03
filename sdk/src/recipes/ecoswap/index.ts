@@ -250,30 +250,46 @@ function balancerV3RouterAddr(prepared: EcoSwapPrepared): bigint {
 }
 
 /**
- * Build the QUOTE-LADDER (QL) venue DESCRIPTOR array — one row per QL venue (Curve StableSwap pilot):
+ * Build the QUOTE-LADDER (QL) venue DESCRIPTOR array — one row per QL venue:
  *   qlv[v] = [poolAddr, i, j, feePpm, segKind, refIdx]
  * NO sampled values — the solver builds each venue's price ladder ON-CHAIN in setup from LIVE
- * cook-time get_dy (prepare-optional: prepare ships only the descriptor). `i`/`j` are the int128 coin
- * indices; `feePpm` is informational (a Curve get_dy is post-fee, so the on-chain head needs no
- * fee-adjust); `segKind` = 1 (Curve → the bestKind===1 cursor → engine swap(poolType:3) → _swapCurve);
- * `refIdx` is the per-venue accumulator key (the on-chain `cinp[refIdx]`/`cven[refIdx]` slot, distinct
- * per venue). Carried as a SEPARATE top-level compiler param so its reads stay at nesting depth ≤ 2.
+ * cook-time get_dy (prepare-optional: prepare ships only the descriptor). `i`/`j` are the coin indices
+ * (Curve int128 / CryptoSwap uint256 — both fit a scalar); `feePpm` is informational (both get_dy are
+ * post-fee, so the on-chain head needs no fee-adjust). Two QL families ship today, each with a distinct
+ * `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters are INDEPENDENT
+ * (0-based into each family's list):
+ *   segKind 1 = Curve StableSwap  → bestKind===1 cursor → engine swap(poolType:3) → _swapCurve
+ *                                   (refIdx → the on-chain `cinp[refIdx]`/`cven[refIdx]` slot).
+ *   segKind 9 = Curve CryptoSwap  → callback-free get_dy(uint256,...) + approve + exchange(uint256,...)
+ *                                   (refIdx → the on-chain `cryinp[refIdx]`/`cryven[refIdx]` slot).
+ * Carried as a SEPARATE top-level compiler param so its reads stay at nesting depth ≤ 2.
  */
 function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   const curves = prepared.curves ?? [];
-  return curves.map((c, refIdx) => [
+  const cryptoSwaps = prepared.cryptoSwaps ?? [];
+  const curveRows = curves.map((c, refIdx) => [
     BigInt(c.address),
     BigInt(c.i),
     BigInt(c.j),
     BigInt(c.feePpm),
-    1n, // segKind = Curve
+    1n, // segKind = Curve StableSwap
     BigInt(refIdx),
   ]);
+  const cryptoRows = cryptoSwaps.map((c, refIdx) => [
+    BigInt(c.address),
+    BigInt(c.i),
+    BigInt(c.j),
+    BigInt(c.feePpm),
+    9n, // segKind = Curve CryptoSwap (uint256 coin indices; callback-free exchange)
+    BigInt(refIdx),
+  ]);
+  return [...curveRows, ...cryptoRows];
 }
 
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
-  // NOTE: Curve is NOT read here — it is a QUOTE-LADDER (QL) venue (see buildQLVenues), built
-  // on-chain from live get_dy, so it ships no static sampled segments.
+  // NOTE: Curve StableSwap (segKind 1) and Curve CryptoSwap (segKind 9) are NOT read here — both are
+  // QUOTE-LADDER (QL) venues (see buildQLVenues), built on-chain from live get_dy, so they ship no
+  // static sampled segments.
   const lbs = prepared.lbs ?? [];
   const dodos = prepared.dodos ?? [];
   const solidlyStables = prepared.solidlyStables ?? [];
@@ -281,7 +297,6 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
   const balancerStables = prepared.balancerStables ?? [];
   const eulerSwaps = prepared.eulerSwaps ?? [];
   const maverickPools = prepared.maverickPools ?? [];
-  const cryptoSwaps = prepared.cryptoSwaps ?? [];
   const wooFiPools = prepared.wooFiPools ?? [];
   const fermiPools = prepared.fermiPools ?? [];
   const fluidPools = prepared.fluidPools ?? [];
@@ -299,7 +314,6 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
         b.kind === EcoBracketKind.BalancerStable ||
         b.kind === EcoBracketKind.EulerSwap ||
         b.kind === EcoBracketKind.MaverickV2 ||
-        b.kind === EcoBracketKind.CryptoSwap ||
         b.kind === EcoBracketKind.WOOFi ||
         b.kind === EcoBracketKind.Fermi ||
         b.kind === EcoBracketKind.Mento ||
@@ -320,19 +334,17 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       const isBalancer = b.kind === EcoBracketKind.BalancerStable;
       const isEuler = b.kind === EcoBracketKind.EulerSwap;
       const isMaverick = b.kind === EcoBracketKind.MaverickV2;
-      const isCrypto = b.kind === EcoBracketKind.CryptoSwap;
       const isWooFi = b.kind === EcoBracketKind.WOOFi;
       const isFermi = b.kind === EcoBracketKind.Fermi;
       const isFluid = b.kind === EcoBracketKind.Fluid;
       const isMento = b.kind === EcoBracketKind.Mento;
       const isBalancerV3 = b.kind === EcoBracketKind.BalancerV3;
-      // segKind: 1 Curve, 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat, 6 Balancer ComposableStable, 7
-      // EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap, 10 WOOFi — kinds 4/5/7/9/10 are callback-free (the
-      // pool view IS the swap math); 4 = getAmountOut + pool.swap, 5 = quotePotentialSwap + approve +
-      // pool.swap (Wombat PULLS via transferFrom), 7 = computeQuote + transfer + pool.swap(...,""), 9 =
-      // get_dy + approve + exchange(uint256 i, uint256 j, Σ, min_dy) (Curve exchange PULLS via
-      // transferFrom, and crypto pools use uint256 coin indices the engine's int128 _swapCurve does NOT
-      // match), 10 = query + transfer + swap(fromToken,toToken,Σ,minTo,to,rebateTo) (WooPPV2 is
+      // segKind: 1 Curve StableSwap (QL — NOT produced here), 2 LB, 3 DODO, 4 Solidly stable, 5 Wombat,
+      // 6 Balancer ComposableStable, 7 EulerSwap, 8 Maverick V2, 9 Curve CryptoSwap (QL — NOT produced
+      // here), 10 WOOFi — kinds 4/5/7/10 are callback-free (the pool view IS the swap math); 4 =
+      // getAmountOut + pool.swap, 5 = quotePotentialSwap + approve + pool.swap (Wombat PULLS via
+      // transferFrom), 7 = computeQuote + transfer + pool.swap(...,""), 10 = query + transfer +
+      // swap(fromToken,toToken,Σ,minTo,to,rebateTo) (WooPPV2 is
       // transfer-first, oracle-priced sPMM), 11 = getAmountOut + approve + swap(tokenIn,tokenOut,Σ,minOut,to)
       // (Fermi/propAMM — Obric-style proactive AMM; propAMM PULLS via transferFrom, so approve-first), 12 =
       // resolver.estimateSwapIn + approve + pool.swapIn(swap0to1,Σ,minOut,to) (Fluid DEX — FluidDexT1
@@ -349,8 +361,9 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
       // + ERC20.approve(PERMIT2) + Permit2.approve(ROUTER) + Router.swapSingleTokenExactIn (the V3 input is
       // PULLED via Permit2; the reentrancy is contained inside Balancer's Router+Vault, never the cooking
       // contract). The chain-wide Router is cfg[8].
-      // segKind 1 (Curve) is NOT produced here — Curve is a QL venue built on-chain (buildQLVenues).
-      const segKind = isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isCrypto ? 9n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
+      // segKind 1 (Curve StableSwap) + 9 (Curve CryptoSwap) are NOT produced here — both are QL venues
+      // built on-chain from live get_dy (buildQLVenues).
+      const segKind = isLb ? 2n : isDodo ? 3n : isSolidly ? 4n : isWombat ? 5n : isBalancer ? 6n : isEuler ? 7n : isMaverick ? 8n : isWooFi ? 10n : isFermi ? 11n : isFluid ? 12n : isMento ? 13n : isBalancerV3 ? 14n : 0n;
       const venue = isLb
           ? BigInt(lbs[b.refIdx].address)
           : isDodo
@@ -365,9 +378,7 @@ function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
                     ? BigInt(eulerSwaps[b.refIdx].address)
                     : isMaverick
                       ? BigInt(maverickPools[b.refIdx].address)
-                      : isCrypto
-                        ? BigInt(cryptoSwaps[b.refIdx].address)
-                        : isWooFi
+                      : isWooFi
                           ? BigInt(wooFiPools[b.refIdx].address)
                           : isFermi
                             ? BigInt(fermiPools[b.refIdx].address)

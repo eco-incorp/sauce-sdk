@@ -8,6 +8,7 @@ import { ISolidlyStablePool } from "./ISolidlyStablePool.json";
 import { IWombatPool } from "./IWombatPool.json";
 import { IEulerSwapPool } from "./IEulerSwapPool.json";
 import { ICryptoSwapPool } from "./ICryptoSwapPool.json";
+import { ICryptoSwapPoolQL } from "./ICryptoSwapPoolQL.json";
 import { ICurveStableSwap } from "./ICurveStableSwap.json";
 import { IWooFiPool } from "./IWooFiPool.json";
 import { IFermiPool } from "./IFermiPool.json";
@@ -87,19 +88,25 @@ import { IPermit2 } from "./IPermit2.json";
 //                 AFTER leg L (final leg → 0). The merge head fold, the route event, and the
 //                 chain-order execution all loop over legCount, so N-hop needs no shape change.
 //   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx] — the QUOTE-LADDER (QL) venue DESCRIPTORS
-//                 (Curve StableSwap pilot). NO sampled values: prepare ships only the descriptor
-//                 (prepare-optional), and the solver BUILDS each venue's price ladder ON-CHAIN in
-//                 setup from LIVE cook-time state. For k in 0..QL_S-1 it takes a geometric cumulative
-//                 input xNext = cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV, derived on-chain,
-//                 clamped at amountIn), quotes q_k = get_dy(i,j,xNext) via PROBE-THEN-DECODE (a
-//                 `.catch` flags a revert ⇒ stop; the sentinel-catch cannot capture the return VALUE),
-//                 differences (capacity = xNext-cum, sliceOut = q_k - q_{k-1}), and emits a segment row
+//                 (Curve StableSwap segKind 1 + Curve CryptoSwap segKind 9). NO sampled values: prepare
+//                 ships only the descriptor (prepare-optional), and the solver BUILDS each venue's price
+//                 ladder ON-CHAIN in setup from LIVE cook-time state. For k in 0..QL_S-1 it takes a
+//                 geometric cumulative input xNext = cum*QL_RN/QL_RD + seed (seed = amountIn/QL_SEED_DIV,
+//                 derived on-chain, clamped at amountIn), quotes q_k = get_dy(i,j,xNext) via
+//                 PROBE-THEN-DECODE dispatched per-row on segKind (qd[4]) — StableSwap get_dy(int128,
+//                 int128,uint256) for kind 1, CryptoSwap get_dy(uint256,uint256,uint256) for kind 9 (a
+//                 DIFFERENT selector + uint256 coin indices) — where the `.catch` flags a revert ⇒ stop
+//                 (both get_dy families are revert-class: StableSwap on bad state, CryptoSwap on Newton
+//                 non-convergence; the sentinel-catch cannot capture the return VALUE). It then
+//                 differences (capacity = xNext-cum, sliceOut = q_k - q_{k-1}) and emits a segment row
 //                 [refIdx, capacity, head, head, segKind, venue] (head = qlSliceHead(sliceOut,capacity);
-//                 Curve get_dy is post-fee ⇒ no extra fee-adjust) into the SAME merged segment stream
+//                 both get_dy are post-fee ⇒ no extra fee-adjust) into the SAME merged segment stream
 //                 the static `segs` feed. Stops early on a sentinel-0 quote, a non-descending head
 //                 (non-convex guard), or the QL_S cap. Building all slices ONCE from one live read is
 //                 exactly as live as re-quoting per merge step (pool state is frozen until EXEC), so
-//                 the ladder is bounded to <=2*QL_S staticcalls per venue.
+//                 the ladder is bounded to <=2*QL_S staticcalls per venue. Everything past obtaining q
+//                 (difference/head/emit/sort) is SHARED across adapters — each later QL lane adds only
+//                 one treeshake-guarded per-segKind quote branch here.
 //   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux] — the STATIC
 //                 sampled-segment venue stream (the 13 not-yet-QL-migrated venues: LB / DODO / Solidly
 //                 / … interleaved), pre-sorted DESC sqrtAdjNear. In setup the solver COPIES these rows
@@ -571,12 +578,15 @@ function main(
       msAux[msN] = sr[6];
       msN = msN + 1;
     }
-    // 2. Build each QL venue's price ladder ON-CHAIN from LIVE get_dy (Curve StableSwap pilot,
-    // segKind 1). PROBE-THEN-DECODE the quote (a `.catch` flags a revert; the sentinel-catch cannot
-    // capture the return VALUE — it yields the CALL flag on v1 / returndata length on v12). All
-    // slices are built from ONE frozen live state, so this is exactly as live as re-quoting per
-    // merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE) {
+    // 2. Build each QL venue's price ladder ON-CHAIN from LIVE get_dy. ONE qlv loop dispatches the
+    // per-row quote on the descriptor segKind (qd[4]) — Curve StableSwap (kind 1) and Curve CryptoSwap
+    // (kind 9) so far, each adapter branch treeshake-guarded so only active adapters ship. PROBE-THEN-
+    // DECODE the quote (a `.catch` flags a revert; the sentinel-catch cannot capture the return VALUE —
+    // it yields the CALL flag on v1 / returndata length on v12). Everything AFTER obtaining q (the
+    // differencing / head / emit / sort below) is SHARED and adapter-agnostic. All slices are built from
+    // ONE frozen live state, so this is exactly as live as re-quoting per merge step; bounded to
+    // ≤ 2*QL_S staticcalls per venue.
+    if (HAS_CURVE || HAS_CRYPTO) {
       for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
@@ -599,11 +609,21 @@ function main(
             if (cap === 0) {
               stop = 1;
             } else {
-              // PROBE (revert flag) — the sentinel-catch value is unusable for capture on both engines.
+              // PROBE-THEN-DECODE, dispatched per-row on segKind. The sentinel-catch value is unusable
+              // for capture on both engines — it ONLY flags the revert; the value is the guarded second
+              // call. StableSwap uses int128 coin indices, CryptoSwap uint256 (a DIFFERENT selector);
+              // both get_dy are revert-class so they share the idiom.
               let ok: Uint256 = 1;
-              ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
               let q: Uint256 = 0;
-              if (ok === 1) { q = ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext); }
+              if (HAS_CURVE && qKind === 1) {
+                ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
+                if (ok === 1) { q = ICurveStableSwap.at(qPool).get_dy(qi, qj, xNext); }
+              } else {
+                if (HAS_CRYPTO && qKind === 9) {
+                  ICryptoSwapPoolQL.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
+                  if (ok === 1) { q = ICryptoSwapPoolQL.at(qPool).get_dy(qi, qj, xNext); }
+                }
+              }
               if (q === 0) {
                 stop = 1;
               } else {

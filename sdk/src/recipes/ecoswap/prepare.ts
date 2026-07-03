@@ -508,14 +508,13 @@ function buildCurveBrackets(pool: CurvePool, refIdx: number, amountIn: bigint): 
 }
 
 /**
- * Build Curve CryptoSwap segments for one pool by sampling the bounded-Newton A-gamma replay (NO
- * extra RPC — pure bigint on the read A/gamma/price_scale/D/balances/fee params). Each sampled
- * (Δinput, Δoutput) increment becomes a STATIC segment (kind CryptoSwap) in unified out/in space,
- * refIdx → the CryptoSwap venue index. The marginal is the POST-FEE execution price (getDyCrypto
- * already nets the dynamic fee), so it enters the descending-price merge directly as both
- * sqrtAdjNear and sqrtAdjFar. The CryptoSwap curve is OFF-CHAIN ONLY for the split; the on-chain
- * solver executes CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...) —
- * crypto pools use uint256 coin indices the engine's int128 _swapCurve does NOT match).
+ * Sample a Curve CryptoSwap pool via the bounded-Newton A-gamma replay (NO extra RPC — pure bigint on
+ * the read A/gamma/price_scale/D/balances/fee params). Used ONLY as a LIVENESS PROBE now: CryptoSwap is
+ * a QUOTE-LADDER (QL) venue (see index.ts buildQLVenues), so the on-chain solver builds its price ladder
+ * live from get_dy and prepare ships only the descriptor — a pool that quotes no valid segment here is
+ * dropped, but the returned brackets are NOT pushed to the segment stream. The on-chain solver executes
+ * CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...) — crypto pools use
+ * uint256 coin indices the engine's int128 _swapCurve does NOT match).
  */
 function buildCryptoSwapBrackets(pool: CryptoSwapPool, refIdx: number, amountIn: bigint): EcoBracket[] {
   const segs = buildCryptoSwapSegments(pool, amountIn);
@@ -1280,19 +1279,22 @@ export async function prepareEcoSwap(
   }
   for (const set of maverickBracketSets) brackets.push(...set);
 
-  const cryptoSwaps: EcoCryptoSwap[] = [];
-  const cryptoBracketSets: EcoBracket[][] = [];
   // Curve CryptoSwap — crypto/tricrypto Metaregistry lookup (find_pool_for_coins → get_coin_indices,
   // UINT256 i,j). CryptoSwap pools trade on the A-gamma invariant with a dynamic fee AND use uint256
-  // coin indices, so the engine `_swapCurve` (exchange(int128,...)) does NOT match — a SAMPLED-SEGMENT
-  // source executed CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...)).
-  // Sampled OFF-CHAIN via the bounded-Newton replay; NO engine change. LOW priority (volatile-asset).
+  // coin indices, so the engine `_swapCurve` (exchange(int128,...)) does NOT match — executed
+  // CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...)). Like Curve, it is a
+  // QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE get_dy (see
+  // ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the descriptor (address + coin
+  // indices i,j + fee) — NO off-chain sampled segments. buildCryptoSwapBrackets is still called as a
+  // pure LIVENESS PROBE (a pool that quotes no valid segment is dropped), but its brackets are NOT
+  // pushed to the segment stream. NO engine change. LOW priority (volatile-asset).
+  const cryptoSwaps: EcoCryptoSwap[] = [];
   const cryptoRegistries = poolConfig.factories.filter((f) => f.factoryType === FactoryType.CurveCryptoRegistry);
   if (cryptoRegistries.length > 0) {
     const cryptoRaw = await discoverCryptoSwapPoolsTyped(tokenIn, tokenOut, client, cryptoRegistries);
     for (const cp of cryptoRaw) {
-      const refIdx = cryptoSwaps.length;
-      const cb = buildCryptoSwapBrackets(cp, refIdx, amountIn);
+      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
+      const cb = buildCryptoSwapBrackets(cp, cryptoSwaps.length, amountIn);
       if (cb.length === 0) continue;
       cryptoSwaps.push({
         address: cp.address,
@@ -1301,10 +1303,8 @@ export async function prepareEcoSwap(
         feePpm: cp.feePpm,
         source: `${cp.source} (Curve CryptoSwap)`,
       });
-      cryptoBracketSets.push(cb);
     }
   }
-  for (const set of cryptoBracketSets) brackets.push(...set);
 
   const wooFiPools: EcoWooFi[] = [];
   const wooFiBracketSets: EcoBracket[][] = [];
@@ -1713,15 +1713,15 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
-  // Curve ships as QL (Quote-Ladder) DESCRIPTORS (curves.length), NOT sampled segments — the on-chain
-  // solver builds its ladder live from get_dy — so it is reported below as "Curve QL", not a seg count.
+  // Curve StableSwap AND Curve CryptoSwap ship as QL (Quote-Ladder) DESCRIPTORS (curves.length /
+  // cryptoSwaps.length), NOT sampled segments — the on-chain solver builds each ladder live from get_dy
+  // — so both are reported below as "QL", not a seg count.
   const nLbSegs = brackets.filter((b) => b.kind === EcoBracketKind.LB).length;
   const nDodoSegs = brackets.filter((b) => b.kind === EcoBracketKind.DODO).length;
   const nSolidlySegs = brackets.filter((b) => b.kind === EcoBracketKind.SolidlyStable).length;
   const nWombatSegs = brackets.filter((b) => b.kind === EcoBracketKind.Wombat).length;
   const nBalancerSegs = brackets.filter((b) => b.kind === EcoBracketKind.BalancerStable).length;
   const nMaverickSegs = brackets.filter((b) => b.kind === EcoBracketKind.MaverickV2).length;
-  const nCryptoSegs = brackets.filter((b) => b.kind === EcoBracketKind.CryptoSwap).length;
   const nWooFiSegs = brackets.filter((b) => b.kind === EcoBracketKind.WOOFi).length;
   const nFermiSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fermi).length;
   const nFluidSegs = brackets.filter((b) => b.kind === EcoBracketKind.Fluid).length;
@@ -1732,9 +1732,10 @@ export async function prepareEcoSwap(
       `${curves.length} Curve, ${lbs.length} LB, ${dodos.length} DODO, ${solidlyStables.length} Solidly-stable, ` +
       `${wombats.length} Wombat, ${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
-      `(all pools walked live), ${curves.length} Curve QL, ${brackets.length} sampled segments (${nLbSegs} LB, ` +
+      `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
+      `${brackets.length} sampled segments (${nLbSegs} LB, ` +
       `${nDodoSegs} DODO, ${nSolidlySegs} Solidly-stable, ${nWombatSegs} Wombat, ${nBalancerSegs} Balancer-stable, ` +
-      `${nMaverickSegs} Maverick, ${nCryptoSegs} CryptoSwap, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi, ` +
+      `${nMaverickSegs} Maverick, ${nWooFiSegs} WOOFi, ${nFermiSegs} Fermi, ` +
       `${nFluidSegs} Fluid, ${nMentoSegs} Mento, ${nBalancerV3Segs} Balancer-V3)`,
   );
 

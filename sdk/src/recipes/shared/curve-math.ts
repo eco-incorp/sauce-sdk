@@ -323,22 +323,28 @@ export function qlSliceHead(sliceOut: bigint, capacity: bigint): bigint {
 }
 
 /**
- * Build one Curve pool's QUOTE-LADDER — the SAME geometric-slice live walk the on-chain solver
- * builds in setup, replayed here through the bigint get_dy so the oracle/reference stay wei-exact
- * with the solver by construction.
+ * GENERIC QUOTE-LADDER builder — the curve-AGNOSTIC geometric-slice live walk the on-chain solver
+ * builds in setup, parameterized ONLY by a `getDy(dx)` cumulative-output quote. The ladder recurrence
+ * (seed / geometric xNext / difference / head / non-convex guard / stop conditions) is IDENTICAL for
+ * every QL family — StableSwap, CryptoSwap, and any later adapter — so ONE builder here keeps the
+ * oracle/reference wei-exact with the solver by construction; a family differs ONLY in its underlying
+ * `getDy` model, passed as the callback. Bit-for-bit with the on-chain qlv loop in ecoswap.sauce.ts.
  *
  * For k in 0..QL_S-1: geometric cumulative input `xNext = cum*QL_RN/QL_RD + seed` (clamped at
- * amountIn), slice capacity = xNext - cum, sliceOut = get_dy(xNext) - get_dy(cum) (differenced),
+ * amountIn), slice capacity = xNext - cum, sliceOut = getDy(xNext) - getDy(cum) (differenced),
  * head = qlSliceHead(sliceOut, capacity). STOP early on a zero-capacity clamp, a sentinel-0 quote,
  * a zero slice-out, a non-DESCENDING head (non-convex guard — the merge needs a monotone stream),
  * or reaching amountIn. Emits (capacity, effOut, marginalOI) segments in the same shape the
- * static-segment cursor consumes — a Curve get_dy is post-fee so marginalOI IS the execution price.
+ * static-segment cursor consumes — a post-fee get_dy makes marginalOI the execution price directly.
  */
-export function buildCurveQLLadder(pool: CurvePool, amountIn: bigint): CurveSegment[] {
+export function buildQLLadder(
+  getDy: (dx: bigint) => bigint,
+  amountIn: bigint,
+): MergeSegment[] {
   if (amountIn <= 0n) return [];
   let seed = amountIn / QL_SEED_DIV;
   if (seed <= 0n) seed = 1n;
-  const segs: CurveSegment[] = [];
+  const segs: MergeSegment[] = [];
   let cum = 0n;
   let prevOut = 0n;
   let prevHead = 0n;
@@ -347,7 +353,7 @@ export function buildCurveQLLadder(pool: CurvePool, amountIn: bigint): CurveSegm
     if (xNext > amountIn) xNext = amountIn;
     const capacity = xNext - cum;
     if (capacity === 0n) break;
-    const q = getDy(pool, xNext);
+    const q = getDy(xNext);
     if (q === 0n) break;
     const effOut = q - prevOut;
     if (effOut === 0n) break;
@@ -361,6 +367,15 @@ export function buildCurveQLLadder(pool: CurvePool, amountIn: bigint): CurveSegm
     if (xNext >= amountIn) break;
   }
   return segs;
+}
+
+/**
+ * Build one Curve StableSwap pool's QUOTE-LADDER — the shared `buildQLLadder` recurrence driven by the
+ * bigint StableSwap `getDy`, so the oracle/reference stay wei-exact with the solver by construction. A
+ * Curve get_dy is post-fee so marginalOI IS the execution price.
+ */
+export function buildCurveQLLadder(pool: CurvePool, amountIn: bigint): CurveSegment[] {
+  return buildQLLadder((dx) => getDy(pool, dx), amountIn);
 }
 
 /**

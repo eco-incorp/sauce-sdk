@@ -97,6 +97,7 @@
  */
 
 import { pushMonotoneSegment, type MergeSegment } from "./segment-merge.js";
+import { buildQLLadder } from "./curve-math.js";
 
 /** 2^192 — the unified out/in sqrt fixed-point scale (matches ecoswap.math Q192). */
 export const Q192 = 1n << 192n;
@@ -351,4 +352,17 @@ export function buildCryptoSwapSegments(
     prevOut = out;
   }
   return segs;
+}
+
+/**
+ * Build one CryptoSwap pool's QUOTE-LADDER — the SHARED curve-agnostic `buildQLLadder` recurrence
+ * (curve-math.ts) driven by the bigint CryptoSwap `getDyCrypto`, so the oracle/reference stay wei-exact
+ * with the on-chain solver by construction (the solver builds the IDENTICAL geometric ladder live from
+ * the pool's own get_dy; getDyCrypto == that get_dy to the wei). The ladder recurrence is IDENTICAL to
+ * Curve's — ONLY the underlying getDy model differs (A-gamma/stableswap-invariant dynamic-fee vs
+ * StableSwap). A CryptoSwap get_dy is post-fee (getDyCrypto nets the dynamic fee) so marginalOI IS the
+ * execution price. Emits the same {capacity, effOut, marginalOI} slices the static-segment cursor consumes.
+ */
+export function buildCryptoSwapQLLadder(pool: CryptoSwapPool, amountIn: bigint): CryptoSwapSegment[] {
+  return buildQLLadder((dx) => getDyCrypto(pool, dx), amountIn);
 }
