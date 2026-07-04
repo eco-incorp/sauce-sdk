@@ -57,6 +57,14 @@ import {
   routeHeadFold,
   routeEventN,
   type RouteLeg,
+  type RouteLegMember,
+  type QlSliceRow,
+  type QlSliceCursor,
+  qlCursorInit,
+  qlCursorActive,
+  qlCursorHead,
+  qlCursorConsume,
+  legMemberWins,
 } from "./ecoswap.math";
 // Curve / LB / DODO segment enumeration — the SINGLE source shared with prepare.ts
 // (buildCurve/Lb/DodoBrackets). The oracle enumerates the SAME segments from true live state, so
@@ -285,6 +293,63 @@ export interface OptimalRouteLeg {
   zeroForOne: boolean;
   /** The leg's pools (the leg splits across all of them via the leg-internal merge). */
   pools: OptimalPool[];
+  /**
+   * The leg's QL VENUE members (optional — every existing leg literal stays valid): each is one
+   * of the 13 QL families as the SAME shared-math model type the direct-QL oracle path
+   * enumerates, direction-stamped for THIS hop's (legIn, legOut). The oracle builds each
+   * venue's slice ladder via the SHARED build*QLLadder (identical builders the on-chain
+   * families replay ⇒ identical grids), SIZED by the chain-order fold of `amountIn` through
+   * the upstream legs' SETUP heads (see routeSegments), and the venue competes in the
+   * leg-internal merge as a flat constant-price SLICE member (post-fee head; far == near).
+   * Fluid (static-seg venue) is explicitly NOT a leg member.
+   */
+  qlvs?: OptimalLegQlVenue[];
+}
+
+/**
+ * One leg QL venue — a (family, shared model) pair. The `model` types are the EXACT shared-math
+ * pool models the direct-QL oracle path consumes (single source: the build*QLLadder builders),
+ * so a leg venue's grid is bit-identical to the same venue quoted directly on the leg edge.
+ */
+export type OptimalLegQlVenue =
+  | { family: "curve"; model: CurvePool }
+  | { family: "cryptoSwap"; model: CryptoSwapPool }
+  | { family: "solidlyStable"; model: SolidlyStablePool }
+  | { family: "wooFi"; model: WooFiPool }
+  | { family: "lb"; model: LbPool }
+  | { family: "mento"; model: MentoPool }
+  | { family: "dodo"; model: DodoPool }
+  | { family: "wombat"; model: WombatPool }
+  | { family: "fermi"; model: FermiPool }
+  | { family: "euler"; model: EulerSwapPool }
+  | { family: "balancerV2"; model: BalancerStablePool }
+  | { family: "balancerV3"; model: BalancerV3Pool }
+  | { family: "maverick"; model: MaverickPool };
+
+/**
+ * Build one leg QL venue's slice ladder via the family's SHARED builder, sized by the leg's
+ * folded `cap` (the solver's per-row ladderCap). `cap === 0` (a dead upstream leg) builds
+ * NOTHING — the venue is born exhausted, mirroring the solver's `ladderCap === 0 ⇒ stop` guard.
+ * Exported as the SINGLE family dispatch the reference (ecoswap.solver-reference.ts) reuses,
+ * so oracle and reference cannot drift on ladder construction.
+ */
+export function buildLegQlVenueLadder(v: OptimalLegQlVenue, cap: bigint): QlSliceRow[] {
+  if (cap <= 0n) return [];
+  switch (v.family) {
+    case "curve": return buildCurveQLLadder(v.model, cap);
+    case "cryptoSwap": return buildCryptoSwapQLLadder(v.model, cap);
+    case "solidlyStable": return buildSolidlyStableQLLadder(v.model, cap);
+    case "wooFi": return buildWooFiQLLadder(v.model, cap);
+    case "lb": return buildLbQLLadder(v.model, cap);
+    case "mento": return buildMentoQLLadder(v.model, cap);
+    case "dodo": return buildDodoQLLadder(v.model, cap);
+    case "wombat": return buildWombatQLLadder(v.model, cap);
+    case "fermi": return buildFermiQLLadder(v.model, cap);
+    case "euler": return buildEulerSwapQLLadder(v.model, cap);
+    case "balancerV2": return buildBalancerStableQLLadder(v.model, cap);
+    case "balancerV3": return buildBalancerV3QLLadder(v.model, cap);
+    case "maverick": return buildMaverickWalkLadder(v.model, cap);
+  }
 }
 
 /**
@@ -844,7 +909,7 @@ function legBrackets(leg: OptimalPool, z: boolean, priceLimit: bigint): RouteLeg
  * legs — the binding leg's cursor steps, every other leg's near moves to its new far and its
  * cursor advances past any fully-crossed bracket). 3-hop lands concretely; the loop is arbitrary-k.
  */
-function routeSegments(route: OptimalRoute, routeIdx: number): Segment[] {
+function routeSegments(route: OptimalRoute, routeIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
   const k = route.legs.length;
   if (k < 2) return segs; // a route is at least 2 hops
@@ -872,15 +937,67 @@ function routeSegments(route: OptimalRoute, routeIdx: number): Segment[] {
   );
 
   // A leg pool is exhausted when its cursor runs off its bracket list; a leg is dead when ALL its
-  // pools are exhausted (no active pool). The route is dead when any leg is dead.
+  // members are exhausted (no active pool AND no active QL venue). The route is dead when any leg
+  // is dead.
   const poolActive = (i: number, j: number): boolean => cur[i][j] < legPoolBrks[i][j].length;
-  const legDead = (i: number): boolean => !legPoolBrks[i].some((_, j) => poolActive(i, j));
 
-  // The leg-internal BEST pool: highest fee-adjusted out/in near among the leg's ACTIVE pools, ties
-  // → higher fee-adjusted far (mirrors the global merge sort + the reference's routeLegBest). The
-  // leg's current bracket [near, far, L, fee] is that pool's current bracket. Returns -1 if none.
-  function legBestPool(i: number): number {
-    let best = -1;
+  // ── Leg QL venue ladders + cursors (the chain-order sizing fold). Built leg-ASCENDING so a
+  // leg's fold can read the already-built LOWER legs' first-slice heads — mirroring index.ts's
+  // (routeIdx, legIdx) leg-row ordering contract and the solver's single flat qlv pass. Each
+  // leg's ladderCap folds `amountIn` through legs 0..L-1's SETUP heads: per upstream leg the
+  // max over (a) each leg pool's LIVE-SPOT fee-adjusted out/in head (the solver's dnOn/dnNear
+  // at build time — identical to the pool's cursor-0 bracket near whenever it emits one) and
+  // (b) each already-built venue ladder's first-slice head (post-fee). Per leg the fold is
+  // out ≈ in·h²/2^192, two-step floor mulDiv (h² overflows 256 bits at real scales); hF==0
+  // (a dead upstream leg) folds the cap to 0 ⇒ the venue builds nothing. The fold is an UPPER
+  // bound on the leg's inflow — heads are the best price any member trades at — so an
+  // under-shoot only exhausts the ladder a few wei early (a mirrored split-quality tail
+  // effect, never a parity break: the solver/reference compute the identical fold). ──
+  function legPoolSpotHead(p: OptimalPool, z: boolean): bigint {
+    // The solver's setup-time head gate: a V2 frontier is on iff L = √(rIn·rOut) > 0; a V3/V4
+    // frontier is always on at its live spot (L may be 0 — the spot head still competes).
+    if (p.isV2) {
+      const rIn = p.reserveIn!;
+      const rOut = p.reserveOut!;
+      if (rIn <= 0n || rOut <= 0n || isqrt(rIn * rOut) === 0n) return 0n;
+      return feeAdjOI(isqrt((rOut * Q192) / rIn), p.feePpm);
+    }
+    return feeAdjOI(toOutIn(p.sqrtPriceX96!, z), p.feePpm);
+  }
+  const legQlCursors: QlSliceCursor[][] = [];
+  for (let i = 0; i < k; i++) {
+    let cap = amountIn;
+    for (let f = 0; f < i; f++) {
+      let hF = 0n;
+      for (const p of route.legs[f].pools) {
+        const hc = legPoolSpotHead(p, route.legs[f].zeroForOne);
+        if (hc > hF) hF = hc;
+      }
+      for (const c of legQlCursors[f]) {
+        if (c.rows.length > 0) {
+          const hq = c.rows[0].marginalOI; // first-slice head, post-fee
+          if (hq > hF) hF = hq;
+        }
+      }
+      cap = mulDiv(mulDiv(cap, hF, Q96), hF, Q96); // hF==0 ⇒ cap 0
+    }
+    const qlvs = route.legs[i].qlvs ?? [];
+    legQlCursors.push(qlvs.map((v) => qlCursorInit(buildLegQlVenueLadder(v, cap))));
+  }
+
+  const legDead = (i: number): boolean =>
+    !legPoolBrks[i].some((_, j) => poolActive(i, j)) && !legQlCursors[i].some((c) => qlCursorActive(c));
+
+  // The leg-internal BEST member: pools scanned FIRST (ascending index), then QL venue cursors
+  // (ascending) — the EXACT comparison ops of the solver's leg best scan (legMemberWins,
+  // transcribed in ecoswap.math.ts): win on a strictly higher fee-adjusted near, or a near-TIE
+  // with a strictly higher fee-adjusted far (a slice's far == its near, so a slice beats any
+  // near-tied bracket); the INCUMBENT (earlier-scanned) member keeps all other ties. The `>=`
+  // outer gate is the solver's lazy far-adjust (a strictly-lower near can never win — skip its
+  // far), result-identical to eager. Returns null when no member produced a winning head.
+  function legBestMember(i: number): { isQ: boolean; idx: number; nearAdj: bigint; farAdj: bigint } | null {
+    let bestIsQ = false;
+    let bestIdx = -1;
     let bestAdj = 0n;
     let bestFarAdj = 0n;
     for (let j = 0; j < legPoolBrks[i].length; j++) {
@@ -889,58 +1006,92 @@ function routeSegments(route: OptimalRoute, routeIdx: number): Segment[] {
       const nAdj = feeAdjOI(near[i][j], fee);
       if (nAdj >= bestAdj) {
         const fAdj = feeAdjOI(legPoolBrks[i][j][cur[i][j]].farOI, fee);
-        if (best < 0 || nAdj > bestAdj || (nAdj === bestAdj && fAdj > bestFarAdj)) {
+        if (legMemberWins(nAdj, fAdj, bestAdj, bestFarAdj)) {
           bestAdj = nAdj;
           bestFarAdj = fAdj;
-          best = j;
+          bestIdx = j;
+          bestIsQ = false;
         }
       }
     }
-    return best;
+    for (let u = 0; u < legQlCursors[i].length; u++) {
+      const c = legQlCursors[i][u];
+      if (!qlCursorActive(c)) continue;
+      const qh = qlCursorHead(c); // post-fee — NO extra fee-adjust; a slice's far == near
+      if (qh >= bestAdj) {
+        if (legMemberWins(qh, qh, bestAdj, bestFarAdj)) {
+          bestAdj = qh;
+          bestFarAdj = qh;
+          bestIdx = u;
+          bestIsQ = true;
+        }
+      }
+    }
+    if (bestIdx < 0) return null;
+    return { isQ: bestIsQ, idx: bestIdx, nearAdj: bestAdj, farAdj: bestFarAdj };
   }
 
   for (let step = 0; step < MAX_V3_STEPS; step++) {
     if (route.legs.some((_, i) => legDead(i))) break;
 
-    // Build each leg's current RouteLeg from its leg-internal BEST pool on the FIXED live grid.
-    const legBestIdx: number[] = new Array(k);
-    const legs: RouteLeg[] = new Array(k);
+    // Build each leg's current RouteLegMember from its leg-internal BEST member on the FIXED live
+    // grid (a bracket for a pool member; a flat {head, remCap, remOut} slice for a QL venue).
+    const sel: ({ isQ: boolean; idx: number; nearAdj: bigint; farAdj: bigint } | null)[] = new Array(k);
+    const members: RouteLegMember[] = new Array(k);
     const adjFns: ((oi: bigint) => bigint)[] = new Array(k);
+    const nearAdjs: bigint[] = new Array(k);
     let degenerate = false;
     for (let i = 0; i < k; i++) {
-      const j = legBestPool(i);
-      if (j < 0) {
+      const m = legBestMember(i);
+      if (m === null) {
         degenerate = true;
         break;
       }
-      const fee = legPoolFees[i][j];
-      const b = legPoolBrks[i][j][cur[i][j]];
-      legBestIdx[i] = j;
-      legs[i] = { nearOI: near[i][j], farOI: b.farOI, L: b.L, feePpm: BigInt(fee) };
-      adjFns[i] = (oi: bigint) => feeAdjOI(oi, fee);
-      if (legs[i].nearOI <= legs[i].farOI) degenerate = true;
+      sel[i] = m;
+      nearAdjs[i] = m.nearAdj;
+      if (m.isQ) {
+        const c = legQlCursors[i][m.idx];
+        members[i] = { kind: "slice", head: qlCursorHead(c), remCap: c.remCap, remOut: c.remOut };
+        adjFns[i] = (oi: bigint) => oi; // a slice head is ALREADY the post-fee out/in price
+      } else {
+        const fee = legPoolFees[i][m.idx];
+        const b = legPoolBrks[i][m.idx][cur[i][m.idx]];
+        members[i] = { nearOI: near[i][m.idx], farOI: b.farOI, L: b.L, feePpm: BigInt(fee) };
+        adjFns[i] = (oi: bigint) => feeAdjOI(oi, fee);
+        if (near[i][m.idx] <= b.farOI) degenerate = true;
+      }
     }
     if (degenerate) break;
 
     // Route head at the segment edges: product fold of the per-leg leg-internal-best fee-adjusted
-    // out/in heads.
-    const adjNear = routeHeadFold(legs.map((l, i) => adjFns[i](l.nearOI)));
-    const ev = routeEventN(legs);
+    // out/in heads (a slice member folds its post-fee head at both edges — far == near).
+    const adjNear = routeHeadFold(nearAdjs);
+    const ev = routeEventN(members);
     const adjFar = routeHeadFold(ev.newFars.map((f, i) => adjFns[i](f)));
 
     if (ev.routeIn > 0n && adjNear > 0n) {
       segs.push({ venue: "route", idx: routeIdx, adjNear, adjFar, gross: ev.routeIn });
     }
 
-    // Advance: in the BOUND leg the leg-internal best pool crosses its tick (next bracket); in every
-    // OTHER leg the leg-internal best pool's near moves to its event new far. routeEventN guarantees
-    // the partial fill fits WITHIN the bracket, so the partial near lands inside [farOI, nearOI];
-    // once it reaches the far it has crossed the bracket entirely — advance that pool's cursor past
-    // every bracket whose far the new near has reached, so its NEXT event sits on the bracket that
-    // actually contains the near. Only the leg-internal best pool moves per event; the leg's OTHER
-    // pools stay put until the cut descends to engage them (the leg-internal merge).
+    // Advance: in the BOUND leg the leg-internal best pool crosses its tick (next bracket) — or
+    // the binding SLICE fully crosses (award == remCap ⇒ its cursor advances); in every OTHER leg
+    // the leg-internal best pool's near moves to its event new far — or the slice consumes its
+    // award (untouched on a zero-flow gap event, mirroring the solver's routeIn>0 partial guard).
+    // routeEventN guarantees a pool's partial fill fits WITHIN the bracket, so the partial near
+    // lands inside [farOI, nearOI]; once it reaches the far it has crossed the bracket entirely —
+    // advance that pool's cursor past every bracket whose far the new near has reached, so its
+    // NEXT event sits on the bracket that actually contains the near. Only the leg-internal best
+    // member moves per event; the leg's OTHER members stay put until the cut descends to engage
+    // them (the leg-internal merge).
     for (let i = 0; i < k; i++) {
-      const j = legBestIdx[i];
+      const m = sel[i]!;
+      if (m.isQ) {
+        const c = legQlCursors[i][m.idx];
+        const award = i === ev.bindLeg ? ev.awards[i] : ev.routeIn > 0n ? ev.awards[i] : 0n;
+        qlCursorConsume(c, award);
+        continue;
+      }
+      const j = m.idx;
       if (i === ev.bindLeg) {
         cur[i][j]++;
         near[i][j] = cur[i][j] < legPoolBrks[i][j].length ? legPoolBrks[i][j][cur[i][j]].nearOI : 0n;
@@ -1035,7 +1186,7 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
     }
   }
   for (let i = 0; i < routes.length; i++) {
-    allSegs.push(...routeSegments(routes[i], i));
+    allSegs.push(...routeSegments(routes[i], i, amountIn));
   }
 
   // Global price-descending merge. A stable sort on adjNear DESC realises the optimal

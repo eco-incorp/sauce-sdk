@@ -30,7 +30,8 @@ import {
   V2_STEP_DEN,
 } from "./ecoswap.math";
 import { kwayReference, type KwayLivePool } from "./ecoswap.solver-reference";
-import { optimalSplit, type OptimalPool, type OptimalRoute } from "./ecoswap.optimal";
+import { optimalSplit, type OptimalPool, type OptimalRoute, type OptimalLegQlVenue } from "./ecoswap.optimal";
+import { buildWooFiQLLadder } from "../shared/woofi-math";
 import {
   EcoBracketKind,
   type EcoBracket,
@@ -1528,5 +1529,241 @@ describe("k-way reference == optimal oracle (k>=3 route with a MULTI-POOL MIDDLE
     assert.equal(kw.perUniversePoolInput[2], 939372870272598188472n, "leg1 pool B input wei-stable");
     assert.equal(kw.perRouteInput[0], opt.perRouteInput[0], "route input == oracle (wei-exact)");
     assert.equal(kw.perRouteInput[0], amountIn, "full route input");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// LEG QL VENUE MEMBERS — kwayReference (per-leg slice cursors) == optimalSplit (qlvs models)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//
+// A route leg's members are now {pools} ∪ {QL venues}: a venue enters the leg-internal merge as
+// a flat constant-price SLICE cursor over its on-chain-built ladder (here: the SHARED
+// build*QLLadder replay, sized by the chain-order fold — the identical grid on both sides by
+// construction). These vectors prove the reference's per-leg qlCur/remCap/remOut mirror and
+// the oracle's qlvs modeling agree to the WEI across: a MIXED leg (pool + venue), a POOL-LESS
+// (venue-only) leg, an opposite-direction hop with a venue, a mid-leg venue in a 3-hop chain,
+// and venue EXHAUSTION (a short ladder drains ⇒ remCap==0 ⇒ the leg dies ⇒ the route dies).
+// The member-election ops are the pinned solver leg-scan ops (legMemberWins) at BOTH sites.
+
+/** A synthetic 2-coin Curve StableSwap leg venue (the shared bigint model both sides replay). */
+function curveVenue(balances: bigint[], a: bigint, fee: bigint): OptimalLegQlVenue {
+  return {
+    family: "curve",
+    model: {
+      poolType: 3, address: nextAddr(), i: 0, j: 1, A: a, aPrecision: 100n,
+      balances, rates: [E18, E18], feePpm10: fee, source: "synthetic-leg-qlv",
+    },
+  };
+}
+
+function assertQlRouteExact(
+  kw: { perPoolInput: bigint[]; perRouteInput: bigint[]; totalInput: bigint },
+  opt: { perPoolInput: bigint[]; perRouteInput: bigint[]; totalInput: bigint },
+  label: string,
+): void {
+  assert.equal(kw.totalInput, opt.totalInput, `${label}: total != oracle`);
+  for (let i = 0; i < kw.perPoolInput.length; i++) {
+    assert.equal(kw.perPoolInput[i], opt.perPoolInput[i], `${label}: pool[${i}] != oracle`);
+  }
+  for (let r = 0; r < kw.perRouteInput.length; r++) {
+    assert.equal(kw.perRouteInput[r], opt.perRouteInput[r], `${label}: route[${r}] != oracle`);
+  }
+}
+
+describe("k-way reference == optimal oracle (leg QL venue members — MIXED bracket+slice leg)", () => {
+  const DEEP = 10n ** 26n;
+  const TS = 60;
+  // Leg0 = {V3 pool, near-peg Curve venue} — the venue's post-fee head (0.04%) beats the pool's
+  // 0.30% fee-adjusted head, so the venue drains first and the pool engages as the cut descends
+  // (the leg-internal merge across member KINDS). A shallow direct pool competes at the global cut.
+  for (const amountIn of [1000n * E18, 60_000n * E18]) {
+    it(`mixed leg0 (pool + Curve venue) amountIn=${amountIn} — wei-exact == oracle; qinp mirror consistent`, () => {
+      const qv = curveVenue([2_000_000n * E18, 2_000_000n * E18], 1000n, 4_000_000n);
+      const dAddr = nextAddr();
+      const a1 = nextAddr();
+      const a2 = nextAddr();
+      const direct: EcoPool = legPool(dAddr, 500, TS, 10n ** 22n, 300, 0, true);
+      const route: EcoRoute = {
+        legs: [
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, TS, DEEP, 300, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, TS, DEEP, 300, 0, true)] },
+        ],
+        intermediateTokens: [nextAddr()],
+      };
+      const prepared: EcoSwapPrepared = {
+        pools: [direct], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+      };
+      const optDirect: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: TS, liquidity: 10n ** 22n, net: new Map() };
+      const optRoute: OptimalRoute = {
+        legs: [{ ...optLeg(3000, TS, DEEP, 0, true), qlvs: [qv] }, optLeg(3000, TS, DEEP, 0, true)],
+      };
+      const kw = kwayReference(prepared, amountIn, undefined, [[[qv], undefined]]);
+      const opt = optimalSplit({ pools: [optDirect], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+      assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
+      assertQlRouteExact(kw, opt, `mixed leg0 A=${amountIn}`);
+      assert.ok(kw.perLegQlvInput[0] > 0n, "the leg venue engaged (qinp mirror > 0)");
+      // Leg0 flow-in accounting (the solver's rinp identity): every event awards leg0's elected
+      // member its full route input, so Σ leg0 member awards == the route's token-A input.
+      // Universe: [0]=direct, [1]=leg0 pool, [2]=leg1 pool.
+      assert.equal(
+        kw.perUniversePoolInput[1] + kw.perLegQlvInput[0],
+        kw.perRouteInput[0],
+        "leg0 pool inp + venue qinp == route input (tokenIn conservation)",
+      );
+    });
+  }
+});
+
+describe("k-way reference == optimal oracle (POOL-LESS leg — venue-only, zero leg pools)", () => {
+  const DEEP = 10n ** 26n;
+  const TS = 60;
+  // Leg1 has NO pools — only a Curve venue. Covers the `legPools.length == 0` route shape (a leg
+  // is dead only when pools AND venues are BOTH exhausted) and the venue-only member election.
+  it("venue-only leg1 — all input via the route, wei-exact == oracle", () => {
+    const amountIn = 2000n * E18;
+    const qv = curveVenue([5_000_000n * E18, 5_000_000n * E18], 1000n, 4_000_000n);
+    const a1 = nextAddr();
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, TS, DEEP, 300, 0, true)] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [] },
+      ],
+      intermediateTokens: [nextAddr()],
+    };
+    const prepared: EcoSwapPrepared = {
+      pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optRoute: OptimalRoute = {
+      legs: [optLeg(3000, TS, DEEP, 0, true), { zeroForOne: true, pools: [], qlvs: [qv] }],
+    };
+    const kw = kwayReference(prepared, amountIn, undefined, [[undefined, [qv]]]);
+    const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assert.equal(kw.totalInput, amountIn, "spends amountIn exactly through the venue-only leg");
+    assertQlRouteExact(kw, opt, "pool-less leg");
+    assert.ok(kw.perLegQlvInput[0] > 0n, "the venue-only leg's venue took the whole leg flow");
+    assert.equal(kw.perRouteInput[0], amountIn, "all input via the route");
+  });
+});
+
+describe("k-way reference == optimal oracle (OPPOSITE-DIRECTION hop with a leg venue)", () => {
+  const DEEP = 10n ** 26n;
+  const TS = 60;
+  // Second hop swaps oneForZero AND carries a venue next to its pool — the venue's model is
+  // direction-stamped for the EDGE (i/j), the pool's frontier for the leg's zHop; the slice and
+  // the bracket compete in the same leg-internal out/in space.
+  it("z1=true, z2=false with a leg1 venue — wei-exact == oracle", () => {
+    const amountIn = 5000n * E18;
+    const qv = curveVenue([3_000_000n * E18, 3_000_000n * E18], 1000n, 4_000_000n);
+    const dAddr = nextAddr();
+    const a1 = nextAddr();
+    const a2 = nextAddr();
+    const direct: EcoPool = legPool(dAddr, 500, 10, 10n ** 24n, 300, 0, true);
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a1, 3000, TS, DEEP, 300, 0, true)] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: false, pools: [legPool(a2, 3000, TS, DEEP, 300, 0, false)] },
+      ],
+      intermediateTokens: [nextAddr()],
+    };
+    const prepared: EcoSwapPrepared = {
+      pools: [direct], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optDirect: OptimalPool = { isV2: false, feePpm: 500, sqrtPriceX96: getSqrtRatioAtTick(0), tick: 0, tickSpacing: 10, liquidity: 10n ** 24n, net: new Map() };
+    const optRoute: OptimalRoute = {
+      legs: [optLeg(3000, TS, DEEP, 0, true), { ...optLeg(3000, TS, DEEP, 0, false), qlvs: [qv] }],
+    };
+    const kw = kwayReference(prepared, amountIn, undefined, [[undefined, [qv]]]);
+    const opt = optimalSplit({ pools: [optDirect], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assert.equal(kw.totalInput, amountIn, "spends amountIn exactly");
+    assertQlRouteExact(kw, opt, "opposite-direction leg venue");
+    assert.ok(kw.perLegQlvInput[0] > 0n, "the reverse-hop venue engaged");
+  });
+});
+
+describe("k-way reference == optimal oracle (3-hop MID-LEG venue — slice upstream AND downstream)", () => {
+  const DEEP = 10n ** 26n;
+  const TS = 60;
+  // A→X→Y→B with the venue on the MIDDLE leg next to a pool: across the event walk the slice sits
+  // upstream of some binding legs and downstream of others (both inversion regimes), and the
+  // leg-internal election rotates between the slice and the bracket as the cut descends.
+  for (const amountIn of [1000n * E18, 20_000n * E18]) {
+    it(`3-hop mid-leg venue amountIn=${amountIn} — wei-exact == oracle`, () => {
+      const qv = curveVenue([1_500_000n * E18, 1_500_000n * E18], 1000n, 4_000_000n);
+      const a0 = nextAddr();
+      const m1 = nextAddr();
+      const a3 = nextAddr();
+      const route: EcoRoute = {
+        legs: [
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a0, 500, TS, DEEP, 400, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(m1, 3000, TS, DEEP, 400, 0, true)] },
+          { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a3, 500, TS, DEEP, 400, 0, true)] },
+        ],
+        intermediateTokens: [nextAddr(), nextAddr()],
+      };
+      const prepared: EcoSwapPrepared = {
+        pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+      };
+      const optRoute: OptimalRoute = {
+        legs: [
+          optLeg(500, TS, DEEP, 0, true),
+          { ...optLeg(3000, TS, DEEP, 0, true), qlvs: [qv] },
+          optLeg(500, TS, DEEP, 0, true),
+        ],
+      };
+      const kw = kwayReference(prepared, amountIn, undefined, [[undefined, [qv], undefined]]);
+      const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+      assert.equal(kw.totalInput, amountIn, "spends amountIn exactly through the 3-hop route");
+      assertQlRouteExact(kw, opt, `3-hop mid venue A=${amountIn}`);
+      assert.ok(kw.perLegQlvInput[0] > 0n, "the mid-leg venue engaged");
+    });
+  }
+});
+
+describe("k-way reference == optimal oracle (leg venue EXHAUSTION — remCap==0 kills the leg)", () => {
+  const DEEP = 10n ** 26n;
+  const TS = 60;
+  // A notional-CAPPED WOOFi venue as leg0's ONLY member: past maxNotionalSwap the shared query
+  // self-truncates to 0 (the on-chain tryQuery's 0-return), so the ladder stops EARLY and the
+  // route can absorb only Σ slice capacities. Once the last slice's remCap hits 0 the cursor
+  // exhausts, the venue drops out of election, leg0 dies, the route dies — and (route-only
+  // universe) the merge halts short of amountIn. Deterministic: every event the venue's slice
+  // binds (the deep leg1 bracket cross costs far more token-A), so the venue's qinp == Σ ladder
+  // capacities EXACTLY, on both sides.
+  it("capped leg0 venue drains fully; totalInput == Σ ladder capacities < amountIn (wei-exact == oracle)", () => {
+    const amountIn = 50_000n * E18;
+    const qv: OptimalLegQlVenue = {
+      family: "wooFi",
+      model: {
+        address: nextAddr(), tokenIn: nextAddr(), tokenOut: nextAddr(), sellBase: true,
+        price: 10n ** 8n, spread: 10n ** 14n, coeff: 10n ** 10n,
+        priceDec: 10n ** 8n, quoteDec: E18, baseDec: E18,
+        feeRate: 25n, maxNotionalSwap: 4000n * E18, maxGamma: 0n,
+        feePpm: 350, source: "synthetic-leg-qlv",
+      },
+    };
+    // The expected drained capacity — the SAME shared ladder both sides build (leg0 ⇒ cap == amountIn).
+    const ladder = buildWooFiQLLadder(qv.model, amountIn);
+    const drained = ladder.reduce((s, row) => s + row.capacity, 0n);
+    assert.ok(ladder.length > 0 && drained < amountIn, "precondition: the capped venue's ladder stops early");
+    const a2 = nextAddr();
+    const route: EcoRoute = {
+      legs: [
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [] },
+        { hopIn: nextAddr(), hopOut: nextAddr(), zeroForOne: true, pools: [legPool(a2, 3000, TS, DEEP, 300, 0, true)] },
+      ],
+      intermediateTokens: [nextAddr()],
+    };
+    const prepared: EcoSwapPrepared = {
+      pools: [], routes: [route], brackets: [], zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT, expectedInputCovered: 0n,
+    };
+    const optRoute: OptimalRoute = {
+      legs: [{ zeroForOne: true, pools: [], qlvs: [qv] }, optLeg(3000, TS, DEEP, 0, true)],
+    };
+    const kw = kwayReference(prepared, amountIn, undefined, [[[qv], undefined]]);
+    const opt = optimalSplit({ pools: [], routes: [optRoute], amountIn, zeroForOne: true, priceLimit: ROUTE_PRICE_LIMIT });
+    assertQlRouteExact(kw, opt, "venue exhaustion");
+    assert.equal(kw.perLegQlvInput[0], drained, "the venue's qinp mirror == Σ ladder capacities (fully drained)");
+    assert.equal(kw.perRouteInput[0], drained, "route input == the drained capacity (leg0 venue = tokenIn)");
+    assert.ok(kw.totalInput < amountIn, "the route dies short of the budget (venue exhausted)");
   });
 });

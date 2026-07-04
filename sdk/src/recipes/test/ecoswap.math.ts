@@ -267,6 +267,118 @@ export interface RouteLeg {
 }
 
 /**
+ * One MEMBER of a route leg — either a constant-L BRACKET (a pool; `kind` is optional so every
+ * existing plain-`RouteLeg[]` call site stays valid, including the routeEvent2/routePartial2
+ * wrappers) or a QL ladder SLICE cursor (a leg QL venue): a FLAT constant-price span with
+ * remaining input capacity `remCap` and remaining modeled output `remOut` at the post-fee out/in
+ * sqrt head `head` (a QL quote is post-fee ⇒ the slice's far == near == head; no extra fee-adjust
+ * anywhere). The slice event math mirrors the solver's Phase B/C/D slice branches bit-for-bit:
+ *   out(x)  = mulDiv(x, remOut, remCap)                          (floor)
+ *   x(need) = mulDiv(need, remCap, remOut)                       (floor — the invertFarFromOut
+ *             ≤-convention: produced-out ≤ demanded), valid ONLY while need < remOut; at/above
+ *             it the slice itself crosses first (the bracket `farj <= farOI` sentinel's slice
+ *             analogue, equality included).
+ *   full-cross gross = remCap; full-cross out = remOut.
+ * Invariant: remOut > 0 while remCap > 0 (out(x) == remOut needs x·remOut ≥ remOut·remCap ⇒
+ * x ≥ remCap under floor), so `remCap === 0` is the single exhaustion test.
+ */
+export type RouteLegMember =
+  | ({ kind?: "bracket" } & RouteLeg)
+  | { kind: "slice"; head: bigint; remCap: bigint; remOut: bigint };
+
+/** Narrow a member to the slice arm (a plain RouteLeg carries no `kind` ⇒ bracket). */
+function isSlice(m: RouteLegMember): m is { kind: "slice"; head: bigint; remCap: bigint; remOut: bigint } {
+  return m.kind === "slice";
+}
+
+// ── Leg QL venue slice cursor (the solver's qlCur/qlRemCap/qlRemOut per-venue scratch) ──────
+//
+// A leg QL venue's ladder is a list of DESCENDING-head slices (the shared build*QLLadder emit:
+// capacity = Δinput, effOut = Δoutput, marginalOI = post-fee head). The merge consumes it via a
+// cursor: the CURRENT slice's (remCap, remOut) deplete under awards; when remCap hits 0 the
+// cursor advances and re-initializes from the next row (else the venue is exhausted). This is
+// the single off-chain copy of the solver's Phase D advance block, shared by the oracle
+// (ecoswap.optimal.ts) and the reference (ecoswap.solver-reference.ts) so the three sites
+// cannot drift.
+
+/** One QL ladder slice row — the shared build*QLLadder emit shape (MergeSegment subset). */
+export interface QlSliceRow {
+  capacity: bigint;
+  effOut: bigint;
+  marginalOI: bigint;
+}
+
+/** A leg QL venue's slice cursor — rows + cursor + the CURRENT slice's remaining (cap, out). */
+export interface QlSliceCursor {
+  rows: QlSliceRow[];
+  cur: number;
+  remCap: bigint;
+  remOut: bigint;
+}
+
+/** Seed a cursor from a built ladder (empty ladder ⇒ born exhausted). */
+export function qlCursorInit(rows: QlSliceRow[]): QlSliceCursor {
+  if (rows.length === 0) return { rows, cur: 0, remCap: 0n, remOut: 0n };
+  return { rows, cur: 0, remCap: rows[0].capacity, remOut: rows[0].effOut };
+}
+
+/** Venue still has a consumable slice (the solver's `qlCur < qlStart + qlCount` gate). */
+export function qlCursorActive(c: QlSliceCursor): boolean {
+  return c.cur < c.rows.length;
+}
+
+/**
+ * The CURRENT slice's post-fee head — the row's ORIGINAL msNear (a slice is a flat constant-price
+ * span, so partial consumption does not move its head). Only valid while the cursor is active.
+ */
+export function qlCursorHead(c: QlSliceCursor): bigint {
+  return c.rows[c.cur].marginalOI;
+}
+
+/**
+ * Consume `award` of the CURRENT slice's input capacity — the solver Phase D slice-apply mirror:
+ *   outX = mulDiv(award, remOut, remCap); remCap -= award; remOut -= outX;
+ *   remCap == 0 (covers the binding full-cross AND an exact-boundary partial) ⇒ advance the
+ *   cursor + re-init from the next row (or zero remOut on exhaustion).
+ * `award === 0` (a zero-flow gap event) leaves the member untouched. Returns the slice's
+ * produced output `outX` (the flow into the next leg).
+ */
+export function qlCursorConsume(c: QlSliceCursor, award: bigint): bigint {
+  let outX = 0n;
+  if (award > 0n) {
+    outX = mulDiv(award, c.remOut, c.remCap);
+    c.remCap -= award;
+    c.remOut -= outX;
+  }
+  if (c.remCap === 0n) {
+    c.cur += 1;
+    if (c.cur < c.rows.length) {
+      c.remCap = c.rows[c.cur].capacity;
+      c.remOut = c.rows[c.cur].effOut;
+    } else {
+      c.remOut = 0n;
+    }
+  }
+  return outX;
+}
+
+/**
+ * The leg member-election comparison — the solver's leg best scan ops TRANSCRIBED (the 1b
+ * per-leg pool scan, ecoswap.sauce.ts): a candidate (near, far) WINS against the incumbent best
+ * (bestNear, bestFar) iff its near is STRICTLY higher, or the near TIES and its far is STRICTLY
+ * higher; the incumbent keeps all other ties (index-order precedence — the earlier-scanned
+ * member keeps the leg). A QL slice passes far == near, so a slice beats any near-tied bracket
+ * (whose far < near) and an earlier slice beats a later identical one. MUST stay bit-identical
+ * at all three mirror sites (solver leg scan / oracle legBestMember / reference routeLegBest) —
+ * near-ties are structural for slices, not a knife-edge.
+ */
+export function legMemberWins(near: bigint, far: bigint, bestNear: bigint, bestFar: bigint): boolean {
+  if (near > bestNear) return true;
+  if (near === bestNear && far > bestFar) return true;
+  return false;
+}
+
+/**
  * Token-A input required to FULLY cross leg `i` of a route, holding every other
  * leg at constant L and maintaining conservation. For leg 0 this is just leg 0's
  * full gross input; for a downstream leg it is its full gross input (token T_i)
@@ -283,11 +395,21 @@ export interface RouteLeg {
  * upstream leg that crosses first. Fixed truncation order (back-to-front); pure
  * bigint; bounded by `i`.
  */
-function tokenAInputToCrossLeg(legs: RouteLeg[], i: number): bigint {
+function tokenAInputToCrossLeg(legs: RouteLegMember[], i: number): bigint {
   const li = legs[i];
-  let need = bracketGross(li.L, li.nearOI, li.farOI, li.feePpm); // leg i full-cross gross (token T_i)
+  // leg i full-cross gross (token T_i): a slice's full-cross gross is its remaining capacity.
+  let need = isSlice(li) ? li.remCap : bracketGross(li.L, li.nearOI, li.farOI, li.feePpm);
   for (let j = i - 1; j >= 0; j--) {
     const lj = legs[j];
+    if (isSlice(lj)) {
+      // Upstream SLICE: producing `need` costs x = mulDiv(need, remCap, remOut) — valid ONLY while
+      // need < remOut; at/above it the slice itself crosses first (the `farj <= farOI` sentinel's
+      // slice analogue, equality included). A slice is NEVER the L==0 gap sentinel (remCap ≥ 1
+      // while its cursor is valid — see the RouteLegMember invariant).
+      if (need >= lj.remOut) return -1n;
+      need = mulDiv(need, lj.remCap, lj.remOut);
+      continue;
+    }
     // An upstream leg sitting at an interior L==0 gap (the walk-through-gap design leaves it active
     // with 0 liquidity) can PRODUCE nothing this bracket, so it must advance THROUGH its own gap
     // before leg i can bind — leg i is not binding through it. Treat it exactly like "upstream
@@ -313,14 +435,25 @@ function tokenAInputToCrossLeg(legs: RouteLeg[], i: number): bigint {
  *
  * Returns route-level (routeIn, routeOut), the binding leg index `bindLeg`, the
  * per-leg new fars `newFars[i]` (the binding leg keeps its bracket far; the caller
- * crosses that tick + updates L via net), and `dX` (the binding leg's throughput at
+ * crosses that tick + updates L via net), the per-leg gross-in `awards[i]` (what the
+ * solver accrues per member: leg0 == routeIn; a deeper bracket the re-derived
+ * bracketGross over [near, newFar]; a slice its exact consumed input — so callers
+ * apply state without re-deriving), and `dX` (the binding leg's throughput at
  * its own boundary — its OUTPUT if it is the first leg, else its GROSS INPUT).
+ *
+ * SLICE members (leg QL venues): the binding slice fully crosses (gross = remCap,
+ * out = remOut; newFars carries its flat `head` — slices have no far, callers use
+ * awards); an upstream slice back-inverts x = mulDiv(need, remCap, remOut); a
+ * downstream slice absorbs min(flow, remCap) (defensive clamp — the argmin
+ * guarantees flow < remCap up to rounding; landing exactly ON remCap is a full
+ * consume at apply time) and produces mulDiv(x, remOut, remCap). All-bracket
+ * inputs are BIT-IDENTICAL to the pre-slice implementation (regression-pinned).
  *
  * Reduces EXACTLY to routeEvent2 at k=2 (see ecoswap.math.test.ts identity guard).
  */
 export function routeEventN(
-  legs: RouteLeg[],
-): { routeIn: bigint; routeOut: bigint; bindLeg: number; newFars: bigint[]; dX: bigint } {
+  legs: RouteLegMember[],
+): { routeIn: bigint; routeOut: bigint; bindLeg: number; newFars: bigint[]; awards: bigint[]; dX: bigint } {
   const k = legs.length;
   // 1) Binding leg = argmin token-A crossing input over the REACHABLE legs (a `-1n` sentinel
   //    means an upstream leg crosses before this one — skip it). Leg 0 is always reachable, so
@@ -335,33 +468,63 @@ export function routeEventN(
     }
   }
   const newFars: bigint[] = new Array(k);
-  // 2) Binding leg lands exactly on its bracket far (caller crosses the tick).
+  const awards: bigint[] = new Array(k);
+  // 2) Binding leg lands exactly on its bracket far (caller crosses the tick); a binding SLICE
+  //    fully crosses (gross = remCap, out = remOut — the flat span has no far, carry its head).
   const lb = legs[bindLeg];
-  newFars[bindLeg] = lb.farOI;
-  const bindGrossIn = bracketGross(lb.L, lb.nearOI, lb.farOI, lb.feePpm); // exact token-T_bind input
-  const bindOut = bracketOut(lb.L, lb.nearOI, lb.farOI); // exact token-T_{bind+1} output
+  let bindGrossIn: bigint;
+  let bindOut: bigint;
+  if (isSlice(lb)) {
+    newFars[bindLeg] = lb.head;
+    bindGrossIn = lb.remCap;
+    bindOut = lb.remOut;
+  } else {
+    newFars[bindLeg] = lb.farOI;
+    bindGrossIn = bracketGross(lb.L, lb.nearOI, lb.farOI, lb.feePpm); // exact token-T_bind input
+    bindOut = bracketOut(lb.L, lb.nearOI, lb.farOI); // exact token-T_{bind+1} output
+  }
+  awards[bindLeg] = bindGrossIn;
   // 3) Upstream legs (j < bindLeg): each PRODUCES the downstream leg's exact required input
-  //    (back-invert via out). `need` starts as the binding leg's exact gross input.
+  //    (back-invert via out; a slice back-inverts x = mulDiv(need, remCap, remOut)). `need`
+  //    starts as the binding leg's exact gross input.
   let need = bindGrossIn;
   for (let j = bindLeg - 1; j >= 0; j--) {
     const lj = legs[j];
-    const farj = invertFarFromOut(lj.L, lj.nearOI, need);
-    newFars[j] = farj;
-    need = bracketGross(lj.L, lj.nearOI, farj, lj.feePpm);
+    if (isSlice(lj)) {
+      const xj = mulDiv(need, lj.remCap, lj.remOut);
+      newFars[j] = lj.head;
+      awards[j] = xj;
+      need = xj;
+    } else {
+      const farj = invertFarFromOut(lj.L, lj.nearOI, need);
+      newFars[j] = farj;
+      need = bracketGross(lj.L, lj.nearOI, farj, lj.feePpm);
+      awards[j] = need;
+    }
   }
   routeIn = need; // token-A gross input (== the min for the binding leg, recomputed exactly)
   // 4) Downstream legs (j > bindLeg): each ABSORBS the upstream leg's exact output as gross-in
-  //    (forward-invert). `flow` starts as the binding leg's exact output.
+  //    (forward-invert; a slice absorbs min(flow, remCap) and produces the floored linear out).
+  //    `flow` starts as the binding leg's exact output.
   let flow = bindOut;
   for (let j = bindLeg + 1; j < k; j++) {
     const lj = legs[j];
-    const farj = invertFarFromGrossIn(lj.L, lj.nearOI, flow, lj.feePpm);
-    newFars[j] = farj;
-    flow = bracketOut(lj.L, lj.nearOI, farj);
+    if (isSlice(lj)) {
+      let xj = flow;
+      if (xj > lj.remCap) xj = lj.remCap; // defensive clamp (see doc above)
+      newFars[j] = lj.head;
+      awards[j] = xj;
+      flow = mulDiv(xj, lj.remOut, lj.remCap);
+    } else {
+      const farj = invertFarFromGrossIn(lj.L, lj.nearOI, flow, lj.feePpm);
+      newFars[j] = farj;
+      awards[j] = bracketGross(lj.L, lj.nearOI, farj, lj.feePpm); // the solver's full-event accrual
+      flow = bracketOut(lj.L, lj.nearOI, farj);
+    }
   }
   const routeOut = flow; // exact output of the final leg
   const dX = bindLeg === 0 ? bindOut : bindGrossIn;
-  return { routeIn, routeOut, bindLeg, newFars, dX };
+  return { routeIn, routeOut, bindLeg, newFars, awards, dX };
 }
 
 /**
@@ -369,24 +532,37 @@ export function routeEventN(
  * current brackets — used when the route is the crossing venue at the global cut
  * and takes the remainder. leg 0 absorbs `targetRouteIn` (gross) and produces its
  * output; that output is leg 1's gross-in; … ; the final leg's output is routeOut.
- * Returns `routeOut` and the per-leg new fars `newFars[i]`.
+ * Returns `routeOut`, the per-leg new fars `newFars[i]`, and the per-leg gross-in
+ * `awards[i]` (the solver's clamped-path accrual: a bracket takes the INCOMING flow
+ * — inp += (L===0 ? rtake : pflow) — a slice its clamped min(flow, remCap); a slice
+ * member's newFars carries its flat `head`).
  *
  * Reduces EXACTLY to routePartial2 at k=2 (f1p/f2p == newFars[0]/newFars[1]).
  */
 export function routePartialN(
-  legs: RouteLeg[],
+  legs: RouteLegMember[],
   targetRouteIn: bigint,
-): { routeOut: bigint; newFars: bigint[] } {
+): { routeOut: bigint; newFars: bigint[]; awards: bigint[] } {
   const k = legs.length;
   const newFars: bigint[] = new Array(k);
+  const awards: bigint[] = new Array(k);
   let flow = targetRouteIn; // gross input into the current leg (token A at leg 0)
   for (let j = 0; j < k; j++) {
     const lj = legs[j];
+    if (isSlice(lj)) {
+      let xj = flow;
+      if (xj > lj.remCap) xj = lj.remCap; // the solver's clamped Phase D slice clamp
+      newFars[j] = lj.head;
+      awards[j] = xj;
+      flow = mulDiv(xj, lj.remOut, lj.remCap);
+      continue;
+    }
     const farj = invertFarFromGrossIn(lj.L, lj.nearOI, flow, lj.feePpm);
     newFars[j] = farj;
+    awards[j] = flow; // the solver's clamped-path accrual (rtake at leg0, pflow deeper)
     flow = bracketOut(lj.L, lj.nearOI, farj); // this leg's output → next leg's gross-in
   }
-  return { routeOut: flow, newFars };
+  return { routeOut: flow, newFars, awards };
 }
 
 /**

@@ -78,12 +78,23 @@ import {
   V2_STEP_BPS,
   V2_STEP_DEN,
   type RouteLeg,
+  type RouteLegMember,
+  type QlSliceCursor,
   routeHeadFold,
   routeEventN,
   routePartialN,
   bracketGross,
   bracketOut,
+  qlCursorInit,
+  qlCursorActive,
+  qlCursorHead,
+  qlCursorConsume,
+  legMemberWins,
 } from "./ecoswap.math";
+// The leg QL venue family dispatch (13 shared build*QLLadder builders) is SINGLE-SOURCED in the
+// oracle so the reference's ladders are the oracle's ladders by construction — the same pattern
+// as the shared routeEventN/routePartialN event math above.
+import { buildLegQlVenueLadder, type OptimalLegQlVenue } from "./ecoswap.optimal";
 
 /** Modeled LIVE state for one pool (what the on-chain SETUP reads). */
 export interface KwayLivePool {
@@ -140,6 +151,13 @@ export interface KwayReferenceResult {
    * COMPUTED split (this array == the oracle), per-wei.
    */
   perUniversePoolInput: bigint[];
+  /**
+   * Per-LEG-QL-VENUE Σ awarded input, in each venue's LEG-INPUT token — the solver's `qinp`
+   * mirror, exposed for the EVM tests' split assertions. Indexed FLAT in (routeIdx asc,
+   * legIdx asc, venue order) — the index.ts leg-row ordering contract — one slot per venue in
+   * `legQlModels` (0n for a venue whose ladder never engaged / built empty).
+   */
+  perLegQlvInput: bigint[];
 }
 
 /** fee-adjusted out/in head price (sqrt(1-fee) scaling) — matches the solver feeAdj. */
@@ -403,25 +421,39 @@ function advanceFrontierNearTo(f: Frontier, partialFarOI: bigint): void {
 interface LegSlice {
   idxs: number[]; // universe pool indices of this leg's pools
   zeroForOne: boolean; // the leg's hop direction
+  // The leg's QL VENUE cursors (the solver's qlCur/qlRemCap/qlRemOut per-venue scratch) + each
+  // venue's GLOBAL index `g` into perLegQlvInput (the qinp mirror). Built at setup from
+  // legQlModels via the SHARED build*QLLadder dispatch, sized by the chain-order fold.
+  qlv: { cur: QlSliceCursor; g: number }[];
+}
+
+/** One leg's elected member: a pool (universe index) or a QL venue (leg-local qlv index). */
+interface LegBestSel {
+  isQ: boolean;
+  poolIdx: number; // universe pool index (isQ === false)
+  qv: number; // leg-local venue index into leg.qlv (isQ === true)
+  nearAdj: bigint;
+  farAdj: bigint;
 }
 
 /**
- * The leg-internal best per leg: for each leg, the active pool with the HIGHEST fee-adjusted out/in
- * near (the leg-internal price-ordered merge — ties broken by higher far, mirroring the global
- * merge). Returns the binding-pool index per leg + the per-leg fee-adjusted near/far heads (the fold
- * inputs). null if any leg has no usable active pool (the route is inactive this step).
+ * The leg-internal best MEMBER per leg: pools scanned FIRST (leg order), then QL venue cursors —
+ * the EXACT comparison ops of the solver's leg best scan (legMemberWins, transcribed in
+ * ecoswap.math.ts): win on a strictly higher fee-adjusted near, or a near-TIE with a strictly
+ * higher fee-adjusted far (a slice's far == its near, so a slice beats any near-tied bracket);
+ * the INCUMBENT (earlier-scanned) member keeps all other ties. The `>=` outer gate is the
+ * solver's lazy far-adjust (result-identical to eager). null if any leg has no usable active
+ * member (the route is inactive this step).
  */
-function routeLegBest(
-  legs: LegSlice[],
-  fr: Frontier[],
-): { poolIdx: number[]; nearAdjs: bigint[]; farAdjs: bigint[] } | null {
-  const poolIdx: number[] = [];
-  const nearAdjs: bigint[] = [];
-  const farAdjs: bigint[] = [];
+function routeLegBest(legs: LegSlice[], fr: Frontier[]): LegBestSel[] | null {
+  const out: LegBestSel[] = [];
   for (const leg of legs) {
-    let best = -1;
+    let bestIsQ = false;
+    let bestPool = -1;
+    let bestQv = -1;
     let bestAdj = 0n;
     let bestFarAdj = 0n;
+    let live = false;
     for (const idx of leg.idxs) {
       const f = fr[idx];
       if (!f.on) continue;
@@ -429,19 +461,33 @@ function routeLegBest(
       const adj = feeAdj(oi, f.feePpm);
       if (adj >= bestAdj) {
         const farAdj = feeAdj(frontierFarOI(f), f.feePpm);
-        if (best < 0 || adj > bestAdj || (adj === bestAdj && farAdj > bestFarAdj)) {
+        if (legMemberWins(adj, farAdj, bestAdj, bestFarAdj)) {
           bestAdj = adj;
           bestFarAdj = farAdj;
-          best = idx;
+          bestPool = idx;
+          bestIsQ = false;
+          live = true;
         }
       }
     }
-    if (best < 0) return null;
-    poolIdx.push(best);
-    nearAdjs.push(bestAdj);
-    farAdjs.push(bestFarAdj);
+    for (let u = 0; u < leg.qlv.length; u++) {
+      const c = leg.qlv[u].cur;
+      if (!qlCursorActive(c)) continue;
+      const qh = qlCursorHead(c); // post-fee — NO extra fee-adjust; a slice's far == near
+      if (qh >= bestAdj) {
+        if (legMemberWins(qh, qh, bestAdj, bestFarAdj)) {
+          bestAdj = qh;
+          bestFarAdj = qh;
+          bestQv = u;
+          bestIsQ = true;
+          live = true;
+        }
+      }
+    }
+    if (!live) return null;
+    out.push({ isQ: bestIsQ, poolIdx: bestPool, qv: bestQv, nearAdj: bestAdj, farAdj: bestFarAdj });
   }
-  return { poolIdx, nearAdjs, farAdjs };
+  return out;
 }
 
 /**
@@ -460,6 +506,7 @@ function advanceRoute(
   prevRouteHead: bigint[],
   routeIdx: number,
   perUniverse: bigint[],
+  perLegQlv: bigint[],
 ): { routeIn: bigint } {
   // Strictly-descending route head invariant: each consumed route segment's near must be <= the
   // previous (a price-ordered merge emits descending segments). Allow the first (prev 0).
@@ -470,24 +517,39 @@ function advanceRoute(
   }
   prevRouteHead[routeIdx] = head;
 
-  const best = routeLegBest(legs, fr);
-  if (best === null) return { routeIn: 0n };
-  const k = best.poolIdx.length;
-  const iLeg = best.poolIdx;
-  const legBr: RouteLeg[] = iLeg.map((idx) => frontierBracket(fr[idx]));
+  const sel = routeLegBest(legs, fr);
+  if (sel === null) return { routeIn: 0n };
+  const k = sel.length;
+  // Per-leg elected member: a pool's CURRENT bracket on the fixed live grid, or a QL venue's
+  // CURRENT slice snapshot {head, remCap, remOut} (the solver's lgIsQ/lgQv member fill).
+  const members: RouteLegMember[] = sel.map((s, i) => {
+    if (s.isQ) {
+      const c = legs[i].qlv[s.qv].cur;
+      return { kind: "slice" as const, head: qlCursorHead(c), remCap: c.remCap, remOut: c.remOut };
+    }
+    return frontierBracket(fr[s.poolIdx]);
+  });
+  const isQ = (i: number): boolean => members[i].kind === "slice";
 
-  const ev = routeEventN(legBr);
+  const ev = routeEventN(members);
 
-  // Conservation at EVERY intermediate: token X_i leg i PRODUCES == gross X_i leg i+1 PULLS for the
-  // bound event (leg i out == leg i+1 in). Compute both from the event's new fars and bound the
-  // residue. The forward/back inversion round-trips an integer truncation per leg boundary (the fee
-  // divide in invertFarFromGrossIn then the multiply in bracketGross), so a k-leg chain accumulates
-  // at most ~1 wei per upstream boundary of leg i+1 — bound it by `k` wei (slack-bounded, NOT a
-  // wei-exact gate; the wei-exact gate is reference == oracle, asserted by the caller).
+  // Conservation at EVERY intermediate where BOTH sides are BRACKETS: token X_i leg i PRODUCES ==
+  // gross X_i leg i+1 PULLS for the bound event (leg i out == leg i+1 in). Compute both from the
+  // event's new fars and bound the residue. The forward/back inversion round-trips an integer
+  // truncation per leg boundary (the fee divide in invertFarFromGrossIn then the multiply in
+  // bracketGross), so a k-leg chain accumulates at most ~1 wei per upstream boundary of leg i+1 —
+  // bound it by `k` wei (slack-bounded, NOT a wei-exact gate; the wei-exact gate is reference ==
+  // oracle, asserted by the caller). A boundary touching a SLICE member is NOT gated here: a
+  // slice's floored linear out under-delivers by up to ~⌈remOut/remCap⌉ wei of the downstream
+  // token by design (§ slice model) — its gate is the EQUALITY of the solver-mirrored computed
+  // values below (the pinned stronger form), not physical conservation.
   const consTol = BigInt(k);
   for (let i = 0; i + 1 < k; i++) {
-    const xOut = bracketOut(legBr[i].L, legBr[i].nearOI, ev.newFars[i]);
-    const xIn = bracketGross(legBr[i + 1].L, legBr[i + 1].nearOI, ev.newFars[i + 1], legBr[i + 1].feePpm);
+    if (isQ(i) || isQ(i + 1)) continue;
+    const mi = members[i] as RouteLeg;
+    const mn = members[i + 1] as RouteLeg;
+    const xOut = bracketOut(mi.L, mi.nearOI, ev.newFars[i]);
+    const xIn = bracketGross(mn.L, mn.nearOI, ev.newFars[i + 1], mn.feePpm);
     const cons = xOut > xIn ? xOut - xIn : xIn - xOut;
     if (cons > consTol) {
       throw new Error(
@@ -496,38 +558,101 @@ function advanceRoute(
     }
   }
 
+  // Slice-event EQUALITY gate (the session-pinned stronger form): every slice member's award must
+  // EQUAL its defining formula re-derived from the PRE-EVENT cursor state — binding: the full
+  // remCap; upstream: mulDiv(need, remCap, remOut) with need = the downstream member's gross-in
+  // (awards[j+1]); downstream: min(flow, remCap) with flow = the upstream member's produced out.
+  // The mirror (solver Phase C/D) computes the identical floored values, so any drift between the
+  // event computation and the cursor bookkeeping throws here on ANY vector.
+  for (let j = 0; j < k; j++) {
+    const m = members[j];
+    if (m.kind !== "slice") continue;
+    if (ev.awards[j] > m.remCap) {
+      throw new Error(`route ${routeIdx} leg ${j} slice over-award: ${ev.awards[j]} > remCap ${m.remCap}`);
+    }
+    let expect: bigint;
+    if (j === ev.bindLeg) {
+      expect = m.remCap; // binding slice fully crosses
+    } else if (j < ev.bindLeg) {
+      expect = mulDiv(ev.awards[j + 1], m.remCap, m.remOut);
+    } else {
+      const prev = members[j - 1];
+      const flow =
+        prev.kind === "slice"
+          ? mulDiv(ev.awards[j - 1], prev.remOut, prev.remCap)
+          : bracketOut(prev.L, prev.nearOI, ev.newFars[j - 1]);
+      expect = flow > m.remCap ? m.remCap : flow;
+    }
+    if (ev.awards[j] !== expect) {
+      throw new Error(
+        `route ${routeIdx} leg ${j} slice award != computed value: ${ev.awards[j]} != ${expect}`,
+      );
+    }
+  }
+
   if (cap < ev.routeIn) {
     // The route is the crossing venue: take exactly the remainder via a forward partial fill, NOT
-    // advancing past the cut. The binding test guarantees each leg's partial lands within its
+    // advancing past the cut. The binding test guarantees each leg pool's partial lands within its
     // bracket; assert it per leg, then advance every leg's near to its partial far (interior). Per
     // leg pool accrue the FLOW INTO that leg (leg 0 = cap, deeper = the upstream leg's output) —
-    // bit-identical to the solver's clamped Phase D `inp[pI] += inAmt` (inAmt = L===0 ? rtake : pflow).
-    const part = routePartialN(legBr, cap);
+    // bit-identical to the solver's clamped Phase D `inp[pI] += inAmt` (inAmt = L===0 ? rtake :
+    // pflow). A SLICE member consumes its clamped min(pflow, remCap) into the venue cursor
+    // (accrued into the qinp mirror), produces the floored linear out, and its award must EQUAL
+    // routePartialN's computed value (the same equality gate as the full event).
+    const part = routePartialN(members, cap);
     let pflow = cap;
     for (let i = 0; i < k; i++) {
+      if (isQ(i)) {
+        const q = legs[i].qlv[sel[i].qv];
+        const c = q.cur;
+        let xj = pflow;
+        if (xj > c.remCap) xj = c.remCap;
+        if (xj !== part.awards[i]) {
+          throw new Error(
+            `route ${routeIdx} leg ${i} clamped slice award != computed value: ${xj} != ${part.awards[i]}`,
+          );
+        }
+        perLegQlv[q.g] += xj;
+        pflow = qlCursorConsume(c, xj);
+        continue;
+      }
+      const mi = members[i] as RouteLeg;
       const f = part.newFars[i];
-      if (f < legBr[i].farOI || f > legBr[i].nearOI) {
+      if (f < mi.farOI || f > mi.nearOI) {
         throw new Error(
-          `route ${routeIdx} leg ${i} partial out of bracket: f=${f} not in [${legBr[i].farOI}, ${legBr[i].nearOI}]`,
+          `route ${routeIdx} leg ${i} partial out of bracket: f=${f} not in [${mi.farOI}, ${mi.nearOI}]`,
         );
       }
-      perUniverse[iLeg[i]] += i === 0 ? cap : pflow;
-      advanceFrontierNearTo(fr[iLeg[i]], f);
-      pflow = bracketOut(legBr[i].L, legBr[i].nearOI, f); // this leg's output → next leg's gross-in
+      perUniverse[sel[i].poolIdx] += i === 0 ? cap : pflow;
+      advanceFrontierNearTo(fr[sel[i].poolIdx], f);
+      pflow = bracketOut(mi.L, mi.nearOI, f); // this leg's output → next leg's gross-in
     }
     return { routeIn: cap };
   }
 
-  // Full event: the BINDING leg crosses its bracket (its frontier steps the tick); every OTHER leg's
-  // near advances to the event's new far (interior — no cross). NO priceLimit on the binding cross.
-  // Per leg pool accrue the leg's flow-in this event (leg 0 = routeIn; deeper = the gross input it
-  // absorbs over its current bracket to newFars[i]) — bit-identical to the solver's full-event
-  // `inp[pI] += inAmt` (inAmt = L===0 ? routeIn : bracketGross(lgL,lgN,lgNF,lgFee)).
+  // Full event: the BINDING leg crosses its bracket (its frontier steps the tick) — or the binding
+  // SLICE fully crosses (award == remCap ⇒ its cursor advances + re-inits from the next row);
+  // every OTHER leg's near advances to the event's new far (interior — no cross) — or the slice
+  // consumes its award. NO priceLimit on the binding cross. Per leg pool accrue the leg's flow-in
+  // this event (leg 0 = routeIn; deeper = the gross input it absorbs over its current bracket to
+  // newFars[i]) — bit-identical to the solver's full-event `inp[pI] += inAmt` (inAmt = L===0 ?
+  // routeIn : bracketGross(lgL,lgN,lgNF,lgFee)); a slice accrues its award into the qinp mirror.
   for (let i = 0; i < k; i++) {
-    perUniverse[iLeg[i]] +=
-      i === 0 ? ev.routeIn : bracketGross(legBr[i].L, legBr[i].nearOI, ev.newFars[i], legBr[i].feePpm);
+    if (isQ(i)) {
+      const q = legs[i].qlv[sel[i].qv];
+      // Phase D slice-apply gate: the binding slice always applies (full cross); a non-binding
+      // slice applies only on a routeIn>0 event (a zero-flow gap event leaves it untouched,
+      // mirroring the solver's routeIn>0 partial guard).
+      const award = i === ev.bindLeg ? ev.awards[i] : ev.routeIn > 0n ? ev.awards[i] : 0n;
+      perLegQlv[q.g] += award;
+      qlCursorConsume(q.cur, award);
+      continue;
+    }
+    const mi = members[i] as RouteLeg;
+    perUniverse[sel[i].poolIdx] +=
+      i === 0 ? ev.routeIn : bracketGross(mi.L, mi.nearOI, ev.newFars[i], mi.feePpm);
     if (i === ev.bindLeg) {
-      const bf = fr[iLeg[i]];
+      const bf = fr[sel[i].poolIdx];
       if (bf.isV2) {
         // V2 BINDING leg: a constant-product pool has NO tick to cross — advance the near to the
         // geometric far at CONSTANT L (no crossV3Boundary: its stepReal would divide by the V2
@@ -546,7 +671,7 @@ function advanceRoute(
       // Non-binding leg partial-fill — SKIPPED on a zero-flow (interior-gap) event (routeIn==0): a
       // leg that absorbs nothing must not move (mirrors the solver's routeIn>0 partial guard + the
       // oracle eliding the gap in the adjacent real event).
-      advanceFrontierNearTo(fr[iLeg[i]], ev.newFars[i]);
+      advanceFrontierNearTo(fr[sel[i].poolIdx], ev.newFars[i]);
     }
   }
   return { routeIn: ev.routeIn };
@@ -558,11 +683,19 @@ function advanceRoute(
  * spot (no drift). `directCount` = prepared.pools.length leading entries are DIRECT venues; the rest
  * are leg pools reached solely via `prepared.routes`. Per-pool direction comes from each pool's
  * `inIsToken0`. `priceLimit` is the swap's real-sqrt price limit (DIRECT pools only).
+ *
+ * `legQlModels[r][L]` is the leg QL VENUE list for prepared.routes[r].legs[L] (the same shared
+ * model types the oracle's OptimalRouteLeg.qlvs takes; tests construct them from the same fixture
+ * state they hand the oracle) — each venue's ladder is built at SETUP via the SHARED
+ * build*QLLadder dispatch, sized by the chain-order fold recomputed from THIS reference's own
+ * seeded frontiers (bit-identical to the solver's per-row prelude). Omitted / sparse ⇒ no leg
+ * venues (every existing call site stays valid).
  */
 export function kwayReference(
   prepared: EcoSwapPrepared,
   amountIn: bigint,
   live?: (KwayLivePool | undefined)[],
+  legQlModels?: (OptimalLegQlVenue[] | undefined)[][],
 ): KwayReferenceResult {
   const { pools, routes } = prepared;
   const priceLimit = prepared.priceLimit;
@@ -590,7 +723,7 @@ export function kwayReference(
         }
         idxs.push(idx);
       }
-      legs.push({ idxs, zeroForOne: leg.zeroForOne });
+      legs.push({ idxs, zeroForOne: leg.zeroForOne, qlv: [] });
     }
     routeLegs.push(legs);
   }
@@ -611,6 +744,44 @@ export function kwayReference(
   for (let i = 0; i < universe.length; i++) {
     fr[i] = seedFrontier(universe[i], live?.[i]);
   }
+
+  // ── SETUP: build every leg QL venue's slice ladder, (routeIdx asc, legIdx asc) so a leg's fold
+  // can read the already-built LOWER legs' first-slice heads (the index.ts leg-row ordering
+  // contract; mirrors the solver's single flat qlv pass over pre-seeded frontiers). ladderCap
+  // folds `amountIn` through legs 0..L-1's SETUP heads — per upstream leg the max over (a) each
+  // ACTIVE leg-pool frontier's fee-adjusted out/in near (the solver's dnOn/dnNear at build time)
+  // and (b) each already-built venue ladder's first-slice head (post-fee) — with the two-step
+  // floor fold cap = mulDiv(mulDiv(cap, hF, Q96), hF, Q96) per leg (hF==0 ⇒ cap 0 ⇒ the venue
+  // builds nothing, the solver's ladderCap==0 stop). Ladders come from the SHARED build*QLLadder
+  // dispatch (buildLegQlVenueLadder), so reference == oracle == solver grids by construction. ──
+  let qlvTotal = 0;
+  for (let r = 0; r < routeLegs.length; r++) {
+    const legs = routeLegs[r];
+    for (let L = 0; L < legs.length; L++) {
+      const models = legQlModels?.[r]?.[L] ?? [];
+      if (models.length === 0) continue;
+      let cap = amountIn;
+      for (let f = 0; f < L; f++) {
+        let hF = 0n;
+        for (const idx of legs[f].idxs) {
+          const fro = fr[idx];
+          if (!fro.on) continue;
+          const hc = feeAdj(frontierNearOI(fro), fro.feePpm);
+          if (hc > hF) hF = hc;
+        }
+        for (const q of legs[f].qlv) {
+          if (q.cur.rows.length > 0) {
+            const hq = q.cur.rows[0].marginalOI; // first-slice head, post-fee
+            if (hq > hF) hF = hq;
+          }
+        }
+        cap = mulDiv(mulDiv(cap, hF, Q96), hF, Q96); // out ≈ in·h²/2^192; hF==0 ⇒ 0
+      }
+      legs[L].qlv = models.map((m) => ({ cur: qlCursorInit(buildLegQlVenueLadder(m, cap)), g: qlvTotal++ }));
+    }
+  }
+  // The qinp mirror — one slot per leg QL venue, flat (routeIdx asc, legIdx asc, venue order).
+  const perLegQlvInput: bigint[] = new Array(qlvTotal).fill(0n);
 
   // ── MERGE ──
   let cum = 0n;
@@ -647,14 +818,15 @@ export function kwayReference(
       }
     }
 
-    // 1b. routes: head = product fold of each leg's internal-best fee-adjusted near. A route is
-    // active only if EVERY leg has at least one active pool with a usable bracket.
+    // 1b. routes: head = product fold of each leg's internal-best fee-adjusted near (a leg's best
+    // MEMBER may be a pool bracket or a QL slice — the slice's post-fee head folds identically,
+    // with far == near). A route is active only if EVERY leg has at least one active member.
     for (let r = 0; r < routes.length; r++) {
       const legBest = routeLegBest(routeLegs[r], fr);
       if (legBest === null) continue;
-      const head = routeHeadFold(legBest.nearAdjs);
+      const head = routeHeadFold(legBest.map((s) => s.nearAdj));
       if (head >= bestPrice) {
-        const farHead = routeHeadFold(legBest.farAdjs);
+        const farHead = routeHeadFold(legBest.map((s) => s.farAdj));
         if (head > bestPrice || (head === bestPrice && farHead > bestFar)) {
           bestPrice = head;
           bestFar = farHead;
@@ -710,7 +882,7 @@ export function kwayReference(
       // ── advance a ROUTE by one event ──
       const r = bestRef;
       const cap = amountIn - cum;
-      const taken = advanceRoute(routeLegs[r], fr, cap, cursorChecks, bestPrice, prevRouteHead, r, perUniversePoolInput);
+      const taken = advanceRoute(routeLegs[r], fr, cap, cursorChecks, bestPrice, prevRouteHead, r, perUniversePoolInput, perLegQlvInput);
       perRouteInput[r] += taken.routeIn;
       cum += taken.routeIn;
       if (taken.routeIn > 0n) cutSqrtAdj = bestFar;
@@ -719,5 +891,5 @@ export function kwayReference(
 
   const totalInput =
     perPoolInput.reduce((a, b) => a + b, 0n) + perRouteInput.reduce((a, b) => a + b, 0n);
-  return { perPoolInput, perRouteInput, totalInput, cutSqrtAdj, cursorChecks, perUniversePoolInput };
+  return { perPoolInput, perRouteInput, totalInput, cutSqrtAdj, cursorChecks, perUniversePoolInput, perLegQlvInput };
 }

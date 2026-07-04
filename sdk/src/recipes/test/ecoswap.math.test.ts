@@ -41,7 +41,13 @@ import {
   routeEventN,
   routePartialN,
   qlSliceHead,
+  qlCursorInit,
+  qlCursorActive,
+  qlCursorHead,
+  qlCursorConsume,
+  legMemberWins,
   type RouteLeg,
+  type RouteLegMember,
 } from "./ecoswap.math";
 import { ecoSwapReference } from "./ecoswap.reference";
 import {
@@ -1575,6 +1581,255 @@ describe("routeEventN — interior L==0 gap leg (walk-through-gap, no Panic) [de
     const ev = routeEventN(legs);
     assert.equal(ev.bindLeg, 1, "the FIRST (lowest-index) gap leg binds");
     assert.equal(ev.routeIn, 0n);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 11d. QL SLICE leg members — routeEventN / routePartialN slice cases + cursor + election ops
+// ─────────────────────────────────────────────────────────────
+//
+// A leg QL venue enters the route event as a SLICE member: a flat constant-price span with
+// (remCap, remOut) at a post-fee head (far == near). These vectors pin the slice event math the
+// solver's Phase B/C/D slice branches mirror bit-for-bit: full-cross gross = remCap / out =
+// remOut; upstream inversion x = mulDiv(need, remCap, remOut) (with the need >= remOut ⇒
+// not-binding sentinel); downstream linear absorb out = mulDiv(x, remOut, remCap) with the
+// defensive remCap clamp; per-member awards; the qlCursor Phase D apply/advance; and the pinned
+// member-election comparison ops (legMemberWins). All-bracket inputs stay BIT-IDENTICAL to the
+// pre-slice implementation (regression pins at the end).
+describe("QL slice leg members [routeEventN / routePartialN / qlCursor / legMemberWins]", () => {
+  const E18 = 10n ** 18n;
+  const FEE = 3000n;
+  const near = toOutIn(getSqrtRatioAtTick(0), true); // 2^96 out/in spot
+  const farDeep = toOutIn(getSqrtRatioAtTick(-6000), true);
+  const farNarrow = toOutIn(getSqrtRatioAtTick(-60), true);
+  const slice = (remCap: bigint, remOut: bigint): RouteLegMember => ({
+    kind: "slice",
+    head: qlSliceHead(remOut, remCap),
+    remCap,
+    remOut,
+  });
+
+  // ── Member-election comparison ops (the solver's leg best scan, transcribed) ──
+  it("legMemberWins — strict-near win / near-tie far tie-break / incumbent keeps exact ties", () => {
+    // strict near win (far irrelevant).
+    assert.equal(legMemberWins(10n, 5n, 9n, 9n), true, "higher near wins");
+    // a lower near NEVER wins, whatever its far.
+    assert.equal(legMemberWins(9n, 100n, 10n, 1n), false, "lower near loses");
+    // near tie: a strictly higher far wins — the structural slice case (a slice's far == near
+    // beats any near-tied bracket whose far < near).
+    assert.equal(legMemberWins(10n, 10n, 10n, 9n), true, "near-tie + higher far wins (slice vs bracket)");
+    // exact tie (near AND far): the INCUMBENT keeps the leg — index-order precedence, so of two
+    // identical slices the earlier-scanned one is elected.
+    assert.equal(legMemberWins(10n, 10n, 10n, 10n), false, "exact tie ⇒ incumbent (earlier index) keeps");
+    // near tie with a LOWER far loses (a bracket never displaces a near-tied slice).
+    assert.equal(legMemberWins(10n, 9n, 10n, 10n), false, "near-tie + lower far loses");
+  });
+
+  // ── 1. [bracket, slice] — the SLICE binds (full cross: gross = remCap, out = remOut) ──
+  it("slice BINDING: awards = [back-inverted gross, remCap]; routeOut = remOut (pinned)", () => {
+    const leg0: RouteLegMember = { nearOI: near, farOI: farDeep, L: 10n ** 26n, feePpm: FEE };
+    const remCap = 40n * E18;
+    const remOut = 39n * E18;
+    const ev = routeEventN([leg0, slice(remCap, remOut)]);
+    assert.equal(ev.bindLeg, 1, "the small slice crosses before the deep bracket");
+    assert.equal(ev.awards[1], remCap, "binding slice award == full remCap");
+    assert.equal(ev.routeOut, remOut, "binding slice out == full remOut");
+    assert.equal(ev.newFars[1], qlSliceHead(remOut, remCap), "slice newFar carries its flat head");
+    assert.equal(ev.dX, remCap, "dX == the binding member's gross input (bindLeg > 0)");
+    // Upstream back-inversion: leg0 PRODUCES exactly remCap; routeIn is the re-derived gross.
+    const farj = invertFarFromOut(10n ** 26n, near, remCap);
+    assert.equal(ev.newFars[0], farj, "upstream bracket far produces the slice's remCap");
+    assert.equal(ev.routeIn, bracketGross(10n ** 26n, near, farj, FEE), "routeIn == upstream gross");
+    assert.equal(ev.awards[0], ev.routeIn, "awards[0] == routeIn always");
+    assert.equal(ev.routeIn, 40120377131400601807n, "routeIn pinned");
+  });
+
+  // ── 2. [slice, bracket] — the slice sits UPSTREAM, non-binding: floor inversion + slip bound ──
+  it("slice UPSTREAM non-binding: x = mulDiv(need, remCap, remOut); produced ≤ need (≤-convention)", () => {
+    const remCap = 10n ** 24n;
+    const remOut = 997n * 10n ** 21n;
+    const leg1: RouteLegMember = { nearOI: near, farOI: farNarrow, L: 10n ** 21n, feePpm: FEE };
+    const need = bracketGross(10n ** 21n, near, farNarrow, FEE); // leg1 full-cross gross
+    assert.ok(need < remOut, "precondition: the slice can produce leg1's full need");
+    const ev = routeEventN([slice(remCap, remOut), leg1]);
+    assert.equal(ev.bindLeg, 1, "the narrow bracket binds through the deep slice");
+    const x0 = mulDiv(need, remCap, remOut);
+    assert.equal(ev.awards[0], x0, "upstream slice award == floor inversion");
+    assert.equal(ev.routeIn, x0, "routeIn == the slice's gross input (leg0)");
+    assert.equal(ev.routeIn, 3022461630369469142n, "routeIn pinned");
+    // The invertFarFromOut ≤-convention: the slice's floored linear out under-delivers by at most
+    // ~⌈remOut/remCap⌉ wei of the downstream token (< 1 wei of the upstream input token).
+    const produced = mulDiv(x0, remOut, remCap);
+    assert.ok(produced <= need, "produced out ≤ demanded (floor)");
+    assert.ok(need - produced <= remOut / remCap + 1n, "slip within the slice floor-slip bound");
+    // Exhaustion sentinel: a slice whose remOut cannot cover leg1's need makes leg1 UNREACHABLE
+    // (need >= remOut ⇒ crossed-first) — the slice itself binds instead.
+    const tiny = routeEventN([slice(2n * E18, need / 2n), leg1]);
+    assert.equal(tiny.bindLeg, 0, "an under-capacity upstream slice binds itself");
+    assert.equal(tiny.awards[0], 2n * E18, "the tiny slice fully crosses");
+  });
+
+  // ── 3. [bracket, slice, bracket] — mid-chain slice, both regimes ──
+  it("mid-chain slice DOWNSTREAM of the binding leg: absorbs bindOut, produces the floored out", () => {
+    const leg0: RouteLegMember = { nearOI: near, farOI: farNarrow, L: 10n ** 21n, feePpm: FEE };
+    const remCap = 10n ** 24n;
+    const remOut = 998n * 10n ** 21n;
+    const leg2: RouteLegMember = { nearOI: near, farOI: farDeep, L: 10n ** 26n, feePpm: 500n };
+    const ev = routeEventN([leg0, slice(remCap, remOut), leg2]);
+    assert.equal(ev.bindLeg, 0, "the narrow leg0 binds");
+    const bindOut = bracketOut(10n ** 21n, near, farNarrow);
+    assert.equal(ev.awards[1], bindOut, "the slice absorbs leg0's exact output (no clamp needed)");
+    const out1 = mulDiv(bindOut, remOut, remCap);
+    const far2 = invertFarFromGrossIn(10n ** 26n, near, out1, 500n);
+    assert.equal(ev.newFars[2], far2, "leg2 absorbs the slice's floored out as gross-in");
+    assert.equal(ev.awards[2], bracketGross(10n ** 26n, near, far2, 500n), "leg2 award == re-derived gross");
+    assert.equal(ev.routeOut, bracketOut(10n ** 26n, near, far2), "routeOut == final leg out");
+    assert.equal(ev.routeIn, 3013394245478360735n, "routeIn pinned");
+    assert.equal(ev.routeOut, 2987869474602317255n, "routeOut pinned");
+  });
+
+  it("mid-chain slice UPSTREAM of the binding leg: chained inversion through slice then bracket", () => {
+    const leg0: RouteLegMember = { nearOI: near, farOI: farDeep, L: 10n ** 26n, feePpm: FEE };
+    const remCap = 10n ** 24n;
+    const remOut = 998n * 10n ** 21n;
+    const leg2: RouteLegMember = { nearOI: near, farOI: farNarrow, L: 10n ** 21n, feePpm: FEE };
+    const ev = routeEventN([leg0, slice(remCap, remOut), leg2]);
+    assert.equal(ev.bindLeg, 2, "the narrow leg2 binds");
+    const need2 = bracketGross(10n ** 21n, near, farNarrow, FEE);
+    const x1 = mulDiv(need2, remCap, remOut);
+    assert.equal(ev.awards[1], x1, "the mid slice back-inverts leg2's need");
+    const farj0 = invertFarFromOut(10n ** 26n, near, x1);
+    assert.equal(ev.routeIn, bracketGross(10n ** 26n, near, farj0, FEE), "leg0 back-inverts the slice's x");
+    assert.equal(ev.routeOut, bracketOut(10n ** 21n, near, farNarrow), "routeOut == binding leg2's full out");
+    assert.equal(ev.routeIn, 3028518759148977107n, "routeIn pinned");
+  });
+
+  // ── 4. Downstream exact-boundary clamp + cursor advance semantics ──
+  it("downstream slice landing exactly ON remCap: full consume ⇒ qlCursor advances to the next row", () => {
+    const leg0: RouteLegMember = { nearOI: near, farOI: farNarrow, L: 10n ** 21n, feePpm: FEE };
+    const bindOut = bracketOut(10n ** 21n, near, farNarrow);
+    // slice sized so leg0's exact output == remCap: the clamp lands exactly ON the boundary.
+    const remOut = mulDiv(bindOut, 997n, 1000n);
+    const ev = routeEventN([leg0, slice(bindOut, remOut)]);
+    assert.equal(ev.bindLeg, 0, "leg0 binds (its full cross costs less token-A than the slice's)");
+    assert.equal(ev.awards[1], bindOut, "flow == remCap ⇒ award == remCap (exact boundary)");
+    // Applying that award is a FULL consume: the cursor advances and re-initializes.
+    const rows = [
+      { capacity: bindOut, effOut: remOut, marginalOI: qlSliceHead(remOut, bindOut) },
+      { capacity: 5n * E18, effOut: 4n * E18, marginalOI: qlSliceHead(4n * E18, 5n * E18) },
+    ];
+    const c = qlCursorInit(rows);
+    const outX = qlCursorConsume(c, ev.awards[1]);
+    assert.equal(outX, remOut, "exact-boundary consume produces the full remOut");
+    assert.equal(c.cur, 1, "cursor advanced");
+    assert.equal(c.remCap, 5n * E18, "remCap re-initialized from the next row");
+    assert.equal(c.remOut, 4n * E18, "remOut re-initialized from the next row");
+    assert.equal(qlCursorHead(c), rows[1].marginalOI, "head == the new row's original head");
+    // Partial then remainder: two consumes spanning the row advance + exhaustion (remOut → 0).
+    assert.equal(qlCursorConsume(c, 2n * E18), mulDiv(2n * E18, 4n * E18, 5n * E18), "partial linear out");
+    assert.ok(qlCursorActive(c), "still active mid-row");
+    qlCursorConsume(c, c.remCap);
+    assert.ok(!qlCursorActive(c), "exhausted after the last row");
+    assert.equal(c.remOut, 0n, "remOut zeroed on exhaustion");
+    assert.equal(c.remCap, 0n, "remCap == 0 is the single exhaustion test");
+    // A zero award (gap event) leaves a cursor untouched.
+    const c2 = qlCursorInit(rows);
+    assert.equal(qlCursorConsume(c2, 0n), 0n, "zero award produces nothing");
+    assert.equal(c2.cur, 0, "zero award does not advance");
+    assert.equal(c2.remCap, rows[0].capacity, "zero award does not deplete");
+  });
+
+  // ── 5. Zero-flow gap event with a slice sibling: the slice is untouched (award 0) ──
+  it("gap (L==0) binding leg + slice sibling: routeIn 0, slice award 0", () => {
+    const gap: RouteLegMember = { nearOI: near, farOI: farNarrow, L: 0n, feePpm: FEE };
+    const ev = routeEventN([gap, slice(10n ** 24n, 998n * 10n ** 21n)]);
+    assert.equal(ev.bindLeg, 0, "the gap leg binds");
+    assert.equal(ev.routeIn, 0n, "gap event consumes 0 token-A");
+    assert.equal(ev.routeOut, 0n, "gap event produces 0");
+    assert.equal(ev.awards[1], 0n, "the downstream slice's award is 0 (member untouched)");
+  });
+
+  // ── 6. routePartialN with slice members: pflow chaining + the clamped variant ──
+  it("routePartialN [bracket, slice, bracket]: awards chain the clamped-path flow (pinned)", () => {
+    const leg0: RouteLegMember = { nearOI: near, farOI: farDeep, L: 10n ** 26n, feePpm: FEE };
+    const remCap = 10n ** 24n;
+    const remOut = 998n * 10n ** 21n;
+    const leg2: RouteLegMember = { nearOI: near, farOI: farDeep, L: 2n * 10n ** 26n, feePpm: 500n };
+    const target = 123n * E18;
+    const r = routePartialN([leg0, slice(remCap, remOut), leg2], target);
+    assert.equal(r.awards[0], target, "leg0 takes the full target (rtake)");
+    const far0 = invertFarFromGrossIn(10n ** 26n, near, target, FEE);
+    assert.equal(r.newFars[0], far0, "leg0 partial far");
+    const flow1 = bracketOut(10n ** 26n, near, far0);
+    assert.equal(r.awards[1], flow1, "the slice absorbs leg0's output (within capacity)");
+    const out1 = mulDiv(flow1, remOut, remCap);
+    assert.equal(r.awards[2], out1, "leg2 absorbs the slice's floored out (incoming pflow)");
+    assert.equal(r.newFars[1], qlSliceHead(remOut, remCap), "slice newFar carries its head");
+    assert.equal(r.routeOut, 122324320307128564022n, "routeOut pinned");
+    // Clamped variant: a small slice caps the mid-chain flow at remCap; downstream sees remOut.
+    const r2 = routePartialN([leg0, slice(10n * E18, 9n * E18), leg2], target);
+    assert.equal(r2.awards[1], 10n * E18, "mid slice clamped at remCap");
+    assert.equal(r2.awards[2], 9n * E18, "downstream absorbs the clamped slice's full remOut");
+    assert.equal(r2.routeOut, 8995499595404916947n, "clamped routeOut pinned");
+  });
+
+  // ── 7. The chain-order sizing fold: est = mulDiv(mulDiv(a, h, Q96), h, Q96) ──
+  it("sizing fold known answers (two-step floor mulDiv; hF==0 ⇒ 0; opposite-direction hops)", () => {
+    const fold = (x: bigint, h: bigint): bigint => mulDiv(mulDiv(x, h, Q96), h, Q96);
+    assert.equal(fold(10n ** 18n, Q96), 10n ** 18n, "h == 1.0 (Q96) is the identity");
+    assert.equal(fold(10n ** 18n, Q96 / 2n), 10n ** 18n / 4n, "h == 0.5 quarters (out ≈ in·h²)");
+    assert.equal(fold(10n ** 18n, 0n), 0n, "hF == 0 (dead upstream leg) folds the cap to 0");
+    assert.equal(fold(10n ** 24n, 3n * 2n ** 95n), 2_250_000n * 10n ** 18n, "h == 1.5 pinned");
+    // h² overflows 256 bits at real scales — the two-step form must not (h = 2^100 ⇒ h² = 2^200).
+    assert.equal(fold(10n ** 24n, 2n ** 100n), 256n * 10n ** 24n, "big-h two-step fold pinned");
+    // Opposite-direction hops: an X/A >> 1 leg then a B/X << 1 leg — the fold rises then falls
+    // (each hop reprices the cap into ITS leg-input token; direction is absorbed by the head).
+    assert.equal(fold(fold(10n ** 18n, 2n * Q96), Q96 / 3n), 444444444444444444n, "up-down fold pinned");
+  });
+
+  // ── 8. All-bracket REGRESSION pins: byte-identical outputs + awards consistency ──
+  it("all-bracket routeEventN/routePartialN: explicit kind:'bracket' is bit-identical; awards pinned to the accrual formulas", () => {
+    const mk = (L: bigint, farTick: number, fee: bigint): RouteLeg => ({
+      nearOI: near,
+      farOI: toOutIn(getSqrtRatioAtTick(farTick), true),
+      L,
+      feePpm: fee,
+    });
+    const trios: [RouteLeg, RouteLeg, RouteLeg][] = [
+      [mk(10n ** 21n, -60, FEE), mk(10n ** 26n, -6000, FEE), mk(2n * 10n ** 26n, -6000, 500n)],
+      [mk(10n ** 26n, -6000, 500n), mk(10n ** 21n, -60, FEE), mk(10n ** 26n, -6000, FEE)],
+      [mk(10n ** 26n, -6000, FEE), mk(3n * 10n ** 26n, -6000, 100n), mk(10n ** 21n, -60, 500n)],
+    ];
+    for (const legs of trios) {
+      const plain = routeEventN(legs);
+      const tagged = routeEventN(legs.map((l) => ({ kind: "bracket" as const, ...l })));
+      assert.equal(plain.routeIn, tagged.routeIn, "routeIn identical with/without kind tag");
+      assert.equal(plain.routeOut, tagged.routeOut, "routeOut identical");
+      assert.equal(plain.bindLeg, tagged.bindLeg, "bindLeg identical");
+      assert.deepEqual(plain.newFars, tagged.newFars, "newFars identical");
+      assert.deepEqual(plain.awards, tagged.awards, "awards identical");
+      assert.equal(plain.dX, tagged.dX, "dX identical");
+      // awards == the solver's full-event accrual: leg0 = routeIn; deeper = the re-derived
+      // bracketGross over [near, newFar] (the binding leg's == its full-cross gross).
+      assert.equal(plain.awards[0], plain.routeIn, "awards[0] == routeIn");
+      for (let i = 1; i < legs.length; i++) {
+        assert.equal(
+          plain.awards[i],
+          bracketGross(legs[i].L, legs[i].nearOI, plain.newFars[i], legs[i].feePpm),
+          `awards[${i}] == bracketGross to newFar`,
+        );
+      }
+      // routePartialN awards == the clamped-path accrual: leg0 = target, deeper = incoming pflow.
+      const target = 3n * E18;
+      const p = routePartialN(legs, target);
+      assert.equal(p.awards[0], target, "partial awards[0] == target");
+      let pflow = target;
+      for (let i = 0; i < legs.length; i++) {
+        assert.equal(p.awards[i], pflow, `partial awards[${i}] == incoming pflow`);
+        pflow = bracketOut(legs[i].L, legs[i].nearOI, p.newFars[i]);
+      }
+      assert.equal(p.routeOut, pflow, "partial routeOut == final leg out");
+    }
   });
 });
 
