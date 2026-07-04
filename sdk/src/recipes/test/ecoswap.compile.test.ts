@@ -524,7 +524,42 @@ describe("index.ts buildSolverArgs (leg-QL ordering contract + cfg[12])", () => 
     assert.equal(defines.HAS_EULER, true); // present ONLY as a leg venue
     assert.equal(defines.HAS_MENTO, true); // present ONLY as a leg venue
     assert.equal(defines.HAS_CURVE, true); // direct + leg
-    assert.equal(defines.HAS_FLUID, false); // Fluid is never a leg member
+    assert.equal(defines.HAS_FLUID, false); // no Fluid venue anywhere in THIS universe
+  });
+
+  it("fluid is leg-capable: a leg-only Fluid venue lights HAS_FLUID + the cfg[6] resolver fallback", () => {
+    const RESOLVER = "0x00000000000000000000000000000000000f1d01" as `0x${string}`;
+    const fluidLeg: EcoLegQlVenue = {
+      family: "fluid",
+      desc: {
+        address: "0x00000000000000000000000000000000000f1d02", resolver: RESOLVER,
+        swap0to1: false, fromToken: X_HEX, toToken: B_HEX, feePpm: 100, source: "test",
+      },
+    };
+    const withFluidLeg: EcoSwapPrepared = {
+      ...prepared,
+      routes: [
+        {
+          ...prepared.routes[0],
+          legs: [
+            prepared.routes[0].legs[0],
+            { ...prepared.routes[0].legs[1], qlVenues: [curveLeg, mentoLeg, fluidLeg] },
+          ],
+        },
+      ],
+    };
+    const defines = protocolDefines(withFluidLeg);
+    assert.equal(defines.HAS_FLUID, true); // present ONLY as a leg venue
+    const args = buildSolverArgs(A_HEX, B_HEX, 10n ** 18n, CALLER_HEX, withFluidLeg);
+    const cfg = args[0] as bigint[];
+    const qlv = args[5] as bigint[][];
+    // cfg[6] = the chain-wide Fluid resolver via the LEG fallback (no direct Fluid venue).
+    assert.equal(cfg[6], BigInt(RESOLVER));
+    // The fluid leg row: segKind 12, refIdx = its GLOBAL index, (route 0, leg 1) backrefs.
+    const fluidRow = qlv[qlv.length - 1];
+    assert.equal(fluidRow.length, 12);
+    assert.deepEqual([fluidRow[4], fluidRow[5], fluidRow[10], fluidRow[11]], [12n, 4n, 0n, 1n]);
+    assert.equal(fluidRow[0], BigInt(fluidLeg.desc.address));
   });
 
   it("pool-only routes: qlvBase/qlvCount = 0 slots, cfg[12] = qlv.length, HAS_LEG_QLV false", () => {

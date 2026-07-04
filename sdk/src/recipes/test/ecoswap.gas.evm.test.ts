@@ -139,15 +139,17 @@ const COOK_BLOCK_TIMESTAMP = 2_000_000_000n;
 // Quote-ladder geometric slice count — MUST equal ecoswap.sauce.ts QL_S. The per-venue ladder-build
 // cost is bounded to ≤ 2·QL_S view staticcalls (QL_2S): the revert-class views are probe-then-decode
 // (an unconditional `.catch` PROBE call + a guarded DECODE call = 2 staticcalls/slice), only the
-// graceful single-return views (WOOFi) cost 1/slice = QL_S. Kept here only to render Table 3 of GAS.md.
+// graceful single-return views (WOOFi tryQuery, Fluid estimateSwapIn) cost 1/slice = QL_S. Kept here
+// only to render Table 3 of GAS.md.
 const QL_S = 8;
 const QL_2S = 2 * QL_S;
 
-// The 13 QUOTE-LADDER venue families (mirrors buildQLVenues in index.ts). segKind + the per-slice
+// The 14 QUOTE-LADDER venue families (mirrors buildQLVenues in index.ts). segKind + the per-slice
 // view quote getter + the ladder-build staticcall bound + the on-chain execution path. The revert-class
-// probe-then-decode venues (Curve/…/Euler) cost up to 2·QL_S staticcalls; the graceful WOOFi tryQuery
-// costs QL_S; the three REPLAY families (Balancer V2/V3, Maverick) have no cumulative-out view, so they
-// read a bounded set of LIVE state and replay the curve on-chain.
+// probe-then-decode venues (Curve/…/Euler) cost up to 2·QL_S staticcalls; the graceful single-return
+// views (WOOFi tryQuery; Fluid resolver estimateSwapIn — a CALL, not a staticcall, that returns 0 past
+// the live utilization cap) cost QL_S; the three REPLAY families (Balancer V2/V3, Maverick) have no
+// cumulative-out view, so they read a bounded set of LIVE state and replay the curve on-chain.
 const QL_VENUE_ROWS: { venue: string; segKind: number; quote: string; calls: string; exec: string }[] = [
   { venue: "Curve StableSwap", segKind: 1, quote: "get_dy(i, j, xNext) (probe-decode, revert-class)", calls: `≤ ${QL_2S}`, exec: "swap(poolType 3) → _swapCurve" },
   { venue: "Curve CryptoSwap", segKind: 9, quote: "get_dy(uint256 i, j, xNext) (probe-decode, revert-class)", calls: `≤ ${QL_2S}`, exec: "approve + exchange (callback-free)" },
@@ -162,6 +164,7 @@ const QL_VENUE_ROWS: { venue: string; segKind: number; quote: string; calls: str
   { venue: "Balancer V3", segKind: 14, quote: "on-chain StableMath replay (no live quote view)", calls: "getCurrentLiveBalances + getAmplificationParameter + getStaticSwapFeePercentage + getRate×2", exec: "Permit2 two-step + swapSingleTokenExactIn" },
   { venue: "Balancer V2", segKind: 6, quote: "on-chain StableMath replay (no live quote view)", calls: "getPoolTokenInfo×n + getAmplificationParameter + getStaticSwapFeePercentage + getScalingFactors", exec: "swap(poolType 4) → _swapBalancerV2" },
   { venue: "Maverick V2", segKind: 8, quote: "on-chain live bin-walk (no cumulative-out view)", calls: "per-tick reserve reads across the walked bins", exec: "swap(poolType 7) → maverickV2SwapCallback" },
+  { venue: "Fluid DEX", segKind: 12, quote: "resolver.estimateSwapIn(dex, swap0to1, xNext, 0) (graceful CALL, 0 past the live cap)", calls: `${QL_S}`, exec: "estimateSwapIn min + approve + pool.swapIn (callback-free)" },
 ];
 
 // ── Compile-arg builders ──
@@ -417,10 +420,11 @@ function writeGasMd(): void {
       "`qlv`) followed by five nested tuple arrays: the FLAT POOL UNIVERSE `pools` (direct pools then " +
       "route-leg pools), the drift-invariant per-pool `netCache` (tick nets reused by a live walk), the " +
       "scalar `routing` layout (one flat tuple per route, uniform 5-field stride per leg — " +
-      "`[legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount]`), the STATIC " +
-      "sampled-segment stream `segs` (Fluid only now), and the QUOTE-LADDER venue descriptors `qlv` " +
-      "(the 13 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/" +
-      "BalV2/BalV3/Maverick — each a UNIFORM 12-column row the solver expands into an on-chain price " +
+      "`[legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount]`), the VESTIGIAL static " +
+      "sampled-segment stream `segs` (always [] — every family is quote-ladder now; kept for the stable " +
+      "6-arg shape), and the QUOTE-LADDER venue descriptors `qlv` " +
+      "(the 14 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/" +
+      "BalV2/BalV3/Maverick/Fluid — each a UNIFORM 12-column row the solver expands into an on-chain price " +
       "ladder; rows [0, directQlvCount) are DIRECT venues, rows [directQlvCount, …) are ROUTE-LEG venues " +
       "carrying qd[10]/qd[11] routeIdx/legIdx backrefs, grouped per (route, leg) so routing's " +
       "qlvBase/qlvCount point at them). `zeroForOne` is DERIVED on-chain from the token sort order. The " +
@@ -554,7 +558,8 @@ function writeGasMd(): void {
       "`.catch(() => ok = 0)` PROBE staticcall (the sentinel-catch can only flag a revert, not capture " +
       "the value) followed by a guarded DECODE staticcall — so a successful slice costs **2** staticcalls, " +
       `i.e. up to 2·QL_S = ${QL_2S}/venue (a revert stops the ladder early). Only the graceful single-return ` +
-      "views (WOOFi `tryQuery`, which returns 0 rather than reverting) cost **1** staticcall/slice = QL_S = " +
+      "views (WOOFi `tryQuery`, and Fluid's resolver `estimateSwapIn` — a CALL, not a staticcall, that " +
+      "returns 0 past the live utilization cap so the ladder self-truncates) cost **1** call/slice = QL_S = " +
       `${QL_S}. Trader Joe LB reads \`getSwapOut()[0]\` and \`[1]\` as two separate staticcalls, so it too is ` +
       "≤ 2·QL_S. The read-only `quoteEcoSwap` (eth_call + stateOverride) runs the SAME ladder but is " +
       "FREE of the block gas cap — the ladder staticcalls only count against gas on a landed cook(). " +
@@ -722,7 +727,7 @@ function writeGasMd(): void {
   // Live-walk / quote-ladder architecture (always emitted — architectural, not run-dependent).
   bullets.push(
     "**Live-walk architecture.** Every venue now LIVE-WALKS: V2/V3/V4 walk a live frontier from the " +
-      "on-chain spot (reusing a drift-invariant per-pool net cache), and the 13 quote-ladder families " +
+      "on-chain spot (reusing a drift-invariant per-pool net cache), and the 14 quote-ladder families " +
       `build a price ladder of QL_S = ${QL_S} slices ON-CHAIN in setup (Table 3). This trades the old static ` +
       `sampled-segment shipping for on-chain freshness: a QL venue costs up to 2·QL_S = ${QL_2S} view staticcalls at ` +
       "ladder-build (probe-then-decode revert-class views cost 2/slice — a probe + a guarded decode; the " +

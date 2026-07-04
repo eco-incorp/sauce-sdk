@@ -93,6 +93,7 @@ import {
   deployMaverickV2Pool,
   deployWooFiPool,
   deployEulerSwapPool,
+  deployFluidDexPool,
   curveAbi,
   SQRT_PRICE_1_1,
   type DeployedStack,
@@ -121,6 +122,7 @@ import {
 import type { CurvePool } from "../shared/curve-math";
 import type { WooFiPool } from "../shared/woofi-math";
 import type { EulerSwapPool } from "../shared/eulerswap-math";
+import type { FluidPool } from "../shared/fluid-math";
 import {
   getTickL,
   getSqrtPrice,
@@ -175,6 +177,12 @@ const EUL_RES = 60_000n * E18;
 const EUL_CONC = (9n * E18) / 10n; // 0.9 — concentrated near equilibrium, bends off it
 const EUL_FEE = E18 / 1000n; // 0.1%
 const EUL_FEE_PPM = 1000;
+// Fluid DEX fixture params (X→B leg venue): par exchange rates, 1:1 center, 0.01% fee (1e6-scaled),
+// a mid utilization depth so the layer curve bends within the trade, deep two-sided reserves.
+const FLU_FEE_PPM = 100n;
+const FLU_DEPTH = 8_000_000n * E18;
+const FLU_RES = 2_000_000n * E18;
+const FLU_FEE_SCALE = 10n ** 6n;
 
 // Minimal ERC20 Transfer event (erc20Abi in harness/setup is functions-only).
 const erc20TransferAbi = parseAbi([
@@ -201,6 +209,8 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
   let curvePin: Hex; // X→B Curve fixture (small, 0.03%)
   let wooPool: Hex; // X→B WOOFi fixture (base == tokX, quote == tokB)
   let eulPool: Hex; // X→B EulerSwap fixture (asset0 == tokX)
+  let fluPool: Hex; // X→B Fluid DexT1 fixture (token0 == tokX ⇒ swap0to1 for the leg)
+  let fluResolver: Hex; // the chain-wide Fluid DexReservesResolver (cfg[6] via the LEG fallback)
   let solverSrc: string;
   let cleanSnapshot: Hex;
 
@@ -281,6 +291,14 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
       outCap0: 0n, outCap1: 0n,
     };
     eulPool = await deployEulerSwapPool(c.walletClient, c.publicClient, tokX, tokB, eulParams, minter);
+    // Fluid DexT1 X→B (token0 == tokX < tokB == token1): par rates, 1:1 center — the leg venue whose
+    // ladder the solver builds on-chain from the resolver's estimateSwapIn CALL (direction derived
+    // on-chain via getDexTokens vs the leg's in-token).
+    const flu = await deployFluidDexPool(
+      c.walletClient, c.publicClient, tokX, tokB, E18, E18, E18, FLU_FEE_PPM, FLU_RES, FLU_RES, FLU_DEPTH, minter,
+    );
+    fluPool = flu.pool;
+    fluResolver = flu.resolver;
 
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
     cleanSnapshot = await c.testClient.snapshot();
@@ -395,6 +413,35 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
       desc: { address, fromToken: tokX, toToken: tokB, feePpm: WOO_FEE_PPM, source: "legql-fixture" },
     };
     return { venue, olv: { family: "wooFi", model } };
+  }
+
+  /** The Fluid fixture's closed-form layer replay (FluidDexPool.sol _netOut, swap0to1 == X→B,
+   *  bit-for-bit): par at 1:1 rates/center, minus the convex utilization slip dx²/depth, minus the
+   *  fee off the output. The oracle/reference ladder from THIS via the SHARED buildFluidQLLadder
+   *  (buildLegQlVenueLadder → family "fluid") — the identical geometric recurrence the on-chain
+   *  solver differences from the LIVE resolver estimateSwapIn CALL. */
+  function fluQuote(dx: bigint): bigint {
+    if (dx <= 0n) return 0n;
+    let par = dx; // par rates + 1:1 center: (dx·1e18/1e18)·1e18/1e18
+    const slip = (dx * dx) / FLU_DEPTH;
+    par = par > slip ? par - slip : 0n;
+    const fee = (par * FLU_FEE_PPM) / FLU_FEE_SCALE;
+    return par > fee ? par - fee : 0n;
+  }
+
+  function fluVenue(address: Hex, resolver: Hex): { venue: EcoLegQlVenue; olv: OptimalLegQlVenue } {
+    const model: FluidPool = {
+      address, resolver, swap0to1: true, tokenIn: tokX, tokenOut: tokB,
+      feePpm: Number(FLU_FEE_PPM), source: "legql-fixture", getDy: fluQuote,
+    };
+    const venue: EcoLegQlVenue = {
+      family: "fluid",
+      desc: {
+        address, resolver, swap0to1: true, fromToken: tokX, toToken: tokB,
+        feePpm: Number(FLU_FEE_PPM), source: "legql-fixture",
+      },
+    };
+    return { venue, olv: { family: "fluid", model } };
   }
 
   function eulVenue(address: Hex): { venue: EcoLegQlVenue; olv: OptimalLegQlVenue } {
@@ -593,6 +640,92 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
 
     console.log(
       `  [legQL venue-only:${engine}] direct=${directIn} route=${leg0In} venueAward=${ref.perLegQlvInput[0]} spent=${spent} (== mirrors, wei)`,
+    );
+  }
+
+  // ── (1b) FLUID VENUE-ONLY LEG — the X→B leg is ONE Fluid QL venue (segKind 12). Fluid became
+  // leg-eligible with the QL migration: the solver builds its ladder on-chain from the chain-wide
+  // resolver's estimateSwapIn CALL (cfg[6] arrives via the LEG fallback — no direct Fluid venue in
+  // this universe), derives swap0to1 on-chain via getDexTokens vs the LEG's in-token (tokX), and
+  // the unified per-leg exec dispatch (qk===12) approves + swapIns the venue's share inline. ──
+  async function runFluidVenueOnlyLeg(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+    const amountIn = parseEther("20000");
+
+    const direct = await v3EcoPool(directPool, FEE_DIRECT, TS_DIRECT);
+    const leg0 = await v3EcoPool(leg0Pool, FEE_LEG0, TS_LEG0);
+    const fv = fluVenue(fluPool, fluResolver);
+
+    const prepared: EcoSwapPrepared = {
+      pools: [direct.pool],
+      routes: [
+        {
+          legs: [
+            { hopIn: tokA, hopOut: tokX, zeroForOne: true, pools: [leg0.pool] },
+            { hopIn: tokX, hopOut: tokB, zeroForOne: true, pools: [], qlVenues: [fv.venue] },
+          ],
+          intermediateTokens: [tokX],
+        },
+      ],
+      brackets: [],
+      zeroForOne: true,
+      priceLimit: MIN_SQRT_RATIO + 1n,
+      expectedInputCovered: 0n,
+    };
+
+    const ref = kwayReference(prepared, amountIn, undefined, [[undefined, [fv.olv]]]);
+    const optRoute: OptimalRoute = {
+      legs: [
+        { zeroForOne: true, pools: [leg0.opt] },
+        { zeroForOne: true, pools: [], qlvs: [fv.olv] },
+      ],
+    };
+    const opt = optimalSplit({
+      pools: [direct.opt], routes: [optRoute], amountIn, zeroForOne: true,
+      priceLimit: MIN_SQRT_RATIO + 1n,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei)");
+    assert.equal(ref.perRouteInput[0], opt.perRouteInput[0], "route award == oracle (wei)");
+    assert.ok(ref.perRouteInput[0] > 0n, "route engaged (viable ONLY through the Fluid leg venue)");
+    assert.ok(ref.perLegQlvInput[0] > 0n, "Fluid leg venue awarded input (the qinp mirror)");
+
+    const bytecodes = compilePrepared(engine, prepared, amountIn, caller);
+
+    const callerABefore = await balanceOf(c.publicClient, tokA, caller);
+    const callerBBefore = await balanceOf(c.publicClient, tokB, caller);
+    const directABefore = await balanceOf(c.publicClient, tokA, directPool);
+    const leg0ABefore = await balanceOf(c.publicClient, tokA, leg0Pool);
+    const fluXBefore = await balanceOf(c.publicClient, tokX, fluPool);
+    const fluBBefore = await balanceOf(c.publicClient, tokB, fluPool);
+
+    await approve(c.walletClient, c.publicClient, tokA, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "fluid venue-only-leg cook() must succeed");
+
+    const spent = callerABefore - (await balanceOf(c.publicClient, tokA, caller));
+    const received = (await balanceOf(c.publicClient, tokB, caller)) - callerBBefore;
+    const directIn = (await balanceOf(c.publicClient, tokA, directPool)) - directABefore;
+    const leg0In = (await balanceOf(c.publicClient, tokA, leg0Pool)) - leg0ABefore;
+    const fluX = (await balanceOf(c.publicClient, tokX, fluPool)) - fluXBefore;
+    const fluOut = fluBBefore - (await balanceOf(c.publicClient, tokB, fluPool));
+
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (wei)`);
+    assert.equal(directIn, ref.perUniversePoolInput[0], `[${engine}] direct pool award == reference (wei)`);
+    assert.equal(leg0In, ref.perUniversePoolInput[1], `[${engine}] leg0 pool award == reference (wei)`);
+    assert.equal(leg0In, ref.perRouteInput[0], `[${engine}] leg0 gross == route award (2-leg identity)`);
+    // EXEC side: the Fluid venue swallowed the WHOLE realized leg X (venue-only leg — the qk===12
+    // approve+swapIn dispatch pulled it, direction derived on-chain from getDexTokens vs tokX), and
+    // its realized dy == the closed-form fixture replay of that X to the wei (exact-in-dy).
+    assert.ok(fluX > 0n, "the Fluid venue was funded on-chain");
+    assert.equal(fluX, transferSumTo(receipt, tokX, fluPool), "Fluid X inflow == Transfer-log sum (approve+pull)");
+    assert.equal(fluOut, fluQuote(fluX), `[${engine}] Fluid dy == closed-form quote(leg X) (exact-in-dy)`);
+    assert.ok(received > 0n, "caller receives tokenOut");
+
+    console.log(
+      `  [legQL fluid venue-only:${engine}] direct=${directIn} route=${leg0In} fluidX=${fluX} ` +
+        `venueAward=${ref.perLegQlvInput[0]} spent=${spent} received=${received} (== mirrors, wei)`,
     );
   }
 
@@ -1168,6 +1301,9 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
+    it(`fluid venue-only leg [${engine}] — Fluid QL leg member (segKind 12), cfg[6] leg fallback, exec exact-in-dy`, { skip }, async () => {
+      await runFluidVenueOnlyLeg(engine);
+    });
     it(`venue-only leg [${engine}] — Curve QL leg member, merge awards == mirrors wei-exact`, { skip }, async () => {
       await runVenueOnlyLeg(engine);
     });

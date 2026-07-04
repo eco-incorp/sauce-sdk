@@ -39,24 +39,28 @@
  *       directions.
  *   (b) FAST + OFFLINE — no fork, no RPC at run time; per-engine wall-clock logged (seconds).
  *   (c) WEI-EXACT — the caller-received tokenOut == the neutral oracle (ecoswap.optimal.ts optimalSplit,
- *       seeded from the REAL etched resolver's LIVE estimateSwapIn ladder via the SHARED buildFluidSegments,
- *       the identical grid discoverFluidPoolsTyped samples) == the REAL pool's OWN LIVE estimateSwapIn view
- *       of the awarded slice, all to the wei. spent == the awarded Σ is asserted explicitly.
+ *       whose Fluid QL model prefetches the REAL etched resolver's LIVE estimateSwapIn quotes at the
+ *       DETERMINISTIC QL grid (fluidQLGridInputs) and runs the SHARED buildFluidQLLadder — the identical
+ *       geometric recurrence the on-chain solver differences live) == the REAL pool's OWN LIVE
+ *       estimateSwapIn view of the awarded slice, all to the wei. spent == the awarded Σ is asserted
+ *       explicitly.
  *
- * HONEST fidelity — SNAPSHOTTED-QUOTE (Class-A, exogenous residual), the SAME class the recipe documents
- * for Fluid: the split is priced off the LIVE estimateSwapIn ladder sampled at prepare (a SNAPSHOT of the
- * layer's exchange prices + center price + caps), so it is EXACT-ON-GRID vs the oracle (both segment the
- * SAME sampled ladder off the SAME etched resolver at the SAME pinned block); per-pool EXECUTION re-reads
- * the out via the LIVE estimateSwapIn view (used as amountOutMin), so the realized out equals the live
- * estimate for the awarded share to the wei. Because block.timestamp is PINNED (pinFluidBlockTimestamp) the
- * layer prices do NOT accrue between prepare and cook here, so the snapshot ladder == the live view and the
- * fill is exact-on-grid AND exact-in-dy — the strongest form. Fluid folds its fee + cap into the resolver
- * quote (there is no separate fee getter), and the pool nets the FULL tokenIn into the Liquidity layer, so
- * poolIn (== the Liquidity-layer tokenIn delta) == spent is asserted explicitly.
+ * QUOTE-LADDER fidelity (the LIVE-WALK class — this is the migration this test pins): prepare ships ONLY
+ * the descriptor (discovery runs ONE liveness probe — the 24-point estimateSwapIn sampling is GONE), and
+ * the on-chain solver builds the ladder at COOK time from the REAL resolver's estimateSwapIn (a plain
+ * CALL — the REAL FluidDexT1 pool writes state on the ADDRESS_DEAD estimate path before its result-revert,
+ * so a STATICCALL would quote 0: THE reason the recipe emits a CALL, proven here against genuine
+ * bytecode). The oracle prefetches the SAME grid off the SAME etched resolver at the SAME pinned block, so
+ * solver == oracle wei-exact by construction; per-pool EXECUTION re-reads the out via the LIVE
+ * estimateSwapIn (used as amountOutMin), so the realized out equals the live estimate for the awarded
+ * share to the wei. block.timestamp is PINNED (pinFluidBlockTimestamp), so the ladder/exec/oracle all read
+ * ONE frozen layer state. Fluid folds its fee + cap into the resolver quote (there is no separate fee
+ * getter), and the pool nets the FULL tokenIn into the Liquidity layer, so poolIn (== the Liquidity-layer
+ * tokenIn delta) == spent is asserted explicitly.
  *
- * SINGLE-VENUE FULL-FILL is the documented expectation for this sizing (amountIn == the full sampled
- * ladder cap, one Fluid venue, the segment ladder covers [0, amountIn] since the deep ~$15M/$11M reserves
- * quote monotonically) — so the whole trade allocates to this one pool and spent == amountIn.
+ * SINGLE-VENUE FULL-FILL is the documented expectation for this sizing (one Fluid venue, the QL ladder
+ * covers [0, amountIn] since the deep ~$15M/$11M reserves quote monotonically) — so the whole trade
+ * allocates to this one pool and spent == amountIn.
  *
  * Dual-engine (v1 + v12), gated by ECO_ENGINE (default v12; skip-by-default for v12 when the artifacts are
  * absent). No state cache — etch+setStorage is a few seconds.
@@ -97,10 +101,9 @@ import {
   cookTarget,
 } from "./harness/engine";
 import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
-import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
-import { buildFluidSegments, fluidSampleInputs, type FluidPool } from "../shared/fluid-math";
+import { buildFluidQLLadder, fluidQLGridInputs, type FluidPool } from "../shared/fluid-math";
 
 const SNAP_NAME = "ethereum-fluid-USDCUSDT";
 const ENGINE_CELLS = engineCells();
@@ -173,24 +176,30 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1) prod-mirror — REAL bytecode
     })) as bigint;
   }
 
-  /** The neutral oracle's FluidPool descriptor — sample the REAL etched resolver's LIVE estimateSwapIn
-   *  ladder over [0, amountIn] on the SAME grid discoverFluidPoolsTyped uses (fluidSampleInputs). Since the
-   *  oracle and prepare sample the IDENTICAL grid off the IDENTICAL etched resolver at the SAME pinned
-   *  block, they produce identical segments ⇒ the split is exact-on-grid vs the oracle by construction. */
+  /** The neutral oracle's FluidPool QL model — PREFETCH the REAL etched resolver's LIVE estimateSwapIn
+   *  quotes at the DETERMINISTIC direct-venue QL grid (fluidQLGridInputs(amountIn) — the exact points the
+   *  SHARED buildQLLadder recurrence touches for a direct venue), and answer getDy by exact-point lookup.
+   *  Since the oracle's recurrence and the on-chain solver's ladder quote the IDENTICAL grid off the
+   *  IDENTICAL etched resolver at the SAME pinned block, they produce identical slices ⇒ the split is
+   *  wei-exact vs the oracle by construction. (The real Fluid pool has no off-chain closed form — the
+   *  Liquidity layer is shared state — which is exactly why the model is quote-backed.) */
   async function offPool(amountIn: bigint): Promise<FluidPool> {
-    const cumIn = fluidSampleInputs(amountIn);
-    const cumOut: bigint[] = [];
-    for (const amt of cumIn) cumOut.push(await onQuery(amt));
+    const grid = fluidQLGridInputs(amountIn);
+    const quotes = new Map<bigint, bigint>();
+    for (const amt of grid) quotes.set(amt, await onQuery(amt));
     return {
       address: etched.pool,
       resolver: etched.resolver,
       swap0to1: true,
       tokenIn: etched.token0,
       tokenOut: etched.token1,
-      cumIn,
-      cumOut,
       feePpm: 0,
       source: "prod-mirror",
+      getDy: (dx: bigint): bigint => {
+        const q = quotes.get(dx);
+        assert.ok(q !== undefined, `oracle QL recurrence quoted an off-grid point ${dx}`);
+        return q!;
+      },
     };
   }
 
@@ -284,7 +293,7 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1) prod-mirror — REAL bytecode
     const tokenIn = etched.token0;
     const tokenOut = etched.token1;
 
-    // amountIn == the full sampled ladder cap (100k USDC) — well within the deep ~$15M/$11M Liquidity-layer
+    // amountIn == the full QL ladder cap (100k USDC) — well within the deep ~$15M/$11M Liquidity-layer
     // reserves, so the ladder quotes monotonically and the merge awards the WHOLE Σ to this one venue.
     const amountIn = 100_000n * 10n ** BigInt(snaps.state.token0Decimals);
     const poolConfig = fluidPoolConfig(tokenIn, tokenOut);
@@ -303,7 +312,8 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1) prod-mirror — REAL bytecode
       engine,
     );
 
-    // Discovery surfaced exactly the ONE reproduced Fluid venue (via the real resolver getters).
+    // Discovery surfaced exactly the ONE reproduced Fluid venue (via the real resolver getters) — as a
+    // DESCRIPTOR-ONLY QL venue: no sampled segments anywhere (the QL migration this test pins).
     assert.equal(prepared.pools.length, 0, "lens surfaces no direct V2/V3/V4 pools (Fluid-only config)");
     assert.equal((prepared.fluidPools ?? []).length, 1, "discovered exactly the 1 reproduced Fluid venue");
     assert.equal(
@@ -312,17 +322,20 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1) prod-mirror — REAL bytecode
       "the discovered Fluid venue is the REAL etched pool",
     );
     assert.equal(prepared.fluidPools![0].swap0to1, true, "discovery oriented the venue as swap0to1 (tokenIn == token0)");
-    assert.ok(
-      (prepared.brackets ?? []).some((b) => b.kind === EcoBracketKind.Fluid),
-      "Fluid segments present",
+    assert.equal(
+      prepared.fluidPools![0].resolver.toLowerCase(),
+      etched.resolver.toLowerCase(),
+      "the descriptor carries the REAL chain-wide resolver (cfg[6])",
     );
+    assert.equal((prepared.brackets ?? []).length, 0, "ZERO sampled segments — Fluid is descriptor-only (QL)");
 
-    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Fluid venue seeded from the REAL etched resolver's LIVE
-    // estimateSwapIn ladder via the SHARED buildFluidSegments (the identical grid discoverFluidPoolsTyped
-    // sampled). Pure off-chain math (computed BEFORE the cook), so the awarded Σ is known ahead — and the
-    // engine's static-segment cursor consumes the IDENTICAL grid, so on-chain spent == oracle.totalInput.
+    // NEUTRAL ORACLE (ecoswap.optimal.ts) — one Fluid QL venue whose getDy prefetches the REAL etched
+    // resolver's LIVE estimateSwapIn quotes at the deterministic QL grid; buildFluidQLLadder runs the
+    // SHARED recurrence over them. Pure off-chain math (computed BEFORE the cook), so the awarded Σ is
+    // known ahead — and the on-chain solver differences the IDENTICAL quotes at cook (pinned clock), so
+    // on-chain spent == oracle.totalInput.
     const op = await offPool(amountIn);
-    assert.ok(buildFluidSegments(op, amountIn).length > 0, "non-empty Fluid segment ladder from the live etched resolver");
+    assert.ok(buildFluidQLLadder(op, amountIn).length > 0, "non-empty Fluid QL ladder from the live etched resolver");
     const optPools: OptimalPool[] = [{ fluid: op, feePpm: 0 }];
     const oracle = optimalSplit({ pools: optPools, amountIn, zeroForOne: true });
     const awarded = oracle.perPoolInput[0] ?? 0n;
@@ -354,8 +367,8 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1) prod-mirror — REAL bytecode
     assert.equal(liqIn, spent, "REAL Fluid Liquidity layer netted the FULL input (fee is folded into the output quote)");
 
     // WEI-EXACT: the on-chain spend == the oracle's awarded input to the WEI. NO tolerance. (The Fluid
-    // ladder is sampled to cover [0, amountIn]; the deep monotonic reserves ⇒ the merge awards the whole Σ,
-    // and the engine's static-segment cursor consumes the IDENTICAL grid ⇒ spent == oracle.totalInput.)
+    // QL ladder covers [0, amountIn]; the deep monotonic reserves ⇒ the merge awards the whole Σ, and the
+    // on-chain ladder differences the IDENTICAL quotes at the pinned block ⇒ spent == oracle.totalInput.)
     assert.equal(spent, awarded, "on-chain spent == neutral oracle awarded input (wei-exact-on-grid)");
     assert.equal(spent, oracle.totalInput, "single venue: spent == oracle totalInput (wei-exact-on-grid)");
     // SINGLE-VENUE FULL-FILL (documented for this sizing — amountIn == the ladder cap, one deep venue, the

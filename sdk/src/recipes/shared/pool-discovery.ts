@@ -27,7 +27,7 @@ import {
   type FactoryConfig,
 } from "./constants.js";
 import type { PoolInfo } from "./types.js";
-import { A_PRECISION_DEFAULT, type CurvePool } from "./curve-math.js";
+import { A_PRECISION_DEFAULT, QL_SEED_DIV, qlSliceHead, type CurvePool } from "./curve-math.js";
 import { FEE_DENOMINATOR_CRYPTO, type CryptoSwapPool } from "./cryptoswap-math.js";
 import type { BalancerStablePool } from "./balancer-stable-math.js";
 import type { LbPool } from "./lb-math.js";
@@ -36,7 +36,7 @@ import type { SolidlyStablePool } from "./solidly-stable-math.js";
 import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
-import { type FluidPool, fluidSampleInputs, FLUID_FEE_SCALE } from "./fluid-math.js";
+import { type FluidVenue, FLUID_FEE_SCALE } from "./fluid-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -2538,26 +2538,28 @@ export async function discoverFermiPoolsTyped(
 // ── Fluid DEX discovery ──────────────────────────────────────
 
 /**
- * Discover Fluid DEX (Instadapp fluid-contracts-public FluidDexT1) pools for the pair AS TYPED `FluidPool`
- * descriptors (the EcoSwap callback-free path). Fluid DEX is a Liquidity-Layer-backed re-centering AMM (NOT
- * xy=k), so it must NOT be priced through the V2 synthetic-sqrt path. Discovery is KNOWN-POOL-ADDRESS based
- * (the candidate DexT1 pool addresses are in `FactoryConfig.fluidPools`; the periphery resolver in
- * `FactoryConfig.fluidResolver`). A pool is kept only when it trades BOTH tokenIn and tokenOut (its
- * token0/token1 match the pair) AND the resolver ladder shows a strictly-positive out.
+ * Discover Fluid DEX (Instadapp fluid-contracts-public FluidDexT1) pools for the pair AS TYPED
+ * DESCRIPTOR-ONLY `FluidVenue`s + a liveness-probe head (the EcoSwap QUOTE-LADDER path). Fluid DEX is a
+ * Liquidity-Layer-backed re-centering AMM (NOT xy=k), so it must NOT be priced through the V2
+ * synthetic-sqrt path. Discovery is KNOWN-POOL-ADDRESS based (the candidate DexT1 pool addresses are in
+ * `FactoryConfig.fluidPools`; the periphery resolver in `FactoryConfig.fluidResolver`). A pool is kept
+ * only when it trades BOTH tokenIn and tokenOut (its token0/token1 match the pair) AND ONE liveness probe
+ * quotes strictly positive.
  *
- * The DexT1 pool exposes NO raw curve state and NO getAmountOut view (its own estimate is a REVERT —
- * FluidDexSwapResult), so the split cannot be priced from a closed-form snapshot. Instead this SAMPLES the
- * pool via a small ladder of `resolver.estimateSwapIn(dex, swap0to1, +cumIn, 0)` eth_calls (the resolver
- * does the pool's revert-decode in Solidity and returns a plain uint256) over [0, amountIn] and stores the
- * (cumIn, cumOut) points on the descriptor. `buildFluidSegments` then differences that ladder into segments
- * with NO further RPC (so the oracle shares them). Execution is CALLBACK-FREE (approve + pool.swapIn —
- * Fluid PULLS via safeTransferFrom, approve-first like Fermi/Wombat/Curve). The utilization/borrow CAP is
- * modeled by stopping at the first slice the resolver quotes 0 (past the tradeable cap), like EulerSwap's
- * inLimit.
+ * NO SAMPLING (the QL family contract): the on-chain solver builds each venue's price ladder LIVE at cook
+ * from `resolver.estimateSwapIn(dex, swap0to1, xNext, 0)` quote-differencing, so discovery ships only the
+ * descriptor. The ONE probe here quotes the FIRST QL slice size (`amountIn / QL_SEED_DIV`, the ladder's
+ * seed) — it gates liveness, yields the fold head (`headOI` = the first-slice post-fee out/in sqrt, the
+ * same head the on-chain ladder's first slice carries at this size) and derives the diagnostic feePpm.
+ * That is 2 RPCs per candidate pool (getDexTokens + one estimateSwapIn) — down from getDexTokens +
+ * FLUID_SAMPLES(24) estimateSwapIn calls in the deleted static-sampling path. Execution is CALLBACK-FREE
+ * (approve + pool.swapIn — Fluid PULLS via safeTransferFrom, approve-first like Fermi/Wombat/Curve). The
+ * utilization/borrow CAP needs no probe: estimateSwapIn quotes 0 past the tradeable cap, so the on-chain
+ * ladder self-truncates at the LIVE cap (like EulerSwap's inLimit).
  *
- * `amountIn` sizes the ladder range. Mirrors `discoverFermiPoolsTyped` / `discoverEulerSwapPoolsTyped` —
- * off-chain discovery + state reads, returning the venue descriptor EcoSwap prepare consumes directly (the
- * on-chain lens does not understand Fluid).
+ * `amountIn` sizes the probe. Mirrors `discoverFermiPoolsTyped` / `discoverEulerSwapPoolsTyped` —
+ * off-chain discovery + a liveness read, returning the venue descriptor EcoSwap prepare consumes directly
+ * (the on-chain lens does not understand Fluid).
  */
 export async function discoverFluidPoolsTyped(
   tokenIn: Hex,
@@ -2565,13 +2567,15 @@ export async function discoverFluidPoolsTyped(
   client: PublicClient,
   fluidConfigs: FactoryConfig[],
   amountIn: bigint,
-): Promise<FluidPool[]> {
+): Promise<(FluidVenue & { headOI: bigint })[]> {
   if (fluidConfigs.length === 0 || amountIn <= 0n) return [];
 
-  const sampleIn = fluidSampleInputs(amountIn);
-  if (sampleIn.length === 0) return [];
+  // The FIRST QL slice size — the on-chain ladder's seed (curve-math QL_SEED_DIV), so the probe's head is
+  // exactly the head the solver's first slice will carry when the state has not moved.
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
 
-  const out: FluidPool[] = [];
+  const out: (FluidVenue & { headOI: bigint })[] = [];
   const seen = new Set<string>();
   for (const cfg of fluidConfigs) {
     const resolver = cfg.fluidResolver;
@@ -2592,44 +2596,29 @@ export async function discoverFluidPoolsTyped(
         if (!inIs0 && !inIs1) continue;
         const swap0to1 = inIs0; // tokenIn is token0 ⇒ swap0→1
 
-        // Sample the LIVE quote ladder via the resolver's estimateSwapIn (amountOutMin 0 ⇒ pure quote).
-        const quotes = await Promise.all(
-          sampleIn.map((amt) =>
-            client
-              .readContract({
-                address: resolver,
-                abi: fluidResolverAbi,
-                functionName: "estimateSwapIn",
-                args: [pool, swap0to1, amt, 0n],
-              })
-              .then((r) => r as bigint)
-              .catch(() => 0n),
-          ),
-        );
+        // ONE liveness probe via the resolver's estimateSwapIn (amountOutMin 0 ⇒ pure quote). 0 ⇒ the pair
+        // is not tradeable at this size (paused / capped-out / dead) — drop.
+        const probeOut = (await client
+          .readContract({
+            address: resolver,
+            abi: fluidResolverAbi,
+            functionName: "estimateSwapIn",
+            args: [pool, swap0to1, probeIn, 0n],
+          })
+          .then((r) => r as bigint)
+          .catch(() => 0n)) as bigint;
+        if (probeOut <= 0n) continue;
 
-        // Keep only the strictly-positive, non-decreasing prefix of the ladder (a zero/failed quote = past
-        // the tradeable range / the utilization cap; a non-increasing out = degenerate).
-        const cumIn: bigint[] = [];
-        const cumOut: bigint[] = [];
-        let prevOut = 0n;
-        for (let i = 0; i < sampleIn.length; i++) {
-          const o = quotes[i];
-          if (o <= prevOut) break;
-          cumIn.push(sampleIn[i]);
-          cumOut.push(o);
-          prevOut = o;
-        }
-        if (cumOut.length === 0 || cumOut[0] <= 0n) continue; // pair not tradeable / no out
+        // The fold head: the first-slice post-fee out/in sqrt — identical to the on-chain ladder's first
+        // head (qlSliceHead(sliceOut, capacity)) at an unchanged state.
+        const headOI = qlSliceHead(probeOut, probeIn);
 
-        // Derive an effective fee (ppm) from the shallowest slice for price-ordering / diagnostics: the
-        // near-par spot ratio's shortfall vs 1:1 is dominated by the fee (the pool folds the fee into the
-        // resolver quote — there is no fee getter on the path). Best-effort; 0 when the ladder is too
-        // thin/coarse to infer.
+        // Derive an effective fee (ppm) from the probe for price-ordering / diagnostics: the near-par spot
+        // ratio's shortfall vs 1:1 is dominated by the fee (the pool folds the fee into the resolver quote
+        // — there is no fee getter on the path). Best-effort; 0 when the size is too coarse to infer.
         let feePpm = 0;
-        const in0 = cumIn[0];
-        const out0 = cumOut[0];
-        if (in0 > 0n && out0 > 0n && out0 < in0) {
-          const shortfall = ((in0 - out0) * FLUID_FEE_SCALE) / in0;
+        if (probeOut < probeIn) {
+          const shortfall = ((probeIn - probeOut) * FLUID_FEE_SCALE) / probeIn;
           if (shortfall > 0n && shortfall < FLUID_FEE_SCALE) feePpm = Number(shortfall);
         }
 
@@ -2639,10 +2628,9 @@ export async function discoverFluidPoolsTyped(
           swap0to1,
           tokenIn,
           tokenOut,
-          cumIn,
-          cumOut,
           feePpm,
           source: `${cfg.label} (Fluid DEX)`,
+          headOI,
         });
       } catch {
         // Pool/resolver read failed (not a FluidDexT1, paused, or unsupported pair) — skip.

@@ -47,13 +47,14 @@ they sort into one global ladder regardless of AMM type or fee tier.
    net — it ships NO prepare-time sqrt edges. V2 needs no tick cache (the solver streams constant-L from
    live reserves). Routes ship NO sampled data either: each leg carries its member pools (with their own
    net caches) plus quote-ladder venue DESCRIPTORS — the leg-venue price ladders are built ON-CHAIN in
-   setup from live cook-time state. Prepare is an optional cache throughout (except Fluid, which stays
-   direct-only and prepare-sampled via the chain-wide resolver).
+   setup from live cook-time state. Prepare is an optional cache throughout — EVERY non-CL family
+   (Fluid included) ships descriptor-only QL venues; no prepare-sampled segments remain.
 
 **On-chain (`ecoswap.sauce.ts`)** — a **unified per-pool live walk + price-ordered merge**. It reads each
 pool's live state once in SETUP, then runs ONE merge over the candidate streams — **each direct pool's single
-frontier** (walked from its LIVE spot, one tickSpacing per step, run-until-filled), the static sampled-segment
-cursor, plus **each route as a LIVE composite venue**: a route's head is the product fold of its legs' best
+frontier** (walked from its LIVE spot, one tickSpacing per step, run-until-filled), the merged QL-slice
+cursor (every non-CL venue's ladder, built ON-CHAIN in setup from its live quote view / state replay /
+bin-walk), plus **each route as a LIVE composite venue**: a route's head is the product fold of its legs' best
 member heads, where a leg's members span universe pools (walked with the same frontier code) AND its
 on-chain-laddered quote-ladder venues. Each step picks the highest fee-adjusted out/in head among `{all
 active pool frontiers, the segment cursor, every route head}`, consumes its segment into `inp[pool]` (route
@@ -210,7 +211,8 @@ LIVE and reuses the per-pool net cache, so on-chain gas scales with the trade si
           netCache[] each: [shiftedTick, rawNet]   (per-pool grouped, sorted swap-direction)
           routing[]  each: [legCount, {poolBase,poolCount,qlvBase,qlvCount,inter} × legCount] (stride 5)
           segs[]     each: [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux]
-                           (the STATIC sampled-venue stream, DESC sqrtAdjNear)
+                           (VESTIGIAL — always [] in production: every family is QL now; kept so
+                           the 6-arg shape the hand-built test universes pin stays stable)
           qlv[]      each: [poolAddr, i, j, feePpm, segKind, refIdx, c6..c9, routeIdx, legIdx]
                            (12 cols; direct rows first, then per-(route,leg) rows — cfg[12] splits) ]
                                                           │
@@ -401,7 +403,7 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   V3-style **fork** (e.g. **PancakeSwap V3**) registered as a `V3Standard`/`V2Standard` factory — each
   queried across its own `FactoryConfig.feeTiers` — AND the quote-ladder venue families
   (Curve StableSwap/CryptoSwap, Solidly-stable, WOOFi, Trader Joe LB, Mento, DODO V2, Wombat, Fermi,
-  EulerSwap, Balancer V2/V3, Maverick V2; Fluid is direct-only). The 13 leg-capable families compete
+  EulerSwap, Balancer V2/V3, Maverick V2, Fluid DEX). All 14 leg-capable families compete
   both as DIRECT venues and as ROUTE-LEG members. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is
   SUPPORTED (discover + price + execute): its curve
   is V3-identical (so it prices wei-exact via the V3 oracle), and the engine now EXECUTES it — an Algebra

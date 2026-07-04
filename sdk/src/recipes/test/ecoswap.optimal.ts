@@ -80,7 +80,7 @@ import { buildEulerSwapQLLadder, type EulerSwapPool } from "../shared/eulerswap-
 import { buildMaverickWalkLadder, type MaverickPool } from "../shared/maverick-math.js";
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math.js";
-import { buildFluidSegments, type FluidPool } from "../shared/fluid-math.js";
+import { buildFluidQLLadder, type FluidPool } from "../shared/fluid-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 
@@ -236,12 +236,15 @@ export interface OptimalPool {
   fermi?: FermiPool;
   /**
    * Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer-backed re-centering AMM) pool
-   * — when present this pool is a FLUID venue (NOT V2/V3/Curve/LB/DODO/Solidly/Wombat/Balancer/Euler/
-   * Maverick/CryptoSwap/WOOFi/Fermi). The oracle enumerates its segments via the SHARED sampler
-   * (buildFluidSegments) from the pool's LIVE estimateSwapIn ladder (the same (cumIn, cumOut) points prepare
-   * sampled), so the split is exact-on-grid vs prepare's segments (one shared ladder). The Fluid marginalOI
-   * is the post-fee + post-cap execution price (the resolver estimate nets the swap fee + utilization);
-   * adjNear == adjFar == marginalOI. All the other venue fields are ignored when `fluid` is set.
+   * — when present this pool is a QUOTE-LADDER (QL) FLUID venue (NOT V2/V3/Curve/LB/DODO/Solidly/Wombat/
+   * Balancer/Euler/Maverick/CryptoSwap/WOOFi/Fermi). The oracle builds its segments via the SHARED
+   * buildFluidQLLadder — the IDENTICAL geometric quote ladder the on-chain solver builds in setup from the
+   * LIVE resolver estimateSwapIn quote — driven by the descriptor's `getDy` quote model (a bit-exact
+   * fixture replay locally; a prefetched real-resolver grid in the prod-mirror), so the split is wei-exact
+   * vs the solver by construction (no prepared segments — prepare ships only the descriptor). The Fluid
+   * marginalOI is the post-fee + post-cap execution price (the resolver estimate nets the swap fee +
+   * utilization); adjNear == adjFar == marginalOI. All the other venue fields are ignored when `fluid` is
+   * set.
    */
   fluid?: FluidPool;
   /**
@@ -301,7 +304,8 @@ export interface OptimalRouteLeg {
    * families replay ⇒ identical grids), SIZED by the chain-order fold of `amountIn` through
    * the upstream legs' SETUP heads (see routeSegments), and the venue competes in the
    * leg-internal merge as a flat constant-price SLICE member (post-fee head; far == near).
-   * Fluid (static-seg venue) is explicitly NOT a leg member.
+   * Fluid is a member like every other QL family (segKind 12; the ladder quotes the chain-wide
+   * resolver, direction derived on-chain from the leg's edge in-token).
    */
   qlvs?: OptimalLegQlVenue[];
 }
@@ -324,7 +328,8 @@ export type OptimalLegQlVenue =
   | { family: "euler"; model: EulerSwapPool }
   | { family: "balancerV2"; model: BalancerStablePool }
   | { family: "balancerV3"; model: BalancerV3Pool }
-  | { family: "maverick"; model: MaverickPool };
+  | { family: "maverick"; model: MaverickPool }
+  | { family: "fluid"; model: FluidPool };
 
 /**
  * Build one leg QL venue's slice ladder via the family's SHARED builder, sized by the leg's
@@ -349,6 +354,7 @@ export function buildLegQlVenueLadder(v: OptimalLegQlVenue, cap: bigint): QlSlic
     case "balancerV2": return buildBalancerStableQLLadder(v.model, cap);
     case "balancerV3": return buildBalancerV3QLLadder(v.model, cap);
     case "maverick": return buildMaverickWalkLadder(v.model, cap);
+    case "fluid": return buildFluidQLLadder(v.model, cap);
   }
 }
 
@@ -765,16 +771,19 @@ function fermiSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
 }
 
 /**
- * Enumerate one Fluid DEX (Instadapp FluidDexT1) pool's segments via the SHARED sampler (buildFluidSegments)
- * over the pool's LIVE estimateSwapIn ladder (the same (cumIn, cumOut) points prepare sampled), so the
- * oracle and prepare emit the IDENTICAL segment grid from the SAME sampled snapshot (single source), making
- * the split exact-on-grid. The Fluid marginalOI is the post-fee + post-cap execution price (the resolver
- * estimate folds the fee + utilization into the quote); adjNear == adjFar == marginalOI. Awarded as a
+ * Enumerate one Fluid DEX (Instadapp FluidDexT1) venue's segments via the QUOTE-LADDER live walk
+ * (buildFluidQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from the LIVE
+ * chain-wide resolver's estimateSwapIn quote (a graceful single-return CALL: 0 past the utilization/borrow
+ * cap ⇒ both ladders self-truncate at the LIVE cap in lockstep). The ladder is driven by the descriptor's
+ * `getDy` quote model — a bit-exact replay of the FluidDexPool.sol fixture locally, a prefetched
+ * real-resolver quote grid (fluidQLGridInputs) in the prod-mirror — so the oracle == solver wei-exact BY
+ * CONSTRUCTION (no prepared segments; the ladder prices at the LIVE layer state, no snapshot). The Fluid
+ * marginalOI is the post-fee + post-cap execution price; adjNear == adjFar == marginalOI. Awarded as a
  * "pool" venue.
  */
 function fluidSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
   const segs: Segment[] = [];
-  for (const s of buildFluidSegments(p.fluid!, amountIn)) {
+  for (const s of buildFluidQLLadder(p.fluid!, amountIn)) {
     segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
   }
   return segs;

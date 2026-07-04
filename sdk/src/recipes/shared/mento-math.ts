@@ -285,7 +285,7 @@ export interface MentoSegment extends MergeSegment {
  * non-descending slice (rounding noise, or the near-flat/slightly-rising ConstantSum tail at scale) is
  * FOLDED into the last segment (isotonic backward-merge — capacity + effOut conserved, blended marginal
  * recomputed) so the merge stays monotone price-ordered without discarding liquidity. Mirrors
- * `buildFluidSegments` / `buildFermiSegments` (same isotonic backward-merge). See shared/segment-merge.ts.
+ * `buildFermiSegments` / `buildWooFiSegments` (same isotonic backward-merge). See shared/segment-merge.ts.
  */
 export function buildMentoSegments(
   pool: MentoPool,

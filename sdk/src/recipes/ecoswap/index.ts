@@ -285,26 +285,6 @@ export function buildUniverseRoutingAndQlv(prepared: EcoSwapPrepared): {
   return { poolTuples, netCache, routing, directCount, qlvRows, directQlvCount };
 }
 
-/**
- * Build the SAMPLED-SEGMENT array — `[refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue]`
- * for every Curve / LB / DODO bracket, sorted DESC by sqrtAdjNear (then adjFar DESC, then refIdx
- * ASC — the same stable order the on-chain merge tie-breaks on). These are the STATIC
- * sampled-segment venues (Curve/LB/DODO — their curve math is off-chain only) that compete in the
- * merge via ONE cursor (the on-chain `bestKind===1` static-segment path) ALONGSIDE the live direct
- * pools (bestKind===3) and the live multi-hop routes (bestKind===2). The solver does NOT recompute
- * either curve; it consumes the rows by sqrtAdjNear, accumulates the awarded Σ per venue (keyed by
- * the row's `venue` address), and dispatches on `segKind` at execution.
- *
- * segKind: 1 = Curve (refIdx → prepared.curves[]; venue = exchange() pool → swap(poolType:3) →
- * _swapCurve), 2 = Trader Joe LB (refIdx → prepared.lbs[]; venue = the pair → swap(poolType:6) →
- * _swapTraderJoeLB), 3 = DODO V2 (refIdx → prepared.dodos[]; venue = the pool → swap(poolType:5) →
- * _swapDODOV2). Each row carries its venue address inline, so the solver shares ONE per-segment
- * accumulator keyed by the static-segment index and resolves the venue from the row.
- *
- * Carried as a SEPARATE top-level compiler param (the 5th, after routing) so the row reads stay at
- * nesting depth ≤ 2 (segs[i] then segs[i][col]); the scalars stay bundled in `cfg`, so main() adds
- * only ONE nested tuple param — the v12 arg-prologue SDUP window stays small.
- */
 /** Every route-leg QL venue, flattened in (routeIdx asc, legIdx asc) order — the same order the
  *  leg qlv rows are emitted in. Used by the chain-wide-address fallbacks + protocolDefines. */
 function legQlVenues(prepared: EcoSwapPrepared): EcoLegQlVenue[] {
@@ -313,15 +293,20 @@ function legQlVenues(prepared: EcoSwapPrepared): EcoLegQlVenue[] {
 
 /**
  * The chain-wide Fluid DEX DexReservesResolver address (the estimateSwapIn quote target the on-chain solver
- * staticcalls for every Fluid slice) — carried as `cfg[6]`. All Fluid pools on a chain share one resolver,
- * so take the first prepared Fluid venue's resolver; 0 when no Fluid venue (the guard folds the branch away
- * under treeshake, so the 0 is never dereferenced). DIRECT-ONLY source, by design: Fluid is NOT a route-leg
- * QL member (it is a static-sampled-segment venue the solver cannot ladder on-chain), so — unlike the other
- * chain-wide addresses below — there is no leg-venue descriptor to fall back to.
+ * CALLs for every Fluid ladder slice + exec, and the getDexTokens orientation source) — carried as
+ * `cfg[6]`. All Fluid pools on a chain share one resolver, so take the first prepared Fluid venue's
+ * resolver; when Fluid is present ONLY as a route-leg venue, FALL BACK to the first leg-venue descriptor
+ * (a chain-wide address must be present whenever ANY venue of the family exists — the leg ladder/exec go
+ * through the same resolver); 0 when no Fluid venue anywhere (the guard folds the branch away under
+ * treeshake, so the 0 is never dereferenced).
  */
 function fluidResolverAddr(prepared: EcoSwapPrepared): bigint {
   const first = prepared.fluidPools?.[0];
-  return first ? BigInt(first.resolver) : 0n;
+  if (first) return BigInt(first.resolver);
+  const leg = legQlVenues(prepared).find(
+    (v): v is Extract<EcoLegQlVenue, { family: "fluid" }> => v.family === "fluid",
+  );
+  return leg ? BigInt(leg.desc.resolver) : 0n;
 }
 
 /**
@@ -592,6 +577,23 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
         8n, // segKind = Maverick V2 (on-chain live bin-walk QL; engine _swapMaverickV2 callback on the exec)
         BigInt(refIdx),
       ];
+    // Fluid DEX (FluidDexT1): qd[0]=DexT1 pool, qd[1]=swap0to1 (informational — the solver derives the
+    // direction bit ON-CHAIN via the chain-wide resolver's getDexTokens vs the (edge) in-token, so a leg
+    // venue needs no extra stamping), qd[2] unused. The QL ladder quotes the GRACEFUL
+    // resolver.estimateSwapIn(dex, swap0to1, xNext, 0) — a plain single-return CALL (NOT a staticcall: the
+    // real pool writes state on its ADDRESS_DEAD estimate path before the result-revert) returning 0 past
+    // the utilization/borrow cap ⇒ the ladder self-truncates at the LIVE cap (the EulerSwap-inLimit
+    // class). The chain-wide resolver is cfg[6]. EXEC stays callback-free (estimateSwapIn minOut + approve
+    // + pool.swapIn — Fluid PULLS via safeTransferFrom).
+    case "fluid":
+      return [
+        BigInt(v.desc.address),
+        v.desc.swap0to1 ? 1n : 0n, // swap0to1 (informational; the solver re-derives it on-chain)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        12n, // segKind = Fluid DEX (resolver estimateSwapIn on the ladder; approve + swapIn on the exec)
+        BigInt(refIdx),
+      ];
   }
 }
 
@@ -644,7 +646,8 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   // Family-concatenation order is LOAD-BEARING (the direct rows' positions feed the on-chain
   // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
   // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
-  // maverickPools — the historical order the per-family map bodies (now qlRowFor) emitted.
+  // maverickPools, fluidPools — the historical order the per-family map bodies (now qlRowFor)
+  // emitted, with Fluid appended when it migrated from the static-segment stream.
   const rows: bigint[][] = [];
   (prepared.curves ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "curve", desc }, i)));
   (prepared.cryptoSwaps ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "cryptoSwap", desc }, i)));
@@ -659,46 +662,24 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   (prepared.balancerV3Pools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "balancerV3", desc }, i)));
   (prepared.balancerStables ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "balancerV2", desc }, i)));
   (prepared.maverickPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "maverick", desc }, i)));
+  (prepared.fluidPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "fluid", desc }, i)));
   // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
   // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
   return rows.map(pad12);
 }
 
-function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
-  // NOTE: Curve StableSwap (segKind 1), Trader Joe LB (segKind 2), DODO V2 (segKind 3), Solidly STABLE
-  // (segKind 4), Wombat (segKind 5), EulerSwap (segKind 7), Maverick V2 (segKind 8), Curve CryptoSwap
-  // (segKind 9), WOOFi (segKind 10), Fermi (segKind 11) and Mento V2 (segKind 13) are NOT read here — all are
-  // QUOTE-LADDER (QL) venues (see buildQLVenues), built on-chain from live state, so they ship no static
-  // sampled segments. Maverick's on-chain segKind-8 branch WALKS the bin book live (no off-chain sampling).
-  const fluidPools = prepared.fluidPools ?? [];
-  return prepared.brackets
-    .filter(
-      (b) =>
-        // Only Fluid DEX remains a STATIC sampled-segment venue here. Every other family — Curve StableSwap
-        // (1) / Trader Joe LB (2) / DODO V2 (3) / Solidly STABLE (4) / Wombat (5) / Balancer V2 (6) / EulerSwap
-        // (7) / Maverick V2 (8) / Curve CryptoSwap (9) / WOOFi (10) / Fermi (11) / Mento V2 (13) / Balancer V3
-        // (14) — is a QUOTE-LADDER venue built ON-CHAIN from live state (buildQLVenues), NOT a static segment.
-        b.kind === EcoBracketKind.Fluid,
-    )
-    .slice()
-    .sort((a, b) => {
-      if (a.sqrtAdjNear !== b.sqrtAdjNear) return a.sqrtAdjNear < b.sqrtAdjNear ? 1 : -1;
-      if (a.sqrtAdjFar !== b.sqrtAdjFar) return a.sqrtAdjFar < b.sqrtAdjFar ? 1 : -1;
-      return a.refIdx - b.refIdx;
-    })
-    .map((b) => {
-      const isFluid = b.kind === EcoBracketKind.Fluid;
-      // Only Fluid DEX (segKind 12, callback-free via the resolver estimate + pool.swapIn) remains a STATIC
-      // sampled-segment venue here. Maverick V2 moved to the QL live bin-walk (segKind 8, buildQLVenues).
-      const segKind = isFluid ? 12n : 0n;
-      const venue = isFluid ? BigInt(fluidPools[b.refIdx].address) : 0n;
-      // venueAux (segs[6]) — the per-segment auxiliary 256-bit value. Now that Mento is a QL venue (its
-      // exchangeId travels in the qlv descriptor), no STATIC sampled venue uses it, so it is always 0 here;
-      // the column is kept to mirror the 7-field seg row the on-chain merge stream expects.
-      const venueAux = 0n;
-      return [BigInt(b.refIdx), b.capacity, b.sqrtAdjNear, b.sqrtAdjFar, segKind, venue, venueAux];
-    });
-}
+/**
+ * The VESTIGIAL static sampled-segment stream — ALWAYS EMPTY in production. Every family — Curve
+ * StableSwap (1), Trader Joe LB (2), DODO V2 (3), Solidly STABLE (4), Wombat (5), Balancer V2 (6),
+ * EulerSwap (7), Maverick V2 (8), Curve CryptoSwap (9), WOOFi (10), Fermi (11), Fluid DEX (12 —
+ * the LAST holdout, migrated to the live resolver-quote ladder), Mento V2 (13), Balancer V3 (14) —
+ * is a QUOTE-LADDER venue built ON-CHAIN from live state (buildQLVenues), so prepare ships NO
+ * sampled segments and `prepared.brackets` is always []. The solver's `segs` main() param (the
+ * 5th) is KEPT as a documented vestige: deleting it would change the 6-arg compile shape every
+ * hand-built test universe + the gas suite pins, for zero behavioral gain — the copy loop over an
+ * empty `segs` is a no-op and the merged stream is fed entirely by the on-chain QL ladders.
+ */
+const EMPTY_SEGS: bigint[][] = [];
 
 /**
  * Compile-time protocol-presence defines for ecoswap.sauce.ts conditional compilation.
@@ -737,7 +718,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_ROUTES = prepared.routes.length > 0;
   // QL families: a family present as a DIRECT venue OR as a ROUTE-LEG venue must compile in — a
   // family present ONLY as a leg venue still needs its ladder/exec branch (else treeshake drops
-  // it and the leg venue silently never ladders). Fluid has no leg form (static-seg venue).
+  // it and the leg venue silently never ladders).
   const legQl = legQlVenues(prepared);
   const hasLegFam = (family: EcoLegQlVenue["family"]): boolean =>
     legQl.some((v) => v.family === family);
@@ -753,7 +734,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_CRYPTO = (prepared.cryptoSwaps?.length ?? 0) > 0 || hasLegFam("cryptoSwap");
   const HAS_WOOFI = (prepared.wooFiPools?.length ?? 0) > 0 || hasLegFam("wooFi");
   const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0 || hasLegFam("fermi");
-  const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0; // never a leg venue (static segs)
+  const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0 || hasLegFam("fluid");
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
   const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
   // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
@@ -787,10 +768,11 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
 /**
  * Assemble the on-chain solver's compiler-arg array from a `prepared` universe — the SINGLE source
  * of truth for the `main(cfg, pools, netCache, routing, segs, qlv)` argument shape (6 top-level
- * args: the 13-scalar cfg bundle + the five nested tuple arrays). `ecoSwap` feeds this straight into
- * `compile()`; the gas-measurement tests import it so their hand-fed args can never drift from the
- * production shape (the historical staleness this replaces). `minOut` is taken from `prepared` (0 on
- * a floor-disabled prepare); a read-only quote overrides cfg[9] to 0 separately. `qlv` carries the
+ * args: the 13-scalar cfg bundle + the five nested tuple arrays; `segs` is the VESTIGIAL static
+ * stream, always [] — see EMPTY_SEGS). `ecoSwap` feeds this straight into `compile()`; the
+ * gas-measurement tests import it so their hand-fed args can never drift from the production shape
+ * (the historical staleness this replaces). `minOut` is taken from `prepared` (0 on a
+ * floor-disabled prepare); a read-only quote overrides cfg[9] to 0 separately. `qlv` carries the
  * direct rows THEN the route-leg rows ((routeIdx, legIdx)-ordered — asserted by the builder);
  * cfg[12] = directQlvCount marks the boundary.
  */
@@ -803,7 +785,6 @@ export function buildSolverArgs(
 ): unknown[] {
   const { poolTuples, netCache, routing, directCount, qlvRows, directQlvCount } =
     buildUniverseRoutingAndQlv(prepared);
-  const segs = buildSegs(prepared);
   return [
     [
       BigInt(tokenIn),
@@ -823,7 +804,7 @@ export function buildSolverArgs(
     poolTuples,
     netCache,
     routing,
-    segs,
+    EMPTY_SEGS, // segs — the VESTIGIAL static stream, always [] (see EMPTY_SEGS)
     qlvRows,
   ];
 }
@@ -1046,7 +1027,6 @@ export async function quoteEcoSwap(
   // descriptors pass through untouched (they carry no cache: prepare-optional by construction).
   const { poolTuples, netCache, routing, directCount, qlvRows, directQlvCount } =
     buildUniverseRoutingAndQlv(usePrepared);
-  const segs = buildSegs(usePrepared);
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
@@ -1073,7 +1053,7 @@ export async function quoteEcoSwap(
       poolTuples,
       netCache,
       routing,
-      segs,
+      EMPTY_SEGS, // segs — the VESTIGIAL static stream, always [] (see EMPTY_SEGS)
       qlvRows,
     ],
   });

@@ -110,8 +110,8 @@ import { IPermit2 } from "./IPermit2.json";
 //   qlv[v]      = [poolAddr, i, j, feePpm, segKind, refIdx, c6, c7, c8, c9, routeIdx, legIdx] — the
 //                 QUOTE-LADDER (QL) venue DESCRIPTORS, uniform 12-column width (Curve StableSwap segKind 1,
 //                 Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE segKind 4, Wombat segKind 5,
-//                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Mento V2 segKind 13,
-//                 Balancer V3 segKind 14). Rows [0, directQlvCount) are DIRECT venues (today's family-
+//                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Fluid DEX segKind 12,
+//                 Mento V2 segKind 13, Balancer V3 segKind 14). Rows [0, directQlvCount) are DIRECT venues (today's family-
 //                 concatenation order; qd[10]=qd[11]=0, never read); rows [directQlvCount, …) are
 //                 ROUTE-LEG venues — qd[0..9] the SAME family row built for the leg's EDGE pair
 //                 (legIn, legOut), qd[5] refIdx = the row's GLOBAL qlv index (informational), qd[10]/
@@ -140,14 +140,20 @@ import { IPermit2 } from "./IPermit2.json";
 //                 derived on-chain, clamped at amountIn), quotes q_k dispatched per-row on segKind (qd[4]):
 //                 StableSwap get_dy(int128,int128,uint256) for kind 1, CryptoSwap get_dy(uint256,uint256,
 //                 uint256) for kind 9 (a DIFFERENT selector + uint256 coin indices), Solidly getAmountOut(
-//                 xIn,tokenIn) for kind 4, WOOFi tryQuery(tokenIn,tokenOut,xIn) for kind 10, Mento
+//                 xIn,tokenIn) for kind 4, WOOFi tryQuery(tokenIn,tokenOut,xIn) for kind 10, Fluid
+//                 resolver.estimateSwapIn(dex=qd[0],flQz,xIn,0) for kind 12 (a plain CALL on the chain-wide
+//                 cfg[6] resolver — NOT a staticcall, see the exec block; the direction bit flQz is derived
+//                 ON-CHAIN per venue via getDexTokens vs the (edge) in-token), Mento
 //                 broker.getAmountOut(provider=qd[0],exchangeId=qd[1],tokenIn,tokenOut,xIn) for kind 13, LB
 //                 pair.getSwapOut(xIn,swapForY=qd[1])→(amountInLeft,amountOut) for kind 2. The revert-class
 //                 views (get_dy families on bad state / Newton non-convergence; Solidly getAmountOut on
 //                 _get_y non-convergence; Mento getAmountOut on a misconfigured exchange) use
 //                 PROBE-THEN-DECODE (a `.catch` flags a revert ⇒ stop; the sentinel-catch cannot capture the
-//                 return VALUE); WOOFi tryQuery + LB getSwapOut NEVER revert (WOOFi returns 0 on a cap /
-//                 feasibility failure ⇒ a PLAIN staticcall decoding [0], 0 ⇒ stop; LB returns amountInLeft,
+//                 return VALUE); WOOFi tryQuery + Fluid estimateSwapIn + LB getSwapOut NEVER revert (WOOFi/
+//                 Fluid return 0 on a cap / feasibility failure ⇒ a PLAIN single-return call, 0 ⇒ stop —
+//                 Fluid's graceful resolver catch decodes the pool's result-revert and returns 0 for any
+//                 OTHER underlying revert, so the ladder self-truncates at the LIVE utilization/borrow cap,
+//                 the EulerSwap-inLimit class; LB returns amountInLeft,
 //                 the UNFILLABLE remainder). It then differences (capacity = xNext-cum, sliceOut = q_k -
 //                 q_{k-1}) and emits a segment row [refIdx, capacity, head, head, segKind, venue, venueAux]
 //                 (head = qlSliceHead(sliceOut,capacity); every quote is post-fee ⇒ no extra fee-adjust)
@@ -161,9 +167,12 @@ import { IPermit2 } from "./IPermit2.json";
 //                 (pool state is frozen until EXEC), so the ladder is bounded to <=2*QL_S staticcalls per
 //                 venue. Everything past obtaining q (difference/head/emit/sort) is SHARED across adapters —
 //                 each later QL lane adds only one treeshake-guarded per-segKind quote branch here.
-//   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux] — the STATIC
-//                 sampled-segment venue stream (the 13 not-yet-QL-migrated venues: LB / DODO / Solidly
-//                 / … interleaved), pre-sorted DESC sqrtAdjNear. In setup the solver COPIES these rows
+//   segs[g]     = [refIdx, capacity, sqrtAdjNear, sqrtAdjFar, segKind, venue, venueAux] — the VESTIGIAL
+//                 static sampled-segment stream, ALWAYS [] in production (Fluid, the last static
+//                 holdout, is a QL family now — every venue's ladder is built ON-CHAIN from live
+//                 state, so prepare ships NO sampled segments; the param is kept so the 6-arg
+//                 compile shape the hand-built test universes + gas suite pin stays stable, and a
+//                 hand-supplied static row still merges verbatim). In setup the solver COPIES these rows
 //                 and the ON-CHAIN-BUILT qlv ladders into ONE set of parallel scalar arrays (an
 //                 array-of-tuples is v12-only — SET_INDEX of a tuple reverts on v1), then BOUNDED-
 //                 insertion-SORTs them DESC (sqrtAdjNear, then sqrtAdjFar, then refIdx ASC) into the
@@ -692,8 +701,9 @@ function main(
   const priceLimit: Uint256 = cfg[4];
   const directCount: Uint256 = cfg[5];
   // cfg[6] = the chain-wide Fluid DEX DexReservesResolver address (0 when no Fluid venue). The Fluid
-  // per-slice quote goes through this resolver's estimateSwapIn (the pool's own estimate is a revert
-  // SauceScript can't try/catch); one resolver serves every Fluid pool on the chain. OPTIONAL 7th cfg
+  // QL LADDER quote, the per-venue direction read (getDexTokens) and the exec quote all go through this
+  // resolver (the pool's own estimate is a revert SauceScript can't try/catch; estimateSwapIn is a plain
+  // CALL — see the exec block); one resolver serves every Fluid pool on the chain. OPTIONAL 7th cfg
   // field — guarded by cfg.length so the many venue EVM tests that hand-build a 6-field cfg (no Fluid)
   // stay valid; production always emits it (index.ts).
   let fluidResolver: Address = 0;
@@ -1026,7 +1036,9 @@ function main(
   // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
   // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
   if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&true) {
-    // 1. Copy the static (not-yet-QL-migrated) segments VERBATIM into the parallel-array stream.
+    // 1. Copy any static segments VERBATIM into the parallel-array stream. VESTIGIAL: production
+    // always ships segs == [] (every family is QL — the ladders below feed the whole stream); a
+    // hand-built test universe may still supply static rows and they merge unchanged.
     for (let k = 0; k < segs.length; k = k + 1) {
       const sr: Tuple = segs[k];
       msRef[msN] = sr[0];
@@ -1053,7 +1065,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID) {
       // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
@@ -1233,6 +1245,17 @@ function main(
           if (qj === 0) { b2sfOut = sf0; }
           if (qj === 1) { b2sfOut = sf1; }
           if (qj === 2) { b2sfOut = sf2; }
+        }
+        // Fluid DEX (segKind 12): derive the direction bit ONCE per venue, ON-CHAIN — swap0to1 ⇔ the
+        // pool's token0 == the (edge) in-token, read via the chain-wide resolver's getDexTokens (the
+        // DexT1 pool has NO token0()/token1() getters; the descriptor's qd[1] swap0to1 stamp is
+        // informational only, so a ROUTE-LEG venue's direction is edge-correct with zero extra leg
+        // stamping — the same derive-don't-trust rule the exec block applies). One view staticcall per
+        // venue; the per-slice estimateSwapIn quote below is a plain CALL (see the exec block).
+        let flQz: Uint256 = 0;
+        if (HAS_FLUID && qKind === 12) {
+          const flqT0: Address = IFluidDexResolver.at(fluidResolver).getDexTokens(qPool)[0];
+          if (flqT0 === qTokIn) { flQz = 1; }
         }
         // Maverick V2 (segKind 8) — LIVE bin-WALK. UNLIKE the geometric quote-difference ladder below (which
         // no-ops for qKind 8: no branch matches ⇒ q stays 0 ⇒ stop), Maverick has no cumulative-out view, so
@@ -1438,6 +1461,20 @@ function main(
                         if (HAS_WOOFI && qKind === 10) {
                           q = IWooFiPool.at(qPool).tryQuery(qTokIn, qTokOut, xNext);
                         } else {
+                        if (HAS_FLUID && qKind === 12) {
+                          // Fluid DEX (FluidDexT1, callback-free): the ladder quote is the chain-wide
+                          // resolver's estimateSwapIn(dex, swap0to1, xNext, 0) — GRACEFUL like WOOFi's
+                          // tryQuery (the resolver's Solidity catch decodes the pool's FluidDexSwapResult
+                          // revert and returns 0 for ANY other underlying revert — utilization/borrow cap,
+                          // paused, invalid amounts), so it is a PLAIN single-return call, 0 ⇒ stop, and
+                          // the ladder SELF-TRUNCATES at the LIVE cap (the EulerSwap-inLimit class, no
+                          // separate cap read). NB a CALL, not a staticcall (the ABI marks it nonpayable):
+                          // the real pool writes state on the ADDRESS_DEAD estimate path before its
+                          // result-revert (which rolls the write back), so a STATICCALL would quote 0.
+                          // Each quote sees the same frozen state ⇒ the differencing is exact. flQz is the
+                          // per-venue on-chain-derived direction bit (the prelude above).
+                          q = IFluidDexResolver.at(fluidResolver).estimateSwapIn(qPool, flQz, xNext, 0);
+                        } else {
                           if (HAS_WOMBAT && qKind === 5) {
                             // Wombat (single-sided stableswap, callback-free): the ladder quote is
                             // quotePotentialSwap(fromToken, toToken, xNext)[0] — the post-haircut out. It is
@@ -1488,6 +1525,7 @@ function main(
                               }
                             }
                           }
+                        }
                         }
                       }
                     }
@@ -1590,8 +1628,8 @@ function main(
         }
       }
     }
-    // 3. Bounded insertion sort over [0, msSorted) — the static segs + DIRECT QL ladders — DESC by
-    // (msNear, then msFar, then msRef ASC) — the SAME stable order index.ts buildSegs emits so the
+    // 3. Bounded insertion sort over [0, msSorted) — the (vestigial) static segs + DIRECT QL ladders —
+    // DESC by (msNear, then msFar, then msRef ASC) — the historical stable stream order, so the
     // cursor sees a global descending-price stream. All eight columns shift together (parallel
     // arrays). Route-leg regions at [msSorted, msN) are never touched. For a single monotone QL
     // ladder this is a near-no-op; the general sort interleaves multiple QL venues + any static
@@ -2763,6 +2801,23 @@ function main(
                   if (qfeOut > 0) {
                     IERC20.at(legIn).approve(qPool, share);
                     IFermiPool.at(qPool).fermiSwapWithAllowances(legIn, legOut, share, qfeOut, address.self);
+                  }
+                }
+                // Fluid DEX (segKind 12) — callback-free: the chain-wide resolver's (cfg[6]) LIVE
+                // estimateSwapIn as amountOutMin (a plain CALL — the DexT1 estimate writes state
+                // before its result-revert, so a staticcall would quote 0; the resolver decodes it
+                // in Solidity), approve-first (Fluid PULLS via safeTransferFrom inside swapIn). The
+                // direction bit is derived ON-CHAIN from getDexTokens vs the LEG's in-token — the
+                // same derive-don't-trust read the direct exec block uses, made leg-correct by the
+                // legIn substitution.
+                if (HAS_FLUID && qk === 12) {
+                  const qflT0: Address = IFluidDexResolver.at(fluidResolver).getDexTokens(qPool)[0];
+                  let qflZ: Uint256 = 0;
+                  if (qflT0 === legIn) { qflZ = 1; }
+                  const qflOut: Uint256 = IFluidDexResolver.at(fluidResolver).estimateSwapIn(qPool, qflZ, share, 0);
+                  if (qflOut > 0) {
+                    IERC20.at(legIn).approve(qPool, share);
+                    IFluidDexPool.at(qPool).swapIn(qflZ, share, qflOut, address.self);
                   }
                 }
                 // Mento V2 (segKind 13) — callback-free: qd[0] = exchangeProvider, qd[1] = the

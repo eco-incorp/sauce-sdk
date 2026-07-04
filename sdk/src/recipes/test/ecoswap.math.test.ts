@@ -84,9 +84,8 @@ import {
   type FermiPool,
 } from "../shared/fermi-math";
 import {
-  getAmountOut as fluidGetAmountOut,
-  buildFluidSegments,
-  fluidSampleInputs,
+  buildFluidQLLadder,
+  fluidQLGridInputs,
   type FluidPool,
 } from "../shared/fluid-math";
 import {
@@ -2220,16 +2219,18 @@ describe("Fermi / propAMM (Obric-style proactive AMM) — quote-ladder interpola
   });
 });
 
-// ── Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer re-centering AMM) ladder ──
+// ── Fluid DEX (Instadapp fluid-contracts-public FluidDexT1 — Liquidity-Layer re-centering AMM) QL ladder ──
 //
 // The real FluidDexT1 pool exposes NO closed-form state getters and NO getAmountOut view (its own estimate
-// is a REVERT) — the split is priced off a LIVE `estimateSwapIn` ladder discovery samples via the periphery
-// resolver (see fluid-math.ts). So there is no hand-pinned closed-form KAT to assert; instead this pins the
-// LADDER machinery: `getAmountOut` interpolates the (cumIn, cumOut) points, and `buildFluidSegments`
-// differences that ladder into a descending-marginal partition. We synthesize a plausible near-1:1 ladder
-// (the re-centering layer form amountIn·rate0/rate1·center, fee off the output, then an out-cap) as the
-// sampled quotes — mirroring what discovery would store from the resolver.
-describe("Fluid DEX (FluidDexT1 Liquidity-Layer re-centering AMM) — quote-ladder interpolation + sampler", () => {
+// is a REVERT) — Fluid is a QUOTE-LADDER family: the on-chain solver builds the ladder LIVE from the
+// periphery resolver's graceful estimateSwapIn quote (see fluid-math.ts). So there is no hand-pinned
+// closed-form KAT to assert; instead this pins the QL machinery: `buildFluidQLLadder` runs the SHARED
+// buildQLLadder recurrence over the descriptor's `getDy` quote model, and `fluidQLGridInputs` is the
+// deterministic quote grid the recurrence touches (the prod-mirror's prefetch contract). We synthesize a
+// plausible near-1:1 quote model (the re-centering layer form amountIn·rate0/rate1·center, a convex
+// utilization slip, fee off the output, then an out-cap → 0) — bit-shaped like the FluidDexPool.sol
+// fixture — as the live quotes the resolver would return.
+describe("Fluid DEX (FluidDexT1 Liquidity-Layer re-centering AMM) — QL ladder + grid contract", () => {
   const E18 = 10n ** 18n;
   const Z = "0x0000000000000000000000000000000000000001" as `0x${string}`;
   const RATE = E18; // both sides at par exchange rate
@@ -2238,13 +2239,13 @@ describe("Fluid DEX (FluidDexT1 Liquidity-Layer re-centering AMM) — quote-ladd
   const FEEPPM = 100n; // 0.01% (1e6-scaled) — Fluid stable-tier fee
   // Depth for the mild convex slippage term (larger ⇒ flatter/deeper, less slippage per unit).
   const DEPTH = 20_000_000n * E18;
-  // An out-cap that bites only well past the sampled range (so the ladder stays a clean partition here).
+  // An out-cap that bites only well past the trade range (so the ladder stays a clean partition here).
   const OUT_CAP = 500_000n * E18;
 
   // The re-centering layer out (amountIn·rate0/rate1·center) minus a size-dependent utilization slippage
   // (dx²/DEPTH — Fluid's price worsens with size as the layer utilization rises), minus the fee, then
-  // capped. Used ONLY to synthesize the sampled ladder the resolver would return (NOT a getter the recipe
-  // reads). The mild convexity gives strictly-descending marginals (like the Fermi/WOOFi KATs).
+  // capped (0 past the cap — the GRACEFUL resolver contract). Models the live estimateSwapIn quote the
+  // on-chain ladder differences. The mild convexity gives strictly-descending marginals.
   function xToY(dx: bigint): bigint {
     if (dx <= 0n) return 0n;
     const par = ((dx * RATE) / RATE * CENTER) / E18;
@@ -2255,79 +2256,67 @@ describe("Fluid DEX (FluidDexT1 Liquidity-Layer re-centering AMM) — quote-ladd
     return net > OUT_CAP ? 0n : net;
   }
 
-  function ladderPool(amountIn: bigint): FluidPool {
-    const cumIn = fluidSampleInputs(amountIn);
-    const cumOut = cumIn.map(xToY);
+  function qlPool(): FluidPool {
     return {
       address: Z, resolver: Z, swap0to1: true, tokenIn: Z, tokenOut: Z,
-      cumIn, cumOut, feePpm: Number(FEEPPM), source: "kat",
+      feePpm: Number(FEEPPM), source: "kat", getDy: xToY,
     };
   }
 
-  it("getAmountOut — exact at a ladder point, interpolated between, fee-adjusted", () => {
+  it("buildFluidQLLadder — covers amountIn, strictly-descending heads, differences the quote model", () => {
     const amountIn = 100_000n * E18;
-    const p = ladderPool(amountIn);
-    // Exact at a stored sample.
-    const i = p.cumIn.length - 1;
-    assert.equal(fluidGetAmountOut(p, p.cumIn[i]), p.cumOut[i], "exact at the last ladder point");
-    // A SMALL trade is near-1:1 minus the 0.01% fee + tiny utilization slippage; a large trade loses more
-    // to the convex utilization term (monotone out, less than in).
-    const small = p.cumIn[0];
-    const outSmall = fluidGetAmountOut(p, small);
-    assert.ok(outSmall < small && outSmall > (small * 999n) / 1000n, "near-1:1 minus fee on a small Fluid slice");
-    const out = fluidGetAmountOut(p, amountIn);
-    assert.ok(out < amountIn && out > (amountIn * 98n) / 100n, "large trade: below par by fee + utilization");
-    // Interpolation is monotone and bracketed between the two neighbouring ladder points.
-    const mid = (p.cumIn[0] + p.cumIn[1]) / 2n;
-    const interp = fluidGetAmountOut(p, mid);
-    assert.ok(interp >= p.cumOut[0] && interp <= p.cumOut[1], "interpolated between neighbouring points");
-  });
-
-  it("buildFluidSegments — covers amountIn, descending (flat) marginals, partition of the ladder", () => {
-    const amountIn = 100_000n * E18;
-    const p = ladderPool(amountIn);
-    const segs = buildFluidSegments(p, amountIn);
-    assert.ok(segs.length > 0, "non-empty segment ladder");
+    const segs = buildFluidQLLadder(qlPool(), amountIn);
+    assert.ok(segs.length > 0, "non-empty QL ladder");
     const sumCap = segs.reduce((a, s) => a + s.capacity, 0n);
-    assert.equal(sumCap, amountIn, "segments cover the full amountIn (last sample == amountIn)");
+    assert.equal(sumCap, amountIn, "QL slices cover the full amountIn (geometric grid clamps at amountIn)");
     for (let i = 1; i < segs.length; i++) {
-      assert.ok(segs[i].marginalOI <= segs[i - 1].marginalOI, "marginals non-increasing");
+      assert.ok(segs[i].marginalOI < segs[i - 1].marginalOI, "heads strictly descending (non-convex guard)");
     }
-    // Σ effOut over the grid == getAmountOut(amountIn) (the sampler is a partition of the ladder).
+    // Σ effOut over the ladder == getDy(amountIn) (quote-differencing is a partition of the quote).
     const sumOut = segs.reduce((a, s) => a + s.effOut, 0n);
-    assert.equal(sumOut, fluidGetAmountOut(p, amountIn), "Σ segment effOut == getAmountOut(amountIn)");
+    assert.equal(sumOut, xToY(amountIn), "Σ slice effOut == getDy(amountIn)");
+    // A SMALL first slice is near-1:1 minus the 0.01% fee + tiny utilization slippage.
+    const first = segs[0];
+    assert.ok(
+      first.effOut < first.capacity && first.effOut > (first.capacity * 999n) / 1000n,
+      "near-1:1 minus fee on the first (best-priced) Fluid slice",
+    );
   });
 
-  it("out-cap: discovery truncates the ladder at the utilization cap; segments stay a clean partition", () => {
-    // Size amountIn so the LAST samples exceed OUT_CAP → those quote 0. discoverFluidPoolsTyped keeps only
-    // the strictly-positive non-decreasing PREFIX (the cap edge, like EulerSwap's inLimit); replay that
-    // truncation here, then build over the truncated descriptor.
-    const amountIn = 1_000_000n * E18; // net at par ≈ 999_900 * E18 > OUT_CAP for the tail samples
-    const rawIn = fluidSampleInputs(amountIn);
-    const rawOut = rawIn.map(xToY);
-    assert.ok(rawOut.some((o) => o === 0n), "some tail samples exceed the out-cap and quote 0");
-    // Discovery's non-decreasing-positive prefix rule (verbatim from discoverFluidPoolsTyped).
-    const cumIn: bigint[] = [];
-    const cumOut: bigint[] = [];
-    let prev = 0n;
-    for (let i = 0; i < rawIn.length; i++) {
-      if (rawOut[i] <= prev) break;
-      cumIn.push(rawIn[i]);
-      cumOut.push(rawOut[i]);
-      prev = rawOut[i];
-    }
-    assert.ok(cumIn.length > 0 && cumIn.length < rawIn.length, "prefix truncated below the cap");
-    const capBoundary = cumIn[cumIn.length - 1];
-    const p: FluidPool = {
-      address: Z, resolver: Z, swap0to1: true, tokenIn: Z, tokenOut: Z,
-      cumIn, cumOut, feePpm: Number(FEEPPM), source: "kat-cap",
+  it("fluidQLGridInputs — the deterministic quote grid the recurrence touches (prefetch contract)", () => {
+    const amountIn = 100_000n * E18;
+    const grid = fluidQLGridInputs(amountIn);
+    assert.ok(grid.length > 0 && grid.length <= 8, "grid bounded by QL_S");
+    for (let i = 1; i < grid.length; i++) assert.ok(grid[i] > grid[i - 1], "grid strictly ascending");
+    assert.equal(grid[grid.length - 1], amountIn, "grid reaches amountIn (QL_SEED_DIV guarantees the clamp)");
+    // The ladder built from a LOOKUP-ONLY getDy over exactly this grid == the closed-form ladder — i.e. the
+    // recurrence never quotes off-grid (the prod-mirror's prefetch relies on this).
+    const quotes = new Map<bigint, bigint>(grid.map((x) => [x, xToY(x)]));
+    const lookup: FluidPool = {
+      ...qlPool(),
+      getDy: (dx: bigint): bigint => {
+        const q = quotes.get(dx);
+        assert.ok(q !== undefined, `QL recurrence quoted an off-grid point ${dx}`);
+        return q!;
+      },
     };
-    // Build over the truncated ladder capped at amountIn (the on-chain merge would only award the tradeable
-    // prefix; anything past the cap is un-fillable, so the split covers only up to the cap boundary).
-    const segs = buildFluidSegments(p, amountIn);
+    assert.deepEqual(buildFluidQLLadder(lookup, amountIn), buildFluidQLLadder(qlPool(), amountIn),
+      "grid-lookup ladder == closed-form ladder (one grid, one recurrence)");
+  });
+
+  it("out-cap: the graceful 0-quote self-truncates the ladder at the live cap (EulerSwap-inLimit class)", () => {
+    // Size amountIn so the tail grid points exceed OUT_CAP → those quote 0 → the ladder stops there, like
+    // the on-chain build (estimateSwapIn returns 0 past the utilization/borrow cap, q === 0 ⇒ stop).
+    const amountIn = 1_000_000n * E18; // net at par ≈ 999_900 * E18 > OUT_CAP for the tail grid points
+    const grid = fluidQLGridInputs(amountIn);
+    assert.ok(grid.some((x) => xToY(x) === 0n), "some tail grid points exceed the out-cap and quote 0");
+    const segs = buildFluidQLLadder(qlPool(), amountIn);
+    assert.ok(segs.length > 0, "the tradeable prefix still ladders");
+    assert.ok(segs.every((s) => s.effOut > 0n), "every slice has a positive out (none past the cap)");
     const covered = segs.reduce((a, s) => a + s.capacity, 0n);
-    assert.ok(segs.every((s) => s.effOut > 0n), "every segment has a positive out (none past the cap)");
-    assert.equal(covered, capBoundary, "covered input == the cap boundary (the tradeable prefix)");
+    // Covered == the last grid point that still quotes positive (the tradeable prefix).
+    const lastPositive = grid.filter((x) => xToY(x) > 0n).pop()!;
+    assert.equal(covered, lastPositive, "covered input == the last positive-quote grid point");
     assert.ok(covered < amountIn, "the cap truncates the covered input below amountIn");
   });
 });

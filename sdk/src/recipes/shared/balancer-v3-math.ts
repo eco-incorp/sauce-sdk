@@ -276,7 +276,7 @@ export interface BalancerV3Segment extends MergeSegment {
  * non-descending slice (rounding noise, or the surge fee kicking down the marginal then recovering) is
  * FOLDED into the last segment (isotonic backward-merge — capacity + effOut conserved, blended marginal
  * recomputed) so the merge stays monotone price-ordered without discarding liquidity. Mirrors
- * `buildFluidSegments` / `buildMentoSegments` (same isotonic backward-merge). See shared/segment-merge.ts.
+ * `buildMentoSegments` / `buildFermiSegments` (same isotonic backward-merge). See shared/segment-merge.ts.
  */
 export function buildBalancerV3Segments(
   pool: BalancerV3Pool,

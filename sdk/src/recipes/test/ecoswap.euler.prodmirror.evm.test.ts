@@ -360,8 +360,8 @@ describe("EcoSwap EulerSwap V1 (Euler vault-backed AMM) prod-mirror — REAL byt
     );
     assert.equal(prepared.eulerSwaps![0].inIsToken0, true, "discovery oriented the venue as inIsToken0 (tokenIn == asset0)");
     assert.ok(prepared.eulerSwaps![0].source.includes("v1"), `the discovered venue is tagged v1 (${prepared.eulerSwaps![0].source})`);
-    // EulerSwap is a QUOTE-LADDER venue now: prepare ships ONLY the descriptor (in prepared.eulerSwaps), NO
-    // static sampled brackets — index.ts buildQLVenues emits the segKind-7 descriptor + buildSegs drops Euler.
+    // EulerSwap is a QUOTE-LADDER venue: prepare ships ONLY the descriptor (in prepared.eulerSwaps), NO
+    // static sampled brackets — index.ts buildQLVenues emits the segKind-7 descriptor (segs is always []).
     assert.equal(
       (prepared.brackets ?? []).filter((b) => b.kind === EcoBracketKind.EulerSwap).length,
       0,
