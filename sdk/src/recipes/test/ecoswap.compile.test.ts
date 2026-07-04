@@ -240,7 +240,8 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   // routeIdx/legIdx backrefs), a stride-5 routing whose leg1 points at the leg row
   // (qlvBase=1, qlvCount=1), and the FULL 13-field cfg with cfg[12]=directQlvCount=1 — so the
   // solver's directQlvCount-bounded ladder loop + the HAS_LEG_QLV-gated cfg[12] read both lower
-  // on BOTH engines. (Leg rows are SKIPPED by this build — compile-shape coverage only.)
+  // on BOTH engines. (The leg row's ladder-build prelude/postlude lowers here too — compile
+  // coverage; the first RUNTIME execution of leg regions arrives with the merge-election lane.)
   it("compiles a 2-hop route with a route-leg QL venue (12-col qlv + cfg[12]) (v1 + v12)", () => {
     const routePools: bigint[][] = [
       [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,

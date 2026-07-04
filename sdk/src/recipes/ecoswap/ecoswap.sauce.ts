@@ -96,11 +96,12 @@ import { IPermit2 } from "./IPermit2.json";
 //   routing[r]  = [legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount] — one flat
 //                 SCALAR tuple per route, uniform 5-field stride per leg: leg L at rt[1+5L] poolBase,
 //                 rt[2+5L] poolCount, rt[3+5L] qlvBase, rt[4+5L] qlvCount, rt[5+5L] interL. Leg L
-//                 pools = universe indices [poolBase, poolBase+poolCount) (poolCount MAY be 0 for a
-//                 future all-QL leg); leg L QL venues = GLOBAL qlv row indices [qlvBase,
+//                 pools = universe indices [poolBase, poolBase+poolCount) (poolCount MAY be 0 for an
+//                 all-QL leg); leg L QL venues = GLOBAL qlv row indices [qlvBase,
 //                 qlvBase+qlvCount) (0/0 for a pool-only leg — prepare emits pool-only legs today;
-//                 the leg-QL ladder/merge/exec branches land in later lanes, so THIS build reads
-//                 only the pool fields + inter). interL = intermediate token AFTER leg L (final leg
+//                 SETUP reads them for the leg-row ladder build + its sizing fold; the leg-QL
+//                 merge election + exec branches land in later lanes). interL = intermediate token
+//                 AFTER leg L (final leg
 //                 → 0); derived reads keep the old symmetry: legIn(L>0) = rt[5L], legOut(L<legCount−1)
 //                 = rt[5+5L]. The merge head fold, the route event, and the chain-order execution
 //                 all loop over legCount, so N-hop needs no shape change.
@@ -114,9 +115,13 @@ import { IPermit2 } from "./IPermit2.json";
 //                 (legIn, legOut), qd[5] refIdx = the row's GLOBAL qlv index (informational), qd[10]/
 //                 qd[11] = the routeIdx/legIdx backrefs — grouped contiguously per (route, leg),
 //                 (routeIdx asc, legIdx asc), so routing's qlvBase/qlvCount point at them. index.ts
-//                 ASSERTS this ordering (the msSorted machinery silently depends on it). THIS build
-//                 ladders ONLY the direct rows (leg rows are skipped — their ladder/merge/exec
-//                 branches land in later lanes, gated HAS_LEG_QLV). Columns c6..c9 are used ONLY by
+//                 ASSERTS this ordering (the msSorted machinery AND the leg-row sizing fold silently
+//                 depend on it). The flat qlv pass ladders EVERY row: direct rows into the SORTED
+//                 merged stream as before; leg rows (gated HAS_LEG_QLV) into per-venue regions PAST
+//                 msSorted — quoted on the leg's EDGE pair (qTokIn/qTokOut from routing) and sized
+//                 by the chain-order fold of amountIn through the upstream legs' LIVE setup heads
+//                 (their merge election + exec branches land in later lanes, so the regions are
+//                 built but dormant). Columns c6..c9 are used ONLY by
 //                 Balancer V3 (segKind 14) and are 0 for every other venue: BalV3's querySwap is eth_call-ONLY,
 //                 so instead of quoting a live view it REPLAYS the amplified StableSwap invariant on-chain from
 //                 the LIVE Vault state — getCurrentLiveBalances(pool)[i]/[j] (inline-indexed), amp +
@@ -666,8 +671,10 @@ const HAS_FLUID: boolean = true;
 const HAS_MENTO: boolean = true;
 const HAS_BALANCER_V3: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
-// — currently only the cfg[12] directQlvCount override read (the leg ladder/merge/exec branches
-// land in later lanes) — so a pool-only-routes universe ships zero leg-QL bytecode.
+// — the cfg[12] directQlvCount override read + the leg-row LADDER build (the per-row edge-token/
+// sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude); the
+// leg-QL merge election + exec branches land in later lanes — so a pool-only-routes universe
+// ships zero leg-QL bytecode.
 const HAS_LEG_QLV: boolean = true;
 
 function main(
@@ -730,13 +737,13 @@ function main(
   let balancerV2Vault: Address = 0;
   if (cfg.length > 11) { balancerV2Vault = cfg[11]; }
   // cfg[12] = directQlvCount — the number of LEADING qlv rows that are DIRECT venues; rows
-  // [directQlvCount, qlv.length) are ROUTE-LEG venue rows, which this build SKIPS entirely (their
-  // ladder/merge/exec branches land in later lanes) — only the direct prefix is laddered into the
-  // sorted merged stream below. OPTIONAL 13th cfg field — guarded by cfg.length so the many venue
-  // EVM tests that hand-build a shorter cfg stay valid (absent ⇒ qlv.length: ALL rows direct, the
-  // pre-leg behavior); production always emits it (index.ts). The override read is gated
-  // HAS_LEG_QLV (false ⇒ no leg rows exist ⇒ directQlvCount == qlv.length by construction, so
-  // treeshake drops the read with zero behavior change).
+  // [directQlvCount, qlv.length) are ROUTE-LEG venue rows — laddered by the flat qlv pass below
+  // into per-venue regions PAST the sorted merged stream (their merge election + exec branches
+  // land in later lanes, so the regions are built but dormant). OPTIONAL 13th cfg field — guarded
+  // by cfg.length so the many venue EVM tests that hand-build a shorter cfg stay valid (absent ⇒
+  // qlv.length: ALL rows direct, the pre-leg behavior); production always emits it (index.ts).
+  // The override read is gated HAS_LEG_QLV (false ⇒ no leg rows exist ⇒ directQlvCount ==
+  // qlv.length by construction, so treeshake drops the read with zero behavior change).
   let directQlvCount: Uint256 = qlv.length;
   if (HAS_LEG_QLV) {
     if (cfg.length > 12) { directQlvCount = cfg[12]; }
@@ -792,7 +799,8 @@ function main(
   // list). MS_CAP=0 for an all-live universe (no sampled venues) ⇒ the segment machinery is a no-op.
   const MS_CAP: Uint256 = segs.length + qlv.length * QL_S;
   // SAFETY dominates every per-pool reach + the route events + ONE merge step per merged segment
-  // (each segment is consumed in exactly one step, so + MS_CAP covers the cursor).
+  // (each row is consumed in exactly one step — via the direct bestKind===1 cursor OR a route
+  // slice-cross event — so + MS_CAP covers both consumption paths, leg rows included).
   const SAFETY: Uint256 = pools.length * PER_POOL * 2 + routing.length * PER_POOL + MS_CAP;
 
   // Per-universe-pool accumulators + the single live frontier state (walked from the live spot).
@@ -853,9 +861,9 @@ function main(
   // in setup from BOTH the static `segs` rows (copied) AND the qlv QUOTE-LADDERS (built live), then
   // bounded-insertion-sorted. Stored as PARALLEL SCALAR arrays (one column per array) because a
   // NEW_ARRAY of TUPLE rows reverts SET_INDEX on v1 (an array-of-tuples is v12-only). msN = the
-  // actual filled row count (≤ MS_CAP). Columns mirror the old row shape:
+  // actual filled row count (≤ MS_CAP). Columns mirror the old row shape (plus the new msOut):
   //   msRef=refIdx, msCap=capacity, msNear=sqrtAdjNear, msFar=sqrtAdjFar, msKind=segKind,
-  //   msVen=venue, msAux=venueAux.
+  //   msVen=venue, msAux=venueAux, msOut=sliceOut.
   let msRef: Tuple = new Array(MS_CAP);
   let msCap: Tuple = new Array(MS_CAP);
   let msNear: Tuple = new Array(MS_CAP);
@@ -863,28 +871,56 @@ function main(
   let msKind: Tuple = new Array(MS_CAP);
   let msVen: Tuple = new Array(MS_CAP);
   let msAux: Tuple = new Array(MS_CAP);
+  // The slice's modeled OUT amount — the 8th parallel column: the static-seg copy writes 0; the
+  // QL emit writes the differenced sliceOut (geometric ladder) / mOutT (Maverick walk). Carried so
+  // a LEG slice's linear consumption differences its out EXACTLY (reconstructing it from head²
+  // would double-round through the floor(sqrt) head); direct rows write it too (unused — harmless).
+  let msOut: Tuple = new Array(MS_CAP);
   let msN: Uint256 = 0;
   // End of the globally-SORTED region [0, msSorted) of the ms arrays (the static segs + the DIRECT
-  // QL ladders — the stream the bestKind===1 cursor consumes). THIS build fills ONLY sorted rows
-  // (route-leg qlv rows are skipped entirely), so msSorted == msN; later lanes append per-leg-venue
-  // regions at [msSorted, msN) (contiguous, internally descending), consumed ONLY via route events.
+  // QL ladders — the stream the bestKind===1 cursor consumes). ROUTE-LEG venue regions live PAST
+  // it at [msSorted, msN) (per-venue contiguous, internally descending via the non-descending-head
+  // guard), consumed ONLY via route events — the insertion sort + the cursor never touch them.
   let msSorted: Uint256 = 0;
   // Merged-stream cursor: msNear/msFar are pre-sorted DESC (then refIdx ASC), so the cursor only ever
   // advances; a segment is consumed once. The head candidate is always the [segCur] slice (next-best).
   let segCur: Uint256 = 0;
 
-  // Per-leg scratch for the N-leg route event (sized to the universe — legCount <= pools.length
-  // since route legs are disjoint pool slices). Reused across every route + step (allocated ONCE
-  // here, never inside the hot loop). lgP = leg binding pool index; lgN/lgF = the leg's current
-  // bracket near/far OI; lgL/lgFee = its L/fee; lgNF = the event's new far OI per leg; lgFR = the
-  // leg pool's bracket far REAL sqrt (re-anchor source for a full cross / brFar latch).
-  let lgP: Tuple = new Array(pools.length);
-  let lgN: Tuple = new Array(pools.length);
-  let lgF: Tuple = new Array(pools.length);
-  let lgL: Tuple = new Array(pools.length);
-  let lgFee: Tuple = new Array(pools.length);
-  let lgNF: Tuple = new Array(pools.length);
-  let lgFR: Tuple = new Array(pools.length);
+  // ── Per-LEG-VENUE scratch (one slot per GLOBAL qlv row index; direct rows' slots stay 0 forever
+  // — the wasted-slot cost buys uniform global indexing). qlStart/qlCount = the venue's contiguous
+  // ms-row region; qlCur = its slice cursor (a row index into the ms arrays; qlCur == qlStart +
+  // qlCount ⇔ exhausted); qlRemCap/qlRemOut = the CURRENT slice's remaining input capacity /
+  // remaining modeled out (seeded from the first row at build time, depleted by awards, re-seeded
+  // on cursor advance — the merge branches land in later lanes); qinp = the venue's Σ awarded
+  // input in ITS LEG-INPUT token (the leg-QL exec's accumulator — leg venues never touch the
+  // per-family direct accumulators above). All written by the HAS_LEG_QLV-gated leg-row build.
+  let qlStart: Tuple = new Array(qlv.length);
+  let qlCount: Tuple = new Array(qlv.length);
+  let qlCur: Tuple = new Array(qlv.length);
+  let qlRemCap: Tuple = new Array(qlv.length);
+  let qlRemOut: Tuple = new Array(qlv.length);
+  let qinp: Tuple = new Array(qlv.length);
+
+  // Per-leg scratch for the N-leg route event, sized LEG_SCRATCH = pools.length + qlv.length (a
+  // leg may hold ZERO pools — QL venues only — so legCount <= pools.length no longer bounds it; a
+  // nonempty leg has >= 1 pool or >= 1 venue ⇒ legCount <= LEG_SCRATCH always). Reused across
+  // every route + step (allocated ONCE here, never inside the hot loop). lgP = leg binding pool
+  // index; lgN/lgF = the leg's current bracket near/far OI; lgL/lgFee = its L/fee; lgNF = the
+  // event's new far OI per leg; lgFR = the leg pool's bracket far REAL sqrt (re-anchor source for
+  // a full cross / brFar latch). lgIsQ/lgQv (leg-QL): 1 ⇔ the leg's elected member is a QL slice
+  // cursor + that member's GLOBAL qlv index — written by the Phase A election when the leg-QL
+  // merge branches land (later lane); for a QL member lgN==lgF==head (flat slice), lgL=0, lgFee=0
+  // (heads are post-fee), lgFR=0, and lgNF is REUSED to carry the member's awarded INPUT.
+  const LEG_SCRATCH: Uint256 = pools.length + qlv.length;
+  let lgP: Tuple = new Array(LEG_SCRATCH);
+  let lgN: Tuple = new Array(LEG_SCRATCH);
+  let lgF: Tuple = new Array(LEG_SCRATCH);
+  let lgL: Tuple = new Array(LEG_SCRATCH);
+  let lgFee: Tuple = new Array(LEG_SCRATCH);
+  let lgNF: Tuple = new Array(LEG_SCRATCH);
+  let lgFR: Tuple = new Array(LEG_SCRATCH);
+  let lgIsQ: Tuple = new Array(LEG_SCRATCH);
+  let lgQv: Tuple = new Array(LEG_SCRATCH);
 
   let cum: Uint256 = 0;
 
@@ -997,8 +1033,12 @@ function main(
       msKind[msN] = sr[4];
       msVen[msN] = sr[5];
       msAux[msN] = sr[6];
+      msOut[msN] = 0; // static rows carry no modeled out (never a leg slice)
       msN = msN + 1;
     }
+    // The static rows are ALL sorted-region rows; each DIRECT qlv row extends msSorted as it is
+    // laddered below (leg rows do not), so a directQlvCount==0 universe sorts nothing extra.
+    msSorted = msN;
     // 2. Build each QL venue's price ladder ON-CHAIN from LIVE quotes. ONE qlv loop dispatches the
     // per-row quote on the descriptor segKind (qd[4]) — Curve StableSwap (kind 1), Curve CryptoSwap
     // (kind 9), Solidly STABLE (kind 4) and WOOFi (kind 10), each adapter branch treeshake-guarded so
@@ -1011,24 +1051,85 @@ function main(
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
     if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK) {
-      // DIRECT rows only ([0, directQlvCount)) — route-leg rows ([directQlvCount, qlv.length))
-      // are SKIPPED this lane (no ladders built for them yet; the per-row leg prelude/postlude
-      // lands with the leg-QL merge branches). With no leg rows prepared, directQlvCount ==
-      // qlv.length and this bound is identical to the old `v < qlv.length`.
-      for (let v = 0; v < directQlvCount; v = v + 1) {
+      // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
+      // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
+      // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
+      // msSorted — quoted on the leg's EDGE pair (qTokIn/qTokOut) and sized by the chain-order
+      // fold (ladderCap) — consumed ONLY via route events (the merge election + exec branches
+      // land in later lanes; until then the regions are built but dormant). index.ts orders leg
+      // rows (routeIdx asc, legIdx asc), so a row's upstream-leg ladders are always already built
+      // when its fold reads their first-slice heads.
+      for (let v = 0; v < qlv.length; v = v + 1) {
         const qd: Tuple = qlv[v];
         const qPool: Address = qd[0];
         const qi: Uint256 = qd[1];
         const qj: Uint256 = qd[2];
         const qKind: Uint256 = qd[4];
         const qRef: Uint256 = qd[5];
-        let seed: Uint256 = amountIn / QL_SEED_DIV;
+        // ── ROUTE-LEG row prelude (v >= directQlvCount): the leg's EDGE tokens + the chain-order
+        // sizing fold. ladderCap = amountIn folded through legs 0..legIdx-1's LIVE setup heads:
+        // per upstream leg the max over (a) each leg pool's fee-adjusted out/in spot head (the
+        // frontier seeded above — dnOn/dnNear; a V2 pool with a zeroed out-reserve seeds dnNear 0
+        // ⇒ head 0, the oracle's V2-iff-L>0 gate) and (b) each ALREADY-BUILT upstream venue's
+        // first-slice head (post-fee). Per upstream leg the fold is out ≈ in·hF²/2^192 — TWO-step
+        // floor mulDiv (hF² overflows 256 bits at real scales); hF==0 (a dead upstream leg) folds
+        // the cap to 0 ⇒ the walk/k-loop below builds NOTHING (a zero-row ladder — the venue is
+        // born exhausted). The fold is an UPPER bound on the leg's inflow (heads are the best
+        // price any member trades at), so an under-shoot only exhausts the ladder a few wei early
+        // — a split-QUALITY tail effect, never a parity break: the oracle/reference compute the
+        // IDENTICAL fold with identical rounding (buildLegQlVenueLadder / kwayReference setup).
+        // DIRECT rows keep ladderCap == amountIn + the cfg tokens — the build body below is
+        // arithmetic-identical for them.
+        let ladderCap: Uint256 = amountIn;
+        let qTokIn: Address = tokenIn;
+        let qTokOut: Address = tokenOut;
+        let isLegV: Uint256 = 0;
+        if (HAS_LEG_QLV) {
+          if (v >= directQlvCount) {
+            isLegV = 1;
+            const rIdx: Uint256 = qd[10];
+            const lIdx: Uint256 = qd[11];
+            const rtv: Tuple = routing[rIdx];
+            // EDGE tokens from routing: legIn(L>0) = rtv[5L]; legOut(L<legCount−1) = rtv[5+5L]
+            // (first leg keeps tokenIn; final leg keeps tokenOut) — the exec's derivation.
+            if (lIdx > 0) { qTokIn = rtv[5 * lIdx]; }
+            if (lIdx + 1 < rtv[0]) { qTokOut = rtv[5 + 5 * lIdx]; }
+            for (let f = 0; f < lIdx; f = f + 1) {
+              let hF: Uint256 = 0;
+              const pB: Uint256 = rtv[1 + 5 * f];
+              const pE: Uint256 = pB + rtv[2 + 5 * f];
+              for (let a = pB; a < pE; a = a + 1) {
+                if (dnOn[a] === 1) {
+                  let aoi: Uint256 = 0;
+                  if (pools[a][6] === 1) { aoi = dnNear[a]; }
+                  else { aoi = toOutIn(dnNear[a], zArr[a]); }
+                  const hc: Uint256 = Math.mulDiv(aoi, sfArr[a], FEE_DENOM);
+                  if (hc > hF) { hF = hc; }
+                }
+              }
+              const qB: Uint256 = rtv[3 + 5 * f];
+              const qE: Uint256 = qB + rtv[4 + 5 * f];
+              for (let u = qB; u < qE; u = u + 1) {
+                if (qlCount[u] > 0) {
+                  const hq: Uint256 = msNear[qlStart[u]]; // first-slice head, post-fee
+                  if (hq > hF) { hF = hq; }
+                }
+              }
+              ladderCap = Math.mulDiv(Math.mulDiv(ladderCap, hF, Q96), hF, Q96);
+            }
+            qlStart[v] = msN;
+          }
+        }
+        let seed: Uint256 = ladderCap / QL_SEED_DIV;
         if (seed === 0) { seed = 1; }
         let cumL: Uint256 = 0;
         let prevOut: Uint256 = 0;
         let prevHead: Uint256 = 0;
         let nv: Uint256 = 0;
         let stop: Uint256 = 0;
+        // Dead upstream leg (ladderCap==0) ⇒ build NOTHING (a zero-row ladder; mirrors the
+        // oracle's buildLegQlVenueLadder cap<=0 ⇒ []). Direct rows carry ladderCap == amountIn.
+        if (HAS_LEG_QLV) { if (ladderCap === 0) { stop = 1; } }
         // Balancer V3 (segKind 14): read the LIVE Vault StableMath state ONCE per venue (the querySwap view is
         // eth_call-only, so we replay the amplified StableSwap invariant on-chain instead of quoting a live view).
         // getCurrentLiveBalances is a BARE dyn array → INLINE-INDEXED [qi]/[qj], NEVER stored (v1 reverts on a
@@ -1088,11 +1189,11 @@ function main(
           b2amp = IBalancerV2Vault.at(qPool).getAmplificationParameter()[0];
           b2fee = IBalancerV2Vault.at(qPool).getSwapFeePercentage();
           b2ij = qi + qj * 256;
-          // Non-BPT index 0: its token address (qi ⇒ tokenIn, qj ⇒ tokenOut, else the third), balance (scalar
+          // Non-BPT index 0: its token address (qi ⇒ qTokIn, qj ⇒ qTokOut, else the third), balance (scalar
           // cash+managed) and scaling (getScalingFactors()[regPos]). regPos travels packed in qd[8].
           let a0: Address = b2third;
-          if (qi === 0) { a0 = tokenIn; }
-          if (qj === 0) { a0 = tokenOut; }
+          if (qi === 0) { a0 = qTokIn; }
+          if (qj === 0) { a0 = qTokOut; }
           const r0p: Uint256 = b2packed & 255;
           const raw0: Uint256 =
             IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a0)[0] +
@@ -1101,8 +1202,8 @@ function main(
           b2u0 = raw0 * sf0 / B2_WAD;
           // Non-BPT index 1.
           let a1: Address = b2third;
-          if (qi === 1) { a1 = tokenIn; }
-          if (qj === 1) { a1 = tokenOut; }
+          if (qi === 1) { a1 = qTokIn; }
+          if (qj === 1) { a1 = qTokOut; }
           const r1p: Uint256 = (b2packed / 256) & 255;
           const raw1: Uint256 =
             IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a1)[0] +
@@ -1113,8 +1214,8 @@ function main(
           let sf2: Uint256 = 0;
           if (b2n === 3) {
             let a2: Address = b2third;
-            if (qi === 2) { a2 = tokenIn; }
-            if (qj === 2) { a2 = tokenOut; }
+            if (qi === 2) { a2 = qTokIn; }
+            if (qj === 2) { a2 = qTokOut; }
             const r2p: Uint256 = (b2packed / 65536) & 255;
             const raw2: Uint256 =
               IBalancerV2Vault.at(balancerV2Vault).getPoolTokenInfo(b2pid, a2)[0] +
@@ -1165,10 +1266,12 @@ function main(
           const mSL: Uint256 = mavGetTickL(mSA, mSB, mSLo, mSHi);
           let mCurSqrt: Uint256 = mavSeedSqrt(mSA, mSB, mSLo, mSHi, mSL);
           let mCurShift: Uint256 = mShift;
-          let mRemain: Uint256 = amountIn;
+          let mRemain: Uint256 = ladderCap;
           let mNEmit: Uint256 = 0;
           let mPrevHead: Uint256 = 0;
           let mDone: Uint256 = 0;
+          // Dead upstream leg (ladderCap==0) ⇒ walk NOTHING (buildMaverickWalkLadder's cap<=0 ⇒ []).
+          if (HAS_LEG_QLV) { if (ladderCap === 0) { mDone = 1; } }
           for (let mi = 0; mi < MAV_STEPS; mi = mi + 1) {
             if (mDone === 0) {
               if (mNEmit >= QL_S) { mDone = 1; }
@@ -1237,6 +1340,7 @@ function main(
                               msRef[msN] = qRef; msCap[msN] = mCapIn;
                               msNear[msN] = mHead; msFar[msN] = mHead;
                               msKind[msN] = qKind; msVen[msN] = qPool; msAux[msN] = 0;
+                              msOut[msN] = mOutT; // slice OUT (leg-slice linear differencing)
                               msN = msN + 1; mNEmit = mNEmit + 1; mPrevHead = mHead;
                             }
                           }
@@ -1262,7 +1366,7 @@ function main(
         for (let k = 0; k < QL_S; k = k + 1) {
           if (stop === 0) {
             let xNext: Uint256 = Math.mulDiv(cumL, QL_RN, QL_RD) + seed;
-            if (xNext > amountIn) { xNext = amountIn; }
+            if (xNext > ladderCap) { xNext = ladderCap; }
             const cap: Uint256 = xNext - cumL;
             if (cap === 0) {
               stop = 1;
@@ -1300,15 +1404,15 @@ function main(
                   if (ok === 1) { q = ICryptoSwapPoolQL.at(qPool).get_dy(qi, qj, xNext); }
                 } else {
                   if (HAS_SOLIDLY_STABLE && qKind === 4) {
-                    ISolidlyStablePool.at(qPool).getAmountOut(xNext, tokenIn).catch(() => { ok = 0; });
-                    if (ok === 1) { q = ISolidlyStablePool.at(qPool).getAmountOut(xNext, tokenIn); }
+                    ISolidlyStablePool.at(qPool).getAmountOut(xNext, qTokIn).catch(() => { ok = 0; });
+                    if (ok === 1) { q = ISolidlyStablePool.at(qPool).getAmountOut(xNext, qTokIn); }
                   } else {
                     if (HAS_MENTO && qKind === 13) {
                       // qPool = exchangeProvider (qd[0]); qi = bytes32 exchangeId (qd[1], intact — not
                       // truncated). PROBE-THEN-DECODE. The exchangeId travels in msAux so the accumulate/
                       // exec (segKind 13) keys the venue by (provider, exchangeId).
-                      IMentoBroker.at(mentoBroker).getAmountOut(qPool, qi, tokenIn, tokenOut, xNext).catch(() => { ok = 0; });
-                      if (ok === 1) { q = IMentoBroker.at(mentoBroker).getAmountOut(qPool, qi, tokenIn, tokenOut, xNext); }
+                      IMentoBroker.at(mentoBroker).getAmountOut(qPool, qi, qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
+                      if (ok === 1) { q = IMentoBroker.at(mentoBroker).getAmountOut(qPool, qi, qTokIn, qTokOut, xNext); }
                       auxV = qi;
                     } else {
                       if (HAS_LB && qKind === 2) {
@@ -1329,24 +1433,24 @@ function main(
                         }
                       } else {
                         if (HAS_WOOFI && qKind === 10) {
-                          q = IWooFiPool.at(qPool).tryQuery(tokenIn, tokenOut, xNext);
+                          q = IWooFiPool.at(qPool).tryQuery(qTokIn, qTokOut, xNext);
                         } else {
                           if (HAS_WOMBAT && qKind === 5) {
                             // Wombat (single-sided stableswap, callback-free): the ladder quote is
                             // quotePotentialSwap(fromToken, toToken, xNext)[0] — the post-haircut out. It is
                             // a REVERT-class view (CASH_NOT_ENOUGH / a paused asset), so PROBE-THEN-DECODE.
                             // xNext feeds the int256 fromAmount param (positive amounts < 2^255 encode as
-                            // +int256). fromToken/toToken == the swap's own tokens.
-                            IWombatPool.at(qPool).quotePotentialSwap(tokenIn, tokenOut, xNext).catch(() => { ok = 0; });
-                            if (ok === 1) { q = IWombatPool.at(qPool).quotePotentialSwap(tokenIn, tokenOut, xNext)[0]; }
+                            // +int256). fromToken/toToken == the swap's own (edge) tokens.
+                            IWombatPool.at(qPool).quotePotentialSwap(qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
+                            if (ok === 1) { q = IWombatPool.at(qPool).quotePotentialSwap(qTokIn, qTokOut, xNext)[0]; }
                           } else {
                             if (HAS_FERMI && qKind === 11) {
                               // Fermi / propAMM (Obric-style proactive AMM, callback-free): the ladder quote is
                               // quoteAmounts(tokenIn, tokenOut, +xNext)[1] — the SECOND return is the exact-in
                               // out (the exec uses [1] too). REVERT-class (maker pause / stale), so PROBE-THEN-
                               // DECODE. xNext feeds the int256 amountSpecified (positive ⇒ exact-in).
-                              IFermiPool.at(qPool).quoteAmounts(tokenIn, tokenOut, xNext).catch(() => { ok = 0; });
-                              if (ok === 1) { q = IFermiPool.at(qPool).quoteAmounts(tokenIn, tokenOut, xNext)[1]; }
+                              IFermiPool.at(qPool).quoteAmounts(qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
+                              if (ok === 1) { q = IFermiPool.at(qPool).quoteAmounts(qTokIn, qTokOut, xNext)[1]; }
                             } else {
                               if (HAS_DODO && qKind === 3) {
                                 // DODO V2 PMM (engine-executed poolType 5 → _swapDODOV2): the ground-truth ladder
@@ -1375,8 +1479,8 @@ function main(
                                   // on the awarded amount (the cap-revert DoS is gone). qi/qj unused (Euler quotes
                                   // by tokenIn/tokenOut). A pool that returns a literal 0 at/past its cap instead
                                   // of reverting also stops, via the q===0 gate below.
-                                  IEulerSwapPool.at(qPool).computeQuote(tokenIn, tokenOut, xNext, true).catch(() => { ok = 0; });
-                                  if (ok === 1) { q = IEulerSwapPool.at(qPool).computeQuote(tokenIn, tokenOut, xNext, true); }
+                                  IEulerSwapPool.at(qPool).computeQuote(qTokIn, qTokOut, xNext, true).catch(() => { ok = 0; });
+                                  if (ok === 1) { q = IEulerSwapPool.at(qPool).computeQuote(qTokIn, qTokOut, xNext, true); }
                                 }
                               }
                             }
@@ -1451,12 +1555,13 @@ function main(
                       msKind[msN] = qKind;
                       msVen[msN] = qPool;
                       msAux[msN] = auxV;
+                      msOut[msN] = sliceOut; // slice OUT (leg-slice linear differencing)
                       msN = msN + 1;
                       nv = nv + 1;
                       prevHead = head;
                       cumL = cumNextV;
                       prevOut = q;
-                      if (cumNextV >= amountIn) { stop = 1; }
+                      if (cumNextV >= ladderCap) { stop = 1; }
                     }
                   }
                 }
@@ -1464,16 +1569,30 @@ function main(
             }
           }
         }
+        // ── ROUTE-LEG row postlude: record the venue's contiguous ms-row region + seed its slice
+        // cursor (qlCur at the first row; qlRemCap/qlRemOut from that row). qlCur == qlStart +
+        // qlCount ⇔ exhausted, so a zero-row ladder (dead upstream leg / no valid quote) is born
+        // exhausted. A DIRECT row instead extends the SORTED region (msSorted) the bestKind===1
+        // cursor + insertion sort consume — leg regions stay PAST it, per-venue contiguous +
+        // internally descending (the non-descending guard above), never sorted.
+        if (HAS_LEG_QLV && isLegV === 1) {
+          qlCount[v] = msN - qlStart[v];
+          qlCur[v] = qlStart[v];
+          if (qlCount[v] > 0) {
+            qlRemCap[v] = msCap[qlStart[v]];
+            qlRemOut[v] = msOut[qlStart[v]];
+          }
+        } else {
+          msSorted = msN;
+        }
       }
     }
-    // Everything emitted so far (static segs + direct QL ladders) is the SORTED region the
-    // bestKind===1 cursor consumes; later lanes append leg-venue rows PAST msSorted (unsorted
-    // globally, per-venue descending), which the sort below must never touch.
-    msSorted = msN;
-    // 3. Bounded insertion sort over [0, msSorted) DESC by (msNear, then msFar, then msRef ASC) — the
-    // SAME stable order index.ts buildSegs emits so the cursor sees a global descending-price stream.
-    // All seven columns shift together (parallel arrays). For a single monotone QL ladder this is a
-    // near-no-op; the general sort interleaves multiple QL venues + any static segments correctly.
+    // 3. Bounded insertion sort over [0, msSorted) — the static segs + DIRECT QL ladders — DESC by
+    // (msNear, then msFar, then msRef ASC) — the SAME stable order index.ts buildSegs emits so the
+    // cursor sees a global descending-price stream. All eight columns shift together (parallel
+    // arrays). Route-leg regions at [msSorted, msN) are never touched. For a single monotone QL
+    // ladder this is a near-no-op; the general sort interleaves multiple QL venues + any static
+    // segments correctly.
     for (let a = 1; a < MS_CAP; a = a + 1) {
       if (a < msSorted) {
         const kRef: Uint256 = msRef[a];
@@ -1483,6 +1602,7 @@ function main(
         const kKind: Uint256 = msKind[a];
         const kVen: Uint256 = msVen[a];
         const kAux: Uint256 = msAux[a];
+        const kOut: Uint256 = msOut[a];
         let b: Uint256 = a;
         for (let g = 0; g < MS_CAP; g = g + 1) {
           if (b > 0) {
@@ -1504,6 +1624,7 @@ function main(
               msKind[b] = msKind[b - 1];
               msVen[b] = msVen[b - 1];
               msAux[b] = msAux[b - 1];
+              msOut[b] = msOut[b - 1];
               b = b - 1;
             } else {
               g = MS_CAP; // key's slot found — force-exit the shift loop
@@ -1517,6 +1638,7 @@ function main(
         msKind[b] = kKind;
         msVen[b] = kVen;
         msAux[b] = kAux;
+        msOut[b] = kOut;
       }
     }
   }
