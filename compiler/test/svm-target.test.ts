@@ -360,7 +360,9 @@ describe('svm target — gating errors', () => {
     );
 
     // All-raw programs keep the escape hatch, eval included.
-    const r = compileSvm(`function main() { const x = eval("return accountData(3, 0, 8)"); return accountData(5, 0, 8) }`);
+    const r = compileSvm(
+      `function main() { const x = eval("return accountData(3, 0, 8)"); return accountData(5, 0, 8) }`,
+    );
 
     expect(r.accountPlan).toEqual({ metas: [], usesRawIndices: true });
   });

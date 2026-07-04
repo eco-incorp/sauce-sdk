@@ -14,7 +14,8 @@ import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import type { RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
 import type { ContractsConfig } from './contracts.js';
-import type { AccountPlan } from './planner/registry.js';
+import { estimatePacket } from './planner/index.js';
+import type { AccountPlan } from './planner/index.js';
 
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
@@ -24,7 +25,8 @@ export type { CompileTarget } from './context.js';
 export { OPS } from './saucer/ops.js';
 export { OPS_V12 } from './saucer/ops-v12.js';
 export { SVM_UNSUPPORTED } from './saucer/svm-profile.js';
-export type { AccountMeta, AccountPlan } from './planner/registry.js';
+export { estimatePacket } from './planner/index.js';
+export type { AccountMeta, AccountPlan, PacketBudget, PacketBudgetOptions } from './planner/index.js';
 
 export type {
   AbiParameter,
@@ -131,8 +133,14 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
 
     if (target === 'svm') {
       // The account plan is the interned-ref registry in first-use order (empty
-      // metas for pure-compute programs or raw-index programs).
-      return { bytecode, warnings: ctx.warnings, accountPlan: ctx.buildAccountPlan() };
+      // metas for pure-compute programs or raw-index programs). The packet-budget
+      // check runs with default send options (fee payer + plan-declared signers,
+      // no lookup tables) and is non-fatal — its warnings ride along with the
+      // compile warnings.
+      const accountPlan = ctx.buildAccountPlan();
+      const budget = estimatePacket(accountPlan, bytecode[0].length);
+
+      return { bytecode, warnings: [...ctx.warnings, ...budget.warnings], accountPlan };
     }
 
     return { bytecode, warnings: ctx.warnings };
