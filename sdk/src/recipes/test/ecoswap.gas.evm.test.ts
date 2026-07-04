@@ -2,14 +2,14 @@
  * EcoSwap solver GAS + BYTECODE-SIZE measurement harness.
  *
  * Measures the production UNIFIED-WALK solver (`ecoswap.sauce.ts` — one per-pool
- * live frontier merged k-way with the static route segments, reusing the
+ * live frontier merged k-way with the quote-ladder venue streams, reusing the
  * drift-invariant per-pool net cache) and, for a historical reference point, the
  * FROZEN unrolled-register variant (`ecoswap.unrolled.sauce.ts`). The two solvers
- * no longer share an arg shape: the unified walk takes
- *   main(tokenIn, tokenOut, amountIn, caller, priceLimit, pools, routes, netCache, routeSegs)
- * (zeroForOne is DERIVED from the token sort order on-chain; the direct-pool bracket
- * ladder is gone — each pool is walked live from its net cache), while the frozen
- * unrolled reference keeps the older
+ * no longer share an arg shape: the unified walk takes the production 6-arg
+ *   main(cfg, pools, netCache, routing, segs, qlv)
+ * shape (13-scalar cfg incl. cfg[12]=directQlvCount; stride-5 scalar routing;
+ * 12-column qlv rows partitioned direct-then-leg — see index.ts buildSolverArgs,
+ * IMPORTED here), while the frozen unrolled reference keeps the older
  *   main(tokenIn, tokenOut, amountIn, caller, zeroForOne, priceLimit, pools, routes, brackets)
  * shape. Each solver is therefore fed the arg array its OWN signature expects, both
  * built from the SAME off-chain `prepared`, over the full {solver × target} matrix:
@@ -61,18 +61,45 @@ import {
   deployV12Stack,
   V12_AVAILABLE,
   deploySortedTokens,
+  deployToken,
   createAndInitPool,
   mint,
   approve,
   mintPosition,
+  getSlot0,
+  getLiquidity,
+  deployCurveStableSwap,
+  deployMaverickV2Pool,
+  deployWooFiPool,
+  deployEulerSwapPool,
   SQRT_PRICE_1_1,
   type DeployedStack,
   type DeployedV12Stack,
+  type MaverickDeployParams,
+  type EulerSwapParams,
 } from "./harness/setup";
-import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
+import {
+  MIN_SQRT_RATIO,
+  SwapPoolType,
+  FactoryType,
+  type ChainPoolConfig,
+} from "../shared/constants";
 import { ecoSwap, buildSolverArgs, protocolDefines } from "../ecoswap/index";
 import { EcoBracketKind } from "../shared/types";
-import type { EcoSwapPrepared, EcoPool, EcoRoute, EcoBracket } from "../shared/types";
+import type {
+  EcoSwapPrepared,
+  EcoPool,
+  EcoRoute,
+  EcoBracket,
+  EcoLegQlVenue,
+} from "../shared/types";
+import { getSqrtRatioAtTick, OFFSET } from "./ecoswap.math";
+import {
+  getTickL,
+  getSqrtPrice,
+  tickSqrtPrices,
+  type MaverickTick,
+} from "../shared/maverick-math";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GAS_MD = join(ECOSWAP_DIR, "GAS.md");
@@ -281,6 +308,51 @@ let executionBlocker = "";
 let v12ExecAvailable = false;
 let v12ExecBlocker = "";
 
+// ── Route-leg QL fixed point (Table 4) — the PINNED-EXAMPLE-shaped universe ──
+// Mirrors the ecoswap.legql.evm.test.ts case-5 fixtures (sizes probe-verified there so EVERY
+// leg member funds at 20000e18): direct A→B UniV3 + ONE 2-hop route A→X→B whose leg A→X =
+// {UniV3 pool + Maverick venue} and leg X→B = {Curve + WOOFi + Euler venues}. Hand-built
+// `prepared` (bypasses prepare/discovery), local fixtures — a COARSE ARCHITECTURAL data point
+// for what the leg-QL machinery costs end-to-end (stride-5 routing, 12-col qlv leg rows,
+// per-leg-edge ladder builds sized by the chain-order fold, merge election over pools+venues,
+// unified leg exec dispatch + intermediate sweep), alongside the V3-only fixed point above.
+const LEG_AMOUNT_IN = parseEther("20000");
+const LEG_FEE_DIRECT = 3000;
+const LEG_TS_DIRECT = 60;
+const LEG_FEE_LEG0 = 500;
+const LEG_TS_LEG0 = 10;
+const E18 = 10n ** 18n;
+const E8 = 10n ** 8n;
+const ZERO = "0x0000000000000000000000000000000000000000" as Hex;
+const ZERO32 = ("0x" + "00".repeat(32)) as Hex;
+const MAV_TS = 10;
+const MAV_FEE = E18 / 1000n; // 0.1% directional (1e18-scaled)
+const MAV_FEE_PPM = Number((MAV_FEE * 1_000_000n) / E18); // 1000
+const MAV_ACTIVE = -3;
+const MAV_LO = -4;
+const MAV_HI = 6;
+const MAV_PER_TICK = 2_000n * E18;
+const CURVE_PIN_BAL = [40_000n * E18, 40_000n * E18];
+const CURVE_PIN_A = 20n;
+const CURVE_PIN_FEE = 3_000_000n; // 0.03% (1e10-scaled)
+const WOO_PRICE = E8; // 1:1 (WooracleV2 canonical 1e8 price decimals)
+const WOO_SPREAD = 10n ** 14n; // 1 bp
+const WOO_COEFF = 10n ** 13n;
+const WOO_FEE_RATE = 25n; // 0.025% (1e5-scaled)
+const WOO_FEE_PPM = 250;
+const WOO_BASE_RES = 500_000n * E18;
+const WOO_QUOTE_RES = 500_000n * E18;
+const EUL_RES = 60_000n * E18;
+const EUL_CONC = (9n * E18) / 10n;
+const EUL_FEE = E18 / 1000n; // 0.1%
+const EUL_FEE_PPM = 1000;
+
+// Table-4 result cells (filled by the route-leg gas test; null until measured).
+const legGas: Cell = { v1: null, v12: null };
+const legSize: Cell = { v1: null, v12: null };
+const legNotes = new Map<string, string>(); // "gas/v1" | "size/v12" … -> failure reason
+let legSetupBlocker = "";
+
 function fmtGas(g: bigint | number | null, note?: string): string {
   if (g !== null) return g.toLocaleString("en-US");
   return note ? "reverted" : "—";
@@ -339,18 +411,23 @@ function writeGasMd(): void {
   lines.push("");
   lines.push(
     "The production solver signature is `main(cfg, pools, netCache, routing, segs, qlv)` — a " +
-      "12-scalar `cfg` bundle (tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, plus the " +
-      "chain-wide Fluid resolver / Mento broker / Balancer V3 router+vault / Balancer V2 vault addresses " +
-      "and the internal amountOutMin floor) followed by five nested tuple arrays: the direct-pool " +
-      "`pools`, the drift-invariant per-pool `netCache` (tick nets reused by a live walk), the scalar " +
-      "`routing` layout, the STATIC sampled-segment stream `segs` (Fluid only now), and the QUOTE-LADDER " +
-      "venue descriptors `qlv` (the 13 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/" +
-      "DODO/Wombat/Fermi/Euler/BalV2/BalV3/Maverick — each a UNIFORM 10-column row the solver expands into " +
-      "an on-chain price ladder). `zeroForOne` is DERIVED on-chain from the token sort order. The arg array " +
-      "is assembled by `index.ts` `buildSolverArgs` — IMPORTED by this harness (not re-copied), so the " +
-      "measured shape can never drift from a real cook. The frozen unrolled reference keeps the older " +
-      "`…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer the production solver " +
-      "and is kept only as a historical bytecode-size / gas data point.",
+      "13-scalar `cfg` bundle (tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, plus the " +
+      "chain-wide Fluid resolver / Mento broker / Balancer V3 router+vault / Balancer V2 vault addresses, " +
+      "the internal amountOutMin floor, and cfg[12] = `directQlvCount` — the direct-prefix boundary in " +
+      "`qlv`) followed by five nested tuple arrays: the FLAT POOL UNIVERSE `pools` (direct pools then " +
+      "route-leg pools), the drift-invariant per-pool `netCache` (tick nets reused by a live walk), the " +
+      "scalar `routing` layout (one flat tuple per route, uniform 5-field stride per leg — " +
+      "`[legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount]`), the STATIC " +
+      "sampled-segment stream `segs` (Fluid only now), and the QUOTE-LADDER venue descriptors `qlv` " +
+      "(the 13 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/" +
+      "BalV2/BalV3/Maverick — each a UNIFORM 12-column row the solver expands into an on-chain price " +
+      "ladder; rows [0, directQlvCount) are DIRECT venues, rows [directQlvCount, …) are ROUTE-LEG venues " +
+      "carrying qd[10]/qd[11] routeIdx/legIdx backrefs, grouped per (route, leg) so routing's " +
+      "qlvBase/qlvCount point at them). `zeroForOne` is DERIVED on-chain from the token sort order. The " +
+      "arg array is assembled by `index.ts` `buildSolverArgs` — IMPORTED by this harness (not re-copied), " +
+      "so the measured shape can never drift from a real cook. The frozen unrolled reference keeps the " +
+      "older `…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer the production " +
+      "solver and is kept only as a historical bytecode-size / gas data point.",
   );
   lines.push("");
   lines.push(
@@ -471,7 +548,7 @@ function writeGasMd(): void {
   lines.push("");
   lines.push(
     "Architectural (derived from the QL framework + `buildQLVenues`), not measured on the V3-only " +
-      "fixture above. Each QL venue expands its 10-column descriptor into an on-chain price ladder of " +
+      "fixture above. Each QL venue expands its 12-column descriptor into an on-chain price ladder of " +
       `QL_S = ${QL_S} geometric slices. The per-venue upper bound is **≤ 2·QL_S = ${QL_2S}** view staticcalls ` +
       "(`ecoswap.sauce.ts:135`): the revert-class views are **probe-then-decode** — an unconditional " +
       "`.catch(() => ok = 0)` PROBE staticcall (the sentinel-catch can only flag a revert, not capture " +
@@ -480,13 +557,75 @@ function writeGasMd(): void {
       "views (WOOFi `tryQuery`, which returns 0 rather than reverting) cost **1** staticcall/slice = QL_S = " +
       `${QL_S}. Trader Joe LB reads \`getSwapOut()[0]\` and \`[1]\` as two separate staticcalls, so it too is ` +
       "≤ 2·QL_S. The read-only `quoteEcoSwap` (eth_call + stateOverride) runs the SAME ladder but is " +
-      "FREE of the block gas cap — the ladder staticcalls only count against gas on a landed cook().",
+      "FREE of the block gas cap — the ladder staticcalls only count against gas on a landed cook(). " +
+      "ROUTE-LEG venues build the SAME per-family ladders: a leg venue's ladder is built at setup on its " +
+      "leg's EDGE pair (legIn, legOut), sized by the chain-order fold of amountIn through the upstream " +
+      "legs' LIVE setup heads — so the per-venue cost below applies PER VENUE INSTANCE, direct or leg " +
+      "(each leg-QL row is its own ladder; a dead upstream folds a leg venue's cap to 0 ⇒ a zero-row " +
+      "ladder with zero quote staticcalls).",
   );
   lines.push("");
   lines.push("| QL venue | segKind | ladder quote (per slice, view) | ladder staticcalls | on-chain exec |");
   lines.push("| --- | ---: | --- | ---: | --- |");
   for (const r of QL_VENUE_ROWS) {
     lines.push(`| ${r.venue} | ${r.segKind} | ${r.quote} | ${r.calls} | ${r.exec} |`);
+  }
+  lines.push("");
+
+  // Table 4 — route-leg QL fixed point (the pinned-example universe), measured when the leg
+  // fixtures deployed. Rendered with dashes + the blocker when they did not.
+  lines.push("## Table 4 — route-leg QL fixed point (pinned-example universe)");
+  lines.push("");
+  lines.push(
+    "ONE measured cook of the epic's canonical route-leg shape (mirrors the " +
+      "`ecoswap.legql.evm.test.ts` pinned example, whose correctness suite asserts this exact universe " +
+      "wei-exact on both engines): a direct A→B UniV3 pool + ONE 2-hop route A→X→B whose leg A→X = " +
+      "{UniV3 pool + Maverick venue} and leg X→B = {Curve + WOOFi + Euler venues}, " +
+      `amountIn = \`${LEG_AMOUNT_IN.toString()}\` wei (\`parseEther("20000")\`, probe-verified so EVERY ` +
+      "member funds). **Methodology note:** the `prepared` universe is HAND-BUILT (bypasses " +
+      "prepare/discovery) over LOCAL fixtures — this is a COARSE ARCHITECTURAL data point for what the " +
+      "leg-QL machinery costs end-to-end (stride-5 routing, 12-col qlv leg rows, per-leg-edge ladder " +
+      "builds sized by the chain-order fold, merge election over pools+venues, the unified 13-family " +
+      "leg exec dispatch + per-route intermediate sweep), alongside the V3-only fixed point of Tables " +
+      "1–2. It is NOT comparable like-for-like with Table 1 (different tokens/pools/venues/amount). " +
+      "Compiled via the production `buildSolverArgs` + `protocolDefines` (treeshaken: HAS_LEG_QLV + " +
+      "the four venue families light up); same fairness discipline (snapshot/revert, pinned timestamp, " +
+      "re-approve) as Table 1.",
+  );
+  lines.push("");
+  if (legSetupBlocker) {
+    lines.push(`_Route-leg QL cell unavailable: ${legSetupBlocker}_`);
+    lines.push("");
+  }
+  {
+    const gasNoteV1 = legNotes.get("gas/v1");
+    const gasNoteV12 = legNotes.get("gas/v12") ?? (!v12ExecAvailable ? v12ExecBlocker : undefined);
+    const sizeNoteV1 = legNotes.get("size/v1");
+    const sizeNoteV12 = legNotes.get("size/v12");
+    let gasDelta = "—";
+    if (legGas.v1 !== null && legGas.v12 !== null) {
+      const d = BigInt(legGas.v12) - BigInt(legGas.v1);
+      gasDelta = `${d >= 0n ? "+" : ""}${d.toLocaleString("en-US")}`;
+    }
+    let sizeDelta = "—";
+    if (legSize.v1 !== null && legSize.v12 !== null) {
+      const d = Number(legSize.v12) - Number(legSize.v1);
+      sizeDelta = `${d >= 0 ? "+" : ""}${d.toLocaleString("en-US")} B`;
+    }
+    lines.push("| Axis | v1 | v12 | v12 − v1 | Notes |");
+    lines.push("| --- | ---: | ---: | ---: | --- |");
+    const gasNotes: string[] = [];
+    if (gasNoteV1) gasNotes.push(`v1: ${gasNoteV1}`);
+    if (gasNoteV12) gasNotes.push(`v12: ${gasNoteV12}`);
+    lines.push(
+      `| cook \`gasUsed\` | ${fmtGas(legGas.v1, gasNoteV1)} | ${fmtGas(legGas.v12, gasNoteV12)} | ${gasDelta} | ${gasNotes.join("; ")} |`,
+    );
+    const sizeNotesRow: string[] = [];
+    if (sizeNoteV1) sizeNotesRow.push(`v1: ${sizeNoteV1}`);
+    if (sizeNoteV12) sizeNotesRow.push(`v12: ${sizeNoteV12}`);
+    lines.push(
+      `| compiled blob size | ${fmtBytes(legSize.v1, sizeNoteV1)} | ${fmtBytes(legSize.v12, sizeNoteV12)} | ${sizeDelta} | ${sizeNotesRow.join("; ")} |`,
+    );
   }
   lines.push("");
 
@@ -554,6 +693,32 @@ function writeGasMd(): void {
         .join("; ")}.`,
     );
   }
+  // Route-leg QL fixed point (when measured).
+  if (legGas.v1 !== null || legGas.v12 !== null) {
+    const parts: string[] = [];
+    if (legGas.v1 !== null) parts.push(`v1 ${Number(legGas.v1).toLocaleString("en-US")}`);
+    if (legGas.v12 !== null) parts.push(`v12 ${Number(legGas.v12).toLocaleString("en-US")}`);
+    const sizes: string[] = [];
+    if (legSize.v1 !== null) sizes.push(`v1 ${Number(legSize.v1).toLocaleString("en-US")} B`);
+    if (legSize.v12 !== null) sizes.push(`v12 ${Number(legSize.v12).toLocaleString("en-US")} B`);
+    bullets.push(
+      `**Route-leg QL fixed point.** The pinned-example leg-QL universe (Table 4) cooks at ${parts.join(" / ")} gas` +
+        (sizes.length > 0 ? ` with a ${sizes.join(" / ")} treeshaken blob` : "") +
+        " — a coarse architectural data point (hand-built prepared, local fixtures; six venues across " +
+        "two legs + a direct pool), not comparable like-for-like with the V3-only Table 1 fixed point.",
+    );
+  }
+  // Leg-QL compile gating (always emitted — architectural, not run-dependent).
+  bullets.push(
+    "**Leg-QL machinery is compile-gated.** Every route-leg QL solver branch (the cfg[12] " +
+      "directQlvCount read, the leg-row ladder builds + sizing fold, the merge's slice election arms, " +
+      "the leg exec venue dispatch + intermediate sweep) sits behind `HAS_LEG_QLV` (plus each family's " +
+      "own HAS_* flag), which `protocolDefines` lights ONLY when the prepared universe carries a leg " +
+      "venue — so a pool-only universe treeshakes ALL of it away and ships ZERO leg-QL bytecode. " +
+      "Pinned at the compile tier by `ecoswap.compile.test.ts` (\"pool-only routes: qlvBase/qlvCount " +
+      "= 0 slots, cfg[12] = qlv.length, HAS_LEG_QLV false\" and the conditional-compilation cell that " +
+      "asserts the all-flags-false build is strictly smaller on both engines).",
+  );
   // Live-walk / quote-ladder architecture (always emitted — architectural, not run-dependent).
   bullets.push(
     "**Live-walk architecture.** Every venue now LIVE-WALKS: V2/V3/V4 walk a live frontier from the " +
@@ -597,6 +762,12 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
   let caller: Hex;
   let chainSetupFailed = false;
   let cleanSnapshot: Hex;
+  // Route-leg QL (Table 4) fixture state — tokens RELABELED ascending (A < X < B) so every
+  // edge (A→X, X→B, A→B) is zeroForOne, mirroring the legql pinned example.
+  let tokA: Hex;
+  let tokX: Hex;
+  let tokB: Hex;
+  let legPrepared: EcoSwapPrepared | null = null;
 
   before(async () => {
     // Boot the deterministic 3-V3-pool Phase-3 stack (mirrors ecoswap.evm.test.ts).
@@ -669,6 +840,139 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
         poolConfig,
       );
       prepared = out.prepared;
+
+      // ── Route-leg QL fixtures (Table 4) — the legql pinned-example universe on the SAME
+      // anvil (its own token triple, so discovery/prepare above never sees these pools; the
+      // fixed-point cells are untouched). Deployed BEFORE the clean snapshot so every cell's
+      // revert restores this state too. A failure here blocks only Table 4, not Tables 1–2.
+      try {
+        // The funding account for the venue-deploy helpers (== minter/account0, typed Account).
+        const minterAcct = c.walletClient.account as Account;
+        const t1 = await deployToken(c.walletClient, c.publicClient, "LegTokOne", "L1");
+        const t2 = await deployToken(c.walletClient, c.publicClient, "LegTokTwo", "L2");
+        const t3 = await deployToken(c.walletClient, c.publicClient, "LegTokThree", "L3");
+        [tokA, tokX, tokB] = [t1, t2, t3].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+        for (const t of [tokA, tokX, tokB]) {
+          await mint(c.walletClient, c.publicClient, t, minter, parseEther("1000000000"));
+          await approve(c.walletClient, c.publicClient, t, stack.helper, HUGE);
+        }
+        // Direct A→B: shallow-ish, engages at the global cut against the route.
+        const legDirectPool = await createAndInitPool(
+          c.walletClient, c.publicClient, stack.factory, tokA, tokB, LEG_FEE_DIRECT, SQRT_PRICE_1_1,
+        );
+        await mintPosition(
+          c.walletClient, c.publicClient, stack.helper, legDirectPool, minter, -12000, 12000, parseEther("8000"),
+        );
+        // Route leg0 A→X: deep, one wide position ⇒ constant L over the walked region.
+        const leg0Pool = await createAndInitPool(
+          c.walletClient, c.publicClient, stack.factory, tokA, tokX, LEG_FEE_LEG0, SQRT_PRICE_1_1,
+        );
+        await mintPosition(
+          c.walletClient, c.publicClient, stack.helper, leg0Pool, minter, -12000, 12000, parseEther("5000000"),
+        );
+        // A→X Maverick venue: shallow uniform book (bends within the trade so the leg splits).
+        const mavTicks: MaverickTick[] = [];
+        for (let t = MAV_LO; t <= MAV_HI; t++) {
+          mavTicks.push({ tick: t, reserveA: MAV_PER_TICK, reserveB: MAV_PER_TICK });
+        }
+        const { sqrtLowerPrice, sqrtUpperPrice } = tickSqrtPrices(MAV_TS, MAV_ACTIVE);
+        const mavActive = mavTicks.find((t) => t.tick === MAV_ACTIVE)!;
+        const mavActiveL = getTickL(mavActive.reserveA, mavActive.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+        const mavSqrtPrice = getSqrtPrice(
+          mavActive.reserveA, mavActive.reserveB, sqrtLowerPrice, sqrtUpperPrice, mavActiveL,
+        );
+        const mavParams: MaverickDeployParams = {
+          tokenA: tokA, tokenB: tokX, tickSpacing: MAV_TS, feeAIn: MAV_FEE, feeBIn: MAV_FEE,
+          protocolFeeRatioD3: 0, ticks: mavTicks, activeTick: MAV_ACTIVE, poolSqrtPrice: mavSqrtPrice,
+        };
+        const mavPool = await deployMaverickV2Pool(c.walletClient, c.publicClient, mavParams, minterAcct);
+        // X→B venues: small Curve (bends fast), WOOFi (1:1 oracle, big gamma), Euler (0.9 conc).
+        const curvePin = await deployCurveStableSwap(
+          c.walletClient, c.publicClient, [tokX, tokB], CURVE_PIN_BAL, [E18, E18], CURVE_PIN_A, CURVE_PIN_FEE, minterAcct,
+        );
+        const wooPool = await deployWooFiPool(
+          c.walletClient, c.publicClient, tokX, tokB,
+          E8, E18, E18, WOO_PRICE, WOO_SPREAD, WOO_COEFF, WOO_FEE_RATE, WOO_BASE_RES, WOO_QUOTE_RES, minterAcct,
+        );
+        const eulParams: EulerSwapParams = {
+          reserve0: EUL_RES, reserve1: EUL_RES, equil0: EUL_RES, equil1: EUL_RES,
+          priceX: E18, priceY: E18, concX: EUL_CONC, concY: EUL_CONC, fee: EUL_FEE,
+          outCap0: 0n, outCap1: 0n,
+        };
+        const eulPool = await deployEulerSwapPool(c.walletClient, c.publicClient, tokX, tokB, eulParams, minterAcct);
+
+        // Hand-stamp the EcoPools from live reads (windowTop=0 ⇒ fully live walk, empty net)
+        // and the leg-QL venue descriptors (state-free) — the legql-test builders, copied.
+        const v3EcoPool = async (address: Hex, feePpm: number, ts: number): Promise<EcoPool> => {
+          const { sqrtPriceX96, tick } = await getSlot0(c.publicClient, address);
+          const liquidity = await getLiquidity(c.publicClient, address);
+          const base = Math.floor(tick / ts) * ts;
+          return {
+            poolType: SwapPoolType.UniV3,
+            address,
+            fee: feePpm,
+            tickSpacing: ts,
+            hooks: ZERO,
+            feePpm,
+            isV2: false,
+            inIsToken0: true,
+            stateView: ZERO,
+            poolId: ZERO32,
+            stepRatio: getSqrtRatioAtTick(ts),
+            windowTopShifted: 0n,
+            windowBotShifted: 0n,
+            extremeShifted: 0n,
+            spotTickShifted: BigInt(base) + OFFSET,
+            spotNearReal: sqrtPriceX96,
+            spotActiveL: liquidity,
+            adaptiveNet: new Map<number, bigint>(),
+            source: "gas-legql-fixture",
+          };
+        };
+        const mavVenue: EcoLegQlVenue = {
+          family: "maverick",
+          desc: { address: mavPool, tokenAIn: true, tickSpacing: MAV_TS, feePpm: MAV_FEE_PPM, source: "gas-legql-fixture" },
+        };
+        const curveVenue: EcoLegQlVenue = {
+          family: "curve",
+          desc: { address: curvePin, i: 0, j: 1, feePpm: Number(CURVE_PIN_FEE), source: "gas-legql-fixture" },
+        };
+        const wooVenue: EcoLegQlVenue = {
+          family: "wooFi",
+          desc: { address: wooPool, fromToken: tokX, toToken: tokB, feePpm: WOO_FEE_PPM, source: "gas-legql-fixture" },
+        };
+        const eulVenue: EcoLegQlVenue = {
+          family: "euler",
+          desc: { address: eulPool, inIsToken0: true, feePpm: EUL_FEE_PPM, source: "gas-legql-fixture" },
+        };
+        legPrepared = {
+          pools: [await v3EcoPool(legDirectPool, LEG_FEE_DIRECT, LEG_TS_DIRECT)],
+          routes: [
+            {
+              legs: [
+                {
+                  hopIn: tokA, hopOut: tokX, zeroForOne: true,
+                  pools: [await v3EcoPool(leg0Pool, LEG_FEE_LEG0, LEG_TS_LEG0)],
+                  qlVenues: [mavVenue],
+                },
+                {
+                  hopIn: tokX, hopOut: tokB, zeroForOne: true,
+                  pools: [],
+                  qlVenues: [curveVenue, wooVenue, eulVenue],
+                },
+              ],
+              intermediateTokens: [tokX],
+            },
+          ],
+          brackets: [],
+          zeroForOne: true,
+          priceLimit: MIN_SQRT_RATIO + 1n,
+          expectedInputCovered: 0n,
+        };
+      } catch (e) {
+        legSetupBlocker = `leg-QL fixture setup failed: ${String(e)}`;
+        legPrepared = null;
+      }
 
       cleanSnapshot = await c.testClient.snapshot();
     } catch (e) {
@@ -781,5 +1085,67 @@ describe("EcoSwap solver gas + bytecode-size comparison", () => {
       if (cell.v12 !== null) measured.push(BigInt(cell.v12));
     }
     assert.ok(measured.length >= 1, "at least one solver/target cell must execute");
+  });
+
+  // ── Route-leg QL fixed point (Table 4) — the pinned-example universe on both engines ──
+  // Same fairness discipline as the cells above: revert into the clean snapshot, re-snapshot,
+  // pin the cook block timestamp, re-approve the cook target. Compiled via the PRODUCTION
+  // buildSolverArgs + protocolDefines path (treeshaken; HAS_LEG_QLV + the four venue families
+  // light up), so the measured blob is exactly what a real leg-QL cook ships.
+  it("cooks the pinned-example route-leg QL universe on both engines (Table 4)", async () => {
+    if (chainSetupFailed || !legPrepared) {
+      assert.ok(true, `route-leg QL cell skipped: ${legSetupBlocker || executionBlocker}`);
+      return;
+    }
+
+    const source = readFileSync(join(ECOSWAP_DIR, "ecoswap.sauce.ts"), "utf-8");
+    const args = buildSolverArgs(tokA, tokB, LEG_AMOUNT_IN, caller, legPrepared);
+    const opts = { treeshake: true, defines: protocolDefines(legPrepared) };
+
+    // Bytecode size — both targets, chain-free.
+    for (const target of TARGETS) {
+      try {
+        const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, target, opts);
+        legSize[target] = blobBytes(bytecodes);
+      } catch (e) {
+        const why = reason(e);
+        legNotes.set(`size/${target}`, why);
+        console.log(`  [legQL size] ${target}: FAILED — ${why}`);
+      }
+    }
+    console.log(`  [legQL size] v1=${legSize.v1 ?? "FAIL"}B v12=${legSize.v12 ?? "FAIL"}B`);
+    assert.ok(legSize.v1 !== null, "leg-QL universe must compile to v1");
+    assert.ok(legSize.v12 !== null, "leg-QL universe must compile to v12");
+
+    // Execution gas — v1 + v12 (when the v12 artifacts are present).
+    const engines: Target[] = v12ExecAvailable ? ["v1", "v12"] : ["v1"];
+    for (const engine of engines) {
+      await c.testClient.revert({ id: cleanSnapshot });
+      cleanSnapshot = await c.testClient.snapshot();
+      await c.testClient.setNextBlockTimestamp({ timestamp: COOK_BLOCK_TIMESTAMP });
+      const target = engine === "v12" ? v12!.pot : stack.sauceRouter;
+      await approve(c.walletClient, c.publicClient, tokA, target, LEG_AMOUNT_IN);
+      try {
+        const { bytecodes } = compileSauce(source, args, ECOSWAP_DIR, engine, opts);
+        const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+        if (receipt.status !== "success") {
+          legNotes.set(`gas/${engine}`, `cook() status=${receipt.status}`);
+          console.log(`  [legQL gas] ${engine}: cook() reverted (status=${receipt.status})`);
+        } else {
+          legGas[engine] = receipt.gasUsed;
+          console.log(`  [legQL gas] ${engine}: gasUsed=${receipt.gasUsed}`);
+        }
+      } catch (e) {
+        const why = reason(e);
+        legNotes.set(`gas/${engine}`, why);
+        console.log(`  [legQL gas] ${engine}: cook() THREW — ${why}`);
+      }
+    }
+
+    // The cell must land on every engine we could run — a leg-QL revert here is a real
+    // regression (the legql correctness suite cooks this exact shape green on both engines).
+    for (const engine of engines) {
+      assert.ok(legGas[engine] !== null, `leg-QL cook must land on ${engine}: ${legNotes.get(`gas/${engine}`) ?? ""}`);
+    }
   });
 });

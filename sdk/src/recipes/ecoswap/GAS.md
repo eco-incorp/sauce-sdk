@@ -9,7 +9,7 @@ Two EcoSwap solver source variants are measured. They have DIFFERENT arg shapes 
 - **unified-walk** — `recipes/ecoswap/ecoswap.sauce.ts` — unified per-pool live walk + per-pool net cache, k-way merge (production solver)
 - **unrolled** — `recipes/ecoswap/ecoswap.unrolled.sauce.ts` — unrolled registers, prepare-time bracket ladder (FROZEN historical reference, divergent arg shape)
 
-The production solver signature is `main(cfg, pools, netCache, routing, segs, qlv)` — a 12-scalar `cfg` bundle (tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, plus the chain-wide Fluid resolver / Mento broker / Balancer V3 router+vault / Balancer V2 vault addresses and the internal amountOutMin floor) followed by five nested tuple arrays: the direct-pool `pools`, the drift-invariant per-pool `netCache` (tick nets reused by a live walk), the scalar `routing` layout, the STATIC sampled-segment stream `segs` (Fluid only now), and the QUOTE-LADDER venue descriptors `qlv` (the 13 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/BalV2/BalV3/Maverick — each a UNIFORM 10-column row the solver expands into an on-chain price ladder). `zeroForOne` is DERIVED on-chain from the token sort order. The arg array is assembled by `index.ts` `buildSolverArgs` — IMPORTED by this harness (not re-copied), so the measured shape can never drift from a real cook. The frozen unrolled reference keeps the older `…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer the production solver and is kept only as a historical bytecode-size / gas data point.
+The production solver signature is `main(cfg, pools, netCache, routing, segs, qlv)` — a 13-scalar `cfg` bundle (tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, plus the chain-wide Fluid resolver / Mento broker / Balancer V3 router+vault / Balancer V2 vault addresses, the internal amountOutMin floor, and cfg[12] = `directQlvCount` — the direct-prefix boundary in `qlv`) followed by five nested tuple arrays: the FLAT POOL UNIVERSE `pools` (direct pools then route-leg pools), the drift-invariant per-pool `netCache` (tick nets reused by a live walk), the scalar `routing` layout (one flat tuple per route, uniform 5-field stride per leg — `[legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount]`), the STATIC sampled-segment stream `segs` (Fluid only now), and the QUOTE-LADDER venue descriptors `qlv` (the 13 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/BalV2/BalV3/Maverick — each a UNIFORM 12-column row the solver expands into an on-chain price ladder; rows [0, directQlvCount) are DIRECT venues, rows [directQlvCount, …) are ROUTE-LEG venues carrying qd[10]/qd[11] routeIdx/legIdx backrefs, grouped per (route, leg) so routing's qlvBase/qlvCount point at them). `zeroForOne` is DERIVED on-chain from the token sort order. The arg array is assembled by `index.ts` `buildSolverArgs` — IMPORTED by this harness (not re-copied), so the measured shape can never drift from a real cook. The frozen unrolled reference keeps the older `…, zeroForOne, priceLimit, pools, routes, brackets` shape; it is no longer the production solver and is kept only as a historical bytecode-size / gas data point.
 
 **Stack** (deterministic, no fork): a fresh `anvil` with Multicall3 etched, the Sauce engine (`Router` → `SauceRouter`), two `MintableERC20` tokens (sorted token0/token1), and **three Uniswap V3 pools** all initialized at `SQRT_PRICE_1_1`, fees `[500, 3000, 10000]`, liquidity `[400000, 250000, 150000]` ether, each a single wide position over ticks ±12000. Discovery config = one local UniV3 factory, `feeTiers [500, 3000, 10000]`, `baseTokens = [tokenIn, tokenOut]` (zero routes — pure direct-pool split).
 
@@ -25,19 +25,19 @@ The production solver signature is `main(cfg, pools, netCache, routing, segs, ql
 
 | Solver variant | v1 gasUsed | v12 gasUsed | v12 − v1 | Notes |
 | --- | ---: | ---: | ---: | --- |
-| unified-walk | 8,493,262 | 1,553,982 | -6,939,280 |  |
+| unified-walk | 8,540,666 | 1,560,268 | -6,980,398 |  |
 | unrolled | 495,742 | 162,023 | -333,719 |  |
 
 ## Table 2 — compiled bytecode size (total blob bytes)
 
 | Solver variant | v1 size | v12 size | v12 − v1 | Notes |
 | --- | ---: | ---: | ---: | --- |
-| unified-walk | 2,837 B | 2,752 B | -85 B |  |
+| unified-walk | 2,901 B | 2,814 B | -87 B |  |
 | unrolled | 2,267 B | 2,213 B | -54 B |  |
 
 ## Table 3 — quote-ladder per-venue ladder-build cost (QL_S = 8 slices, ≤ 2·QL_S = 16 staticcalls/venue)
 
-Architectural (derived from the QL framework + `buildQLVenues`), not measured on the V3-only fixture above. Each QL venue expands its 10-column descriptor into an on-chain price ladder of QL_S = 8 geometric slices. The per-venue upper bound is **≤ 2·QL_S = 16** view staticcalls (`ecoswap.sauce.ts:135`): the revert-class views are **probe-then-decode** — an unconditional `.catch(() => ok = 0)` PROBE staticcall (the sentinel-catch can only flag a revert, not capture the value) followed by a guarded DECODE staticcall — so a successful slice costs **2** staticcalls, i.e. up to 2·QL_S = 16/venue (a revert stops the ladder early). Only the graceful single-return views (WOOFi `tryQuery`, which returns 0 rather than reverting) cost **1** staticcall/slice = QL_S = 8. Trader Joe LB reads `getSwapOut()[0]` and `[1]` as two separate staticcalls, so it too is ≤ 2·QL_S. The read-only `quoteEcoSwap` (eth_call + stateOverride) runs the SAME ladder but is FREE of the block gas cap — the ladder staticcalls only count against gas on a landed cook().
+Architectural (derived from the QL framework + `buildQLVenues`), not measured on the V3-only fixture above. Each QL venue expands its 12-column descriptor into an on-chain price ladder of QL_S = 8 geometric slices. The per-venue upper bound is **≤ 2·QL_S = 16** view staticcalls (`ecoswap.sauce.ts:135`): the revert-class views are **probe-then-decode** — an unconditional `.catch(() => ok = 0)` PROBE staticcall (the sentinel-catch can only flag a revert, not capture the value) followed by a guarded DECODE staticcall — so a successful slice costs **2** staticcalls, i.e. up to 2·QL_S = 16/venue (a revert stops the ladder early). Only the graceful single-return views (WOOFi `tryQuery`, which returns 0 rather than reverting) cost **1** staticcall/slice = QL_S = 8. Trader Joe LB reads `getSwapOut()[0]` and `[1]` as two separate staticcalls, so it too is ≤ 2·QL_S. The read-only `quoteEcoSwap` (eth_call + stateOverride) runs the SAME ladder but is FREE of the block gas cap — the ladder staticcalls only count against gas on a landed cook(). ROUTE-LEG venues build the SAME per-family ladders: a leg venue's ladder is built at setup on its leg's EDGE pair (legIn, legOut), sized by the chain-order fold of amountIn through the upstream legs' LIVE setup heads — so the per-venue cost below applies PER VENUE INSTANCE, direct or leg (each leg-QL row is its own ladder; a dead upstream folds a leg venue's cap to 0 ⇒ a zero-row ladder with zero quote staticcalls).
 
 | QL venue | segKind | ladder quote (per slice, view) | ladder staticcalls | on-chain exec |
 | --- | ---: | --- | ---: | --- |
@@ -55,12 +55,23 @@ Architectural (derived from the QL framework + `buildQLVenues`), not measured on
 | Balancer V2 | 6 | on-chain StableMath replay (no live quote view) | getPoolTokenInfo×n + getAmplificationParameter + getStaticSwapFeePercentage + getScalingFactors | swap(poolType 4) → _swapBalancerV2 |
 | Maverick V2 | 8 | on-chain live bin-walk (no cumulative-out view) | per-tick reserve reads across the walked bins | swap(poolType 7) → maverickV2SwapCallback |
 
+## Table 4 — route-leg QL fixed point (pinned-example universe)
+
+ONE measured cook of the epic's canonical route-leg shape (mirrors the `ecoswap.legql.evm.test.ts` pinned example, whose correctness suite asserts this exact universe wei-exact on both engines): a direct A→B UniV3 pool + ONE 2-hop route A→X→B whose leg A→X = {UniV3 pool + Maverick venue} and leg X→B = {Curve + WOOFi + Euler venues}, amountIn = `20000000000000000000000` wei (`parseEther("20000")`, probe-verified so EVERY member funds). **Methodology note:** the `prepared` universe is HAND-BUILT (bypasses prepare/discovery) over LOCAL fixtures — this is a COARSE ARCHITECTURAL data point for what the leg-QL machinery costs end-to-end (stride-5 routing, 12-col qlv leg rows, per-leg-edge ladder builds sized by the chain-order fold, merge election over pools+venues, the unified 13-family leg exec dispatch + per-route intermediate sweep), alongside the V3-only fixed point of Tables 1–2. It is NOT comparable like-for-like with Table 1 (different tokens/pools/venues/amount). Compiled via the production `buildSolverArgs` + `protocolDefines` (treeshaken: HAS_LEG_QLV + the four venue families light up); same fairness discipline (snapshot/revert, pinned timestamp, re-approve) as Table 1.
+
+| Axis | v1 | v12 | v12 − v1 | Notes |
+| --- | ---: | ---: | ---: | --- |
+| cook `gasUsed` | 59,811,937 | 10,014,610 | -49,797,327 |  |
+| compiled blob size | 13,482 B | 13,161 B | -321 B |  |
+
 ## Takeaways
 
-- **Unified walk vs frozen unrolled reference (size).** The production unified-walk solver (v1 2,837 B) is larger than the frozen unrolled-register reference (v1 2,267 B). The two are DIFFERENT programs (different arg shapes), so this is a coarse code-density reference, not a like-for-like swap.
-- **Unified walk vs frozen reference (v1 gas).** The unified walk uses more gas (8,493,262) than the frozen unrolled reference (495,742) — different programs, so a coarse reference only.
-- **v12 vs v1 (size).** v12 (postfix Huff) is markedly smaller than v1 (prefix) — e.g. the unified walk 2,752 B vs 2,837 B (3% smaller).
-- **v12 vs v1 (execution gas).** unified-walk 1,553,982 (v12) vs 8,493,262 (v1), 82% smaller; unrolled 162,023 (v12) vs 495,742 (v1), 67% smaller.
+- **Unified walk vs frozen unrolled reference (size).** The production unified-walk solver (v1 2,901 B) is larger than the frozen unrolled-register reference (v1 2,267 B). The two are DIFFERENT programs (different arg shapes), so this is a coarse code-density reference, not a like-for-like swap.
+- **Unified walk vs frozen reference (v1 gas).** The unified walk uses more gas (8,540,666) than the frozen unrolled reference (495,742) — different programs, so a coarse reference only.
+- **v12 vs v1 (size).** v12 (postfix Huff) is markedly smaller than v1 (prefix) — e.g. the unified walk 2,814 B vs 2,901 B (3% smaller).
+- **v12 vs v1 (execution gas).** unified-walk 1,560,268 (v12) vs 8,540,666 (v1), 82% smaller; unrolled 162,023 (v12) vs 495,742 (v1), 67% smaller.
+- **Route-leg QL fixed point.** The pinned-example leg-QL universe (Table 4) cooks at v1 59,811,937 / v12 10,014,610 gas with a v1 13,482 B / v12 13,161 B treeshaken blob — a coarse architectural data point (hand-built prepared, local fixtures; six venues across two legs + a direct pool), not comparable like-for-like with the V3-only Table 1 fixed point.
+- **Leg-QL machinery is compile-gated.** Every route-leg QL solver branch (the cfg[12] directQlvCount read, the leg-row ladder builds + sizing fold, the merge's slice election arms, the leg exec venue dispatch + intermediate sweep) sits behind `HAS_LEG_QLV` (plus each family's own HAS_* flag), which `protocolDefines` lights ONLY when the prepared universe carries a leg venue — so a pool-only universe treeshakes ALL of it away and ships ZERO leg-QL bytecode. Pinned at the compile tier by `ecoswap.compile.test.ts` ("pool-only routes: qlvBase/qlvCount = 0 slots, cfg[12] = qlv.length, HAS_LEG_QLV false" and the conditional-compilation cell that asserts the all-flags-false build is strictly smaller on both engines).
 - **Live-walk architecture.** Every venue now LIVE-WALKS: V2/V3/V4 walk a live frontier from the on-chain spot (reusing a drift-invariant per-pool net cache), and the 13 quote-ladder families build a price ladder of QL_S = 8 slices ON-CHAIN in setup (Table 3). This trades the old static sampled-segment shipping for on-chain freshness: a QL venue costs up to 2·QL_S = 16 view staticcalls at ladder-build (probe-then-decode revert-class views cost 2/slice — a probe + a guarded decode; the graceful single-return views like WOOFi cost 1/slice = QL_S; the three replay families — Balancer V2/V3, Maverick — instead read a bounded set of live state and replay the curve). The read-only `quoteEcoSwap` runs the identical ladder via eth_call + stateOverride and is FREE of the block gas cap; the ladder staticcalls only count against gas on a landed cook().
 
 ## Scaling matrix — unified-walk gas across pools × cache density
@@ -77,17 +88,17 @@ Generated by `src/recipes/test/ecoswap.gas-matrix.evm.test.ts` (gated on `ECO_GA
 
 | pools | density | net rows | split | v1 gas | v12 gas | v12 − v1 |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 2 | sparse | 0 | 2/2 | 6,000,422 | over budget | — |
-| 2 | dense | 0 | 2/2 | 25,426,479 | over budget | — |
-| 4 | sparse | 0 | 4/4 | 6,221,770 | over budget | — |
-| 4 | dense | 0 | 4/4 | 24,691,337 | over budget | — |
-| 6 | sparse | 0 | 4/6 | 7,479,547 | over budget | — |
-| 6 | dense | 0 | 6/6 | 25,727,351 | over budget | — |
-| 8 | sparse | 0 | 4/8 | 8,740,154 | over budget | — |
-| 8 | dense | 0 | 8/8 | 26,187,220 | over budget | — |
+| 2 | sparse | 0 | 2/2 | 6,047,139 | over budget | — |
+| 2 | dense | 0 | 2/2 | 25,474,820 | over budget | — |
+| 4 | sparse | 0 | 4/4 | 6,269,607 | over budget | — |
+| 4 | dense | 0 | 4/4 | 24,740,662 | over budget | — |
+| 6 | sparse | 0 | 4/6 | 7,528,302 | over budget | — |
+| 6 | dense | 0 | 6/6 | 25,777,828 | over budget | — |
+| 8 | sparse | 0 | 4/8 | 8,790,002 | over budget | — |
+| 8 | dense | 0 | 8/8 | 26,238,818 | over budget | — |
 
 ### Analysis
 
-- **v1 (Solidity Router) scaling.** Unified-walk cook gas grows with both pool count and cache density (avg 15,585,002 gas at ≤4 pools → 17,033,568 at ≥6 pools); the dense trades walk more tick steps per pool, and the per-pool live walk + per-pool swap dominate the cost.
+- **v1 (Solidity Router) scaling.** Unified-walk cook gas grows with both pool count and cache density (avg 15,633,057 gas at ≤4 pools → 17,083,738 at ≥6 pools); the dense trades walk more tick steps per pool, and the per-pool live walk + per-pool swap dominate the cost.
 - **v12 reverts (recorded v1-only).** The v12 cook reverted on these configs: 2p/sparse (0 net rows), 2p/dense (0 net rows), 4p/sparse (0 net rows), 4p/dense (0 net rows), 6p/sparse (0 net rows), 6p/dense (0 net rows), 8p/sparse (0 net rows), 8p/dense (0 net rows). Revert reason(s): cook() reverted, 0x3f9cc3fd. These pools use NON-default fee tiers (enabled via `enableFeeAmount` with coarse tickSpacings) and wide ±200·ts positions — a configuration the v12 Huff runtime does not cook here, distinct from the 3-pool default-tier fixed point above which DOES run on v12. The reverts are recorded v1-only; reproducing the exact v12 cause on these tiers is an engine follow-up, out of scope for this gas harness.
 - **Correctness.** Across all configs the unified-walk on-chain per-pool input matched the oracle to within 0.00% (max relative deviation); the unified walk spent the input exactly (leftover 0) and v1≡v12 output parity held everywhere.

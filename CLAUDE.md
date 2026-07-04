@@ -178,8 +178,25 @@ THROUGH interior `dL==0` gaps and deactivates only on the price limit, the per-p
 far (the near-tie break) ONLY when the near could win or tie the current best — split-identical, ~60% of
 the per-pool scan arithmetic saved. It is **compute-then-pull** — `transferFrom`s exactly the merged `cum`
 (one guarded terminal refund for the limit-price edge), not a pre-pull. The wei-exact gate vs the oracle is
-mirrored bit-for-bit by `ecoswap.solver-reference.ts`. Routes stay STATIC (composed off-chain via
-`localQuote` into route segments, competing in the merge via one cursor). The **on-chain lens is the single
+mirrored bit-for-bit by `ecoswap.solver-reference.ts`. **N-hop routes are LIVE composite venues (the
+QL-legs epic):** a route's head is the product fold of its legs' best heads, and each LEG is a SET of
+members — universe pools (V2/V3/V4/Algebra families, appended after the direct pools; a leg pool reuses
+the per-pool frontier code byte-identically via `pd[7]`) AND the 13 quote-ladder families (Curve/
+CryptoSwap/Solidly-stable/WOOFi/LB/Mento/DODO/Wombat/Fermi/Euler/BalV2/BalV3/Maverick; Fluid stays
+direct-only). Leg-venue price LADDERS are built ON-CHAIN in setup on the leg's EDGE pair, sized by the
+chain-order live fold of `amountIn` through the upstream legs' live heads; the merge elects the per-leg
+binding MEMBER (strict-near win, near-tie by strictly-higher far, pools before venues) and advances a
+route via binding-leg events with slice branches; exec is ONE unified per-leg loop (13-family dispatch,
+venue shares ride `qinp[]`, a per-route intermediate sweep returns residual mid-route dust). Prepare
+discovers leg venues per DIRECTED edge (memoized, `discoverQlVenuesForPair` shared with the direct path)
+under global pool+venue CLAIMS — a multi-coin venue holding several route tokens is admitted on exactly
+ONE leg, never both direct and leg. Plumbing: stride-5 routing tuples
+`[legCount,{poolBase,poolCount,qlvBase,qlvCount,inter}×L]`, a 12-column `qlv` partition (direct rows
+first, then per-`(route,leg)` rows) with `cfg[12]=directQlvCount`; the whole leg-QLV surface is
+`HAS_LEG_QLV`-gated and treeshaken away for pool-only universes. Prepare stays an OPTIONAL cache
+throughout (except Fluid, which is still prepare-sampled via the chain-wide resolver): venue descriptors
+carry no sampled data — ladders come from live cook-time state — and `quoteEcoSwap`'s zero-cache path
+carries the leg venues too. The **on-chain lens is the single
 source of truth** for survivorship: it emits **survivors-only** plus a header `[discoveredCount,
 survivorCount, totalL, liqFloor]`, and `prepare.ts` consumes them with **no re-filter**. The absolute
 `MIN_LIQUIDITY` floor was **dropped** — relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the
@@ -258,6 +275,12 @@ those paths, so the `!`-negation entries in `files` are the mechanism.)
    `block.timestamp`, which drifts across `evm_revert`. Two new tier-2 tests: `ecoswap.adaptive.evm.test.ts`
    (window-exceeded adaptive fill) and `ecoswap.gas.evm.test.ts` + `GAS.md` (`ECO_GAS=1`, {2 single-pass
    solver variants: array + unrolled}×{v1,v12} gas + bytecode size).
+   **QL-legs tests:** `ecoswap.legql.evm.test.ts` (hand-built prepared driving the production
+   `buildSolverArgs` path — venue-only leg, mixed pool+venue leg, budget-clamp-on-the-slice,
+   dead-upstream born-exhausted ladder, venue-funded output custody, the pinned 2-route example, a
+   leg-venue adverse-drift cell; both engines) and `ecoswap.legql.prepare.evm.test.ts` (the same
+   example through PRODUCTION `ecoSwap(config,…,poolConfig)` discovery — per-edge direction stamping,
+   the 3-coin claims cell, direct-vs-leg exclusion, pool-only shape stability, quote == cook).
    **Prod-mirror tests** replay REAL Base pool state from checked-in snapshots: `*.prodmirror.evm.test.ts`
    for V3 (`prod-snapshot.ts`, heavy ~10 min — one mint per boundary), V2 (`v2-snapshot.ts`, asserts
    output == exact constant-product) and V4 (`v4-snapshot.ts`, re-mints the tick profile into the etched
@@ -285,6 +308,14 @@ those paths, so the `!`-negation entries in `files` are the mechanism.)
    src/recipes/test/harness/lens-capacity-probe.ts`, which loads the cached state + replays the lens's
    capacity walk off-chain.) Survivors are fully reconstructed (real tick profiles); droppees are
    light-minted at real price + real active L.
+   Beyond the Uniswap-lineage ones, **every venue family has its own prod-mirror**
+   (`ecoswap.<family>.prodmirror.evm.test.ts` — curve/crypto/dodo/lb/solidly/euler/fermi/fluid/mento/
+   balancer/balancerv3/maverick/slipstream/algebra/…) replaying that family's REAL captured pool state,
+   wei-exact both engines + a drift case; the newest lineages are `ecoswap.algebraintegral.prodmirror`
+   (BSC THENA Integral — 6-word `globalState` with a poisoned word 3, reconstructed via
+   `harness/reproduce-pool-shifted.ts` for its negative-prefix net profile), `ecoswap.topaz.prodmirror`
+   (BSC Topaz CL, dynamic per-pool `fee()` read live) and `ecoswap.projectx.prodmirror` (HyperEVM
+   Project X, complete 1064-boundary profile + the odd fee-400/ts-8 tier).
    Recapture the prod SNAPSHOTS with `BASE_RPC_URL=<url> npx tsx src/recipes/test/harness/<x>-snapshot.ts`
    (V3/Pancake take an optional source-tag arg → `base-WETHUSDC-pancake<fee>.json`).
    **Anvil-state cache (fast setup).** Reconstruction is deterministic given the engine artifacts +
@@ -322,6 +353,12 @@ those paths, so the `!`-negation entries in `files` are the mechanism.)
    fund/approve, `prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run
    manually (`BASE_RPC_URL=<url> npx tsx src/recipes/test/megaswap.test.ts` from `sdk/`). `terraswap` has
    no fork test. These spawn `hardhat node` from `dev-tools/` (where the hardhat config + fork env live).
+   `ecoswap.chains.fork.test.ts` is the manual **network** tier for EcoSwap: one parametrized runner
+   over the covered chains (per-chain env-gated `<CHAIN>_RPC_URL`, skip-when-absent; block-pinned anvil
+   forks so re-runs hit anvil's disk cache) — real discovery + prepare via the chain's
+   `CHAIN_POOL_CONFIGS` entry, a read-only `quoteEcoSwap`, and on BSC a landed `cook()` asserted against
+   the quote. The Celo known-failure note (deterministic quote-cook MemoryOOG with deep ts=1 route-leg
+   universes) lives in-file.
 
 ## Publishing
 

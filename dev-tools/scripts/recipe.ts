@@ -394,7 +394,11 @@ async function main() {
     }
     console.log(`  Multi-hop routes: ${result.prepared.routes.length}`);
     for (const r of result.prepared.routes) {
-      console.log(`    via ${r.route.intermediateToken.slice(0, 10)}...`);
+      const via = r.intermediateTokens.map((t) => `${t.slice(0, 10)}...`).join(" -> ");
+      const legs = r.legs
+        .map((l) => `${l.pools.length}p+${l.qlVenues?.length ?? 0}v`)
+        .join(" | ");
+      console.log(`    via ${via} legs: [${legs}]`);
     }
     console.log(`  Brackets: ${result.prepared.brackets.length}`);
     console.log(
