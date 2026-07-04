@@ -11,7 +11,7 @@
  */
 
 import type { PublicClient, Hex } from "viem";
-import { parseAbi, keccak256, encodeAbiParameters } from "viem";
+import { parseAbi, keccak256, encodeAbiParameters, encodeFunctionData } from "viem";
 import {
   BASE_CHAIN_POOL_CONFIG,
   SwapPoolType,
@@ -114,15 +114,107 @@ const erc20DecimalsAbi = parseAbi([
  */
 const SOLIDLY_STABLE_DEFAULT_FEE_PPM = 100;
 
+// Canonical Uniswap V3 slot0 (7 words) — the typed PRIMARY decode. Slipstream-family forks
+// (Velodrome/Aerodrome CL, Topaz) return a 6-word slot0 (no feeProtocol word); those fall back to
+// the raw word-decode below (see "Shape-tolerant slot0 / globalState decode").
 const v3PoolAbi = parseAbi([
   "function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint32 feeProtocol, bool unlocked)",
   "function liquidity() external view returns (uint128)",
 ]);
 
+// Camelot / Algebra 1.9 globalState (8 words) — the typed PRIMARY decode. Algebra V1 (QuickSwap V3,
+// THENA Fusion) returns 7 words and Algebra Integral (THENA V3,3, SwapX) 6; those fall back to the
+// raw word-decode below. Fee-word taxonomy: `FactoryConfig.algebraFeeLayout` in shared/constants.ts.
 const algebraPoolAbi = parseAbi([
   "function globalState() external view returns (uint160 price, int24 tick, uint16 feeZto, uint16 feeOtz, uint16 timepointIndex, uint8 communityFeeToken0, uint8 communityFeeToken1, bool unlocked)",
   "function liquidity() external view returns (uint128)",
 ]);
+
+// ── Shape-tolerant slot0 / globalState decode ─────────────────
+//
+// The typed ABIs above pin ONE word layout per read — the 7-word Uniswap slot0 and the 8-word
+// Camelot/Algebra-1.9 globalState. Live forks return SHORTER shapes for the same selectors:
+//   slot0:       6 words on Slipstream-family pools (Velodrome CL on Celo/Ink/Unichain, Aerodrome
+//                CL, Topaz on BSC — no feeProtocol word),
+//   globalState: 7 words on Algebra V1 (QuickSwap V3, THENA Fusion), 6 words on Algebra Integral
+//                (THENA V3,3, SwapX),
+// and viem rejects the short returndata, which used to silently DROP those pools from the legacy
+// aggregator (decode failure ⇒ pool skipped). The batched typed multicall stays the PRIMARY path
+// (zero extra RPC for canonical pools); a pool whose typed decode fails is re-read with ONE raw
+// eth_call and decoded by 32-byte word position, consuming ONLY the fields the aggregator needs —
+// word 0 (sqrtPriceX96/price) and, for Algebra, the per-layout fee word (the layout taxonomy and
+// the per-factory `algebraFeeLayout` config live in shared/constants.ts).
+
+const SLOT0_CALLDATA = encodeFunctionData({ abi: v3PoolAbi, functionName: "slot0" });
+const GLOBAL_STATE_CALLDATA = encodeFunctionData({ abi: algebraPoolAbi, functionName: "globalState" });
+
+type AlgebraFeeLayout = NonNullable<FactoryConfig["algebraFeeLayout"]>;
+
+/** Raw eth_call → returndata split into 32-byte words. undefined on revert/empty/ragged/short data. */
+async function readReturnWords(
+  client: PublicClient,
+  to: Hex,
+  data: Hex,
+  minWords: number,
+): Promise<bigint[] | undefined> {
+  try {
+    const { data: ret } = await client.call({ to, data });
+    if (!ret) return undefined;
+    const hex = ret.slice(2);
+    if (hex.length === 0 || hex.length % 64 !== 0 || hex.length / 64 < minWords) return undefined;
+    const words: bigint[] = [];
+    for (let i = 0; i < hex.length / 64; i++) words.push(BigInt(`0x${hex.slice(i * 64, (i + 1) * 64)}`));
+    return words;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * sqrtPriceX96 per pool from a typed slot0 multicall, with the shape-tolerant raw fallback. The raw
+ * retry is only attempted when the pool's paired liquidity() read succeeded — a pool whose liquidity
+ * read ALSO failed is a dead/non-V3 address, not a shape mismatch. Returns undefined where no shape
+ * yields a price (the caller skips the pool, exactly as before).
+ */
+async function tolerantSqrtPrices(
+  client: PublicClient,
+  pools: readonly { address: Hex }[],
+  slot0Results: readonly { status: "success" | "failure"; result?: unknown }[],
+  liquidityResults: readonly { status: "success" | "failure" }[],
+): Promise<(bigint | undefined)[]> {
+  const prices: (bigint | undefined)[] = pools.map((_, i) => {
+    const s = slot0Results[i];
+    return s.status === "success" ? (s.result as unknown as [bigint, ...unknown[]])[0] : undefined;
+  });
+  await Promise.all(
+    pools.map(async (p, i) => {
+      if (prices[i] !== undefined || liquidityResults[i].status !== "success") return;
+      const words = await readReturnWords(client, p.address, SLOT0_CALLDATA, 2); // ≥ (sqrtPriceX96, tick)
+      if (words) prices[i] = words[0];
+    }),
+  );
+  return prices;
+}
+
+/** globalState word count → fee layout, used ONLY when the factory config omits algebraFeeLayout. */
+function guessAlgebraFeeLayout(wordCount: number): AlgebraFeeLayout {
+  return wordCount >= 8 ? "camelot" : wordCount === 7 ? "algebra-v1" : "integral";
+}
+
+/**
+ * The dynamic fee (ppm) at its per-layout globalState word (the algebraFeeLayout taxonomy in
+ * shared/constants.ts): camelot is DIRECTIONAL — word 2 (feeZto) for zeroForOne, word 3 (feeOtz)
+ * otherwise; algebra-v1 and integral carry a single fee ALWAYS at word 2 (their word 3 is the
+ * timepointIndex / pluginConfig — NOT a fee). Masked to uint24 defensively.
+ */
+function algebraFeeAt(
+  words: readonly (number | bigint)[],
+  layout: AlgebraFeeLayout,
+  zeroForOne: boolean,
+): number {
+  const w = (layout === "camelot" && !zeroForOne ? words[3] : words[2]) ?? 0;
+  return Number(BigInt(w) & 0xffffffn);
+}
 
 const v2PairAbi = parseAbi([
   "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
@@ -481,13 +573,16 @@ async function discoverV3Pools(
     }),
   ]);
 
+  // Shape-tolerant slot0: the typed 7-word Uniswap decode above is the batched primary; a fork
+  // returning the 6-word Slipstream-style slot0 falls back to one raw eth_call per pool.
+  const sqrtPrices = await tolerantSqrtPrices(client, validPools, slot0Results, liquidityResults);
+
   const pools: PoolInfo[] = [];
   for (let i = 0; i < validPools.length; i++) {
-    const slot0 = slot0Results[i];
+    const sqrtPriceX96 = sqrtPrices[i];
     const liq = liquidityResults[i];
-    if (slot0.status !== "success" || liq.status !== "success") continue;
+    if (sqrtPriceX96 === undefined || liq.status !== "success") continue;
 
-    const [sqrtPriceX96] = slot0.result as unknown as [bigint, ...unknown[]];
     const liquidity = liq.result as bigint;
     if (sqrtPriceX96 === 0n || liquidity === 0n) continue;
 
@@ -604,14 +699,18 @@ async function discoverSlipstreamCLPools(
     }),
   ]);
 
+  // Shape-tolerant slot0: real Slipstream pools return a 6-WORD slot0 (no feeProtocol word), which
+  // the typed 7-word Uniswap decode rejects — those pools (Velodrome CL on Celo/Ink/Unichain,
+  // Aerodrome CL, Topaz on BSC) fall back to one raw eth_call per pool, consuming only word 0.
+  const sqrtPrices = await tolerantSqrtPrices(client, validPools, slot0Results, liquidityResults);
+
   const pools: PoolInfo[] = [];
   for (let i = 0; i < validPools.length; i++) {
-    const slot0 = slot0Results[i];
+    const sqrtPriceX96 = sqrtPrices[i];
     const liq = liquidityResults[i];
     const feeRes = feeResults[i];
-    if (slot0.status !== "success" || liq.status !== "success") continue;
+    if (sqrtPriceX96 === undefined || liq.status !== "success") continue;
 
-    const [sqrtPriceX96] = slot0.result as unknown as [bigint, ...unknown[]];
     const liquidity = liq.result as bigint;
     if (sqrtPriceX96 === 0n || liquidity === 0n) continue;
 
@@ -707,24 +806,51 @@ async function discoverAlgebraPools(
     }),
   ]);
 
+  // Shape-tolerant globalState: the typed 8-word Camelot decode above is the batched primary; the
+  // 7-word Algebra V1 (QuickSwap V3, THENA Fusion) and 6-word Integral (THENA V3,3, SwapX) shapes
+  // fall back to one raw eth_call per pool, decoded by word position. The DYNAMIC fee is read at its
+  // per-layout word — resolved by `FactoryConfig.algebraFeeLayout` when the config carries it,
+  // length-guessed from the returndata shape only when it does not.
+  const zeroForOne = BigInt(tokenIn) < BigInt(tokenOut); // tokenIn is the pool's token0
+  const states: ({ price: bigint; fee: number } | undefined)[] = validPools.map((p, i) => {
+    const s = stateResults[i];
+    if (s.status !== "success") return undefined;
+    // Typed 8-word decode: [price, tick, feeZto, feeOtz, …]. An explicit non-camelot layout still
+    // reads word 2 — both single-fee layouts carry the fee there.
+    const r = s.result as unknown as readonly (number | bigint)[];
+    const layout = p.factory.algebraFeeLayout ?? "camelot";
+    return { price: r[0] as bigint, fee: algebraFeeAt(r, layout, zeroForOne) };
+  });
+  await Promise.all(
+    validPools.map(async (p, i) => {
+      if (states[i] !== undefined || liquidityResults[i].status !== "success") return;
+      const words = await readReturnWords(client, p.address, GLOBAL_STATE_CALLDATA, 3); // ≥ (price, tick, fee)
+      if (!words) return;
+      const layout = p.factory.algebraFeeLayout ?? guessAlgebraFeeLayout(words.length);
+      states[i] = { price: words[0], fee: algebraFeeAt(words, layout, zeroForOne) };
+    }),
+  );
+
   const pools: PoolInfo[] = [];
   for (let i = 0; i < validPools.length; i++) {
-    const state = stateResults[i];
+    const state = states[i];
     const liq = liquidityResults[i];
-    if (state.status !== "success" || liq.status !== "success") continue;
+    if (state === undefined || liq.status !== "success") continue;
 
-    const [price] = state.result as unknown as [bigint, ...unknown[]];
     const liquidity = liq.result as bigint;
-    if (price === 0n || liquidity === 0n) continue;
+    if (state.price === 0n || liquidity === 0n) continue;
 
     pools.push({
       address: validPools[i].address,
       tokenIn,
       tokenOut,
-      fee: 0, // Algebra uses dynamic fees, not fixed tiers
+      // The DYNAMIC fee (ppm) read from globalState at its per-layout word (directional for
+      // camelot). Previously hardcoded 0; downstream fee consumers (megaswap's fee-adjusted
+      // price limit) now see the real Algebra fee, same as a fixed-tier V3 row.
+      fee: state.fee,
       poolType: validPools[i].factory.poolType,
       priceLimited: hasPriceLimit(validPools[i].factory.poolType),
-      sqrtPriceX96: price, // globalState.price is sqrtPriceX96-compatible
+      sqrtPriceX96: state.price, // globalState.price is sqrtPriceX96-compatible
       liquidity,
       source: validPools[i].factory.label,
     });
