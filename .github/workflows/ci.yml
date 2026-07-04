@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
 
+env:
+  # Anza (Solana) toolchain used to build the SVM engine from the sauce dep —
+  # keep in step with the engine repo's svm-ci.yml SOLANA_VERSION.
+  SOLANA_VERSION: "v3.1.14"
+
 jobs:
   ci:
     name: Build & Test
@@ -50,6 +55,47 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # ---- SVM engine binary ------------------------------------------------
+      # The SVM integration suites (compiler/integration-test/svm-*.test.ts,
+      # sdk/test/svm/solswap.e2e.test.ts) execute compiled `target: 'svm'`
+      # bytecode on the real engine via LiteSVM. The engine sources ship inside
+      # the pinned `sauce` git dep (svm/), so we build engine.so from
+      # node_modules and cache the binary by the locked dep commit — cache hits
+      # skip the Solana toolchain install entirely.
+      - name: Resolve sauce dep commit
+        id: sauce-dep
+        run: echo "sha=$(grep -oE 'eco-incorp/sauce\.git#[0-9a-f]+' pnpm-lock.yaml | head -1 | cut -d'#' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore SVM engine binary
+        id: engine-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sauce-engine/${{ steps.sauce-dep.outputs.sha }}/engine.so
+          key: engine-so-${{ steps.sauce-dep.outputs.sha }}-${{ env.SOLANA_VERSION }}
+
+      - name: Install Solana toolchain
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Build SVM engine from the sauce dep
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        working-directory: compiler/node_modules/sauce/svm
+        run: |
+          cargo build-sbf
+          mkdir -p ~/.cache/sauce-engine/${{ steps.sauce-dep.outputs.sha }}
+          cp target/deploy/engine.so ~/.cache/sauce-engine/${{ steps.sauce-dep.outputs.sha }}/engine.so
+
+      - name: Enable SVM suites
+        # The suites skip silently when the binary is missing — fail loudly here
+        # instead so a broken build path can never look green.
+        run: |
+          ENGINE_SO="$HOME/.cache/sauce-engine/${{ steps.sauce-dep.outputs.sha }}/engine.so"
+          test -s "$ENGINE_SO" || { echo "::error::engine.so missing at $ENGINE_SO"; exit 1; }
+          echo "SAUCE_ENGINE_SO=$ENGINE_SO" >> "$GITHUB_ENV"
+      # -----------------------------------------------------------------------
 
       - name: Build compiler
         run: pnpm --filter './compiler' build

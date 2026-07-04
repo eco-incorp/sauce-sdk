@@ -66,9 +66,12 @@ Actions and dev-tools use the **node test runner**, not jest → `pnpm --filter 
   `cargo build-sbf` in the sauce repo's `svm/`). The SVM integration suites
   (`compiler/integration-test/svm-*.test.ts`, `sdk/test/svm/solswap.e2e.test.ts`) run compiled
   `target: 'svm'` bytecode on it via LiteSVM; default is the sibling-checkout path
-  `../sauce/svm/target/deploy/engine.so`, and the suites **skip cleanly** when the binary is absent
-  (so CI stays green without it). The `'svm'` compile target, its account-plan output, and the
-  `/svm` SDK subpath are documented in `docs/plans/2026-07-03-solana-svm-support.md`.
+  `../sauce/svm/target/deploy/engine.so`, and the suites **skip cleanly** when the binary is
+  absent. CI does NOT skip them: it builds `engine.so` from the pinned `sauce` dep
+  (`compiler/node_modules/sauce/svm`, Anza toolchain, binary cached by the locked dep commit)
+  and fails loudly if the binary is missing. The `'svm'` compile target, its account-plan
+  output, and the `/svm` SDK subpath are documented in
+  `docs/plans/2026-07-03-solana-svm-support.md`.
 
 ## Architecture
 
