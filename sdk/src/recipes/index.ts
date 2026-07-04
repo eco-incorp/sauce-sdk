@@ -24,6 +24,9 @@ export { terraSwap } from "./terraswap/index.js";
 export type { TerraSwapOutput, ChainSeriesResult } from "./terraswap/index.js";
 export { prepareTerraSwap, prepareNextSeries } from "./terraswap/prepare.js";
 
+export { solswap, solswapQuote } from "./solswap/index.js";
+export type { SolswapConfig, SolswapPool, SolswapOutput } from "./solswap/index.js";
+
 export { discoverPools } from "./shared/pool-discovery.js";
 export { quotePool } from "./shared/quoting.js";
 export * from "./shared/constants.js";
