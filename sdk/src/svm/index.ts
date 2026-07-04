@@ -10,3 +10,5 @@ export * from './alt.js';
 export * from './transaction.js';
 export * from './send.js';
 export * from './client.js';
+export * from './quoteSim.js';
+export * from './venues/index.js';
