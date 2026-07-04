@@ -150,6 +150,24 @@ import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 //
 //   tickBlob = concatenated 32-byte words, TICK_STRIDE = 3 words per tick row:
 //     [0] poolIdx  [1] tickIndexRaw (int24 ZERO-EXT)  [2] liquidityNetRaw (int128 ZERO-EXT)
+//
+// ── EMIT ALLOCATION SHAPE (chunked concat — same bytes, O(rows) memory) ──────
+// tickBlob is NOT grown one row per concat. The engine's CONCAT allocates a brand-new
+// buffer of the full combined size on a bump allocator that never frees within one
+// cook(), so appending R rows one-by-one leaves Σ 96·i ≈ 48·R² bytes of dead memory,
+// and EVM memory-expansion pricing ((M/32)²/512) turns that into gas ∝ R⁴ — ~830 total
+// rows exhausted a 2e9-gas eth_call as MemoryOOG (a real edge on celo: CELO/stable
+// pairs carry multiple ts=1 pools × 256-boundary bands ⇒ ~1088 rows ⇒ deterministic
+// OOG in prepare's route-edge lens read). Instead each pool buffers rows in a small
+// chunk (flushed into a per-pool blob every EMIT_CHUNK rows) and merges the per-pool
+// blob into tickBlob ONCE at pool end. The emitted BYTES and their ORDER are identical
+// — this is purely an allocation-shape change — but total allocation drops to
+// ~48·R·(EMIT_CHUNK + rowsPerPool/EMIT_CHUNK) + Σpools 48·R²/rowsPerPool ≈ ~2MB at
+// 1088 rows (vs ~57MB). The lens read cost is then LINEAR in scanned boundaries
+// (~380k gas/boundary on the v1 interpreter): ~1.2e9 gas at the 1032-row scale —
+// comfortably inside test/fork anvil + Alchemy-class eth_call budgets, but still
+// ABOVE strict public-RPC caps (e.g. geth's default 50M); prod prepare needs an
+// RPC with a generous eth_call gas cap either way (see lens.ts).
 
 // ── Pure helpers (no contract scope needed) ──────────────────────────────────
 
@@ -285,6 +303,13 @@ function main(
   let discovered: Uint256 = 0; // alive pools seen across all families (for header)
 
   const OFFSET: Uint256 = 888000; // tick shift (multiple of LCM(spacings)=3000, > max|tick|)
+  // Tick-row flush size for the EMIT pass's chunked concat (see "EMIT ALLOCATION
+  // SHAPE" above). Rows accumulate in a small per-pool chunk and flush into the
+  // per-pool blob every EMIT_CHUNK rows, so no concat ever re-copies more than
+  // ~max(EMIT_CHUNK·96, rowsPerPool·96) bytes. A pure gas/allocation knob — the
+  // emitted bytes are identical for any value ≥1. 16 balances the two chunk levels
+  // (copied bytes ≈ 48·R·(CHUNK + rowsPerPool/CHUNK), minimized near √rowsPerPool).
+  const EMIT_CHUNK: Uint256 = 16;
   const Q96: Uint256 = 2 ** 96;
   const Q192: Uint256 = 2 ** 192;
   const HALF128: Uint256 = 2 ** 127; // int128 sign bit
@@ -1072,6 +1097,14 @@ function main(
             }
             const idx3: Uint256 = poolCount;
 
+            // Per-pool chunked tick-row accumulation (see "EMIT ALLOCATION SHAPE"):
+            // rows3 = the small in-flight chunk (flushed every EMIT_CHUNK rows),
+            // poolTicks3 = this pool's full row blob (merged into tickBlob ONCE at
+            // pool end). Same bytes + order as appending straight to tickBlob.
+            let rows3: bytes = abi.encode(idx3).slice(0, 0);
+            let poolTicks3: bytes = abi.encode(idx3).slice(0, 0);
+            let rcnt3: Uint256 = 0;
+
             // ── Reverse-side drift reads (opposite direction), survivors only ──
             const baseRev3: Uint256 = tickShiftedBase(tick3, OFFSET, ts3);
             // reverse of swap dir: for zeroForOne (down) reverse is UP → start +ts.
@@ -1083,7 +1116,13 @@ function main(
             for (let rd3 = 0; rd3 < driftTicks; rd3 = rd3 + 1) {
               const ra3: Uint256 = tickArg(revShift3, OFFSET);
               const rn3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).ticks(ra3)[1];
-              tickBlob = tickBlob.concat(abi.encode(idx3, ra3, rn3));
+              rows3 = rows3.concat(abi.encode(idx3, ra3, rn3));
+              rcnt3 = rcnt3 + 1;
+              if (rcnt3 >= EMIT_CHUNK) {
+                poolTicks3 = poolTicks3.concat(rows3);
+                rows3 = rows3.slice(0, 0);
+                rcnt3 = 0;
+              }
               scanRev3 = scanRev3 + 1;
               if (zeroForOne === 1) {
                 revShift3 = revShift3 + ts3; // further up
@@ -1113,7 +1152,13 @@ function main(
               if (done3 === 0) {
                 const argW3: Uint256 = tickArg(curShift3, OFFSET);
                 const net3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).ticks(argW3)[1];
-                tickBlob = tickBlob.concat(abi.encode(idx3, argW3, net3));
+                rows3 = rows3.concat(abi.encode(idx3, argW3, net3));
+                rcnt3 = rcnt3 + 1;
+                if (rcnt3 >= EMIT_CHUNK) {
+                  poolTicks3 = poolTicks3.concat(rows3);
+                  rows3 = rows3.slice(0, 0);
+                  rcnt3 = 0;
+                }
                 scanned3 = scanned3 + 1;
 
                 const farReal3: Uint256 = stepReal(nearReal3, step3, zeroForOne);
@@ -1174,6 +1219,13 @@ function main(
                 }
               }
             }
+
+            // Flush the in-flight chunk, then merge this pool's rows into tickBlob
+            // ONCE (the only tickBlob concat this pool performs).
+            if (rcnt3 > 0) {
+              poolTicks3 = poolTicks3.concat(rows3);
+            }
+            tickBlob = tickBlob.concat(poolTicks3);
 
             poolBlob = poolBlob.concat(
               abi.encode(1, poolAddr3, fee3, ts3, 0, sqrt3, liq3, tick3, 0, 0, 0, scanned3, scanRev3)
@@ -1262,6 +1314,12 @@ function main(
           const tick43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[1];
           const idx43: Uint256 = poolCount;
 
+          // Per-pool chunked tick-row accumulation — the V4 mirror of the V3 EMIT
+          // block's rows3/poolTicks3 (see "EMIT ALLOCATION SHAPE").
+          let rows4: bytes = abi.encode(idx43).slice(0, 0);
+          let poolTicks4: bytes = abi.encode(idx43).slice(0, 0);
+          let rcnt4: Uint256 = 0;
+
           const baseRev4: Uint256 = tickShiftedBase(tick43, OFFSET, v4ts3);
           let revShift4: Uint256 = baseRev4;
           if (zeroForOne === 1) {
@@ -1271,7 +1329,13 @@ function main(
           for (let rd4 = 0; rd4 < driftTicks; rd4 = rd4 + 1) {
             const ra4: Uint256 = tickArg(revShift4, OFFSET);
             const rn4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, ra4)[1];
-            tickBlob = tickBlob.concat(abi.encode(idx43, ra4, rn4));
+            rows4 = rows4.concat(abi.encode(idx43, ra4, rn4));
+            rcnt4 = rcnt4 + 1;
+            if (rcnt4 >= EMIT_CHUNK) {
+              poolTicks4 = poolTicks4.concat(rows4);
+              rows4 = rows4.slice(0, 0);
+              rcnt4 = 0;
+            }
             scanRev4 = scanRev4 + 1;
             if (zeroForOne === 1) {
               revShift4 = revShift4 + v4ts3;
@@ -1298,7 +1362,13 @@ function main(
             if (done4 === 0) {
               const argW4: Uint256 = tickArg(curShift4, OFFSET);
               const net4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, argW4)[1];
-              tickBlob = tickBlob.concat(abi.encode(idx43, argW4, net4));
+              rows4 = rows4.concat(abi.encode(idx43, argW4, net4));
+              rcnt4 = rcnt4 + 1;
+              if (rcnt4 >= EMIT_CHUNK) {
+                poolTicks4 = poolTicks4.concat(rows4);
+                rows4 = rows4.slice(0, 0);
+                rcnt4 = 0;
+              }
               scanned4 = scanned4 + 1;
 
               const farReal4: Uint256 = stepReal(nearReal4, v4step3, zeroForOne);
@@ -1357,6 +1427,12 @@ function main(
               }
             }
           }
+
+          // Flush the in-flight chunk, then merge this pool's rows into tickBlob ONCE.
+          if (rcnt4 > 0) {
+            poolTicks4 = poolTicks4.concat(rows4);
+          }
+          tickBlob = tickBlob.concat(poolTicks4);
 
           poolBlob = poolBlob.concat(
             abi.encode(2, poolManager3, v4fee3, v4ts3, 0, sqrtP43, liq43, tick43, 0, stateView3, poolId3, scanned4, scanRev4)

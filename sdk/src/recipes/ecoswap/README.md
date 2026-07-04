@@ -436,7 +436,10 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   cut). The per-pool budget cap + a guarded terminal refund keep totals correct on the limit-price edge.
 - **Tick window** is bounded (`V3_TICK_STEPS`, fetched in one lens eth_call); the on-chain walk runs
   past it via staticcalls when a trade reaches beyond the cached window (run-until-filled).
-- **Env knobs:** `ECO_MAX_POOLS` (default 12), `ECO_MAX_ROUTES` (default 2) bound the on-chain loop;
+- **Env knobs:** `ECO_MAX_POOLS` (default 12), `ECO_MAX_ROUTES` (default 8) bound the on-chain loop;
+  `ECO_MAX_ROUTES=0` disables routes OUTRIGHT — prepare then skips the route DFS entirely, including
+  its per-edge lens eth_calls (it never pays edge-read cost for routes it cannot admit, and once the
+  cap is reached mid-DFS the remaining subtree is pruned before any further edge read).
   `ECO_MIN_REL_BPS` (default 100 = 1% of total in-range capacity) sets the relative-depth filter (0 disables).
   `prepareEcoSwap` / `ecoSwap` also take a `{ minRelBps }` opt that overrides the env per call.
 

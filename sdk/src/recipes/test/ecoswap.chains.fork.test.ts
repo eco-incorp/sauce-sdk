@@ -151,15 +151,18 @@ const SPECS: ChainSpec[] = [
     // CELO-legged swap (and the quote's balance-slot state override) is un-forkable.
     // cUSD (Mento StableTokenV2): balances slot 5, allowances slot 7 (probed on-fork).
     //
-    // KNOWN FAILURE (real solver finding, 2026-07-04, solver @ bfeea97): the FULL celo
-    // config quote cook MemoryOOGs at ANY trade size (10/100/1000 cUSD — size-independent,
-    // deterministic). Bisect: {Uniswap V3}, {Mento}, {Velodrome CL}, {UniV3+Mento} and
-    // {UniV3+Mento+VelodromeV2} all PASS; adding EITHER Ubeswap V3 OR Uniswap V4 (which
-    // contribute only ROUTE-LEG universes for this pair — deep ts=1 CELO-pair leg pools)
-    // flips it to MemoryOOG, and ECO_MAX_ROUTES=0 does NOT cure it — consistent with the
-    // route-leg ladder machinery walking prod-scale ts=1 leg pools at setup. No other
-    // chain reproduces it (bsc/sonic/plasma/worldchain/unichain pass with routes present).
-    // This spec keeps the REAL config so the lane goes green when the solver is fixed.
+    // RESOLVED (was: KNOWN FAILURE, MemoryOOG at any trade size, 2026-07-04). The OOG was
+    // NOT the quote cook — it was PREPARE's route-edge LENS eth_call: the lens EMIT pass
+    // appended one 3-word tick row per concat, whose bump-allocator memory grows ~48·R²
+    // (gas ∝ R⁴), and celo's CELO/stable edges carry several ts=1 pools × 256-boundary
+    // full-band walks (no pool solo-covers ⇒ floorAdj=0 disables early-stop) ⇒ ~1088 rows
+    // ⇒ >2e9 gas. That also explains the bisect (Ubeswap V3 / Uniswap V4 added the ts=1
+    // edge pools that crossed the ~830-row threshold) and the ECO_MAX_ROUTES=0 anomaly
+    // (the DFS lens-read edges before the cap could gate anything — also fixed; a zero
+    // cap now skips the DFS outright). Fixed by the lens's chunked emit (identical bytes,
+    // O(rows) allocation) — see ecoswap.lens.sauce.ts "EMIT ALLOCATION SHAPE" and the
+    // local no-fork regression at src/recipes/test/ecoswap.lens-scale.evm.test.ts.
+    // Verified green on this fork pin post-fix (quote ≈992 USDC for 1000 cUSD).
     chain: "celo",
     envVar: "CELO_RPC_URL",
     forkBlock: 71_238_500,

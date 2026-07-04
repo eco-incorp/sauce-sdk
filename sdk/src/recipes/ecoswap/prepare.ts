@@ -1727,7 +1727,25 @@ export async function prepareEcoSwap(
     }
     // Branch deeper: only if another interior hop still leaves room for the closing leg to out.
     if (hopsUsed + 2 > MAX_HOPS) return;
+    // ROUTE-CAP PRUNE: once MAX_ROUTES routes are admitted, deeper exploration can only
+    // produce paths the closing-leg gate above would truncate anyway — but each branch
+    // step below still costs a buildLeg → readEdge → runLens eth_call (an expensive
+    // on-chain edge read). Stop the whole subtree instead: the admitted route set is
+    // IDENTICAL (routes are only ever admitted in DFS order until the cap), only the
+    // pointless edge reads are skipped. routesTruncated then reports the prune points
+    // reached (a lower bound on dropped paths), not an exact dropped-path count.
+    if (routes.length >= MAX_ROUTES) {
+      routesTruncated++;
+      return;
+    }
     for (const next of interiorTokens) {
+      // Re-check the cap PER SIBLING: a child subtree may have admitted the final route,
+      // and the dfs()-entry check alone would still lens-read every remaining sibling
+      // edge here (buildLeg → readEdge → runLens) before its recursion could prune.
+      if (routes.length >= MAX_ROUTES) {
+        routesTruncated++;
+        return;
+      }
       const nl = next.toLowerCase();
       if (visited.has(nl)) continue; // no cycles — each token at most once per path
       const built = await buildLeg(token, next, estIn);
@@ -1743,12 +1761,18 @@ export async function prepareEcoSwap(
       visited.delete(nl);
     }
   };
-  await dfs(tokenIn, [], [], new Set<string>([inLower]), amountIn);
+  // ECO_MAX_ROUTES=0 disables routes OUTRIGHT — including the DFS's per-edge lens reads.
+  // The closing-leg gate alone is NOT enough: with a zero cap the DFS would admit nothing
+  // yet still buildLeg→readEdge→runLens every interior edge first (each a heavy on-chain
+  // eth_call), i.e. pay the full route-discovery cost for a result known to be empty.
+  if (MAX_ROUTES > 0) {
+    await dfs(tokenIn, [], [], new Set<string>([inLower]), amountIn);
+  }
 
   if (routesTruncated > 0) {
     console.log(
-      `  EcoSwap capped routes to ${MAX_ROUTES} (ECO_MAX_ROUTES); dropped ${routesTruncated} ` +
-        `additional path(s) — a calldata/loop bound, not a liquidity gate`,
+      `  EcoSwap capped routes to ${MAX_ROUTES} (ECO_MAX_ROUTES); pruned exploration at ` +
+        `${routesTruncated} point(s) past the cap — a calldata/loop bound, not a liquidity gate`,
     );
   }
 
