@@ -403,7 +403,7 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   V3-style **fork** (e.g. **PancakeSwap V3**) registered as a `V3Standard`/`V2Standard` factory — each
   queried across its own `FactoryConfig.feeTiers` — AND the quote-ladder venue families
   (Curve StableSwap/CryptoSwap, Solidly-stable, WOOFi, Trader Joe LB, Mento, DODO V2, Wombat, Fermi,
-  EulerSwap, Balancer V2/V3, Maverick V2, Fluid DEX, Tessera V, ElfomoFi). All 16 leg-capable families compete
+  EulerSwap, Balancer V2/V3, Maverick V2, Fluid DEX, Tessera V, ElfomoFi, Metric). All 17 leg-capable families compete
   both as DIRECT venues and as ROUTE-LEG members. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is
   SUPPORTED (discover + price + execute): its curve
   is V3-identical (so it prices wei-exact via the V3 oracle), and the engine now EXECUTES it — an Algebra
