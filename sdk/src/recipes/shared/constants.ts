@@ -1117,6 +1117,58 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // stable-adjacent tier) and 1000->20 on top of the canonical set (2500/7500 disabled) — the
       // default [100,500,3000,10000] would miss them; spacings added to TICK_SPACING_BY_FEE.
       { address: "0xFf7B3e8C00e57ea31477c32A5B52a58Eea47b072" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Project X CL", feeTiers: [100, 200, 400, 500, 1000, 3000, 10000] },
+      // nest CLAMM — Algebra Integral (poolByPair; fee-keyed getPool(a,b,uint24) reverts).
+      // globalState is the 6-word INTEGRAL layout (lastFee at word 2, pluginConfig at word 3 — NOT
+      // the camelot directional default). Factory from the official docs contracts page
+      // (docs.usenest.xyz), back-referenced by the live WHYPE/USDT0 pool. On-chain re-verified
+      // 2026-07-04: poolByPair(WHYPE,USDT0) → 0x20e6E73C…623E, globalState() = 6 words
+      // (lastFee=0x12c=300, pluginConfig=0xd7), liquidity ≈ 2.65e17; pool bytecode carries the
+      // algebraSwapCallback selector. CAVEAT: Integral tickSpacing is PER-POOL (the WHYPE/USDT0 hub
+      // pool is 5; factory defaultTickspacing()=60) — algebraTickSpacing matches the hub pool;
+      // other-spacing pools get a mismatched lens step ratio.
+      { address: "0xF77Bd082c627aA54591cF2f2EaA811fd1AB3b1F3" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "nest CL", algebraFeeLayout: "integral", algebraTickSpacing: 5 },
+      // Ramses CL (HyperRAM) — the factory formerly MIS-PLACED on Arbitrum (see the Arbitrum note).
+      // On HyperEVM it is TICKSPACING-keyed (getPool(a,b,int24); fee-keyed getPool(a,b,uint24)
+      // reverts for EVERY tier) => SlipstreamCL, NOT V3Standard (unlike Arbitrum Ramses CL, which is
+      // fee-keyed) — wiring it V3Standard would make it inert (the Chronos-class dead-entry failure).
+      // Enabled spacings via tickSpacingInitialFee: [1,5,10,50,100,200] (the default Slipstream set
+      // would miss 5 and 10, where the deep stable-adjacent pools live). Fees are DYNAMIC per pool —
+      // the reader's per-pool fee() read picks them up (WHYPE/USDT0 ts=10 fee()=1300 vs initial 500).
+      // Standard uniswapV3SwapCallback. On-chain re-verified 2026-07-04: getPool(WHYPE,USDT0,10) →
+      // 0xeE02e3A3…a067, slot0() responds, liquidity ≈ 2.50e17 (ts=1/5/50 pools exist with L=0 —
+      // left to the relative-depth filter).
+      { address: "0x07E60782535752be279929e2DFfDd136Db2e6b45" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Ramses CL", slipstreamTickSpacings: [1, 5, 10, 50, 100, 200] },
+      // Kittenswap CL — Algebra INTEGRAL (docs: "built with Algebra Integral"; globalState is the
+      // 6-word integral layout: lastFee at word 2, pluginConfig at word 3 — wiring WITHOUT
+      // algebraFeeLayout:"integral" would decode pluginConfig as a fee). Factory from the official
+      // deployed-contracts docs, back-referenced by the live WHYPE/USDT0 pool. On-chain re-verified
+      // 2026-07-04: poolByPair(WHYPE,USDT0) → 0x3c140333…b809, globalState() = 6 words
+      // (lastFee=0x1f4=500, pluginConfig=0xc3), liquidity ≈ 2.86e17; WHYPE/USDe pool L ≈ 2.60e17.
+      // CAVEAT: per-pool tickSpacing is HETEROGENEOUS (WHYPE/USDT0=10, WHYPE/USDe=60,
+      // WHYPE/KITTEN=500; factory default 60) — algebraTickSpacing:10 matches the deep WHYPE/USDT0
+      // hub pool; the 60-spacing WHYPE/USDe pool's lens step ratio will be off-grid (dense-stepped)
+      // until per-pool spacing is threaded through.
+      { address: "0x5f95E92c338e6453111Fc55ee66D4AafccE661A7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Kittenswap CL", algebraFeeLayout: "integral", algebraTickSpacing: 10 },
+      // Hybra V3 — plain fee-keyed Uniswap V3 fork (their CL "uses Uniswap V3 contracts without
+      // modification"). NON-standard tier menu: feeAmountTickSpacing enables 200->4, 2500->50
+      // (Pancake-style) and 7500->150 on top of 100/500/3000/10000 — the per-factory feeTiers
+      // override is required or the 2500/7500 pools are missed. Verified via pool.factory() backref
+      // (GeckoTerminal hbHYPE/WHYPE Hybra-V3 pool) + live WHYPE/USDT0 pools at 100/500/2500; pools
+      // expose standard slot0/liquidity + the uniswapV3SwapCallback selector. On-chain re-verified
+      // 2026-07-04: getPool(WHYPE,USDT0,500) → 0x3514cC7C…D2AD, slot0() responds (7-word standard
+      // V3). WHYPE/USDT0 depth is modest (L ≈ 1.59e16 — most Hybra depth migrated to Hybra V4); the
+      // relative-depth filter judges it per-trade, and other pairs (hbHYPE/WHYPE) are deep.
+      { address: "0x2dC0Ec0F0db8bAF250eCccF268D7dFbF59346E5E" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Hybra V3", feeTiers: [100, 200, 500, 2500, 3000, 7500, 10000] },
+      // Hybra V4 — "V4" branding but NOT a Uniswap-V4 singleton: per-address minimal-proxy pools
+      // (impl 0xa421…52ab) with the STANDARD V3 swap + uniswapV3SwapCallback surface (no
+      // algebra/pancake callback), discovered by TICKSPACING-keyed getPool(a,b,int24) (fee-keyed
+      // getPool and poolByPair both revert) => SlipstreamCL (Ramses-V3 lineage, like Shadow).
+      // Per-pool fee() is DYNAMIC (ts=50 WHYPE/USDT0 fee()=1800) — the reader's live fee() read
+      // handles it. No tickSpacingInitialFee getter — the spacing menu was established empirically
+      // from live pools: [5,10,50,100,200] (+1 harmless to over-query). On-chain re-verified
+      // 2026-07-04: getPool(WHYPE,USDT0,50) → 0xC22FaD66…8D6b, slot0() responds; liquidity ≈ 1.72e18
+      // — the deepest WHYPE/USDT0 CL depth probed on the chain (ts=5/10/100 pools exist with L=0).
+      { address: "0x32b9dA73215255d50D84FeB51540B75acC1324c2" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Hybra V4", slipstreamTickSpacings: [1, 5, 10, 50, 100, 200] },
     ],
     baseTokens: [
       "0x5555555555555555555555555555555555555555" as Hex, // WHYPE (wrapped native, routing hub, 18 dec)
