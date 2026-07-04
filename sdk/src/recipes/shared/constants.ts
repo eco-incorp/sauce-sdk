@@ -451,15 +451,17 @@ export const PANCAKE_V3_FEE_TIERS = [100, 500, 2500, 10000] as const;
 
 /**
  * Fee (ppm) → tickSpacing for the discovered fee-keyed V3 forks: the Uniswap standard tiers
- * (100/500/3000/10000 → 1/10/60/200), Pancake's 2500 → 50, and Ramses CL's non-standard low
+ * (100/500/3000/10000 → 1/10/60/200), Pancake's 2500 → 50, Ramses CL's non-standard low
  * tiers 50 → 1 and 250 → 5 (on-chain verified on Arbitrum: getPool(USDC,USDT,50) → a pool with
- * tickSpacing() == 1). Unknown tiers fall back to 60 — beware: on a fork whose real spacing is
- * finer, the 60-stride walk overstates per-step capacity ~(60/ts)× and poisons the lens's
- * relative-depth floor, so REAL tiers must be listed here. THE SINGLE SOURCE for the recipe:
- * lens.ts is the sole recipe consumer (prepare.ts keeps no copy — tickSpacing flows to it
- * from the lens rows); keep any duplicate map elsewhere in sync.
+ * tickSpacing() == 1), Project X's (HyperEVM) extra tiers 200 → 4, 400 → 8 and 1000 → 20, and
+ * WAGMI's (Sonic) 1500 → 30 (both sets on-chain verified via each factory's
+ * feeAmountTickSpacing(fee), 2026-07-03). Unknown tiers fall back to 60 — beware: on a fork
+ * whose real spacing is finer, the 60-stride walk overstates per-step capacity ~(60/ts)× and
+ * poisons the lens's relative-depth floor, so REAL tiers must be listed here. THE SINGLE SOURCE
+ * for the recipe: lens.ts is the sole recipe consumer (prepare.ts keeps no copy — tickSpacing
+ * flows to it from the lens rows); keep any duplicate map elsewhere in sync.
  */
-export const TICK_SPACING_BY_FEE: Record<number, number> = { 50: 1, 100: 1, 250: 5, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+export const TICK_SPACING_BY_FEE: Record<number, number> = { 50: 1, 100: 1, 200: 4, 250: 5, 400: 8, 500: 10, 1000: 20, 1500: 30, 2500: 50, 3000: 60, 10000: 200 };
 /** TICK_SPACING_BY_FEE lookup with the standard-V3 default of 60 for unknown tiers. */
 export function feeToTickSpacing(fee: number): number {
   return TICK_SPACING_BY_FEE[fee] ?? 60;
@@ -562,6 +564,19 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x1097053Fd2ea711dad45caCcc45EfF7548fCB362" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "PancakeSwap V2" },
       // Curve
       { address: "0x90E00ACe148ca3b23Ac1bC8C240C2a7Dd9c2d7f5" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
+      // Curve CryptoSwap (the twocrypto-ng FACTORY is the CryptoSwap registry surface:
+      // find_pool_for_coins / get_coin_indices → UINT256 i,j — the shape curveCryptoRegistryAbi expects;
+      // the factory implements NEITHER registry get_n_coins NOR get_decimals, which the adapter's .catch
+      // fallbacks cover via the pool's own coins()/ERC20 decimals()). On-chain verified 2026-07-03:
+      // find_pool_for_coins(crvUSD,WETH) → 0x6e5492F8… (BOTH orderings — the prod-mirror pool, version
+      // "v2.1.0d", the exact family cryptoswap-math.ts replays wei-exact; ~15.0M crvUSD / ~16.8k WETH),
+      // get_coin_indices → (0,1), get_dy(0,1,1000e18) → 0.5645 WETH live. poolType Curve is INERT for
+      // CryptoSwap (discovery keys off factoryType; crypto pools flow into the EcoCryptoSwap QL bucket,
+      // executed CALLBACK-FREE via exchange(uint256,uint256,…) — never the engine _swapCurve int128 path).
+      // NOTE (cryptoswap-math.ts LIMITATIONS): a pool of ANOTHER generation resolved by this registry
+      // would be mismodeled in the off-chain liveness probe only — the QL ladder is built on-chain from
+      // LIVE get_dy and min_dy is the pool's own get_dy, so mis-split-only, never mis-execute.
+      { address: "0x98EE851a00abeE0d95D08cF4CA2BdCE32aeaAF7F" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveCryptoRegistry, label: "Curve CryptoSwap (twocrypto-ng)" },
       // Balancer V2 (Vault address — pool discovery via known ComposableStable pool addresses).
       // On-chain verified via Vault.getPoolTokens(getPoolId(pool)) — the two deepest V2 stable pools
       // holding baseTokens (the plain-stablecoin V2 pools have largely migrated to V3/boosted, so these
@@ -627,6 +642,15 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
         ] },
       // DODO V2
       { address: "0x72d220cE168C4f361dD4deE5D826a01AD8598f6C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
+      // DODO V2 DSP (DODOStablePool factory — the SAME getDODOPool(base,quote)→address[] surface as the
+      // DVMFactory 0x72d220cE above; DSP pools are registered ONLY here, so the DVM-only entry cannot see
+      // them; discovery iterates every DODOZoo entry, so the two zoos coexist). On-chain verified
+      // 2026-07-03: getDODOPool(DAI,USDT) → [0x3058EF90… (the prod-mirror DAI/USDT DSP, ~5.4k DAI /
+      // ~11.7k USDT reserves, querySellBase(1000e18 DAI) → 1000.55 USDT), 0xb6005C01… (thin)]; the
+      // reverse ordering returns [] (clean — discovery queries BOTH orderings). Pool responds to the
+      // full typed read surface: getPMMStateForCall / _BASE_TOKEN_ / _LP_FEE_RATE_ / _MT_FEE_RATE_MODEL_
+      // (version "DSP 1.0.1"). Address per the DODO contract API (chainId 1, DSPFactory).
+      { address: "0x6fdDB76c93299D985f4d3FC7ac468F9A168577A4" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2 DSP" },
       // Maverick V2
       { address: "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e" as Hex, poolType: SwapPoolType.MaverickV2, factoryType: FactoryType.MaverickV2Factory, label: "Maverick V2" },
       // KyberSwap Classic / DMM (amplified constant-product on virtual reserves; V2-shaped,
@@ -785,8 +809,14 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x1F98431c8aD98523631AE4a59f267346ea31F984" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
       // KyberSwap Elastic REMOVED: Elastic is NOT V3-compatible (getPoolState()/its own swap, no slot0) — a queried-tier collision reverts the whole lens eth_call; needs its own FactoryType before re-adding.
       { address: "0x917933899c6a5F8E37F31E19f92CdBFF7e8FF0e2" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "SushiSwap V3" },
-      // Algebra (V3-compatible with dynamic fees)
-      { address: "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "QuickSwap V3" },
+      // QuickSwap V3 is Algebra V1 (SINGLE fee): raw globalState() returns 7 words — (price, tick, fee,
+      // timepointIndex, communityFee0, communityFee1, unlocked) — verified 2026-07-03 on the live
+      // WMATIC/USDC.e and WMATIC/USDC pools (word2 = 403/404 ppm dynamic fee; word3 = 45562/32434
+      // timepointIndex, NOT a fee). The "camelot" DEFAULT (Camelot returns 8 words, feeZto/feeOtz at
+      // words 2/3 — cross-checked on Arbitrum) would decode QuickSwap's timepointIndex as the oneForZero
+      // fee (≈4.6%), poisoning the survivor filter + merge pricing — so the layout MUST be pinned (same
+      // determination as THENA Fusion on bsc). tickSpacing 60 matches the default.
+      { address: "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "QuickSwap V3", algebraFeeLayout: "algebra-v1" },
       // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Polygon deployment.
       { address: "0x67366782805870060151383F4BbFF9daB53e5cD6" as Hex, stateView: "0x5eA1bD7974c8A611cBAB0bDCAFcB1D9CC9b3BA5a" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
@@ -847,9 +877,33 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "PancakeSwap V3", feeTiers: [...PANCAKE_V3_FEE_TIERS] },
       // Uniswap V3 (standard 0.30% tier — NOT Pancake's 2500).
       { address: "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3" },
-      // THENA Fusion (Algebra dynamic-fee CL; poolByPair + globalState). Executable — the engine
-      // services algebraSwapCallback (sauce#186). Algebra v1 pools share a fixed tickSpacing of 60.
-      { address: "0x306F06C147f064A010530292A1EB6737c3e378e4" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, algebraTickSpacing: 60, label: "THENA Fusion" },
+      // Topaz CL (Slipstream-family CLFactory, per Topaz docs). tickSpacing-keyed getPool(a,b,int24)
+      // proven on-chain 2026-07-03 (fee-keyed uint24 selector reverts; WBNB/USDT live at ts=50 →
+      // 0x767F1F4b…, L≈9.4e22); enabled tickSpacings() == the SLIPSTREAM_TICK_SPACINGS default
+      // [1,50,100,200,2000], so no slipstreamTickSpacings override needed; per-pool fee READ from
+      // fee() (dynamic, decoupled from spacing — the ts=50 pool carries fee()=53).
+      { address: "0x73DC984D9490286E735548f61dfCCec67Af82ed9" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Topaz CL (Slipstream)" },
+      // THENA Fusion (Algebra V1 dynamic-fee CL; poolByPair + 7-word globalState). Executable — the
+      // engine services algebraSwapCallback (sauce#186). Algebra v1 pools share a fixed tickSpacing of
+      // 60. algebraFeeLayout MUST be "algebra-v1": the fee is ALWAYS word 2; word 3 is the
+      // timepointIndex (observed 18284 on the live WBNB/USDT pool 0xD405b976…, 2026-07-03 — decoded as
+      // a camelot feeOtz it would be a bogus 1.83% fee; Algebra's own partner docs classify Thena as
+      // v1.0).
+      { address: "0x306F06C147f064A010530292A1EB6737c3e378e4" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, algebraTickSpacing: 60, algebraFeeLayout: "algebra-v1", label: "THENA Fusion" },
+      // THENA Integral (Algebra Integral CL, 'THENA V3,3' — launched 2025-05; DISTINCT from THENA
+      // Fusion's Algebra V1 factory 0x306F06C1… above). poolByPair + 6-word Integral globalState
+      // (single fee at word 2, word 3 is pluginConfig — NOT a fee); pools verified 2026-07-03 at
+      // tickSpacing 60 (poolByPair(WBNB,USDT) → 0x9EA0f51F…, L≈4.5e22, lastFee=987; the factory
+      // address is derived ON-CHAIN — factory() on three live V3,3 pools all return it, since the
+      // THENA gitbook publishes no addresses and Algebra's partner page is stale). Integral supports
+      // additional custom pools per pair (poolByPair returns only the base pool), which the
+      // one-pool-per-pair AlgebraV3 reader tolerates by design.
+      { address: "0x30055F87716d3DFD0E5198C27024481099fB4A98" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, algebraTickSpacing: 60, algebraFeeLayout: "integral", label: "THENA Integral (V3,3)" },
+      // V4 singleton (PoolManager + StateView lens). Official Uniswap deployment (docs + explorer
+      // label agree). On-chain verified 2026-07-03: StateView.poolManager() round-trips to this
+      // PoolManager; keccak(PoolKey)-derived poolId for native-BNB/BTCB 100/1 matches the live
+      // indexed pool (getSlot0 responds, lpFee=100; getLiquidity ≈4.7e20; USDT/USDC pool ≈2.5e26).
+      { address: "0x28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF" as Hex, stateView: "0xd13Dd3D6E93f276FAfc9Db9E6BB47C1180aeE0c4" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // Maverick V2
       { address: "0x0A7e848Aca42d879EF06507Fca0E7b33A0a63c1e" as Hex, poolType: SwapPoolType.MaverickV2, factoryType: FactoryType.MaverickV2Factory, label: "Maverick V2" },
       // V2 constant-product. Pancake V2 pairs ENFORCE 0.25% (2500 ppm — the pair's K check is
@@ -882,13 +936,34 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
   // Sonic (chainId 146). wS (wrapped native) included as a routing hub, not a stablecoin.
   sonic: {
     factories: [
-      // SwapX (Algebra Integral CL) — dynamic fee, poolByPair + globalState.
-      { address: "0x8121a3F8c4176E9765deEa0B95FA2BDfD3016794" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "SwapX (Algebra Integral CL)" },
+      // SwapX (Algebra Integral CL) — dynamic fee, poolByPair + globalState. INTEGRAL fee layout,
+      // on-chain verified 2026-07-03: globalState() on the live wS/USDC pool 0x5C4B7d60… returns
+      // exactly 6 words (price, tick, lastFee=2000, pluginConfig=197, communityFee, unlocked) — the
+      // default "camelot" decode would read word 3 (pluginConfig=197) as the oneForZero fee,
+      // mispricing the deep pool (~278k wS + ~20k USDC) ~10x.
+      { address: "0x8121a3F8c4176E9765deEa0B95FA2BDfD3016794" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, algebraFeeLayout: "integral", label: "SwapX (Algebra Integral CL)" },
       // Shadow Exchange CL (Ramses V3 / Slipstream-style) — tickSpacing-keyed getPool(a,b,int24), now
       // discoverable via FactoryType.SlipstreamCL. Verified on-chain: getPool(wS,USDC,int24) returns
       // non-zero pools at tickSpacings {1,50,100,200}. Per-pool fee READ from fee() (decoupled from
       // tickSpacing). V3-compatible for execution (swapV3 / uniswapV3SwapCallback).
       { address: "0xcD2d0637c94fe77C2896BbCBB174cefFb08DE6d7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Shadow Exchange CL (Ramses V3)" },
+      // WAGMI V3 (Uniswap V3 fork). On-chain verified 2026-07-03: fee-keyed getPool; enabled tiers are
+      // NON-STANDARD [500, 1500, 3000, 10000] (feeAmountTickSpacing: 500->10, 1500->30, 3000->60,
+      // 10000->200; 100 and 2500 DISABLED). The deep wS/USDC pool is the 0.15%/1500 tier (~768k wS,
+      // L≈1.8e17); fee=3000 thin, fee=500 exists but L=0. REQUIRES TICK_SPACING_BY_FEE's `1500: 30`
+      // (added above) — the unknown-tier fallback of 60 would double the walk stride and poison the
+      // lens relative-depth floor.
+      { address: "0x56CFC796bC88C9c7e1b38C2b0aF9B7120B079aef" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "WAGMI V3", feeTiers: [500, 1500, 3000, 10000] },
+      // Metropolis DLMM (Trader Joe LB v2.2 fork — native Liquidity Book on Sonic). On-chain verified
+      // 2026-07-03: getNumberOfLBPairs()=522; getLBPairInformation(wS,USDC,·) live at binSteps
+      // {1,4,10,20,25,50,100}, (USDC,USDT,1) live two-sided (~3.2k USDC + ~2.4k USDT); pairs answer
+      // getReserves/getActiveId/getStaticFeeParameters (baseFactor read live — USDC/USDT bs=1 uses
+      // 10000, not the 5000 default).
+      // NOTE: Metropolis enables binSteps 4/50/100 that the global TRADER_JOE_BIN_STEPS
+      // [1,5,10,15,20,25] does not enumerate — the deepest wS/USDC pair (binStep=4) is missed until
+      // the constant is extended (extra steps are harmless for Joe: absent steps return pair=0) or a
+      // per-factory binSteps override is added.
+      { address: "0x39D966c1BaFe7D3F1F53dA4845805E15f7D6EE43" as Hex, poolType: SwapPoolType.TraderJoeLB, factoryType: FactoryType.TraderJoeLB, label: "Metropolis DLMM (Joe LB)" },
       // SwapX Classic (Solidly ve(3,3), stable + volatile)
       { address: "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "SwapX Classic (Solidly)" },
       // Shadow Exchange Legacy (Solidly PairFactory, stable + volatile)
@@ -936,6 +1011,11 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
     factories: [
       // V3 concentrated liquidity (has price limit). Standard Uniswap V3 fee tiers.
       { address: "0xAfE208a311B21f13EF87E33A90049fC17A7acDEc" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
+      // Ubeswap V3 (Uniswap V3 fork). On-chain verified 2026-07-03: fee-keyed getPool; CELO/cUSD live
+      // at tiers {100, 3000, 10000} with the depth in the 0.01%/100 pool (~39.5k CELO + ~6k cUSD,
+      // L≈2.6e23); pool factory() back-references this factory. No stable-stable pools (cUSD/USDC,
+      // USDC/USDT all zero) — the CELO/cUSD leg is what this entry adds.
+      { address: "0x67FEa58D5a5a4162cED847E13c2c81c73bf8aeC4" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Ubeswap V3", feeTiers: [100, 500, 3000, 10000] },
       // V4 singleton (PoolManager + StateView lens). V4 is dynamic-fee/tickSpacing-keyed.
       { address: "0x288dc841A52FCA2707c6947B3A777c5E56cd87BC" as Hex, stateView: "0xbc21f8720BABf4b20d195eE5C6e99c52b76F2bfb" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // Velodrome V2 (Solidly volatile + stable pools). Canonical Superchain Leaf PoolFactory.
@@ -998,6 +1078,18 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // NOT the StableSwap Factory 0x8271e06E... (which implements a different interface the
       // CurveRegistry reader does not call). Stable-stable pools (USDT0/USDe verified).
       { address: "0xe6dA14500f0b5783E2325F9C5a7eE5d99DA0fB42" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "Curve" },
+      // Fluid DEX (FluidDexT1 typed path). On-chain verified 2026-07-03: DexFactory (deterministic
+      // 0x91716C…, has code on Plasma) getDexAddress → 6 dexes; dexId2 0x667701e5… is
+      // USDe(0x5d3a…)/USDT0(0xB8CE…) — both baseTokens; resolver estimateSwapIn deep (100k USDe →
+      // 99,908 USDT0, both directions). NOTE: Plasma's DexResolver is 0xAf572EfC… (per the official
+      // Instadapp fluid-contracts-public deployments.md — the eth/arb/polygon 0x11D80C… address has
+      // NO code on Plasma). poolType UniV2 is INERT for Fluid (discovery keys off factoryType; Fluid
+      // executes callback-free via its own EcoFluid path) — a placeholder, not a UniV2 claim.
+      { address: "0x91716C4EDA1Fb55e84Bf8b4c7085f84285c19085" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Fluid, label: "Fluid DEX",
+        fluidResolver: "0xAf572EfC84d905926F7b05C1B7bE04e4E89542B0" as Hex,
+        fluidPools: [
+          "0x667701e51B4D1Ca244F17C78F7aB8744B4C99F9B" as Hex, // USDe/USDT0 (deep)
+        ] },
     ],
     baseTokens: [
       "0x6100E367285b01F48D07953803A2d8dCA5D19873" as Hex, // WXPL (wrapped native, routing hub, 18 dec)
@@ -1015,6 +1107,16 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xB1c0fa0B789320044A6F623cFe5eBda9562602E3" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "HyperSwap V3", feeTiers: [100, 500, 3000, 10000] },
       // HyperSwap V2 constant-product (canonical 0.30% fee, UniswapV2 fork — no v2FeePpm override).
       { address: "0x724412C00059bf7d6ee7d4a1d0D5cd4de3ea1C48" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "HyperSwap V2" },
+      // Project X CL — fee-keyed Uniswap V3 fork (getPool(a,b,uint24); the int24-keyed getPool
+      // reverts, so V3Standard NOT SlipstreamCL). On-chain verified 2026-07-03: factory found via
+      // pool.factory() backref on the live LHYPE/WHYPE pool + cross-checked as the Project X
+      // SwapRouter's _factory constructor arg on the explorer; WHYPE/USDT0 pools live at
+      // 100/400/500/3000/10000 (fee=500 L≈6.0e17; LHYPE/WHYPE fee=100 L≈8.1e22, ~$1.18M); pools
+      // expose standard slot0/liquidity + the uniswapV3SwapCallback selector. NON-standard extra
+      // tiers: feeAmountTickSpacing enables 200->4, 400->8 (the deep 0.04% WHYPE/USDT0
+      // stable-adjacent tier) and 1000->20 on top of the canonical set (2500/7500 disabled) — the
+      // default [100,500,3000,10000] would miss them; spacings added to TICK_SPACING_BY_FEE.
+      { address: "0xFf7B3e8C00e57ea31477c32A5B52a58Eea47b072" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Project X CL", feeTiers: [100, 200, 400, 500, 1000, 3000, 10000] },
     ],
     baseTokens: [
       "0x5555555555555555555555555555555555555555" as Hex, // WHYPE (wrapped native, routing hub, 18 dec)
@@ -1044,12 +1146,41 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x1F98400000000000000000000000000000000004" as Hex, stateView: "0x86e8631A016F9068C3f085fAF484Ee3F5fDee8f2" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit). Canonical 0.30% fee.
       { address: "0x1F98400000000000000000000000000000000002" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.V2Standard, label: "Uniswap V2" },
+      // Velodrome Slipstream CL (Unichain) — tickSpacing-keyed getPool(a,b,int24), discovered via
+      // FactoryType.SlipstreamCL. Canonical Superchain leaf CLFactory (same address as Celo/Ink).
+      // Verified on-chain 2026-07-03: getPool(WETH,USDC,int24) non-zero at ts=100 (fee()=150 —
+      // DECOUPLED from spacing; L≈1.9e15) and getPool(USDC,USDT0,1) non-zero (fee()=100, L≈1.2e15
+      // at tick 7); the fee-keyed getPool finds nothing. V3-compatible for execution (swapV3 /
+      // uniswapV3SwapCallback).
+      { address: "0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Velodrome CL" },
     ],
     baseTokens: [
       "0x4200000000000000000000000000000000000006" as Hex, // WETH (OP-stack predeploy, routing hub)
       "0x078D782b760474a361dDA0AF3839290b0EF57AD6" as Hex, // USDC (Circle native, 6 dec)
       "0x9151434b16b9763660705744891fA906F660EcC5" as Hex, // USDT0 (Tether OFT, 6 dec)
       "0x1217BfE6c773EEC6cc4A38b5Dc45B92292B6E189" as Hex, // oUSDT (OpenUSDT, 6 dec)
+    ],
+    feeTiers: [100, 500, 3000, 10000],
+  },
+
+  // World Chain (OP-stack, chainId 480). WLD is the routing hub; USDC 0x79A0… is Circle-native
+  // (the former bridged USDC.e was upgraded in place — symbol() now returns "USDC").
+  worldchain: {
+    factories: [
+      // V3 concentrated liquidity (has price limit). Standard Uniswap V3 fee tiers. Official
+      // Uniswap deployment (developers.uniswap.org WorldChain-deployments); on-chain verified
+      // 2026-07-03: getPool(WLD,USDC,·) live at all 4 tiers, fee=3000 pool holds ~445k WLD +
+      // ~200k USDC (slot0/liquidity respond, L≈5.2e17).
+      { address: "0x7a5028BDa40e7B173C278C5342087826455ea25a" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Uniswap V3", feeTiers: [100, 500, 3000, 10000] },
+      // V4 singleton (PoolManager + StateView lens). On-chain verified 2026-07-03:
+      // StateView.getLiquidity on keccak(PoolKey) poolIds — ETH/WLD 3000 L≈1.24e21, WLD/USDC
+      // 10000 L≈1.79e17 (addresses cross-checked: Uniswap V4 deployments docs + the explorer).
+      { address: "0xb1860D529182ac3BC1F51Fa2ABd56662b7D13f33" as Hex, stateView: "0x51D394718bc09297262e368c1A481217FdEB71eb" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
+    ],
+    baseTokens: [
+      "0x2cFc85d8E48F8EAB294be644d9E25C3030863003" as Hex, // WLD (routing hub, 18 dec)
+      "0x79A02482A880bCE3F13e09Da970dC34db4CD24d1" as Hex, // USDC (Circle native — former USDC.e upgraded in place, 6 dec)
+      "0x4200000000000000000000000000000000000006" as Hex, // WETH (OP-stack predeploy, 18 dec)
     ],
     feeTiers: [100, 500, 3000, 10000],
   },

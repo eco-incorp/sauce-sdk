@@ -28,7 +28,7 @@ const FACTORY_TYPE_VALUES = new Set(Object.values(FactoryType));
 // pre-existing chains carry some non-checksummed (but valid) addresses, so for those we
 // only assert the 20-byte 0x format.
 const STRICT_CHECKSUM_CHAINS = new Set([
-  "bsc", "sonic", "celo", "ink", "plasma", "hyperevm", "unichain", "ronin",
+  "bsc", "sonic", "celo", "ink", "plasma", "hyperevm", "unichain", "ronin", "worldchain",
 ]);
 
 function assertAddrFormat(addr: Hex, where: string): void {
@@ -121,5 +121,6 @@ describe("CHAIN_POOL_CONFIGS shape", () => {
     assert.ok(CHAIN_POOL_CONFIGS.hyperevm, "hyperevm config present");
     assert.ok(CHAIN_POOL_CONFIGS.unichain, "unichain config present");
     assert.ok(CHAIN_POOL_CONFIGS.ronin, "ronin config present");
+    assert.ok(CHAIN_POOL_CONFIGS.worldchain, "worldchain config present");
   });
 });
