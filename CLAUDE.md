@@ -62,6 +62,13 @@ Actions and dev-tools use the **node test runner**, not jest → `pnpm --filter 
   OpenZeppelin submodule into the `sauce` dep and `forge build`s it (pnpm doesn't recurse submodules).
 - **`FORK_URL`** — actions `test`/`test:megas-swap` and dev-tools fork flows hit a hardhat mainnet
   fork (loaded from `.env`). `test:unit` is the fork-free subset.
+- **`SAUCE_ENGINE_SO`** — path to the Solana engine binary (`engine.so`, built with
+  `cargo build-sbf` in the sauce repo's `svm/`). The SVM integration suites
+  (`compiler/integration-test/svm-*.test.ts`, `sdk/test/svm/solswap.e2e.test.ts`) run compiled
+  `target: 'svm'` bytecode on it via LiteSVM; default is the sibling-checkout path
+  `../sauce/svm/target/deploy/engine.so`, and the suites **skip cleanly** when the binary is absent
+  (so CI stays green without it). The `'svm'` compile target, its account-plan output, and the
+  `/svm` SDK subpath are documented in `docs/plans/2026-07-03-solana-svm-support.md`.
 
 ## Architecture
 

@@ -9,6 +9,32 @@ Port Solana as a compile + execution target for the TypeScript compiler and SDK,
 stacked on `feat/compiler-source-imports` (PR #23), the tip of the compiler stack — this base
 includes the v12 bytecode target (PR #18) that Phase A extends; `origin/main` does not have it.
 
+## Status: implemented (2026-07-04)
+
+All five phases landed on this branch. Deliberate deviations from the plan below, with reasons:
+
+- **Target naming**: the repo already used `target: 'v1' | 'v12'`, so SVM is a third value
+  `'svm'` (a v12 dialect) rather than a separate `'evm' | 'svm'` axis.
+- **No `bindings` array on `AccountPlan`**: account refs are interned first-use during emission,
+  so index bytes are final when written — nothing to back-patch, and the ordered `metas` array
+  alone is the compiler↔sender contract.
+- **Phase D harness**: litesvm **npm** bindings (1.2.x, `@solana/kit`-native) instead of the
+  Rust-shim option — zero cross-repo coupling. Cross-engine parity compares svm results against
+  the **v1 Solidity interpreter** via the existing anvil/cast harness (local-only: the suite is
+  engine.so-gated and skips in CI, which has no SVM build), since the Huff-runtime suites are
+  hnc-gated; engine-level v12≡SVM parity is already proven by the 172-vector suite in the
+  engine repo.
+- **`@solana/kit` pinned `^6.10`**, not 7.x: every `@solana-program/*` client peer-requires
+  kit 6 and fails at ESM link against 7.0.
+- **Risk 1 resolved**: the account-lock cap is **64** (the 128 feature gate is inactive);
+  read-only accounts count. The 4-venue budget fits without ALTs.
+- **Phase E**: recipe named `solswap`, runs on LiteSVM with canonical big-endian fixture pools
+  and a system-transfer stand-in for the venue CPI (no engine devnet deploy exists yet — risk 2);
+  real venue adapters (LE reserve decoding, CLMM) documented as out of v1 scope.
+- **Found by executing on the real engine**: two pre-existing v12 emitter bugs — prefix NEG
+  encoding for negative literals (unexecutable on any postfix engine) and the smart-MSTORE
+  epilogue on void mains (underflows the SVM engine's sentinel-less stack).
+
 ---
 
 ## 0. Ground truth this plan is built on
