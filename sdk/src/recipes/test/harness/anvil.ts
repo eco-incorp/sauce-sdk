@@ -59,9 +59,19 @@ async function rpcReady(rpcUrl: string, timeoutMs: number): Promise<void> {
 /**
  * Boot a fresh anvil. Retries port selection a few times in case of a race
  * between freePort() releasing the socket and anvil claiming it.
+ *
+ * `forkUrl`/`forkBlock` (both optional, additive) boot anvil as a FORK of a live
+ * chain pinned to a fixed block — anvil disk-caches fetched fork state per
+ * (chain, block), so repeat runs against the same pin are cheap and
+ * deterministic. Used by the manual network-tier fork smokes
+ * (ecoswap.chains.fork.test.ts); omitted ⇒ the fresh no-fork node all the
+ * local EVM tests boot (unchanged behavior).
  */
-export async function startAnvil(opts: { timeoutMs?: number } = {}): Promise<AnvilHandle> {
-  const timeoutMs = opts.timeoutMs ?? 30_000;
+export async function startAnvil(
+  opts: { timeoutMs?: number; forkUrl?: string; forkBlock?: number } = {},
+): Promise<AnvilHandle> {
+  // Forked boots pull state from a remote RPC — allow much longer to come up.
+  const timeoutMs = opts.timeoutMs ?? (opts.forkUrl ? 120_000 : 30_000);
   let lastErr: unknown;
 
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -83,7 +93,14 @@ export async function startAnvil(opts: { timeoutMs?: number } = {}): Promise<Anv
       // anvil state via anvil_loadState, whose hex payload (~2.5MB for the 10-pool
       // all-pools fixture) exceeds anvil's default 2MB request body limit — without
       // this the loadState RPC fails with "JSON is not a valid request object".
-      ["--port", String(port), "--silent", "--gas-limit", "2000000000", "--no-request-size-limit"],
+      [
+        "--port", String(port), "--silent", "--gas-limit", "2000000000", "--no-request-size-limit",
+        // Fork mode (see docstring): pin to a fixed block for determinism + disk cache reuse.
+        ...(opts.forkUrl ? ["--fork-url", opts.forkUrl] : []),
+        ...(opts.forkUrl && opts.forkBlock !== undefined
+          ? ["--fork-block-number", String(opts.forkBlock)]
+          : []),
+      ],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
 

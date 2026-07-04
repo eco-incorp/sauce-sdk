@@ -46,6 +46,25 @@
  * liquidity(), and a WINDOW of initialized ticks around the current tick, then
  * serialises everything (bigints as decimal strings) to a JSON fixture under
  *   src/recipes/test/fixtures/snapshots/<chain>-algebra-<symbol0><symbol1>-<something>.json
+ *
+ * ALGEBRA INTEGRAL SUPPORT (additive). Algebra Integral (THENA V3,3 on BSC, SwapX on
+ * Sonic, nest/Kittenswap on HyperEVM) returns SHORTER tuples for the SAME selectors:
+ *   - globalState() is 6 words: (uint160 price, int24 tick, uint16 lastFee,
+ *     uint8 pluginConfig, uint16 communityFee, bool unlocked) — the single fee is
+ *     STILL word 2 (word 3 is pluginConfig, NOT a fee; see FactoryConfig.algebraFeeLayout).
+ *   - ticks() is 6 words: (uint256 liquidityTotal, int128 liquidityDelta,
+ *     int24 prevTick, int24 nextTick, uint256 outerFeeGrowth0Token,
+ *     uint256 outerFeeGrowth1Token) — liquidityDelta (== liquidityNet) is STILL index 1,
+ *     but there is NO trailing `initialized` bool: a tick is initialized iff it is
+ *     threaded into the prev/next linked list (liquidityTotal > 0 covers every tick
+ *     that carries positions; nets can be 0 on balanced ticks, which reproduce as no-ops).
+ * The layout is AUTO-DETECTED from the raw globalState() returndata word count
+ * (6 ⇒ integral, 7 ⇒ algebra-v1, 8+ ⇒ camelot), so the default THENA-Fusion capture
+ * path is byte-identical to before. A second CLI arg tags the output filename
+ * (mirrors prod-snapshot.ts's source-tag convention):
+ *
+ *   npx tsx src/recipes/test/harness/algebra-snapshot.ts <poolAddress> integral
+ *     → <chain>-algebraintegral-<symbol0><symbol1>-<tickSpacing>.json
  */
 
 import { join, dirname } from "node:path";
@@ -54,6 +73,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import {
   createPublicClient,
   defineChain,
+  encodeFunctionData,
   http,
   parseAbi,
   getAddress,
@@ -89,6 +109,31 @@ const algebraPoolAbi = parseAbi([
   "function globalState() view returns (uint160 price, int24 tick, uint16 fee, uint16 timepointIndex, uint8 communityFeeToken0, uint8 communityFeeToken1, bool unlocked)",
   "function ticks(int24 tick) view returns (uint128 liquidityTotal, int128 liquidityDelta, uint256 outerFeeGrowth0Token, uint256 outerFeeGrowth1Token, int56 outerTickCumulative, uint160 outerSecondsPerLiquidity, uint32 outerSecondsSpent, bool initialized)",
 ]);
+
+// Algebra INTEGRAL pool surface (THENA V3,3 / SwapX / nest / Kittenswap): the SAME
+// selectors return SHORTER tuples. globalState() is 6 words with the single dynamic
+// fee (lastFee) STILL at word 2; ticks() is 6 words with liquidityDelta STILL at
+// index 1 but NO trailing `initialized` bool (the prev/next linked list replaces it).
+const algebraIntegralPoolAbi = parseAbi([
+  "function globalState() view returns (uint160 price, int24 tick, uint16 lastFee, uint8 pluginConfig, uint16 communityFee, bool unlocked)",
+  "function ticks(int24 tick) view returns (uint256 liquidityTotal, int128 liquidityDelta, int24 prevTick, int24 nextTick, uint256 outerFeeGrowth0Token, uint256 outerFeeGrowth1Token)",
+]);
+
+/** The fork's globalState layout, keyed by raw returndata word count (the same
+ *  length-guess shared/pool-discovery.ts uses when the config omits the layout). */
+type AlgebraLayout = "camelot" | "algebra-v1" | "integral";
+
+/** Detect the pool's globalState layout from ONE raw eth_call (word count). */
+async function detectLayout(client: PublicClient, pool: Hex): Promise<AlgebraLayout> {
+  const data = encodeFunctionData({ abi: algebraPoolAbi, functionName: "globalState" });
+  const { data: ret } = await client.call({ to: pool, data });
+  if (!ret) throw new Error(`algebra-snapshot: ${pool} returned no data for globalState()`);
+  const words = (ret.length - 2) / 64;
+  if (!Number.isInteger(words) || words < 3) {
+    throw new Error(`algebra-snapshot: ${pool} globalState() returndata is ragged/short (${ret.length - 2} hex chars)`);
+  }
+  return words >= 8 ? "camelot" : words === 7 ? "algebra-v1" : "integral";
+}
 
 const erc20Abi = parseAbi([
   "function symbol() view returns (string)",
@@ -149,14 +194,22 @@ async function symbolOf(client: PublicClient, token: Hex): Promise<{ symbol: str
 async function captureSnapshot(client: PublicClient, pool: Hex): Promise<ProdPoolSnapshot> {
   const chainId = await client.getChainId();
 
+  // Detect the fork's globalState/ticks tuple shape FIRST (one raw eth_call): a typed
+  // 7-word decode on a 6-word Integral pool throws, so the reads below pick the ABI
+  // by layout. The default (algebra-v1) path is unchanged.
+  const layout = await detectLayout(client, pool);
+  console.log(`algebra-snapshot: detected globalState layout "${layout}"`);
+  const gsAbi = layout === "integral" ? algebraIntegralPoolAbi : algebraPoolAbi;
+
   const [token0, token1, tickSpacing, liquidity, globalState] = await Promise.all([
     client.readContract({ address: pool, abi: algebraPoolAbi, functionName: "token0" }) as Promise<Hex>,
     client.readContract({ address: pool, abi: algebraPoolAbi, functionName: "token1" }) as Promise<Hex>,
     client.readContract({ address: pool, abi: algebraPoolAbi, functionName: "tickSpacing" }) as Promise<number>,
     client.readContract({ address: pool, abi: algebraPoolAbi, functionName: "liquidity" }) as Promise<bigint>,
     // globalState() is Algebra's slot0() analogue: [0]=sqrtPriceX96, [1]=tick,
-    // [2]=CURRENT dynamic fee (from the on-chain volatility oracle).
-    client.readContract({ address: pool, abi: algebraPoolAbi, functionName: "globalState" }) as Promise<
+    // [2]=CURRENT dynamic fee (from the on-chain volatility oracle) — the fee sits at
+    // word 2 on EVERY layout (integral's word 3 is pluginConfig, v1's the timepointIndex).
+    client.readContract({ address: pool, abi: gsAbi, functionName: "globalState" }) as Promise<
       readonly [bigint, number, number, ...unknown[]]
     >,
   ]);
@@ -178,10 +231,12 @@ async function captureSnapshot(client: PublicClient, pool: Hex): Promise<ProdPoo
     boundaries.push(base + k * ts);
   }
 
-  // One multicall round-trip for the whole window.
+  // One multicall round-trip for the whole window. The ticks() ABI is layout-keyed:
+  // Integral's tuple is 6 words with NO trailing `initialized` bool.
+  const ticksAbi = layout === "integral" ? algebraIntegralPoolAbi : algebraPoolAbi;
   const tickCalls = boundaries.map((b) => ({
     address: pool,
-    abi: algebraPoolAbi,
+    abi: ticksAbi,
     functionName: "ticks" as const,
     args: [b] as const,
   }));
@@ -191,13 +246,15 @@ async function captureSnapshot(client: PublicClient, pool: Hex): Promise<ProdPoo
   for (let i = 0; i < boundaries.length; i++) {
     const r = results[i];
     if (r.status !== "success") continue;
-    // Algebra ticks(): [liquidityTotal, liquidityDelta, …, initialized].
-    // liquidityDelta (== the Uniswap-V3 liquidityNet) is index 1 — SAME slot as
-    // Uniswap V3. The trailing `initialized` bool is the last element regardless
-    // of the exact tuple width.
+    // Algebra ticks(): [liquidityTotal, liquidityDelta, …]. liquidityDelta (== the
+    // Uniswap-V3 liquidityNet) is index 1 on EVERY layout — SAME slot as Uniswap V3.
     const tup = r.result as unknown as [bigint, bigint, ...unknown[]];
     const liquidityNet = tup[1];
-    const initialized = tup[tup.length - 1] as boolean;
+    // Initialized: v1/camelot carry a trailing bool; Integral has NONE (membership in
+    // the prev/next linked list replaces it) — there liquidityTotal > 0 marks a tick
+    // that carries positions (a balanced tick can have net 0, reproducing as a no-op).
+    const initialized =
+      layout === "integral" ? tup[0] > 0n : (tup[tup.length - 1] as boolean);
     if (initialized || liquidityNet !== 0n) ticks.push([boundaries[i], liquidityNet.toString()]);
   }
 
@@ -308,6 +365,10 @@ async function main(): Promise<void> {
 
   const client = await makeClient(rpcUrl);
   const arg = process.argv[2];
+  // Optional source tag (mirrors prod-snapshot.ts): appended to the "algebra" stem in
+  // the output filename, e.g. `integral` → <chain>-algebraintegral-<syms>-<ts>.json.
+  // Keeps sibling Algebra-family captures (v1 vs Integral) from clobbering each other.
+  const sourceTag = (process.argv[3] ?? "").replace(/[^a-zA-Z0-9]/g, "");
 
   let pool: Hex;
   if (arg && /^0x[0-9a-fA-F]{40}$/.test(arg)) {
@@ -321,12 +382,12 @@ async function main(): Promise<void> {
   const snap = await captureSnapshot(client, pool);
 
   mkdirSync(SNAPSHOT_DIR, { recursive: true });
-  // <chain>-algebra-<symbol0><symbol1>-<tickSpacing>.json — Algebra has ONE pool
+  // <chain>-algebra<tag>-<symbol0><symbol1>-<tickSpacing>.json — Algebra has ONE pool
   // per pair (no fee tiers), so the tickSpacing is the stable disambiguator (the
   // dynamic fee floats and would drift the filename between captures).
   const file = join(
     SNAPSHOT_DIR,
-    `${chainName(snap.chainId)}-algebra-${snap.symbol0}${snap.symbol1}-${snap.tickSpacing}.json`,
+    `${chainName(snap.chainId)}-algebra${sourceTag}-${snap.symbol0}${snap.symbol1}-${snap.tickSpacing}.json`,
   );
   writeFileSync(file, JSON.stringify(snap, null, 2) + "\n");
 

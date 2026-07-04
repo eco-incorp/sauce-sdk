@@ -19,12 +19,27 @@
  *
  * NOT imported by any test. Run it only when you have a live RPC:
  *
- *   BASE_RPC_URL=<url> npx tsx src/recipes/test/harness/slipstream-snapshot.ts [poolAddressOrPair]
+ *   BASE_RPC_URL=<url> npx tsx src/recipes/test/harness/slipstream-snapshot.ts [poolAddressOrPair] [venueTag]
  *
  * With no arg it discovers the deepest all-stablecoin Aerodrome CL pool on Base
  * (USDC/USDbC) from the Slipstream CLFactory (the pool address is read from
  * getPool, never hardcoded). An optional CLI arg overrides the target with an
  * explicit pool address.
+ *
+ * NON-Base Slipstream-family venues (Topaz CL on BSC, Hybra V4 / Ramses CL on
+ * HyperEVM, Velodrome CL on Unichain, …) are captured by pointing SNAPSHOT_RPC_URL
+ * at the venue's chain (it takes precedence over BASE_RPC_URL) and passing the
+ * pool address + a venue tag (argv[3], folded into the filename — mirrors
+ * prod-snapshot.ts's source tag):
+ *
+ *   SNAPSHOT_RPC_URL=<bsc-url> npx tsx src/recipes/test/harness/slipstream-snapshot.ts \
+ *     0x767F1F4bF9E5E40F3D865c172c9bD0AE216e65B4 topaz
+ *
+ * → fixtures/snapshots/bsc-topaz-<symbol0><symbol1>-<tickSpacing>.json. The
+ * captured shape is IDENTICAL (ProdPoolSnapshot): every Slipstream-family pool
+ * exposes the same 6-field slot0 + decoupled fee() surface. The tick-window scan
+ * is CHUNKED with retry/backoff so rate-limited public RPCs (e.g. HyperEVM's
+ * rpc.hyperliquid.xyz/evm) sustain the capture.
  *
  * It reads the pool's static config (token0/token1/fee/tickSpacing), its live
  * slot0 (sqrtPriceX96 + tick) and active liquidity(), and a WINDOW of
@@ -96,6 +111,13 @@ const SLIPSTREAM_TICK_SPACINGS = [1, 50, 100, 200, 2000] as const;
  */
 const WINDOW_TICKSPACINGS = 200;
 
+/**
+ * ticks() calls per multicall round-trip. Small enough that a rate-limited public
+ * RPC (HyperEVM) accepts each aggregate3; on a paid RPC the whole window is still
+ * only a handful of round-trips.
+ */
+const TICKS_CHUNK = 50;
+
 async function makeClient(rpcUrl: string): Promise<PublicClient> {
   const probe = createPublicClient({ transport: http(rpcUrl) });
   const chainId = await probe.getChainId();
@@ -150,14 +172,36 @@ async function captureSnapshot(client: PublicClient, pool: Hex): Promise<ProdPoo
     boundaries.push(base + k * ts);
   }
 
-  // One multicall round-trip for the whole window.
+  // Chunked multicall over the window (one aggregate3 per chunk) with
+  // retry/backoff per chunk — a 401-call single round-trip is fine on a paid
+  // RPC but can exceed a public RPC's request/gas budget or trip rate limits.
   const tickCalls = boundaries.map((b) => ({
     address: pool,
     abi: clPoolAbi,
     functionName: "ticks" as const,
     args: [b] as const,
   }));
-  const results = await client.multicall({ contracts: tickCalls, allowFailure: true });
+  const results: { status: "success" | "failure"; result?: unknown }[] = [];
+  for (let off = 0; off < tickCalls.length; off += TICKS_CHUNK) {
+    const chunk = tickCalls.slice(off, off + TICKS_CHUNK);
+    let lastErr: unknown;
+    let ok = false;
+    for (let attempt = 0; attempt < 4 && !ok; attempt++) {
+      if (attempt > 0) {
+        const backoffMs = 1000 * 2 ** (attempt - 1);
+        console.log(`  ticks chunk @${off}: retry ${attempt} after ${backoffMs}ms`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
+      try {
+        const part = await client.multicall({ contracts: chunk, allowFailure: true });
+        results.push(...part);
+        ok = true;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!ok) throw lastErr;
+  }
 
   const ticks: [number, string][] = [];
   for (let i = 0; i < boundaries.length; i++) {
@@ -197,6 +241,11 @@ function chainName(chainId: number): string {
   if (chainId === 1) return "ethereum";
   if (chainId === 42161) return "arbitrum";
   if (chainId === 10) return "optimism";
+  if (chainId === 56) return "bsc";
+  if (chainId === 999) return "hyperevm";
+  if (chainId === 130) return "unichain";
+  if (chainId === 42220) return "celo";
+  if (chainId === 146) return "sonic";
   return `chain${chainId}`;
 }
 
@@ -247,13 +296,17 @@ async function discoverDefaultPool(client: PublicClient): Promise<Hex> {
 }
 
 async function main(): Promise<void> {
-  const rpcUrl = process.env.BASE_RPC_URL;
+  // SNAPSHOT_RPC_URL points the capture at ANY Slipstream-family chain (BSC
+  // Topaz, HyperEVM Hybra V4, …); BASE_RPC_URL keeps the original Base default.
+  const rpcUrl = process.env.SNAPSHOT_RPC_URL || process.env.BASE_RPC_URL;
   if (!rpcUrl) {
     console.error(
-      "slipstream-snapshot: BASE_RPC_URL is not set.\n" +
-        "  Set it to a Base RPC and re-run, e.g.:\n" +
+      "slipstream-snapshot: neither SNAPSHOT_RPC_URL nor BASE_RPC_URL is set.\n" +
+        "  Set one and re-run, e.g.:\n" +
         "    BASE_RPC_URL=https://... npx tsx src/recipes/test/harness/slipstream-snapshot.ts\n" +
-        "  Optional arg: an explicit Slipstream CL pool address to capture instead of the default USDC/USDbC pool.",
+        "    SNAPSHOT_RPC_URL=https://<other-chain> npx tsx src/recipes/test/harness/slipstream-snapshot.ts <pool> <venueTag>\n" +
+        "  Optional args: an explicit Slipstream-family pool address (argv[2]) and a venue tag (argv[3])\n" +
+        "  folded into the snapshot filename (default 'slipstream').",
     );
     process.exit(0);
     return;
@@ -261,6 +314,10 @@ async function main(): Promise<void> {
 
   const client = await makeClient(rpcUrl);
   const arg = process.argv[2];
+  // Optional venue tag (argv[3]) — folded into the filename so a Slipstream-family
+  // fork's pool (topaz, hybrav4, …) lands beside the Aerodrome default without
+  // clobbering it. Mirrors prod-snapshot.ts's source tag.
+  const tag = (process.argv[3] ?? "slipstream").replace(/[^a-zA-Z0-9]/g, "") || "slipstream";
 
   let pool: Hex;
   if (arg && /^0x[0-9a-fA-F]{40}$/.test(arg)) {
@@ -273,11 +330,14 @@ async function main(): Promise<void> {
   const snap = await captureSnapshot(client, pool);
 
   mkdirSync(SNAPSHOT_DIR, { recursive: true });
-  // base-slipstream-<symbol0><symbol1>-<tickSpacing>.json — keyed by tickSpacing
-  // (Slipstream's pool key), NOT fee, since Slipstream decouples the two.
+  // <chain>-<venueTag>-<symbol0><symbol1>-<tickSpacing>.json — keyed by tickSpacing
+  // (Slipstream's pool key), NOT fee, since Slipstream decouples the two. Symbols
+  // are ASCII-sanitized for the filename only (Tether's ₮ glyph → T; the snapshot
+  // JSON keeps the raw symbol): checked-in fixture names stay plain ASCII.
+  const fsSafe = (s: string) => s.replace(/₮/g, "T").replace(/[^a-zA-Z0-9]/g, "");
   const file = join(
     SNAPSHOT_DIR,
-    `${chainName(snap.chainId)}-slipstream-${snap.symbol0}${snap.symbol1}-${snap.tickSpacing}.json`,
+    `${chainName(snap.chainId)}-${tag}-${fsSafe(snap.symbol0)}${fsSafe(snap.symbol1)}-${snap.tickSpacing}.json`,
   );
   writeFileSync(file, JSON.stringify(snap, null, 2) + "\n");
 
