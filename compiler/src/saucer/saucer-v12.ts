@@ -3,6 +3,7 @@ import { OPS_V12 } from './ops-v12.js';
 import { encodeInt } from './integer.js';
 import { encodeBytes, encodeString } from './bytes.js';
 import { encodeArray } from './array.js';
+import { assertSvmSupported } from './svm-profile.js';
 import type { CompilerContext, VariableKind, ElementType, StructType } from '../context.js';
 import type { SaucerLike, SaucerIfLike, SaucerThenLike, SaucerLoopLike, OutputSpec } from './saucer-like.js';
 
@@ -645,9 +646,13 @@ export class V12Saucer implements SaucerLike {
 
   // ── storage ──
   sload(slot: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'storage.read'); // svm SLOAD reads account data, not slots
+
     return this.unary(OPS.SLOAD, slot);
   }
   sstore(slot: SaucerLike, value: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'storage.write'); // svm SSTORE writes account data, not slots
+
     // v12: [value][slot][SSTORE] — value before slot.
     return this.binaryRaw(OPS.SSTORE, value, slot, false);
   }
@@ -689,23 +694,71 @@ export class V12Saucer implements SaucerLike {
     );
   }
 
+  /**
+   * Ternary op with explicit (no-swap) operand order: [first][second][third][OP].
+   * `opStackEffect` is the opcode's own net stack delta: -2 for ops that consume
+   * three operands and push a result (svm SLOAD), -3 for ops that push nothing
+   * (svm SSTORE). The 3-operand sibling of `binaryRaw`.
+   */
+  private ternaryRaw(
+    op: number,
+    firstL: SaucerLike,
+    secondL: SaucerLike,
+    thirdL: SaucerLike,
+    isDynamic: boolean,
+    opStackEffect: number,
+  ): V12Saucer {
+    const first = firstL as V12Saucer;
+    const second = secondL as V12Saucer;
+    const third = thirdL as V12Saucer;
+    const calls = [...this.callPositions];
+    const refs = [...this.refPositions];
+    const firstOff = this._bytes.length;
+    mergeSentinels(calls, refs, first, firstOff, this.stackEffect);
+    const secondOff = firstOff + first._bytes.length;
+    mergeSentinels(calls, refs, second, secondOff, this.stackEffect + first.stackEffect);
+    const thirdOff = secondOff + second._bytes.length;
+    mergeSentinels(calls, refs, third, thirdOff, this.stackEffect + first.stackEffect + second.stackEffect);
+
+    return new V12Saucer(
+      this.ctx,
+      concat(this._bytes, first._bytes, second._bytes, third._bytes, [op]),
+      this.stackEffect + first.stackEffect + second.stackEffect + third.stackEffect + opStackEffect,
+      isDynamic,
+      calls,
+      refs,
+    );
+  }
+
   // ── create ──
   create(value: SaucerLike, bytecode: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'create');
+
     return this.binary(OPS.CREATE, value, bytecode);
   }
   create2(value: SaucerLike, salt: SaucerLike, bytecode: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'create2');
+
     return this.ternary(OPS.CREATE2, value, salt, bytecode);
   }
   create3(value: SaucerLike, salt: SaucerLike, bytecode: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'create3');
+
     return this.ternary(OPS.CREATE3, value, salt, bytecode);
   }
   createAddress(deployer: SaucerLike, nonce: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'createAddress');
+
     return this.binary(OPS.CREATE_ADDRESS, deployer, nonce);
   }
   create2Address(deployer: SaucerLike, salt: SaucerLike, bytecodeHash: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'create2Address');
+
     return this.ternary(OPS.CREATE2_ADDRESS, deployer, salt, bytecodeHash);
   }
   create3Address(salt: SaucerLike): V12Saucer {
+    assertSvmSupported(this.ctx, 'create3Address');
+
     return this.unary(OPS.CREATE3_ADDRESS, salt);
   }
 
@@ -817,10 +870,57 @@ export class V12Saucer implements SaucerLike {
     return raw.decodeOutput(output);
   }
   delegateCall(target: SaucerLike, calldata: SaucerLike, output?: OutputSpec): V12Saucer {
+    assertSvmSupported(this.ctx, 'delegatecall');
+
     // DELEGATE consumes target+calldata and pushes a result descriptor → net -1.
     const raw = this.binaryRaw(OPS.DELEGATE, target, calldata, true, -1);
 
     return raw.decodeOutput(output);
+  }
+
+  // ── svm-target lowering (divergent shapes — see svm-profile.ts) ──
+
+  /**
+   * svm CALL (0xA2): [accountsArray][calldata][target][CALL] — target (32-byte
+   * program id) on top, then the calldata Bytes descriptor, then a static ARRAY
+   * of scalar user-account indices (element data inline in bytecode; the engine
+   * pops only the descriptor). No value operand. Pushes the CPI returndata as a
+   * Bytes descriptor (net -2). `.catch()` composes exactly as on the EVM call,
+   * but on SVM it intercepts only PRE-FLIGHT failures (unresolvable target /
+   * calldata / accounts operands) — once invoke() launches, a failing callee
+   * aborts the whole transaction.
+   */
+  svmCall(target: SaucerLike, calldata: SaucerLike, accountsArray: SaucerLike): V12Saucer {
+    return this.ternary(OPS.CALL, accountsArray, calldata, target, true);
+  }
+
+  /** svm STATIC (0xA3): exact alias of svm CALL — identical operands and result. */
+  svmStaticCall(target: SaucerLike, calldata: SaucerLike, accountsArray: SaucerLike): V12Saucer {
+    return this.ternary(OPS.STATIC, accountsArray, calldata, target, true);
+  }
+
+  /**
+   * svm SLOAD (0x81): [len][offset][index][SLOAD] — account index on top, then
+   * offset, then len. Reads accounts[index].data[offset..offset+len] and pushes
+   * a Bytes descriptor (net -2). Surface: accountData(ref, offset, len).
+   */
+  svmAccountData(index: SaucerLike, offset: SaucerLike, len: SaucerLike): V12Saucer {
+    return this.ternaryRaw(OPS.SLOAD, len, offset, index, true, -2);
+  }
+
+  /**
+   * svm SSTORE (0xC5): [value][offset][index][SSTORE] — account index on top,
+   * then offset, then the value Bytes descriptor. Writes the bytes into the
+   * (writable) account's data; pushes nothing (net -3, so a bare statement's
+   * dropIfUnused is a no-op). Surface: writeAccountData(ref, offset, value).
+   * The engine REQUIRES a Bytes descriptor for the value, so a scalar operand
+   * is MSTORE-wrapped into a 32-byte heap word first (the CONCAT wrap idiom).
+   */
+  svmWriteAccountData(index: SaucerLike, offset: SaucerLike, value: SaucerLike): V12Saucer {
+    const v = value as V12Saucer;
+    const wrapped = v.isDynamic ? v : v.withBytes([OPS_V12.MSTORE], v.stackEffect, true);
+
+    return this.ternaryRaw(OPS.SSTORE, wrapped, offset, index, false, -3);
   }
 
   private decodeOutput(output?: OutputSpec): V12Saucer {
@@ -947,6 +1047,12 @@ export class V12Saucer implements SaucerLike {
   // ── build ──
   /** Main body: append MSTORE for a scalar result (the engine expects a descriptor). */
   build(): Uint8Array {
+    // svm: the engine enters main with an EMPTY stack (no stack-bottom sentinel,
+    // unlike the EVM Huff runtime), so a VOID main (net stack effect 0) must not
+    // emit the result-MSTORE — it would pop the empty stack and abort the whole
+    // transaction with StackUnderflow.
+    if (this.ctx.isSvm && this.stackEffect <= 0) return this._bytes;
+
     if (!this.isDynamic && this._bytes.length > 0) {
       return concat(this._bytes, [OPS_V12.MSTORE]);
     }

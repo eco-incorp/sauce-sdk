@@ -1,8 +1,8 @@
 import type { Expression, Literal, ArrayExpression, ObjectExpression, Property } from 'acorn';
 import { keccak256, toBytes } from 'viem';
 import { OPS } from './saucer/index.js';
-import type { SaucerLike } from './saucer/index.js';
-import type { VariableKind } from './context.js';
+import type { SaucerLike, V12Saucer } from './saucer/index.js';
+import type { VariableKind, CompilerContext } from './context.js';
 import { compile } from './index.js';
 
 type PropertyCompile = (saucer: SaucerLike) => SaucerLike;
@@ -76,6 +76,114 @@ const expectArity = (name: string, expected: number, args: Expression[]): void =
     throw new Error(
       `${name} expects ${expected === 1 ? 'exactly 1 argument' : `${expected} argument(s), got ${args.length}`}`,
     );
+};
+
+// --- svm account helpers (target 'svm' call/storage lowering) ---
+
+/**
+ * Resolve one accounts-list entry to a user-account index: a string literal is a
+ * READONLY symbolic ref (interned into the shared plan), an object literal
+ * `{ref, writable?, signer?}` interns with flags (ref a string literal, flags
+ * boolean literals), and an integer literal 0-255 is a raw index (escape hatch
+ * bypassing the plan; raw and symbolic modes cannot be mixed in one compile).
+ */
+const svmAccountEntry = (name: string, el: ArrayExpression['elements'][number], ctx: CompilerContext): number => {
+  const invalid = (): Error =>
+    new Error(`${name} accounts entries must be string refs, {ref, writable?, signer?} objects, or integer indices`);
+
+  if (el?.type === 'Literal') {
+    const v = (el as Literal).value;
+
+    if (typeof v === 'string') return ctx.internAccount(v);
+
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 255) {
+      ctx.useRawAccountIndex();
+
+      return v;
+    }
+
+    throw invalid();
+  }
+
+  if (el?.type === 'ObjectExpression') {
+    let ref: string | undefined;
+    const flags = { writable: false, signer: false };
+
+    for (const prop of (el as ObjectExpression).properties) {
+      if (prop.type !== 'Property') throw invalid();
+
+      const p = prop as Property;
+
+      // Computed keys ({ [expr]: … }) are not the plain literal shape the spec
+      // allows — reject rather than silently reading the key expression's node.
+      if (p.computed) throw invalid();
+
+      const key = p.key.type === 'Identifier' ? (p.key as { name: string }).name : String((p.key as Literal).value);
+      const value = p.value as Expression;
+
+      if (key === 'ref') {
+        if (value.type !== 'Literal' || typeof (value as Literal).value !== 'string') throw invalid();
+
+        ref = (value as Literal).value as string;
+      } else if (key === 'writable' || key === 'signer') {
+        if (value.type !== 'Literal' || typeof (value as Literal).value !== 'boolean') throw invalid();
+
+        flags[key] = (value as Literal).value as boolean;
+      } else {
+        throw invalid();
+      }
+    }
+
+    if (ref === undefined) throw invalid();
+
+    return ctx.internAccount(ref, flags);
+  }
+
+  throw invalid();
+};
+
+/**
+ * Lower a call's accounts argument (an array-literal expression) to the static
+ * ARRAY of 1-byte account indices the SVM engine expects — element data inline
+ * in the bytecode (the engine pops just the descriptor and resolves each index
+ * against the execute instruction's user accounts).
+ */
+const svmAccountsArray = (name: string, arg: Expression, ctx: CompilerContext): SaucerLike => {
+  if (arg.type !== 'ArrayExpression') {
+    throw new Error(`${name} on target 'svm' expects (target, calldata, accounts[])`);
+  }
+
+  const elements = (arg as ArrayExpression).elements;
+
+  if (elements.length > 64) {
+    throw new Error(`${name} accounts list exceeds the 64-account CPI cap (got ${elements.length})`);
+  }
+
+  const indices = elements.map((el) => svmAccountEntry(name, el, ctx));
+
+  return ctx.newSaucer().array(indices.map((i) => ctx.newSaucer().int(BigInt(i))));
+};
+
+/** Resolve an accountData/writeAccountData ref argument to an account-index saucer. */
+const svmAccountRef = (
+  name: string,
+  arg: Expression,
+  ctx: CompilerContext,
+  flags: { writable?: boolean; signer?: boolean } = {},
+): SaucerLike => {
+  if (arg.type === 'Literal') {
+    const v = (arg as Literal).value;
+
+    if (typeof v === 'string') return ctx.newSaucer().int(BigInt(ctx.internAccount(v, flags)));
+
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 255) {
+      ctx.useRawAccountIndex();
+
+      return ctx.newSaucer().int(BigInt(v));
+    }
+  }
+
+  throw new Error(`${name} ref must be a string literal ref or an integer index`);
 };
 
 // --- emit() helpers ---
@@ -411,8 +519,11 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   },
 
   // contract.call(target, value, calldata)             — raw external call
+  //   target 'svm': contract.call(target, calldata, accounts[]) — accounts is an
+  //   array literal of string refs / {ref, writable?, signer?} objects / raw indices
   // contract.static(target, calldata)                  — raw static call (read-only)
-  // contract.delegate(target, calldata)                — raw delegate call
+  //   target 'svm': contract.static(target, calldata, accounts[]) — alias of call
+  // contract.delegate(target, calldata)                — raw delegate call (not on 'svm')
   // contract.create(value, bytecode)                   — deploy contract with CREATE
   // contract.create2(value, salt, bytecode)            — deploy contract with CREATE2
   // contract.create3(value, salt, bytecode)            — deploy contract with CREATE3
@@ -425,12 +536,27 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
       compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
         expectArity('contract.call', 3, args);
 
+        if (s.ctx.isSvm) {
+          const target = process(args[0]);
+          const calldata = process(args[1]);
+
+          return (s as V12Saucer).svmCall(target, calldata, svmAccountsArray('contract.call', args[2], s.ctx));
+        }
+
         return s.externalCall(process(args[0]), process(args[1]), process(args[2]));
       },
     },
     static: {
       kind: 'dynamic',
       compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
+        if (s.ctx.isSvm) {
+          expectArity('contract.static', 3, args);
+          const target = process(args[0]);
+          const calldata = process(args[1]);
+
+          return (s as V12Saucer).svmStaticCall(target, calldata, svmAccountsArray('contract.static', args[2], s.ctx));
+        }
+
         expectArity('contract.static', 2, args);
 
         return s.staticCall(process(args[0]), process(args[1]));
@@ -439,6 +565,8 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     delegate: {
       kind: 'dynamic',
       compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
+        if (s.ctx.isSvm) throw new Error(`delegatecall is not supported on target 'svm'`);
+
         expectArity('contract.delegate', 2, args);
 
         return s.delegateCall(process(args[0]), process(args[1]));
@@ -556,14 +684,57 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
         const code = (args[0] as Literal).value as string;
         const source = /function\s+main\s*\(/.test(code) ? code : `function main() { ${code} }`;
         // Compile the nested program for the SAME target as the enclosing one, so
-        // the EVAL'd bytecode matches the engine it will run on (v1 vs v12).
-        const { bytecode } = compile(source, { target: s.ctx.target });
+        // the EVAL'd bytecode matches the engine it will run on (v1 vs v12/svm).
+        const { bytecode, accountPlan } = compile(source, { target: s.ctx.target });
+
+        // svm: the nested compile has its OWN account registry, so a ref interned
+        // inside eval'd code would silently miss the outer account plan (and EVAL
+        // runs in static mode — no CPI). Reject refs; plain eval'd compute is fine.
+        if (accountPlan && accountPlan.metas.length > 0) {
+          throw new Error(`account refs inside eval() are not supported on target 'svm'`);
+        }
+
+        // Raw numeric indices inside eval'd code read the OUTER instruction's
+        // account list (EVAL shares it) — propagate raw mode so mixing with the
+        // enclosing program's symbolic refs still fails loud.
+        if (accountPlan?.usesRawIndices) s.ctx.useRawAccountIndex();
 
         return s.eval(s.ctx.newSaucer().bytes(bytecode[0]));
       }
 
       // Dynamic: pass runtime bytecodes to EVAL opcode
       return s.eval(process(args[0]));
+    },
+  },
+  // accountData(ref, offset, len) — svm-only: read len bytes at offset from the
+  //   ref'd account's data (ref interned READONLY into the account plan) → bytes
+  //   accountData('pool', 0, 32)
+  //   accountData(2, 8, 16)  — raw user-account index (escape hatch)
+  // writeAccountData(ref, offset, value) — svm-only: write the value bytes at
+  //   offset into the ref'd account's data (ref interned WRITABLE); returns nothing
+  //   writeAccountData('vault', 0, abi.encode(42))
+  accountData: {
+    kind: 'dynamic',
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
+      if (!s.ctx.isSvm) throw new Error(`accountData is only available on target 'svm'`);
+
+      expectArity('accountData', 3, args);
+
+      const index = svmAccountRef('accountData', args[0], s.ctx);
+
+      return (s as V12Saucer).svmAccountData(index, process(args[1]), process(args[2]));
+    },
+  },
+  writeAccountData: {
+    kind: 'scalar',
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
+      if (!s.ctx.isSvm) throw new Error(`writeAccountData is only available on target 'svm'`);
+
+      expectArity('writeAccountData', 3, args);
+
+      const index = svmAccountRef('writeAccountData', args[0], s.ctx, { writable: true });
+
+      return (s as V12Saucer).svmWriteAccountData(index, process(args[1]), process(args[2]));
     },
   },
 };

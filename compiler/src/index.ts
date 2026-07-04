@@ -14,6 +14,7 @@ import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import type { RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
 import type { ContractsConfig } from './contracts.js';
+import type { AccountPlan } from './planner/registry.js';
 
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
@@ -22,6 +23,8 @@ export { CompilerContext } from './context.js';
 export type { CompileTarget } from './context.js';
 export { OPS } from './saucer/ops.js';
 export { OPS_V12 } from './saucer/ops-v12.js';
+export { SVM_UNSUPPORTED } from './saucer/svm-profile.js';
+export type { AccountMeta, AccountPlan } from './planner/registry.js';
 
 export type {
   AbiParameter,
@@ -40,7 +43,11 @@ export interface CompileOptions {
   baseDirs?: string[];
   contracts?: ContractsConfig;
   args?: ArgValue[];
-  /** Bytecode target: 'v1' (prefix, Solidity interpreter) or 'v12' (postfix, Huff runtime). Default 'v1'. */
+  /**
+   * Bytecode target: 'v1' (prefix, Solidity interpreter), 'v12' (postfix, Huff runtime) or
+   * 'svm' (postfix v12 dialect for the Solana engine — same assembler/opcodes, divergent
+   * call/storage lowering; the result carries an accountPlan). Default 'v1'.
+   */
   target?: CompileTarget;
   /**
    * Transform an imported SOURCE module's text before parsing — e.g. strip TypeScript types.
@@ -69,6 +76,8 @@ export interface CompileOptions {
 export interface CompileResult {
   bytecode: Uint8Array[];
   warnings: string[];
+  /** target 'svm' only: ordered user-account plan (metas[i] = user-account index i). */
+  accountPlan?: AccountPlan;
 }
 
 function inferArgType(v: ArgValue): { kind: VariableKind; elementType?: ElementType } {
@@ -111,14 +120,22 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
 
   const saucers = processNode(ast, ctx);
 
-  if (target === 'v12') {
-    // v12 assembles every function into a single blob. The runtime entry pushes
-    // only a stack-bottom sentinel and jumps to offset 0 — it does NOT marshal
-    // main()'s parameters onto the stack. So when args are supplied, we synthesize
-    // a no-param WRAPPER entry that pushes the args and CALL_FUNCTIONs the original
-    // main (now a normal table function whose params arrive via the call frame) —
-    // the v12 analogue of v1's appended [CALL_FUNCTION, mainIndex, argCount, …args].
-    return { bytecode: [assembleV12(ctx, options.args ?? [])], warnings: ctx.warnings };
+  if (target !== 'v1') {
+    // v12 (and its svm dialect) assembles every function into a single blob. The
+    // runtime entry pushes only a stack-bottom sentinel and jumps to offset 0 — it
+    // does NOT marshal main()'s parameters onto the stack. So when args are supplied,
+    // we synthesize a no-param WRAPPER entry that pushes the args and CALL_FUNCTIONs
+    // the original main (now a normal table function whose params arrive via the call
+    // frame) — the v12 analogue of v1's appended [CALL_FUNCTION, mainIndex, argCount, …args].
+    const bytecode = [assembleV12(ctx, options.args ?? [])];
+
+    if (target === 'svm') {
+      // The account plan is the interned-ref registry in first-use order (empty
+      // metas for pure-compute programs or raw-index programs).
+      return { bytecode, warnings: ctx.warnings, accountPlan: ctx.buildAccountPlan() };
+    }
+
+    return { bytecode, warnings: ctx.warnings };
   }
 
   const bytecodes = saucers.map((saucer) => saucer.build());
