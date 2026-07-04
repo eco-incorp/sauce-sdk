@@ -1694,9 +1694,11 @@ function main(
 
       // 1b. routes — each route's head is the LEFT-TO-RIGHT product fold of its legs' best
       // fee-adjusted heads. For EACH leg L (pool slice [baseL, baseL+countL), fields at rt[1+5L],
-      // rt[2+5L]) compute its internal best ACTIVE pool near/far adj, fold near→routeNear and
-      // far→routeFar via composeStep. A route is dead if ANY leg has no active pool. N-leg loop
-      // over legCount (rt[0]) — 2-hop and 3-hop are the same code.
+      // rt[2+5L]) compute its internal best ACTIVE member near/far adj — pools first, then the
+      // leg's QL VENUE cursors (HAS_LEG_QLV; a slice head is post-fee with far == near) — fold
+      // near→routeNear and far→routeFar via composeStep. A route is dead only when a leg has NO
+      // active member (pools AND venues all inactive/exhausted). N-leg loop over legCount (rt[0])
+      // — 2-hop and 3-hop are the same code.
       if (HAS_ROUTES) {
       for (let r = 0; r < routing.length; r = r + 1) {
         const rt: Tuple = routing[r];
@@ -1737,6 +1739,30 @@ function main(
                 if (aadj > lAdj) { w0 = 1; }
                 if (aadj === lAdj) { if (afarAdj > lFarAdj) { w0 = 1; } }
                 if (w0 === 1) { lAdj = aadj; lFarAdj = afarAdj; lLive = 1; }
+              }
+            }
+          }
+          // Leg QL VENUE heads ([qB, qE) GLOBAL qlv indices from the stride-5 routing row): the
+          // cursor's CURRENT slice head msNear[qlCur] is ALREADY post-fee out/in (NO extra
+          // fee-adjust) and a slice is FLAT — its far IS its near — so it enters the fold with
+          // far == near (beating any near-tied bracket, whose far < near). Same legMemberWins ops
+          // as the pool scan above (strict-near win; near-tie by strictly higher far; the
+          // incumbent keeps exact ties; pools scanned BEFORE venues, both ascending). Activity is
+          // the cursor test ALONE (the qlCursorActive mirror): active ⇒ remCap > 0 (rows are
+          // emitted with capacity > 0 and Phase D advances the cursor exactly when remCap hits 0),
+          // so an extra remCap gate would be a third-site election-op divergence, not a guard.
+          if (HAS_LEG_QLV) {
+            const qB: Uint256 = rt[3 + 5 * L];
+            const qE: Uint256 = qB + rt[4 + 5 * L];
+            for (let u = qB; u < qE; u = u + 1) {
+              if (qlCur[u] < qlStart[u] + qlCount[u]) {
+                const qh: Uint256 = msNear[qlCur[u]];
+                if (qh >= lAdj) {
+                  let wq: Uint256 = 0;
+                  if (qh > lAdj) { wq = 1; }
+                  if (qh === lAdj) { if (qh > lFarAdj) { wq = 1; } }
+                  if (wq === 1) { lAdj = qh; lFarAdj = qh; lLive = 1; }
+                }
               }
             }
           }
@@ -1886,23 +1912,80 @@ function main(
           const rt: Tuple = routing[bestRoute];
           const legCount: Uint256 = rt[0];
 
-          // Phase A: per-leg binding pool (the leg's best ACTIVE fee-adjusted near, the SAME scan as
-          // the head selection) + its CURRENT bracket [near, far] OI on the fixed live grid. brFar
-          // (latched on a prior partial) holds the bracket's fixed far; else one stepReal ahead.
+          // Phase A: per-leg binding MEMBER — pools scanned FIRST (ascending), then the leg's QL
+          // VENUE cursors (ascending — GLOBAL qlv order), with the legMemberWins ops (the ops all
+          // three mirror sites share: solver / oracle legBestMember / reference routeLegBest):
+          // win on a strictly higher fee-adjusted near, or a near-TIE with a strictly higher
+          // fee-adjusted far (a slice's far == its near, so a slice beats any near-tied bracket);
+          // the incumbent keeps all other ties. Near-ties are STRUCTURAL for slices — the far
+          // tie-break is load-bearing here, so the pool scan carries its bracket far too (lazily,
+          // the 1b idiom: a strictly-lower near never wins — skip its far). The elected pool's
+          // CURRENT bracket [near, far] OI sits on the fixed live grid; brFar (latched on a prior
+          // partial) holds the bracket's fixed far, else one stepReal ahead.
           for (let L = 0; L < legCount; L = L + 1) {
             const baseL: Uint256 = rt[1 + 5 * L];
             const eL: Uint256 = baseL + rt[2 + 5 * L];
             let pBest: Uint256 = baseL;
             let pAdj: Uint256 = 0;
+            let pFarAdj: Uint256 = 0;
+            if (HAS_LEG_QLV) { lgIsQ[L] = 0; }
             for (let a = baseL; a < eL; a = a + 1) {
               if (dnOn[a] === 1) {
                 let aoi: Uint256 = 0;
                 if (pools[a][6] === 1) { aoi = dnNear[a]; }
                 else { aoi = toOutIn(dnNear[a], zArr[a]); }
                 const aadj: Uint256 = Math.mulDiv(aoi, sfArr[a], FEE_DENOM);
-                if (aadj > pAdj) { pAdj = aadj; pBest = a; }
+                if (aadj >= pAdj) {
+                  // The candidate's CURRENT bracket far (V2: constant-L geometric from the current
+                  // near; V3/V4: the brFar latch, else one stepReal ahead) — the reference's
+                  // frontierFarOI, fee-adjusted for the near-tie break.
+                  let afOI: Uint256 = 0;
+                  if (pools[a][6] === 1) {
+                    afOI = dnNear[a] - Math.mulDiv(dnNear[a], V2_STEP_BPS, V2_STEP_DEN);
+                  } else {
+                    let afReal: Uint256 = stepReal(dnNear[a], pools[a][10], zArr[a]);
+                    if (brFar[a] > 0) { afReal = brFar[a]; }
+                    afOI = toOutIn(afReal, zArr[a]);
+                  }
+                  const afAdj: Uint256 = Math.mulDiv(afOI, sfArr[a], FEE_DENOM);
+                  let wp: Uint256 = 0;
+                  if (aadj > pAdj) { wp = 1; }
+                  if (aadj === pAdj) { if (afAdj > pFarAdj) { wp = 1; } }
+                  if (wp === 1) { pAdj = aadj; pFarAdj = afAdj; pBest = a; }
+                }
               }
             }
+            // Leg QL VENUE cursors: a slice head is ALREADY post-fee (NO extra fee-adjust) and
+            // flat (far == near). lgQv records the winning venue's GLOBAL qlv index. Activity is
+            // the cursor test ALONE (the qlCursorActive mirror; active ⇒ remCap > 0 — see 1b).
+            if (HAS_LEG_QLV) {
+              const qB: Uint256 = rt[3 + 5 * L];
+              const qE: Uint256 = qB + rt[4 + 5 * L];
+              for (let u = qB; u < qE; u = u + 1) {
+                if (qlCur[u] < qlStart[u] + qlCount[u]) {
+                  const qh: Uint256 = msNear[qlCur[u]];
+                  if (qh >= pAdj) {
+                    let wq: Uint256 = 0;
+                    if (qh > pAdj) { wq = 1; }
+                    if (qh === pAdj) { if (qh > pFarAdj) { wq = 1; } }
+                    if (wq === 1) { pAdj = qh; pFarAdj = qh; lgIsQ[L] = 1; lgQv[L] = u; }
+                  }
+                }
+              }
+            }
+            if (HAS_LEG_QLV && lgIsQ[L] === 1) {
+              // QL slice member fill: lgN == lgF == head (a flat constant-price span), lgL = 0
+              // (NOT an L==0 gap — every Phase B/C/D pool formula dispatches on lgIsQ BEFORE
+              // touching lgL), lgFee = 0 (heads are post-fee), lgFR = 0; lgNF is written by
+              // Phase C with the member's awarded INPUT (pools keep carrying the new far).
+              const qw: Uint256 = lgQv[L];
+              const hv: Uint256 = msNear[qlCur[qw]];
+              lgN[L] = hv;
+              lgF[L] = hv;
+              lgL[L] = 0;
+              lgFee[L] = 0;
+              lgFR[L] = 0;
+            } else {
             const zb: Uint256 = zArr[pBest];
             const db: Tuple = pools[pBest];
             lgP[L] = pBest;
@@ -1923,6 +2006,7 @@ function main(
               lgFR[L] = fReal;
               lgF[L] = toOutIn(fReal, zb);
             }
+            }
           }
 
           // Phase B: binding leg = argmin over REACHABLE legs of the token-A input to FULLY cross
@@ -1936,11 +2020,25 @@ function main(
           for (let i = 0; i < legCount; i = i + 1) {
             // need = leg i full-cross gross (token T_i), then back-propagate through legs i-1..0.
             // SauceScript is uint256-only (no `j-- >= 0` — 0-1 underflows), so walk an ASCENDING
-            // counter q over [0, i) and address leg j = i-1-q (legs i-1 down to 0).
-            let need: Uint256 = bracketGross(lgL[i], lgN[i], lgF[i], lgFee[i]);
+            // counter q over [0, i) and address leg j = i-1-q (legs i-1 down to 0). A QL slice
+            // member's full-cross gross is its remaining capacity (dispatch on lgIsQ BEFORE any
+            // lgL read — a slice also carries lgL==0 but is NOT a gap).
+            let need: Uint256 = 0;
+            if (HAS_LEG_QLV && lgIsQ[i] === 1) { need = qlRemCap[lgQv[i]]; }
+            else { need = bracketGross(lgL[i], lgN[i], lgF[i], lgFee[i]); }
             let crossed: Uint256 = 0;
             for (let q = 0; q < i; q = q + 1) {
               const j: Uint256 = i - 1 - q;
+              if (HAS_LEG_QLV && lgIsQ[j] === 1) {
+                // Upstream SLICE: producing `need` costs mulDiv(need, remCap, remOut) (floor —
+                // the invertFarFromOut ≤-convention), valid ONLY while need < remOut; at/above it
+                // the slice itself crosses first (the bracket `farj <= lgF` sentinel's slice
+                // analogue, EQUALITY INCLUDED). A slice is never the L==0 gap (remCap ≥ 1 while
+                // its cursor is valid), so no divide guard is needed (remOut > 0 while remCap > 0).
+                const vj: Uint256 = lgQv[j];
+                if (need >= qlRemOut[vj]) { crossed = 1; }
+                else { need = Math.mulDiv(need, qlRemCap[vj], qlRemOut[vj]); }
+              } else {
               // An upstream leg sitting at an interior L==0 gap (the walk-through-gap design leaves
               // it active with 0 liquidity) can produce NOTHING this bracket, so leg i cannot bind
               // through it — it must advance THROUGH its own gap first. Treat it as "upstream crosses
@@ -1959,6 +2057,7 @@ function main(
                   else { need = bracketGross(lgL[j], lgN[j], farj, lgFee[j]); }
                 }
               }
+              }
             }
             if (crossed === 0) {
               if (haveBest === 0) { bindLeg = i; routeIn = need; haveBest = 1; }
@@ -1967,29 +2066,61 @@ function main(
           }
 
           // Phase C: resolve the event from the binding leg. The binding leg lands EXACTLY on its
-          // bracket far (lgNF[bindLeg] = its far); upstream legs back-invert (invertFarFromOut) to
-          // PRODUCE the binding leg's exact gross input; downstream legs forward-invert
-          // (invertFarFromGrossIn) to ABSORB the upstream leg's exact output. routeIn is recomputed
+          // bracket far (lgNF[bindLeg] = its far) — or, for a binding SLICE, fully crosses
+          // (gross = remCap, out = remOut; the flat span has no far and Phase D reads remCap
+          // directly); upstream legs back-invert (invertFarFromOut; a slice back-inverts
+          // x = mulDiv(need, remCap, remOut)) to PRODUCE the binding leg's exact gross input;
+          // downstream legs forward-invert (invertFarFromGrossIn; a slice absorbs
+          // min(flow, remCap)) to ABSORB the upstream leg's exact output. For a SLICE member
+          // lgNF carries its awarded INPUT (pools keep the new far). routeIn is recomputed
           // exactly here (the back-propagated leg-0 gross).
-          lgNF[bindLeg] = lgF[bindLeg];
-          const bindGrossIn: Uint256 = bracketGross(lgL[bindLeg], lgN[bindLeg], lgF[bindLeg], lgFee[bindLeg]);
-          const bindOut: Uint256 = bracketOut(lgL[bindLeg], lgN[bindLeg], lgF[bindLeg]);
+          let bindGrossIn: Uint256 = 0;
+          let bindOut: Uint256 = 0;
+          if (HAS_LEG_QLV && lgIsQ[bindLeg] === 1) {
+            const vb: Uint256 = lgQv[bindLeg];
+            bindGrossIn = qlRemCap[vb];
+            bindOut = qlRemOut[vb];
+          } else {
+            lgNF[bindLeg] = lgF[bindLeg];
+            bindGrossIn = bracketGross(lgL[bindLeg], lgN[bindLeg], lgF[bindLeg], lgFee[bindLeg]);
+            bindOut = bracketOut(lgL[bindLeg], lgN[bindLeg], lgF[bindLeg]);
+          }
           // Upstream (j < bindLeg): each PRODUCES the downstream leg's exact required input. Walk
           // an ASCENDING counter q over [0, bindLeg) and address j = bindLeg-1-q (uint256-only).
           let need: Uint256 = bindGrossIn;
           for (let q = 0; q < bindLeg; q = q + 1) {
             const j: Uint256 = bindLeg - 1 - q;
-            const farj: Uint256 = invertFarFromOut(lgL[j], lgN[j], need);
-            lgNF[j] = farj;
-            need = bracketGross(lgL[j], lgN[j], farj, lgFee[j]);
+            if (HAS_LEG_QLV && lgIsQ[j] === 1) {
+              // Upstream SLICE back-inverts x = mulDiv(need, remCap, remOut) (floor — produced-out
+              // ≤ demanded, slip absorbed downstream); lgNF carries the awarded INPUT.
+              const vj: Uint256 = lgQv[j];
+              const xj: Uint256 = Math.mulDiv(need, qlRemCap[vj], qlRemOut[vj]);
+              lgNF[j] = xj;
+              need = xj;
+            } else {
+              const farj: Uint256 = invertFarFromOut(lgL[j], lgN[j], need);
+              lgNF[j] = farj;
+              need = bracketGross(lgL[j], lgN[j], farj, lgFee[j]);
+            }
           }
           routeIn = need; // token-A gross input (the merged route input this event)
           // Downstream (j > bindLeg): each ABSORBS the upstream leg's exact output as gross-in.
           let flow: Uint256 = bindOut;
           for (let j = bindLeg + 1; j < legCount; j = j + 1) {
-            const farj: Uint256 = invertFarFromGrossIn(lgL[j], lgN[j], flow, lgFee[j]);
-            lgNF[j] = farj;
-            flow = bracketOut(lgL[j], lgN[j], farj);
+            if (HAS_LEG_QLV && lgIsQ[j] === 1) {
+              // Downstream SLICE absorbs min(flow, remCap) (defensive clamp — the argmin
+              // guarantees flow < remCap up to rounding; landing exactly ON remCap is a full
+              // consume at apply time) and produces the floored linear out. lgNF = its INPUT.
+              const vj: Uint256 = lgQv[j];
+              let xj: Uint256 = flow;
+              if (xj > qlRemCap[vj]) { xj = qlRemCap[vj]; }
+              lgNF[j] = xj;
+              flow = Math.mulDiv(xj, qlRemOut[vj], qlRemCap[vj]);
+            } else {
+              const farj: Uint256 = invertFarFromGrossIn(lgL[j], lgN[j], flow, lgFee[j]);
+              lgNF[j] = farj;
+              flow = bracketOut(lgL[j], lgN[j], farj);
+            }
           }
 
           // Phase D: clamp to the remaining global budget. If clamped, the route is the crossing
@@ -2002,8 +2133,29 @@ function main(
 
           if (clamp === 1) {
             // routePartialN: forward-propagate rtake through all legs; near → partial far (interior).
+            // A SLICE member consumes min(pflow, remCap) into its venue cursor (qinp accrual — the
+            // stake-at-average slice analogue of the pools' interior partial) and produces the
+            // floored linear out; remCap hitting 0 advances the cursor + re-seeds from the next
+            // row (or exhausts) — the qlCursorConsume mirror.
             let pflow: Uint256 = rtake;
             for (let L = 0; L < legCount; L = L + 1) {
+              if (HAS_LEG_QLV && lgIsQ[L] === 1) {
+                const vv: Uint256 = lgQv[L];
+                let xj: Uint256 = pflow;
+                if (xj > qlRemCap[vv]) { xj = qlRemCap[vv]; }
+                qinp[vv] = qinp[vv] + xj;
+                const outX: Uint256 = Math.mulDiv(xj, qlRemOut[vv], qlRemCap[vv]);
+                qlRemCap[vv] = qlRemCap[vv] - xj;
+                qlRemOut[vv] = qlRemOut[vv] - outX;
+                if (qlRemCap[vv] === 0) {
+                  qlCur[vv] = qlCur[vv] + 1;
+                  if (qlCur[vv] < qlStart[vv] + qlCount[vv]) {
+                    qlRemCap[vv] = msCap[qlCur[vv]];
+                    qlRemOut[vv] = msOut[qlCur[vv]];
+                  } else { qlRemOut[vv] = 0; }
+                }
+                pflow = outX; // this slice's output → next leg's gross-in
+              } else {
               const pI: Uint256 = lgP[L];
               const farL: Uint256 = invertFarFromGrossIn(lgL[L], lgN[L], pflow, lgFee[L]);
               // V2 leg pool stores near as out/in directly (no real-sqrt grid, no brFar latch);
@@ -2017,10 +2169,39 @@ function main(
               const inAmt: Uint256 = L === 0 ? rtake : pflow;
               inp[pI] = inp[pI] + inAmt; // leg L's flow-in share (tokenIn for leg0, intermediate else)
               pflow = bracketOut(lgL[L], lgN[L], farL); // this leg's output → next leg's gross-in
+              }
             }
           } else {
             // Full event: cross the binding leg's tick; partial-fill the others to lgNF[L].
             for (let L = 0; L < legCount; L = L + 1) {
+              if (HAS_LEG_QLV && lgIsQ[L] === 1) {
+                // SLICE member apply: the BINDING slice fully crosses (award = its remCap); a
+                // non-binding slice applies its Phase C awarded input lgNF[L] ONLY on a routeIn>0
+                // event (a zero-flow interior-gap event leaves it untouched — the pools' routeIn>0
+                // partial guard mirrored; a slice itself is never the gap). Accrue the award into
+                // qinp (the venue's Σ in ITS LEG-INPUT token — the exec lane's accumulator; for a
+                // leg-0 slice the award == routeIn by construction, so rinp still carries the
+                // route-level pull). remCap hitting 0 — the full cross AND an exact-boundary
+                // partial — advances the cursor + re-seeds from the next row (or exhausts:
+                // remOut = 0, the born-exhausted sentinel).
+                const vv: Uint256 = lgQv[L];
+                let award: Uint256 = 0;
+                if (L === bindLeg) { award = qlRemCap[vv]; }
+                else { if (routeIn > 0) { award = lgNF[L]; } }
+                if (award > 0) {
+                  qinp[vv] = qinp[vv] + award;
+                  const outX: Uint256 = Math.mulDiv(award, qlRemOut[vv], qlRemCap[vv]);
+                  qlRemCap[vv] = qlRemCap[vv] - award;
+                  qlRemOut[vv] = qlRemOut[vv] - outX;
+                }
+                if (qlRemCap[vv] === 0) {
+                  qlCur[vv] = qlCur[vv] + 1;
+                  if (qlCur[vv] < qlStart[vv] + qlCount[vv]) {
+                    qlRemCap[vv] = msCap[qlCur[vv]];
+                    qlRemOut[vv] = msOut[qlCur[vv]];
+                  } else { qlRemOut[vv] = 0; }
+                }
+              } else {
               const pI: Uint256 = lgP[L];
               // leg L's flow-in this event: leg0 = routeIn; leg L>0 = the gross input it absorbs
               // (== bracketGross over its current bracket to lgNF[L]). Conservation holds by
@@ -2107,6 +2288,7 @@ function main(
                     if (brFar[pI] === 0) { brFar[pI] = lgFR[L]; }
                   }
                 }
+              }
               }
             }
           }
@@ -2456,7 +2638,15 @@ function main(
                 }
               }
             } else {
-              router.swapV3(pools[baseL][1], legIn, legOut, inBal, 0, address.self, address.self);
+              // Funded-weight 0 but balance arrived (rounding dust): route it through the
+              // leg's first POOL — only when the leg HAS one. A POOL-LESS leg (rt[2+5L]==0,
+              // reachable once QL venues are leg members) must NOT take this fallback:
+              // pools[baseL] would dereference an UNRELATED pool (an empty slice emits
+              // base 0) and revert the whole cook. Its balance is consumed by the leg-QL
+              // dispatch (next lane); until then it is left in place.
+              if (rt[2 + 5 * L] > 0) {
+                router.swapV3(pools[baseL][1], legIn, legOut, inBal, 0, address.self, address.self);
+              }
             }
           }
         }
