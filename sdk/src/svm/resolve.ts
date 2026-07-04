@@ -1,10 +1,16 @@
 import { AccountRole } from '@solana/kit';
-import type { Address } from '@solana/kit';
+import type { Address, TransactionSigner } from '@solana/kit';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 
-/** Maps each symbolic account ref from the compiler's AccountPlan to a concrete address. */
+/**
+ * Maps each symbolic account ref from the compiler's AccountPlan to a concrete
+ * address. `signer: true` upgrades the role only; pass the TransactionSigner
+ * itself to also sign the transaction with it (required for any signer ref
+ * other than the reserved fee-payer ref — the send layer has no other way to
+ * obtain that signature).
+ */
 export interface AccountResolution {
-  [ref: string]: Address | { address: Address; signer?: boolean };
+  [ref: string]: Address | { address: Address; signer?: boolean | TransactionSigner };
 }
 
 /**
@@ -17,14 +23,22 @@ export const PAYER_REF = 'payer';
 export interface ResolvedAccountMeta {
   address: Address;
   role: AccountRole;
+  /**
+   * Present only when the resolution attached a TransactionSigner — kit's
+   * signTransactionMessageWithSigners collects it from the instruction meta
+   * (detection is `'signer' in meta`, so the key is omitted, not undefined).
+   */
+  signer?: TransactionSigner;
 }
 
 /**
  * Resolves an AccountPlan into ordered account metas: metas[i] is user-account
  * index i of the execute instruction (i.e. instruction account index i + 3).
  * writable comes from the plan; signer is upgraded by the plan flag, the
- * resolution entry's signer flag, or the reserved PAYER_REF. Duplicate
- * addresses across refs are fine — Solana dedupes at message compile.
+ * resolution entry's signer flag or TransactionSigner, or the reserved
+ * PAYER_REF. An attached TransactionSigner rides on the meta so the
+ * transaction builder signs with it. Duplicate addresses across refs are
+ * fine — Solana dedupes at message compile.
  */
 export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution, payer: Address): ResolvedAccountMeta[] {
   if (plan.usesRawIndices) {
@@ -37,6 +51,7 @@ export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution
   for (const meta of plan.metas) {
     let address: Address | undefined;
     let signer = meta.signer;
+    let transactionSigner: TransactionSigner | undefined;
 
     if (meta.ref === PAYER_REF) {
       if (resolution[PAYER_REF] !== undefined) {
@@ -53,7 +68,19 @@ export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution
           address = entry;
         } else {
           address = entry.address;
-          signer = signer || (entry.signer ?? false);
+
+          if (typeof entry.signer === 'object') {
+            if (entry.signer.address !== entry.address) {
+              throw new Error(
+                `account ref '${meta.ref}' address ${entry.address} does not match its TransactionSigner address ${entry.signer.address}`,
+              );
+            }
+
+            transactionSigner = entry.signer;
+            signer = true;
+          } else {
+            signer = signer || (entry.signer ?? false);
+          }
         }
       } else if (meta.pubkey !== undefined) {
         address = meta.pubkey as Address;
@@ -69,7 +96,7 @@ export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution
       ? (signer ? AccountRole.WRITABLE_SIGNER : AccountRole.WRITABLE)
       : (signer ? AccountRole.READONLY_SIGNER : AccountRole.READONLY);
 
-    metas.push({ address, role });
+    metas.push(transactionSigner ? { address, role, signer: transactionSigner } : { address, role });
   }
 
   if (unresolved.length > 0) {

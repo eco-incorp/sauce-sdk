@@ -181,7 +181,7 @@ function generateSource({ pools, amountIn, minOut }: SolswapConfig): string {
 /**
  * Generate and compile the quote-and-swap program for `config.pools`
  * (unrolled per pool, 2..8 pools). Pure and off-line: no RPC — callers
- * resolve the plan and send via `@eco-incorp/sauce-sdk-source`'s /svm module.
+ * resolve the plan and send via `@eco-incorp/sauce-sdk`'s /svm module.
  */
 export function solswap(config: SolswapConfig): SolswapOutput {
   validate(config);

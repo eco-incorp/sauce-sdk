@@ -6,6 +6,7 @@ import {
   buildExecuteTransaction,
   deriveEnginePdas,
   getTransactionSize,
+  resolveAccounts,
 } from '../../src/svm/index.js';
 
 const PROGRAM_ID = address('Stake11111111111111111111111111111111111111');
@@ -48,5 +49,21 @@ describe('buildExecuteTransaction', () => {
     const size = getTransactionSize(transaction);
     expect(size).toBeGreaterThan(0);
     expect(size).toBeLessThanOrEqual(1232);
+  });
+
+  it('signs for a non-payer plan signer attached to the execute metas via resolveAccounts', async () => {
+    const delegate = await generateKeyPairSigner();
+    const pdas = await deriveEnginePdas(PROGRAM_ID);
+    const plan = { metas: [{ ref: 'delegate', writable: false, signer: true }] };
+    const accounts = resolveAccounts(plan, { delegate: { address: delegate.address, signer: delegate } }, payer.address);
+    const instructions = [
+      buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts }),
+    ];
+
+    const transaction = await buildExecuteTransaction({ payer, instructions, latestBlockhash: BLOCKHASH });
+
+    // both the payer's and the delegate's 64-byte signatures are present
+    expect(transaction.signatures[payer.address]).toHaveLength(64);
+    expect(transaction.signatures[delegate.address]).toHaveLength(64);
   });
 });

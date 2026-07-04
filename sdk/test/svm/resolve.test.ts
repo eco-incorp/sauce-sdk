@@ -1,4 +1,4 @@
-import { AccountRole, address } from '@solana/kit';
+import { AccountRole, address, createNoopSigner } from '@solana/kit';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 import { PAYER_REF, resolveAccounts } from '../../src/svm/index.js';
 
@@ -65,6 +65,30 @@ describe('resolveAccounts', () => {
     const metas = resolveAccounts(plan, { auth: { address: ORACLE, signer: true } }, PAYER);
 
     expect(metas).toEqual([{ address: ORACLE, role: AccountRole.WRITABLE_SIGNER }]);
+  });
+
+  it('carries a resolution-attached TransactionSigner on the meta and upgrades the role', () => {
+    const signer = createNoopSigner(ORACLE);
+    const plan: AccountPlan = { metas: [{ ref: 'delegate', writable: false, signer: true }] };
+    const metas = resolveAccounts(plan, { delegate: { address: ORACLE, signer } }, PAYER);
+
+    expect(metas).toEqual([{ address: ORACLE, role: AccountRole.READONLY_SIGNER, signer }]);
+    expect(metas[0].signer).toBe(signer);
+  });
+
+  it("omits the signer key on metas without an attached signer (kit detects signers via 'signer' in meta)", () => {
+    const plan: AccountPlan = { metas: [{ ref: 'auth', writable: false, signer: true }] };
+    const metas = resolveAccounts(plan, { auth: { address: ORACLE, signer: true } }, PAYER);
+
+    expect('signer' in metas[0]).toBe(false);
+  });
+
+  it('rejects a TransactionSigner whose address differs from the resolved address', () => {
+    const plan: AccountPlan = { metas: [{ ref: 'delegate', writable: false, signer: false }] };
+
+    expect(() => resolveAccounts(plan, { delegate: { address: POOL, signer: createNoopSigner(ORACLE) } }, PAYER)).toThrow(
+      `account ref 'delegate' address ${POOL} does not match its TransactionSigner address ${ORACLE}`,
+    );
   });
 
   it('takes writable from the plan, not the resolution', () => {
