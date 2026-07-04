@@ -1343,7 +1343,7 @@ async function discoverQlVenuesForPair(
 }
 
 /**
- * The claim-set identity of a QL venue — the venue's POOL address for 16 families (incl. LiquidCore's
+ * The claim-set identity of a QL venue — the venue's POOL address for 15 families (incl. LiquidCore's
  * per-pair pool proxies) and the wrapper/relayer contract for the single-contract multi-pair
  * families (Tessera/Elfomo/SIZE — desc.address IS that contract); Mento (whose
  * venues all share the chain-wide Broker/provider contracts) claims by `provider|exchangeId`.
@@ -1949,7 +1949,7 @@ export async function prepareEcoSwap(
   // — the per-route produce-then-consume order in ecoswap.sauce.ts is the load-bearing guarantee.
   const claimed = new Set<string>();
   for (const p of pools) claimed.add(p.address.toLowerCase());
-  // Direct QL venue identities (rule 1) — all 16 QL families, Fluid included (a DexT1 pool's
+  // Direct QL venue identities (rule 1) — all 19 QL families, Fluid included (a DexT1 pool's
   // Liquidity-layer inventory is one shared depth like any other venue's).
   for (const c of curves) claimed.add(c.address.toLowerCase());
   for (const cp of cryptoSwaps) claimed.add(cp.address.toLowerCase());
