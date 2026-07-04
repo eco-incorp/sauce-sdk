@@ -21,6 +21,11 @@ import type { CompilerContext } from '../context.js';
  *   - SSTORE (0xC5): pops [account_index(top), offset, value descriptor] →
  *     writes the bytes into the account's data (surface: writeAccountData).
  *
+ * DIVERGENT LOWERING (same SauceScript source, different opcode byte):
+ *   - uint(data): lowers to the platform-native cast — CAST (0x54) on 'v12',
+ *     CAST_LE (0x55) on 'svm'. The endianness rule lives on the builtin in
+ *     globals.ts.
+ *
  * Everything else passes through untouched — the engine has fork-parity analogs
  * for all chain ops (MSG_SENDER, TIMESTAMP, BALANCE, CHAIN_ID, LOG, KECCAK,
  * ABI codec, EVAL, CATCH, TLOAD/TSTORE, ...). Note: EVAL runs in static mode

@@ -186,6 +186,57 @@ describe('svm target — accountData / writeAccountData', () => {
   });
 });
 
+describe('svm target — uint() lowering divergence and the accountUint sugar (CAST 0x54 / CAST_LE 0x55)', () => {
+  it('uint(bytes) lowers to the platform-native cast: CAST_LE on svm, CAST on v12', () => {
+    const src = 'function main() { return uint(Uint8Array.from([0x01, 0x02])) }';
+
+    // svm: [BYTES,2,01,02] [CAST_LE] [MSTORE (scalar main result)]
+    expect(hex(compileSvm(src).bytecode[0])).toBe('9002010255f2');
+    // same source on v12: [BYTES,2,01,02] [CAST] [MSTORE]
+    expect(hex(compile(src, { target: 'v12' }).bytecode[0])).toBe('9002010254f2');
+  });
+
+  it('accountUint(ref, offset, width) is uint over the accountData read — ONE op, CAST_LE, no CAST', () => {
+    const r = compileSvm(`function main() { return accountUint('pool', 64, 8) }`);
+
+    // [BYTE_1,8 (len)] [BYTE_1,64 (offset)] [BYTE_1,0 (index)] [SLOAD] [CAST_LE] [MSTORE]
+    expect(hex(r.bytecode[0])).toBe('0108014001008155f2');
+    expect(r.accountPlan).toEqual({ metas: [{ ref: 'pool', writable: false, signer: false }] });
+  });
+
+  it('accountUint accepts a raw numeric index (escape hatch)', () => {
+    const r = compileSvm('function main() { return accountUint(2, 8, 8) }');
+
+    // [BYTE_1,8 (len)] [BYTE_1,8 (offset)] [BYTE_1,2 (index)] [SLOAD] [CAST_LE] [MSTORE]
+    expect(hex(r.bytecode[0])).toBe('0108010801028155f2');
+    expect(r.accountPlan).toEqual({ metas: [], usesRawIndices: true });
+  });
+
+  it('uint is v12-dialect only (the v1 engine has no cast op)', () => {
+    expect(() => compile('function main() { return uint(Uint8Array.from([0x01])) }')).toThrow(
+      "uint is only available on targets 'v12' and 'svm'",
+    );
+  });
+
+  it('accountUint is svm-only (accountData is)', () => {
+    expect(() => compile(`function main() { return accountUint('pool', 0, 8) }`, { target: 'v12' })).toThrow(
+      "accountUint is only available on target 'svm'",
+    );
+    expect(() => compile(`function main() { return accountUint('pool', 0, 8) }`)).toThrow(
+      "accountUint is only available on target 'svm'",
+    );
+  });
+
+  it('width must be an integer literal 1-32', () => {
+    const message = 'accountUint width must be an integer literal between 1 and 32';
+
+    expect(() => compileSvm(`function main() { return accountUint('pool', 0, 0) }`)).toThrow(message);
+    expect(() => compileSvm(`function main() { return accountUint('pool', 0, 33) }`)).toThrow(message);
+    expect(() => compileSvm(`function main() { return accountUint('pool', 0, 8.5) }`)).toThrow(message);
+    expect(() => compileSvm(`function main(w) { return accountUint('pool', 0, w) }`)).toThrow(message);
+  });
+});
+
 describe('svm target — gating errors', () => {
   const svmThrows = (src: string, message: string): void => {
     expect(() => compileSvm(src)).toThrow(message);

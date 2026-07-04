@@ -485,6 +485,11 @@ export class V12Saucer implements SaucerLike {
     return this.unary(OPS.CAST, data, false);
   }
 
+  /** v12-only: CAST_LE — CAST with the dereferenced bytes read little-endian (byte 0 least significant). The svm-native cast: uint() lowers to it on target 'svm'. */
+  castLe(data: SaucerLike): V12Saucer {
+    return this.unary(OPS.CAST_LE, data, false);
+  }
+
   // ── variables ──
   store(
     name: string,

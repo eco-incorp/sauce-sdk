@@ -186,6 +186,29 @@ const svmAccountRef = (
   throw new Error(`${name} ref must be a string literal ref or an integer index`);
 };
 
+/**
+ * Lower the accountUint sugar's data read: accountData(ref, offset, width)
+ * with the width pinned to an integer literal 1-32 — the CAST band only holds
+ * up to a 32-byte word, and a runtime-computed width would defeat the "one op
+ * per field" point of the sugar.
+ */
+const svmAccountUintData = (
+  name: string,
+  s: SaucerLike,
+  args: Expression[],
+  process: (e: Expression) => SaucerLike,
+): SaucerLike => {
+  expectArity(name, 3, args);
+
+  const index = svmAccountRef(name, args[0], s.ctx);
+  const width = args[2].type === 'Literal' ? (args[2] as Literal).value : undefined;
+
+  if (typeof width !== 'number' || !Number.isInteger(width) || width < 1 || width > 32)
+    throw new Error(`${name} width must be an integer literal between 1 and 32`);
+
+  return (s.ctx.newSaucer() as V12Saucer).svmAccountData(index, process(args[1]), s.ctx.newSaucer().int(BigInt(width)));
+};
+
 // --- emit() helpers ---
 
 interface EmitArgs {
@@ -706,6 +729,25 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
       return s.eval(process(args[0]));
     },
   },
+  // uint(data) — scalar from dynamic bytes read in the PLATFORM's byte order:
+  //   EVM bytes are big-endian, Solana account bytes are little-endian, and the
+  //   native cast reads each correctly (len ≤ 32, len 0 → 0). A LOWERING
+  //   divergence (see svm-profile.ts): the same source emits CAST (0x54) on
+  //   target 'v12' and CAST_LE (0x55) on 'svm'. Not on 'v1' — the v1 engine
+  //   implements the cast ops, but its Saucer builder has no cast surface.
+  //   uint(accountData('pool', 64, 8))
+  uint: {
+    kind: 'scalar',
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
+      if (!s.ctx.isV12) throw new Error(`uint is only available on targets 'v12' and 'svm'`);
+
+      expectArity('uint', 1, args);
+
+      const data = process(args[0]);
+
+      return s.ctx.isSvm ? (s as V12Saucer).castLe(data) : (s as V12Saucer).cast(data);
+    },
+  },
   // accountData(ref, offset, len) — svm-only: read len bytes at offset from the
   //   ref'd account's data (ref interned READONLY into the account plan) → bytes
   //   accountData('pool', 0, 32)
@@ -735,6 +777,19 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
       const index = svmAccountRef('writeAccountData', args[0], s.ctx, { writable: true });
 
       return (s as V12Saucer).svmWriteAccountData(index, process(args[1]), process(args[2]));
+    },
+  },
+  // accountUint(ref, offset, width) — svm-only sugar for
+  //   uint(accountData(ref, offset, width)): read a width-byte account field as
+  //   a scalar in one op (lowers to CAST_LE, uint's svm-native cast). width
+  //   must be an integer literal 1-32.
+  //   accountUint('token', 64, 8)  — SPL token account amount (u64 LE)
+  accountUint: {
+    kind: 'scalar',
+    compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
+      if (!s.ctx.isSvm) throw new Error(`accountUint is only available on target 'svm'`);
+
+      return (s as V12Saucer).castLe(svmAccountUintData('accountUint', s, args, process));
     },
   },
 };

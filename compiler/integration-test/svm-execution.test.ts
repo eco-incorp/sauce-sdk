@@ -11,6 +11,7 @@
  * whole suite skips there — same pattern as the v12 suites.
  */
 import { getAddressCodec } from '@solana/kit';
+import { compile } from '../src/index.js';
 import { canRunSvm, randomSvmAddress, startSvm, svmCook, svmHex, svmUint, SYSTEM_PROGRAM } from './svm-utils.js';
 import type { SvmCookResult, SvmHarness } from './svm-utils.js';
 
@@ -265,6 +266,60 @@ describeSvm('integration: svm accountData / writeAccountData', () => {
     // Engine data-path errors all surface as InvalidInstructionData, so the
     // logs only pin that the failure happened inside the engine program.
     expect(expectFail(r).logs.join('\n')).toContain(`Program ${h.programId} invoke`);
+  });
+});
+
+describeSvm('integration: svm uint / accountUint (CAST_LE 0x55)', () => {
+  let h: SvmHarness;
+
+  beforeAll(async () => {
+    h = await startSvm();
+  });
+
+  it('accountUint reads a u64 LE field at a non-zero offset in ONE op (CAST_LE, never CAST)', async () => {
+    const src = `function main() { return accountUint('pool', 16, 8) }`;
+    // The LE read must not lean on a byte-reverse + CAST chain: the emitted
+    // bytecode carries CAST_LE (0x55) and no CAST (0x54) anywhere.
+    const { bytecode } = compile(src, { target: 'svm' });
+
+    expect(bytecode[0]).toContain(0x55);
+    expect(bytecode[0]).not.toContain(0x54);
+
+    const data = new Uint8Array(64);
+    data.set([0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01], 16); // 0x0102030405060708 stored LE
+
+    const r = await svmCook(h, src, { accounts: [{ ref: 'pool', data }] });
+
+    expect(svmUint(r)).toBe(0x0102030405060708n);
+  });
+
+  it('SPL-token amount pattern: u64 LE at offset 64 of a 165-byte account', async () => {
+    // SPL token account layout: mint(32) + owner(32) + amount u64 LE at 64.
+    const amount = 123_456_789n;
+    const data = new Uint8Array(165);
+    new DataView(data.buffer).setBigUint64(64, amount, true);
+
+    const r = await svmCook(h, `function main() { return accountUint('token', 64, 8) }`, {
+      accounts: [{ ref: 'token', data }],
+    });
+
+    expect(svmUint(r)).toBe(amount);
+  });
+
+  it('uint(bytes literal) diverges from v12 in EXACTLY the cast byte and evaluates LE on-chain', async () => {
+    const src = 'function main() { return uint(Uint8Array.from([0x01, 0x02])) }';
+    const svmBytes = compile(src, { target: 'svm' }).bytecode[0];
+    const v12Bytes = compile(src, { target: 'v12' }).bytecode[0];
+
+    // Same source, same shape — the ONLY diverging byte is the platform-native
+    // cast: CAST_LE (0x55) on svm where v12 emits CAST (0x54).
+    expect(svmBytes.length).toBe(v12Bytes.length);
+    const diffs = [...svmBytes].flatMap((b, i) => (b !== v12Bytes[i] ? [i] : []));
+    expect(diffs).toHaveLength(1);
+    expect(svmBytes[diffs[0]]).toBe(0x55);
+    expect(v12Bytes[diffs[0]]).toBe(0x54);
+    // byte[0] is least significant: [0x01, 0x02] → 0x0201 (0x0102 would mean a BE read).
+    expect(svmUint(await svmCook(h, src))).toBe(0x0201n);
   });
 });
 
