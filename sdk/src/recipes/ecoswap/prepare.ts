@@ -106,6 +106,7 @@ import {
   type EcoFluid,
   type EcoMento,
   type EcoBalancerV3,
+  type EcoLegQlVenue,
   type PoolInfo,
 } from "../shared/types.js";
 
@@ -810,6 +811,415 @@ function balancerFeeToPpm(swapFeeWad: bigint): number {
   return Number((swapFeeWad * 1_000_000n + 5n * 10n ** 17n) / 10n ** 18n);
 }
 
+// ── Shared per-pair QL venue discovery (the DIRECT pair AND every route-leg edge) ──
+
+/**
+ * One discovered QUOTE-LADDER venue for a (pairIn → pairOut) token pair: the DIRECTION-STAMPED
+ * per-family descriptor tagged with its family (the `EcoLegQlVenue` shape — for the DIRECT pair
+ * the same descriptors are split back into the per-family `prepared` lists), plus the venue's
+ * liveness-probe FIRST-SLICE head (post-fee out/in sqrt Q96). The head feeds the route DFS's
+ * `estIn` fold when an upstream leg has NO pools (an all-QL leg) — prepare-time sizing only,
+ * never a merge input (the on-chain ladders re-size from live state at cook).
+ */
+interface EdgeQlVenue {
+  venue: EcoLegQlVenue;
+  headOI: bigint;
+}
+
+/**
+ * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 13 leg-capable families
+ * (Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2,
+ * Wombat, Fermi, EulerSwap, Balancer V3, Balancer V2 ComposableStable, Maverick V2), run in the
+ * canonical family-concatenation order (the same order index.ts buildQLVenues emits rows in).
+ * This is the SINGLE discovery path for QL venues: the DIRECT (tokenIn, tokenOut) pair calls it
+ * with `probeAmount = amountIn`, and every route-leg EDGE calls it with the edge pair + the
+ * DFS-folded `estIn` — so a leg venue descriptor is built by EXACTLY the code (and direction
+ * stamping: i/j coin indices, isSellBase, swapForY, tokenAIn, inIdx/outIdx, rate/decScale
+ * columns) a direct venue would be. Fluid is deliberately ABSENT: it is a static-sampled-segment
+ * venue (segKind 12) the solver cannot ladder on-chain, so it stays DIRECT-only (prepare keeps
+ * its own block).
+ *
+ * Each family block is gated on the chain config carrying that FactoryType — a family absent
+ * from ChainPoolConfig costs ZERO RPC. Each discovered pool runs its family's existing LIVENESS
+ * probe (the build*Brackets / build*QLLadder replay at `probeAmount`): a venue that quotes no
+ * valid slice is dropped (born-dead at this size). The probe output is ONLY a gate + the fold
+ * head — no sampled segments ship (prepare-optional: the on-chain solver builds every ladder
+ * live from its quote view / bin-walk at cook).
+ */
+async function discoverQlVenuesForPair(
+  pairIn: Hex,
+  pairOut: Hex,
+  probeAmount: bigint,
+  client: PublicClient,
+  poolConfig: ChainPoolConfig,
+  dodoCaller: Hex,
+): Promise<EdgeQlVenue[]> {
+  const out: EdgeQlVenue[] = [];
+
+  // Curve StableSwap — registry find_pool_for_coins → get_coin_indices (int128 i,j — DIRECTIONAL,
+  // so the edge orientation falls out of the registry read). The on-chain solver builds the ladder
+  // from LIVE get_dy; the descriptor ships address + i/j + fee only.
+  const curveRegistries = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.CurveRegistry,
+  );
+  if (curveRegistries.length > 0) {
+    const curveRaw = await discoverCurvePoolsTyped(pairIn, pairOut, client, curveRegistries);
+    for (const c of curveRaw) {
+      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
+      const cb = buildCurveBrackets(c, 0, probeAmount);
+      if (cb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "curve",
+          desc: {
+            address: c.address,
+            i: c.i,
+            j: c.j,
+            feePpm: curveFeeToPpm(c.feePpm10),
+            source: `${c.source} (Curve)`,
+          },
+        },
+        headOI: cb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Curve CryptoSwap — crypto Metaregistry lookup (uint256 i,j; A-gamma invariant + dynamic fee).
+  // Executed CALLBACK-FREE (uint256-index exchange — the engine's int128 _swapCurve does not match).
+  const cryptoRegistries = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.CurveCryptoRegistry,
+  );
+  if (cryptoRegistries.length > 0) {
+    const cryptoRaw = await discoverCryptoSwapPoolsTyped(pairIn, pairOut, client, cryptoRegistries);
+    for (const cp of cryptoRaw) {
+      const cb = buildCryptoSwapBrackets(cp, 0, probeAmount);
+      if (cb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "cryptoSwap",
+          desc: {
+            address: cp.address,
+            i: cp.i,
+            j: cp.j,
+            feePpm: cp.feePpm,
+            source: `${cp.source} (Curve CryptoSwap)`,
+          },
+        },
+        headOI: cb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Solidly STABLE (sAMM — x3y+y3x, NOT xy=k) — the on-chain ladder reads LIVE getAmountOut;
+  // executed callback-free (getAmountOut + transfer + pool.swap). inIsToken0 is per-edge.
+  const solidlyFactories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.SolidlyV2,
+  );
+  if (solidlyFactories.length > 0) {
+    const stableRaw = await discoverSolidlyStablePoolsTyped(pairIn, pairOut, client, solidlyFactories);
+    for (const sp of stableRaw) {
+      const sb = buildSolidlyStableBrackets(sp, 0, probeAmount);
+      if (sb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "solidlyStable",
+          desc: {
+            address: sp.address,
+            inIsToken0: sp.inIsToken0,
+            feePpm: sp.feePpm,
+            source: sp.source,
+          },
+        },
+        headOI: sb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // WOOFi (WooPPV2 sPMM, oracle-priced) — only a DIRECT base↔quote pair is in scope (discovery
+  // self-gates); the on-chain ladder reads LIVE tryQuery and re-anchors to the live oracle.
+  const woofiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.WOOFi);
+  if (woofiConfigs.length > 0) {
+    const wooRaw = await discoverWooFiPoolsTyped(pairIn, pairOut, client, woofiConfigs);
+    for (const wp of wooRaw) {
+      const wb = buildWooFiBrackets(wp, 0, probeAmount);
+      if (wb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "wooFi",
+          desc: {
+            address: wp.address,
+            fromToken: wp.tokenIn,
+            toToken: wp.tokenOut,
+            feePpm: wp.feePpm,
+            source: wp.source,
+          },
+        },
+        headOI: wb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Trader Joe LB (discrete-bin constant-sum) — the on-chain ladder reads the LIVE graceful
+  // getSwapOut view; swapForY = (pairIn == pair.getTokenX()) is per-edge.
+  const lbFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.TraderJoeLB);
+  if (lbFactories.length > 0) {
+    const lbRaw = await discoverTraderJoeLBPoolsTyped(pairIn, pairOut, client, lbFactories);
+    for (const lb of lbRaw) {
+      const lbb = buildLbBrackets(lb, 0, probeAmount);
+      if (lbb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "lb",
+          desc: {
+            address: lb.address,
+            binStep: lb.binStep,
+            feePpm: lbFeeToPpm(lb.binStep, lb.baseFactor),
+            swapForY: lb.swapForY,
+            source: lb.source,
+          },
+        },
+        headOI: lbb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Mento V2 (Broker + BiPoolManager, oracle-priced buckets) — two-step enumeration maps the
+  // pair → (exchangeProvider, exchangeId); the on-chain ladder reads the LIVE Broker getAmountOut.
+  const mentoConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Mento);
+  if (mentoConfigs.length > 0) {
+    const mentoRaw = await discoverMentoPoolsTyped(pairIn, pairOut, client, mentoConfigs, probeAmount);
+    for (const mp of mentoRaw) {
+      const mb = buildMentoBrackets(mp, 0, probeAmount);
+      if (mb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "mento",
+          desc: {
+            broker: mp.broker,
+            exchangeProvider: mp.exchangeProvider,
+            exchangeId: mp.exchangeId,
+            fromToken: mp.tokenIn,
+            toToken: mp.tokenOut,
+            feePpm: mp.feePpm,
+            source: mp.source,
+          },
+        },
+        headOI: mb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // DODO V2 PMM — the on-chain ladder reads LIVE querySellBase/querySellQuote; sellBase =
+  // (pairIn == _BASE_TOKEN_()) is per-edge.
+  const dodoZoos = poolConfig.factories.filter((f) => f.factoryType === FactoryType.DODOZoo);
+  if (dodoZoos.length > 0) {
+    const dodoRaw = await discoverDodoV2PoolsTyped(pairIn, pairOut, client, dodoZoos, dodoCaller);
+    for (const d of dodoRaw) {
+      const db = buildDodoBrackets(d, 0, probeAmount);
+      if (db.length === 0) continue;
+      out.push({
+        venue: {
+          family: "dodo",
+          desc: {
+            address: d.address,
+            sellBase: d.sellBase,
+            feePpm: d.feePpm,
+            source: `${d.source} (DODO V2)`,
+          },
+        },
+        headOI: db[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Wombat (single-sided stableswap; multi-ASSET pool — one pool can serve several pairs, which
+  // is exactly why leg admission claims by pool ADDRESS) — LIVE quotePotentialSwap ladder.
+  const wombatPools = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Wombat);
+  if (wombatPools.length > 0) {
+    const wombatRaw = await discoverWombatPoolsTyped(pairIn, pairOut, client, wombatPools);
+    for (const wp of wombatRaw) {
+      const wb = buildWombatBrackets(wp, 0, probeAmount);
+      if (wb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "wombat",
+          desc: {
+            address: wp.address,
+            fromToken: wp.tokenIn,
+            toToken: wp.tokenOut,
+            feePpm: wp.feePpm,
+            source: wp.source,
+          },
+        },
+        headOI: wb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Fermi / propAMM (FermiSwapper router) — LIVE quoteAmounts ladder; the descriptor address is
+  // the ROUTER (the quote/exec target — Fermi exposes no per-pair pool contract).
+  const fermiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Fermi);
+  if (fermiConfigs.length > 0) {
+    const fermiRaw = await discoverFermiPoolsTyped(pairIn, pairOut, client, fermiConfigs, probeAmount);
+    for (const fp of fermiRaw) {
+      const fb = buildFermiBrackets(fp, 0, probeAmount);
+      if (fb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "fermi",
+          desc: {
+            address: fp.address,
+            fromToken: fp.tokenIn,
+            toToken: fp.tokenOut,
+            feePpm: fp.feePpm,
+            source: fp.source,
+          },
+        },
+        headOI: fb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // EulerSwap — known-pool-address discovery (per-config eulerSwapPools); the on-chain ladder
+  // reads LIVE computeQuote (self-truncating at the vault cap). inIsToken0 is per-edge.
+  const eulerFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.EulerSwap);
+  if (eulerFactories.length > 0) {
+    const eulerRaw = await discoverEulerSwapPoolsTyped(pairIn, pairOut, client, eulerFactories);
+    for (const ep of eulerRaw) {
+      const eb = buildEulerSwapBrackets(ep, 0, probeAmount);
+      if (eb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "euler",
+          desc: {
+            address: ep.address,
+            inIsToken0: ep.inIsToken0,
+            feePpm: ep.feePpm,
+            source: ep.source,
+          },
+        },
+        headOI: eb[0].sqrtAdjNear,
+      });
+    }
+  }
+
+  // Balancer V3 — known-pool-address discovery; the on-chain solver REPLAYS StableMath from the
+  // LIVE Vault state (querySwapSingleTokenExactIn is eth_call-only). inIdx/outIdx + rpIn/rpOut +
+  // decScaleIn/decScaleOut are the per-edge orientation columns; the surge cross-check runs per
+  // edge inside the discovery.
+  const balancerV3Configs = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.BalancerV3,
+  );
+  if (balancerV3Configs.length > 0) {
+    const b3Raw = await discoverBalancerV3PoolsTyped(pairIn, pairOut, client, balancerV3Configs, probeAmount);
+    for (const bp of b3Raw) {
+      const qb = buildBalancerV3QLLadder(bp, probeAmount);
+      if (qb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "balancerV3",
+          desc: {
+            address: bp.address,
+            router: bp.router,
+            fromToken: bp.tokenIn,
+            toToken: bp.tokenOut,
+            feePpm: bp.feePpm,
+            source: bp.source,
+            vault: bp.vault!,
+            inIdx: bp.inIdx!,
+            outIdx: bp.outIdx!,
+            rpIn: bp.rpIn!,
+            rpOut: bp.rpOut!,
+            decScaleIn: bp.decScaleIn!,
+            decScaleOut: bp.decScaleOut!,
+          },
+        },
+        headOI: qb[0].marginalOI,
+      });
+    }
+  }
+
+  // Balancer V2 ComposableStable (multi-TOKEN pool — address-claimed for the same reason as
+  // Wombat) — the on-chain solver replays StableMath from the LIVE Vault scalars; the qd[6..9]
+  // block (non-BPT i/j + poolId + third token + regPos) is computed against the EDGE pair.
+  const balancerVaults = poolConfig.factories.filter((f) => f.factoryType === FactoryType.BalancerV2);
+  if (balancerVaults.length > 0) {
+    const balRaw = await discoverBalancerStablePoolsTyped(pairIn, pairOut, client, balancerVaults);
+    for (const bp of balRaw) {
+      const qb = buildBalancerStableQLLadder(bp, probeAmount);
+      if (qb.length === 0) continue;
+      out.push({
+        venue: {
+          family: "balancerV2",
+          desc: {
+            address: bp.address,
+            i: bp.i,
+            j: bp.j,
+            feePpm: balancerFeeToPpm(bp.swapFeeWad),
+            source: bp.source,
+            poolId: bp.poolId!,
+            nonBptTokens: bp.tokens!,
+            nonBptRegPos: bp.regPos!,
+            vault: bp.vault!,
+          },
+        },
+        headOI: qb[0].marginalOI,
+      });
+    }
+  }
+
+  // Maverick V2 (bin-based directional AMM; a CALLBACK pool executed through the engine) — the
+  // on-chain solver WALKS the live bin book; tokenAIn = (pairIn == tokenA) is per-edge. Discovery
+  // skips mixed-decimal pairs (maverick-math is D18-normalized).
+  const maverickFactories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.MaverickV2Factory,
+  );
+  if (maverickFactories.length > 0) {
+    const maverickRaw = await discoverMaverickV2PoolsTyped(pairIn, pairOut, client, maverickFactories);
+    for (const mp of maverickRaw) {
+      const ml = buildMaverickWalkLadder(mp, probeAmount);
+      if (ml.length === 0) continue;
+      out.push({
+        venue: {
+          family: "maverick",
+          desc: {
+            address: mp.address,
+            tokenAIn: mp.tokenAIn,
+            tickSpacing: mp.tickSpacing,
+            feePpm: mp.feePpm,
+            source: `${mp.source} (Maverick V2)`,
+          },
+        },
+        headOI: ml[0].marginalOI,
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * The claim-set identity of a QL venue — the venue's POOL address for 12 families; Mento (whose
+ * venues all share the chain-wide Broker/provider contracts) claims by `provider|exchangeId`.
+ * Lowercased so it unions safely with the pool-address claim set (one shared mechanism — a UniV3
+ * address never collides with a Curve address). Claiming by POOL address (not by pair) is the
+ * multi-coin rule: a 3-coin Curve/CryptoSwap pool, a 3-token Balancer pool or a multi-asset
+ * Wombat pool holding {A, X, B} is discoverable on BOTH legs of one route A→X→B (and as a direct
+ * (A,B) venue) — every instance prices ladders over the SAME pool inventory, so at most ONE may
+ * be admitted. (For Fermi the address is the ROUTER — two pairs through one router claim-collide;
+ * deliberately conservative: an excluded second instance forgoes a venue, never double-counts.)
+ */
+function mentoClaimKey(exchangeProvider: string, exchangeId: string): string {
+  return `${exchangeProvider.toLowerCase()}|${exchangeId.toLowerCase()}`;
+}
+
+function qlVenueClaimKey(v: EcoLegQlVenue): string {
+  if (v.family === "mento") {
+    return mentoClaimKey(v.desc.exchangeProvider, v.desc.exchangeId);
+  }
+  return v.desc.address.toLowerCase();
+}
+
 // ── Main preparation ─────────────────────────────────────────
 
 /** Tuning knobs for off-chain preparation (overridable per call; mainly for tests). */
@@ -1045,316 +1455,41 @@ export async function prepareEcoSwap(
     }
   }
 
-  // ── Sampled-segment venues: Curve / Trader Joe LB / DODO V2 (off-chain — NOT in the lens) ──
-  // These venues' curve math is OFF-CHAIN ONLY (no Newton / per-bin walk / PMM integral in
-  // SauceScript). Each is discovered separately, its curve sampled (or, for LB, EXACTLY
-  // enumerated) into STATIC segments emitted as EcoBrackets (kinds Curve/LB/DODO), and the venue
-  // metadata collected into prepared.curves/lbs/dodos (indexed by the bracket's refIdx). The
-  // on-chain solver competes these segments in the SAME price-ordered merge as the live direct
-  // pools + live routes via a static-segment cursor (bestKind===1), and executes the awarded Σ
-  // per venue through the engine swap (poolType 3 Curve / 6 LB / 5 DODO).
+  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 13 leg-capable families) ──
+  // Runs the SHARED per-pair discovery (discoverQlVenuesForPair — the exact path every route-leg
+  // EDGE runs below), then splits the tagged descriptors back into the per-family prepared lists
+  // (family order preserved: the shared function emits families in the canonical buildQLVenues
+  // concatenation order, discovery order within each family). These are all QL venues: the
+  // on-chain solver builds each price ladder LIVE at cook from the venue's own quote view /
+  // state replay / bin-walk, so prepare ships ONLY direction-stamped descriptors — the
+  // build*Brackets / build*QLLadder replays ran inside the shared discovery as pure LIVENESS
+  // probes at amountIn (a venue quoting no valid slice was dropped). `brackets` now carries
+  // ONLY Fluid sampled segments (Fluid is the one static-sampled-segment source left — it is
+  // NOT leg-capable and keeps its own direct-only block below).
   const brackets: EcoBracket[] = [];
-
-  // Curve is a QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from
-  // LIVE get_dy (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the descriptor
-  // (address + coin indices i,j + fee) — NO off-chain sampled segments. buildCurveBrackets is still
-  // called as a pure LIVENESS PROBE (a pool that quotes no valid segment is dropped), but its brackets
-  // are NOT pushed to the segment stream. This is the prepare-optional win: the descriptor alone
-  // drives the on-chain ladder, and a zero-cache quote (no prepared brackets) still walks it live.
-  const curves: EcoCurve[] = [];
-  const curveRegistries = poolConfig.factories.filter(
-    (f) => f.factoryType === FactoryType.CurveRegistry,
+  const directQl = await discoverQlVenuesForPair(
+    tokenIn,
+    tokenOut,
+    amountIn,
+    client,
+    poolConfig,
+    caller ?? ZERO_ADDRESS,
   );
-  if (curveRegistries.length > 0) {
-    const curveRaw = await discoverCurvePoolsTyped(tokenIn, tokenOut, client, curveRegistries);
-    for (const c of curveRaw) {
-      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
-      const cb = buildCurveBrackets(c, curves.length, amountIn);
-      if (cb.length === 0) continue;
-      curves.push({
-        address: c.address,
-        i: c.i,
-        j: c.j,
-        feePpm: curveFeeToPpm(c.feePpm10),
-        source: `${c.source} (Curve)`,
-      });
-    }
-  }
-
-  // Trader Joe LB — like Curve, it is a QUOTE-LADDER (QL) venue: the on-chain solver builds its price
-  // ladder in setup from the LIVE pair.getSwapOut(xIn, swapForY) view (a GRACEFUL view — returns
-  // amountInLeft instead of reverting — capped at the live fillable bin capacity), so prepare ships ONLY
-  // the descriptor (address + swapForY + fee). buildLbBrackets is still called as a pure LIVENESS PROBE (a
-  // pair with no fillable bins is dropped), but its brackets are NOT pushed to the segment stream. EXEC
-  // stays engine poolType 6 → _swapTraderJoeLB (transfer-first).
-  const lbs: EcoLb[] = [];
-  const lbFactories = poolConfig.factories.filter(
-    (f) => f.factoryType === FactoryType.TraderJoeLB,
-  );
-  if (lbFactories.length > 0) {
-    const lbRaw = await discoverTraderJoeLBPoolsTyped(tokenIn, tokenOut, client, lbFactories);
-    for (const lb of lbRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live getSwapOut, not from these brackets.
-      const lbb = buildLbBrackets(lb, lbs.length, amountIn);
-      if (lbb.length === 0) continue;
-      lbs.push({
-        address: lb.address,
-        binStep: lb.binStep,
-        feePpm: lbFeeToPpm(lb.binStep, lb.baseFactor),
-        swapForY: lb.swapForY,
-        source: lb.source,
-      });
-    }
-  }
-
-  // DODO V2 PMM — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE
-  // querySellBase/querySellQuote (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the
-  // descriptor (address + isSellBase orientation + fee). buildDodoBrackets is still called as a pure LIVENESS
-  // PROBE (a pool that quotes no valid segment is dropped), but its brackets are NOT pushed to the seg stream.
-  const dodos: EcoDodo[] = [];
-  const dodoZoos = poolConfig.factories.filter((f) => f.factoryType === FactoryType.DODOZoo);
-  if (dodoZoos.length > 0) {
-    const dodoRaw = await discoverDodoV2PoolsTyped(
-      tokenIn,
-      tokenOut,
-      client,
-      dodoZoos,
-      caller ?? ZERO_ADDRESS,
-    );
-    for (const d of dodoRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live querySell*, not from these brackets.
-      const db = buildDodoBrackets(d, dodos.length, amountIn);
-      if (db.length === 0) continue;
-      dodos.push({
-        address: d.address,
-        sellBase: d.sellBase,
-        feePpm: d.feePpm,
-        source: `${d.source} (DODO V2)`,
-      });
-    }
-  }
-
-  // Solidly STABLE (sAMM) — like Curve, it is a QUOTE-LADDER (QL) venue: the on-chain solver builds its
-  // price ladder in setup from LIVE getAmountOut (see ecoswap.sauce.ts / index.ts buildQLVenues), so
-  // prepare ships ONLY the descriptor (address + orientation + fee) — NO off-chain sampled segments.
-  // buildSolidlyStableBrackets is still called as a pure LIVENESS PROBE (a pool that quotes no valid
-  // segment is dropped), but its brackets are NOT pushed to the segment stream.
-  const solidlyStables: EcoSolidlyStable[] = [];
-  const solidlyFactories = poolConfig.factories.filter(
-    (f) => f.factoryType === FactoryType.SolidlyV2,
-  );
-  if (solidlyFactories.length > 0) {
-    const stableRaw = await discoverSolidlyStablePoolsTyped(tokenIn, tokenOut, client, solidlyFactories);
-    for (const sp of stableRaw) {
-      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
-      const sb = buildSolidlyStableBrackets(sp, solidlyStables.length, amountIn);
-      if (sb.length === 0) continue;
-      solidlyStables.push({
-        address: sp.address,
-        inIsToken0: sp.inIsToken0,
-        feePpm: sp.feePpm,
-        source: sp.source,
-      });
-    }
-  }
-
-  // Wombat (single-sided stableswap) — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder
-  // in setup from LIVE quotePotentialSwap (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships
-  // ONLY the descriptor (address + fee). buildWombatBrackets is a pure LIVENESS PROBE (drop a pool that
-  // quotes no valid segment); its brackets are NOT pushed to the segment stream.
-  const wombats: EcoWombat[] = [];
-  const wombatPools = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Wombat);
-  if (wombatPools.length > 0) {
-    const wombatRaw = await discoverWombatPoolsTyped(tokenIn, tokenOut, client, wombatPools);
-    for (const wp of wombatRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live quotePotentialSwap.
-      const wb = buildWombatBrackets(wp, wombats.length, amountIn);
-      if (wb.length === 0) continue;
-      wombats.push({
-        address: wp.address,
-        fromToken: wp.tokenIn,
-        toToken: wp.tokenOut,
-        feePpm: wp.feePpm,
-        source: wp.source,
-      });
-    }
-  }
-
-  const balancerStables: EcoBalancerStable[] = [];
-  // Balancer V2 ComposableStable — known-pool-address discovery (the FactoryConfig.address is the canonical
-  // Vault singleton; the per-config balancerStablePools carries the candidate ComposableStable pools). A
-  // QUOTE-LADDER (QL) LIVE-WALK venue (segKind 6): the on-chain solver reads the LIVE Vault StableMath state at
-  // cook (NON-BPT balances via getPoolTokenInfo SCALARS, scaling via getScalingFactors, amp/fee live) and
-  // REPLAYS the amplified StableSwap invariant (V2 rounding) to build the SAME geometric QL ladder — Balancer's
-  // own quote (Vault.queryBatchSwap) is eth_call-ONLY, so it cannot be quoted from a live view on-chain. So
-  // prepare ships ONLY the descriptor (pool + non-BPT in/out indices + poolId + non-BPT token addresses +
-  // registered scaling positions) — NO off-chain sampled segments (see index.ts buildQLVenues; the oracle
-  // mirrors it via buildBalancerStableQLLadder). Executed via the EXISTING engine BalancerV2 dispatch (poolType
-  // 4 → _swapBalancerV2 → Vault.swap(GIVEN_IN)); NO engine change. Because the ladder is built LIVE on-chain,
-  // the split RE-ANCHORS to cook-time balances + scaling (wei-exact vs the oracle even after adverse drift).
-  const balancerVaults = poolConfig.factories.filter((f) => f.factoryType === FactoryType.BalancerV2);
-  if (balancerVaults.length > 0) {
-    const balRaw = await discoverBalancerStablePoolsTyped(tokenIn, tokenOut, client, balancerVaults);
-    for (const bp of balRaw) {
-      // Liveness probe only — the QL ladder is built ON-CHAIN from live StableMath state, not from prepared
-      // segments; a descriptor that quotes no valid slice at the live state is dropped.
-      const qb = buildBalancerStableQLLadder(bp, amountIn);
-      if (qb.length === 0) continue;
-      balancerStables.push({
-        address: bp.address,
-        i: bp.i,
-        j: bp.j,
-        feePpm: balancerFeeToPpm(bp.swapFeeWad),
-        source: bp.source,
-        poolId: bp.poolId!,
-        nonBptTokens: bp.tokens!,
-        nonBptRegPos: bp.regPos!,
-        vault: bp.vault!,
-      });
-    }
-  }
-
-  const eulerSwaps: EcoEulerSwap[] = [];
-  // EulerSwap — QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE
-  // computeQuote (see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the descriptor
-  // (address + inIsToken0 orientation + fee). Known-pool-address discovery (the EulerSwap factory has NO
-  // pool enumeration, only a `deployedPools` mapping + PoolDeployed events, so the candidate pool addresses
-  // are carried per-config like Balancer; `discoverEulerSwapPoolsTyped` reads each pool's reserves + curve
-  // params + fee). buildEulerSwapBrackets is a pure LIVENESS PROBE (drop a pool that samples no valid
-  // segment); its brackets are NOT pushed to the segment stream. Executed CALLBACK-FREE (a live computeQuote
-  // staticcall for minOut + transfer + getAssets-oriented pool.swap(...,"") — EulerSwap's swap is V2-shaped,
-  // empty data ⇒ no flash callback). The QL ladder self-truncates at the LIVE vault cap (computeQuote reverts
-  // past inLimit/outLimit) with NO getLimits call, so the awarded Σ never cap-reverts on the exec. NO engine
-  // change.
-  const eulerFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.EulerSwap);
-  if (eulerFactories.length > 0) {
-    const eulerRaw = await discoverEulerSwapPoolsTyped(tokenIn, tokenOut, client, eulerFactories);
-    for (const ep of eulerRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live computeQuote, not from these brackets.
-      const eb = buildEulerSwapBrackets(ep, eulerSwaps.length, amountIn);
-      if (eb.length === 0) continue;
-      eulerSwaps.push({
-        address: ep.address,
-        inIsToken0: ep.inIsToken0,
-        feePpm: ep.feePpm,
-        source: ep.source,
-      });
-    }
-  }
-
-  const maverickPools: EcoMaverick[] = [];
-  // Maverick V2 — factory lookup discovery (lookup(tokenA, tokenB, idx) over both orderings). Maverick is a
-  // BIN-based directional AMM; it is now a QUOTE-LADDER (QL) venue — the on-chain solver's segKind-8 branch
-  // WALKS the pool's bin book LIVE from getState()/getTick() (the reference-math LIVE bin-walk), so prepare
-  // ships ONLY the descriptor (address + tokenAIn direction + tickSpacing; fee + activeTick + per-tick
-  // reserves are read on-chain, so the walk re-anchors to any drift). `discoverMaverickV2PoolsTyped` reads the
-  // tick book around the active tick + directional fee + tickSpacing and surfaces EVERY liquid pool regardless
-  // of which side of tick 0 its active tick sits on (the engine — ../sauce PR #193 — passes a per-direction
-  // FULL-RANGE tickLimit). Discovery SKIPS mixed-decimal pairs (maverick-math is D18-normalized and the reads
-  // feed raw reserves ⇒ wei-exact only for 18/18) so a mis-scaled marginal cannot enter the live path.
-  // buildMaverickWalkLadder is a pure LIVENESS PROBE (drop a pool the walk cannot fill — no reachable liquidity
-  // / degenerate); its slices are NOT pushed (the on-chain walk rebuilds them). EXECUTED through the engine
-  // (swap poolType 7 → _swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input mid-swap — a
-  // CALLBACK pool, so NOT callback-free). NO engine change.
-  const maverickFactories = poolConfig.factories.filter((f) => f.factoryType === FactoryType.MaverickV2Factory);
-  if (maverickFactories.length > 0) {
-    const maverickRaw = await discoverMaverickV2PoolsTyped(tokenIn, tokenOut, client, maverickFactories);
-    for (const mp of maverickRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live getState()/getTick(), not from these slices.
-      if (buildMaverickWalkLadder(mp, amountIn).length === 0) continue;
-      maverickPools.push({
-        address: mp.address,
-        tokenAIn: mp.tokenAIn,
-        tickSpacing: mp.tickSpacing,
-        feePpm: mp.feePpm,
-        source: `${mp.source} (Maverick V2)`,
-      });
-    }
-  }
-
-  // Curve CryptoSwap — crypto/tricrypto Metaregistry lookup (find_pool_for_coins → get_coin_indices,
-  // UINT256 i,j). CryptoSwap pools trade on the A-gamma invariant with a dynamic fee AND use uint256
-  // coin indices, so the engine `_swapCurve` (exchange(int128,...)) does NOT match — executed
-  // CALLBACK-FREE (get_dy staticcall for min_dy + approve + exchange(uint256,...)). Like Curve, it is a
-  // QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE get_dy (see
-  // ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the descriptor (address + coin
-  // indices i,j + fee) — NO off-chain sampled segments. buildCryptoSwapBrackets is still called as a
-  // pure LIVENESS PROBE (a pool that quotes no valid segment is dropped), but its brackets are NOT
-  // pushed to the segment stream. NO engine change. LOW priority (volatile-asset).
-  const cryptoSwaps: EcoCryptoSwap[] = [];
-  const cryptoRegistries = poolConfig.factories.filter((f) => f.factoryType === FactoryType.CurveCryptoRegistry);
-  if (cryptoRegistries.length > 0) {
-    const cryptoRaw = await discoverCryptoSwapPoolsTyped(tokenIn, tokenOut, client, cryptoRegistries);
-    for (const cp of cryptoRaw) {
-      // Liveness probe only — the QL ladder is built on-chain, not from these brackets.
-      const cb = buildCryptoSwapBrackets(cp, cryptoSwaps.length, amountIn);
-      if (cb.length === 0) continue;
-      cryptoSwaps.push({
-        address: cp.address,
-        i: cp.i,
-        j: cp.j,
-        feePpm: cp.feePpm,
-        source: `${cp.source} (Curve CryptoSwap)`,
-      });
-    }
-  }
-
-  const wooFiPools: EcoWooFi[] = [];
-  // WOOFi (WooPPV2 sPMM) — single-pool-per-chain discovery (the FactoryConfig.address is the WooPPV2
-  // pool). WOOFi is ORACLE-PRICED (prices off its WooracleV2 feed), NOT xy=k. Like Curve, it is now a
-  // QUOTE-LADDER (QL) venue: the on-chain solver builds its price ladder in setup from LIVE cook-time
-  // tryQuery (the GRACEFUL, never-reverting quote — returns 0 on a cap/feasibility failure — while the
-  // EXEC still reads the reverting query for the minToAmount), so prepare ships ONLY the descriptor
-  // (address + orientation + fee), NO off-chain sampled segments, and re-anchors to the live oracle at
-  // cook time (no snapshot). `discoverWooFiPoolsTyped` reads the pool's quoteToken/wooracle + the base's
-  // oracle state + decimals + feeRate; only a DIRECT base↔quote leg is in scope (base→base is two legs).
-  // Executed CALLBACK-FREE (query for minToAmount + transfer + pool.swap — WooPPV2 is transfer-first,
-  // computing the sold amount from balanceOf − reserve). NO engine change. buildWooFiBrackets is still
-  // called as a pure LIVENESS PROBE (a pool the snapshot sampler cannot quote — e.g. an infeasible
-  // oracle — is dropped), but its brackets are NOT pushed to the segment stream.
-  const woofiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.WOOFi);
-  if (woofiConfigs.length > 0) {
-    const wooRaw = await discoverWooFiPoolsTyped(tokenIn, tokenOut, client, woofiConfigs);
-    for (const wp of wooRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live tryQuery, not from these brackets.
-      const wb = buildWooFiBrackets(wp, wooFiPools.length, amountIn);
-      if (wb.length === 0) continue;
-      wooFiPools.push({
-        address: wp.address,
-        fromToken: wp.tokenIn,
-        toToken: wp.tokenOut,
-        feePpm: wp.feePpm,
-        source: wp.source,
-      });
-    }
-  }
-
-  const fermiPools: EcoFermi[] = [];
-  // Fermi / propAMM (gattaca-com/propamm FermiSwapper — Obric-style proactive AMM) — QUOTE-LADDER (QL) venue:
-  // the on-chain solver builds its price ladder in setup from LIVE quoteAmounts (see ecoswap.sauce.ts /
-  // index.ts buildQLVenues), so prepare ships ONLY the descriptor (address + fee). ROUTER discovery (the
-  // FactoryConfig.address is a FermiSwapper router); the router exposes NO curve-state getters, so
-  // `discoverFermiPoolsTyped` checks `isActive` and SAMPLES a LIVE `quoteAmounts` ladder as a LIVENESS PROBE.
-  // buildFermiBrackets is a pure probe (drop a pool that quotes no valid segment); its brackets are NOT pushed
-  // to the segment stream. Executed CALLBACK-FREE (a live quoteAmounts staticcall for amountCheck + approve +
-  // fermiSwapWithAllowances — propAMM PULLS via transferFrom, so approve-first, unlike WOOFi's transfer-first
-  // path). NO engine change. The exec re-reads the live quote (amountCheck + amountOutMin bound a bad fill).
-  const fermiConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Fermi);
-  if (fermiConfigs.length > 0) {
-    const fermiRaw = await discoverFermiPoolsTyped(tokenIn, tokenOut, client, fermiConfigs, amountIn);
-    for (const fp of fermiRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live quoteAmounts, not from these brackets.
-      const fb = buildFermiBrackets(fp, fermiPools.length, amountIn);
-      if (fb.length === 0) continue;
-      fermiPools.push({
-        address: fp.address,
-        fromToken: fp.tokenIn,
-        toToken: fp.tokenOut,
-        feePpm: fp.feePpm,
-        source: fp.source,
-      });
-    }
-  }
+  const qlFamilyDescs = <T,>(family: EcoLegQlVenue["family"]): T[] =>
+    directQl.filter((e) => e.venue.family === family).map((e) => e.venue.desc as T);
+  const curves = qlFamilyDescs<EcoCurve>("curve");
+  const cryptoSwaps = qlFamilyDescs<EcoCryptoSwap>("cryptoSwap");
+  const solidlyStables = qlFamilyDescs<EcoSolidlyStable>("solidlyStable");
+  const wooFiPools = qlFamilyDescs<EcoWooFi>("wooFi");
+  const lbs = qlFamilyDescs<EcoLb>("lb");
+  const mentoPools = qlFamilyDescs<EcoMento>("mento");
+  const dodos = qlFamilyDescs<EcoDodo>("dodo");
+  const wombats = qlFamilyDescs<EcoWombat>("wombat");
+  const fermiPools = qlFamilyDescs<EcoFermi>("fermi");
+  const eulerSwaps = qlFamilyDescs<EcoEulerSwap>("euler");
+  const balancerV3Pools = qlFamilyDescs<EcoBalancerV3>("balancerV3");
+  const balancerStables = qlFamilyDescs<EcoBalancerStable>("balancerV2");
+  const maverickPools = qlFamilyDescs<EcoMaverick>("maverick");
 
   const fluidPools: EcoFluid[] = [];
   const fluidBracketSets: EcoBracket[][] = [];
@@ -1394,88 +1529,6 @@ export async function prepareEcoSwap(
     }
   }
   for (const set of fluidBracketSets) brackets.push(...set);
-
-  const mentoPools: EcoMento[] = [];
-  // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) — ENUMERABLE
-  // discovery via the Broker (FactoryConfig.address = Broker). Mento is a BiPool oracle-priced exchange
-  // (the Broker routes to a registered exchange provider that prices off oracle rates + a spread over
-  // interval-updated buckets — canonical on-chain state, NOT xy=k). Like Curve, it is now a QUOTE-LADDER
-  // (QL) venue: the on-chain solver builds its price ladder in setup from the LIVE Broker getAmountOut
-  // view (PROBE-THEN-DECODE — see ecoswap.sauce.ts / index.ts buildQLVenues), so prepare ships ONLY the
-  // descriptor (broker + exchangeProvider + exchangeId + fee) — NO off-chain sampled segments — and
-  // re-anchors to the live bucket state at cook time. `discoverMentoPoolsTyped` runs the two-step
-  // enumeration (Broker.getExchangeProviders → provider.getExchanges) to map (tokenIn,tokenOut) →
-  // (exchangeProvider, exchangeId), then SAMPLES the Broker getAmountOut view for the liveness probe.
-  // buildMentoBrackets is still called as a pure LIVENESS PROBE (a venue that quotes no valid segment is
-  // dropped), but its brackets are NOT pushed to the segment stream. Executed CALLBACK-FREE (a live Broker
-  // getAmountOut staticcall for amountOutMin + approve the BROKER + broker.swapIn — Mento PULLS via
-  // transferFrom into the reserve, so approve-first, unlike WOOFi's transfer-first path). NO engine change.
-  const mentoConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Mento);
-  if (mentoConfigs.length > 0) {
-    const mentoRaw = await discoverMentoPoolsTyped(tokenIn, tokenOut, client, mentoConfigs, amountIn);
-    for (const mp of mentoRaw) {
-      // Liveness probe only — the QL ladder is built on-chain from live getAmountOut, not from these brackets.
-      const mb = buildMentoBrackets(mp, mentoPools.length, amountIn);
-      if (mb.length === 0) continue;
-      mentoPools.push({
-        broker: mp.broker,
-        exchangeProvider: mp.exchangeProvider,
-        exchangeId: mp.exchangeId,
-        fromToken: mp.tokenIn,
-        toToken: mp.tokenOut,
-        feePpm: mp.feePpm,
-        source: mp.source,
-      });
-    }
-  }
-
-  const balancerV3Pools: EcoBalancerV3[] = [];
-  // Balancer V3 (balancer-v3-monorepo — Vault singleton + per-chain Router) — KNOWN-POOL-ADDRESS discovery
-  // (FactoryConfig.address = the CREATE2 Vault singleton, FactoryConfig.balancerV3Pools = the pool addresses,
-  // FactoryConfig.balancerV3Router = the per-chain single-swap Router). Balancer V3 is a QUOTE-LADDER (QL)
-  // venue — but a SPECIAL one: its querySwapSingleTokenExactIn is eth_call-ONLY (uncallable on-chain in a
-  // cook), so it CANNOT quote-ladder off a live view like Curve/DODO. Instead the on-chain solver reads the
-  // LIVE Vault state (getCurrentLiveBalances / getAmplificationParameter / getStaticSwapFeePercentage + each
-  // token's rateProvider.getRate — all SCALARS / inline-indexed bare arrays, v12-safe) and REPLAYS the
-  // amplified StableSwap invariant (V3 rounding, live rate scaling) in SauceScript to build the SAME geometric
-  // QL ladder (see ecoswap.sauce.ts / index.ts buildQLVenues; the oracle mirrors it via buildBalancerV3QLLadder).
-  // So prepare ships ONLY the descriptor (pool + in/out indices + rate providers + const decimal scales + the
-  // Vault) — NO off-chain sampled segments. `discoverBalancerV3PoolsTyped` keeps a pool trading BOTH tokenIn
-  // and tokenOut (via Vault.getPoolTokens — V3 has NO BPT in the swappable set), reads the live state, and
-  // CROSS-CHECKS the static-fee StableMath replay against the REAL Router query at the sample points — a pool
-  // whose StableSurge hook is ACTIVE for this direction/size (the replay diverges) is EXCLUDED (documented
-  // scope: surge-active pools are a follow-up lane, since static-fee StableMath cannot reproduce an active
-  // surge fee). Executed CALLBACK-FREE (the Permit2 two-step approval — ERC20.approve(PERMIT2) +
-  // Permit2.approve(ROUTER) — + Router.swapSingleTokenExactIn; the V3 input is PULLED via Permit2, the ONE
-  // operational difference from V2, and the reentrancy is fully contained inside Balancer's own Router + Vault,
-  // never the cooking contract). NO engine change (unlike the V4 unlockCallback path). Because the ladder is
-  // built LIVE on-chain, the split RE-ANCHORS to cook-time balances + rates (wei-exact vs the oracle even after
-  // adverse drift), UNLIKE the prior snapshotted-query approach.
-  const balancerV3Configs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.BalancerV3);
-  if (balancerV3Configs.length > 0) {
-    const b3Raw = await discoverBalancerV3PoolsTyped(tokenIn, tokenOut, client, balancerV3Configs, amountIn);
-    for (const bp of b3Raw) {
-      // Liveness probe only — the QL ladder is built ON-CHAIN from live StableMath state, not from prepared
-      // segments; a descriptor that quotes no valid slice at the live state is dropped.
-      const qb = buildBalancerV3QLLadder(bp, amountIn);
-      if (qb.length === 0) continue;
-      balancerV3Pools.push({
-        address: bp.address,
-        router: bp.router,
-        fromToken: bp.tokenIn,
-        toToken: bp.tokenOut,
-        feePpm: bp.feePpm,
-        source: bp.source,
-        vault: bp.vault!,
-        inIdx: bp.inIdx!,
-        outIdx: bp.outIdx!,
-        rpIn: bp.rpIn!,
-        rpOut: bp.rpOut!,
-        decScaleIn: bp.decScaleIn!,
-        decScaleOut: bp.decScaleOut!,
-      });
-    }
-  }
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1542,19 +1595,63 @@ export async function prepareEcoSwap(
     }
     return pending;
   };
+  // QL venue discovery per edge — the SAME per-family typed discovery + liveness probes the
+  // DIRECT pair ran (discoverQlVenuesForPair), called with the EDGE pair so every descriptor is
+  // direction-stamped for the leg (i/j, isSellBase, swapForY, tokenAIn, inIdx/outIdx, …).
+  // MEMOIZED per DIRECTED edge with the SAME edgeKey as readEdge (direction matters: every
+  // orientation field above is per-direction). A family absent from ChainPoolConfig costs 0 RPC.
+  //
+  // SESSION-LEAD DECISION — the liveness-probe amount `estIn` rides the memo: the FIRST DFS path
+  // to touch a directed edge fixes the probe amount every later path sharing that edge reuses
+  // (two paths reaching the same edge through different upstream legs would fold different
+  // estimates). Accepted deliberately: the probe gates LIVENESS ONLY (is the venue quotable at
+  // roughly this size?) — the merge NEVER consumes probe output, since the on-chain ladders are
+  // re-sized and re-built from LIVE state at cook. A pathological shared edge with wildly
+  // different upstream estimates could at worst mis-drop (or keep) a borderline venue — a
+  // split-quality tail effect, never a correctness one.
+  const qlEdgeCache = new Map<string, Promise<EdgeQlVenue[]>>();
+  const readEdgeQl = (hopIn: Hex, hopOut: Hex, estIn: bigint): Promise<EdgeQlVenue[]> => {
+    const key = edgeKey(hopIn, hopOut);
+    let pending = qlEdgeCache.get(key);
+    if (!pending) {
+      pending = discoverQlVenuesForPair(hopIn, hopOut, estIn, client, poolConfig, caller ?? ZERO_ADDRESS);
+      qlEdgeCache.set(key, pending);
+    }
+    return pending;
+  };
+  // Fold a leg's best-member head into the DFS's downstream probe estimate: the leg converts
+  // `est` of its hopIn into ≈ est · h²/2^192 of its hopOut (h = post-fee out/in sqrt Q96), the
+  // same two-step floor fold the on-chain sizing prelude computes from live setup heads. h==0
+  // (an empty leg cannot happen — buildLeg returns null) would fold to 0, which simply probes
+  // downstream venues at 0 ⇒ they drop (a dead upstream ⇒ the venue could never be fed anyway).
+  const foldEstIn = (est: bigint, headOI: bigint): bigint =>
+    (((est * headOI) / Q96) * headOI) / Q96;
 
   /**
    * Build a leg from a memoized edge read, keeping EVERY survivor pool the lens returned for the
-   * edge — V2, V3 and hookless V4 alike (the leg-internal merge + N-hop chain are type-agnostic).
-   * Each leg pool is stamped with the LEG's hop direction zHop exactly like a direct pool of its
-   * type (V2 via the live-reserves seed, V3/V4 via the net cache). Returns null if the edge has no
-   * survivor. A V4 survivor WITH hooks is excluded (the unified swap path is hookless-V4 only).
+   * edge — V2, V3 and hookless V4 alike (the leg-internal merge + N-hop chain are type-agnostic)
+   * — PLUS every live QL venue the shared per-edge discovery surfaced (the leg's quote-ladder
+   * members, direction-stamped for this edge). Each leg pool is stamped with the LEG's hop
+   * direction zHop exactly like a direct pool of its type (V2 via the live-reserves seed, V3/V4
+   * via the net cache). Returns null only when the edge has NO members at all (no pools AND no
+   * venues — a venue-only leg is a valid leg). A V4 survivor WITH hooks is excluded (the unified
+   * swap path is hookless-V4 only). `estIn` is the DFS-folded prepare-time estimate of the
+   * tokenIn flow reaching this edge — the venue liveness-probe amount (see readEdgeQl).
+   *
+   * Also returns the leg's best-member HEAD (post-fee out/in sqrt Q96) for the DFS fold: the max
+   * over the leg pools' fee-adjusted live spots (the lens read), falling back to the venues'
+   * probe-ladder first-slice heads only when the leg has no pools (the all-QL-leg case).
    */
-  const buildLeg = async (hopIn: Hex, hopOut: Hex): Promise<EcoLeg | null> => {
+  const buildLeg = async (
+    hopIn: Hex,
+    hopOut: Hex,
+    estIn: bigint,
+  ): Promise<{ leg: EcoLeg; headOI: bigint } | null> => {
     const zHop = hopIn.toLowerCase() < hopOut.toLowerCase(); // THIS leg's hop direction
-    const [lens, legAlgebra] = await Promise.all([
+    const [lens, legAlgebra, edgeQl] = await Promise.all([
       readEdge(hopIn, hopOut),
       readEdgeAlgebra(hopIn, hopOut),
+      readEdgeQl(hopIn, hopOut, estIn),
     ]);
     const legPools: EcoPool[] = [];
     for (const p of lens.pools) {
@@ -1573,13 +1670,22 @@ export async function prepareEcoSwap(
         legPools.push(lensToEcoPool(p, zHop, "lens route leg V4", false));
       }
     }
-    if (legPools.length === 0) return null;
-    return {
-      hopIn,
-      hopOut,
-      zeroForOne: zHop,
-      pools: legPools,
-    };
+    if (legPools.length + edgeQl.length === 0) return null;
+    // Best-member head for the downstream fold: pools carry the lens's live spot (V2's
+    // spotNearReal is ALREADY the out/in seed; V3/V4's is the real sqrt → orient by zHop),
+    // fee-adjusted; an all-QL leg falls back to the venues' probe-ladder first-slice heads.
+    let headOI = 0n;
+    for (const lp of legPools) {
+      const spotOI = lp.isV2 ? lp.spotNearReal! : toOutIn(lp.spotNearReal!, zHop);
+      const h = feeAdjust(spotOI, lp.feePpm);
+      if (h > headOI) headOI = h;
+    }
+    if (legPools.length === 0) {
+      for (const e of edgeQl) if (e.headOI > headOI) headOI = e.headOI;
+    }
+    const leg: EcoLeg = { hopIn, hopOut, zeroForOne: zHop, pools: legPools };
+    if (edgeQl.length > 0) leg.qlVenues = edgeQl.map((e) => e.venue);
+    return { leg, headOI };
   };
 
   // Interior nodes the DFS may transit through: base tokens that are neither endpoint.
@@ -1594,12 +1700,16 @@ export async function prepareEcoSwap(
   // the visited token set (lowercased) to forbid revisiting any token on the same path (no cycles).
   // At each node we may close the path by hopping to tokenOut (emit a route), and — if we have
   // hop budget left — branch into each unvisited interior token. Legs are built lazily, so an
-  // edge with no V3 survivor simply prunes that branch (a dead edge ⇒ no route through it).
+  // edge with no member simply prunes that branch (a dead edge ⇒ no route through it). `estIn`
+  // is the prepare-time estimate of the tokenIn-equivalent flow REACHING this node — amountIn
+  // folded through each upstream leg's best-member head (foldEstIn) — the per-edge QL venue
+  // liveness-probe amount (see readEdgeQl; sizing only, never merge data).
   const dfs = async (
     token: Hex,
     legsSoFar: EcoLeg[],
     interSoFar: Hex[],
     visited: Set<string>,
+    estIn: bigint,
   ): Promise<void> => {
     const hopsUsed = legsSoFar.length;
     // Close the path: hop directly to tokenOut. A path needs ≥2 legs to be a route (a direct
@@ -1609,9 +1719,9 @@ export async function prepareEcoSwap(
       if (routes.length >= MAX_ROUTES) {
         routesTruncated++;
       } else {
-        const closing = await buildLeg(token, tokenOut);
+        const closing = await buildLeg(token, tokenOut, estIn);
         if (closing) {
-          routes.push({ legs: [...legsSoFar, closing], intermediateTokens: [...interSoFar] });
+          routes.push({ legs: [...legsSoFar, closing.leg], intermediateTokens: [...interSoFar] });
         }
       }
     }
@@ -1620,14 +1730,20 @@ export async function prepareEcoSwap(
     for (const next of interiorTokens) {
       const nl = next.toLowerCase();
       if (visited.has(nl)) continue; // no cycles — each token at most once per path
-      const leg = await buildLeg(token, next);
-      if (!leg) continue; // dead edge — prune
+      const built = await buildLeg(token, next, estIn);
+      if (!built) continue; // dead edge — prune
       visited.add(nl);
-      await dfs(next, [...legsSoFar, leg], [...interSoFar, next], visited);
+      await dfs(
+        next,
+        [...legsSoFar, built.leg],
+        [...interSoFar, next],
+        visited,
+        foldEstIn(estIn, built.headOI),
+      );
       visited.delete(nl);
     }
   };
-  await dfs(tokenIn, [], [], new Set<string>([inLower]));
+  await dfs(tokenIn, [], [], new Set<string>([inLower]), amountIn);
 
   if (routesTruncated > 0) {
     console.log(
@@ -1651,6 +1767,23 @@ export async function prepareEcoSwap(
   // are claimed. The universe dedup then never fires (no address appears twice), exec cannot
   // double-spend or invert, and solver == oracle == reference for routes BY CONSTRUCTION. (Shared-
   // pool routes with per-route shared-frontier accounting are a later phase — not attempted here.)
+  //
+  // QL VENUES join the SAME claim discipline, keyed by qlVenueClaimKey (pool address; Mento
+  // provider|exchangeId) in ONE shared set with the pool addresses (namespaces never collide).
+  // Two ladders over one pool's liquidity double-count its depth no matter WHICH coin pair each
+  // prices (a direct (A,B) instance and a leg (A,X) instance of a 3-coin pool assume the same
+  // untouched inventory; the second exec realizes less than modeled — no revert, the callback-free
+  // execs re-quote live, but the split is economically wrong). So, unlike 2-token pools — which
+  // cannot serve two edges of one cycle-free path — a MULTI-COIN venue (3-coin Curve/CryptoSwap,
+  // 3-token BalancerV2, multi-asset Wombat) holding {A, X, B} IS discoverable on BOTH legs of one
+  // route: claim-after-admission alone is NOT sufficient. The filter therefore claims WITHIN the
+  // route as it walks (tentative `routeClaims`, merged into the global set only on admission):
+  //   1. DIRECT venues claim first (a pool serving the overall pair directly is excluded from
+  //      every leg — one shared inventory cannot serve both).
+  //   2. Within a route, an earlier leg's admitted venue excludes the same venue from later legs.
+  //   3. Across routes, first (shortest) route wins — mirroring the pools' first-landing bound.
+  // A leg is dead only when pools AND venues are BOTH empty; a dead leg drops the route.
+  //
   // NOTE: address-disjointness does NOT cover a shared intermediate TOKEN — two admitted disjoint-
   // POOL routes can still transit the same token X via different edges (P: A→X→Y→B, Q: A→Z→X→B share
   // token X with NO common pool, both survive this filter). That case is safe by the on-chain exec
@@ -1659,8 +1792,26 @@ export async function prepareEcoSwap(
   // leg>0 whole-balance drain reads balanceOf(X) to 0 before the next route deposits X. A future
   // exec reorder (e.g. batching all leg0s then all leg1s for gas) would reintroduce the double-read
   // — the per-route produce-then-consume order in ecoswap.sauce.ts is the load-bearing guarantee.
-  const claimedPools = new Set<string>();
-  for (const p of pools) claimedPools.add(p.address.toLowerCase());
+  const claimed = new Set<string>();
+  for (const p of pools) claimed.add(p.address.toLowerCase());
+  // Direct QL venue identities (rule 1). Fluid joins for uniformity (direct-only anyway — no leg
+  // instance can exist, but the one-inventory argument is family-agnostic and the union is free).
+  for (const c of curves) claimed.add(c.address.toLowerCase());
+  for (const cp of cryptoSwaps) claimed.add(cp.address.toLowerCase());
+  for (const sp of solidlyStables) claimed.add(sp.address.toLowerCase());
+  for (const wp of wooFiPools) claimed.add(wp.address.toLowerCase());
+  for (const lb of lbs) claimed.add(lb.address.toLowerCase());
+  for (const mp of mentoPools) {
+    claimed.add(mentoClaimKey(mp.exchangeProvider, mp.exchangeId));
+  }
+  for (const d of dodos) claimed.add(d.address.toLowerCase());
+  for (const wp of wombats) claimed.add(wp.address.toLowerCase());
+  for (const fp of fermiPools) claimed.add(fp.address.toLowerCase());
+  for (const ep of eulerSwaps) claimed.add(ep.address.toLowerCase());
+  for (const bp of balancerV3Pools) claimed.add(bp.address.toLowerCase());
+  for (const bp of balancerStables) claimed.add(bp.address.toLowerCase());
+  for (const mp of maverickPools) claimed.add(mp.address.toLowerCase());
+  for (const fp of fluidPools) claimed.add(fp.address.toLowerCase());
   const orderedRoutes = routes
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
@@ -1668,31 +1819,55 @@ export async function prepareEcoSwap(
   const disjointRoutes: EcoRoute[] = [];
   let droppedRouteCount = 0;
   let droppedLegPoolCount = 0;
+  let droppedLegVenueCount = 0;
   for (const route of orderedRoutes) {
     const survivingLegs: EcoLeg[] = [];
+    // Tentative intra-route claims (rule 2) — discarded whole if the route is rejected, merged
+    // into the global set on admission (rule 3). Pools ride the same set: a 2-token pool cannot
+    // collide across a cycle-free path's edges, so this is a no-op for them (kept uniform).
+    const routeClaims = new Set<string>();
     let admit = true;
     for (const leg of route.legs) {
-      const keep = leg.pools.filter((lp) => !claimedPools.has(lp.address.toLowerCase()));
-      droppedLegPoolCount += leg.pools.length - keep.length;
-      if (keep.length === 0) {
+      const keepPools = leg.pools.filter((lp) => {
+        const k = lp.address.toLowerCase();
+        return !claimed.has(k) && !routeClaims.has(k);
+      });
+      droppedLegPoolCount += leg.pools.length - keepPools.length;
+      const legVenues = leg.qlVenues ?? [];
+      // legSeen: dedupe SAME-LEG duplicate instances of one venue (e.g. one Curve pool surfaced
+      // by two configured registries) — claimed/routeClaims only see venues from EARLIER legs,
+      // so intra-leg duplicates would otherwise both survive and double-count one inventory.
+      const legSeen = new Set<string>();
+      const keepVenues = legVenues.filter((v) => {
+        const k = qlVenueClaimKey(v);
+        if (claimed.has(k) || routeClaims.has(k) || legSeen.has(k)) return false;
+        legSeen.add(k);
+        return true;
+      });
+      droppedLegVenueCount += legVenues.length - keepVenues.length;
+      if (keepPools.length + keepVenues.length === 0) {
         admit = false;
         break;
       }
-      survivingLegs.push({ ...leg, pools: keep });
+      for (const lp of keepPools) routeClaims.add(lp.address.toLowerCase());
+      for (const v of keepVenues) routeClaims.add(qlVenueClaimKey(v));
+      const survLeg: EcoLeg = { ...leg, pools: keepPools };
+      if (keepVenues.length > 0) survLeg.qlVenues = keepVenues;
+      else delete survLeg.qlVenues; // a venue-free leg carries NO qlVenues key (shape-stable)
+      survivingLegs.push(survLeg);
     }
     if (!admit) {
       droppedRouteCount++;
       continue;
     }
-    for (const leg of survivingLegs) {
-      for (const lp of leg.pools) claimedPools.add(lp.address.toLowerCase());
-    }
+    for (const k of routeClaims) claimed.add(k);
     disjointRoutes.push({ ...route, legs: survivingLegs });
   }
-  if (droppedRouteCount > 0 || droppedLegPoolCount > 0) {
+  if (droppedRouteCount > 0 || droppedLegPoolCount > 0 || droppedLegVenueCount > 0) {
     console.log(
       `  EcoSwap disjoint-route filter: dropped ${droppedRouteCount} route(s) + ${droppedLegPoolCount} ` +
-        `already-claimed leg pool(s) — first-landing bound (a shared leg pool would double-spend/invert at exec)`,
+        `already-claimed leg pool(s) + ${droppedLegVenueCount} already-claimed leg QL venue(s) — ` +
+        `first-landing bound (a shared member would double-spend/double-count its inventory)`,
     );
   }
   routes.length = 0;
@@ -1729,6 +1904,10 @@ export async function prepareEcoSwap(
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
   const directNetRows = pools.reduce((s, p) => s + (p.netRows?.length ?? 0), 0);
   const legPoolCount = routes.reduce((s, r) => s + r.legs.reduce((t, l) => t + l.pools.length, 0), 0);
+  const legQlvCount = routes.reduce(
+    (s, r) => s + r.legs.reduce((t, l) => t + (l.qlVenues?.length ?? 0), 0),
+    0,
+  );
   // Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2, Wombat,
   // Fermi, EulerSwap AND Maverick V2 ship as QL (Quote-Ladder) DESCRIPTORS (the .length of each list), NOT
   // sampled segments — the on-chain solver builds each ladder live from its quote view / bin-walk — so they
@@ -1737,7 +1916,7 @@ export async function prepareEcoSwap(
   console.log(
     `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${balancerStables.length} Balancer-stable, ` +
-      `${routes.length} routes (${legPoolCount} leg pools), ${directNetRows} direct net-cache rows ` +
+      `${routes.length} routes (${legPoolCount} leg pools, ${legQlvCount} leg QL venues), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
       `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +

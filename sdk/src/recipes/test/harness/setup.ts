@@ -173,6 +173,17 @@ export const eulerSwapPoolArtifact = loadArtifact(
 export const maverickV2PoolArtifact = loadArtifact(
   join(FIXTURES, "MaverickV2Pool.sol", "MaverickV2Pool.json"),
 );
+/** PAIR-AWARE Curve MetaRegistry mock (find_pool_for_coins / get_coin_indices / get_n_coins keyed by
+ *  unordered pair; unregistered pair → address(0)) — the production FactoryType.CurveRegistry discovery
+ *  surface for multi-edge route tests (the etch shim answers every pair with one pool — single-pair only). */
+export const curveRegistryMockArtifact = loadArtifact(
+  join(FIXTURES, "DiscoveryRegistryMocks.sol", "CurveRegistryMock.json"),
+);
+/** PAIR-AWARE Maverick V2 factory mock (lookup(a,b,start,end) keyed by unordered pair; unregistered
+ *  pair → empty page) — the production FactoryType.MaverickV2Factory discovery surface for route tests. */
+export const maverickFactoryMockArtifact = loadArtifact(
+  join(FIXTURES, "DiscoveryRegistryMocks.sol", "MaverickFactoryMock.json"),
+);
 export const v4HelperArtifact = loadArtifact(
   join(FIXTURES, "V4LiquidityHelper.sol", "V4LiquidityHelper.json"),
 );
@@ -941,6 +952,71 @@ export async function deployCurveStableSwap(
     });
   }
   return pool;
+}
+
+/** Register/read surface of the pair-aware discovery mocks (DiscoveryRegistryMocks.sol). */
+export const curveRegistryMockAbi = parseAbi([
+  "function register(address a, address b, address pool)",
+  "function find_pool_for_coins(address from, address to) view returns (address)",
+  "function get_coin_indices(address pool, address from, address to) view returns (int128 i, int128 j, bool underlying)",
+  "function get_n_coins(address pool) view returns (uint256)",
+]);
+export const maverickFactoryMockAbi = parseAbi([
+  "function register(address tokenA, address tokenB, address pool)",
+  "function lookup(address tokenA, address tokenB, uint256 startIndex, uint256 endIndex) view returns (address[] pools)",
+]);
+
+/**
+ * Deploy a PAIR-AWARE Curve MetaRegistry mock and register each (a, b) → pool entry. The mock
+ * answers the production FactoryType.CurveRegistry discovery surface with REAL pair semantics
+ * (unregistered pair → address(0); get_coin_indices scans the pool's own coins(k) so one
+ * multi-coin pool registered under several pairs orients per-edge) — required by multi-edge
+ * route tests, where the single-pair etch shim would surface its one pool on EVERY edge.
+ */
+export async function deployCurveRegistryMock(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  entries: { a: Hex; b: Hex; pool: Hex }[],
+): Promise<Hex> {
+  const registry = await deployContract(walletClient, publicClient, {
+    abi: curveRegistryMockArtifact.abi,
+    bytecode: curveRegistryMockArtifact.bytecode,
+    args: [],
+  });
+  for (const e of entries) {
+    await writeAndWait(walletClient, publicClient, {
+      address: registry,
+      abi: curveRegistryMockAbi as Abi,
+      functionName: "register",
+      args: [e.a, e.b, e.pool],
+    });
+  }
+  return registry;
+}
+
+/**
+ * Deploy a PAIR-AWARE Maverick V2 factory mock and register each (tokenA, tokenB) → pool entry
+ * (the lookup(a,b,start,end) discovery surface; unregistered pair → empty page).
+ */
+export async function deployMaverickFactoryMock(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  entries: { tokenA: Hex; tokenB: Hex; pool: Hex }[],
+): Promise<Hex> {
+  const factory = await deployContract(walletClient, publicClient, {
+    abi: maverickFactoryMockArtifact.abi,
+    bytecode: maverickFactoryMockArtifact.bytecode,
+    args: [],
+  });
+  for (const e of entries) {
+    await writeAndWait(walletClient, publicClient, {
+      address: factory,
+      abi: maverickFactoryMockAbi as Abi,
+      functionName: "register",
+      args: [e.tokenA, e.tokenB, e.pool],
+    });
+  }
+  return factory;
 }
 
 /** Minimal Curve CryptoSwap fixture ABI (coins/get_dy/exchange(uint256,...) + state reads). */

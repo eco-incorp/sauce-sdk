@@ -89,6 +89,45 @@ contract WooFiPool {
         quoteReserve = IERC20Min(quoteToken).balanceOf(address(this));
     }
 
+    // ── Production-discovery read surface (discoverWooFiPoolsTyped) ────────
+    // The real WooPPV2 exposes a separate WooracleV2 feed; this fixture's oracle is BUILT-IN, so it
+    // reports ITSELF as the oracle and answers the WooracleV2 reads (state/decimals) directly.
+
+    /// @notice WooPPV2.wooracle() — the oracle address (this fixture: self).
+    function wooracle() external view returns (address) {
+        return address(this);
+    }
+
+    /// @notice WooracleV2.state(base) — the sPMM inputs for the base token. Reverts for any other
+    /// token, so a non-base/quote pair query fails discovery's try (the pair is skipped) exactly
+    /// like an unsupported token on the real oracle.
+    function state(address base) external view returns (uint128, uint64, uint64, bool) {
+        require(base == baseToken, "WooOracle: !base");
+        return (uint128(price), uint64(spread), uint64(coeff), woFeasible);
+    }
+
+    /// @notice WooracleV2.decimals(base) — the oracle price decimals (priceDec = 10**decimals).
+    function decimals(address base) external view returns (uint8 d) {
+        require(base == baseToken, "WooOracle: !base");
+        uint256 p = priceDec;
+        while (p > 1) {
+            p /= 10;
+            d++;
+        }
+    }
+
+    /// @notice WooPPV2.tokenInfos(token) — reserve + feeRate + caps. The fixture is UNCAPPED
+    /// (maxGamma = maxNotionalSwap = 0 ⇒ discovery's unknown/uncapped sentinel).
+    function tokenInfos(address token)
+        external
+        view
+        returns (uint192 reserve, uint16 feeRate_, uint128 maxGamma, uint128 maxNotionalSwap)
+    {
+        require(token == baseToken || token == quoteToken, "WooPPV2: !token");
+        reserve = uint192(token == baseToken ? baseReserve : quoteReserve);
+        return (reserve, uint16(feeRate), 0, 0);
+    }
+
     // ── sPMM math (mirrors woofi-math.ts / WooPPV2._calc*) ─────────────────
 
     /// @notice _calcQuoteAmountSellBase then the sell-base fee off the OUTPUT.
