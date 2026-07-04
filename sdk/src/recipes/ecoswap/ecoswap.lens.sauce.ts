@@ -178,6 +178,30 @@ function tickArg(shifted: Uint256, OFFSET: Uint256): Uint256 {
   return Math.neg(OFFSET - shifted) | HIGH;
 }
 
+// ts-aligned SHIFTED base tick from a slot0/getSlot0/globalState int24 tick READ —
+// verbatim from the solver (ecoswap.sauce.ts tickShiftedBase).
+//
+// The engine decodes a signed intN CONTRACT-OUTPUT (slot0/getSlot0/globalState tick,
+// int24) by ZERO-extending it (not sign-extending) — a negative tick like -180 comes
+// back as its raw 24-bit two's-complement 16777036 (= 2^24 - 180), NOT 2^256-180. So
+// the naive `((tickRaw + OFFSET) / ts) * ts` produces a grid base displaced by
+// -(2^24 mod ts) ticks for any pool below tick 0 with ts > 1 (ts=10 → +4, ts=50/60/
+// 200 → -16): every scanned boundary lands OFF-GRID, every ticks()/getTickLiquidity
+// read returns 0 (L never updates; emitted net rows are all zero). Recover the true
+// SHIFTED tick directly: a raw value with the int24 sign bit set (>= 2^23) is
+// negative, so shift = rawTick + OFFSET - 2^24; otherwise shift = rawTick + OFFSET.
+// Both are non-negative (OFFSET > max|tick|). Then floor to the tickSpacing lattice.
+// Mirrors the off-chain BigInt.asIntN(24, tickRaw).
+function tickShiftedBase(tickRaw: Uint256, OFFSET: Uint256, ts: Uint256): Uint256 {
+  const INT24_SIGN: Uint256 = 8388608; // 2^23
+  const INT24_MOD: Uint256 = 16777216; // 2^24
+  let shifted: Uint256 = tickRaw + OFFSET;
+  if (tickRaw >= INT24_SIGN) {
+    shifted = tickRaw + OFFSET - INT24_MOD;
+  }
+  return (shifted / ts) * ts;
+}
+
 // fee-adjusted out/in sqrt: sqrt * sqrt(1-fee) (sqrt(1-fee) scaled by 1e6).
 function feeAdj(sqrtV: Uint256, fee: Uint256): Uint256 {
   const sf: Uint256 = Math.sqrt((1000000 - fee) * 1000000);
@@ -465,7 +489,7 @@ function main(
             } else {
               tickA3 = IUniswapV3PoolFull.at(poolA3).slot0()[1];
             }
-            const baseA3: Uint256 = ((tickA3 + OFFSET) / tsA3) * tsA3;
+            const baseA3: Uint256 = tickShiftedBase(tickA3, OFFSET, tsA3);
             let curA3: Uint256 = baseA3;
             if (zeroForOne === 0) {
               curA3 = baseA3 + tsA3;
@@ -580,7 +604,7 @@ function main(
         const liqA4: Uint256 = IStateViewFull.at(stateViewA).getLiquidity(poolIdA);
         if (liqA4 > 0) {
           const tickA4: Uint256 = IStateViewFull.at(stateViewA).getSlot0(poolIdA)[1];
-          const baseA4: Uint256 = ((tickA4 + OFFSET) / tsA4) * tsA4;
+          const baseA4: Uint256 = tickShiftedBase(tickA4, OFFSET, tsA4);
           let curA4: Uint256 = baseA4;
           if (zeroForOne === 0) {
             curA4 = baseA4 + tsA4;
@@ -734,7 +758,7 @@ function main(
             // STOPS at the cut WITHOUT drift. cumIn at the stop = windowed capacity.
             // (Inlined, not a helper: the compiler does not support helper→helper
             // calls, and the walk calls stepReal/toOutIn/feeAdj/tickArg.)
-            const baseShiftM: Uint256 = ((tickM + OFFSET) / tsM) * tsM;
+            const baseShiftM: Uint256 = tickShiftedBase(tickM, OFFSET, tsM);
             let curShiftM: Uint256 = baseShiftM;
             if (zeroForOne === 0) {
               curShiftM = baseShiftM + tsM;
@@ -865,7 +889,7 @@ function main(
           const tickM4: Uint256 = IStateViewFull.at(stateViewM).getSlot0(poolIdM)[1];
           // IN-RANGE capacity walk (V4 via StateView.getTickLiquidity) — same body
           // as the V3 measure walk above; inlined (no helper→helper calls).
-          const baseShiftM4: Uint256 = ((tickM4 + OFFSET) / v4tsM) * v4tsM;
+          const baseShiftM4: Uint256 = tickShiftedBase(tickM4, OFFSET, v4tsM);
           let curShiftM4: Uint256 = baseShiftM4;
           if (zeroForOne === 0) {
             curShiftM4 = baseShiftM4 + v4tsM;
@@ -1049,7 +1073,7 @@ function main(
             const idx3: Uint256 = poolCount;
 
             // ── Reverse-side drift reads (opposite direction), survivors only ──
-            const baseRev3: Uint256 = ((tick3 + OFFSET) / ts3) * ts3;
+            const baseRev3: Uint256 = tickShiftedBase(tick3, OFFSET, ts3);
             // reverse of swap dir: for zeroForOne (down) reverse is UP → start +ts.
             let revShift3: Uint256 = baseRev3;
             if (zeroForOne === 1) {
@@ -1069,7 +1093,7 @@ function main(
             }
 
             // ── Forward lazy walk (swap direction) ──
-            const baseShift3: Uint256 = ((tick3 + OFFSET) / ts3) * ts3;
+            const baseShift3: Uint256 = tickShiftedBase(tick3, OFFSET, ts3);
             let curShift3: Uint256 = baseShift3;
             if (zeroForOne === 0) {
               curShift3 = baseShift3 + ts3;
@@ -1238,7 +1262,7 @@ function main(
           const tick43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[1];
           const idx43: Uint256 = poolCount;
 
-          const baseRev4: Uint256 = ((tick43 + OFFSET) / v4ts3) * v4ts3;
+          const baseRev4: Uint256 = tickShiftedBase(tick43, OFFSET, v4ts3);
           let revShift4: Uint256 = baseRev4;
           if (zeroForOne === 1) {
             revShift4 = baseRev4 + v4ts3;
@@ -1256,7 +1280,7 @@ function main(
             }
           }
 
-          const baseShift4: Uint256 = ((tick43 + OFFSET) / v4ts3) * v4ts3;
+          const baseShift4: Uint256 = tickShiftedBase(tick43, OFFSET, v4ts3);
           let curShift4: Uint256 = baseShift4;
           if (zeroForOne === 0) {
             curShift4 = baseShift4 + v4ts3;
