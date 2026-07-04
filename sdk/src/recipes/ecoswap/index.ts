@@ -680,6 +680,21 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
         19n, // segKind = SIZE (window-hoisted quoteSell ladder; approve RELAYER + sell on the exec)
         BigInt(refIdx),
       ];
+    // PANCAKESWAP STABLESWAP (BSC legacy-Curve Solidity port): qd[0]=pool, qd[1]/qd[2]=the UINT256
+    // coin indices i/j (direction-stamped per edge by the getPairInfo sorted token0/token1). The QL
+    // ladder quotes get_dy(uint256 i, uint256 j, xNext) PROBE-THEN-DECODE (an empty/killed pool
+    // REVERTS get_dy — the venue self-drops; zero/oversize quote gracefully); EXEC is callback-free
+    // (coins(0) orient + live get_dy as min_dy + approve POOL + exchange(uint256 i, uint256 j, Σ,
+    // min_dy) — the CryptoSwap segKind-9 shape; the engine _swapCurve int128 dispatch does NOT fit).
+    case "pancakeStable":
+      return [
+        BigInt(v.desc.address),
+        BigInt(v.desc.i),
+        BigInt(v.desc.j),
+        BigInt(v.desc.feePpm),
+        20n, // segKind = PancakeStableSwap (uint256-index get_dy ladder; approve + exchange on the exec)
+        BigInt(refIdx),
+      ];
   }
 }
 
@@ -698,9 +713,14 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
  * scalars, re-purposed per family: Curve int128 / CryptoSwap uint256 coin indices; LB packs `swapForY`
  * into `i`; Mento packs the exchangeId (bytes32 as uint256) into `i`; Balancer V3 packs inIdx/outIdx
  * into `i`/`j`; UNUSED (0) for Solidly/WOOFi, which quote by tokenIn/tokenOut. `feePpm` is informational
- * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Nineteen QL families ship today,
+ * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Twenty QL families ship today,
  * each with a distinct `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters
  * are INDEPENDENT (0-based into each family's list). The newest:
+ *   segKind 20 = PANCAKE STABLESWAP → callback-free get_dy(uint256,uint256,uint256) ladder
+ *                                   (probe-then-decode: an empty/killed pool REVERTS; zero/oversize
+ *                                   quote gracefully) + coins(0) orient + approve POOL +
+ *                                   exchange(uint256 i, uint256 j, Σ, min_dy) (refIdx → the
+ *                                   on-chain `pksinp[refIdx]`/`pksven[refIdx]` slot).
  *   segKind 18 = LIQUIDCORE     → callback-free pool.estimateSwap (probe-then-decode: zero/unsupported
  *                                   REVERT, drained ⇒ 0, oversize ⇒ graceful cap) + approve POOL +
  *                                   pool.swap(tokenIn, tokenOut, Σ, minOut) (refIdx → the on-chain
@@ -752,7 +772,8 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   // Family-concatenation order is LOAD-BEARING (the direct rows' positions feed the on-chain
   // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
   // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
-  // maverickPools, fluidPools, tesseraPools, elfomoPools, metricPools, liquidCorePools, sizePools — the historical order the per-family map
+  // maverickPools, fluidPools, tesseraPools, elfomoPools, metricPools, liquidCorePools, sizePools,
+  // pancakeStablePools — the historical order the per-family map
   // bodies (now qlRowFor) emitted, with Fluid appended when it migrated from the static-segment
   // stream and Tessera/Elfomo appended when they landed (new families ALWAYS append at the tail).
   const rows: bigint[][] = [];
@@ -775,6 +796,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   (prepared.metricPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "metric", desc }, i)));
   (prepared.liquidCorePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "liquidcore", desc }, i)));
   (prepared.sizePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "size", desc }, i)));
+  (prepared.pancakeStablePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "pancakeStable", desc }, i)));
   // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
   // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
   return rows.map(pad12);
@@ -852,6 +874,8 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_METRIC = (prepared.metricPools?.length ?? 0) > 0 || hasLegFam("metric");
   const HAS_LIQUIDCORE = (prepared.liquidCorePools?.length ?? 0) > 0 || hasLegFam("liquidcore");
   const HAS_SIZE = (prepared.sizePools?.length ?? 0) > 0 || hasLegFam("size");
+  const HAS_PANCAKE_STABLE =
+    (prepared.pancakeStablePools?.length ?? 0) > 0 || hasLegFam("pancakeStable");
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
   const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
   // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
@@ -881,6 +905,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_METRIC,
     HAS_LIQUIDCORE,
     HAS_SIZE,
+    HAS_PANCAKE_STABLE,
     HAS_MENTO,
     HAS_BALANCER_V3,
     HAS_LEG_QLV,

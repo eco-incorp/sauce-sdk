@@ -85,6 +85,7 @@ import { buildTesseraQLLadder, type TesseraPool } from "../shared/tessera-math.j
 import { buildElfomoQLLadder, type ElfomoPool } from "../shared/elfomo-math.js";
 import { buildMetricQLLadder, type MetricPool } from "../shared/metric-math.js";
 import { buildLiquidCoreQLLadder, type LiquidCorePool } from "../shared/liquidcore-math.js";
+import { buildPancakeStableQLLadder, type PancakeStablePool } from "../shared/pancakestable-math.js";
 import { buildSizeQLLadder, type SizePool } from "../shared/size-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
@@ -299,6 +300,19 @@ export interface OptimalPool {
    */
   liquidcore?: LiquidCorePool;
   /**
+   * PANCAKESWAP STABLESWAP (BSC legacy-Curve Solidity port) venue — when present this pool is a
+   * QUOTE-LADDER (QL) PANCAKE-STABLE venue (NOT any of the above). The oracle builds its segments
+   * via the SHARED buildPancakeStableQLLadder — the IDENTICAL geometric quote ladder the on-chain
+   * solver builds in setup from the LIVE get_dy(uint256 i, uint256 j, xNext) (PROBE-THEN-DECODE;
+   * an empty/killed pool's revert / a graceful 0 / a flatlined oversize quote truncates both
+   * ladders in lockstep) — driven by the descriptor's `getDy` quote model (the bit-exact
+   * pancakeStableGetDy replay — curve-math getDy at A_PRECISION=1 — over read state, locally and
+   * in the prod-mirror alike, since the pool source is VERIFIED), so the split is wei-exact vs the
+   * solver by construction. marginalOI is the post-fee execution price; adjNear == adjFar ==
+   * marginalOI. All the other venue fields are ignored when `pancakeStable` is set.
+   */
+  pancakeStable?: PancakeStablePool;
+  /**
    * INTEGRAL SIZE (TwapRelayer) venue — when present this pool is a QUOTE-LADDER (QL) SIZE venue
    * (NOT any of the above). The oracle builds its segments via the SHARED buildSizeQLLadder — the
    * IDENTICAL WINDOW-FLOORED geometric ladder the on-chain solver builds in setup (the venue
@@ -396,7 +410,8 @@ export type OptimalLegQlVenue =
   | { family: "elfomo"; model: ElfomoPool }
   | { family: "metric"; model: MetricPool }
   | { family: "liquidcore"; model: LiquidCorePool }
-  | { family: "size"; model: SizePool };
+  | { family: "size"; model: SizePool }
+  | { family: "pancakeStable"; model: PancakeStablePool };
 
 /**
  * Build one leg QL venue's slice ladder via the family's SHARED builder, sized by the leg's
@@ -427,6 +442,7 @@ export function buildLegQlVenueLadder(v: OptimalLegQlVenue, cap: bigint): QlSlic
     case "metric": return buildMetricQLLadder(v.model, cap);
     case "liquidcore": return buildLiquidCoreQLLadder(v.model, cap);
     case "size": return buildSizeQLLadder(v.model, cap);
+    case "pancakeStable": return buildPancakeStableQLLadder(v.model, cap);
   }
 }
 
@@ -934,6 +950,24 @@ function liquidCoreSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): 
 }
 
 /**
+ * Enumerate one PANCAKESWAP STABLESWAP (BSC legacy-Curve Solidity port) venue's segments via the
+ * QUOTE-LADDER live walk (buildPancakeStableQLLadder) — the SAME geometric-slice ladder the
+ * on-chain solver builds in setup from the LIVE get_dy(uint256 i, uint256 j, xNext)
+ * (PROBE-THEN-DECODE — an empty/killed pool's revert / a graceful 0 / a flatlined oversize quote
+ * truncates both ladders in lockstep). Driven by the descriptor's `getDy` quote model (the
+ * bit-exact pancakeStableGetDy replay — curve-math getDy at A_PRECISION=1 — over read state; the
+ * pool source is VERIFIED so the replay is exact at any input), so the oracle == solver wei-exact
+ * BY CONSTRUCTION. marginalOI is the post-fee execution price. Awarded as a "pool" venue.
+ */
+function pancakeStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildPancakeStableQLLadder(p.pancakeStable!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
  * Enumerate one INTEGRAL SIZE (TwapRelayer) venue's segments via the WINDOW-FLOORED QUOTE-LADDER
  * live walk (buildSizeQLLadder) — the SAME seed-floored geometric ladder the on-chain solver builds
  * in setup (the prelude hoists minIn and raises the seed; the model's `liveMinIn` carries the same
@@ -1312,6 +1346,8 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       allSegs.push(...metricSegments(p, i, amountIn));
     } else if (p.liquidcore) {
       allSegs.push(...liquidCoreSegments(p, i, amountIn));
+    } else if (p.pancakeStable) {
+      allSegs.push(...pancakeStableSegments(p, i, amountIn));
     } else if (p.size) {
       allSegs.push(...sizeSegments(p, i, amountIn));
     } else if (p.fermi) {

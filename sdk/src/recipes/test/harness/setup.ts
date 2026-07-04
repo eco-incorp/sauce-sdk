@@ -98,6 +98,14 @@ export const kyberPoolRuntime = loadDeployedBytecode(
 export const curveStableSwapArtifact = loadArtifact(
   join(FIXTURES, "CurveStableSwap.sol", "CurveStableSwap.json"),
 );
+/** PancakeSwap StableSwap 2-pool (uint256 indices, legacy A_PRECISION=1) + the getPairInfo factory
+ *  registry — deployed normally (constructor sets coins/balances/rates/A/fee/admin_fee). */
+export const pancakeStablePoolArtifact = loadArtifact(
+  join(FIXTURES, "PancakeStableSwapPool.sol", "PancakeStableSwapPool.json"),
+);
+export const pancakeStableFactoryMockArtifact = loadArtifact(
+  join(FIXTURES, "PancakeStableSwapPool.sol", "PancakeStableSwapFactoryMock.json"),
+);
 /** DODO V2 PMM pool — deployed normally (constructor sets base/quote + i/K/B/Q/B0/Q0 + fees). */
 export const dodoV2PoolArtifact = loadArtifact(
   join(FIXTURES, "DodoV2Pool.sol", "DodoV2Pool.json"),
@@ -986,6 +994,80 @@ export async function deployCurveStableSwap(
     });
   }
   return pool;
+}
+
+/** Minimal PancakeSwap StableSwap fixture ABI (uint256-index get_dy/exchange + state reads). */
+export const pancakeStableFixtureAbi = parseAbi([
+  "function coins(uint256 k) view returns (address)",
+  "function balances(uint256 k) view returns (uint256)",
+  "function A() view returns (uint256)",
+  "function fee() view returns (uint256)",
+  "function get_dy(uint256 i, uint256 j, uint256 dx) view returns (uint256)",
+  "function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy)",
+  "function setKilled(bool killed)",
+]);
+/** The factory registry surface production discovery reads (getPairInfo — order-independent,
+ *  zero struct for an unknown pair) + the fixture's addPair registration hook. */
+export const pancakeStableFactoryFixtureAbi = parseAbi([
+  "function addPair(address pool, address tokenA, address tokenB, address lp)",
+  "function getPairInfo(address tokenA, address tokenB) view returns (address swapContract, address token0, address token1, address LPContract)",
+  "function pairLength() view returns (uint256)",
+  "function swapPairContract(uint256 i) view returns (address)",
+]);
+
+/**
+ * Deploy a local PancakeSwap StableSwap 2-pool (uint256 coin indices, legacy A_PRECISION=1 math,
+ * the real view/exchange dy rounding split), fund it with its coin balances, and register it on a
+ * PancakeStableSwapFactoryMock under getPairInfo (deploying the factory when none is passed).
+ * Mirrors deployCurveStableSwap + the LiquidCore router registration: the pool pulls coin i from
+ * the cooking contract and transfers coin j out (callback-free), so it must HOLD the tokenOut-side
+ * balance — `minter` transfers each coin's full `balances[k]` in. A ZERO balance is NOT funded
+ * (the drained-pool class: get_dy then REVERTS via get_D's divide-by-zero, exactly the real class).
+ */
+export async function deployPancakeStableSwap(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  coins: [Hex, Hex],
+  balances: [bigint, bigint],
+  rates: [bigint, bigint],
+  a: bigint,
+  fee: bigint,
+  adminFee: bigint,
+  minter?: Account,
+  factory?: Hex,
+): Promise<{ pool: Hex; factory: Hex }> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: pancakeStablePoolArtifact.abi,
+    bytecode: pancakeStablePoolArtifact.bytecode,
+    args: [coins, balances, rates, a, fee, adminFee],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  for (let k = 0; k < coins.length; k++) {
+    if (balances[k] <= 0n) continue; // the drained class keeps its zero balance
+    await writeAndWait(walletClient, publicClient, {
+      address: coins[k],
+      abi: erc20Abi as Abi,
+      functionName: "transfer",
+      args: [pool, balances[k]],
+      account: acct,
+    });
+  }
+  let fac = factory;
+  if (!fac) {
+    fac = await deployContract(walletClient, publicClient, {
+      abi: pancakeStableFactoryMockArtifact.abi,
+      bytecode: pancakeStableFactoryMockArtifact.bytecode,
+      args: [],
+    });
+  }
+  await writeAndWait(walletClient, publicClient, {
+    address: fac,
+    abi: pancakeStableFactoryFixtureAbi as Abi,
+    functionName: "addPair",
+    args: [pool, coins[0], coins[1], pool], // LP unused by the recipe — the pool addr stands in
+    account: acct,
+  });
+  return { pool, factory: fac };
 }
 
 /** Register/read surface of the pair-aware discovery mocks (DiscoveryRegistryMocks.sol). */

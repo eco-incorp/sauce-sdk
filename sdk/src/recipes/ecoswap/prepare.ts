@@ -62,6 +62,7 @@ import {
   discoverMetricPoolsTyped,
   discoverLiquidCorePoolsTyped,
   discoverSizePoolsTyped,
+  discoverPancakeStablePoolsTyped,
   discoverMentoPoolsTyped,
   discoverBalancerV3PoolsTyped,
 } from "../shared/pool-discovery.js";
@@ -113,6 +114,7 @@ import {
   type EcoMetric,
   type EcoLiquidCore,
   type EcoSize,
+  type EcoPancakeStable,
   type EcoMento,
   type EcoBalancerV3,
   type EcoLegQlVenue,
@@ -806,10 +808,10 @@ interface EdgeQlVenue {
 }
 
 /**
- * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 16 leg-capable families
+ * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 20 leg-capable families
  * (Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2,
  * Wombat, Fermi, EulerSwap, Balancer V3, Balancer V2 ComposableStable, Maverick V2, Fluid DEX,
- * Tessera V, ElfomoFi),
+ * Tessera V, ElfomoFi, METRIC, LiquidCore, Integral SIZE, PancakeStableSwap),
  * run in the canonical family-concatenation order (the same order index.ts buildQLVenues emits
  * rows in). This is the SINGLE discovery path for QL venues: the DIRECT (tokenIn, tokenOut) pair
  * calls it with `probeAmount = amountIn`, and every route-leg EDGE calls it with the edge pair +
@@ -1339,6 +1341,37 @@ async function discoverQlVenuesForPair(
     }
   }
 
+  // PANCAKESWAP STABLESWAP (BSC legacy-Curve Solidity port; getPairInfo-keyed discovery — the
+  // factory's ORDER-INDEPENDENT pair getter returns the SORTED token0/token1 == the pool's coins
+  // order, so the uint256 i/j stamp per edge for free) — the on-chain solver builds the ladder
+  // LIVE from get_dy(uint256,uint256,uint256) (probe-then-decode: an empty/killed pool reverts
+  // and self-drops) and executes CALLBACK-FREE (coins(0) orient + live get_dy as min_dy + approve
+  // POOL + exchange(uint256 i, uint256 j, Σ, min_dy) — the CryptoSwap segKind-9 class; the engine
+  // _swapCurve int128 dispatch does NOT fit the uint256 indices). The descriptor is
+  // (pool, i, j, fee) — a per-pair 2-coin inventory, so the claim key is the POOL address (the
+  // qlVenueClaimKey default).
+  const pancakeStableConfigs = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.PancakeStableSwap,
+  );
+  if (pancakeStableConfigs.length > 0) {
+    const pksRaw = await discoverPancakeStablePoolsTyped(pairIn, pairOut, client, pancakeStableConfigs, probeAmount);
+    for (const pp of pksRaw) {
+      out.push({
+        venue: {
+          family: "pancakeStable",
+          desc: {
+            address: pp.address,
+            i: pp.i,
+            j: pp.j,
+            feePpm: pp.feePpm,
+            source: pp.source,
+          },
+        },
+        headOI: pp.headOI,
+      });
+    }
+  }
+
   return out;
 }
 
@@ -1606,7 +1639,7 @@ export async function prepareEcoSwap(
     }
   }
 
-  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 16 leg-capable families) ──
+  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 20 leg-capable families) ──
   // Runs the SHARED per-pair discovery (discoverQlVenuesForPair — the exact path every route-leg
   // EDGE runs below), then splits the tagged descriptors back into the per-family prepared lists
   // (family order preserved: the shared function emits families in the canonical buildQLVenues
@@ -1660,6 +1693,10 @@ export async function prepareEcoSwap(
   // diagnostic window reads), window-hoisted + laddered LIVE from quoteSell at cook.
   const liquidCorePools = qlFamilyDescs<EcoLiquidCore>("liquidcore");
   const sizePools = qlFamilyDescs<EcoSize>("size");
+  // PANCAKESWAP STABLESWAP (segKind 20): descriptor-only (pool + uint256 i/j + fee), laddered
+  // LIVE on-chain from get_dy at cook (probe-then-decode — the CryptoSwap class with a
+  // getPairInfo-keyed discovery).
+  const pancakeStablePools = qlFamilyDescs<EcoPancakeStable>("pancakeStable");
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1949,7 +1986,7 @@ export async function prepareEcoSwap(
   // — the per-route produce-then-consume order in ecoswap.sauce.ts is the load-bearing guarantee.
   const claimed = new Set<string>();
   for (const p of pools) claimed.add(p.address.toLowerCase());
-  // Direct QL venue identities (rule 1) — all 19 QL families, Fluid included (a DexT1 pool's
+  // Direct QL venue identities (rule 1) — all 20 QL families, Fluid included (a DexT1 pool's
   // Liquidity-layer inventory is one shared depth like any other venue's).
   for (const c of curves) claimed.add(c.address.toLowerCase());
   for (const cp of cryptoSwaps) claimed.add(cp.address.toLowerCase());
@@ -1981,6 +2018,10 @@ export async function prepareEcoSwap(
   // SIZE claims by the RELAYER address (single-contract multi-pair — the Tessera/Elfomo class).
   for (const lp of liquidCorePools) claimed.add(lp.address.toLowerCase());
   for (const sp of sizePools) claimed.add(sp.address.toLowerCase());
+  // PancakeStableSwap claims by POOL address (per-pair 2-coin inventories — the qlVenueClaimKey
+  // default; every registered pool is N_COINS=2, so the multi-coin both-legs case cannot arise,
+  // but the shared claim set still excludes a direct instance from any route leg and vice versa).
+  for (const pp of pancakeStablePools) claimed.add(pp.address.toLowerCase());
   const orderedRoutes = routes
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
@@ -2066,6 +2107,7 @@ export async function prepareEcoSwap(
     metricPools.length === 0 &&
     liquidCorePools.length === 0 &&
     sizePools.length === 0 &&
+    pancakeStablePools.length === 0 &&
     mentoPools.length === 0 &&
     balancerV3Pools.length === 0
   ) {
@@ -2095,7 +2137,8 @@ export async function prepareEcoSwap(
       `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${maverickPools.length} Maverick QL, ` +
       `${balancerV3Pools.length} Balancer-V3 QL, ${fluidPools.length} Fluid QL, ` +
       `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL, ${metricPools.length} Metric QL, ` +
-      `${liquidCorePools.length} LiquidCore QL, ${sizePools.length} SIZE QL`,
+      `${liquidCorePools.length} LiquidCore QL, ${sizePools.length} SIZE QL, ` +
+      `${pancakeStablePools.length} PancakeStable QL`,
   );
 
   const prepared: EcoSwapPrepared = {
@@ -2122,6 +2165,7 @@ export async function prepareEcoSwap(
     metricPools,
     liquidCorePools,
     sizePools,
+    pancakeStablePools,
     mentoPools,
     balancerV3Pools,
     brackets,

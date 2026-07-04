@@ -4512,3 +4512,221 @@ export const balancerV3PoolReadAbi = parseAbi([
 export const balancerV3RateProviderReadAbi = parseAbi([
   "function getRate() view returns (uint256)",
 ]);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PANCAKESWAP STABLESWAP (BSC legacy-Curve Solidity port) prod-mirror etch — ADDITIVE extension.
+// The simplest etch class: the pool is a SELF-CONTAINED Solidity contract (get_dy/exchange touch
+// NOTHING but the two coin ERC20s — the admin fee accrues in the pool's own balances bookkeeping,
+// no factory read on the swap path), and its coins live in STORAGE inside the captured window, so
+// the verbatim slot copy restores them and the local MintableERC20s are etched AT those captured
+// addresses (the Wombat/WOOFi repoint pattern). Discovery is served by a const-response shim at
+// the captured factory address: getPairInfo keyed on the SELECTOR alone reproduces the real
+// factory's ORDER-INDEPENDENCE for the one reproduced pair (the reader queries exactly this pair).
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** PancakeStableSwap state snapshot (written by harness/pancakestable-snapshot.ts). */
+export interface PancakeStableStateSnapshot {
+  chain: string;
+  chainId: number;
+  block: string;
+  pool: Hex;
+  factory: Hex;
+  source: string;
+  discovery: {
+    factory: Hex;
+    pairLength: string;
+    getPairInfo: { swapContract: Hex; token0: Hex; token1: Hex; LPContract: Hex };
+    orderIndependent: boolean;
+  };
+  i: number;
+  j: number;
+  nCoins: number;
+  coins: { address: Hex; symbol: string; decimals: number; poolBalanceOf: string }[];
+  tokenIn: Hex;
+  tokenOut: Hex;
+  A: string;
+  aPrecision: string;
+  fee: string;
+  adminFee: string;
+  initialA: string;
+  futureA: string;
+  initialATime: string;
+  futureATime: string;
+  isKilled: boolean;
+  lpToken: Hex;
+  balances: string[];
+  rates: string[];
+  precisionMul: string[];
+  probe: {
+    forward: { i: number; j: number; dx: string; dy: string };
+    reverse: { i: number; j: number; dx: string; dy: string };
+  };
+  storage: Record<string, Hex>;
+}
+
+/** Load a PancakeStableSwap `<name>.bytecode.json` + `<name>.state.json` pair from fixtures/snapshots. */
+export function loadPancakeStableSnapshots(name: string): {
+  bytecode: PoolBytecodeSnapshot;
+  state: PancakeStableStateSnapshot;
+} {
+  const bytecode = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.bytecode.json`), "utf-8"),
+  ) as PoolBytecodeSnapshot;
+  const state = JSON.parse(
+    readFileSync(join(SNAP_DIR, `${name}.state.json`), "utf-8"),
+  ) as PancakeStableStateSnapshot;
+  return { bytecode, state };
+}
+
+/** PancakeStableSwapFactory shim selectors (the production discovery surface + enumeration diagnostics). */
+const PANCAKE_STABLE_FACTORY_SELECTOR = {
+  getPairInfo: "400f7a1e", // getPairInfo(address,address) -> (address,address,address,address) [4 words]
+  pairLength: "fcc9136c", // pairLength() -> uint256
+  swapPairContract: "636e66a0", // swapPairContract(uint256) -> address
+} as const;
+
+/**
+ * Build the PancakeStableSwapFactory shim runtime from a captured state snapshot: ONE read-only
+ * contract at the factory address answering getPairInfo (the 4-word struct — keyed on the SELECTOR
+ * alone, so BOTH argument orders return the captured sorted struct, exactly the real sortTokens
+ * order-independence for the one reproduced pair) + pairLength/swapPairContract (enumeration
+ * diagnostics). Constant replies are faithful: the reader queries exactly this one pair.
+ */
+export function buildPancakeStableFactoryShimRuntime(state: PancakeStableStateSnapshot): Hex {
+  const info = state.discovery.getPairInfo;
+  return buildConstResponseShimRuntime([
+    {
+      selector: PANCAKE_STABLE_FACTORY_SELECTOR.getPairInfo,
+      words: [
+        BigInt(getAddress(info.swapContract)),
+        BigInt(getAddress(info.token0)),
+        BigInt(getAddress(info.token1)),
+        BigInt(getAddress(info.LPContract)),
+      ],
+    },
+    { selector: PANCAKE_STABLE_FACTORY_SELECTOR.pairLength, words: [BigInt(state.discovery.pairLength)] },
+    { selector: PANCAKE_STABLE_FACTORY_SELECTOR.swapPairContract, words: [BigInt(getAddress(state.pool))] },
+  ]);
+}
+
+export interface EtchedPancakeStablePool {
+  /** The pool address (the get_dy/exchange target — the captured mainnet address). */
+  pool: Hex;
+  /** The factory shim address (the getPairInfo discovery source — the captured factory address). */
+  factory: Hex;
+  /** The locally-deployed coins, etched at the REAL coin addresses (the captured storage points there). */
+  coins: Hex[];
+  /** tokenIn == coins[i], tokenOut == coins[j] — echoed for the test. */
+  tokenIn: Hex;
+  tokenOut: Hex;
+  /** Captured invariant params, echoed for the test. */
+  A: bigint;
+  fee: bigint;
+  adminFee: bigint;
+  balances: bigint[];
+  rates: bigint[];
+}
+
+/**
+ * Stand up the captured REAL PancakeSwap StableSwap pool on the local anvil, OFFLINE.
+ *
+ *   1. Capture a local MintableERC20 runtime, etch it AT EACH real coin address + seed decimals —
+ *      the captured pool storage's coin slots point at those addresses (the Wombat/WOOFi repoint).
+ *   2. setCode the REAL pool runtime at its captured address.
+ *   3. setStorageAt the captured storage window VERBATIM (owner/reentrancy/PRECISION_MUL/RATES/
+ *      coins/balances/fee/admin_fee/A-ramp/kill bookkeeping) — A()/fee()/balances(k)/coins(k) and
+ *      the inline get_dy/exchange invariant then compute the mainnet-identical dy. The A-ramp was
+ *      captured SETTLED (future_A_time in the past), so the anvil wall-clock timestamp reads
+ *      A() == future_A == the captured A.
+ *   4. setCode the READ-ONLY factory shim at the captured factory address (getPairInfo both
+ *      orders + pairLength/swapPairContract).
+ *   5. Fund the pool with each coin's captured balance + caller headroom in tokenIn.
+ */
+export async function etchPancakeStablePool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: MiniTestClient,
+  snapshots: { bytecode: PoolBytecodeSnapshot; state: PancakeStableStateSnapshot },
+  opts: { minter?: Account; callerFund?: bigint } = {},
+): Promise<EtchedPancakeStablePool> {
+  const { bytecode, state } = snapshots;
+  if (bytecode.isMinimalProxy || bytecode.implementation) {
+    throw new Error("etchPancakeStablePool expects a self-contained pool snapshot (no proxy/impl)");
+  }
+  const acct = (opts.minter ?? walletClient.account) as Account;
+  const pool = getAddress(bytecode.pool.address) as Hex;
+  const factory = getAddress(state.factory) as Hex;
+  const balances = state.balances.map((b) => BigInt(b));
+
+  // 1. Local MintableERC20s at the REAL coin addresses (+ decimals).
+  const scratch = await deployToken(walletClient, publicClient, "pancake-stable-scratch", "PKSCR", 18);
+  const erc20Runtime = await publicClient.getCode({ address: scratch });
+  if (!erc20Runtime || erc20Runtime === "0x") throw new Error("failed to capture MintableERC20 runtime");
+  const coins: Hex[] = [];
+  for (let k = 0; k < state.coins.length; k++) {
+    const tok = getAddress(state.coins[k].address) as Hex;
+    await testClient.setCode({ address: tok, bytecode: erc20Runtime });
+    await testClient.setStorageAt({
+      address: tok,
+      index: slotHex(CURVE_ERC20_DECIMALS_SLOT),
+      value: word(BigInt(state.coins[k].decimals)),
+    });
+    coins.push(tok);
+  }
+
+  // 2. The REAL pool runtime at its captured address.
+  await testClient.setCode({ address: pool, bytecode: bytecode.pool.runtime });
+
+  // 3. The captured storage window, verbatim.
+  for (const [k, v] of Object.entries(state.storage)) {
+    await testClient.setStorageAt({ address: pool, index: slotHex(Number(k)), value: v });
+  }
+
+  // 4. The read-only factory shim at the captured factory address.
+  await testClient.setCode({ address: factory, bytecode: buildPancakeStableFactoryShimRuntime(state) });
+
+  // 5. Fund the pool + caller headroom.
+  for (let k = 0; k < coins.length; k++) {
+    await mint(walletClient, publicClient, coins[k], pool, balances[k]);
+  }
+  const tokenIn = coins[state.i];
+  const tokenOut = coins[state.j];
+  if (opts.callerFund && opts.callerFund > 0n) {
+    await mint(walletClient, publicClient, tokenIn, acct.address as Hex, opts.callerFund);
+  }
+
+  return {
+    pool,
+    factory,
+    coins,
+    tokenIn,
+    tokenOut,
+    A: BigInt(state.A),
+    fee: BigInt(state.fee),
+    adminFee: BigInt(state.adminFee),
+    balances,
+    rates: state.rates.map((r) => BigInt(r)),
+  };
+}
+
+/** PancakeStableSwap pool read surface (the getters the test + discovery + oracle replay read). */
+export const pancakeStablePoolReadAbi = parseAbi([
+  "function coins(uint256 i) view returns (address)",
+  "function balances(uint256 i) view returns (uint256)",
+  "function RATES(uint256 i) view returns (uint256)",
+  "function A() view returns (uint256)",
+  "function fee() view returns (uint256)",
+  "function admin_fee() view returns (uint256)",
+  "function is_killed() view returns (bool)",
+  // get_dy is the REAL exact quote (self-contained) — the exact-in-dy ground truth.
+  "function get_dy(uint256 i, uint256 j, uint256 dx) view returns (uint256)",
+  // exchange is the REAL execution path (no return value in the deployed variant).
+  "function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy)",
+]);
+
+/** PancakeStableSwapFactory shim read surface (the getPairInfo getter production discovery reads). */
+export const pancakeStableFactoryShimAbi = parseAbi([
+  "function getPairInfo(address tokenA, address tokenB) view returns (address swapContract, address token0, address token1, address LPContract)",
+  "function pairLength() view returns (uint256)",
+  "function swapPairContract(uint256 i) view returns (address)",
+]);

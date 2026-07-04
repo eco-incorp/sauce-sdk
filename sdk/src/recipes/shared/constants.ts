@@ -330,6 +330,27 @@ export enum FactoryType {
    * fork-proven wei-exact same-block; a sub-min award soft-skips into the terminal refund).
    */
   IntegralSize = "integral-size",
+  /**
+   * PANCAKESWAP STABLESWAP (pancake-smart-contracts/projects/stable-swap — the BSC Solidity port
+   * of the LEGACY Curve StableSwap 2-pool; VERIFIED source). Discovery is FACTORY-PAIR-KEYED: the
+   * config's `address` is the PancakeStableSwapFactory and `discoverPancakeStablePoolsTyped` calls
+   * its ORDER-INDEPENDENT `getPairInfo(tokenA, tokenB)` (sortTokens internally — probed both
+   * orders; a non-existent pair returns the ZERO struct, no revert) → (swapContract, token0,
+   * token1, LP), with token0/token1 the SORTED pair == the pool's coins order ⇒ the uint256 i/j
+   * stamp per edge for free. NOT the Curve registry surface (`find_pool_for_coins` is absent —
+   * the historical CurveRegistry-typed entry enumerated NOTHING), and NOT the engine `_swapCurve`
+   * dispatch (the pools use UINT256 coin indices; the int128 get_dy REVERTS on probe). A
+   * QUOTE-LADDER family (segKind 20, the CryptoSwap segKind-9 class): prepare ships only the
+   * descriptor (pool + i/j + fee); the on-chain solver builds the ladder LIVE from
+   * get_dy(uint256,uint256,uint256) (PROBE-THEN-DECODE — an EMPTY pool's get_D divides by zero ⇒
+   * revert ⇒ self-drop; zero/oversize quote gracefully) and executes CALLBACK-FREE (coins(0)
+   * orient + live get_dy as min_dy + approve POOL + exchange(uint256 i, uint256 j, Σ, min_dy) —
+   * exchange pulls EXACTLY dx via safeTransferFrom, VERIFIED source ⇒ pull == approve, residue 0).
+   * ONE liveness get_dy probe per pair at the first QL slice size drops dead/killed pools. See
+   * pancakestable-math.ts for the full 2026-07-04 probe record (31 pools, USDT/USDC + USDT/BUSD +
+   * lisUSD/USDT live depth) + the A_PRECISION=1 legacy replay.
+   */
+  PancakeStableSwap = "pancake-stable",
 }
 
 /**
@@ -1159,12 +1180,19 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x27DfD2D7b85e0010542da35C6EBcD59E45fc949D" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "Thena (Solidly fork)" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
       { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
-      // PancakeSwap StableSwap (Curve-like A-invariant). NOTE: discovery interface is
-      // getPairInfo/getThreePoolPairInfo, NOT Curve's find_pool_for_coins — the CurveRegistry
-      // reader in pool-discovery.ts needs a Pancake-StableSwap branch before it enumerates pools,
-      // and execution is not in the engine's _swapCurve dispatch. Authoritatively verified address;
-      // included but NOT drop-in (needs-integration-work).
-      { address: "0x25a55f9f2279A54951133D503490342b50E5cd15" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.CurveRegistry, label: "PancakeSwap StableSwap" },
+      // PancakeSwap StableSwap (the legacy-Curve A-invariant Solidity port; QL segKind 20). The
+      // TYPED FactoryType.PancakeStableSwap path — getPairInfo(tokenA,tokenB)-keyed discovery +
+      // callback-free uint256-index exchange (the historical CurveRegistry-typed entry here was
+      // INERT: the factory has NO find_pool_for_coins, and the pools' uint256 indices do not fit
+      // the engine _swapCurve int128 dispatch). On-chain verified 2026-07-04: pairLength()=31;
+      // getPairInfo(USDT,USDC) → pool 0x3EFebC41… (bal ≈162.9k USDT + 91.2k USDC, A=1000,
+      // fee=1e6/1e10=0.01%, get_dy(0,1,1e18)=0.99923e18 — near-par live quoting, BOTH argument
+      // orders return the same sorted struct); USDT/BUSD pool 0x169F653A… ≈ $1.96M combined,
+      // lisUSD/USDT 0xb1Da7D2C… ≈ $13.8M; the int128 get_dy REVERTS while the uint256 get_dy
+      // answers; exchange(uint256×4) selector 5b41b908 present in the deployed runtime; empty
+      // pools (6 of 31) REVERT get_dy — dropped by the liveness probe. poolType Curve is INERT
+      // (discovery keys off factoryType).
+      { address: "0x25a55f9f2279A54951133D503490342b50E5cd15" as Hex, poolType: SwapPoolType.Curve, factoryType: FactoryType.PancakeStableSwap, label: "PancakeSwap StableSwap" },
       // Wombat Exchange (single-sided stableswap, callback-free). Discovered via the TYPED
       // FactoryType.Wombat path (addressOfAsset + per-asset cash/liability + ampFactor/haircutRate),
       // so poolType is unused here — UniV2 is a benign placeholder. Address is the Wombat Main Pool.

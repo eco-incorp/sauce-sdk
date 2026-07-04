@@ -47,6 +47,7 @@ import {
 } from "./metric-math.js";
 import type { LiquidCoreVenue } from "./liquidcore-math.js";
 import { type SizeVenue, SIZE_PRECISION } from "./size-math.js";
+import { type PancakeStableVenue, PANCAKE_STABLE_FEE_DENOMINATOR } from "./pancakestable-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -509,6 +510,23 @@ const sizeRelayerAbi = parseAbi([
 ]);
 const sizeFactoryAbi = parseAbi([
   "function getPair(address tokenA, address tokenB) external view returns (address pair)",
+]);
+
+// PANCAKESWAP STABLESWAP (pancake-smart-contracts/projects/stable-swap) read surface for the
+// EcoSwap TYPED path — the REAL VERIFIED interface (PancakeStableSwapFactory.sol / the TwoPool
+// contracts; see pancakestable-math.ts for the 2026-07-04 BSC probe record). getPairInfo is
+// ORDER-INDEPENDENT (sortTokens internally) and returns the ZERO struct for an unknown pair (no
+// revert); its token0/token1 are the SORTED pair == the pool's coins order. get_dy uses UINT256
+// coin indices (the int128 variant REVERTS — this family is NOT the engine _swapCurve class) and
+// is REVERT-class on an empty/killed pool (probe-then-decode), graceful on zero/oversize.
+const pancakeStableFactoryAbi = parseAbi([
+  "function getPairInfo(address tokenA, address tokenB) external view returns (address swapContract, address token0, address token1, address LPContract)",
+]);
+const pancakeStablePoolAbi = parseAbi([
+  "function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256)",
+  "function fee() external view returns (uint256)",
+  "function A() external view returns (uint256)",
+  "function balances(uint256 k) external view returns (uint256)",
 ]);
 
 // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) read surface for the
@@ -3218,6 +3236,122 @@ export async function discoverSizePoolsTyped(
       });
     } catch {
       // Relayer read failed (no pair / disabled / out-of-window) — skip.
+    }
+  }
+  return out;
+}
+
+// ── PANCAKESWAP STABLESWAP discovery ─────────────────────────
+
+/**
+ * Discover PANCAKESWAP STABLESWAP (BSC — the Solidity port of the LEGACY Curve StableSwap 2-pool)
+ * venues for the pair AS TYPED DESCRIPTOR-ONLY `PancakeStableVenue`s + a liveness-probe head (the
+ * EcoSwap QUOTE-LADDER path, segKind 20). Pancake stable pools trade on the StableSwap A-invariant
+ * (NOT xy=k) AND use UINT256 coin indices — the engine `_swapCurve` int128 dispatch does NOT match
+ * them (the int128 get_dy REVERTS on probe), so execution is CALLBACK-FREE (the CryptoSwap class).
+ * Discovery is FACTORY-PAIR-KEYED (the config `address` is the PancakeStableSwapFactory):
+ *
+ *   1. `factory.getPairInfo(tokenIn, tokenOut)` — ORDER-INDEPENDENT (sortTokens internally;
+ *      probed both orders return the same struct); a non-existent pair returns the ZERO struct
+ *      (no revert) ⇒ skip. token0/token1 in the returned struct are the SORTED pair == the pool's
+ *      coins(0)/coins(1) (createSwapPair deploys sorted — VERIFIED source), so the descriptor's
+ *      i/j orient per edge with no extra reads: i = (tokenIn == token0 ? 0 : 1), j = 1 − i. (1 RPC.)
+ *   2. `pool.get_dy(i, j, probeIn)` at the FIRST QL slice size — PROBE-THEN-DECODE (an EMPTY
+ *      pool's get_D divides by zero ⇒ REVERT; a killed pool reverts too; a zero quote means no
+ *      output depth — either drops). The probe out is the liveness head. (1 RPC.)
+ *   3. `pool.fee()` — the 1e10-scaled swap fee → diagnostic feePpm (= fee/1e4; best-effort).
+ *
+ * NO SAMPLING (the QL family contract): the on-chain solver builds the ladder LIVE from the SAME
+ * get_dy view at cook. Execution is CALLBACK-FREE (approve POOL + exchange(uint256 i, uint256 j,
+ * Σ, min_dy) — exchange PULLS EXACTLY dx via safeTransferFrom, VERIFIED source ⇒ pull == approve,
+ * residue 0). Only the 2-pool surface is discovered — getThreePoolPairInfo returned the ZERO
+ * struct for every probed pair (NO 3-pools registered on BSC; see pancakestable-math.ts).
+ */
+export async function discoverPancakeStablePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  pancakeStableConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(PancakeStableVenue & { headOI: bigint })[]> {
+  if (pancakeStableConfigs.length === 0 || amountIn <= 0n) return [];
+
+  // The FIRST QL slice size — the on-chain ladder's seed, so the probe's head is exactly the head
+  // the solver's first slice will carry when the state has not moved.
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
+
+  const out: (PancakeStableVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of pancakeStableConfigs) {
+    try {
+      // 1. The pair's single pool via the order-independent getter (zero struct ⇒ no pool).
+      const info = (await client
+        .readContract({
+          address: cfg.address,
+          abi: pancakeStableFactoryAbi,
+          functionName: "getPairInfo",
+          args: [tokenIn, tokenOut],
+        })
+        .catch(() => null)) as readonly [Hex, Hex, Hex, Hex] | null;
+      if (!info) continue;
+      const [pool, token0, token1] = info;
+      if (!pool || BigInt(pool) === 0n) continue;
+      const key = pool.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // Orient the uint256 coin indices off the factory's SORTED token0/token1 (== coins order).
+      // Defensive: both edge tokens must be the pair's coins (a mis-registered pool is skipped).
+      const inIs0 = tokenIn.toLowerCase() === token0.toLowerCase();
+      const outIs1 = tokenOut.toLowerCase() === token1.toLowerCase();
+      const inIs1 = tokenIn.toLowerCase() === token1.toLowerCase();
+      const outIs0 = tokenOut.toLowerCase() === token0.toLowerCase();
+      if (!((inIs0 && outIs1) || (inIs1 && outIs0))) continue;
+      const i = inIs0 ? 0 : 1;
+      const j = 1 - i;
+
+      // 2. ONE liveness quote at the first QL slice size — PROBE-THEN-DECODE (revert/0 ⇒ drop:
+      // an empty/killed pool reverts get_dy; a zero quote has no output depth).
+      const probeOut = (await client
+        .readContract({
+          address: pool,
+          abi: pancakeStablePoolAbi,
+          functionName: "get_dy",
+          args: [BigInt(i), BigInt(j), probeIn],
+        })
+        .catch(() => null)) as bigint | null;
+      if (!probeOut || probeOut <= 0n) continue;
+      const headOI = qlSliceHead(probeOut, probeIn);
+      if (headOI <= 0n) continue;
+
+      // 3. Diagnostic feePpm from the 1e10-scaled fee() (best-effort; the quote is post-fee).
+      let feePpm = 0;
+      try {
+        const fee = (await client.readContract({
+          address: pool,
+          abi: pancakeStablePoolAbi,
+          functionName: "fee",
+        })) as bigint;
+        const ppm = (fee * 10n ** 6n) / PANCAKE_STABLE_FEE_DENOMINATOR;
+        if (ppm > 0n && ppm < 10n ** 6n) feePpm = Number(ppm);
+      } catch {
+        // diagnostics only
+      }
+
+      out.push({
+        address: pool,
+        factory: cfg.address,
+        i,
+        j,
+        tokenIn,
+        tokenOut,
+        feePpm,
+        source: `${cfg.label} (PancakeStableSwap)`,
+        headOI,
+      });
+    } catch {
+      // Factory/pool read failed (no pool for the pair / drained / killed) — skip.
     }
   }
   return out;

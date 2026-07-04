@@ -311,6 +311,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
       HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true, HAS_BALANCER_V3: true, HAS_LEG_QLV: true,
       HAS_TESSERA: true, HAS_ELFOMO: true, HAS_METRIC: true, HAS_LIQUIDCORE: true, HAS_SIZE: true,
+      HAS_PANCAKE_STABLE: true,
     };
     const V3_ONLY = {
       HAS_V2: false, HAS_V4: false, HAS_ALGEBRA: false, HAS_KYBER: false, HAS_ROUTES: false,
@@ -318,6 +319,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
       HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false, HAS_LEG_QLV: false,
       HAS_TESSERA: false, HAS_ELFOMO: false, HAS_METRIC: false, HAS_LIQUIDCORE: false, HAS_SIZE: false,
+      HAS_PANCAKE_STABLE: false,
     };
     // GUARD: the define-set keys must exactly equal the HAS_* consts declared in ecoswap.sauce.ts.
     // A flag declared in the source but missing here keeps its `true` default in EVERY reduced

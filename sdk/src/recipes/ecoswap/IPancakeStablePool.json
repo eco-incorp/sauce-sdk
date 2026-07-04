@@ -1,0 +1,34 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "coins",
+      "stateMutability": "view",
+      "inputs": [{ "name": "i", "type": "uint256" }],
+      "outputs": [{ "name": "", "type": "address" }]
+    },
+    {
+      "type": "function",
+      "name": "get_dy",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "i", "type": "uint256" },
+        { "name": "j", "type": "uint256" },
+        { "name": "dx", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "exchange",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        { "name": "i", "type": "uint256" },
+        { "name": "j", "type": "uint256" },
+        { "name": "dx", "type": "uint256" },
+        { "name": "min_dy", "type": "uint256" }
+      ],
+      "outputs": []
+    }
+  ]
+}

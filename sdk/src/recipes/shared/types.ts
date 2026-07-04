@@ -408,7 +408,8 @@ export type EcoLegQlVenue =
   | { family: "elfomo"; desc: EcoElfomo }
   | { family: "metric"; desc: EcoMetric }
   | { family: "liquidcore"; desc: EcoLiquidCore }
-  | { family: "size"; desc: EcoSize };
+  | { family: "size"; desc: EcoSize }
+  | { family: "pancakeStable"; desc: EcoPancakeStable };
 
 /**
  * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
@@ -953,6 +954,38 @@ export interface EcoSize {
 }
 
 /**
+ * One PANCAKESWAP STABLESWAP (BSC — the Solidity port of the LEGACY Curve StableSwap 2-pool)
+ * QUOTE-LADDER (QL) venue, referenced by a qlv-row refIdx (segKind 20). Pancake stable pools trade
+ * on the StableSwap A-invariant (NOT xy=k) AND use UINT256 coin indices
+ * (`get_dy(uint256,uint256,uint256)` / `exchange(uint256,uint256,uint256,uint256)` — the int128
+ * get_dy REVERTS on probe), so the engine `_swapCurve` (exchange(int128,…)) does NOT match them —
+ * the CryptoSwap segKind-9 class, executed CALLBACK-FREE. Discovery is FACTORY-PAIR-KEYED: the
+ * config `address` is the PancakeStableSwapFactory and `getPairInfo(tokenA, tokenB)` (ORDER-
+ * INDEPENDENT — sortTokens internally) returns (swapContract, token0, token1, LP) with token0/
+ * token1 the SORTED pair == the pool's coins order, so i/j stamp per edge with zero extra reads.
+ * The ladder quotes get_dy PROBE-THEN-DECODE (an EMPTY pool's get_D divides by zero ⇒ REVERT ⇒ the
+ * venue self-drops; zero/oversize quote gracefully — the asymptotic A-invariant, truncated by the
+ * non-descending-head guard). It EXECUTES the awarded Σ share CALLBACK-FREE: resolve i on-chain via
+ * coins(0) (derive-don't-trust — leg-edge-correct for free), read the EXACT out from the pool's own
+ * get_dy(i, j, Σ) as min_dy, APPROVE the pool (exchange PULLS EXACTLY dx via safeTransferFrom —
+ * VERIFIED source; pull == approve ⇒ residue == 0), then exchange(i, j, Σ, min_dy). NO engine
+ * SwapPoolType. LIVE-WALK class. `address` is the POOL (per-pair inventory ⇒ the claim key is the
+ * pool address — the qlVenueClaimKey default). See pancakestable-math.ts for the probed surface +
+ * the A_PRECISION=1 legacy replay.
+ */
+export interface EcoPancakeStable {
+  /** Pool address — the get_dy/exchange/approve target (the claim key). */
+  address: Hex;
+  /** uint256 coin index of tokenIn (0 iff tokenIn == the factory-sorted token0). */
+  i: number;
+  /** uint256 coin index of tokenOut (1 − i for the 2-coin pool). */
+  j: number;
+  /** Rounded ppm fee (pool fee()/1e4 — the price-ordering coordinate; the quote is post-fee). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * One Mento V2 venue to execute, indexed by an EcoBracket.refIdx (kind === Mento). Mento V2 (Celo
  * mento-protocol/mento-core Broker + BiPoolManager) is a BiPool oracle-priced stablecoin exchange (NOT
  * xy=k): the Broker routes to a registered exchange provider (BiPoolManager) that prices off oracle rates +
@@ -1228,6 +1261,16 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   sizePools?: EcoSize[];
+  /**
+   * PANCAKESWAP STABLESWAP (BSC legacy-Curve Solidity port) QUOTE-LADDER venues (qlv segKind 20
+   * rows reference these by refIdx). DESCRIPTOR-ONLY — the on-chain solver builds the ladder LIVE
+   * from get_dy(uint256,uint256,uint256) (probe-then-decode — an empty/killed pool reverts and
+   * self-drops) and executes CALLBACK-FREE (coins(0) i/j resolve + live get_dy as min_dy + approve
+   * POOL + exchange(uint256 i, uint256 j, Σ, min_dy); exchange pulls EXACTLY dx ⇒ residue == 0;
+   * NO engine SwapPoolType — the uint256 indices do not fit _swapCurve's int128 dispatch).
+   * Optional/empty when no Pancake stable venue was discovered (omitted ⇒ additive-compatible).
+   */
+  pancakeStablePools?: EcoPancakeStable[];
   /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues (kind === Mento brackets
    * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE

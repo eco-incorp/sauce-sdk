@@ -23,6 +23,7 @@ import { IElfomoFi } from "./IElfomoFi.json";
 import { IMetricRouter } from "./IMetricRouter.json";
 import { ILiquidCorePool } from "./ILiquidCorePool.json";
 import { ISizeRelayer } from "./ISizeRelayer.json";
+import { IPancakeStablePool } from "./IPancakeStablePool.json";
 import { IMetricPool } from "./IMetricPool.json";
 import { IMetricPriceProvider } from "./IMetricPriceProvider.json";
 import { IMentoBroker } from "./IMentoBroker.json";
@@ -119,7 +120,8 @@ import { IPermit2 } from "./IPermit2.json";
 //                 Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE segKind 4, Wombat segKind 5,
 //                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Fluid DEX segKind 12,
 //                 Mento V2 segKind 13, Balancer V3 segKind 14, Tessera V segKind 15, ElfomoFi segKind
-//                 16, METRIC segKind 17, LIQUIDCORE segKind 18, INTEGRAL SIZE segKind 19). Rows
+//                 16, METRIC segKind 17, LIQUIDCORE segKind 18, INTEGRAL SIZE segKind 19,
+//                 PANCAKE STABLESWAP segKind 20). Rows
 //                 [0, directQlvCount) are DIRECT venues (today's family-
 //                 concatenation order; qd[10]=qd[11]=0, never read); rows [directQlvCount, …) are
 //                 ROUTE-LEG venues — qd[0..9] the SAME family row built for the leg's EDGE pair
@@ -695,6 +697,7 @@ const HAS_ELFOMO: boolean = true;
 const HAS_METRIC: boolean = true;
 const HAS_LIQUIDCORE: boolean = true;
 const HAS_SIZE: boolean = true;
+const HAS_PANCAKE_STABLE: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
 // — the cfg[12] directQlvCount override read, the leg-row LADDER build (the per-row edge-token/
 // sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude), the
@@ -905,6 +908,8 @@ function main(
   let lcven: Tuple = new Array(MS_CAP); // LIQUIDCORE venue (per-pair pool) address
   let szinp: Tuple = new Array(MS_CAP); // INTEGRAL SIZE per-venue Σ input
   let szven: Tuple = new Array(MS_CAP); // INTEGRAL SIZE venue (TwapRelayer) address
+  let pksinp: Tuple = new Array(MS_CAP); // PancakeStableSwap per-venue Σ input
+  let pksven: Tuple = new Array(MS_CAP); // PancakeStableSwap venue (pool) address
 
   // ── MERGED SAMPLED-SEGMENT STREAM (parallel scalar arrays) ──
   // The bestKind===1 cursor consumes ONE globally-DESC-sorted segment stream. It is built ON-CHAIN
@@ -1072,7 +1077,7 @@ function main(
   // ── BUILD THE MERGED SAMPLED-SEGMENT STREAM (static segs + live QL ladders, then DESC sort) ──
   // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
   // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
-  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) &&true) {
+  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) &&true) {
     // 1. Copy any static segments VERBATIM into the parallel-array stream. VESTIGIAL: production
     // always ships segs == [] (every family is QL — the ladders below feed the whole stream); a
     // hand-built test universe may still supply static rows and they merge unchanged.
@@ -1102,7 +1107,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) {
       // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
@@ -1732,6 +1737,18 @@ function main(
                 ISizeRelayer.at(qPool).quoteSell(qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
                 if (ok === 1) { q = ISizeRelayer.at(qPool).quoteSell(qTokIn, qTokOut, xNext); }
               }
+              // PANCAKE STABLESWAP (segKind 20) — the pool's own uint256-index exact-in view
+              // (the CryptoSwap segKind-9 shape; the int128 get_dy REVERTS on these pools, so the
+              // engine _swapCurve class does not apply). qi/qj are the descriptor's uint256 coin
+              // indices (direction-stamped per edge by the getPairInfo sorted token0/token1).
+              // PROBE-THEN-DECODE: an EMPTY pool's get_D divides by zero and a killed pool's
+              // guard both REVERT ⇒ q = 0 ⇒ the venue self-drops; a zero input quotes 0 and an
+              // OVERSIZED xNext quotes the graceful A-invariant asymptote (the differenced
+              // slice-out collapses and the non-descending-head guard truncates the ladder).
+              if (HAS_PANCAKE_STABLE && qKind === 20) {
+                IPancakeStablePool.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
+                if (ok === 1) { q = IPancakeStablePool.at(qPool).get_dy(qi, qj, xNext); }
+              }
               if (q === 0) {
                 stop = 1;
               } else {
@@ -2006,7 +2023,7 @@ function main(
       // (next-best); its near/far are ALREADY post-fee out/in (adjNear==adjFar==the post-fee
       // marginal), so they compare directly. Same tie-break as the pools/routes (near DESC, then
       // far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) &&segCur < msSorted) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) &&segCur < msSorted) {
         const sNear: Uint256 = msNear[segCur];
         const sFar: Uint256 = msFar[segCur];
         if (sNear >= bestPrice) {
@@ -2513,7 +2530,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) &&bestKind === 1) {
             // ── sampled-segment slice: a fixed capacity slice at a fixed post-fee price. Consume the
             // [segCur] merged-stream row (parallel arrays), clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -2656,6 +2673,15 @@ function main(
                                                 if (HAS_SIZE && sKind === 19) {
                                                   szinp[sIdx] = szinp[sIdx] + stake;
                                                   szven[sIdx] = sVenue;
+                                                } else {
+                                                  // segKind 20 — PANCAKE STABLESWAP: callback-
+                                                  // free, executed below via get_dy (min_dy) +
+                                                  // approve + exchange(uint256 i, uint256 j, Σ,
+                                                  // min_dy). sVenue = the per-pair pool.
+                                                  if (HAS_PANCAKE_STABLE && sKind === 20) {
+                                                    pksinp[sIdx] = pksinp[sIdx] + stake;
+                                                    pksven[sIdx] = sVenue;
+                                                  }
                                                 }
                                               }
                                             }
@@ -3157,6 +3183,29 @@ function main(
                     if (qszOut > 0) {
                       IERC20.at(legIn).approve(qPool, share);
                       ISizeRelayer.at(qPool).sell({ tokenIn: legIn, tokenOut: legOut, amountIn: share, amountOutMin: qszOut, wrapUnwrap: 0, to: address.self, submitDeadline: SZ_DEADLINE });
+                    }
+                  }
+                }
+                // PANCAKE STABLESWAP (segKind 20) — callback-free: uint256 coin indices resolved
+                // on-chain via coins(0) against the LEG's in-token (derive-don't-trust — edge-
+                // correct for any leg), probe the live get_dy for min_dy (a drained/killed pool
+                // reverts and skips soft — the share strands in legIn and the per-route
+                // intermediate sweep / terminal refund returns it), approve-first (exchange PULLS
+                // EXACTLY dx via safeTransferFrom — pull == approve, residue 0).
+                if (HAS_PANCAKE_STABLE && qk === 20) {
+                  const qpkc0: Address = IPancakeStablePool.at(qPool).coins(0);
+                  let qpki: Uint256 = 1;
+                  let qpkj: Uint256 = 0;
+                  if (qpkc0 === legIn) { qpki = 0; qpkj = 1; }
+                  let qpkOk: Uint256 = 1;
+                  IPancakeStablePool.at(qPool).get_dy(qpki, qpkj, share).catch(() => { qpkOk = 0; });
+                  if (qpkOk === 1) {
+                    const qpkOut: Uint256 = IPancakeStablePool.at(qPool).get_dy(qpki, qpkj, share);
+                    if (qpkOut > 0) {
+                      IERC20.at(legIn).approve(qPool, share);
+                      // min_dy = quote − 1 wei (the view/exchange rounding-form split on
+                      // mixed-decimal pools — see the direct arm + pancakestable-math.ts).
+                      IPancakeStablePool.at(qPool).exchange(qpki, qpkj, share, qpkOut - 1);
                     }
                   }
                 }
@@ -3776,6 +3825,48 @@ function main(
         if (szOut > 0) {
           token.approve(szrel, szamt);
           ISizeRelayer.at(szrel).sell({ tokenIn: tokenIn, tokenOut: tokenOut, amountIn: szamt, amountOutMin: szOut, wrapUnwrap: 0, to: address.self, submitDeadline: SZ_DEADLINE });
+        }
+      }
+    }
+  }
+  }
+  // PANCAKE STABLESWAP (BSC legacy-Curve Solidity port) → CALLBACK-FREE (NO engine SwapPoolType).
+  // Pancake stable pools trade on the StableSwap A-invariant with UINT256 coin indices
+  // (exchange(uint256 i, uint256 j, dx, min_dy)), so the engine's _swapCurve (exchange(int128,...))
+  // does NOT match them — the CryptoSwap segKind-9 execution shape verbatim. Resolve the pool's
+  // uint256 coin indices ON-CHAIN by reading coins(0) (every registered pool is a 2-coin pool ⇒
+  // tokenIn is coin0 iff coins(0)==tokenIn, else coin1; the other coin is 1-i — derive-don't-trust),
+  // read the EXACT out from the pool's own get_dy(i, j, Σ) view (the view IS the swap math ⇒
+  // wei-exact-in-dy for the awarded share) as min_dy, APPROVE the pool for the awarded input
+  // (exchange PULLS EXACTLY dx via safeTransferFrom — VERIFIED source; pull == approve ⇒ residue 0),
+  // then exchange(i, j, Σ, min_dy) (min_dy == the quoted out ⇒ the min never trips — the exchange
+  // re-runs the SAME live math atomically). The get_dy min-probe is PROBE-THEN-DECODE so a pool
+  // drained/killed between the merge read and the exec SKIPS SOFT (the share strands for the
+  // terminal refund — never a bricked cook). compute-then-pull already transferred `cum` (incl.
+  // each PancakeStable share) into this contract above, so the approved pull draws from this
+  // contract's balance and the out lands here.
+  if (HAS_PANCAKE_STABLE) {
+  for (let pk = 0; pk < MS_CAP; pk = pk + 1) {
+    const pkamt: Uint256 = pksinp[pk];
+    if (pkamt > 0) {
+      const pkpool: Address = pksven[pk];
+      const pkc0: Address = IPancakeStablePool.at(pkpool).coins(0);
+      let pki: Uint256 = 1;
+      let pkj: Uint256 = 0;
+      if (pkc0 === tokenIn) { pki = 0; pkj = 1; }
+      let pkOk: Uint256 = 1;
+      IPancakeStablePool.at(pkpool).get_dy(pki, pkj, pkamt).catch(() => { pkOk = 0; });
+      if (pkOk === 1) {
+        const pkOut: Uint256 = IPancakeStablePool.at(pkpool).get_dy(pki, pkj, pkamt);
+        if (pkOut > 0) {
+          token.approve(pkpool, pkamt);
+          // min_dy = the view quote MINUS ONE WEI: the VERIFIED source computes the view's dy
+          // SCALE-then-fee but the exchange's dy fee-then-SCALE, so on a MIXED-DECIMAL pool the
+          // realized dy can land exactly 1 wei below the view (dy_e >= dy_g − 1, proven — see
+          // pancakestable-math.ts); the raw view quote as min_dy would revert the whole cook
+          // there. Atomically un-trippable (18-dec pairs realize dy_e == dy_g); the whole-trade
+          // cfg[9] minOut floor guards the aggregate.
+          IPancakeStablePool.at(pkpool).exchange(pki, pkj, pkamt, pkOut - 1);
         }
       }
     }
