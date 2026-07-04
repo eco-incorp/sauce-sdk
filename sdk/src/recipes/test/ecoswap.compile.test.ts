@@ -20,6 +20,9 @@ import { fileURLToPath } from "url";
 import ts from "typescript";
 
 import { compile } from "../../../../compiler/dist/index.js";
+import { buildSolverArgs, protocolDefines } from "../ecoswap/index";
+import type { EcoSwapPrepared, EcoPool, EcoLegQlVenue } from "../shared/types";
+import { SwapPoolType } from "../shared/constants";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const RECIPE_DIR = join(__dirname, "..", "ecoswap");
@@ -95,10 +98,18 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     directCount: number,
     segsArg: bigint[][] = segs,
     cfgExtra: bigint[] = [],
+    qlvArg?: bigint[][],
   ) {
     const source = readFileSync(SINGLEPASS, "utf-8");
     const stripped = stripTypes(source);
-    const args = [cfgTuple(directCount, cfgExtra), poolsArg, netCacheArg, routingArg, segsArg];
+    const args = [
+      cfgTuple(directCount, cfgExtra),
+      poolsArg,
+      netCacheArg,
+      routingArg,
+      segsArg,
+      ...(qlvArg ? [qlvArg] : []),
+    ];
 
     const v1: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args });
     const v12: any = compile(stripped, { baseDirs: [REPO_ROOT, RECIPE_DIR], args, target: "v12" });
@@ -114,13 +125,15 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     compileBoth(pools, netCache, routing, 2);
   });
 
-  it("compiles the FULL 10-field cfg incl. minOut>0 — floor guard (v1 + v12)", () => {
+  it("compiles the FULL 13-field cfg incl. minOut>0 — floor guard + directQlvCount (v1 + v12)", () => {
     // Production emits the full cfg (index.ts): cfg[6]=fluidResolver, [7]=mentoBroker,
-    // [8]=balancerV3Router, [9]=minOut. Compiling with a NON-ZERO minOut exercises the terminal
+    // [8]=balancerV3Router, [9]=minOut, [10]=balancerV3Vault, [11]=balancerV2Vault,
+    // [12]=directQlvCount. Compiling with a NON-ZERO minOut exercises the terminal
     // `if (minOut > 0) { if (outBal < minOut) throw ... }` branch codegen on BOTH engines and
-    // confirms the extra scalar does NOT disturb the v12 arg-prologue SDUP window (cfg is still
-    // ONE tuple). The 6-field short-cfg cells above already prove the cfg.length guards.
-    compileBoth(pools, netCache, routing, 2, segs, [0n, 0n, 0n, 10n ** 15n]);
+    // confirms the extra scalars do NOT disturb the v12 arg-prologue SDUP window (cfg is still
+    // ONE tuple). directQlvCount=0 == qlv.length here (no qlv arg ⇒ all-direct default). The
+    // 6-field short-cfg cells above already prove the cfg.length guards.
+    compileBoth(pools, netCache, routing, 2, segs, [0n, 0n, 0n, 10n ** 15n, 0n, 0n, 0n]);
   });
 
   // V2 + V3 mix — guards the unified swap(SwapParams) nested-PoolKey branch (isV2=1) plus the
@@ -153,8 +166,10 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
   // MULTI-HOP ROUTE fixture — guards the flat-universe route loop: ONE direct A->B pool +
   // a 2-hop route A->X->B whose FIRST leg splits across TWO pools (multi-pool leg) and second
   // leg has one pool. The universe is [direct, leg0a, leg0b, leg1] (directCount=1), and routing
-  // carries the per-leg [base,count,inter] scalar strides:
-  //   routing[0] = [2 (legCount), 1,2,BASE_TOKEN (leg0: pools [1,3), inter=X), 3,1,0 (leg1: pool [3,4), final inter 0)]
+  // carries the per-leg [poolBase,poolCount,qlvBase,qlvCount,inter] 5-field scalar strides
+  // (qlvBase/qlvCount = 0 — pool-only legs):
+  //   routing[0] = [2 (legCount), 1,2,0,0,BASE_TOKEN (leg0: pools [1,3), inter=X),
+  //                 3,1,0,0,0 (leg1: pool [3,4), final inter 0)]
   // This exercises composeStep/routeEvent2/routePartial2 codegen + the routing depth-2 reads.
   it("compiles a 2-hop route with a multi-pool leg (v1 + v12)", () => {
     const routePools: bigint[][] = [
@@ -178,15 +193,16 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       [OFFSET - 180n, 10n ** 17n], // leg1 [3]
     ];
     const routeRouting: bigint[][] = [
-      [2n, 1n, 2n, BASE_TOKEN, 3n, 1n, 0n],
+      [2n, 1n, 2n, 0n, 0n, BASE_TOKEN, 3n, 1n, 0n, 0n, 0n],
     ];
     compileBoth(routePools, routeNetCache, routeRouting, 1);
   });
 
   // 3-HOP ROUTE fixture — guards the N-leg route loop (legCount=3): ONE direct A->B pool + a
   // 3-hop route A->X->Y->B (one V3 pool per leg). The universe is [direct, leg0, leg1, leg2]
-  // (directCount=1); routing carries the uniform [base,count,inter] stride for THREE legs:
-  //   routing[0] = [3, 1,1,X, 2,1,Y, 3,1,0]
+  // (directCount=1); routing carries the uniform [poolBase,poolCount,qlvBase,qlvCount,inter]
+  // 5-field stride for THREE legs (qlvBase/qlvCount = 0 — pool-only legs):
+  //   routing[0] = [3, 1,1,0,0,X, 2,1,0,0,Y, 3,1,0,0,0]
   // (leg0 pool [1,2) inter=X; leg1 pool [2,3) inter=Y; leg2 pool [3,4) final inter 0). This is the
   // structural variant the 2-hop path can't cover: the route-event back/forward propagation runs
   // an actual upstream+downstream chain (the middle leg has BOTH an upstream and a downstream leg).
@@ -214,9 +230,44 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       [OFFSET - 30n, 10n ** 17n], // leg2 [3]
     ];
     const routeRouting: bigint[][] = [
-      [3n, 1n, 1n, X_TOKEN, 2n, 1n, Y_TOKEN, 3n, 1n, 0n],
+      [3n, 1n, 1n, 0n, 0n, X_TOKEN, 2n, 1n, 0n, 0n, Y_TOKEN, 3n, 1n, 0n, 0n, 0n],
     ];
     compileBoth(routePools, routeNetCache, routeRouting, 1);
+  });
+
+  // LEG-QL ARGS fixture — guards the NEW leg-venue arg shape end-to-end through the compiler:
+  // a 12-column qlv (one DIRECT Curve row + one ROUTE-LEG Curve row carrying the qd[10]/qd[11]
+  // routeIdx/legIdx backrefs), a stride-5 routing whose leg1 points at the leg row
+  // (qlvBase=1, qlvCount=1), and the FULL 13-field cfg with cfg[12]=directQlvCount=1 — so the
+  // solver's directQlvCount-bounded ladder loop + the HAS_LEG_QLV-gated cfg[12] read both lower
+  // on BOTH engines. (Leg rows are SKIPPED by this build — compile-shape coverage only.)
+  it("compiles a 2-hop route with a route-leg QL venue (12-col qlv + cfg[12]) (v1 + v12)", () => {
+    const routePools: bigint[][] = [
+      [1n, BigInt("0xaaaa000000000000000000000000000000000001"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 0n, 1n],
+      [1n, BigInt("0xdddd000000000000000000000000000000000004"), 500n, 10n, 0n, 500n, 0n, 1n, 0n, 0n,
+       STEP_10, OFFSET, OFFSET - 50n, OFFSET - 30n, 1n, 1n],
+      [1n, BigInt("0xffff000000000000000000000000000000000006"), 3000n, 60n, 0n, 3000n, 0n, 1n, 0n, 0n,
+       STEP_60, OFFSET, OFFSET - 300n, OFFSET - 180n, 2n, 1n],
+    ];
+    const routeNetCache: bigint[][] = [
+      [OFFSET - 180n, 10n ** 17n], // direct [0]
+      [OFFSET - 30n, 10n ** 17n], // leg0 [1]
+      [OFFSET - 180n, 10n ** 17n], // leg1 [2]
+    ];
+    const CURVE_DIRECT = BigInt("0xc0c0000000000000000000000000000000000001");
+    const CURVE_LEG = BigInt("0xc0c0000000000000000000000000000000000002");
+    // qlv[0] = DIRECT Curve (refIdx 0, backrefs 0/0); qlv[1] = LEG Curve on route 0 leg 1
+    // (refIdx = its GLOBAL index 1, qd[10]=routeIdx 0, qd[11]=legIdx 1).
+    const legQlv: bigint[][] = [
+      [CURVE_DIRECT, 0n, 1n, 400n, 1n, 0n, 0n, 0n, 0n, 0n, 0n, 0n],
+      [CURVE_LEG, 0n, 1n, 400n, 1n, 1n, 0n, 0n, 0n, 0n, 0n, 1n],
+    ];
+    const routeRouting: bigint[][] = [
+      [2n, 1n, 1n, 0n, 0n, BASE_TOKEN, 2n, 1n, 1n, 1n, 0n],
+    ];
+    compileBoth(routePools, routeNetCache, routeRouting, 1, segs,
+      [0n, 0n, 0n, 0n, 0n, 0n, 1n], legQlv);
   });
 
   // SAMPLED-SEGMENT venues (Curve / LB / DODO) — guards the bestKind===1 static-segment cursor +
@@ -257,13 +308,13 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       HAS_V2: true, HAS_V4: true, HAS_ALGEBRA: true, HAS_KYBER: true, HAS_ROUTES: true,
       HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: true,
       HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
-      HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true, HAS_BALANCER_V3: true,
+      HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true, HAS_BALANCER_V3: true, HAS_LEG_QLV: true,
     };
     const V3_ONLY = {
       HAS_V2: false, HAS_V4: false, HAS_ALGEBRA: false, HAS_KYBER: false, HAS_ROUTES: false,
       HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
       HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
-      HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false,
+      HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false, HAS_LEG_QLV: false,
     };
     // GUARD: the define-set keys must exactly equal the HAS_* consts declared in ecoswap.sauce.ts.
     // A flag declared in the source but missing here keeps its `true` default in EVERY reduced
@@ -360,4 +411,141 @@ describe("ecoswap.lens.sauce.ts", () => {
       for (const seg of segments) assert.ok(seg.length > 0, "segment not empty");
     });
   }
+});
+
+// ── The leg-QL ARG BUILDER ordering contract (index.ts buildUniverseRoutingAndQlv) ────────────
+// Pins the MANDATORY qlv emission order the solver's msSorted machinery silently depends on:
+// ALL direct rows first ([0, directQlvCount) in family-concatenation order), then leg rows
+// grouped contiguously per (routeIdx asc, legIdx asc) with routing's qlvBase/qlvCount pointing
+// exactly at them — plus cfg[12]=directQlvCount, the stride-5 routing shape, the 12-column qlv
+// width, the chain-wide-address leg fallbacks, and the protocolDefines leg-venue scan.
+describe("index.ts buildSolverArgs (leg-QL ordering contract + cfg[12])", () => {
+  const ZERO = "0x0000000000000000000000000000000000000000" as `0x${string}`;
+  const ZERO32 = ("0x" + "00".repeat(32)) as `0x${string}`;
+  const A_HEX = "0x00000000000000000000000000000000000000aa" as `0x${string}`;
+  const B_HEX = "0x00000000000000000000000000000000000000bb" as `0x${string}`;
+  const X_HEX = "0x00000000000000000000000000000000000000cc" as `0x${string}`; // intermediate
+  const CALLER_HEX = "0x1111111111111111111111111111111111111111" as `0x${string}`;
+  const BROKER = "0x00000000000000000000000000000000000b0b01" as `0x${string}`;
+  const PROVIDER = "0x00000000000000000000000000000000000b0b02" as `0x${string}`;
+  const XID = ("0x" + "ab".repeat(32)) as `0x${string}`;
+
+  const mkPool = (address: string): EcoPool => ({
+    poolType: SwapPoolType.UniV3,
+    address: address as `0x${string}`,
+    fee: 3000,
+    tickSpacing: 60,
+    hooks: ZERO,
+    feePpm: 3000,
+    isV2: false,
+    inIsToken0: true,
+    stateView: ZERO,
+    poolId: ZERO32,
+    source: "test",
+  });
+
+  // Route A->X->B: leg0 carries one LEG-ONLY Euler venue; leg1 carries a Curve + a Mento venue
+  // (Mento has NO direct instance, so cfg[7] must come from the LEG fallback). One DIRECT Curve
+  // venue ⇒ directQlvCount = 1.
+  const eulerLeg: EcoLegQlVenue = {
+    family: "euler",
+    desc: { address: "0x00000000000000000000000000000000000000e1", inIsToken0: true, feePpm: 500, source: "test" },
+  };
+  const curveLeg: EcoLegQlVenue = {
+    family: "curve",
+    desc: { address: "0x00000000000000000000000000000000000000c2", i: 0, j: 1, feePpm: 400, source: "test" },
+  };
+  const mentoLeg: EcoLegQlVenue = {
+    family: "mento",
+    desc: {
+      broker: BROKER, exchangeProvider: PROVIDER, exchangeId: XID,
+      fromToken: X_HEX, toToken: B_HEX, feePpm: 250, source: "test",
+    },
+  };
+  const prepared: EcoSwapPrepared = {
+    pools: [mkPool("0x0000000000000000000000000000000000000d01")],
+    routes: [
+      {
+        legs: [
+          { hopIn: A_HEX, hopOut: X_HEX, zeroForOne: true, pools: [mkPool("0x0000000000000000000000000000000000000d02")], qlVenues: [eulerLeg] },
+          { hopIn: X_HEX, hopOut: B_HEX, zeroForOne: false, pools: [mkPool("0x0000000000000000000000000000000000000d03")], qlVenues: [curveLeg, mentoLeg] },
+        ],
+        intermediateTokens: [X_HEX],
+      },
+    ],
+    curves: [{ address: "0x00000000000000000000000000000000000000c1", i: 0, j: 1, feePpm: 400, source: "test" }],
+    brackets: [],
+    zeroForOne: true,
+    priceLimit: 4295128740n,
+    expectedInputCovered: 0n,
+  };
+
+  it("emits ALL direct qlv rows first, then leg rows contiguous per (routeIdx asc, legIdx asc)", () => {
+    const args = buildSolverArgs(A_HEX, B_HEX, 10n ** 18n, CALLER_HEX, prepared);
+    const cfg = args[0] as bigint[];
+    const routing = args[3] as bigint[][];
+    const qlv = args[5] as bigint[][];
+
+    // cfg[12] = directQlvCount (1 direct Curve row); cfg[7] = the Mento broker via the LEG fallback.
+    assert.equal(cfg.length, 13);
+    assert.equal(cfg[12], 1n);
+    assert.equal(cfg[7], BigInt(BROKER));
+
+    // Stride-5 routing: [legCount, {poolBase,poolCount,qlvBase,qlvCount,inter} × 2].
+    assert.equal(routing.length, 1);
+    assert.deepEqual(routing[0], [
+      2n,
+      1n, 1n, 1n, 1n, BigInt(X_HEX), // leg0: pool [1,2), qlv rows [1,2), inter = X
+      2n, 1n, 2n, 2n, 0n, // leg1: pool [2,3), qlv rows [2,4), final inter 0
+    ]);
+
+    // qlv: uniform 12 columns; [0, directQlvCount) direct (backrefs 0/0), then leg rows in
+    // (routeIdx asc, legIdx asc) order with refIdx = the GLOBAL row index.
+    assert.equal(qlv.length, 4);
+    for (const row of qlv) assert.equal(row.length, 12);
+    assert.deepEqual(
+      qlv.map((r) => [r[4], r[5], r[10], r[11]]),
+      [
+        [1n, 0n, 0n, 0n], // direct Curve (refIdx = per-family 0)
+        [7n, 1n, 0n, 0n], // leg Euler — route 0, leg 0 (refIdx = global 1)
+        [1n, 2n, 0n, 1n], // leg Curve — route 0, leg 1 (refIdx = global 2)
+        [13n, 3n, 0n, 1n], // leg Mento — route 0, leg 1 (refIdx = global 3)
+      ],
+    );
+    // Mento leg row carries provider/exchangeId in qd[0]/qd[1] (the direct-row layout, edge-stamped).
+    assert.equal(qlv[3][0], BigInt(PROVIDER));
+    assert.equal(qlv[3][1], BigInt(XID));
+  });
+
+  it("protocolDefines scans leg venues (leg-only family lights its HAS_*) + HAS_LEG_QLV", () => {
+    const defines = protocolDefines(prepared);
+    assert.equal(defines.HAS_LEG_QLV, true);
+    assert.equal(defines.HAS_EULER, true); // present ONLY as a leg venue
+    assert.equal(defines.HAS_MENTO, true); // present ONLY as a leg venue
+    assert.equal(defines.HAS_CURVE, true); // direct + leg
+    assert.equal(defines.HAS_FLUID, false); // Fluid is never a leg member
+  });
+
+  it("pool-only routes: qlvBase/qlvCount = 0 slots, cfg[12] = qlv.length, HAS_LEG_QLV false", () => {
+    const poolOnly: EcoSwapPrepared = {
+      ...prepared,
+      routes: [
+        {
+          legs: [
+            { hopIn: A_HEX, hopOut: X_HEX, zeroForOne: true, pools: [mkPool("0x0000000000000000000000000000000000000d02")] },
+            { hopIn: X_HEX, hopOut: B_HEX, zeroForOne: false, pools: [mkPool("0x0000000000000000000000000000000000000d03")] },
+          ],
+          intermediateTokens: [X_HEX],
+        },
+      ],
+    };
+    const args = buildSolverArgs(A_HEX, B_HEX, 10n ** 18n, CALLER_HEX, poolOnly);
+    const cfg = args[0] as bigint[];
+    const routing = args[3] as bigint[][];
+    const qlv = args[5] as bigint[][];
+    assert.equal(cfg[12], BigInt(qlv.length)); // ALL rows direct
+    assert.equal(cfg[7], 0n); // no Mento anywhere ⇒ broker 0
+    assert.deepEqual(routing[0], [2n, 1n, 1n, 0n, 0n, BigInt(X_HEX), 2n, 1n, 0n, 0n, 0n]);
+    assert.equal(protocolDefines(poolOnly).HAS_LEG_QLV, false);
+  });
 });

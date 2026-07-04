@@ -141,12 +141,12 @@ const QL_VENUE_ROWS: { venue: string; segKind: number; quote: string; calls: str
 // The production unified-walk shape is IMPORTED from index.ts (buildSolverArgs + protocolDefines) so
 // it can never drift from what a real cook feeds the solver — the old local copy went stale through
 // the quote-ladder migration (it fed a 4-arg [cfg,pools,netCache,routing] shape while production
-// main() grew to the 6-arg [cfg(12),pools,netCache,routing,segs,qlv] shape, so the unified cook
+// main() grew to the 6-arg [cfg(13),pools,netCache,routing,segs,qlv] shape, so the unified cook
 // reverted). The frozen unrolled reference keeps its own DIVERGENT legacy builder below.
 
 /**
  * Production unified-walk arg array — delegates to index.ts `buildSolverArgs`, the SINGLE source of
- * truth for the current 6-arg shape (`[cfg(12), pools, netCache, routing, segs, qlv]`). Imported (not
+ * truth for the current 6-arg shape (`[cfg(13), pools, netCache, routing, segs, qlv]`). Imported (not
  * re-copied) so it can never drift from what a real cook feeds the solver.
  */
 function buildUnifiedArgs(

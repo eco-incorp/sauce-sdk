@@ -79,7 +79,7 @@ const HOP_FEE_A = 500;
 const HOP_FEE_B = 3000;
 
 /**
- * Reconstruct the FLAT POOL UNIVERSE index.ts buildPoolUniverseAndRouting builds —
+ * Reconstruct the FLAT POOL UNIVERSE index.ts buildUniverseRoutingAndQlv builds —
  * [...prepared.pools, ...legPools] deduped by lowercased address, leg pools appended
  * contiguously per leg — together with each pool's INPUT token (the token it pulls in
  * its hop: tokenIn for a direct pool / a leg-0 pool; the leg's hopIn for a deeper leg).

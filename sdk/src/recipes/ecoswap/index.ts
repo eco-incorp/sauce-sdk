@@ -34,7 +34,13 @@ import {
   SwapPoolType,
   type ChainPoolConfig,
 } from "../shared/constants.js";
-import { EcoBracketKind, type EcoSwapConfig, type EcoSwapPrepared, type EcoPool } from "../shared/types.js";
+import {
+  EcoBracketKind,
+  type EcoSwapConfig,
+  type EcoSwapPrepared,
+  type EcoPool,
+  type EcoLegQlVenue,
+} from "../shared/types.js";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler");
@@ -114,7 +120,8 @@ function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netC
 }
 
 /**
- * Build the FLAT POOL UNIVERSE + the SCALAR ROUTING layout.
+ * Build the FLAT POOL UNIVERSE + the SCALAR ROUTING layout + the FULL qlv descriptor array
+ * (direct QL rows THEN route-leg QL rows).
  *
  * The universe is `[...prepared.pools, ...legPools]`: every route-leg pool is APPENDED after
  * the direct pools, with each leg's pools laid CONTIGUOUSLY so a leg is a `[base, base+count)`
@@ -125,26 +132,43 @@ function buildPoolsAndNetCache(pools: EcoPool[]): { poolTuples: bigint[][]; netC
  * `buildPoolsAndNetCache` is reused VERBATIM over the assembled universe (a leg pool is
  * byte-identical to a direct pool on-chain), producing the `poolTuples`/`netCache` args.
  *
- * `routing` is one flat SCALAR tuple per route, depth-2 read on-chain:
- *   routing[r] = [legCount, base0,count0,inter0, base1,count1,inter1, …]
- * where for leg L: pools are universe indices `[baseL, baseL+countL)` and `interL` is the
- * INTERMEDIATE token AFTER leg L (== legL.hopOut). The FINAL leg's `interL` is 0 (unused — its
- * out is tokenOut). Stride is a uniform 3 scalars per leg, so N-hop needs no shape change.
+ * `routing` is one flat SCALAR tuple per route, depth-2 read on-chain, uniform 5-field stride:
+ *   routing[r] = [legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount]
+ * where for leg L: pools are universe indices `[poolBase, poolBase+poolCount)` (rt[1+5L]/
+ * rt[2+5L]; poolCount MAY be 0 for an all-QL leg), QL venues are GLOBAL qlv row indices
+ * `[qlvBase, qlvBase+qlvCount)` (rt[3+5L]/rt[4+5L]; 0/0 for a pool-only leg — prepare emits
+ * pool-only legs today), and `interL` (rt[5+5L]) is the INTERMEDIATE token AFTER leg L
+ * (== legL.hopOut). The FINAL leg's `interL` is 0 (unused — its out is tokenOut). The derived
+ * reads keep the old symmetry: legIn(L>0) = rt[5L], legOut(L<legCount−1) = rt[5+5L]. N-hop
+ * needs no shape change.
  *
  * `directCount` = `prepared.pools.length` — how many leading universe entries are DIRECT venues
  * (the on-chain merge scans `[0, directCount)` as direct pools; entries `[directCount, …)` are
  * leg-only pools reached solely via `routing`). It is carried in the `cfg` bundle.
  *
+ * `qlvRows` = [ALL direct rows (buildQLVenues, today's family-concatenation order), THEN one
+ * 12-column row per route-leg QL venue] — leg rows are grouped contiguously per (route, leg)
+ * and sorted (routeIdx asc, legIdx asc), each carrying qd[10]=routeIdx / qd[11]=legIdx and
+ * refIdx (qd[5]) = its GLOBAL qlv index (informational — leg rows never touch the per-family
+ * direct accumulators). `directQlvCount` = the direct-row prefix length, carried as cfg[12]:
+ * the solver ladders/sorts ONLY rows [0, directQlvCount) into the direct merged stream.
+ * The ORDERING CONTRACT is asserted below — the solver's msSorted machinery silently depends
+ * on it (a violated order would let the direct-stream insertion sort scramble a leg venue's
+ * contiguous ms-row region: silent corruption, the stride-change hazard class).
+ *
  * Per-pool swap direction is derived on-chain from each pool tuple's `inIsToken0` field [7]
  * (== that pool's `zeroForOne`). A leg pool whose leg direction `zHop` differs from the route's
  * overall direction therefore needs [7] stamped with the LEG's `zHop` — done in prepare when the
- * leg pool's `EcoPool.inIsToken0` is set; the universe build does not re-derive it.
+ * leg pool's `EcoPool.inIsToken0` is set; the universe build does not re-derive it. Leg QL
+ * venue descriptors are likewise direction-stamped for their EDGE pair in prepare/discovery.
  */
-function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
+export function buildUniverseRoutingAndQlv(prepared: EcoSwapPrepared): {
   poolTuples: bigint[][];
   netCache: bigint[][];
   routing: bigint[][];
   directCount: number;
+  qlvRows: bigint[][];
+  directQlvCount: number;
 } {
   const directCount = prepared.pools.length;
   const universe: EcoPool[] = [...prepared.pools];
@@ -154,8 +178,13 @@ function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
   const indexByAddr = new Map<string, number>();
   prepared.pools.forEach((p, i) => indexByAddr.set(p.address.toLowerCase(), i));
 
+  // Direct QL rows FIRST (family-concatenation order, refIdx = per-family index), then the
+  // route walk below APPENDS leg rows so routing's qlvBase/qlvCount point at contiguous groups.
+  const qlvRows: bigint[][] = buildQLVenues(prepared);
+  const directQlvCount = qlvRows.length;
+
   const routing: bigint[][] = [];
-  for (const route of prepared.routes) {
+  prepared.routes.forEach((route, routeIdx) => {
     const rt: bigint[] = [BigInt(route.legs.length)];
     route.legs.forEach((leg, legIdx) => {
       // Append this leg's pools contiguously, deduping any already in the universe. NOTE: prepare's
@@ -180,19 +209,80 @@ function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
       // pool is freshly appended, so the slice is always contiguous (base = first index).
       const base = idxs.length > 0 ? Math.min(...idxs) : 0;
       const count = idxs.length;
+      // Leg QL venue rows: one 12-column row per venue via the SHARED per-family mapper, with
+      // refIdx (qd[5]) = the row's GLOBAL qlv index and the qd[10]/qd[11] route/leg backrefs.
+      // Appended contiguously ⇒ [qlvBase, qlvBase+qlvCount) is this leg's group. A pool-only leg
+      // emits qlvBase=qlvCount=0 (mirroring the pools' base-0-when-empty convention).
+      const appendAt = qlvRows.length;
+      for (const lv of leg.qlVenues ?? []) {
+        const row = pad12(qlRowFor(lv, qlvRows.length));
+        row[10] = BigInt(routeIdx);
+        row[11] = BigInt(legIdx);
+        qlvRows.push(row);
+      }
+      const qlvCount = qlvRows.length - appendAt;
+      const qlvBase = qlvCount > 0 ? appendAt : 0;
       // interL: the intermediate token AFTER this leg (legL.hopOut). Final leg → 0 (its out is
       // tokenOut). intermediateTokens[legIdx] is the token between leg legIdx and legIdx+1.
       const inter =
         legIdx < route.intermediateTokens.length
           ? BigInt(route.intermediateTokens[legIdx])
           : 0n;
-      rt.push(BigInt(base), BigInt(count), inter);
+      rt.push(BigInt(base), BigInt(count), BigInt(qlvBase), BigInt(qlvCount), inter);
     });
     routing.push(rt);
+  });
+
+  // ── ORDERING-CONTRACT ASSERT (mandatory): ALL direct rows first, then leg rows contiguous
+  // per (routeIdx asc, legIdx asc), with routing's qlvBase/qlvCount pointing exactly at them.
+  // Construction above guarantees it today; the assert guards future refactors (e.g. a
+  // late-appended direct family AFTER the route walk would silently extend the solver's sorted
+  // region across leg-row regions — see the solver's msSorted docs).
+  for (let v = 0; v < directQlvCount; v += 1) {
+    if (qlvRows[v][10] !== 0n || qlvRows[v][11] !== 0n) {
+      throw new Error(`qlv ordering violated: direct row ${v} carries a route/leg backref`);
+    }
+  }
+  let prevRoute = -1;
+  let prevLeg = -1;
+  for (let v = directQlvCount; v < qlvRows.length; v += 1) {
+    const ri = Number(qlvRows[v][10]);
+    const li = Number(qlvRows[v][11]);
+    if (ri < prevRoute || (ri === prevRoute && li < prevLeg)) {
+      throw new Error(
+        `qlv ordering violated: leg row ${v} (route ${ri}, leg ${li}) after (route ${prevRoute}, leg ${prevLeg})`,
+      );
+    }
+    prevRoute = ri;
+    prevLeg = li;
+  }
+  let coveredLegRows = 0;
+  routing.forEach((rt, r) => {
+    const legCount = Number(rt[0]);
+    for (let L = 0; L < legCount; L += 1) {
+      const qB = Number(rt[3 + 5 * L]);
+      const qC = Number(rt[4 + 5 * L]);
+      for (let u = qB; u < qB + qC; u += 1) {
+        if (
+          u < directQlvCount ||
+          u >= qlvRows.length ||
+          Number(qlvRows[u][10]) !== r ||
+          Number(qlvRows[u][11]) !== L
+        ) {
+          throw new Error(`qlv ordering violated: routing[${r}] leg ${L} row ${u} is not its own`);
+        }
+      }
+      coveredLegRows += qC;
+    }
+  });
+  if (directQlvCount + coveredLegRows !== qlvRows.length) {
+    throw new Error(
+      `qlv ordering violated: ${qlvRows.length - directQlvCount} leg rows built but routing covers ${coveredLegRows}`,
+    );
   }
 
   const { poolTuples, netCache } = buildPoolsAndNetCache(universe);
-  return { poolTuples, netCache, routing, directCount };
+  return { poolTuples, netCache, routing, directCount, qlvRows, directQlvCount };
 }
 
 /**
@@ -215,11 +305,19 @@ function buildPoolUniverseAndRouting(prepared: EcoSwapPrepared): {
  * nesting depth ≤ 2 (segs[i] then segs[i][col]); the scalars stay bundled in `cfg`, so main() adds
  * only ONE nested tuple param — the v12 arg-prologue SDUP window stays small.
  */
+/** Every route-leg QL venue, flattened in (routeIdx asc, legIdx asc) order — the same order the
+ *  leg qlv rows are emitted in. Used by the chain-wide-address fallbacks + protocolDefines. */
+function legQlVenues(prepared: EcoSwapPrepared): EcoLegQlVenue[] {
+  return prepared.routes.flatMap((route) => route.legs.flatMap((leg) => leg.qlVenues ?? []));
+}
+
 /**
  * The chain-wide Fluid DEX DexReservesResolver address (the estimateSwapIn quote target the on-chain solver
  * staticcalls for every Fluid slice) — carried as `cfg[6]`. All Fluid pools on a chain share one resolver,
  * so take the first prepared Fluid venue's resolver; 0 when no Fluid venue (the guard folds the branch away
- * under treeshake, so the 0 is never dereferenced).
+ * under treeshake, so the 0 is never dereferenced). DIRECT-ONLY source, by design: Fluid is NOT a route-leg
+ * QL member (it is a static-sampled-segment venue the solver cannot ladder on-chain), so — unlike the other
+ * chain-wide addresses below — there is no leg-venue descriptor to fall back to.
  */
 function fluidResolverAddr(prepared: EcoSwapPrepared): bigint {
   const first = prepared.fluidPools?.[0];
@@ -229,13 +327,19 @@ function fluidResolverAddr(prepared: EcoSwapPrepared): bigint {
 /**
  * The chain-wide Mento V2 Broker address (the getAmountOut quote + swapIn target the on-chain solver calls
  * for every Mento slice) — carried as `cfg[7]`. All Mento venues on a chain share one Broker, so take the
- * first prepared Mento venue's broker; 0 when no Mento venue (the guard folds the branch away under
- * treeshake, so the 0 is never dereferenced). The per-venue exchangeProvider/exchangeId travel in the segs
- * row (venue = segs[5], exchangeId = segs[6]).
+ * first prepared Mento venue's broker; when Mento is present ONLY as a route-leg venue, FALL BACK to the
+ * first leg-venue descriptor (a chain-wide address must be present whenever ANY venue of the family exists —
+ * the leg quote/exec go through the same Broker); 0 when no Mento venue anywhere (the guard folds the branch
+ * away under treeshake, so the 0 is never dereferenced). The per-venue exchangeProvider/exchangeId travel in
+ * the qlv row (qd[0]/qd[1]).
  */
 function mentoBrokerAddr(prepared: EcoSwapPrepared): bigint {
   const first = prepared.mentoPools?.[0];
-  return first ? BigInt(first.broker) : 0n;
+  if (first) return BigInt(first.broker);
+  const leg = legQlVenues(prepared).find(
+    (v): v is Extract<EcoLegQlVenue, { family: "mento" }> => v.family === "mento",
+  );
+  return leg ? BigInt(leg.desc.broker) : 0n;
 }
 
 /**
@@ -243,43 +347,264 @@ function mentoBrokerAddr(prepared: EcoSwapPrepared): bigint {
  * Permit2-approve-spender target the on-chain solver uses for every Balancer V3 slice) — carried as `cfg[8]`.
  * Balancer V3's Vault is a CREATE2 singleton (same on all chains) but the Router DIFFERS per chain, so the
  * per-chain Router is threaded here; all V3 pools on a chain share one Router, so take the first prepared V3
- * venue's router; 0 when no V3 venue (the guard folds the branch away under treeshake, so the 0 is never
- * dereferenced). The per-venue POOL travels in the segs row (venue = segs[5]).
+ * venue's router, FALLING BACK to the first route-leg V3 venue's descriptor when the direct list is empty;
+ * 0 when no V3 venue anywhere (the guard folds the branch away under treeshake, so the 0 is never
+ * dereferenced). The per-venue POOL travels in the segs/qlv row.
  */
 function balancerV3RouterAddr(prepared: EcoSwapPrepared): bigint {
   const first = prepared.balancerV3Pools?.[0];
-  return first ? BigInt(first.router) : 0n;
+  if (first) return BigInt(first.router);
+  const leg = legQlVenues(prepared).find(
+    (v): v is Extract<EcoLegQlVenue, { family: "balancerV3" }> => v.family === "balancerV3",
+  );
+  return leg ? BigInt(leg.desc.router) : 0n;
 }
 
 /**
  * The chain-wide Balancer V3 Vault (CREATE2 singleton, SAME address on all chains) — carried as `cfg[10]`. The
  * on-chain solver reads its LIVE state per QL slice: getCurrentLiveBalances(pool) (inline-indexed), plus
  * getStaticSwapFeePercentage(pool), to replay the amplified StableSwap invariant. All V3 pools on a chain
- * share ONE Vault, so take the first prepared V3 venue's vault; 0 when no V3 venue (the guard folds the branch
+ * share ONE Vault, so take the first prepared V3 venue's vault, FALLING BACK to the first route-leg V3
+ * venue's descriptor when the direct list is empty; 0 when no V3 venue anywhere (the guard folds the branch
  * away under treeshake, so the 0 is never dereferenced).
  */
 function balancerV3VaultAddr(prepared: EcoSwapPrepared): bigint {
   const first = prepared.balancerV3Pools?.[0];
-  return first ? BigInt(first.vault) : 0n;
+  if (first) return BigInt(first.vault);
+  const leg = legQlVenues(prepared).find(
+    (v): v is Extract<EcoLegQlVenue, { family: "balancerV3" }> => v.family === "balancerV3",
+  );
+  return leg ? BigInt(leg.desc.vault) : 0n;
 }
 
 /**
  * The chain-wide Balancer V2 Vault (the canonical singleton 0xBA12…, SAME address on every EVM chain) —
  * carried as `cfg[11]`. The on-chain solver reads its LIVE per-token balances per QL slice via
  * getPoolTokenInfo(poolId, token) SCALARS (cash+managed — the v12-safe read). All V2 ComposableStable pools on
- * a chain share ONE Vault, so take the first prepared Balancer venue's vault; 0 when no V2 venue (the guard
+ * a chain share ONE Vault, so take the first prepared Balancer venue's vault, FALLING BACK to the first
+ * route-leg BalV2 venue's descriptor when the direct list is empty; 0 when no V2 venue anywhere (the guard
  * folds the branch away under treeshake, so the 0 is never dereferenced). Distinct from cfg[10] (the V3 Vault).
  */
 function balancerV2VaultAddr(prepared: EcoSwapPrepared): bigint {
   const first = prepared.balancerStables?.[0];
-  return first ? BigInt(first.vault) : 0n;
+  if (first) return BigInt(first.vault);
+  const leg = legQlVenues(prepared).find(
+    (v): v is Extract<EcoLegQlVenue, { family: "balancerV2" }> => v.family === "balancerV2",
+  );
+  return leg ? BigInt(leg.desc.vault) : 0n;
+}
+
+/** Pad a 6/10-column family row to the UNIFORM 12-column qlv width (0-fill; direct rows keep
+ *  qd[10]=qd[11]=0, leg rows overwrite them with the routeIdx/legIdx backrefs). */
+const pad12 = (r: bigint[]): bigint[] =>
+  r.length >= 12 ? r : [...r, ...new Array(12 - r.length).fill(0n)];
+
+/**
+ * ONE QL descriptor row (columns 0..9) for a venue of `family` — the SINGLE per-family row
+ * mapper shared by the DIRECT rows (buildQLVenues; refIdx = the per-family list index) and the
+ * ROUTE-LEG rows (buildUniverseRoutingAndQlv; refIdx = the row's GLOBAL qlv index —
+ * informational only, leg rows never touch the per-family direct accumulators). The descriptor
+ * is direction-stamped by construction: i/j, swapForY, sellBase, inIdx/outIdx … were computed
+ * for the pair the venue serves — (tokenIn, tokenOut) for a direct venue, the leg's
+ * (hopIn, hopOut) for a leg venue. Callers pad to the uniform 12-column width (pad12).
+ */
+function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
+  switch (v.family) {
+    case "curve":
+      return [
+        BigInt(v.desc.address),
+        BigInt(v.desc.i),
+        BigInt(v.desc.j),
+        BigInt(v.desc.feePpm),
+        1n, // segKind = Curve StableSwap
+        BigInt(refIdx),
+      ];
+    case "cryptoSwap":
+      return [
+        BigInt(v.desc.address),
+        BigInt(v.desc.i),
+        BigInt(v.desc.j),
+        BigInt(v.desc.feePpm),
+        9n, // segKind = Curve CryptoSwap (uint256 coin indices; callback-free exchange)
+        BigInt(refIdx),
+      ];
+    case "solidlyStable":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (Solidly quotes by tokenIn, not a coin index)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        4n, // segKind = Solidly STABLE (getAmountOut; callback-free transfer + swap)
+        BigInt(refIdx),
+      ];
+    case "wooFi":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (WOOFi quotes by tokenIn/tokenOut, not a coin index)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        10n, // segKind = WOOFi (WooPPV2 sPMM; tryQuery on the ladder, query on the exec)
+        BigInt(refIdx),
+      ];
+    // Trader Joe LB: qd[0]=pair, qd[1]=swapForY (0/1, tokenIn == pair.getTokenX()), qd[2] unused. The QL
+    // ladder quotes the GRACEFUL pair.getSwapOut(xIn, swapForY)→(amountInLeft, amountOut) and caps each slice
+    // at the LIVE fillable bin capacity (effAbsorbed = xIn − amountInLeft); EXEC stays engine poolType 6.
+    case "lb":
+      return [
+        BigInt(v.desc.address),
+        v.desc.swapForY ? 1n : 0n, // swapForY (the on-chain getSwapOut direction bit)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        2n, // segKind = Trader Joe LB (getSwapOut on the ladder; engine _swapTraderJoeLB on the exec)
+        BigInt(refIdx),
+      ];
+    // Mento V2: qd[0]=exchangeProvider, qd[1]=exchangeId (bytes32 as uint256, intact), qd[2] unused. The QL
+    // ladder quotes broker.getAmountOut(provider, exchangeId, tokenIn, tokenOut, xIn) via probe-then-decode;
+    // the chain-wide Broker is cfg[7]. The solver emits msVen=provider, msAux=exchangeId so the segKind-13
+    // accumulator/exec (approve BROKER + broker.swapIn) key by (provider, exchangeId). EXEC unchanged.
+    case "mento":
+      return [
+        BigInt(v.desc.exchangeProvider),
+        BigInt(v.desc.exchangeId), // bytes32 exchangeId as uint256 — kept intact (not truncated)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        13n, // segKind = Mento V2 (Broker getAmountOut on the ladder; approve BROKER + swapIn on the exec)
+        BigInt(refIdx),
+      ];
+    // DODO V2 PMM: qd[0]=pool, qd[1]=isSellBase (0/1, tokenIn == pool._BASE_TOKEN_() — computed in prepare
+    // via discoverDodoV2PoolsTyped's orientation), qd[2] unused. The QL ladder quotes the DIRECTIONAL
+    // querySellBase(caller,xNext)[0] / querySellQuote(caller,xNext)[0] view (probe-then-decode, post-fee);
+    // EXEC stays engine poolType 5 (_swapDODOV2 resolves orientation on-chain from _BASE_TOKEN_()).
+    case "dodo":
+      return [
+        BigInt(v.desc.address),
+        v.desc.sellBase ? 1n : 0n, // isSellBase — the on-chain querySell* direction bit
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        3n, // segKind = DODO V2 (querySell* on the ladder; engine _swapDODOV2 on the exec)
+        BigInt(refIdx),
+      ];
+    // Wombat (single-sided stableswap): qd[0]=pool, qd[1..2] unused (quotes by fromToken/toToken). The QL
+    // ladder quotes quotePotentialSwap(tokenIn,tokenOut,xNext)[0] (probe-then-decode, post-haircut); EXEC
+    // stays callback-free (approve + pool.swap).
+    case "wombat":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (Wombat quotes by fromToken/toToken)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        5n, // segKind = Wombat (quotePotentialSwap on the ladder; approve + pool.swap on the exec)
+        BigInt(refIdx),
+      ];
+    // Fermi / propAMM (Obric-style proactive AMM): qd[0]=pool, qd[1..2] unused (quotes by tokenIn/tokenOut).
+    // The QL ladder quotes quoteAmounts(tokenIn,tokenOut,xNext)[1] (probe-then-decode, post-fee — the SECOND
+    // return is the exact-in out); EXEC stays callback-free (approve + fermiSwapWithAllowances).
+    case "fermi":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (Fermi quotes by tokenIn/tokenOut)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        11n, // segKind = Fermi (quoteAmounts on the ladder; approve + fermiSwapWithAllowances on the exec)
+        BigInt(refIdx),
+      ];
+    // EulerSwap (Euler vault-backed AMM, v1+v2): qd[0]=pool, qd[1..2] unused (Euler quotes by tokenIn/tokenOut).
+    // The QL ladder quotes computeQuote(tokenIn,tokenOut,xNext,true) (probe-then-decode, post-fee — the exact-in
+    // dy). computeQuote REVERTS past the LIVE vault inLimit/outLimit, so the probe self-truncates the ladder at
+    // the live cap (NO getLimits call) — the award is bounded by live capacity, so the exec never cap-reverts.
+    // EXEC stays callback-free (computeQuote minOut + transfer + getAssets-oriented pool.swap(...,"")).
+    case "euler":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (Euler quotes by tokenIn/tokenOut)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        7n, // segKind = EulerSwap (computeQuote on the ladder; computeQuote + transfer + pool.swap on the exec)
+        BigInt(refIdx),
+      ];
+    // Balancer V3 (balancer-v3-monorepo Vault + per-chain Router) — segKind 14. UNIQUE among QL venues: its
+    // querySwapSingleTokenExactIn is eth_call-ONLY (uncallable on-chain), so it does NOT quote a live view;
+    // instead the solver replays the amplified StableSwap invariant on-chain from LIVE Vault state. That needs
+    // FOUR extra descriptor fields beyond the base six — the tokenIn/tokenOut rate providers (rpIn/rpOut, the
+    // solver's on-chain getRate() targets) and the CONST decimal scaling factors (decScaleIn/decScaleOut =
+    // 10^(18−decimals)). amp + the static fee are read LIVE on-chain (getAmplificationParameter()[0] /
+    // getStaticSwapFeePercentage), so they need NO descriptor slot; the Vault is chain-wide (cfg[10]). qd[1]/qd[2]
+    // carry inIdx/outIdx (the getCurrentLiveBalances slots). These 4 fields (qd[6..9]) are the reason EVERY qlv
+    // row is padded to the uniform width — the non-BalV3 venues carry 0 for all four.
+    case "balancerV3":
+      return [
+        BigInt(v.desc.address),
+        BigInt(v.desc.inIdx), // i = tokenIn Vault index (getCurrentLiveBalances slot)
+        BigInt(v.desc.outIdx), // j = tokenOut Vault index
+        BigInt(v.desc.feePpm),
+        14n, // segKind = Balancer V3 (on-chain StableMath QL; Permit2 two-step + swapSingleTokenExactIn on the exec)
+        BigInt(refIdx),
+        BigInt(v.desc.rpIn), // qd[6] = tokenIn rate provider (getRate scalar)
+        BigInt(v.desc.rpOut), // qd[7] = tokenOut rate provider
+        v.desc.decScaleIn, // qd[8] = 10^(18−decIn)
+        v.desc.decScaleOut, // qd[9] = 10^(18−decOut)
+      ];
+    // Balancer V2 ComposableStable — segKind 6. Like V3 its quote (Vault.queryBatchSwap) is eth_call-ONLY, so the
+    // solver replays the amplified StableSwap invariant on-chain from LIVE Vault state (V2 rounding). qd[1]/qd[2]
+    // carry the NON-BPT invariant-order indices of tokenIn/tokenOut. The 4 extra columns carry: qd[6] = the
+    // Vault poolId (the getPoolTokenInfo(poolId, token) argument); qd[7] = the THIRD non-BPT token address (0 for
+    // a 2-token pool) — the two others ARE tokenIn/tokenOut (read from cfg on-chain); qd[8] = the packed FULL
+    // registered scaling positions (regPos0 | regPos1<<8 | regPos2<<16 in non-BPT order, for the live
+    // getScalingFactors inline-index); qd[9] = the non-BPT token count (2 or 3). amp + fee are read LIVE on-chain
+    // (no descriptor slot); the Vault is chain-wide (cfg[11]). EXEC stays engine poolType 4 (_swapBalancerV2 →
+    // Vault.swap(GIVEN_IN)); refIdx → the on-chain binp[refIdx]/bven[refIdx] accumulator (segKind 6, unchanged).
+    case "balancerV2": {
+      const b = v.desc;
+      const n = b.nonBptTokens.length;
+      // The third non-BPT index (the one that is neither tokenIn (i) nor tokenOut (j)); 0/none for a 2-token pool.
+      const thirdIdx = n === 3 ? [0, 1, 2].find((p) => p !== b.i && p !== b.j)! : -1;
+      const thirdAddr = thirdIdx >= 0 ? BigInt(b.nonBptTokens[thirdIdx]) : 0n;
+      // Packed FULL registered scaling positions in non-BPT order (each ≤ 255 for any real ComposableStable).
+      const rp = b.nonBptRegPos;
+      const packedReg =
+        BigInt(rp[0] ?? 0) | (BigInt(rp[1] ?? 0) << 8n) | (BigInt(rp[2] ?? 0) << 16n);
+      return [
+        BigInt(b.address),
+        BigInt(b.i),
+        BigInt(b.j),
+        BigInt(b.feePpm),
+        6n, // segKind = Balancer V2 ComposableStable (on-chain StableMath QL; engine _swapBalancerV2 on the exec)
+        BigInt(refIdx),
+        BigInt(b.poolId), // qd[6] = Vault poolId (getPoolTokenInfo argument)
+        thirdAddr, // qd[7] = third non-BPT token address (0 for a 2-token pool)
+        packedReg, // qd[8] = packed registered scaling positions (regPos0 | regPos1<<8 | regPos2<<16)
+        BigInt(n), // qd[9] = non-BPT token count (2 or 3)
+      ];
+    }
+    // Maverick V2 (bin-based directional AMM) — segKind 8. The solver's segKind-8 branch WALKS the pool's bin
+    // book on-chain from the LIVE active tick/price (Maverick has no cumulative-out view to quote), so the
+    // descriptor ships ONLY the walk seeds: qd[1] = tokenAIn (1 iff tokenIn == the pool's tokenA ⇒ price rises)
+    // and qd[2] = tickSpacing (the bin width exponent). fee(tokenAIn), the active tick, and every per-tick
+    // reserve are read LIVE on-chain (no descriptor slot, so the walk re-anchors to any drift). EXEC is
+    // UNCHANGED — engine poolType 7 (_swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input); the
+    // segKind-8 accumulator (minp/mven, refIdx-keyed) and the poolType-7 dispatch already handle it.
+    case "maverick":
+      return [
+        BigInt(v.desc.address),
+        v.desc.tokenAIn ? 1n : 0n, // i = tokenAIn (the walk direction bit)
+        BigInt(v.desc.tickSpacing), // j = tickSpacing (the bin-width exponent for the sqrt-price ladder)
+        BigInt(v.desc.feePpm),
+        8n, // segKind = Maverick V2 (on-chain live bin-walk QL; engine _swapMaverickV2 callback on the exec)
+        BigInt(refIdx),
+      ];
+  }
 }
 
 /**
- * Build the QUOTE-LADDER (QL) venue DESCRIPTOR array — one row per QL venue, UNIFORM 10 columns:
- *   qlv[v] = [poolAddr, i, j, feePpm, segKind, refIdx, rpIn, rpOut, decScaleIn, decScaleOut]
- * Columns 6..9 (rpIn/rpOut/decScaleIn/decScaleOut) are used ONLY by Balancer V3 (segKind 14) and are
- * padded 0 for every other family (see the balancerV3Rows emit + pad10 below).
+ * Build the DIRECT QUOTE-LADDER (QL) venue DESCRIPTOR rows — one row per direct QL venue, UNIFORM
+ * 12 columns:
+ *   qlv[v] = [poolAddr, i, j, feePpm, segKind, refIdx, c6, c7, c8, c9, routeIdx, legIdx]
+ * Columns 6..9 are used ONLY by Balancer V3 (segKind 14: rpIn/rpOut/decScaleIn/decScaleOut) and
+ * Balancer V2 (segKind 6: poolId/thirdToken/packedRegPos/count) and are padded 0 for every other
+ * family (see qlRowFor + pad12). Columns 10..11 are the ROUTE-LEG backrefs — always 0 for the
+ * direct rows this builder emits, never read on-chain for rows < directQlvCount (the leg branch
+ * is gated `v >= directQlvCount`); buildUniverseRoutingAndQlv appends the leg rows after these
+ * and stamps their backrefs.
  * NO sampled values — the solver builds each venue's price ladder ON-CHAIN in setup from LIVE
  * cook-time quotes (prepare-optional: prepare ships only the descriptor). `i`/`j` are the descriptor
  * scalars, re-purposed per family: Curve int128 / CryptoSwap uint256 coin indices; LB packs `swapForY`
@@ -316,198 +641,27 @@ function balancerV2VaultAddr(prepared: EcoSwapPrepared): bigint {
  * Carried as a SEPARATE top-level compiler param so its reads stay at nesting depth ≤ 2.
  */
 function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
-  const curves = prepared.curves ?? [];
-  const cryptoSwaps = prepared.cryptoSwaps ?? [];
-  const solidlyStables = prepared.solidlyStables ?? [];
-  const wooFiPools = prepared.wooFiPools ?? [];
-  const lbs = prepared.lbs ?? [];
-  const mentoPools = prepared.mentoPools ?? [];
-  const dodos = prepared.dodos ?? [];
-  const wombats = prepared.wombats ?? [];
-  const fermiPools = prepared.fermiPools ?? [];
-  const eulerSwaps = prepared.eulerSwaps ?? [];
-  const balancerV3Pools = prepared.balancerV3Pools ?? [];
-  const balancerStables = prepared.balancerStables ?? [];
-  const maverickPools = prepared.maverickPools ?? [];
-  const curveRows = curves.map((c, refIdx) => [
-    BigInt(c.address),
-    BigInt(c.i),
-    BigInt(c.j),
-    BigInt(c.feePpm),
-    1n, // segKind = Curve StableSwap
-    BigInt(refIdx),
-  ]);
-  const cryptoRows = cryptoSwaps.map((c, refIdx) => [
-    BigInt(c.address),
-    BigInt(c.i),
-    BigInt(c.j),
-    BigInt(c.feePpm),
-    9n, // segKind = Curve CryptoSwap (uint256 coin indices; callback-free exchange)
-    BigInt(refIdx),
-  ]);
-  const solidlyRows = solidlyStables.map((s, refIdx) => [
-    BigInt(s.address),
-    0n, // i unused (Solidly quotes by tokenIn, not a coin index)
-    0n, // j unused
-    BigInt(s.feePpm),
-    4n, // segKind = Solidly STABLE (getAmountOut; callback-free transfer + swap)
-    BigInt(refIdx),
-  ]);
-  const wooFiRows = wooFiPools.map((w, refIdx) => [
-    BigInt(w.address),
-    0n, // i unused (WOOFi quotes by tokenIn/tokenOut, not a coin index)
-    0n, // j unused
-    BigInt(w.feePpm),
-    10n, // segKind = WOOFi (WooPPV2 sPMM; tryQuery on the ladder, query on the exec)
-    BigInt(refIdx),
-  ]);
-  // Trader Joe LB: qd[0]=pair, qd[1]=swapForY (0/1, tokenIn == pair.getTokenX()), qd[2] unused. The QL
-  // ladder quotes the GRACEFUL pair.getSwapOut(xIn, swapForY)→(amountInLeft, amountOut) and caps each slice
-  // at the LIVE fillable bin capacity (effAbsorbed = xIn − amountInLeft); EXEC stays engine poolType 6.
-  const lbRows = lbs.map((l, refIdx) => [
-    BigInt(l.address),
-    l.swapForY ? 1n : 0n, // swapForY (the on-chain getSwapOut direction bit)
-    0n, // j unused
-    BigInt(l.feePpm),
-    2n, // segKind = Trader Joe LB (getSwapOut on the ladder; engine _swapTraderJoeLB on the exec)
-    BigInt(refIdx),
-  ]);
-  // Mento V2: qd[0]=exchangeProvider, qd[1]=exchangeId (bytes32 as uint256, intact), qd[2] unused. The QL
-  // ladder quotes broker.getAmountOut(provider, exchangeId, tokenIn, tokenOut, xIn) via probe-then-decode;
-  // the chain-wide Broker is cfg[7]. The solver emits msVen=provider, msAux=exchangeId so the segKind-13
-  // accumulator/exec (approve BROKER + broker.swapIn) key by (provider, exchangeId). EXEC unchanged.
-  const mentoRows = mentoPools.map((m, refIdx) => [
-    BigInt(m.exchangeProvider),
-    BigInt(m.exchangeId), // bytes32 exchangeId as uint256 — kept intact (not truncated)
-    0n, // j unused
-    BigInt(m.feePpm),
-    13n, // segKind = Mento V2 (Broker getAmountOut on the ladder; approve BROKER + swapIn on the exec)
-    BigInt(refIdx),
-  ]);
-  // DODO V2 PMM: qd[0]=pool, qd[1]=isSellBase (0/1, tokenIn == pool._BASE_TOKEN_() — computed in prepare
-  // via discoverDodoV2PoolsTyped's orientation), qd[2] unused. The QL ladder quotes the DIRECTIONAL
-  // querySellBase(caller,xNext)[0] / querySellQuote(caller,xNext)[0] view (probe-then-decode, post-fee);
-  // EXEC stays engine poolType 5 (_swapDODOV2 resolves orientation on-chain from _BASE_TOKEN_()).
-  const dodoRows = dodos.map((d, refIdx) => [
-    BigInt(d.address),
-    d.sellBase ? 1n : 0n, // isSellBase — the on-chain querySell* direction bit
-    0n, // j unused
-    BigInt(d.feePpm),
-    3n, // segKind = DODO V2 (querySell* on the ladder; engine _swapDODOV2 on the exec)
-    BigInt(refIdx),
-  ]);
-  // Wombat (single-sided stableswap): qd[0]=pool, qd[1..2] unused (quotes by fromToken/toToken). The QL
-  // ladder quotes quotePotentialSwap(tokenIn,tokenOut,xNext)[0] (probe-then-decode, post-haircut); EXEC
-  // stays callback-free (approve + pool.swap).
-  const wombatRows = wombats.map((w, refIdx) => [
-    BigInt(w.address),
-    0n, // i unused (Wombat quotes by fromToken/toToken)
-    0n, // j unused
-    BigInt(w.feePpm),
-    5n, // segKind = Wombat (quotePotentialSwap on the ladder; approve + pool.swap on the exec)
-    BigInt(refIdx),
-  ]);
-  // Fermi / propAMM (Obric-style proactive AMM): qd[0]=pool, qd[1..2] unused (quotes by tokenIn/tokenOut).
-  // The QL ladder quotes quoteAmounts(tokenIn,tokenOut,xNext)[1] (probe-then-decode, post-fee — the SECOND
-  // return is the exact-in out); EXEC stays callback-free (approve + fermiSwapWithAllowances).
-  const fermiRows = fermiPools.map((f, refIdx) => [
-    BigInt(f.address),
-    0n, // i unused (Fermi quotes by tokenIn/tokenOut)
-    0n, // j unused
-    BigInt(f.feePpm),
-    11n, // segKind = Fermi (quoteAmounts on the ladder; approve + fermiSwapWithAllowances on the exec)
-    BigInt(refIdx),
-  ]);
-  // EulerSwap (Euler vault-backed AMM, v1+v2): qd[0]=pool, qd[1..2] unused (Euler quotes by tokenIn/tokenOut).
-  // The QL ladder quotes computeQuote(tokenIn,tokenOut,xNext,true) (probe-then-decode, post-fee — the exact-in
-  // dy). computeQuote REVERTS past the LIVE vault inLimit/outLimit, so the probe self-truncates the ladder at
-  // the live cap (NO getLimits call) — the award is bounded by live capacity, so the exec never cap-reverts.
-  // EXEC stays callback-free (computeQuote minOut + transfer + getAssets-oriented pool.swap(...,"")).
-  const eulerRows = eulerSwaps.map((e, refIdx) => [
-    BigInt(e.address),
-    0n, // i unused (Euler quotes by tokenIn/tokenOut)
-    0n, // j unused
-    BigInt(e.feePpm),
-    7n, // segKind = EulerSwap (computeQuote on the ladder; computeQuote + transfer + pool.swap on the exec)
-    BigInt(refIdx),
-  ]);
-  // Balancer V3 (balancer-v3-monorepo Vault + per-chain Router) — segKind 14. UNIQUE among QL venues: its
-  // querySwapSingleTokenExactIn is eth_call-ONLY (uncallable on-chain), so it does NOT quote a live view;
-  // instead the solver replays the amplified StableSwap invariant on-chain from LIVE Vault state. That needs
-  // FOUR extra descriptor fields beyond the base six — the tokenIn/tokenOut rate providers (rpIn/rpOut, the
-  // solver's on-chain getRate() targets) and the CONST decimal scaling factors (decScaleIn/decScaleOut =
-  // 10^(18−decimals)). amp + the static fee are read LIVE on-chain (getAmplificationParameter()[0] /
-  // getStaticSwapFeePercentage), so they need NO descriptor slot; the Vault is chain-wide (cfg[10]). qd[1]/qd[2]
-  // carry inIdx/outIdx (the getCurrentLiveBalances slots). These 4 fields (qd[6..9]) are the reason EVERY qlv
-  // row is padded to 10 columns below — the non-BalV3 venues carry 0 for all four.
-  const balancerV3Rows = balancerV3Pools.map((b, refIdx) => [
-    BigInt(b.address),
-    BigInt(b.inIdx), // i = tokenIn Vault index (getCurrentLiveBalances slot)
-    BigInt(b.outIdx), // j = tokenOut Vault index
-    BigInt(b.feePpm),
-    14n, // segKind = Balancer V3 (on-chain StableMath QL; Permit2 two-step + swapSingleTokenExactIn on the exec)
-    BigInt(refIdx),
-    BigInt(b.rpIn), // qd[6] = tokenIn rate provider (getRate scalar)
-    BigInt(b.rpOut), // qd[7] = tokenOut rate provider
-    b.decScaleIn, // qd[8] = 10^(18−decIn)
-    b.decScaleOut, // qd[9] = 10^(18−decOut)
-  ]);
-  // Balancer V2 ComposableStable — segKind 6. Like V3 its quote (Vault.queryBatchSwap) is eth_call-ONLY, so the
-  // solver replays the amplified StableSwap invariant on-chain from LIVE Vault state (V2 rounding). qd[1]/qd[2]
-  // carry the NON-BPT invariant-order indices of tokenIn/tokenOut. The 4 extra columns carry: qd[6] = the
-  // Vault poolId (the getPoolTokenInfo(poolId, token) argument); qd[7] = the THIRD non-BPT token address (0 for
-  // a 2-token pool) — the two others ARE tokenIn/tokenOut (read from cfg on-chain); qd[8] = the packed FULL
-  // registered scaling positions (regPos0 | regPos1<<8 | regPos2<<16 in non-BPT order, for the live
-  // getScalingFactors inline-index); qd[9] = the non-BPT token count (2 or 3). amp + fee are read LIVE on-chain
-  // (no descriptor slot); the Vault is chain-wide (cfg[11]). EXEC stays engine poolType 4 (_swapBalancerV2 →
-  // Vault.swap(GIVEN_IN)); refIdx → the on-chain binp[refIdx]/bven[refIdx] accumulator (segKind 6, unchanged).
-  const balancerRows = balancerStables.map((b, refIdx) => {
-    const n = b.nonBptTokens.length;
-    // The third non-BPT index (the one that is neither tokenIn (i) nor tokenOut (j)); 0/none for a 2-token pool.
-    const thirdIdx = n === 3 ? [0, 1, 2].find((p) => p !== b.i && p !== b.j)! : -1;
-    const thirdAddr = thirdIdx >= 0 ? BigInt(b.nonBptTokens[thirdIdx]) : 0n;
-    // Packed FULL registered scaling positions in non-BPT order (each ≤ 255 for any real ComposableStable).
-    const rp = b.nonBptRegPos;
-    const packedReg =
-      BigInt(rp[0] ?? 0) | (BigInt(rp[1] ?? 0) << 8n) | (BigInt(rp[2] ?? 0) << 16n);
-    return [
-      BigInt(b.address),
-      BigInt(b.i),
-      BigInt(b.j),
-      BigInt(b.feePpm),
-      6n, // segKind = Balancer V2 ComposableStable (on-chain StableMath QL; engine _swapBalancerV2 on the exec)
-      BigInt(refIdx),
-      BigInt(b.poolId), // qd[6] = Vault poolId (getPoolTokenInfo argument)
-      thirdAddr, // qd[7] = third non-BPT token address (0 for a 2-token pool)
-      packedReg, // qd[8] = packed registered scaling positions (regPos0 | regPos1<<8 | regPos2<<16)
-      BigInt(n), // qd[9] = non-BPT token count (2 or 3)
-    ];
-  });
-  // Maverick V2 (bin-based directional AMM) — segKind 8. The solver's segKind-8 branch WALKS the pool's bin
-  // book on-chain from the LIVE active tick/price (Maverick has no cumulative-out view to quote), so the
-  // descriptor ships ONLY the walk seeds: qd[1] = tokenAIn (1 iff tokenIn == the pool's tokenA ⇒ price rises)
-  // and qd[2] = tickSpacing (the bin width exponent). fee(tokenAIn), the active tick, and every per-tick
-  // reserve are read LIVE on-chain (no descriptor slot, so the walk re-anchors to any drift). EXEC is
-  // UNCHANGED — engine poolType 7 (_swapMaverickV2 → the pool's maverickV2SwapCallback pulls the input); the
-  // segKind-8 accumulator (minp/mven, refIdx-keyed) and the poolType-7 dispatch already handle it.
-  const maverickRows = maverickPools.map((m, refIdx) => [
-    BigInt(m.address),
-    m.tokenAIn ? 1n : 0n, // i = tokenAIn (the walk direction bit)
-    BigInt(m.tickSpacing), // j = tickSpacing (the bin-width exponent for the sqrt-price ladder)
-    BigInt(m.feePpm),
-    8n, // segKind = Maverick V2 (on-chain live bin-walk QL; engine _swapMaverickV2 callback on the exec)
-    BigInt(refIdx),
-  ]);
-  // PAD every SHORT row from 6 → 10 columns (0-fill) so the qlv tuple is uniform-width and the solver's qd[6..9]
-  // read is always in range (only BalV3 (segKind 14) + BalV2 (segKind 6) read qd[6..9]; a uniform width keeps
-  // the compiler's INDEX safe on every engine). BalV3 + BalV2 rows are already 10 wide.
-  const pad10 = (rows: bigint[][]): bigint[][] =>
-    rows.map((r) => (r.length >= 10 ? r : [...r, ...new Array(10 - r.length).fill(0n)]));
-  return pad10([
-    ...curveRows, ...cryptoRows, ...solidlyRows, ...wooFiRows, ...lbRows, ...mentoRows,
-    ...dodoRows, ...wombatRows, ...fermiRows, ...eulerRows, ...balancerV3Rows, ...balancerRows,
-    ...maverickRows,
-  ]);
+  // Family-concatenation order is LOAD-BEARING (the direct rows' positions feed the on-chain
+  // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
+  // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
+  // maverickPools — the historical order the per-family map bodies (now qlRowFor) emitted.
+  const rows: bigint[][] = [];
+  (prepared.curves ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "curve", desc }, i)));
+  (prepared.cryptoSwaps ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "cryptoSwap", desc }, i)));
+  (prepared.solidlyStables ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "solidlyStable", desc }, i)));
+  (prepared.wooFiPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "wooFi", desc }, i)));
+  (prepared.lbs ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "lb", desc }, i)));
+  (prepared.mentoPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "mento", desc }, i)));
+  (prepared.dodos ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "dodo", desc }, i)));
+  (prepared.wombats ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "wombat", desc }, i)));
+  (prepared.fermiPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "fermi", desc }, i)));
+  (prepared.eulerSwaps ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "euler", desc }, i)));
+  (prepared.balancerV3Pools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "balancerV3", desc }, i)));
+  (prepared.balancerStables ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "balancerV2", desc }, i)));
+  (prepared.maverickPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "maverick", desc }, i)));
+  // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
+  // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
+  return rows.map(pad12);
 }
 
 function buildSegs(prepared: EcoSwapPrepared): bigint[][] {
@@ -581,20 +735,30 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   // is the un-masked audit finding). An Algebra pool is always isV2 false, so it also lights HAS_V3.
   const HAS_ALGEBRA = allPools.some((p) => p.isAlgebra === true);
   const HAS_ROUTES = prepared.routes.length > 0;
-  const HAS_CURVE = (prepared.curves?.length ?? 0) > 0;
-  const HAS_LB = (prepared.lbs?.length ?? 0) > 0;
-  const HAS_DODO = (prepared.dodos?.length ?? 0) > 0;
-  const HAS_SOLIDLY_STABLE = (prepared.solidlyStables?.length ?? 0) > 0;
-  const HAS_WOMBAT = (prepared.wombats?.length ?? 0) > 0;
-  const HAS_BALANCER = (prepared.balancerStables?.length ?? 0) > 0;
-  const HAS_EULER = (prepared.eulerSwaps?.length ?? 0) > 0;
-  const HAS_MAVERICK = (prepared.maverickPools?.length ?? 0) > 0;
-  const HAS_CRYPTO = (prepared.cryptoSwaps?.length ?? 0) > 0;
-  const HAS_WOOFI = (prepared.wooFiPools?.length ?? 0) > 0;
-  const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0;
-  const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0;
-  const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0;
-  const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0;
+  // QL families: a family present as a DIRECT venue OR as a ROUTE-LEG venue must compile in — a
+  // family present ONLY as a leg venue still needs its ladder/exec branch (else treeshake drops
+  // it and the leg venue silently never ladders). Fluid has no leg form (static-seg venue).
+  const legQl = legQlVenues(prepared);
+  const hasLegFam = (family: EcoLegQlVenue["family"]): boolean =>
+    legQl.some((v) => v.family === family);
+  const HAS_CURVE = (prepared.curves?.length ?? 0) > 0 || hasLegFam("curve");
+  const HAS_LB = (prepared.lbs?.length ?? 0) > 0 || hasLegFam("lb");
+  const HAS_DODO = (prepared.dodos?.length ?? 0) > 0 || hasLegFam("dodo");
+  const HAS_SOLIDLY_STABLE =
+    (prepared.solidlyStables?.length ?? 0) > 0 || hasLegFam("solidlyStable");
+  const HAS_WOMBAT = (prepared.wombats?.length ?? 0) > 0 || hasLegFam("wombat");
+  const HAS_BALANCER = (prepared.balancerStables?.length ?? 0) > 0 || hasLegFam("balancerV2");
+  const HAS_EULER = (prepared.eulerSwaps?.length ?? 0) > 0 || hasLegFam("euler");
+  const HAS_MAVERICK = (prepared.maverickPools?.length ?? 0) > 0 || hasLegFam("maverick");
+  const HAS_CRYPTO = (prepared.cryptoSwaps?.length ?? 0) > 0 || hasLegFam("cryptoSwap");
+  const HAS_WOOFI = (prepared.wooFiPools?.length ?? 0) > 0 || hasLegFam("wooFi");
+  const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0 || hasLegFam("fermi");
+  const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0; // never a leg venue (static segs)
+  const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
+  const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
+  // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
+  // it), so a pool-only-routes universe ships zero leg-QL bytecode.
+  const HAS_LEG_QLV = legQl.length > 0;
   return {
     HAS_V2,
     HAS_V3,
@@ -616,16 +780,19 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_FLUID,
     HAS_MENTO,
     HAS_BALANCER_V3,
+    HAS_LEG_QLV,
   };
 }
 
 /**
  * Assemble the on-chain solver's compiler-arg array from a `prepared` universe — the SINGLE source
  * of truth for the `main(cfg, pools, netCache, routing, segs, qlv)` argument shape (6 top-level
- * args: the 12-scalar cfg bundle + the five nested tuple arrays). `ecoSwap` feeds this straight into
+ * args: the 13-scalar cfg bundle + the five nested tuple arrays). `ecoSwap` feeds this straight into
  * `compile()`; the gas-measurement tests import it so their hand-fed args can never drift from the
  * production shape (the historical staleness this replaces). `minOut` is taken from `prepared` (0 on
- * a floor-disabled prepare); a read-only quote overrides cfg[9] to 0 separately.
+ * a floor-disabled prepare); a read-only quote overrides cfg[9] to 0 separately. `qlv` carries the
+ * direct rows THEN the route-leg rows ((routeIdx, legIdx)-ordered — asserted by the builder);
+ * cfg[12] = directQlvCount marks the boundary.
  */
 export function buildSolverArgs(
   tokenIn: Hex,
@@ -634,9 +801,9 @@ export function buildSolverArgs(
   caller: Hex,
   prepared: EcoSwapPrepared,
 ): unknown[] {
-  const { poolTuples, netCache, routing, directCount } = buildPoolUniverseAndRouting(prepared);
+  const { poolTuples, netCache, routing, directCount, qlvRows, directQlvCount } =
+    buildUniverseRoutingAndQlv(prepared);
   const segs = buildSegs(prepared);
-  const qlv = buildQLVenues(prepared);
   return [
     [
       BigInt(tokenIn),
@@ -651,12 +818,13 @@ export function buildSolverArgs(
       prepared.minOut ?? 0n, // cfg[9] — internal whole-trade amountOutMin FLOOR (0 ⇒ no floor)
       balancerV3VaultAddr(prepared), // cfg[10] — chain-wide Balancer V3 Vault (0 when no Balancer V3 venue)
       balancerV2VaultAddr(prepared), // cfg[11] — chain-wide Balancer V2 Vault (0 when no Balancer V2 venue)
+      BigInt(directQlvCount), // cfg[12] — leading qlv rows that are DIRECT venues (leg rows follow)
     ],
     poolTuples,
     netCache,
     routing,
     segs,
-    qlv,
+    qlvRows,
   ];
 }
 
@@ -873,10 +1041,12 @@ export async function quoteEcoSwap(
 
   const source = readFileSync(join(__dirname, "ecoswap.sauce.ts"), "utf-8");
   const jsSource = stripTypes(source);
-  const { poolTuples, netCache, routing, directCount } =
-    buildPoolUniverseAndRouting(usePrepared);
+  // Same combined builder as buildSolverArgs (stride-5 routing + direct-then-leg qlv rows +
+  // directQlvCount). The no-cache quote cleared only the leg POOLS' net caches above — leg QL
+  // descriptors pass through untouched (they carry no cache: prepare-optional by construction).
+  const { poolTuples, netCache, routing, directCount, qlvRows, directQlvCount } =
+    buildUniverseRoutingAndQlv(usePrepared);
   const segs = buildSegs(usePrepared);
-  const qlv = buildQLVenues(usePrepared);
   const result = compile(jsSource, {
     baseDirs: [REPO_ROOT, __dirname],
     target,
@@ -898,12 +1068,13 @@ export async function quoteEcoSwap(
         0n, // cfg[9] — amountOutMin floor: 0 on a QUOTE (a read-only quote must never floor-revert)
         balancerV3VaultAddr(usePrepared), // cfg[10] — chain-wide Balancer V3 Vault (0 when no Balancer V3 venue)
         balancerV2VaultAddr(usePrepared), // cfg[11] — chain-wide Balancer V2 Vault (0 when no Balancer V2 venue)
+        BigInt(directQlvCount), // cfg[12] — leading qlv rows that are DIRECT venues (leg rows follow)
       ],
       poolTuples,
       netCache,
       routing,
       segs,
-      qlv,
+      qlvRows,
     ],
   });
   const segments: Uint8Array[] = result.bytecode ?? result.bytecodes;

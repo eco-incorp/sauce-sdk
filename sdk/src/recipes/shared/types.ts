@@ -378,6 +378,32 @@ export interface EcoPool {
 }
 
 /**
+ * One QUOTE-LADDER (QL) venue serving a route LEG's edge (hopIn → hopOut) — the leg-member
+ * analogue of a direct QL venue. `desc` is the EXISTING per-family descriptor type (the same
+ * shape the direct per-family lists carry), DIRECTION-STAMPED for the LEG's (hopIn, hopOut)
+ * pair: i/j coin indices, swapForY, sellBase, inIsToken0, fromToken/toToken, inIdx/outIdx …
+ * are all per-direction, computed by the discovery functions against the EDGE pair instead of
+ * (tokenIn, tokenOut). index.ts appends one 12-column qlv row per leg venue (columns [10]/[11]
+ * = routeIdx/legIdx backrefs) AFTER all direct rows, contiguous per (routeIdx asc, legIdx asc).
+ * Fluid is deliberately NOT a member — it is a static-sampled-segment venue (segKind 12) whose
+ * ladder the solver cannot build on-chain, so it stays direct-only.
+ */
+export type EcoLegQlVenue =
+  | { family: "curve"; desc: EcoCurve }
+  | { family: "cryptoSwap"; desc: EcoCryptoSwap }
+  | { family: "solidlyStable"; desc: EcoSolidlyStable }
+  | { family: "wooFi"; desc: EcoWooFi }
+  | { family: "lb"; desc: EcoLb }
+  | { family: "mento"; desc: EcoMento }
+  | { family: "dodo"; desc: EcoDodo }
+  | { family: "wombat"; desc: EcoWombat }
+  | { family: "fermi"; desc: EcoFermi }
+  | { family: "euler"; desc: EcoEulerSwap }
+  | { family: "balancerV2"; desc: EcoBalancerStable }
+  | { family: "balancerV3"; desc: EcoBalancerV3 }
+  | { family: "maverick"; desc: EcoMaverick };
+
+/**
  * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
  * leg splits across. Each pool is a full `EcoPool` (the same live-walk descriptor a direct
  * pool carries), so a leg pool is byte-identical on-chain to a direct pool and reuses the
@@ -391,6 +417,12 @@ export interface EcoLeg {
   hopOut: Hex;
   zeroForOne: boolean;
   pools: EcoPool[];
+  /**
+   * QUOTE-LADDER venues competing as members of THIS leg (direction-stamped for the edge —
+   * see EcoLegQlVenue). Optional ⇒ every existing test literal stays valid; absent/empty ⇒ a
+   * pool-only leg (index.ts emits qlvBase=qlvCount=0 in the stride-5 routing tuple).
+   */
+  qlVenues?: EcoLegQlVenue[];
 }
 
 /**
@@ -544,7 +576,7 @@ export interface EcoBalancerStable {
   // Balancer V2 is now a LIVE-WALK QL venue: the on-chain solver reads the LIVE Vault StableMath state at cook
   // (balances via getPoolTokenInfo scalars, scaling via getScalingFactors, amp/fee live) and replays the
   // amplified StableSwap invariant to build its price ladder, so the split RE-ANCHORS to cook-time state. These
-  // fields are what buildQLVenues packs into the 10-column qlv descriptor. (The oracle mirrors the ladder off
+  // fields are what buildQLVenues packs into the 12-column qlv descriptor. (The oracle mirrors the ladder off
   // the same live state via buildBalancerStableQLLadder.)
   /** The pool's Vault poolId (bytes32) — the getPoolTokenInfo(poolId, token) argument for live balances. */
   poolId: Hex;

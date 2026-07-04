@@ -700,7 +700,7 @@ export function kwayReference(
   const { pools, routes } = prepared;
   const priceLimit = prepared.priceLimit;
 
-  // ── Build the FLAT POOL UNIVERSE exactly as index.ts buildPoolUniverseAndRouting: the direct
+  // ── Build the FLAT POOL UNIVERSE exactly as index.ts buildUniverseRoutingAndQlv: the direct
   // pools, then each route leg's pools appended contiguously, DEDUPED by lowercased address. The
   // routing metadata records, per route, the per-leg universe-index slices + the leg direction. ──
   const directCount = pools.length;
