@@ -79,7 +79,7 @@ initialized tick).
 
 For each direct pool the merge does one swap (V3 → flat `swapV3`; V2/V4 → unified `swap(SwapParams)`); a
 route executes chain-order — each leg reads its REALIZED input balance and splits it proportionally across
-its funded members through ONE unified dispatch (leg pools + all 19 quote-ladder families), with a per-route
+its funded members through ONE unified dispatch (leg pools + all 20 quote-ladder families), with a per-route
 intermediate sweep returning residual mid-route dust. **`prepare.ts` is a gas-optimization cache, not a correctness
 dependency** — the solver is exact from live data alone (`windowTop=0` ⇒ every boundary staticcalls, the
 1-RPC quote path with no prepared ticks). Compute-then-pull pulls exactly what the swaps consume; one guarded
@@ -272,7 +272,7 @@ the same value either way. There is no reverse/up frontier and no re-anchor bran
               V4 → unified swap(SwapParams) poolType=2, PoolKey + poolId, neg amount
    routes: chain-order per leg — read the REALIZED leg input balance, split it
            proportionally across the leg's funded members (pools + quote-ladder
-           venues, ONE unified 19-family dispatch; last funded member absorbs
+           venues, ONE unified 20-family dispatch; last funded member absorbs
            division dust), then a per-route intermediate sweep
 ```
 
@@ -404,7 +404,7 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   queried across its own `FactoryConfig.feeTiers` — AND the quote-ladder venue families
   (Curve StableSwap/CryptoSwap, Solidly-stable, WOOFi, Trader Joe LB, Mento, DODO V2, Wombat, Fermi,
   EulerSwap, Balancer V2/V3, Maverick V2, Fluid DEX, Tessera V, ElfomoFi, Metric, LiquidCore, Integral
-  SIZE). All 19 leg-capable families compete both as DIRECT venues and as ROUTE-LEG members. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is
+  SIZE, PancakeSwap StableSwap). All 20 leg-capable families compete both as DIRECT venues and as ROUTE-LEG members. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is
   SUPPORTED (discover + price + execute): its curve
   is V3-identical (so it prices wei-exact via the V3 oracle), and the engine now EXECUTES it — an Algebra
   pool re-enters via `algebraSwapCallback`, a selector the Router services (a mirror of
@@ -429,7 +429,7 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
   to `feePpm=3000` off-chain to keep its marginal consistent with execution.
 - **Multi-hop routes are full EcoSwaps per leg.** An N-hop route is a LIVE composite venue: each leg
   splits across ALL its members — universe pools (V2/V3/V4/Algebra families, walked live like direct
-  pools) and the 19 quote-ladder families (leg-venue ladders built on-chain in setup, sized by the
+  pools) and the 20 quote-ladder families (leg-venue ladders built on-chain in setup, sized by the
   chain-order live fold). Route allocations are inside the per-wei live-walk gate (wei-exact vs the
   oracle/reference mirrors); execution is chain-order per leg with a per-route intermediate sweep.
 - **Direct pools are exact under drift.** The solver walks each pool's frontier from its LIVE spot on

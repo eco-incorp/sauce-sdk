@@ -91,7 +91,7 @@ import {
   qlCursorConsume,
   legMemberWins,
 } from "./ecoswap.math";
-// The leg QL venue family dispatch (13 shared build*QLLadder builders) is SINGLE-SOURCED in the
+// The leg QL venue family dispatch (the per-family shared build*QLLadder builders) is SINGLE-SOURCED in the
 // oracle so the reference's ladders are the oracle's ladders by construction — the same pattern
 // as the shared routeEventN/routePartialN event math above.
 import { buildLegQlVenueLadder, type OptimalLegQlVenue } from "./ecoswap.optimal";
