@@ -72,7 +72,7 @@ export function compileSauce(
   // to false preserves each old map's exact treeshake semantics; a caller that mentions the flag
   // explicitly (a new-family test / production protocolDefines, which is always complete) wins.
   const defines = opts.defines
-    ? { HAS_TESSERA: false, HAS_ELFOMO: false, ...opts.defines }
+    ? { HAS_TESSERA: false, HAS_ELFOMO: false, HAS_METRIC: false, ...opts.defines }
     : undefined;
   const result = compile(jsSource, {
     baseDirs: [SRC_ROOT, recipeDir], args, target,

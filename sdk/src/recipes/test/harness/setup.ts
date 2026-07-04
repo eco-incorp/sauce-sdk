@@ -161,6 +161,15 @@ export const tesseraSwapArtifact = loadArtifact(
 export const elfomoFiArtifact = loadArtifact(
   join(FIXTURES, "ElfomoFi.sol", "ElfomoFi.json"),
 );
+export const metricPoolArtifact = loadArtifact(
+  join(FIXTURES, "MetricPool.sol", "MetricPool.json"),
+);
+export const metricRouterArtifact = loadArtifact(
+  join(FIXTURES, "MetricRouter.sol", "MetricRouter.json"),
+);
+export const metricPriceProviderArtifact = loadArtifact(
+  join(FIXTURES, "MetricPriceProvider.sol", "MetricPriceProvider.json"),
+);
 /** Mento V2 (Celo Broker + BiPoolManager) — the Broker is the swap entry; the BiPoolManager is the
  *  ENUMERABLE exchange provider (getExchanges). Both deployed normally; the Broker holds token reserves. */
 export const mentoBrokerArtifact = loadArtifact(
@@ -1545,6 +1554,71 @@ export async function deployElfomoFi(
     address: tokenY, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, yReserve], account: acct,
   });
   return pool;
+}
+
+// The REAL METRIC surfaces the fixtures mirror (probed live on Base 2026-07-04; signature-exact —
+// see metric-math.ts): the Router's quoteSwap/swapExactInput (+ its own metricOmmSwapCallback), the
+// PriceProvider's staleness-reverting getBidAndAskPrice, and the pool's 14-word getImmutables + REAL
+// Swap event. `setBidAndAskPrice`/`setStale` are fixture-only levers (the drift + staleness cells).
+export const metricRouterFixtureAbi = parseAbi([
+  "function quoteSwap(address pool, bool xToY, int128 amountSpecified, uint128 priceLimit, uint128 bid, uint128 ask) view returns (int256 amount0Delta, int256 amount1Delta)",
+  "function swapExactInput(address pool, address recipient, bool xToY, uint128 amountIn, uint128 priceLimit, uint256 minAmountOut, uint256 deadline) returns (uint256 amountOut)",
+]);
+export const metricProviderFixtureAbi = parseAbi([
+  "function getBidAndAskPrice() view returns (uint128 bid, uint128 ask)",
+  "function setBidAndAskPrice(uint128 bid, uint128 ask)",
+  "function setStale(bool stale)",
+]);
+export const metricPoolFixtureAbi = parseAbi([
+  "function getImmutables() view returns (address factory, address priceProvider, address token0, address token1)",
+]);
+
+/**
+ * Deploy a local METRIC stack — PriceProvider (maker anchor, X64) + Router (quoteSwap /
+ * swapExactInput / its own metricOmmSwapCallback) + a per-pair Pool over the deterministic
+ * oracle-anchored bin curve (see MetricPool.sol) — and fund the POOL with both reserves (a Metric
+ * pool is a per-pair inventory contract; the pool pays the out and the router pulls the input into
+ * it). `bid`/`ask` are X64 (price = v/2^64); `feePpm`/`stepPpm` are 1e6-scaled; `binCapIn0`/
+ * `binCapIn1` are the per-bin input capacities (token0 for xToY, token1 for yToX).
+ */
+export async function deployMetricStack(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  token0: Hex,
+  token1: Hex,
+  bid: bigint,
+  ask: bigint,
+  feePpm: bigint,
+  binCapIn0: bigint,
+  binCapIn1: bigint,
+  stepPpm: bigint,
+  reserve0: bigint,
+  reserve1: bigint,
+  minter?: Account,
+): Promise<{ pool: Hex; router: Hex; provider: Hex }> {
+  const provider = await deployContract(walletClient, publicClient, {
+    abi: metricPriceProviderArtifact.abi,
+    bytecode: metricPriceProviderArtifact.bytecode,
+    args: [bid, ask],
+  });
+  const router = await deployContract(walletClient, publicClient, {
+    abi: metricRouterArtifact.abi,
+    bytecode: metricRouterArtifact.bytecode,
+    args: [],
+  });
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: metricPoolArtifact.abi,
+    bytecode: metricPoolArtifact.bytecode,
+    args: [provider, token0, token1, feePpm, binCapIn0, binCapIn1, stepPpm],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: token0, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
+  });
+  return { pool, router, provider };
 }
 
 // The REAL Fluid DEX surface the fixtures mirror: DexT1 token0/token1 + swapIn (approve-first pull, output

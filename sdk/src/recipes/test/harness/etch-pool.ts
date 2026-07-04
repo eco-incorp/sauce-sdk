@@ -3651,6 +3651,13 @@ export interface FermiStateSnapshot {
   };
   /** The EIP-7702 EOA touched via EXTCODESIZE/BALANCE — the harness etches its 24-byte designator. */
   eoa7702: { address: Hex; designator: Hex; delegate: Hex } | null;
+  /** METRIC snapshots only (harness/metric-snapshot.ts — fermi-SHAPED: `fermiSwapper` = the ROUTER,
+   *  `vault` = the per-pair POOL holding the payout inventory): the pool + its PriceProvider + the
+   *  captured maker anchor (X64 bid/ask at the pin — the frozen values every captured probe quote and
+   *  the prod-mirror prefetch price at). Absent on non-Metric snapshots. */
+  metricPool?: Hex;
+  metricProvider?: Hex;
+  metricAnchor?: { bid: string; ask: string };
   probe: {
     target: { pair: string; ladder: { amountIn: string; amountOut: string }[] };
     second: { pair: string; ladder: { amountIn: string; amountOut: string }[] } | null;
