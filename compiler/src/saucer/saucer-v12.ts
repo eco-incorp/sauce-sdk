@@ -329,7 +329,12 @@ export class V12Saucer implements SaucerLike {
 
   // ── values ──
   int(value: bigint): V12Saucer {
-    return this.withBytes(encodeInt(value), this.stackEffect + 1, false);
+    // encodeInt emits v1's PREFIX form for negatives ([NEG, BYTE_N, …]); the
+    // postfix engines pop NEG's operand off the stack, so the literal must come
+    // first and NEG last (the Solidity builder's NEG(UINT(n)) order).
+    const bytes = encodeInt(value);
+
+    return this.withBytes(value < 0n ? concat(bytes.slice(1), [OPS.NEG]) : bytes, this.stackEffect + 1, false);
   }
   bytes(data: Uint8Array): V12Saucer {
     return this.withBytes(encodeBytes(data), this.stackEffect + 1, true);

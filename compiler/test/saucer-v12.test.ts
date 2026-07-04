@@ -28,6 +28,13 @@ describe('V12Saucer — postfix emission', () => {
     expect(hex(S().int(256n)._bytes)).toBe('020100');
   });
 
+  it('emits a negative constant postfix: literal first, NEG last', () => {
+    // encodeInt's v1 prefix form ([NEG][BYTE_N][…]) is reordered — the postfix
+    // engines pop NEG's operand off the stack. [BYTE_1,5][NEG=0x29].
+    expect(hex(S().int(-5n)._bytes)).toBe('010529');
+    expect(hex(S().int(-256n)._bytes)).toBe('02010029');
+  });
+
   it('context ops are nullary single opcodes', () => {
     expect(Array.from(S().msgSender()._bytes)).toEqual([OPS.MSG_SENDER]);
     expect(Array.from(S().blockTimestamp()._bytes)).toEqual([OPS.TIMESTAMP]);
