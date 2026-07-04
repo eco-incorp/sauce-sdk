@@ -27,7 +27,7 @@
  *       only; at 2000e18 the clamp lands ON the slice mid-row (remaining cap ≈115.8e18;
  *       5000e18+ elect the pool), exercising the CLAMPED-slice arm — min(pflow, remCap)
  *       consume + qinp accrual + cursor advance — ON-CHAIN. tokenIn-side deltas wei-exact;
- *       the leg1 X-side per-member split assert lands with the exec lane.
+ *       the leg1 X-side per-member exec split is asserted wei-exact in both cases.
  *   (3) DEAD UPSTREAM (hF==0) — a route whose leg0 has NO members folds the leg-QL venue's
  *       ladderCap to 0 (the chain-order sizing fold's hF==0 arm) ⇒ the venue builds a
  *       zero-row ladder (born exhausted) and contributes ZERO; the route is dead and the
@@ -35,17 +35,23 @@
  *       stateOverride, the quoteEcoSwap mechanics, MintableERC20 slots 4/5): quoted ==
  *       cooked amountOut to the wei.
  *
- * NOT YET COOKED: a venue UPSTREAM of a binding leg. Every case here puts the venue on the
- * LAST leg, so the Phase B upstream-slice sentinel/inversion (need >= remOut ⇒ crossed;
- * mulDiv(need, remCap, remOut)) and the Phase C upstream-slice inversion are pinned by the
- * ecoswap.math.test.ts vectors + the mirrors only, NOT by an on-chain cook. A venue-on-leg0
- * (or mid-leg 3-hop) case needs exec-side asserts to be meaningful — it rides with the
- * exec/prepare lanes.
- *
- * The leg-QL EXEC dispatch is the NEXT lane — a leg venue's awarded input is computed by the
- * merge (and pulled: spent == totalInput includes it) but not yet swapped, so the OUTPUT-side
- * cases (venue receives its share; quote == cook on a venue-funded route) are gated behind
- * ECO_LANE4=1 below and land with that lane.
+ * EXEC-side (the unified per-leg loop + the leg-QL venue dispatch in ecoswap.sauce.ts):
+ *   (4) VENUE-ONLY OUTPUT — the X→B Curve venue EXECUTES its awarded share (the whole
+ *       realized leg X, wei-exact vs the leg0 pool's X outflow), the caller receives
+ *       tokenOut, quote == cook, and the per-route intermediate sweep NO-OPS (zero X back
+ *       to the caller) on the happy path.
+ *   (5) PINNED EXAMPLE — the epic's canonical shape: leg A→X = {UniV3 pool + Maverick
+ *       venue}, leg X→B = {Curve + WOOFi + Euler venues} (+ a direct A→B pool competing at
+ *       the global cut). EVERY funded member executes (Transfer-log gated): leg0 members
+ *       receive EXACTLY their computed awards (leg0 inBal := lTotal ⇒ share == award), leg1
+ *       members receive EXACTLY their proportional slice of the realized X (last-funded
+ *       venue absorbs the division dust — the exec's member ordering mirrored off-chain),
+ *       totals wei-exact vs kwayReference == optimalSplit, quote == cook.
+ *   (6) ADVERSE DRIFT on a leg venue — a REAL exchange moves the mixed leg's Curve fixture
+ *       between arg-build and cook; the cook RE-ANCHORS (the venue ladder is rebuilt
+ *       on-chain from live get_dy at cook): awards == the mirrors run on the DRIFTED state,
+ *       the drifted venue's share SHRINKS vs the no-drift baseline while the sibling V3
+ *       pool's grows, and the X-side split still lands exactly proportional.
  *
  * Run: ECO_ENGINE=both npx tsx --test src/recipes/test/ecoswap.legql.evm.test.ts
  */
@@ -61,9 +67,11 @@ import {
   encodeAbiParameters,
   keccak256,
   parseAbi,
+  parseEventLogs,
   type Abi,
   type Account,
   type Hex,
+  type TransactionReceipt,
 } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
@@ -82,10 +90,17 @@ import {
   approve,
   balanceOf,
   deployCurveStableSwap,
+  deployMaverickV2Pool,
+  deployWooFiPool,
+  deployEulerSwapPool,
+  curveAbi,
   SQRT_PRICE_1_1,
   type DeployedStack,
   type DeployedV12Stack,
+  type MaverickDeployParams,
+  type EulerSwapParams,
 } from "./harness/setup";
+import { writeAndWait } from "./harness/deploy";
 import {
   type Engine,
   engineCells,
@@ -95,7 +110,7 @@ import {
 import { MIN_SQRT_RATIO, SwapPoolType } from "../shared/constants";
 import type { EcoPool, EcoSwapPrepared, EcoLegQlVenue } from "../shared/types";
 import { buildSolverArgs, protocolDefines } from "../ecoswap/index";
-import { getSqrtRatioAtTick, OFFSET } from "./ecoswap.math";
+import { getSqrtRatioAtTick, mulDiv, OFFSET } from "./ecoswap.math";
 import { kwayReference } from "./ecoswap.solver-reference";
 import {
   optimalSplit,
@@ -104,16 +119,23 @@ import {
   type OptimalLegQlVenue,
 } from "./ecoswap.optimal";
 import type { CurvePool } from "../shared/curve-math";
+import type { WooFiPool } from "../shared/woofi-math";
+import type { EulerSwapPool } from "../shared/eulerswap-math";
+import {
+  getTickL,
+  getSqrtPrice,
+  tickSqrtPrices,
+  type MaverickPool,
+  type MaverickTick,
+} from "../shared/maverick-math";
 
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 const HUGE = parseEther("1000000000");
 const E18 = 10n ** 18n;
 const ZERO = "0x0000000000000000000000000000000000000000" as Hex;
 const ZERO32 = ("0x" + "00".repeat(32)) as Hex;
+const E8 = 10n ** 8n;
 const ENGINE_CELLS = engineCells();
-// The leg-QL EXEC dispatch is the NEXT lane: output-side cases (the venue actually swaps its
-// awarded share) are written but skipped until that lane flips this knob.
-const LANE4 = process.env.ECO_LANE4 === "1";
 
 // Fee tiers (V3 feePpm == fee tier for the canonical tiers).
 const FEE_DIRECT = 3000;
@@ -129,6 +151,35 @@ const CURVE_DEEP_FEE = 4_000_000n; // 0.04%
 const CURVE_STEEP_BAL = [150_000n * E18, 150_000n * E18];
 const CURVE_STEEP_A = 20n;
 const CURVE_STEEP_FEE = 3_000_000n; // 0.03%, steep low-A curve — bends within the trade
+// ── PINNED-EXAMPLE fixtures (case 5): sizes PROBE-VERIFIED so EVERY leg member funds at
+// 20000e18 (kwayReference on these exact models: leg0 V3 ≈7.8k, Maverick ≈12.0k, Curve ≈11.4k,
+// WOOFi ≈1.25k, Euler ≈7.2k, direct ≈146) — shrinking any depth or the amount re-probes. ──
+const MAV_TS = 10;
+const MAV_FEE = E18 / 1000n; // 0.1% directional (1e18-scaled)
+const MAV_FEE_PPM = Number((MAV_FEE * 1_000_000n) / E18); // 1000
+const MAV_ACTIVE = -3;
+const MAV_LO = -4;
+const MAV_HI = 6;
+const MAV_PER_TICK = 2_000n * E18; // shallow book — bends within the trade so the V3 pool splits
+const CURVE_PIN_BAL = [40_000n * E18, 40_000n * E18];
+const CURVE_PIN_A = 20n;
+const CURVE_PIN_FEE = 3_000_000n; // 0.03%
+const WOO_PRICE = E8; // 1:1 (WooracleV2 canonical 1e8 price decimals)
+const WOO_SPREAD = 10n ** 14n; // 1 bp
+const WOO_COEFF = 10n ** 13n; // large gamma — the sPMM bends within the trade
+const WOO_FEE_RATE = 25n; // 0.025% (1e5-scaled)
+const WOO_FEE_PPM = 250;
+const WOO_BASE_RES = 500_000n * E18;
+const WOO_QUOTE_RES = 500_000n * E18;
+const EUL_RES = 60_000n * E18;
+const EUL_CONC = (9n * E18) / 10n; // 0.9 — concentrated near equilibrium, bends off it
+const EUL_FEE = E18 / 1000n; // 0.1%
+const EUL_FEE_PPM = 1000;
+
+// Minimal ERC20 Transfer event (erc20Abi in harness/setup is functions-only).
+const erc20TransferAbi = parseAbi([
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+]);
 
 describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / dead-upstream legs)", () => {
   let anvil: AnvilHandle;
@@ -145,6 +196,11 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
   let leg1V3Pool: Hex; // X→B V3 (fee 3000) — the mixed-leg pool member
   let curveDeep: Hex; // X→B Curve fixture (deep, 0.04%)
   let curveSteep: Hex; // X→B Curve fixture (steep low-A, 0.03%)
+  // Pinned-example fixtures (case 5): A→X Maverick + X→B Curve/WOOFi/Euler venues.
+  let mavPool: Hex; // A→X Maverick V2 fixture (tokenA == tokA, tokenAIn)
+  let curvePin: Hex; // X→B Curve fixture (small, 0.03%)
+  let wooPool: Hex; // X→B WOOFi fixture (base == tokX, quote == tokB)
+  let eulPool: Hex; // X→B EulerSwap fixture (asset0 == tokX)
   let solverSrc: string;
   let cleanSnapshot: Hex;
 
@@ -198,6 +254,33 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     curveSteep = await deployCurveStableSwap(
       c.walletClient, c.publicClient, [tokX, tokB], CURVE_STEEP_BAL, [E18, E18], CURVE_STEEP_A, CURVE_STEEP_FEE, minter,
     );
+    // Pinned-example fixtures. Maverick A→X: tokenA == tokA (tokenAIn — the walk direction the
+    // descriptor stamps), a SHALLOW uniform book so the leg splits pool+venue. The deploy params
+    // mirror mavModel() below so the fixture state == the oracle model bit-for-bit.
+    const mavTicks: MaverickTick[] = [];
+    for (let t = MAV_LO; t <= MAV_HI; t++) {
+      mavTicks.push({ tick: t, reserveA: MAV_PER_TICK, reserveB: MAV_PER_TICK });
+    }
+    const mavParams: MaverickDeployParams = {
+      tokenA: tokA, tokenB: tokX, tickSpacing: MAV_TS, feeAIn: MAV_FEE, feeBIn: MAV_FEE,
+      protocolFeeRatioD3: 0, ticks: mavTicks, activeTick: MAV_ACTIVE,
+      poolSqrtPrice: mavModel(ZERO).poolSqrtPrice,
+    };
+    mavPool = await deployMaverickV2Pool(c.walletClient, c.publicClient, mavParams, minter);
+    // X→B: small Curve (bends fast), WOOFi (1:1 oracle, big gamma), Euler (0.9-concentration).
+    curvePin = await deployCurveStableSwap(
+      c.walletClient, c.publicClient, [tokX, tokB], CURVE_PIN_BAL, [E18, E18], CURVE_PIN_A, CURVE_PIN_FEE, minter,
+    );
+    wooPool = await deployWooFiPool(
+      c.walletClient, c.publicClient, tokX, tokB,
+      E8, E18, E18, WOO_PRICE, WOO_SPREAD, WOO_COEFF, WOO_FEE_RATE, WOO_BASE_RES, WOO_QUOTE_RES, minter,
+    );
+    const eulParams: EulerSwapParams = {
+      reserve0: EUL_RES, reserve1: EUL_RES, equil0: EUL_RES, equil1: EUL_RES,
+      priceX: E18, priceY: E18, concX: EUL_CONC, concY: EUL_CONC, fee: EUL_FEE,
+      outCap0: 0n, outCap1: 0n,
+    };
+    eulPool = await deployEulerSwapPool(c.walletClient, c.publicClient, tokX, tokB, eulParams, minter);
 
     v12 = await maybeDeployV12Stack(c, c.walletClient.account as Account);
     cleanSnapshot = await c.testClient.snapshot();
@@ -271,6 +354,104 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
       desc: { address, i: 0, j: 1, feePpm: Number(fee), source: "legql-fixture" },
     };
     return { venue, model, olv: { family: "curve", model } };
+  }
+
+  /** The Maverick fixture's shared-math model — the SAME uniform book the deploy params carry
+   *  (offPoolAt construction from the maverick EVM test), so fixture state == model bit-for-bit
+   *  and buildMaverickWalkLadder == the solver's on-chain bin-walk. */
+  function mavModel(address: Hex): MaverickPool {
+    const ticks: MaverickTick[] = [];
+    for (let t = MAV_LO; t <= MAV_HI; t++) {
+      ticks.push({ tick: t, reserveA: MAV_PER_TICK, reserveB: MAV_PER_TICK });
+    }
+    const { sqrtLowerPrice, sqrtUpperPrice } = tickSqrtPrices(MAV_TS, MAV_ACTIVE);
+    const active = ticks.find((t) => t.tick === MAV_ACTIVE)!;
+    const activeL = getTickL(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice);
+    const poolSqrtPrice = getSqrtPrice(active.reserveA, active.reserveB, sqrtLowerPrice, sqrtUpperPrice, activeL);
+    return {
+      poolType: 7, address, tokenAIn: true, activeTick: MAV_ACTIVE, poolSqrtPrice,
+      tickSpacing: MAV_TS, fee: MAV_FEE, protocolFeeD3: 0n, ticks,
+      feePpm: MAV_FEE_PPM, source: "legql-fixture",
+    };
+  }
+
+  function mavVenue(address: Hex): { venue: EcoLegQlVenue; olv: OptimalLegQlVenue } {
+    const venue: EcoLegQlVenue = {
+      family: "maverick",
+      desc: { address, tokenAIn: true, tickSpacing: MAV_TS, feePpm: MAV_FEE_PPM, source: "legql-fixture" },
+    };
+    return { venue, olv: { family: "maverick", model: mavModel(address) } };
+  }
+
+  function wooVenue(address: Hex): { venue: EcoLegQlVenue; olv: OptimalLegQlVenue } {
+    const model: WooFiPool = {
+      address, tokenIn: tokX, tokenOut: tokB, sellBase: true,
+      price: WOO_PRICE, spread: WOO_SPREAD, coeff: WOO_COEFF,
+      priceDec: E8, quoteDec: E18, baseDec: E18,
+      feeRate: WOO_FEE_RATE, feePpm: WOO_FEE_PPM, source: "legql-fixture",
+    };
+    const venue: EcoLegQlVenue = {
+      family: "wooFi",
+      desc: { address, fromToken: tokX, toToken: tokB, feePpm: WOO_FEE_PPM, source: "legql-fixture" },
+    };
+    return { venue, olv: { family: "wooFi", model } };
+  }
+
+  function eulVenue(address: Hex): { venue: EcoLegQlVenue; olv: OptimalLegQlVenue } {
+    const model: EulerSwapPool = {
+      address, inIsToken0: true,
+      reserveIn: EUL_RES, reserveOut: EUL_RES, equilIn: EUL_RES, equilOut: EUL_RES,
+      priceIn: E18, priceOut: E18, concIn: EUL_CONC, concOut: EUL_CONC, feeWad: EUL_FEE,
+      inLimit: 0n, outLimit: 0n, feePpm: EUL_FEE_PPM, source: "legql-fixture",
+    };
+    const venue: EcoLegQlVenue = {
+      family: "euler",
+      desc: { address, inIsToken0: true, feePpm: EUL_FEE_PPM, source: "legql-fixture" },
+    };
+    return { venue, olv: { family: "euler", model } };
+  }
+
+  /** Σ of Transfer(token, * → to) values in a receipt — the venue-funding Transfer-log gate. */
+  function transferSumTo(receipt: TransactionReceipt, token: Hex, to: Hex): bigint {
+    const events = parseEventLogs({ abi: erc20TransferAbi, logs: receipt.logs, eventName: "Transfer" });
+    let sum = 0n;
+    for (const ev of events) {
+      if (ev.address.toLowerCase() !== token.toLowerCase()) continue;
+      if ((ev.args.to as Hex).toLowerCase() === to.toLowerCase()) sum += ev.args.value as bigint;
+    }
+    return sum;
+  }
+
+  /** The exec's unified per-leg proportional split, mirrored off-chain: pools first then venues
+   *  (floor mulDiv shares), the LAST funded member (venues scanned second, so a funded venue
+   *  wins 'last') takes inBal − spent — EXACTLY the solver's member ordering + dust rule. */
+  function expectedLegShares(
+    inBal: bigint,
+    poolWeights: bigint[],
+    venueWeights: bigint[],
+  ): { pools: bigint[]; venues: bigint[] } {
+    const lTotal = [...poolWeights, ...venueWeights].reduce((a, b) => a + b, 0n);
+    const pools = poolWeights.map(() => 0n);
+    const venues = venueWeights.map(() => 0n);
+    if (lTotal === 0n || inBal === 0n) return { pools, venues };
+    let lastIsQ = false;
+    let lastIdx = 0;
+    poolWeights.forEach((w, i) => { if (w > 0n) { lastIsQ = false; lastIdx = i; } });
+    venueWeights.forEach((w, i) => { if (w > 0n) { lastIsQ = true; lastIdx = i; } });
+    let spent = 0n;
+    poolWeights.forEach((w, i) => {
+      if (w === 0n) return;
+      let share = mulDiv(inBal, w, lTotal);
+      if (!lastIsQ && i === lastIdx) share = inBal - spent;
+      if (share > 0n) { pools[i] = share; spent += share; }
+    });
+    venueWeights.forEach((w, i) => {
+      if (w === 0n) return;
+      let share = mulDiv(inBal, w, lTotal);
+      if (lastIsQ && i === lastIdx) share = inBal - spent;
+      if (share > 0n) { venues[i] = share; spent += share; }
+    });
+    return { pools, venues };
   }
 
   // ── eth_call QUOTE drive (the quoteEcoSwap mechanics inline — hand-built prepared can't go
@@ -469,8 +650,11 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     const bytecodes = compilePrepared(engine, prepared, amountIn, caller);
 
     const callerABefore = await balanceOf(c.publicClient, tokA, caller);
+    const callerXBefore = await balanceOf(c.publicClient, tokX, caller);
     const leg0ABefore = await balanceOf(c.publicClient, tokA, leg0Pool);
+    const leg0XBefore = await balanceOf(c.publicClient, tokX, leg0Pool);
     const leg1XBefore = await balanceOf(c.publicClient, tokX, leg1V3Pool);
+    const curveXBefore = await balanceOf(c.publicClient, tokX, curveSteep);
 
     await approve(c.walletClient, c.publicClient, tokA, target, amountIn);
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
@@ -479,18 +663,29 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     const spent = callerABefore - (await balanceOf(c.publicClient, tokA, caller));
     const leg0In = (await balanceOf(c.publicClient, tokA, leg0Pool)) - leg0ABefore;
     const leg1V3In = (await balanceOf(c.publicClient, tokX, leg1V3Pool)) - leg1XBefore;
+    const curveXIn = (await balanceOf(c.publicClient, tokX, curveSteep)) - curveXBefore;
 
     // tokenIn-side WEI gate (the merge): spent == cum; leg0 absorbs the whole route gross.
     assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (wei)`);
     assert.equal(leg0In, ref.perUniversePoolInput[0], `[${engine}] leg0 pool award == reference (wei)`);
     assert.equal(leg0In, ref.perRouteInput[0], `[${engine}] leg0 gross == route award (2-leg identity)`);
-    // X-side: pre-exec-lane the leg's realized X drains through its POOL members only (the
-    // venue's share is merged/pulled but not yet swapped), so the leg1 pool receives > 0 —
-    // the exact per-member X split assert lands with the exec lane (ECO_LANE4).
-    assert.ok(leg1V3In > 0n, `[${engine}] leg1 V3 pool received intermediate X`);
+    // X-side WEI gate (the exec): the leg's REALIZED X (the leg0 pool's X outflow) splits
+    // across {leg1 V3 pool, Curve venue} proportional to the merged awards — the last-funded
+    // member (the venue: venues scan second) absorbs the division dust. Mirrored exactly by
+    // expectedLegShares, so both member inflows are wei-exact.
+    const inBalX = leg0XBefore - (await balanceOf(c.publicClient, tokX, leg0Pool));
+    assert.ok(inBalX > 0n, `[${engine}] leg0 produced intermediate X`);
+    const exp = expectedLegShares(inBalX, [ref.perUniversePoolInput[1]], [ref.perLegQlvInput[0]]);
+    assert.equal(leg1V3In, exp.pools[0], `[${engine}] leg1 V3 pool X share == proportional award (wei)`);
+    assert.equal(curveXIn, exp.venues[0], `[${engine}] Curve venue X share == proportional award (wei)`);
+    // Happy path: the per-route intermediate sweep NO-OPS (no X dust back to the caller).
+    assert.equal(
+      await balanceOf(c.publicClient, tokX, caller), callerXBefore,
+      `[${engine}] intermediate sweep no-ops on the happy path`,
+    );
 
     console.log(
-      `  [legQL mixed:${engine}] route=${leg0In} leg1V3award=${ref.perUniversePoolInput[1]} venueAward=${ref.perLegQlvInput[0]} spent=${spent} (tokenIn-side == mirrors, wei)`,
+      `  [legQL mixed:${engine}] route=${leg0In} leg1V3X=${leg1V3In} venueX=${curveXIn} spent=${spent} (both sides == mirrors, wei)`,
     );
   }
 
@@ -506,7 +701,7 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     // + qinp accrual + cursor bookkeeping — ON-CHAIN (any transcription drift that breaks its
     // uint256 arithmetic reverts the cook; the value-level pin is the reference's internal
     // clamped-slice equality gate, which throws while computing `ref` below, plus the X-side
-    // split assert that lands with the exec lane). tokenIn-side deltas stay the wei gate.
+    // venue-only drain assert below). tokenIn-side deltas stay the wei gate.
     const amountIn = parseEther("2000");
 
     const leg0 = await v3EcoPool(leg0Pool, FEE_LEG0, TS_LEG0);
@@ -555,6 +750,9 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
 
     const callerABefore = await balanceOf(c.publicClient, tokA, caller);
     const leg0ABefore = await balanceOf(c.publicClient, tokA, leg0Pool);
+    const leg0XBefore = await balanceOf(c.publicClient, tokX, leg0Pool);
+    const leg1XBefore = await balanceOf(c.publicClient, tokX, leg1V3Pool);
+    const curveXBefore = await balanceOf(c.publicClient, tokX, curveSteep);
 
     await approve(c.walletClient, c.publicClient, tokA, target, amountIn);
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
@@ -566,9 +764,18 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (wei)`);
     assert.equal(leg0In, ref.perUniversePoolInput[0], `[${engine}] leg0 pool award == reference (wei)`);
     assert.equal(leg0In, ref.perRouteInput[0], `[${engine}] leg0 gross == route award (2-leg identity)`);
+    // X-side (the exec): the venue holds the WHOLE leg1 award (the V3 pool got 0), so the
+    // whole realized X drains through the venue and the pool receives NOTHING.
+    const inBalX = leg0XBefore - (await balanceOf(c.publicClient, tokX, leg0Pool));
+    const curveXIn = (await balanceOf(c.publicClient, tokX, curveSteep)) - curveXBefore;
+    assert.equal(curveXIn, inBalX, `[${engine}] venue drains the WHOLE realized X (sole funded member)`);
+    assert.equal(
+      await balanceOf(c.publicClient, tokX, leg1V3Pool), leg1XBefore,
+      `[${engine}] unfunded leg1 V3 pool receives no X`,
+    );
 
     console.log(
-      `  [legQL slice-clamp:${engine}] route=${leg0In} venueAward=${ref.perLegQlvInput[0]} spent=${spent} (clamp landed ON the slice)`,
+      `  [legQL slice-clamp:${engine}] route=${leg0In} venueX=${curveXIn} spent=${spent} (clamp landed ON the slice)`,
     );
   }
 
@@ -656,7 +863,7 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     );
   }
 
-  // ── LANE-4-GATED — output-side cases (need the leg-QL EXEC dispatch; ECO_LANE4=1) ──
+  // ── (4) VENUE-ONLY OUTPUT — the leg venue EXECUTES its share (the exec dispatch) ──
   async function runVenueOnlyOutput(engine: Engine): Promise<void> {
     await resetPools();
     const target = cookTarget(engine, stack, v12);
@@ -691,7 +898,10 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
 
     const callerABefore = await balanceOf(c.publicClient, tokA, caller);
     const callerBBefore = await balanceOf(c.publicClient, tokB, caller);
+    const callerXBefore = await balanceOf(c.publicClient, tokX, caller);
+    const leg0XBefore = await balanceOf(c.publicClient, tokX, leg0Pool);
     const curveXBefore = await balanceOf(c.publicClient, tokX, curveDeep);
+    const curveBBefore = await balanceOf(c.publicClient, tokB, curveDeep);
 
     await approve(c.walletClient, c.publicClient, tokA, target, amountIn);
     const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
@@ -700,16 +910,260 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     const spent = callerABefore - (await balanceOf(c.publicClient, tokA, caller));
     const received = (await balanceOf(c.publicClient, tokB, caller)) - callerBBefore;
     const curveXIn = (await balanceOf(c.publicClient, tokX, curveDeep)) - curveXBefore;
+    const curveBOut = curveBBefore - (await balanceOf(c.publicClient, tokB, curveDeep));
 
     assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (wei)`);
-    // The venue was FUNDED with its intermediate-token share (the leg exec dispatch swapped
-    // the realized X through the Curve pool) and the caller received the route's tokenOut.
-    assert.ok(curveXIn > 0n, `[${engine}] leg venue funded with intermediate X`);
+    // The venue (the leg's SOLE member) drains the WHOLE realized X — wei-exact vs the leg0
+    // pool's X outflow — Transfer-log gated too (self → venue in the leg-INPUT token).
+    const inBalX = leg0XBefore - (await balanceOf(c.publicClient, tokX, leg0Pool));
+    assert.ok(inBalX > 0n, `[${engine}] leg0 produced intermediate X`);
+    assert.equal(curveXIn, inBalX, `[${engine}] venue funded with the WHOLE realized X (wei)`);
+    assert.equal(
+      transferSumTo(receipt, tokX, curveDeep), inBalX,
+      `[${engine}] Transfer log: venue received exactly the leg's realized X`,
+    );
+    assert.ok(curveBOut > 0n, `[${engine}] venue paid its tokenOut to self`);
     assert.ok(received > 0n, `[${engine}] caller received tokenOut through the venue leg`);
     assert.equal(quoted, received, `[${engine}] quoted amountOut == cooked amountOut (wei)`);
+    // Happy path: the per-route intermediate sweep NO-OPS (no X dust back to the caller).
+    assert.equal(
+      await balanceOf(c.publicClient, tokX, caller), callerXBefore,
+      `[${engine}] intermediate sweep no-ops on the happy path`,
+    );
 
     console.log(
       `  [legQL venue-only OUTPUT:${engine}] venueX=${curveXIn} received=${received} quoted=${quoted} spent=${spent}`,
+    );
+  }
+
+  // ── (5) PINNED EXAMPLE — leg A→X {UniV3 + Maverick}, leg X→B {Curve + WOOFi + Euler} ──
+  async function runPinnedExample(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+    // Probe-verified (see the fixture-size comment above): every member funds at this amount.
+    const amountIn = parseEther("20000");
+
+    const direct = await v3EcoPool(directPool, FEE_DIRECT, TS_DIRECT);
+    const leg0 = await v3EcoPool(leg0Pool, FEE_LEG0, TS_LEG0);
+    const mv = mavVenue(mavPool);
+    const cv = curveVenue(curvePin, CURVE_PIN_BAL, CURVE_PIN_A, CURVE_PIN_FEE);
+    const wv = wooVenue(wooPool);
+    const ev = eulVenue(eulPool);
+
+    const prepared: EcoSwapPrepared = {
+      pools: [direct.pool],
+      routes: [
+        {
+          legs: [
+            { hopIn: tokA, hopOut: tokX, zeroForOne: true, pools: [leg0.pool], qlVenues: [mv.venue] },
+            { hopIn: tokX, hopOut: tokB, zeroForOne: true, pools: [], qlVenues: [cv.venue, wv.venue, ev.venue] },
+          ],
+          intermediateTokens: [tokX],
+        },
+      ],
+      brackets: [],
+      zeroForOne: true,
+      priceLimit: MIN_SQRT_RATIO + 1n,
+      expectedInputCovered: 0n,
+    };
+
+    // Both mirrors from the SAME models (global leg-venue order: mav g0, curve g1, woo g2,
+    // euler g3 — routeIdx asc, legIdx asc, venue order).
+    const ref = kwayReference(prepared, amountIn, undefined, [[[mv.olv], [cv.olv, wv.olv, ev.olv]]]);
+    const optRoute: OptimalRoute = {
+      legs: [
+        { zeroForOne: true, pools: [leg0.opt], qlvs: [mv.olv] },
+        { zeroForOne: true, pools: [], qlvs: [cv.olv, wv.olv, ev.olv] },
+      ],
+    };
+    const opt = optimalSplit({
+      pools: [direct.opt], routes: [optRoute], amountIn, zeroForOne: true,
+      priceLimit: MIN_SQRT_RATIO + 1n,
+    });
+    assert.equal(ref.totalInput, opt.totalInput, "reference total == oracle total (wei)");
+    assert.equal(ref.perRouteInput[0], opt.perRouteInput[0], "route award == oracle (wei)");
+    // The pinned shape only pins the exec dispatch if EVERY member funds — a zero here means
+    // the fixtures drifted and the sizes must be RE-PROBED.
+    assert.ok(ref.perPoolInput[0] > 0n, "direct pool funded");
+    assert.ok(ref.perUniversePoolInput[1] > 0n, "leg0 V3 pool funded");
+    for (let g = 0; g < 4; g++) assert.ok(ref.perLegQlvInput[g] > 0n, `leg venue g${g} funded`);
+
+    const bytecodes = compilePrepared(engine, prepared, amountIn, caller);
+    const quoted = await quoteViaStateOverride(engine, target, caller, bytecodes);
+
+    const callerABefore = await balanceOf(c.publicClient, tokA, caller);
+    const callerBBefore = await balanceOf(c.publicClient, tokB, caller);
+    const callerXBefore = await balanceOf(c.publicClient, tokX, caller);
+    const leg0XBefore = await balanceOf(c.publicClient, tokX, leg0Pool);
+    const mavXBefore = await balanceOf(c.publicClient, tokX, mavPool);
+
+    await approve(c.walletClient, c.publicClient, tokA, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "pinned-example cook() must succeed");
+
+    const spent = callerABefore - (await balanceOf(c.publicClient, tokA, caller));
+    const received = (await balanceOf(c.publicClient, tokB, caller)) - callerBBefore;
+    assert.equal(spent, ref.totalInput, `[${engine}] spent == reference totalInput (wei)`);
+    assert.ok(received > 0n, `[${engine}] caller received tokenOut`);
+    assert.equal(quoted, received, `[${engine}] quoted amountOut == cooked amountOut (wei)`);
+
+    // Leg0 (tokenIn side): inBal := lTotal ⇒ every member receives EXACTLY its computed award
+    // (Transfer-log gated: self → member in tokA; the direct pool's inflow rides the same log).
+    assert.equal(
+      transferSumTo(receipt, tokA, leg0Pool), ref.perUniversePoolInput[1],
+      `[${engine}] Transfer log: leg0 V3 pool received exactly its award`,
+    );
+    assert.equal(
+      transferSumTo(receipt, tokA, mavPool), ref.perLegQlvInput[0],
+      `[${engine}] Transfer log: Maverick venue received exactly its award (== qinp)`,
+    );
+    assert.equal(
+      transferSumTo(receipt, tokA, directPool), ref.perPoolInput[0],
+      `[${engine}] Transfer log: direct pool received exactly its award`,
+    );
+
+    // Leg1 (X side): the REALIZED X (leg0 pool + Maverick outflows) splits across the three
+    // venues proportional to qinp, the last funded venue (Euler — venue order) absorbing the
+    // dust — each inflow wei-exact and Transfer-log gated.
+    const inBalX =
+      (leg0XBefore - (await balanceOf(c.publicClient, tokX, leg0Pool))) +
+      (mavXBefore - (await balanceOf(c.publicClient, tokX, mavPool)));
+    assert.ok(inBalX > 0n, `[${engine}] leg0 members produced intermediate X`);
+    const exp = expectedLegShares(
+      inBalX, [], [ref.perLegQlvInput[1], ref.perLegQlvInput[2], ref.perLegQlvInput[3]],
+    );
+    assert.equal(
+      transferSumTo(receipt, tokX, curvePin), exp.venues[0],
+      `[${engine}] Transfer log: Curve venue X share == proportional award (wei)`,
+    );
+    assert.equal(
+      transferSumTo(receipt, tokX, wooPool), exp.venues[1],
+      `[${engine}] Transfer log: WOOFi venue X share == proportional award (wei)`,
+    );
+    assert.equal(
+      transferSumTo(receipt, tokX, eulPool), exp.venues[2],
+      `[${engine}] Transfer log: Euler venue X share == proportional award (wei)`,
+    );
+    // Every leg1 venue paid its out to self (B outflow > 0 — the exec actually swapped).
+    assert.ok(transferSumTo(receipt, tokB, target) > 0n, `[${engine}] leg1 venues paid tokenOut to self`);
+    // Happy path: the per-route intermediate sweep NO-OPS (no X dust back to the caller).
+    assert.equal(
+      await balanceOf(c.publicClient, tokX, caller), callerXBefore,
+      `[${engine}] intermediate sweep no-ops on the happy path`,
+    );
+
+    console.log(
+      `  [legQL pinned:${engine}] direct=${ref.perPoolInput[0]} leg0V3=${ref.perUniversePoolInput[1]} mav=${ref.perLegQlvInput[0]} curve=${exp.venues[0]} woo=${exp.venues[1]} euler=${exp.venues[2]} received=${received} (all members executed, wei)`,
+    );
+  }
+
+  // ── (6) ADVERSE DRIFT on a leg QL venue — re-anchoring between arg-build and cook ──
+  async function runLegVenueDrift(engine: Engine): Promise<void> {
+    await resetPools();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+    const amountIn = parseEther("100000"); // the mixed-leg shape (both leg1 members funded)
+
+    // Arg-build against the PRE-drift state (descriptors are state-free; the V3 pools carry
+    // windowTop=0 ⇒ fully live walks, so pre-drift args stay valid).
+    const leg0 = await v3EcoPool(leg0Pool, FEE_LEG0, TS_LEG0);
+    const leg1 = await v3EcoPool(leg1V3Pool, FEE_LEG1V3, TS_LEG1V3);
+    const cv = curveVenue(curveSteep, CURVE_STEEP_BAL, CURVE_STEEP_A, CURVE_STEEP_FEE);
+    const prepared: EcoSwapPrepared = {
+      pools: [],
+      routes: [
+        {
+          legs: [
+            { hopIn: tokA, hopOut: tokX, zeroForOne: true, pools: [leg0.pool] },
+            { hopIn: tokX, hopOut: tokB, zeroForOne: true, pools: [leg1.pool], qlVenues: [cv.venue] },
+          ],
+          intermediateTokens: [tokX],
+        },
+      ],
+      brackets: [],
+      zeroForOne: true,
+      priceLimit: MIN_SQRT_RATIO + 1n,
+      expectedInputCovered: 0n,
+    };
+    // No-drift BASELINE mirror (what the venue would have been awarded on the pre-drift state).
+    const refBase = kwayReference(prepared, amountIn, undefined, [[undefined, [cv.olv]]]);
+    assert.ok(refBase.perLegQlvInput[0] > 0n, "baseline: venue funded pre-drift");
+    const bytecodes = compilePrepared(engine, prepared, amountIn, caller);
+
+    // REAL adverse drift: a third-party exchange sells 20000e18 X→B through the Curve fixture
+    // (approve + exchange(0,1,dx,0) — the pool PULLS via transferFrom), so every later X→B
+    // quote is worse. The cook below runs the PRE-drift bytecodes against this moved state.
+    const driftDx = parseEther("20000");
+    await approve(c.walletClient, c.publicClient, tokX, curveSteep, driftDx);
+    await writeAndWait(c.walletClient, c.publicClient, {
+      address: curveSteep, abi: curveAbi as Abi, functionName: "exchange",
+      args: [0n, 1n, driftDx, 0n],
+    });
+
+    // DRIFTED mirrors: the venue model re-read from the LIVE (post-drift) pool balances —
+    // exactly what the on-chain ladder build reads at cook (live get_dy).
+    const balX = (await c.publicClient.readContract({
+      address: curveSteep, abi: curveAbi as Abi, functionName: "balances", args: [0n],
+    })) as bigint;
+    const balB = (await c.publicClient.readContract({
+      address: curveSteep, abi: curveAbi as Abi, functionName: "balances", args: [1n],
+    })) as bigint;
+    const cvDrift = curveVenue(curveSteep, [balX, balB], CURVE_STEEP_A, CURVE_STEEP_FEE);
+    const refDrift = kwayReference(prepared, amountIn, undefined, [[undefined, [cvDrift.olv]]]);
+    const optRoute: OptimalRoute = {
+      legs: [
+        { zeroForOne: true, pools: [leg0.opt] },
+        { zeroForOne: true, pools: [leg1.opt], qlvs: [cvDrift.olv] },
+      ],
+    };
+    const opt = optimalSplit({
+      pools: [], routes: [optRoute], amountIn, zeroForOne: true,
+      priceLimit: MIN_SQRT_RATIO + 1n,
+    });
+    assert.equal(refDrift.totalInput, opt.totalInput, "drifted reference total == drifted oracle (wei)");
+    // RE-ANCHORING: the drifted venue's live ladder is WORSE, so its award SHRINKS vs the
+    // baseline while the untouched sibling V3 pool's grows (the split adapts at cook time).
+    assert.ok(
+      refDrift.perLegQlvInput[0] < refBase.perLegQlvInput[0],
+      "drifted venue award < no-drift baseline (adverse drift shrinks its share)",
+    );
+    assert.ok(
+      refDrift.perUniversePoolInput[1] > refBase.perUniversePoolInput[1],
+      "sibling leg1 V3 pool award grows under the venue's adverse drift",
+    );
+
+    const quoted = await quoteViaStateOverride(engine, target, caller, bytecodes);
+
+    const callerABefore = await balanceOf(c.publicClient, tokA, caller);
+    const callerBBefore = await balanceOf(c.publicClient, tokB, caller);
+    const leg0ABefore = await balanceOf(c.publicClient, tokA, leg0Pool);
+    const leg0XBefore = await balanceOf(c.publicClient, tokX, leg0Pool);
+    const leg1XBefore = await balanceOf(c.publicClient, tokX, leg1V3Pool);
+    const curveXBefore = await balanceOf(c.publicClient, tokX, curveSteep);
+
+    await approve(c.walletClient, c.publicClient, tokA, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "drift cook() must succeed");
+
+    const spent = callerABefore - (await balanceOf(c.publicClient, tokA, caller));
+    const received = (await balanceOf(c.publicClient, tokB, caller)) - callerBBefore;
+    const leg0In = (await balanceOf(c.publicClient, tokA, leg0Pool)) - leg0ABefore;
+    const leg1V3In = (await balanceOf(c.publicClient, tokX, leg1V3Pool)) - leg1XBefore;
+    const curveXIn = (await balanceOf(c.publicClient, tokX, curveSteep)) - curveXBefore;
+
+    // The cook RE-ANCHORED: awards == the mirrors run on the DRIFTED state (the pre-drift
+    // bytecodes carry no venue state — the ladder was rebuilt on-chain from live get_dy).
+    assert.equal(spent, refDrift.totalInput, `[${engine}] spent == DRIFTED reference totalInput (wei)`);
+    assert.equal(leg0In, refDrift.perUniversePoolInput[0], `[${engine}] leg0 award == drifted reference (wei)`);
+    const inBalX = leg0XBefore - (await balanceOf(c.publicClient, tokX, leg0Pool));
+    const exp = expectedLegShares(inBalX, [refDrift.perUniversePoolInput[1]], [refDrift.perLegQlvInput[0]]);
+    assert.equal(leg1V3In, exp.pools[0], `[${engine}] leg1 V3 X share == drifted proportional award (wei)`);
+    assert.equal(curveXIn, exp.venues[0], `[${engine}] drifted venue X share == drifted proportional award (wei)`);
+    assert.equal(quoted, received, `[${engine}] quoted amountOut == cooked amountOut (post-drift state, wei)`);
+
+    console.log(
+      `  [legQL drift:${engine}] venueX ${refBase.perLegQlvInput[0]}→${curveXIn} leg1V3X=${leg1V3In} spent=${spent} (re-anchored to the drifted ladder, wei)`,
     );
   }
 
@@ -717,7 +1171,7 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     it(`venue-only leg [${engine}] — Curve QL leg member, merge awards == mirrors wei-exact`, { skip }, async () => {
       await runVenueOnlyLeg(engine);
     });
-    it(`mixed pool+venue leg [${engine}] — split INSIDE the leg (clamp elects the pool)`, { skip }, async () => {
+    it(`mixed pool+venue leg [${engine}] — split INSIDE the leg, X-side exec split wei-exact`, { skip }, async () => {
       await runMixedLeg(engine);
     });
     it(`mixed leg slice-clamp [${engine}] — budget clamp lands ON the slice (routePartialN arm)`, { skip }, async () => {
@@ -726,13 +1180,14 @@ describe("EcoSwap route-leg QL venues — merge WEI-EXACT (venue-only / mixed / 
     it(`dead upstream (hF==0) [${engine}] — venue contributes zero; state-override quote == cook`, { skip }, async () => {
       await runDeadUpstream(engine);
     });
-    // Output-side (exec) cases — land with the leg-QL exec lane (ECO_LANE4=1 flips them on).
-    it(
-      `venue-only leg OUTPUT [${engine}] — venue executes its share; quote == cook (exec lane)`,
-      { skip: skip || !LANE4 },
-      async () => {
-        await runVenueOnlyOutput(engine);
-      },
-    );
+    it(`venue-only leg OUTPUT [${engine}] — venue executes its share; quote == cook`, { skip }, async () => {
+      await runVenueOnlyOutput(engine);
+    });
+    it(`pinned example [${engine}] — {V3+Maverick} → {Curve+WOOFi+Euler}: every member executes, wei-exact`, { skip }, async () => {
+      await runPinnedExample(engine);
+    });
+    it(`leg venue adverse drift [${engine}] — cook re-anchors to the drifted live ladder`, { skip }, async () => {
+      await runLegVenueDrift(engine);
+    });
   }
 });

@@ -64,8 +64,10 @@ import { IPermit2 } from "./IPermit2.json";
 // COMPUTE-THEN-PULL: the merge is read-only (slot0 / getReserves / ticks / getTickLiquidity
 //   staticcalls only), so we first compute exactly how much tokenIn the swaps will consume (cum),
 //   then transferFrom the caller EXACTLY that. Direct pools swap their inp[]; routes swap their
-//   rinp[] tokenIn->X then read the REALIZED intermediate balance and swap X->tokenOut. One
-//   guarded terminal refund returns the only possible leftover (the limit-price edge).
+//   rinp[] tokenIn->X then read the REALIZED intermediate balance and split it across the leg's
+//   members (pools inp[] + leg-QL venues qinp[], proportional) X->tokenOut. One guarded terminal
+//   refund returns the only possible tokenIn leftover (the limit-price edge); a per-route
+//   intermediate sweep returns any venue-0-quote-stranded intermediate dust (normally 0).
 //
 // Inputs (precomputed off-chain in prepare.ts; layout built by index.ts buildUniverseRoutingAndQlv):
 //   cfg         = [tokenIn, tokenOut, amountIn, caller, priceLimit, directCount, fluidResolver?,
@@ -98,10 +100,10 @@ import { IPermit2 } from "./IPermit2.json";
 //                 rt[2+5L] poolCount, rt[3+5L] qlvBase, rt[4+5L] qlvCount, rt[5+5L] interL. Leg L
 //                 pools = universe indices [poolBase, poolBase+poolCount) (poolCount MAY be 0 for an
 //                 all-QL leg); leg L QL venues = GLOBAL qlv row indices [qlvBase,
-//                 qlvBase+qlvCount) (0/0 for a pool-only leg — prepare emits pool-only legs today;
-//                 SETUP reads them for the leg-row ladder build + its sizing fold; the leg-QL
-//                 merge election + exec branches land in later lanes). interL = intermediate token
-//                 AFTER leg L (final leg
+//                 qlvBase+qlvCount) (0/0 for a pool-only leg). SETUP reads them for the leg-row
+//                 ladder build + its sizing fold; the MERGE elects them as leg members (1b/Phase
+//                 A–D); the EXEC dispatches them inline in the unified per-leg loop (venue shares
+//                 ride qinp[]). interL = intermediate token AFTER leg L (final leg
 //                 → 0); derived reads keep the old symmetry: legIn(L>0) = rt[5L], legOut(L<legCount−1)
 //                 = rt[5+5L]. The merge head fold, the route event, and the chain-order execution
 //                 all loop over legCount, so N-hop needs no shape change.
@@ -119,9 +121,9 @@ import { IPermit2 } from "./IPermit2.json";
 //                 depend on it). The flat qlv pass ladders EVERY row: direct rows into the SORTED
 //                 merged stream as before; leg rows (gated HAS_LEG_QLV) into per-venue regions PAST
 //                 msSorted — quoted on the leg's EDGE pair (qTokIn/qTokOut from routing) and sized
-//                 by the chain-order fold of amountIn through the upstream legs' LIVE setup heads
-//                 (their merge election + exec branches land in later lanes, so the regions are
-//                 built but dormant). Columns c6..c9 are used ONLY by
+//                 by the chain-order fold of amountIn through the upstream legs' LIVE setup heads;
+//                 the merge consumes them via route events (1b/Phase A–D slice branches) and the
+//                 unified per-leg exec loop dispatches their qinp[] shares inline. Columns c6..c9 are used ONLY by
 //                 Balancer V3 (segKind 14) and are 0 for every other venue: BalV3's querySwap is eth_call-ONLY,
 //                 so instead of quoting a live view it REPLAYS the amplified StableSwap invariant on-chain from
 //                 the LIVE Vault state — getCurrentLiveBalances(pool)[i]/[j] (inline-indexed), amp +
@@ -671,10 +673,11 @@ const HAS_FLUID: boolean = true;
 const HAS_MENTO: boolean = true;
 const HAS_BALANCER_V3: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
-// — the cfg[12] directQlvCount override read + the leg-row LADDER build (the per-row edge-token/
-// sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude); the
-// leg-QL merge election + exec branches land in later lanes — so a pool-only-routes universe
-// ships zero leg-QL bytecode.
+// — the cfg[12] directQlvCount override read, the leg-row LADDER build (the per-row edge-token/
+// sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude), the
+// merge's leg-venue election + slice event branches (1b/Phase A–D), and the exec's venue
+// dispatch + per-route intermediate sweep — so a pool-only-routes universe ships zero leg-QL
+// bytecode.
 const HAS_LEG_QLV: boolean = true;
 
 function main(
@@ -738,8 +741,8 @@ function main(
   if (cfg.length > 11) { balancerV2Vault = cfg[11]; }
   // cfg[12] = directQlvCount — the number of LEADING qlv rows that are DIRECT venues; rows
   // [directQlvCount, qlv.length) are ROUTE-LEG venue rows — laddered by the flat qlv pass below
-  // into per-venue regions PAST the sorted merged stream (their merge election + exec branches
-  // land in later lanes, so the regions are built but dormant). OPTIONAL 13th cfg field — guarded
+  // into per-venue regions PAST the sorted merged stream, consumed by the merge's route events
+  // and executed by the unified per-leg exec loop. OPTIONAL 13th cfg field — guarded
   // by cfg.length so the many venue EVM tests that hand-build a shorter cfg stay valid (absent ⇒
   // qlv.length: ALL rows direct, the pre-leg behavior); production always emits it (index.ts).
   // The override read is gated HAS_LEG_QLV (false ⇒ no leg rows exist ⇒ directQlvCount ==
@@ -890,10 +893,10 @@ function main(
   // — the wasted-slot cost buys uniform global indexing). qlStart/qlCount = the venue's contiguous
   // ms-row region; qlCur = its slice cursor (a row index into the ms arrays; qlCur == qlStart +
   // qlCount ⇔ exhausted); qlRemCap/qlRemOut = the CURRENT slice's remaining input capacity /
-  // remaining modeled out (seeded from the first row at build time, depleted by awards, re-seeded
-  // on cursor advance — the merge branches land in later lanes); qinp = the venue's Σ awarded
-  // input in ITS LEG-INPUT token (the leg-QL exec's accumulator — leg venues never touch the
-  // per-family direct accumulators above). All written by the HAS_LEG_QLV-gated leg-row build.
+  // remaining modeled out (seeded from the first row at build time, depleted by the route-event
+  // awards, re-seeded on cursor advance); qinp = the venue's Σ awarded input in ITS LEG-INPUT
+  // token — the unified per-leg exec loop's venue weight (leg venues never touch the per-family
+  // direct accumulators above). All gated HAS_LEG_QLV.
   let qlStart: Tuple = new Array(qlv.length);
   let qlCount: Tuple = new Array(qlv.length);
   let qlCur: Tuple = new Array(qlv.length);
@@ -908,9 +911,9 @@ function main(
   // index; lgN/lgF = the leg's current bracket near/far OI; lgL/lgFee = its L/fee; lgNF = the
   // event's new far OI per leg; lgFR = the leg pool's bracket far REAL sqrt (re-anchor source for
   // a full cross / brFar latch). lgIsQ/lgQv (leg-QL): 1 ⇔ the leg's elected member is a QL slice
-  // cursor + that member's GLOBAL qlv index — written by the Phase A election when the leg-QL
-  // merge branches land (later lane); for a QL member lgN==lgF==head (flat slice), lgL=0, lgFee=0
-  // (heads are post-fee), lgFR=0, and lgNF is REUSED to carry the member's awarded INPUT.
+  // cursor + that member's GLOBAL qlv index — written by the Phase A election; for a QL member
+  // lgN==lgF==head (flat slice), lgL=0, lgFee=0 (heads are post-fee), lgFR=0, and lgNF is REUSED
+  // to carry the member's awarded INPUT.
   const LEG_SCRATCH: Uint256 = pools.length + qlv.length;
   let lgP: Tuple = new Array(LEG_SCRATCH);
   let lgN: Tuple = new Array(LEG_SCRATCH);
@@ -1055,8 +1058,8 @@ function main(
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
       // msSorted — quoted on the leg's EDGE pair (qTokIn/qTokOut) and sized by the chain-order
-      // fold (ladderCap) — consumed ONLY via route events (the merge election + exec branches
-      // land in later lanes; until then the regions are built but dormant). index.ts orders leg
+      // fold (ladderCap) — consumed ONLY via route events (1b/Phase A–D) and executed inline in
+      // the unified per-leg exec loop. index.ts orders leg
       // rows (routeIdx asc, legIdx asc), so a row's upstream-leg ladders are always already built
       // when its fold reads their first-slice heads.
       for (let v = 0; v < qlv.length; v = v + 1) {
@@ -2179,7 +2182,7 @@ function main(
                 // non-binding slice applies its Phase C awarded input lgNF[L] ONLY on a routeIn>0
                 // event (a zero-flow interior-gap event leaves it untouched — the pools' routeIn>0
                 // partial guard mirrored; a slice itself is never the gap). Accrue the award into
-                // qinp (the venue's Σ in ITS LEG-INPUT token — the exec lane's accumulator; for a
+                // qinp (the venue's Σ in ITS LEG-INPUT token — the exec's venue weight; for a
                 // leg-0 slice the award == routeIn by construction, so rinp still carries the
                 // route-level pull). remCap hitting 0 — the full cross AND an exact-boundary
                 // partial — advances the cursor + re-seeds from the next row (or exhausts:
@@ -2523,15 +2526,21 @@ function main(
       }
     }
   }
-  // Routes: chain-order leg execution reading the REALIZED intermediate balance between legs.
-  // N-hop, ANY leg-pool type: walk the route's legCount legs in order. Leg L's INPUT token is
-  // tokenIn (L==0) else the previous intermediate (rt[5L]); its OUTPUT token is tokenOut (final
-  // leg) else this leg's intermediate (rt[5+5L]). Leg 0 swaps the route's COMPUTED tokenIn shares
-  // (inp[a]); every later leg feeds the REALIZED input-token balance, distributed proportional to
-  // inp[] across the leg's pools (the last funded pool takes the remainder to absorb multi-pool-leg
-  // dust). Each leg pool is dispatched by type (pd[0]/pd[6]) — swapV3 for V3, swap(poolType:0) for
-  // V2, swap(poolType:2) for V4 with the leg PoolKey — MIRRORING the direct-pool execution block.
-  // 2-hop and 3-hop are the same loop.
+  // Routes: chain-order leg execution — ONE unified per-leg loop for ALL legs (N-hop, ANY member
+  // mix). Leg L's INPUT token is tokenIn (L==0) else the previous intermediate (rt[5L]); its
+  // OUTPUT token is tokenOut (final leg) else this leg's intermediate (rt[5+5L]). The leg's
+  // members — universe pools [poolBase, poolBase+poolCount) AND (leg-QL) venues [qlvBase,
+  // qlvBase+qlvCount) — split the leg's input PROPORTIONAL to their merged awards (pools inp[],
+  // venues qinp[]), the LAST funded member absorbing the division dust (pools scanned first,
+  // venues second, so a funded venue wins 'last'). Leg 0's input is its COMPUTED award sum
+  // (inBal := lTotal ⇒ share == mulDiv(lTotal, w, lTotal) == w EXACTLY and the last-member
+  // remainder is exact — the computed-share semantics through the SAME proportional path), NOT a
+  // balanceOf read: the direct-QL families' tokenIn shares are still UN-executed at route time
+  // (their loops run after the routes), so a whole-balance read would drain them. Legs L>0 feed
+  // the REALIZED input-token balance. Pool members dispatch by type (pd[0]/pd[6]) — swapV3 for
+  // V3, swap(poolType:0) for V2, swap(poolType:2) for V4 with the leg PoolKey; venue members
+  // dispatch on the descriptor segKind (qd[4]) — each MIRRORING the direct execution blocks with
+  // (tokenIn, tokenOut) → (legIn, legOut). 2-hop and 3-hop are the same loop.
   if (HAS_ROUTES) {
   for (let r = 0; r < routing.length; r = r + 1) {
     const ramt: Uint256 = rinp[r];
@@ -2548,107 +2557,255 @@ function main(
         // leg output token: this leg's intermediate (rt[5+5L]) unless this is the final leg.
         let legOut: Address = tokenOut;
         if (L + 1 < legCount) { legOut = rt[5 + 5 * L]; }
-        if (L === 0) {
-          // leg0: split the route's computed tokenIn share across its pools (tokenIn → legOut).
-          for (let a = baseL; a < eL; a = a + 1) {
-            const a0: Uint256 = inp[a];
-            if (a0 > 0) {
-              const lp: Tuple = pools[a];
-              const lIsV2: Uint256 = lp[6];
-              const lType: Uint256 = lp[0];
-              const lz: Uint256 = lp[7]; // leg pool's inIsToken0 (legIn-is-currency0 when 1)
-              if (lIsV2 === 1) {
-                const c0: Address = lz === 1 ? legIn : legOut;
-                const c1: Address = lz === 1 ? legOut : legIn;
-                router.swap({
-                  poolType: 0, pool: lp[1],
-                  poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
-                  tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(a0),
-                  sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
-                });
-              } else {
-                if (lType === 2) {
-                  const k0: Address = lz === 1 ? legIn : legOut;
-                  const k1: Address = lz === 1 ? legOut : legIn;
-                  router.swap({
-                    poolType: 2, pool: lp[1],
-                    poolKey: { currency0: k0, currency1: k1, fee: lp[2], tickSpacing: lp[3], hooks: lp[4] },
-                    tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(a0),
-                    sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
-                  });
-                } else {
-                  router.swapV3(lp[1], legIn, legOut, a0, 0, address.self, address.self);
-                }
+        // The leg's funded member-weight sum: pools' inp[] + (leg-QL) venues' qinp[].
+        let lTotal: Uint256 = 0;
+        for (let b = baseL; b < eL; b = b + 1) { lTotal = lTotal + inp[b]; }
+        if (HAS_LEG_QLV) {
+          const qsB: Uint256 = rt[3 + 5 * L];
+          const qsE: Uint256 = qsB + rt[4 + 5 * L];
+          for (let u = qsB; u < qsE; u = u + 1) { lTotal = lTotal + qinp[u]; }
+        }
+        // WHOLE-BALANCE DRAIN (legs L>0): reads the ENTIRE balanceOf(legIn) and the last funded
+        // member takes the remainder. This is correct ONLY because (a) routes run fully
+        // sequentially (the enclosing `for r`), so each route produces AND consumes its
+        // intermediate within its own contiguous run before the next route deposits the same
+        // token, and (b) EVERY leg member — pool swap or QL venue dispatch — executes INLINE in
+        // this per-leg loop with its output landing at address.self in the leg's OUT token
+        // (leg-QL exec is never deferred to the per-family direct loops below, which run after
+        // all routes). Two admitted disjoint-POOL routes may still share an intermediate TOKEN
+        // via different edges; that safety rests on THIS exec order, NOT on prepare's
+        // disjoint-pool filter — do not batch legs across routes.
+        let inBal: Uint256 = lTotal;
+        if (L > 0) { inBal = IERC20.at(legIn).balanceOf(address.self); }
+        if (inBal > 0) {
+          // Last FUNDED member (pools scanned first, venues second ⇒ a funded venue wins
+          // 'last') — it absorbs the proportional-split dust so the whole inBal is spent.
+          let lastIsQ: Uint256 = 0;
+          let lastIdx: Uint256 = baseL;
+          let spent: Uint256 = 0;
+          if (lTotal > 0) {
+            for (let b = baseL; b < eL; b = b + 1) {
+              if (inp[b] > 0) { lastIdx = b; }
+            }
+            if (HAS_LEG_QLV) {
+              const qsB: Uint256 = rt[3 + 5 * L];
+              const qsE: Uint256 = qsB + rt[4 + 5 * L];
+              for (let u = qsB; u < qsE; u = u + 1) {
+                if (qinp[u] > 0) { lastIsQ = 1; lastIdx = u; }
               }
             }
-          }
-        } else {
-          // leg L>0: feed the REALIZED input-token balance across the leg's pools (legIn → legOut).
-          // WHOLE-BALANCE DRAIN: reads the ENTIRE balanceOf(legIn) and the last pool takes the
-          // remainder. This is correct ONLY because routes run fully sequentially (the enclosing
-          // `for r`), so each route produces AND consumes its intermediate within its own contiguous
-          // run before the next route deposits the same token. Two admitted disjoint-POOL routes may
-          // still share an intermediate TOKEN via different edges; that safety rests on THIS exec
-          // order, NOT on prepare's disjoint-pool filter — do not batch legs across routes.
-          const inBal: Uint256 = IERC20.at(legIn).balanceOf(address.self);
-          if (inBal > 0) {
-            let lTotal: Uint256 = 0;
-            for (let b = baseL; b < eL; b = b + 1) { lTotal = lTotal + inp[b]; }
-            if (lTotal > 0) {
-              let spent: Uint256 = 0;
-              let lastIdx: Uint256 = baseL;
-              for (let b = baseL; b < eL; b = b + 1) {
-                if (inp[b] > 0) { lastIdx = b; }
-              }
-              for (let b = baseL; b < eL; b = b + 1) {
-                const w: Uint256 = inp[b];
-                if (w > 0) {
-                  let share: Uint256 = Math.mulDiv(inBal, w, lTotal);
-                  if (b === lastIdx) { share = inBal - spent; }
-                  if (share > 0) {
-                    const lp: Tuple = pools[b];
-                    const lIsV2: Uint256 = lp[6];
-                    const lType: Uint256 = lp[0];
-                    const lz: Uint256 = lp[7];
-                    if (lIsV2 === 1) {
-                      const c0: Address = lz === 1 ? legIn : legOut;
-                      const c1: Address = lz === 1 ? legOut : legIn;
+            for (let b = baseL; b < eL; b = b + 1) {
+              const w: Uint256 = inp[b];
+              if (w > 0) {
+                let share: Uint256 = Math.mulDiv(inBal, w, lTotal);
+                if (lastIsQ === 0) { if (b === lastIdx) { share = inBal - spent; } }
+                if (share > 0) {
+                  const lp: Tuple = pools[b];
+                  const lIsV2: Uint256 = lp[6];
+                  const lType: Uint256 = lp[0];
+                  const lz: Uint256 = lp[7]; // leg pool's inIsToken0 (legIn-is-currency0 when 1)
+                  if (lIsV2 === 1) {
+                    const c0: Address = lz === 1 ? legIn : legOut;
+                    const c1: Address = lz === 1 ? legOut : legIn;
+                    router.swap({
+                      poolType: 0, pool: lp[1],
+                      poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
+                      tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(share),
+                      sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+                    });
+                  } else {
+                    if (lType === 2) {
+                      const k0: Address = lz === 1 ? legIn : legOut;
+                      const k1: Address = lz === 1 ? legOut : legIn;
                       router.swap({
-                        poolType: 0, pool: lp[1],
-                        poolKey: { currency0: c0, currency1: c1, fee: 0, tickSpacing: 0, hooks: 0 },
+                        poolType: 2, pool: lp[1],
+                        poolKey: { currency0: k0, currency1: k1, fee: lp[2], tickSpacing: lp[3], hooks: lp[4] },
                         tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(share),
                         sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
                       });
                     } else {
-                      if (lType === 2) {
-                        const k0: Address = lz === 1 ? legIn : legOut;
-                        const k1: Address = lz === 1 ? legOut : legIn;
-                        router.swap({
-                          poolType: 2, pool: lp[1],
-                          poolKey: { currency0: k0, currency1: k1, fee: lp[2], tickSpacing: lp[3], hooks: lp[4] },
-                          tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(share),
-                          sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
-                        });
-                      } else {
-                        router.swapV3(lp[1], legIn, legOut, share, 0, address.self, address.self);
-                      }
+                      router.swapV3(lp[1], legIn, legOut, share, 0, address.self, address.self);
                     }
-                    spent = spent + share;
                   }
+                  spent = spent + share;
                 }
               }
-            } else {
-              // Funded-weight 0 but balance arrived (rounding dust): route it through the
-              // leg's first POOL — only when the leg HAS one. A POOL-LESS leg (rt[2+5L]==0,
-              // reachable once QL venues are leg members) must NOT take this fallback:
-              // pools[baseL] would dereference an UNRELATED pool (an empty slice emits
-              // base 0) and revert the whole cook. Its balance is consumed by the leg-QL
-              // dispatch (next lane); until then it is left in place.
-              if (rt[2 + 5 * L] > 0) {
-                router.swapV3(pools[baseL][1], legIn, legOut, inBal, 0, address.self, address.self);
+            }
+          } else {
+            // Funded-weight 0 but balance arrived (rounding dust): route it through the leg's
+            // first POOL when it has one (rt[2+5L] > 0 — unchanged); a POOL-LESS leg routes it
+            // through its FIRST venue via the shared venue dispatch below (share = inBal).
+            // pools[baseL] on an empty pool slice would dereference an UNRELATED pool (an empty
+            // slice emits base 0) and revert the whole cook.
+            if (rt[2 + 5 * L] > 0) {
+              router.swapV3(pools[baseL][1], legIn, legOut, inBal, 0, address.self, address.self);
+            }
+          }
+          // ── Leg-QL VENUE execution — the ONE dispatch home (shared by the proportional split
+          // AND the pool-less dust fallback above). Each funded venue swaps its share on ITS OWN
+          // family surface with (legIn, legOut) substituted for (tokenIn, tokenOut) — the direct
+          // per-family loops below, leg-parameterized. Min/limit args mirror the direct loops:
+          // the engine-routed unified swap carries no per-leg floor (sqrtPriceLimitX96 0); each
+          // callback-free family re-quotes ITS OWN live view and passes that quote as the
+          // min/out-slot arg (never trips: same state, atomic); Balancer V3's min stays 0 (its
+          // query is eth_call-only) — the whole-trade cfg[9] floor is the aggregate protection.
+          // A venue whose live re-quote returns 0 at exec skips its swap (the `out > 0` guards)
+          // and leaves its share in legIn for the per-route intermediate sweep below.
+          if (HAS_LEG_QLV) {
+            const qsB: Uint256 = rt[3 + 5 * L];
+            const qsE: Uint256 = qsB + rt[4 + 5 * L];
+            for (let u = qsB; u < qsE; u = u + 1) {
+              let share: Uint256 = 0;
+              if (lTotal > 0) {
+                const w: Uint256 = qinp[u];
+                if (w > 0) {
+                  share = Math.mulDiv(inBal, w, lTotal);
+                  if (lastIsQ === 1) { if (u === lastIdx) { share = inBal - spent; } }
+                }
+              } else {
+                // pool-less dust fallback: the whole stray balance through the FIRST venue.
+                if (rt[2 + 5 * L] === 0) { if (u === qsB) { share = inBal; } }
+              }
+              if (share > 0) {
+                const qd: Tuple = qlv[u];
+                const qk: Uint256 = qd[4];
+                const qPool: Address = qd[0];
+                // Engine-routed kinds (Curve 1 / LB 2 / DODO 3 / BalV2 6 / Maverick 8) collapse
+                // to ONE unified router swap: the engine resolves coin indices / swapForY /
+                // base-quote / poolId / tokenA on-chain from the SwapParams tokens (NONE
+                // hardcodes the pair), so ONLY poolType differs — mapped below (every
+                // engine-routed SwapPoolType is > 0, so ep == 0 is the not-engine-routed
+                // sentinel). payer/recipient == self: the leg's input balance is already here
+                // (leg0: compute-then-pull; L>0: the previous leg's realized out) and the out
+                // feeds the next leg / the terminal payout.
+                if (HAS_CURVE || HAS_LB || HAS_DODO || HAS_BALANCER || HAS_MAVERICK) {
+                  let ep: Uint256 = 0;
+                  if (HAS_CURVE && qk === 1) { ep = 3; }    // → SwapPoolType.Curve
+                  if (HAS_LB && qk === 2) { ep = 6; }       // → SwapPoolType.TraderJoeLB
+                  if (HAS_DODO && qk === 3) { ep = 5; }     // → SwapPoolType.DODOV2
+                  if (HAS_BALANCER && qk === 6) { ep = 4; } // → SwapPoolType.BalancerV2
+                  if (HAS_MAVERICK && qk === 8) { ep = 7; } // → SwapPoolType.MaverickV2
+                  if (ep > 0) {
+                    router.swap({
+                      poolType: ep, pool: qPool,
+                      poolKey: { currency0: 0, currency1: 0, fee: 0, tickSpacing: 0, hooks: 0 },
+                      tokenIn: legIn, tokenOut: legOut, amountSpecified: Math.neg(share),
+                      sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
+                    });
+                  }
+                }
+                // Solidly STABLE (segKind 4) — callback-free: exact getAmountOut, transfer-first,
+                // output in the OUT-token slot by the pool's own token0() (the direct loop).
+                if (HAS_SOLIDLY_STABLE && qk === 4) {
+                  const qsOut: Uint256 = ISolidlyStablePool.at(qPool).getAmountOut(share, legIn);
+                  if (qsOut > 0) {
+                    const qsT0: Address = ISolidlyStablePool.at(qPool).token0();
+                    IERC20.at(legIn).transfer(qPool, share);
+                    const qsEmpty: bytes = abi.encode(legIn).slice(0, 0);
+                    if (qsT0 === legIn) {
+                      ISolidlyStablePool.at(qPool).swap(0, qsOut, address.self, qsEmpty);
+                    } else {
+                      ISolidlyStablePool.at(qPool).swap(qsOut, 0, address.self, qsEmpty);
+                    }
+                  }
+                }
+                // Wombat (segKind 5) — callback-free: exact quotePotentialSwap as the min,
+                // approve-first (Wombat PULLS via transferFrom inside swap).
+                if (HAS_WOMBAT && qk === 5) {
+                  const qwOut: Uint256 = IWombatPool.at(qPool).quotePotentialSwap(legIn, legOut, share)[0];
+                  if (qwOut > 0) {
+                    const qwDl: Uint256 = 2 ** 64;
+                    IERC20.at(legIn).approve(qPool, share);
+                    IWombatPool.at(qPool).swap(legIn, legOut, share, qwOut, address.self, qwDl);
+                  }
+                }
+                // EulerSwap (segKind 7) — callback-free: exact computeQuote, transfer-first,
+                // output slot by the pool's own getAssets()[0] (the direct loop).
+                if (HAS_EULER && qk === 7) {
+                  const qeOut: Uint256 = IEulerSwapPool.at(qPool).computeQuote(legIn, legOut, share, true);
+                  if (qeOut > 0) {
+                    const qeA0: Address = IEulerSwapPool.at(qPool).getAssets()[0];
+                    IERC20.at(legIn).transfer(qPool, share);
+                    const qeEmpty: bytes = abi.encode(legIn).slice(0, 0);
+                    if (qeA0 === legIn) {
+                      IEulerSwapPool.at(qPool).swap(0, qeOut, address.self, qeEmpty);
+                    } else {
+                      IEulerSwapPool.at(qPool).swap(qeOut, 0, address.self, qeEmpty);
+                    }
+                  }
+                }
+                // Curve CryptoSwap (segKind 9) — callback-free: uint256 coin indices resolved
+                // on-chain via coins(0), exact get_dy as min_dy, approve-first (the direct loop).
+                if (HAS_CRYPTO && qk === 9) {
+                  const qxc0: Address = ICryptoSwapPool.at(qPool).coins(0);
+                  let qxi: Uint256 = 1;
+                  let qxj: Uint256 = 0;
+                  if (qxc0 === legIn) { qxi = 0; qxj = 1; }
+                  const qxOut: Uint256 = ICryptoSwapPool.at(qPool).get_dy(qxi, qxj, share);
+                  if (qxOut > 0) {
+                    IERC20.at(legIn).approve(qPool, share);
+                    ICryptoSwapPool.at(qPool).exchange(qxi, qxj, share, qxOut);
+                  }
+                }
+                // WOOFi (segKind 10) — callback-free: live query as minToAmount, transfer-first
+                // (WooPPV2 computes the sold amount from balance − reserve); rebateTo == caller.
+                if (HAS_WOOFI && qk === 10) {
+                  const qwooOut: Uint256 = IWooFiPool.at(qPool).query(legIn, legOut, share);
+                  if (qwooOut > 0) {
+                    IERC20.at(legIn).transfer(qPool, share);
+                    IWooFiPool.at(qPool).swap(legIn, legOut, share, qwooOut, address.self, caller);
+                  }
+                }
+                // Fermi / propAMM (segKind 11) — callback-free: quoteAmounts[1] as amountCheck,
+                // approve-first (propAMM PULLS via transferFrom inside fermiSwapWithAllowances).
+                if (HAS_FERMI && qk === 11) {
+                  const qfeOut: Uint256 = IFermiPool.at(qPool).quoteAmounts(legIn, legOut, share)[1];
+                  if (qfeOut > 0) {
+                    IERC20.at(legIn).approve(qPool, share);
+                    IFermiPool.at(qPool).fermiSwapWithAllowances(legIn, legOut, share, qfeOut, address.self);
+                  }
+                }
+                // Mento V2 (segKind 13) — callback-free: qd[0] = exchangeProvider, qd[1] = the
+                // bytes32 exchangeId; the approve target is the CHAIN-WIDE Broker (cfg[7]), not
+                // the per-pair provider (the direct loop).
+                if (HAS_MENTO && qk === 13) {
+                  const qmtId: Uint256 = qd[1];
+                  const qmtOut: Uint256 = IMentoBroker.at(mentoBroker).getAmountOut(qPool, qmtId, legIn, legOut, share);
+                  if (qmtOut > 0) {
+                    IERC20.at(legIn).approve(mentoBroker, share);
+                    IMentoBroker.at(mentoBroker).swapIn(qPool, qmtId, legIn, legOut, share, qmtOut);
+                  }
+                }
+                // Balancer V3 (segKind 14) — callback-free: Permit2 two-step on the LEG token,
+                // then Router.swapSingleTokenExactIn with minAmountOut 0 (its query is
+                // eth_call-ONLY — see the direct loop's rationale; the whole-trade cfg[9] floor
+                // guards the aggregate). Router (cfg[8]) + PERMIT2 are chain-wide.
+                if (HAS_BALANCER_V3 && qk === 14) {
+                  const qbEmpty: bytes = abi.encode(legIn).slice(0, 0);
+                  IERC20.at(legIn).approve(PERMIT2, share);
+                  IPermit2.at(PERMIT2).approve(legIn, balancerV3Router, share, B3_EXPIRATION);
+                  IBalancerV3Router.at(balancerV3Router).swapSingleTokenExactIn(qPool, legIn, legOut, share, 0, B3_DEADLINE, 0, qbEmpty);
+                }
+                spent = spent + share;
               }
             }
           }
+        }
+      }
+      // ── Per-route INTERMEDIATE-token sweep (defense-in-depth; normally 0) ── every leg
+      // member's exec is guarded `out > 0`, so a venue whose live re-quote returns 0 at exec
+      // (state moved adversely between the merge read and the exec / a cap shrank) skips its
+      // swap and strands its share in the leg's INPUT token — an INTERMEDIATE token the
+      // terminal tokenIn refund below cannot return (interL is never tokenIn or tokenOut: the
+      // DFS interior tokens exclude the endpoints, so this sweep can interfere with neither
+      // the terminal refund nor the tokenOut payout/minOut floor). Sweep any residual
+      // intermediate balance to the caller after EACH route's contiguous run — BEFORE the next
+      // route (which may share the intermediate token) whole-balance-drains it into ITS legs.
+      if (HAS_LEG_QLV) {
+        for (let L = 0; L + 1 < legCount; L = L + 1) {
+          const interT: Address = rt[5 + 5 * L];
+          const interBal: Uint256 = IERC20.at(interT).balanceOf(address.self);
+          if (interBal > 0) { IERC20.at(interT).transfer(caller, interBal); }
         }
       }
     }
