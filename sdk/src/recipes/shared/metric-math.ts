@@ -169,7 +169,9 @@ export interface MetricVenue {
  * view's capped quote): the next grid point then quotes the same value, the differenced slice-out is
  * 0, and both ladders stop identically (at most one final slice carries capacity the pool cannot
  * absorb — the exec's partial fill pulls only the consumed input and the terminal refund returns the
- * rest, minAmountOut-guarded).
+ * rest, minAmountOut-guarded; the exec then RESETS the router allowance to 0, because a partial fill
+ * leaves a residue approval on the shared cooking contract and a USDT-class tokenIn would revert the
+ * NEXT cook's nonzero→nonzero approve).
  */
 export interface MetricPool extends MetricVenue {
   /** Cumulative quote model: out for TOTAL input dx (post-fee, anchor-frozen; 0 ⇒ not fillable). */
@@ -196,7 +198,13 @@ export { qlLadderInputs as metricQLGridInputs } from "./curve-math.js";
  * ⇒ the ladder self-truncates), with (bid, ask) hoisted once per venue. The quote is post-fee (the
  * pool folds the spread/fee into the deltas) so marginalOI IS the execution price. Emits the same
  * {capacity, effOut, marginalOI} slices the merged sampled-segment stream consumes.
+ *
+ * The `getDy` input is CLAMPED at METRIC_INT128_MAX exactly like the solver clamps its quoteSwap
+ * amount (the int128 encode bound), so oracle == solver stays term-by-term even for a grid point
+ * past 2^127 (an amountIn > int128.max makes the top grid points clamp; the solver's quote then
+ * flatlines and both ladders stop identically — pinned by the ≥2^127 clamp cell in
+ * ecoswap.metric.evm.test.ts). Slice capacities stay on the UNCLAMPED grid on both sides.
  */
 export function buildMetricQLLadder(pool: MetricPool, amountIn: bigint): MergeSegment[] {
-  return buildQLLadder((dx) => pool.getDy(dx), amountIn);
+  return buildQLLadder((dx) => pool.getDy(dx > METRIC_INT128_MAX ? METRIC_INT128_MAX : dx), amountIn);
 }

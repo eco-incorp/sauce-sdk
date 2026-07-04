@@ -2968,8 +2968,11 @@ export async function discoverMetricPoolsTyped(
         const inDelta = xToY ? deltas[0] : deltas[1];
         if (outDelta >= 0n || inDelta <= 0n) continue; // empty pool / wrong-side (0,0) / nonsense
         const probeOut = -outDelta;
-        // The probe may PARTIAL-FILL (inDelta < probeIn on a thin pool) — head over the CONSUMED input,
-        // exactly what the on-chain ladder's first slice sees at an unchanged state.
+        // The probe may PARTIAL-FILL (inDelta < probeIn on a thin pool) — head over the CONSUMED
+        // input, the venue's truthful first-slice execution price. (== the on-chain ladder's first
+        // head when the probe fully fills; on a partial fill the solver's head spreads the same out
+        // over the FULL slice capacity and reads slightly worse — headOI only price-orders route-leg
+        // sizing off-chain, never the live on-chain split, so the divergence is diagnostic-only.)
         const consumed = inDelta < probeIn ? inDelta : probeIn;
         const headOI = qlSliceHead(probeOut, consumed);
         if (headOI <= 0n) continue;

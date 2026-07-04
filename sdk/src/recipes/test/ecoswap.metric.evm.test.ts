@@ -85,9 +85,11 @@ import { getSqrtRatioAtTick } from "./ecoswap.math";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import {
   buildMetricQLLadder,
+  METRIC_INT128_MAX,
   METRIC_LIMIT_MAX_U128,
   type MetricPool,
 } from "../shared/metric-math";
+import { qlLadderInputs } from "../shared/curve-math";
 
 const SOLVER = join(ECOSWAP_DIR, "ecoswap.sauce.ts");
 
@@ -145,8 +147,10 @@ function v3PoolTuple(pool: Hex, feePpm: number, tickSpacing: number, inIsToken0:
 // Bit-exact TS replay of the fixture's bin walk (MetricPool.sol _walk + the terminal fee), with the
 // recipe's UNBOUNDED directional limit baked in (0 for xToY — no limit break; uint128.max for yToX)
 // — the `getDy` quote model buildMetricQLLadder consumes (the Fluid/Tessera-family model contract).
-// `availOut` is the pool's OUT-token inventory (the walk stops at it — whole bins only).
-function metricGetDy(xToY: boolean, bid: bigint, ask: bigint, availOut: bigint): (dx: bigint) => bigint {
+// `availOut` is the pool's OUT-token inventory (the walk stops at it — whole bins only). `binCap`
+// overrides the per-bin input capacity (the ≥2^127 clamp cell needs huge bins so the curve is still
+// ascending at the int128 bound).
+function metricGetDy(xToY: boolean, bid: bigint, ask: bigint, availOut: bigint, binCap: bigint = BIN_CAP): (dx: bigint) => bigint {
   return (dx: bigint): bigint => {
     if (dx <= 0n) return 0n;
     let remaining = dx;
@@ -163,7 +167,7 @@ function metricGetDy(xToY: boolean, bid: bigint, ask: bigint, availOut: bigint):
         pk = (ask * (SCALE + k * STEP_PPM)) / SCALE;
         if (pk >= METRIC_LIMIT_MAX_U128) break; // priceLimit == uint128.max (the unbounded yToX side)
       }
-      const take = remaining < BIN_CAP ? remaining : BIN_CAP;
+      const take = remaining < binCap ? remaining : binCap;
       const o = xToY ? (take * pk) / X64 : (take * X64) / pk;
       if (o === 0n) break;
       if (gross + o > availOut) break; // OUT inventory exhausted — partial fill (whole bins only)
@@ -212,6 +216,14 @@ describe("EcoSwap METRIC QL live-walk (local fixture) — anchor-hoisted quoteSw
       BID0, ASK0, FEE_PPM, BIN_CAP, BIN_CAP, STEP_PPM, reserve0, reserve1,
       c.walletClient.account as Account,
     );
+  }
+
+  // ERC20 allowance read (the residue-reset assertions).
+  const allowanceAbi = parseAbi(["function allowance(address owner, address spender) view returns (uint256)"]);
+  async function allowanceOf(token: Hex, owner: Hex, spender: Hex): Promise<bigint> {
+    return (await c.publicClient.readContract({
+      address: token, abi: allowanceAbi as Abi, functionName: "allowance", args: [owner, spender],
+    })) as bigint;
   }
 
   // The router's own on-chain quote at the LIVE provider anchor — the engine-independent ground
@@ -557,6 +569,137 @@ describe("EcoSwap METRIC QL live-walk (local fixture) — anchor-hoisted quoteSw
     console.log(`  [QL Metric stale-provider:${engine}] Metric=0 V3=${v3In} received=${received} (venue self-dropped, no DoS)`);
   }
 
+  // ── (7) INT128 CLAMP — amountIn ≥ 2^127: the top grid points exceed the int128 encode bound, so
+  // BOTH the solver (min(xNext, MC_I128MAX) before the quoteSwap ABI encode) and the oracle mirror
+  // (buildMetricQLLadder's getDy clamp) must quote at the CLAMPED amount. An UNCLAMPED xNext would
+  // low-byte-truncate into the int128 slot, flip sign and silently quote exact-OUT (the fixture
+  // reverts "M10" on a non-positive amount → the probe would catch → the ladder would stop a grid
+  // point early). Huge bins keep the real curve ASCENDING at the bound, so the clamped slice is
+  // load-bearing: spent reaching EXACTLY the int128 max proves the clamped quote fired and filled. ──
+  async function runClampI128(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const BIN_HUGE = 1n << 121n; // per-bin input capacity: 4096 bins ≈ 2^133 absorbable ≫ 2^128
+    const RES_OUT = 1n << 130n; // token1 inventory covers the out at the int128 bound
+    // The astronomic reserves/trade exceed setup()'s standard mints — top the deployer + caller up.
+    await mint(c.walletClient, c.publicClient, token1, c.account0, 1n << 131n);
+    const m = await deployMetricStack(
+      c.walletClient, c.publicClient, token0, token1,
+      BID0, ASK0, FEE_PPM, BIN_HUGE, BIN_HUGE, STEP_PPM, E18, RES_OUT,
+      c.walletClient.account as Account,
+    );
+    const amountIn = 1n << 128n; // > int128.max — the top grid points MUST clamp
+    await mint(c.walletClient, c.publicClient, token0, caller, 1n << 129n);
+
+    const op = offPool(m, true, BID0, ASK0, RES_OUT);
+    op.getDy = metricGetDy(true, BID0, ASK0, RES_OUT, BIN_HUGE);
+    const ladder = buildMetricQLLadder(op, amountIn);
+    const coverage = ladder.reduce((a, s) => a + s.capacity, 0n);
+    // The oracle stops at the FIRST clamped grid point (the next quote flatlines at the same clamp).
+    const firstClamped = qlLadderInputs(amountIn).find((x) => x > METRIC_INT128_MAX);
+    assert.ok(firstClamped !== undefined, "the grid reaches past int128.max");
+    assert.equal(coverage, firstClamped, "oracle ladder covers exactly the first clamped grid point");
+
+    const { bytecodes } = compileSauce(
+      solverSrc,
+      args(token0, token1, amountIn, caller, 0, [], [metricDescriptor(m.pool, m.provider, m.router, true, 0, Number(FEE_PPM))]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: METRIC_DEFINES },
+    );
+    await approve(c.walletClient, c.publicClient, token0, target, amountIn);
+    const inBefore = await balanceOf(c.publicClient, token0, caller);
+    const outBefore = await balanceOf(c.publicClient, token1, caller);
+    const poolInBefore = await balanceOf(c.publicClient, token0, m.pool);
+    const onViewClamp = await onQuote(m.router, m.provider, m.pool, true, METRIC_INT128_MAX);
+    assert.equal(onViewClamp, op.getDy(METRIC_INT128_MAX), "TS replay == quoteSwap at the int128 bound (bit-exact)");
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "≥2^127 cook() must succeed (clamped quotes + clamped exec)");
+
+    const spent = inBefore - (await balanceOf(c.publicClient, token0, caller));
+    const received = (await balanceOf(c.publicClient, token1, caller)) - outBefore;
+    const poolIn = (await balanceOf(c.publicClient, token0, m.pool)) - poolInBefore;
+
+    // The exec clamps Σ (== coverage > int128.max) to EXACTLY int128.max; the pool absorbs it in
+    // full (huge bins), the clamped remainder refunds. spent == 2^127−1 is the smoking gun: an
+    // unclamped encode would have sign-flipped and the venue would have filled ≤ the last unclamped
+    // grid point (< int128.max).
+    assert.equal(spent, METRIC_INT128_MAX, "net spent == exactly the int128 clamp bound");
+    assert.equal(poolIn, METRIC_INT128_MAX, "the pool absorbed exactly the clamped input");
+    assert.equal(received, onViewClamp, "received == quoteSwap(int128.max) to the wei");
+    assert.equal(
+      await allowanceOf(token0, target, m.router), 0n,
+      "no router allowance residue (exact consume at the clamp + the exec reset)",
+    );
+    console.log(`  [QL Metric int128-clamp:${engine}] amountIn=2^128 spent=${spent} (== 2^127-1) received=${received}`);
+  }
+
+  // ── (8) OVERSIZE PARTIAL FILL + ALLOWANCE RESET — the documented overstated-final-slice edge: the
+  // ladder flatlines at the pool's absorbable capacity, the merge still awards the final slice's
+  // full capacity, the exec swap PARTIAL-FILLS (pulls only the consumed input) and the terminal
+  // refund returns the rest. The exec must then RESET the router allowance: the residue approval
+  // would otherwise persist on the shared cooking contract and a USDT-class tokenIn (the wired
+  // Ethereum venue) reverts any later nonzero→nonzero approve — a cross-cook DoS. ──
+  async function runOversizePartialFill(engine: Engine): Promise<void> {
+    await setup();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    const BIN_SMALL = 100n * E18;
+    const RES_OUT = 1_000n * E18; // thin OUT inventory — absorbable input ≈ 1001 e18 (whole bins)
+    const m = await deployMetricStack(
+      c.walletClient, c.publicClient, token0, token1,
+      BID0, ASK0, FEE_PPM, BIN_SMALL, BIN_SMALL, STEP_PPM, E18, RES_OUT,
+      c.walletClient.account as Account,
+    );
+    const amountIn = 10_000n * E18; // ≫ absorbable — the quote flatlines mid-grid
+
+    const op = offPool(m, true, BID0, ASK0, RES_OUT);
+    op.getDy = metricGetDy(true, BID0, ASK0, RES_OUT, BIN_SMALL);
+    const ladder = buildMetricQLLadder(op, amountIn);
+    const coverage = ladder.reduce((a, s) => a + s.capacity, 0n);
+    assert.ok(coverage < amountIn, "the ladder flatlines strictly inside amountIn (thin pool)");
+    assert.ok(op.getDy(coverage) === op.getDy(amountIn), "the final slice carries capacity the pool cannot absorb");
+
+    const { bytecodes } = compileSauce(
+      solverSrc,
+      args(token0, token1, amountIn, caller, 0, [], [metricDescriptor(m.pool, m.provider, m.router, true, 0, Number(FEE_PPM))]),
+      ECOSWAP_DIR, engine, { treeshake: true, defines: METRIC_DEFINES },
+    );
+    await approve(c.walletClient, c.publicClient, token0, target, amountIn);
+    const inBefore = await balanceOf(c.publicClient, token0, caller);
+    const outBefore = await balanceOf(c.publicClient, token1, caller);
+    const poolInBefore = await balanceOf(c.publicClient, token0, m.pool);
+    // The exec quotes the awarded Σ (== coverage): consumed = the IN delta (< Σ), out = |OUT delta|.
+    const [a0, a1] = (await c.publicClient.readContract({
+      address: m.router, abi: metricRouterFixtureAbi as Abi, functionName: "quoteSwap",
+      args: [m.pool, true, coverage, 0n, BID0, ASK0],
+    })) as readonly [bigint, bigint];
+    const consumed = a0;
+    const quotedOut = -a1;
+    assert.ok(consumed > 0n && consumed < coverage, `exec-partial-fill shape (consumed=${consumed} < awarded=${coverage})`);
+
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "oversize cook() must succeed (partial fill + refund)");
+
+    const spent = inBefore - (await balanceOf(c.publicClient, token0, caller));
+    const received = (await balanceOf(c.publicClient, token1, caller)) - outBefore;
+    const poolIn = (await balanceOf(c.publicClient, token0, m.pool)) - poolInBefore;
+
+    assert.equal(poolIn, consumed, "the router pulled only the CONSUMED input (partial fill)");
+    assert.equal(spent, consumed, "net spent == consumed (the awarded remainder refunded)");
+    assert.equal(received, quotedOut, "received == the partial-fill quote to the wei (minOut held)");
+    assert.equal(
+      await allowanceOf(token0, target, m.router), 0n,
+      "router allowance reset to 0 after the partial fill (no USDT-class cross-cook DoS residue)",
+    );
+    console.log(
+      `  [QL Metric oversize partial-fill:${engine}] awarded=${coverage} consumed=${consumed} ` +
+        `received=${received}; allowance residue cleared`,
+    );
+  }
+
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`QL Metric solo xToY [${engine}] — anchor-hoisted ladder, received == quoteSwap wei-exact`, { skip }, async () => {
       await runSolo(engine);
@@ -575,6 +718,12 @@ describe("EcoSwap METRIC QL live-walk (local fixture) — anchor-hoisted quoteSw
     });
     it(`QL Metric stale provider [${engine}] — venue self-drops, V3 absorbs, no DoS`, { skip }, async () => {
       await runStaleProvider(engine);
+    });
+    it(`QL Metric int128 clamp [${engine}] — amountIn ≥ 2^127 quotes at the clamp, no sign-flip`, { skip }, async () => {
+      await runClampI128(engine);
+    });
+    it(`QL Metric oversize partial fill [${engine}] — overstated final slice + refund + allowance reset`, { skip }, async () => {
+      await runOversizePartialFill(engine);
     });
   }
 });

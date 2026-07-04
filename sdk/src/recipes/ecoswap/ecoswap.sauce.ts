@@ -3028,6 +3028,9 @@ function main(
                       if (qmcOut > 0) {
                         IERC20.at(legIn).approve(qmcRtr, qmcAmt);
                         IMetricRouter.at(qmcRtr).swapExactInput(qPool, address.self, qmcXy, qmcAmt, qmcLim, qmcOut, MC_DEADLINE);
+                        // RESET the allowance (a partial fill pulls less than approved; a USDT-class
+                        // legIn would revert a later nonzero→nonzero approve — see the direct arm).
+                        IERC20.at(legIn).approve(qmcRtr, 0);
                       }
                     }
                   }
@@ -3578,6 +3581,14 @@ function main(
           if (mcOut > 0) {
             token.approve(mcrtrA, mcAmt);
             IMetricRouter.at(mcrtrA).swapExactInput(mcpool, address.self, mcxy, mcAmt, mcLim, mcOut, MC_DEADLINE);
+            // RESET the allowance: a PARTIAL FILL pulls only the consumed input (< mcAmt), leaving a
+            // residue approval on this SHARED cooking contract — a USDT-class tokenIn (the wired
+            // Ethereum venue's token0) reverts a later nonzero→nonzero approve, so a residue would
+            // DoS every subsequent cook touching the venue. approve(0) is always allowed; on the
+            // common exact-consume fill the allowance is already 0 and this is a no-op write. Metric
+            // is the ONLY family whose exec can by design pull less than it approves (every other
+            // QL exec is exact-consume), so only Metric needs the reset.
+            token.approve(mcrtrA, 0);
           }
         }
       }
