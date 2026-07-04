@@ -1,0 +1,323 @@
+{
+  "chain": "hyperevm",
+  "fermiSwapper": "0x625aC1D165c776121A52ff158e76e3544B4a0b8B",
+  "block": "39586415",
+  "blockTimestamp": "1783193119",
+  "staleUpdateSelector": "0x1f2a2005 zero / 0xc1ab6dc1 unsupported-pair (informational — drained quotes 0 gracefully)",
+  "target": {
+    "tokenIn": "0x5555555555555555555555555555555555555555",
+    "tokenOut": "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",
+    "inSym": "WHYPE",
+    "outSym": "USDT0"
+  },
+  "second": {
+    "tokenIn": "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",
+    "tokenOut": "0x5555555555555555555555555555555555555555",
+    "inSym": "USDT0",
+    "outSym": "WHYPE"
+  },
+  "tokens": {
+    "WHYPE": {
+      "address": "0x5555555555555555555555555555555555555555",
+      "symbol": "WHYPE",
+      "decimals": 18
+    },
+    "USDT0": {
+      "address": "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",
+      "symbol": "USD₮0",
+      "decimals": 6
+    }
+  },
+  "tokenBalanceSlots": {},
+  "contractSlots": {
+    "0x174034A1A29cfad9B598B527Ac70C80b29539614": {
+      "role": "implementation / dependency (proxy target or shared library)",
+      "slots": {}
+    },
+    "0x5555555555555555555555555555555555555555": {
+      "role": "token (repointed by harness)",
+      "slots": {
+        "0x191f31230e571b2c8bfb2cccf8447e0c2f0d18c0fb92e7c76af4826885386c83": "0x00000000000000000000000000000000000000000000002fe86aa4e5f568fd15",
+        "0x9c35da83f88043b3115f30d93beacec49ca14b6238430bdff196a249c29baa80": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0xf28a3f1d1625eb69ccdbab989051e2f6056160b20a680db9f063e4cd0804137f": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "0x5574998Ab59F06374d64e37a116828022F2bC0Eb": {
+      "role": "implementation / dependency (proxy target or shared library)",
+      "slots": {}
+    },
+    "0x625aC1D165c776121A52ff158e76e3544B4a0b8B": {
+      "role": "LiquidCore Router proxy (getPoolForPair/getPools discovery)",
+      "slots": {
+        "0x24ed44ee9374370fd3aa7c8b1abf58827504c20f65246b17d2b9e7e1aef77847": "0x000000000000000000000000174034a1a29cfad9b598b527ac70c80b29539614"
+      }
+    },
+    "0xA7478A5ff7cB27A8008D6D90785db10223bc6087": {
+      "role": "LiquidCore per-pair POOL proxy (estimateSwap/swap + the inventory accounting)",
+      "slots": {
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0262d80f9e3faa59d3bf78534f7b85ab11eaca2d73fbafe712efd336ae8a6357": "0x0000000000000000000000005555555555555555555555555555555555555555",
+        "0x0f57e9ab8ca0de5af3028563039a0dac3f90158b458a5d374fae5e2d7027a457": "0x000000000000000000000000b8ce59fc3717ada4c02eadf9682a9e934f625ebb",
+        "0x24ed44ee9374370fd3aa7c8b1abf58827504c20f65246b17d2b9e7e1aef77847": "0x0000000000000000000000005574998ab59f06374d64e37a116828022f2bc0eb",
+        "0x3c5332be38b453036c8b42f8911489074086008730fd7108cec73a95449386c8": "0x00000000000000000000000000000000000000000000000024dcc7142d6cbd61",
+        "0x43b41ac6cd8e26d721af2534df911fc8837ab958e4fb4ff8f2ed8aafde99a320": "0x0000000000000000000000000000000000000000000000000000000000000012",
+        "0x555e5fad638aa33b3e8dede2390fa0452b3509c62b60f93ca8c7f7f9f11a6d56": "0x00000000000000000000000000000000000000000000000000966f201d97f952",
+        "0x5e2bdc131269e48e8be1a39ce1b8bf81f78f849e87d615a70db017faa234262e": "0x00000000000000000000000000000000000000000000000000000000018132a0",
+        "0x69e0dfa9dced03e5f6b415b328bffb85575939c2c65e10a2ac70f28dcb2e1ae3": "0x0000000000000000000000000000000000000000000000000000000000afde0f",
+        "0x7238ff17cb935f68633100e7a6ccd7b9bfc157f13700ee1356b9276a0ed74725": "0x0000000000000000000000000000000000000000000000f470ad19c0cdf6ffcd",
+        "0x7c90a536361393b3f47d0dcdf638d1f1c1e56b2f28ce8e2d8391b8197d7b0caf": "0x0000000000000000000000000000000000000000000000000ab8b4c112f2073e",
+        "0x827b817ed865aca03ad5c2380f13d125b90d023af6777a92287b11db6ef877b5": "0x000000000000000000000000000000000000000000000000023b8ab9c59f1b0b",
+        "0x978d77ea9252a086f3a0e9b912344fcda07261cbd8681203c7f5c307c5fd4d3d": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0xa6fc985450d614ee63c1f84c94e70dba635915411166abefd63f7eb7e41dabc4": "0x0000000000000000000000000000000000000000000000000000000027282e4f",
+        "0xbacbd5b89a5df248abd477f07a47651344c104996c177d5fc731ff14e91fcadf": "0x00000000000000000000000000000000000000000000000000000000a67a063d",
+        "0xc56c774a20b85c06a862d8517bdbae662e95ba23c4ed61cfe7acee2f2e9d09f8": "0x000000000000000000000000000000000000000000000000000000000297dd13",
+        "0xc9f74e810699857476d7a00814f4ec9646eeadef769c550dbd04d6fc0f6bd79a": "0x0000000000000000000000000000000000000000000000000000000000000006",
+        "0xec432b3fd828fbcee0b7ac89dc0249d1d697bf4e5ea86e0954cb87e02253af01": "0x00000000000000000000000000000000000000000000002fc0bbe3f7e4c52b57"
+      }
+    },
+    "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb": {
+      "role": "token (repointed by harness)",
+      "slots": {
+        "0x0e9dab7e694ea15d2b2274379ed98d91d70fed2cc25459b899166263988eec23": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x000000000000000000000000f555a12bffaef20cc201a74ae6513cb4aadb34b9",
+        "0x6cf80d6356500028505a6b93e6b738e8ce0c880653428fa54a3048039c4328fa": "0x00000000000000000000000000000000000000000000000000000000d0e9efae",
+        "0x7efad4c524ec2b5db3a157287f12147b4ed53d87ba59613dab23242ea4e1e1f9": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x92bd2eeb10345a81fd7b2b4d9d3b106c9dfd37970c8cd6b7da7f3ab675fcc6b9": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0xae92a85a8745bc4c65a2e10db53e27cc3ceebe52896b27be46cd763051ff5d1b": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x000000000000000000000000779ded0c9e1022225f8e0630b35a9b54be713736"
+      }
+    },
+    "0xcf0527D4C68646b76074daC30aAa2B491727d9bB": {
+      "role": "implementation / dependency (proxy target or shared library)",
+      "slots": {}
+    },
+    "0xD3994A6CF46cA91536376f89aCDadf92eD289a9F": {
+      "role": "implementation / dependency (proxy target or shared library)",
+      "slots": {
+        "0x0262d80f9e3faa59d3bf78534f7b85ab11eaca2d73fbafe712efd336ae8a6357": "0x0000000000000000000000005555555555555555555555555555555555555555",
+        "0x0f57e9ab8ca0de5af3028563039a0dac3f90158b458a5d374fae5e2d7027a457": "0x000000000000000000000000b88339cb7199b77e23db6e890353e22632ba630f",
+        "0x24ed44ee9374370fd3aa7c8b1abf58827504c20f65246b17d2b9e7e1aef77847": "0x000000000000000000000000cf0527d4c68646b76074dac30aaa2b491727d9bb",
+        "0x978d77ea9252a086f3a0e9b912344fcda07261cbd8681203c7f5c307c5fd4d3d": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    "0xF555A12bfFAEf20cC201A74ae6513Cb4aaDB34B9": {
+      "role": "implementation / dependency (proxy target or shared library)",
+      "slots": {}
+    }
+  },
+  "vault": {
+    "address": "0xA7478A5ff7cB27A8008D6D90785db10223bc6087",
+    "role": "the per-pair POOL (the estimateSwap/swap/approve target + the claim key): holds both payout inventories as PLAIN token balances — the harness re-funds them; the pool's INTERNAL reserve accounting (getReserves ≠ balances) rides the captured storage slots.",
+    "reserves": {
+      "WHYPE": "883744350936251301141",
+      "USDT0": "3504992174"
+    },
+    "allowanceToRouter": {
+      "WHYPE": "0",
+      "USDT0": "0"
+    }
+  },
+  "eoa7702": null,
+  "lcPool": "0xA7478A5ff7cB27A8008D6D90785db10223bc6087",
+  "lcBbo": {
+    "10107": {
+      "bid": "69727000",
+      "ask": "69729000"
+    },
+    "10166": {
+      "bid": "999080",
+      "ask": "999090"
+    }
+  },
+  "lcInternalReserves": {
+    "getReservesWT": [
+      "2793014845",
+      "880884915994110536535"
+    ]
+  },
+  "probe": {
+    "target": {
+      "pair": "WHYPE/USDT0",
+      "ladder": [
+        {
+          "amountIn": "100000000000000000",
+          "amountOut": "6960970"
+        },
+        {
+          "amountIn": "500000000000000000",
+          "amountOut": "34804851"
+        },
+        {
+          "amountIn": "1000000000000000000",
+          "amountOut": "69609703"
+        },
+        {
+          "amountIn": "2500000000000000000",
+          "amountOut": "174022512"
+        },
+        {
+          "amountIn": "5000000000000000000",
+          "amountOut": "348038045"
+        },
+        {
+          "amountIn": "10000000000000000000",
+          "amountOut": "696055153"
+        },
+        {
+          "amountIn": "20000000000000000000",
+          "amountOut": "1392026556"
+        },
+        {
+          "amountIn": "50000000000000000000",
+          "amountOut": "2785026823"
+        },
+        {
+          "amountIn": "100000000000000000000",
+          "amountOut": "2785026823"
+        },
+        {
+          "amountIn": "1000000000000000000000000",
+          "amountOut": "2785026823"
+        }
+      ]
+    },
+    "second": {
+      "pair": "USDT0/WHYPE",
+      "ladder": [
+        {
+          "amountIn": "10000000",
+          "amountOut": "143281753262861808"
+        },
+        {
+          "amountIn": "50000000",
+          "amountOut": "716408766314309040"
+        },
+        {
+          "amountIn": "100000000",
+          "amountOut": "1432817532628618081"
+        },
+        {
+          "amountIn": "250000000",
+          "amountOut": "3582043831571545204"
+        },
+        {
+          "amountIn": "500000000",
+          "amountOut": "7164087663143090407"
+        },
+        {
+          "amountIn": "1000000000",
+          "amountOut": "14328175326286180815"
+        },
+        {
+          "amountIn": "2000000000",
+          "amountOut": "28656350652572361630"
+        },
+        {
+          "amountIn": "5000000000",
+          "amountOut": "71640876631430904075"
+        },
+        {
+          "amountIn": "10000000000",
+          "amountOut": "143281753262861808150"
+        },
+        {
+          "amountIn": "1000000000000000",
+          "amountOut": "880039266474756190420"
+        }
+      ]
+    }
+  },
+  "remoteProbe": {
+    "note": "the RAW remote-RPC ladders at the pin (the canonical `probe` ladders are the mocked-fork values — identical within the asserted 1e-4 bound; see the bytecode note)",
+    "target": {
+      "pair": "WHYPE/USDT0",
+      "ladder": [
+        {
+          "amountIn": "100000000000000000",
+          "amountOut": "6960970"
+        },
+        {
+          "amountIn": "500000000000000000",
+          "amountOut": "34804851"
+        },
+        {
+          "amountIn": "1000000000000000000",
+          "amountOut": "69609703"
+        },
+        {
+          "amountIn": "2500000000000000000",
+          "amountOut": "174022512"
+        },
+        {
+          "amountIn": "5000000000000000000",
+          "amountOut": "348038045"
+        },
+        {
+          "amountIn": "10000000000000000000",
+          "amountOut": "696055153"
+        },
+        {
+          "amountIn": "20000000000000000000",
+          "amountOut": "1392026556"
+        },
+        {
+          "amountIn": "50000000000000000000",
+          "amountOut": "2785026823"
+        },
+        {
+          "amountIn": "100000000000000000000",
+          "amountOut": "2785026823"
+        },
+        {
+          "amountIn": "1000000000000000000000000",
+          "amountOut": "2784998893"
+        }
+      ]
+    },
+    "second": {
+      "pair": "USDT0/WHYPE",
+      "ladder": [
+        {
+          "amountIn": "10000000",
+          "amountOut": "143281753262861808"
+        },
+        {
+          "amountIn": "50000000",
+          "amountOut": "716408766314309040"
+        },
+        {
+          "amountIn": "100000000",
+          "amountOut": "1432649377689719427"
+        },
+        {
+          "amountIn": "250000000",
+          "amountOut": "3582043831571545204"
+        },
+        {
+          "amountIn": "500000000",
+          "amountOut": "7163369889507061094"
+        },
+        {
+          "amountIn": "1000000000",
+          "amountOut": "14326739779014122188"
+        },
+        {
+          "amountIn": "2000000000",
+          "amountOut": "28653685015274450724"
+        },
+        {
+          "amountIn": "5000000000",
+          "amountOut": "71635442579015700008"
+        },
+        {
+          "amountIn": "10000000000",
+          "amountOut": "143270885158031400016"
+        },
+        {
+          "amountIn": "1000000000000000",
+          "amountOut": "880004031078116425999"
+        }
+      ]
+    }
+  }
+}

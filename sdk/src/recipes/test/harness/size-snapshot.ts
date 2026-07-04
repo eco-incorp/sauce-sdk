@@ -70,11 +70,18 @@ const BYTECODE_OUT = join(SNAP_DIR, `${SNAP_NAME}.bytecode.json`);
 const STATE_OUT = join(SNAP_DIR, `${SNAP_NAME}.state.json`);
 
 // The REAL Ethereum SIZE stack (VERIFIED source; see shared/size-math.ts for the probe record).
+// SECOND is WETH→USDT, NOT WETH→USDC: at capture (block ~25.46M) the relayer's USDC inventory
+// (~3207e6) sits BELOW getTokenLimitMin(USDC) (5000e6), so the WETH→USDC OUT-window is EMPTY —
+// every quote reverts (TR03 below the min, TR3A above the inventory cap, and the two bounds have
+// CROSSED). That live state is itself captured as `sizeWindow.closed` ground truth (the
+// closed-window discovery-drop cell); the quotable second direction exercises the OTHER real pair
+// (WETH/USDT) on the SAME single-inventory relayer — the multi-pair claim-scope evidence.
 const RELAYER = getAddress("0xd17b3c9784510E33cD5B87b490E79253BcD81e2E") as Address;
 const WETH = getAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2") as Address;
 const USDC = getAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48") as Address;
+const USDT = getAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7") as Address;
 const TARGET = { tokenIn: USDC, tokenOut: WETH, inSym: "USDC", outSym: "WETH" };
-const SECOND = { tokenIn: WETH, tokenOut: USDC, inSym: "WETH", outSym: "USDC" };
+const SECOND = { tokenIn: WETH, tokenOut: USDT, inSym: "WETH", outSym: "USDT" };
 const PORT = 8571;
 
 const RPC = process.argv[2] || process.env.ETH_RPC_URL || process.env.ETHEREUM_RPC_URL || "";
@@ -139,18 +146,29 @@ async function main() {
     const delay = getAddress(await rd<Address>("delay")) as Address;
     const minWeth = await rd<bigint>("getTokenLimitMin", [WETH]);
     const minUsdc = await rd<bigint>("getTokenLimitMin", [USDC]);
+    const minUsdt = await rd<bigint>("getTokenLimitMin", [USDT]);
     const maxMult = await rd<bigint>("getTokenLimitMaxMultiplier", [WETH]);
     const pair = (await fork.readContract({ address: factory, abi: factoryAbi as Abi, functionName: "getPair", args: [WETH, USDC] })) as Address;
     const swapFee = await rd<bigint>("swapFee", [pair]);
+    const pair2 = (await fork.readContract({ address: factory, abi: factoryAbi as Abi, functionName: "getPair", args: [WETH, USDT] })) as Address;
+    const swapFee2 = await rd<bigint>("swapFee", [pair2]);
     const minInUsdcToWeth = await rd<bigint>("quoteBuy", [USDC, WETH, minWeth]);
-    const minInWethToUsdc = await rd<bigint>("quoteBuy", [WETH, USDC, minUsdc]);
+    const minInWethToUsdt = await rd<bigint>("quoteBuy", [WETH, USDT, minUsdt]);
+    // The CLOSED direction (WETH→USDC): quoteBuy(minOut) REVERTS when the inventory cap sits below
+    // the out-min — captured probe-then-decode as the closed-window ground truth (discovery drops it).
+    const closedWethToUsdc = await rd<bigint>("quoteBuy", [WETH, USDC, minUsdc]).then(
+      (v) => `OPEN:minIn=${v}`,
+      (e) => `REVERT:${(String((e as Error).message ?? e).match(/TR[0-9A-Z]{2}/) ?? ["?"])[0]}`,
+    );
     const relayerWeth = (await fork.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [RELAYER] })) as bigint;
     const relayerUsdc = (await fork.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [RELAYER] })) as bigint;
+    const relayerUsdt = (await fork.readContract({ address: USDT, abi: erc20Abi, functionName: "balanceOf", args: [RELAYER] })) as bigint;
     const relayerEth = await fork.getBalance({ address: RELAYER });
     console.log(
-      `[size-snapshot] window: minOut WETH=${minWeth} USDC=${minUsdc} maxMult=${maxMult}; minIn USDC→WETH=${minInUsdcToWeth} ` +
-        `WETH→USDC=${minInWethToUsdc}; inventory WETH=${relayerWeth} USDC=${relayerUsdc} ETH=${relayerEth}; ` +
-        `pair=${pair} swapFee=${swapFee} delay=${delay}`,
+      `[size-snapshot] window: minOut WETH=${minWeth} USDC=${minUsdc} USDT=${minUsdt} maxMult=${maxMult}; ` +
+        `minIn USDC→WETH=${minInUsdcToWeth} WETH→USDT=${minInWethToUsdt}; WETH→USDC ${closedWethToUsdc}; ` +
+        `inventory WETH=${relayerWeth} USDC=${relayerUsdc} USDT=${relayerUsdt} ETH=${relayerEth}; ` +
+        `pair=${pair} swapFee=${swapFee} pair2=${pair2} swapFee2=${swapFee2} delay=${delay}`,
     );
 
     // ── Fund + approve the probe EOA (REAL txs on the fork; tokens are repointed at etch time so
@@ -201,19 +219,26 @@ async function main() {
       return out;
     };
     for (const amt of ladderSizes(minInUsdcToWeth)) await trace(RELAYER, enc("quoteSell", [USDC, WETH, amt]), eoa.address, `qs U→W ${amt}`);
-    for (const amt of ladderSizes(minInWethToUsdc)) await trace(RELAYER, enc("quoteSell", [WETH, USDC, amt]), eoa.address, `qs W→U ${amt}`);
+    for (const amt of ladderSizes(minInWethToUsdt)) await trace(RELAYER, enc("quoteSell", [WETH, USDT, amt]), eoa.address, `qs W→T ${amt}`);
+    // The CLOSED direction's revert paths (TR03 + TR3A) — captured so the prod-mirror reproduces them.
+    await trace(RELAYER, enc("quoteSell", [WETH, USDC, 2n * 10n ** 18n]), eoa.address, "qs W→U closed TR03");
+    await trace(RELAYER, enc("quoteSell", [WETH, USDC, 5n * 10n ** 18n]), eoa.address, "qs W→U closed TR3A");
     await trace(RELAYER, enc("quoteBuy", [USDC, WETH, minWeth]), eoa.address, "qb U→W min");
-    await trace(RELAYER, enc("quoteBuy", [WETH, USDC, minUsdc]), eoa.address, "qb W→U min");
-    for (const t of [WETH, USDC]) {
+    await trace(RELAYER, enc("quoteBuy", [WETH, USDT, minUsdt]), eoa.address, "qb W→T min");
+    await trace(RELAYER, enc("quoteBuy", [WETH, USDC, minUsdc]), eoa.address, "qb W→U min (closed)");
+    for (const t of [WETH, USDC, USDT]) {
       await trace(RELAYER, enc("getTokenLimitMin", [t]), eoa.address, "limitMin");
       await trace(RELAYER, enc("getTokenLimitMaxMultiplier", [t]), eoa.address, "limitMax");
     }
     await trace(RELAYER, enc("factory", []), eoa.address, "factory");
     await trace(RELAYER, enc("delay", []), eoa.address, "delay");
     await trace(factory, encodeFunctionData({ abi: factoryAbi as Abi, functionName: "getPair", args: [WETH, USDC] }), eoa.address, "getPair");
+    await trace(factory, encodeFunctionData({ abi: factoryAbi as Abi, functionName: "getPair", args: [WETH, USDT] }), eoa.address, "getPair2");
     await trace(RELAYER, enc("isPairEnabled", [pair]), eoa.address, "isPairEnabled");
     await trace(RELAYER, enc("swapFee", [pair]), eoa.address, "swapFee");
-    // sell() BOTH directions — the funded/approved EOA walks transferIn→payout→TwapDelay.relayerSell.
+    await trace(RELAYER, enc("isPairEnabled", [pair2]), eoa.address, "isPairEnabled2");
+    await trace(RELAYER, enc("swapFee", [pair2]), eoa.address, "swapFee2");
+    // sell() BOTH quotable directions — the funded/approved EOA walks transferIn→payout→TwapDelay.relayerSell.
     const deadline = Number(blockTimestamp) + 3600;
     await trace(
       RELAYER,
@@ -222,17 +247,17 @@ async function main() {
     );
     await trace(
       RELAYER,
-      enc("sell", [{ tokenIn: WETH, tokenOut: USDC, amountIn: (minInWethToUsdc * 3n) / 2n, amountOutMin: 0n, wrapUnwrap: false, to: eoa.address, submitDeadline: deadline }]),
-      eoa.address, "sell W→U",
+      enc("sell", [{ tokenIn: WETH, tokenOut: USDT, amountIn: (minInWethToUsdt * 3n) / 2n, amountOutMin: 0n, wrapUnwrap: false, to: eoa.address, submitDeadline: deadline }]),
+      eoa.address, "sell W→T",
     );
-    for (const must of [RELAYER, factory, pair, delay]) {
+    for (const must of [RELAYER, factory, pair, pair2, delay]) {
       const key = must.toLowerCase();
       if (!touched.has(key)) touched.set(key, new Set());
     }
 
     // ── Capture code + slot VALUES for every touched contract (debug_traceCall committed nothing,
     //    so `latest` still reflects the pinned mainnet state for all non-token contracts). ──
-    const TOKENS = new Set([WETH.toLowerCase(), USDC.toLowerCase()]);
+    const TOKENS = new Set([WETH.toLowerCase(), USDC.toLowerCase(), USDT.toLowerCase()]);
     const contracts: { address: Address; role: string; runtime: string; runtimeSha256: Hex; codeSizeBytes: number; slots: Record<string, Hex> }[] = [];
     for (const [addrLc, slotSet] of [...touched.entries()].sort()) {
       const address = getAddress(addrLc) as Address;
@@ -243,7 +268,8 @@ async function main() {
       const role =
         addrLc === RELAYER.toLowerCase() ? "TwapRelayer proxy (quoteSell/quoteBuy/sell + the out-window)" :
         addrLc === factory.toLowerCase() ? "TwapFactory (getPair)" :
-        addrLc === pair.toLowerCase() ? "ITwapPair (oracle()/swapFee source)" :
+        addrLc === pair.toLowerCase() ? "ITwapPair WETH/USDC (oracle()/swapFee source)" :
+        addrLc === pair2.toLowerCase() ? "ITwapPair WETH/USDT (oracle()/swapFee source)" :
         addrLc === delay.toLowerCase() ? "TwapDelay (relayerSell hedge enqueue — the sell()'s input sink)" :
         TOKENS.has(addrLc) ? "token (repointed by harness)" :
         "oracle-dependency (TwapOracle / Uniswap-V3 pool / relayer impl)";
@@ -275,7 +301,12 @@ async function main() {
       return pts;
     };
     const fwdLadder = await ladder(USDC, WETH, minInUsdcToWeth);
-    const revLadder = await ladder(WETH, USDC, minInWethToUsdc);
+    const revLadder = await ladder(WETH, USDT, minInWethToUsdt);
+    // The CLOSED direction's ground truth: BOTH domain ends revert (the crossed window).
+    const closedLadder: { amountIn: string; amountOut: string }[] = [];
+    for (const amt of [2n * 10n ** 18n, 5n * 10n ** 18n]) {
+      closedLadder.push({ amountIn: amt.toString(), amountOut: await quoteAt(WETH, USDC, amt) });
+    }
 
     const meta = async (t: Address) => ({
       address: t,
@@ -310,7 +341,7 @@ async function main() {
       staleUpdateSelector: "TR03/TR3A (out-window string reverts — informational)",
       target: { ...TARGET },
       second: { ...SECOND },
-      tokens: { WETH: await meta(WETH), USDC: await meta(USDC) },
+      tokens: { WETH: await meta(WETH), USDC: await meta(USDC), USDT: await meta(USDT) },
       tokenBalanceSlots: {},
       contractSlots: Object.fromEntries(contracts.map((cc) => [cc.address, { role: cc.role, slots: cc.slots }])),
       vault: {
@@ -318,20 +349,31 @@ async function main() {
         role:
           "the RELAYER ITSELF (single-contract multi-pair inventory): checkLimits caps on balanceOf(relayer) " +
           "and the sell pays out of it — the harness re-funds the captured balances so the window reproduces.",
-        reserves: { WETH: relayerWeth.toString(), USDC: relayerUsdc.toString() },
-        allowanceToRouter: { WETH: "0", USDC: "0" },
+        reserves: { WETH: relayerWeth.toString(), USDC: relayerUsdc.toString(), USDT: relayerUsdt.toString() },
+        allowanceToRouter: { WETH: "0", USDC: "0", USDT: "0" },
       },
       eoa7702: null,
       sizeDelay: delay,
       sizeRelayerEth: relayerEth.toString(),
       sizeWindow: {
-        minOutWETH: minWeth.toString(),
-        minOutUSDC: minUsdc.toString(),
         maxMultiplier: maxMult.toString(),
-        minInUsdcToWeth: minInUsdcToWeth.toString(),
-        minInWethToUsdc: minInWethToUsdc.toString(),
-        pair,
-        swapFee: swapFee.toString(),
+        minOut: { WETH: minWeth.toString(), USDC: minUsdc.toString(), USDT: minUsdt.toString() },
+        minInTarget: minInUsdcToWeth.toString(),
+        minInSecond: minInWethToUsdt.toString(),
+        pairTarget: pair,
+        pairSecond: pair2,
+        swapFeeTarget: swapFee.toString(),
+        swapFeeSecond: swapFee2.toString(),
+        closed: {
+          tokenIn: "WETH",
+          tokenOut: "USDC",
+          evidence: closedWethToUsdc,
+          reason:
+            "relayer USDC inventory below getTokenLimitMin(USDC) at the pin — the OUT-window bounds have " +
+            "crossed (min > cap): EVERY WETH→USDC quote reverts (TR03 low / TR3A high) and quoteBuy(minOut) " +
+            "reverts too, so discovery drops the direction (probe-then-decode).",
+          ladder: closedLadder,
+        },
       },
       probe: {
         target: { pair: `${TARGET.inSym}/${TARGET.outSym}`, ladder: fwdLadder },

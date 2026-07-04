@@ -3660,18 +3660,28 @@ export interface FermiStateSnapshot {
   metricAnchor?: { bid: string; ask: string };
   /** SIZE snapshots only (harness/size-snapshot.ts — fermi-SHAPED: `fermiSwapper` = `vault` = the
    *  RELAYER): the TwapDelay the sell forwards input to, the relayer's captured ETH balance (its
-   *  hedge prepay funding — the test must anvil_setBalance it), and the captured window reads.
-   *  Absent on non-SIZE snapshots. */
+   *  hedge prepay funding — the test must anvil_setBalance it), and the captured window reads —
+   *  per-token minOut, the target/second directions' quoteBuy minIn conversions, both ITwapPairs +
+   *  their swapFees, and the CLOSED direction's evidence (a live crossed window: inventory < minOut
+   *  ⇒ every quote reverts ⇒ discovery drops it). Absent on non-SIZE snapshots. */
   sizeDelay?: Hex;
   sizeRelayerEth?: string;
   sizeWindow?: {
-    minOutWETH: string;
-    minOutUSDC: string;
     maxMultiplier: string;
-    minInUsdcToWeth: string;
-    minInWethToUsdc: string;
-    pair: Hex;
-    swapFee: string;
+    minOut: Record<string, string>;
+    minInTarget: string;
+    minInSecond: string;
+    pairTarget: Hex;
+    pairSecond: Hex;
+    swapFeeTarget: string;
+    swapFeeSecond: string;
+    closed?: {
+      tokenIn: string;
+      tokenOut: string;
+      evidence: string;
+      reason: string;
+      ladder: { amountIn: string; amountOut: string }[];
+    };
   };
   /** LIQUIDCORE snapshots only (harness/liquidcore-snapshot.ts — fermi-SHAPED: `fermiSwapper` = the
    *  ROUTER, `vault` = the per-pair POOL): the pool address + the captured HyperEVM BBO
