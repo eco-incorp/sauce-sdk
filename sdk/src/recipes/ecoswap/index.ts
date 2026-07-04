@@ -594,6 +594,35 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
         12n, // segKind = Fluid DEX (resolver estimateSwapIn on the ladder; approve + swapIn on the exec)
         BigInt(refIdx),
       ];
+    // Tessera V (Wintermute TesseraSwap wrapper): qd[0]=wrapper, qd[1..2] unused (Tessera quotes by
+    // tokenIn/tokenOut). The QL ladder quotes tesseraSwapViewAmounts(tokenIn,tokenOut,+xNext)[1]
+    // (PROBE-THEN-DECODE — the view is revert-class: unsupported pair "T33" / engine pause; the SECOND
+    // return is the exact-in out, like Fermi's quoteAmounts); EXEC stays callback-free (approve +
+    // tesseraSwapWithAllowances with empty swapData — the wrapper pulls tokenIn via transferFrom and
+    // pays tokenOut from its treasury).
+    case "tessera":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (Tessera quotes by tokenIn/tokenOut)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        15n, // segKind = Tessera V (viewAmounts on the ladder; approve + tesseraSwapWithAllowances on the exec)
+        BigInt(refIdx),
+      ];
+    // ElfomoFi (vault-funded PMM): qd[0]=wrapper, qd[1..2] unused (Elfomo quotes by tokenIn/tokenOut).
+    // The QL ladder quotes the GRACEFUL getAmountOut(tokenIn,tokenOut,xNext) — a plain single-return
+    // staticcall (0 on an unsupported pair / stale oracle feed ⇒ stop, the WOOFi-tryQuery class, no
+    // probe-then-decode); EXEC stays callback-free (approve + swap(tokenIn,tokenOut,+Σ,limitAmount,
+    // self,0) — the wrapper pulls tokenIn via transferFrom and pays tokenOut from its vault).
+    case "elfomo":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (Elfomo quotes by tokenIn/tokenOut)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        16n, // segKind = ElfomoFi (getAmountOut on the ladder; approve + swap(..., partnerId 0) on the exec)
+        BigInt(refIdx),
+      ];
   }
 }
 
@@ -612,9 +641,16 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
  * scalars, re-purposed per family: Curve int128 / CryptoSwap uint256 coin indices; LB packs `swapForY`
  * into `i`; Mento packs the exchangeId (bytes32 as uint256) into `i`; Balancer V3 packs inIdx/outIdx
  * into `i`/`j`; UNUSED (0) for Solidly/WOOFi, which quote by tokenIn/tokenOut. `feePpm` is informational
- * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Eleven QL families ship today,
+ * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Sixteen QL families ship today,
  * each with a distinct `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters
- * are INDEPENDENT (0-based into each family's list):
+ * are INDEPENDENT (0-based into each family's list). The newest two:
+ *   segKind 15 = Tessera V      → callback-free tesseraSwapViewAmounts (probe-then-decode, [1]) +
+ *                                   approve + tesseraSwapWithAllowances(..., "") (refIdx → the on-chain
+ *                                   `teinp[refIdx]`/`teven[refIdx]` slot).
+ *   segKind 16 = ElfomoFi       → callback-free GRACEFUL getAmountOut (plain staticcall, 0 ⇒ stop) +
+ *                                   approve + swap(..., partnerId 0) (refIdx → the on-chain
+ *                                   `elinp[refIdx]`/`elven[refIdx]` slot).
+ * The historical five:
  *   segKind 1  = Curve StableSwap → bestKind===1 cursor → engine swap(poolType:3) → _swapCurve
  *                                   (refIdx → the on-chain `cinp[refIdx]`/`cven[refIdx]` slot).
  *   segKind 2  = Trader Joe LB   → engine swap(poolType:6) → _swapTraderJoeLB (transfer-first; refIdx →
@@ -646,8 +682,9 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   // Family-concatenation order is LOAD-BEARING (the direct rows' positions feed the on-chain
   // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
   // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
-  // maverickPools, fluidPools — the historical order the per-family map bodies (now qlRowFor)
-  // emitted, with Fluid appended when it migrated from the static-segment stream.
+  // maverickPools, fluidPools, tesseraPools, elfomoPools — the historical order the per-family map
+  // bodies (now qlRowFor) emitted, with Fluid appended when it migrated from the static-segment
+  // stream and Tessera/Elfomo appended when they landed (new families ALWAYS append at the tail).
   const rows: bigint[][] = [];
   (prepared.curves ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "curve", desc }, i)));
   (prepared.cryptoSwaps ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "cryptoSwap", desc }, i)));
@@ -663,6 +700,8 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   (prepared.balancerStables ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "balancerV2", desc }, i)));
   (prepared.maverickPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "maverick", desc }, i)));
   (prepared.fluidPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "fluid", desc }, i)));
+  (prepared.tesseraPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "tessera", desc }, i)));
+  (prepared.elfomoPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "elfomo", desc }, i)));
   // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
   // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
   return rows.map(pad12);
@@ -735,6 +774,8 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_WOOFI = (prepared.wooFiPools?.length ?? 0) > 0 || hasLegFam("wooFi");
   const HAS_FERMI = (prepared.fermiPools?.length ?? 0) > 0 || hasLegFam("fermi");
   const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0 || hasLegFam("fluid");
+  const HAS_TESSERA = (prepared.tesseraPools?.length ?? 0) > 0 || hasLegFam("tessera");
+  const HAS_ELFOMO = (prepared.elfomoPools?.length ?? 0) > 0 || hasLegFam("elfomo");
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
   const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
   // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
@@ -759,6 +800,8 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_WOOFI,
     HAS_FERMI,
     HAS_FLUID,
+    HAS_TESSERA,
+    HAS_ELFOMO,
     HAS_MENTO,
     HAS_BALANCER_V3,
     HAS_LEG_QLV,

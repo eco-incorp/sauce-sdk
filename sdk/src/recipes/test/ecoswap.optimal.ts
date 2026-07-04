@@ -81,6 +81,8 @@ import { buildMaverickWalkLadder, type MaverickPool } from "../shared/maverick-m
 import { buildWooFiQLLadder, type WooFiPool } from "../shared/woofi-math.js";
 import { buildFermiQLLadder, type FermiPool } from "../shared/fermi-math.js";
 import { buildFluidQLLadder, type FluidPool } from "../shared/fluid-math.js";
+import { buildTesseraQLLadder, type TesseraPool } from "../shared/tessera-math.js";
+import { buildElfomoQLLadder, type ElfomoPool } from "../shared/elfomo-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 
@@ -248,6 +250,28 @@ export interface OptimalPool {
    */
   fluid?: FluidPool;
   /**
+   * Tessera V (Wintermute TesseraSwap wrapper + private engine) venue — when present this pool is a
+   * QUOTE-LADDER (QL) TESSERA venue (NOT any of the above). The oracle builds its segments via the SHARED
+   * buildTesseraQLLadder — the IDENTICAL geometric quote ladder the on-chain solver builds in setup from
+   * the LIVE tesseraSwapViewAmounts view (PROBE-THEN-DECODE; a revert/0 truncates both ladders in
+   * lockstep) — driven by the descriptor's `getDy` quote model (a bit-exact fixture replay locally; a
+   * prefetched real-wrapper quote grid in the prod-mirror), so the split is wei-exact vs the solver by
+   * construction. marginalOI is the post-fee execution price; adjNear == adjFar == marginalOI. All the
+   * other venue fields are ignored when `tessera` is set.
+   */
+  tessera?: TesseraPool;
+  /**
+   * ElfomoFi (vault-funded PMM + on-chain pricing module) venue — when present this pool is a
+   * QUOTE-LADDER (QL) ELFOMO venue (NOT any of the above). The oracle builds its segments via the SHARED
+   * buildElfomoQLLadder — the IDENTICAL geometric quote ladder the on-chain solver builds in setup from
+   * the LIVE graceful getAmountOut view (0 ⇒ both ladders self-truncate in lockstep) — driven by the
+   * descriptor's `getDy` quote model (a bit-exact fixture replay locally; a prefetched real-wrapper quote
+   * grid in the prod-mirror), so the split is wei-exact vs the solver by construction. marginalOI is the
+   * post-fee execution price; adjNear == adjFar == marginalOI. All the other venue fields are ignored
+   * when `elfomo` is set.
+   */
+  elfomo?: ElfomoPool;
+  /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) venue — when
    * present this pool is a MENTO venue (NOT any of the above). The oracle enumerates its segments via the
    * SHARED sampler (buildMentoSegments) from the venue's LIVE Broker getAmountOut ladder (the same
@@ -329,7 +353,9 @@ export type OptimalLegQlVenue =
   | { family: "balancerV2"; model: BalancerStablePool }
   | { family: "balancerV3"; model: BalancerV3Pool }
   | { family: "maverick"; model: MaverickPool }
-  | { family: "fluid"; model: FluidPool };
+  | { family: "fluid"; model: FluidPool }
+  | { family: "tessera"; model: TesseraPool }
+  | { family: "elfomo"; model: ElfomoPool };
 
 /**
  * Build one leg QL venue's slice ladder via the family's SHARED builder, sized by the leg's
@@ -355,6 +381,8 @@ export function buildLegQlVenueLadder(v: OptimalLegQlVenue, cap: bigint): QlSlic
     case "balancerV3": return buildBalancerV3QLLadder(v.model, cap);
     case "maverick": return buildMaverickWalkLadder(v.model, cap);
     case "fluid": return buildFluidQLLadder(v.model, cap);
+    case "tessera": return buildTesseraQLLadder(v.model, cap);
+    case "elfomo": return buildElfomoQLLadder(v.model, cap);
   }
 }
 
@@ -790,6 +818,41 @@ function fluidSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segme
 }
 
 /**
+ * Enumerate one Tessera V (Wintermute TesseraSwap) venue's segments via the QUOTE-LADDER live walk
+ * (buildTesseraQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from the
+ * LIVE tesseraSwapViewAmounts view (PROBE-THEN-DECODE — a revert/0 truncates both ladders in lockstep).
+ * The ladder is driven by the descriptor's `getDy` quote model — a bit-exact replay of the
+ * TesseraSwap.sol fixture locally, a prefetched real-wrapper quote grid (tesseraQLGridInputs) in the
+ * prod-mirror — so the oracle == solver wei-exact BY CONSTRUCTION (no prepared segments; the ladder
+ * prices at the LIVE engine state, no snapshot). marginalOI is the post-fee execution price; adjNear ==
+ * adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function tesseraSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildTesseraQLLadder(p.tessera!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
+ * Enumerate one ElfomoFi venue's segments via the QUOTE-LADDER live walk (buildElfomoQLLadder) — the
+ * SAME geometric-slice ladder the on-chain solver builds in setup from the LIVE graceful getAmountOut
+ * view (0 ⇒ both ladders self-truncate in lockstep). The ladder is driven by the descriptor's `getDy`
+ * quote model — a bit-exact replay of the ElfomoFi.sol fixture locally, a prefetched real-wrapper quote
+ * grid (elfomoQLGridInputs) in the prod-mirror — so the oracle == solver wei-exact BY CONSTRUCTION (no
+ * prepared segments; the ladder prices at the LIVE oracle-feed state, no snapshot). marginalOI is the
+ * post-fee execution price; adjNear == adjFar == marginalOI. Awarded as a "pool" venue.
+ */
+function elfomoSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildElfomoQLLadder(p.elfomo!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
  * Enumerate one Mento V2 (Celo Broker + BiPoolManager) venue's segments via the QUOTE-LADDER live walk
  * (buildMentoQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from the live
  * broker.getAmountOut view. The ladder is driven by the venue's closed-form bucket model (mentoQuoteClosed,
@@ -1144,6 +1207,10 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       allSegs.push(...mentoSegments(p, i, amountIn));
     } else if (p.fluid) {
       allSegs.push(...fluidSegments(p, i, amountIn));
+    } else if (p.tessera) {
+      allSegs.push(...tesseraSegments(p, i, amountIn));
+    } else if (p.elfomo) {
+      allSegs.push(...elfomoSegments(p, i, amountIn));
     } else if (p.fermi) {
       allSegs.push(...fermiSegments(p, i, amountIn));
     } else if (p.woofi) {

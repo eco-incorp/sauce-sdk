@@ -18,6 +18,8 @@ import { ILBPair } from "./ILBPair.json";
 import { IFermiPool } from "./IFermiPool.json";
 import { IFluidDexPool } from "./IFluidDexPool.json";
 import { IFluidDexResolver } from "./IFluidDexResolver.json";
+import { ITesseraSwap } from "./ITesseraSwap.json";
+import { IElfomoFi } from "./IElfomoFi.json";
 import { IMentoBroker } from "./IMentoBroker.json";
 import { IBalancerV3Router } from "./IBalancerV3Router.json";
 import { IBalancerV3Vault } from "./IBalancerV3Vault.json";
@@ -111,7 +113,8 @@ import { IPermit2 } from "./IPermit2.json";
 //                 QUOTE-LADDER (QL) venue DESCRIPTORS, uniform 12-column width (Curve StableSwap segKind 1,
 //                 Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE segKind 4, Wombat segKind 5,
 //                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Fluid DEX segKind 12,
-//                 Mento V2 segKind 13, Balancer V3 segKind 14). Rows [0, directQlvCount) are DIRECT venues (today's family-
+//                 Mento V2 segKind 13, Balancer V3 segKind 14, Tessera V segKind 15, ElfomoFi segKind
+//                 16). Rows [0, directQlvCount) are DIRECT venues (today's family-
 //                 concatenation order; qd[10]=qd[11]=0, never read); rows [directQlvCount, …) are
 //                 ROUTE-LEG venues — qd[0..9] the SAME family row built for the leg's EDGE pair
 //                 (legIn, legOut), qd[5] refIdx = the row's GLOBAL qlv index (informational), qd[10]/
@@ -681,6 +684,8 @@ const HAS_FERMI: boolean = true;
 const HAS_FLUID: boolean = true;
 const HAS_MENTO: boolean = true;
 const HAS_BALANCER_V3: boolean = true;
+const HAS_TESSERA: boolean = true;
+const HAS_ELFOMO: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
 // — the cfg[12] directQlvCount override read, the leg-row LADDER build (the per-row edge-token/
 // sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude), the
@@ -868,6 +873,10 @@ function main(
   let mtxid: Tuple = new Array(MS_CAP); // Mento V2 venue exchangeId (bytes32-as-uint256, segs[6])
   let b3inp: Tuple = new Array(MS_CAP); // Balancer V3 per-venue Σ input
   let b3ven: Tuple = new Array(MS_CAP); // Balancer V3 venue (Vault pool) address (segs[5])
+  let teinp: Tuple = new Array(MS_CAP); // Tessera V per-venue Σ input
+  let teven: Tuple = new Array(MS_CAP); // Tessera V venue (wrapper) address
+  let elinp: Tuple = new Array(MS_CAP); // ElfomoFi per-venue Σ input
+  let elven: Tuple = new Array(MS_CAP); // ElfomoFi venue (wrapper) address
 
   // ── MERGED SAMPLED-SEGMENT STREAM (parallel scalar arrays) ──
   // The bestKind===1 cursor consumes ONE globally-DESC-sorted segment stream. It is built ON-CHAIN
@@ -1035,7 +1044,7 @@ function main(
   // ── BUILD THE MERGED SAMPLED-SEGMENT STREAM (static segs + live QL ladders, then DESC sort) ──
   // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
   // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
-  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&true) {
+  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO) &&true) {
     // 1. Copy any static segments VERBATIM into the parallel-array stream. VESTIGIAL: production
     // always ships segs == [] (every family is QL — the ladders below feed the whole stream); a
     // hand-built test universe may still supply static rows and they merge unchanged.
@@ -1065,7 +1074,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO) {
       // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
@@ -1573,6 +1582,28 @@ function main(
                   else { q = b2out * B2W / b2sfOut; } // downscale to out-token native decimals (divDown)
                 }
               }
+              // Tessera V (segKind 15) — the wrapper's signed-amount view, PROBE-THEN-DECODE (the
+              // Fermi class): tesseraSwapViewAmounts REVERTS on an unsupported/deactivated pair
+              // ("T33") or an engine pause, while an OVERSIZED ask returns (in, 0) gracefully —
+              // either way a failed probe / zero out stops the ladder (the venue self-drops; the
+              // engine's ~18.5M gas-AVAILABILITY gate also lands here: a starved probe fails ⇒ a
+              // zero ladder, never a cook DoS — though the failed probe burns its forwarded gas, so
+              // cook Tessera universes with generous limits; see tessera-math.ts). [1] is the
+              // exact-in out (positive amountSpecified = exact tokenIn); the quote is post-fee +
+              // gas-price-coherent with the exec (both read the same tx.gasprice), so the head IS
+              // the execution price.
+              if (HAS_TESSERA && qKind === 15) {
+                ITesseraSwap.at(qPool).tesseraSwapViewAmounts(qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
+                if (ok === 1) { q = ITesseraSwap.at(qPool).tesseraSwapViewAmounts(qTokIn, qTokOut, xNext)[1]; }
+              }
+              // ElfomoFi (segKind 16) — the wrapper's GRACEFUL exact-in view (the WOOFi-tryQuery /
+              // Fluid-resolver class): getAmountOut returns 0 on an unsupported pair / zero amount /
+              // STALE oracle feed (never reverts — probed live on the real Base wrapper), so it is a
+              // PLAIN single-return staticcall, 0 ⇒ stop (a stale venue self-truncates, no
+              // probe-then-decode `.catch` needed — one call per slice).
+              if (HAS_ELFOMO && qKind === 16) {
+                q = IElfomoFi.at(qPool).getAmountOut(qTokIn, qTokOut, xNext);
+              }
               if (q === 0) {
                 stop = 1;
               } else {
@@ -1829,7 +1860,7 @@ function main(
       // (next-best); its near/far are ALREADY post-fee out/in (adjNear==adjFar==the post-fee
       // marginal), so they compare directly. Same tie-break as the pools/routes (near DESC, then
       // far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&segCur < msSorted) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO) &&segCur < msSorted) {
         const sNear: Uint256 = msNear[segCur];
         const sFar: Uint256 = msFar[segCur];
         if (sNear >= bestPrice) {
@@ -2336,7 +2367,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO) &&bestKind === 1) {
             // ── sampled-segment slice: a fixed capacity slice at a fixed post-fee price. Consume the
             // [segCur] merged-stream row (parallel arrays), clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -2440,6 +2471,22 @@ function main(
                                       if (HAS_BALANCER_V3 && sKind === 14) {
                                         b3inp[sIdx] = b3inp[sIdx] + stake;
                                         b3ven[sIdx] = sVenue;
+                                      } else {
+                                        // segKind 15 — Tessera V (Wintermute wrapper): callback-free,
+                                        // executed below via tesseraSwapViewAmounts (probe-then-decode
+                                        // amountCheck) + approve + tesseraSwapWithAllowances(..., "").
+                                        if (HAS_TESSERA && sKind === 15) {
+                                          teinp[sIdx] = teinp[sIdx] + stake;
+                                          teven[sIdx] = sVenue;
+                                        } else {
+                                          // segKind 16 — ElfomoFi (vault-funded PMM): callback-free,
+                                          // executed below via the graceful getAmountOut (limitAmount)
+                                          // + approve + swap(..., partnerId 0).
+                                          if (HAS_ELFOMO && sKind === 16) {
+                                            elinp[sIdx] = elinp[sIdx] + stake;
+                                            elven[sIdx] = sVenue;
+                                          }
+                                        }
                                       }
                                     }
                                   }
@@ -2840,6 +2887,33 @@ function main(
                   IERC20.at(legIn).approve(PERMIT2, share);
                   IPermit2.at(PERMIT2).approve(legIn, balancerV3Router, share, B3_EXPIRATION);
                   IBalancerV3Router.at(balancerV3Router).swapSingleTokenExactIn(qPool, legIn, legOut, share, 0, B3_DEADLINE, 0, qbEmpty);
+                }
+                // Tessera V (segKind 15) — callback-free: the live signed-amount view as
+                // amountCheck (PROBE-THEN-DECODE — the view is revert-class, so a paused/starved
+                // venue skips soft instead of bricking the cook; the share strands in legIn and the
+                // per-route intermediate sweep / terminal refund returns it), approve-first
+                // (Tessera PULLS via transferFrom inside tesseraSwapWithAllowances; empty swapData).
+                if (HAS_TESSERA && qk === 15) {
+                  let qteOk: Uint256 = 1;
+                  ITesseraSwap.at(qPool).tesseraSwapViewAmounts(legIn, legOut, share).catch(() => { qteOk = 0; });
+                  if (qteOk === 1) {
+                    const qteOut: Uint256 = ITesseraSwap.at(qPool).tesseraSwapViewAmounts(legIn, legOut, share)[1];
+                    if (qteOut > 0) {
+                      const qteEmpty: bytes = abi.encode(legIn).slice(0, 0);
+                      IERC20.at(legIn).approve(qPool, share);
+                      ITesseraSwap.at(qPool).tesseraSwapWithAllowances(legIn, legOut, share, qteOut, address.self, qteEmpty);
+                    }
+                  }
+                }
+                // ElfomoFi (segKind 16) — callback-free: the live GRACEFUL getAmountOut as
+                // limitAmount (0 ⇒ stale/unsupported ⇒ skip soft), approve-first (Elfomo PULLS via
+                // transferFrom inside swap; partnerId 0).
+                if (HAS_ELFOMO && qk === 16) {
+                  const qelOut: Uint256 = IElfomoFi.at(qPool).getAmountOut(legIn, legOut, share);
+                  if (qelOut > 0) {
+                    IERC20.at(legIn).approve(qPool, share);
+                    IElfomoFi.at(qPool).swap(legIn, legOut, share, qelOut, address.self, 0);
+                  }
                 }
                 spent = spent + share;
               }
@@ -3272,6 +3346,71 @@ function main(
       token.approve(PERMIT2, b3amt);
       IPermit2.at(PERMIT2).approve(tokenIn, balancerV3Router, b3amt, B3_EXPIRATION);
       IBalancerV3Router.at(balancerV3Router).swapSingleTokenExactIn(b3pool, tokenIn, tokenOut, b3amt, 0, B3_DEADLINE, 0, b3Empty);
+    }
+  }
+  }
+  // Tessera V (Wintermute TesseraSwap wrapper + private engine — treasury-funded prop-AMM) → CALLBACK-FREE
+  // (NO engine SwapPoolType). Tessera prices off its private engine's posted state + feed, NOT xy=k, so the
+  // engine's _swapV2 would mis-price it. Execute exactly as the Tessera taker would, against the REAL
+  // verified wrapper surface: read the LIVE amountOut from tesseraSwapViewAmounts(tokenIn, tokenOut, +Σ)[1]
+  // (the SECOND return is the exact-in out — positive amountSpecified = exact tokenIn, the propAMM/Fermi
+  // taker convention) via PROBE-THEN-DECODE — the view is REVERT-class (a deactivated pair / engine pause /
+  // a gas-starved call reverts), so a dead venue at exec time SKIPS SOFT: its share stays in this contract
+  // and the terminal leftover refund returns it to the caller (never a bricked cook). APPROVE the wrapper
+  // for the awarded input (Tessera PULLS via transferFrom inside tesseraSwapWithAllowances — approve-first,
+  // like Fermi/Wombat/Curve, unlike the transfer-first WOOFi/Solidly path), then call
+  // tesseraSwapWithAllowances(tokenIn, tokenOut, +Σ, amountCheck, to, "") with amountCheck == the
+  // just-quoted out (the exact-in slippage bound — same-tx quote+swap is wei-exact on the real engine at
+  // ANY gas price: the ~2-gwei globalPrioFeeThresholddd1337 shifts the quote sub-bp above threshold but
+  // quote and exec read the SAME tx.gasprice, so the check never trips when the state is unchanged; empty
+  // swapData is the verified taker path). The engine also enforces a ~18.5M gas-AVAILABILITY gate (burns
+  // forwarded gas when starved) — cook Tessera universes with generous gas limits (see tessera-math.ts).
+  // compute-then-pull already transferred `cum` (incl. each Tessera share) into this contract above, so the
+  // approved pull draws from this contract's balance and the out lands here (to == self, paid from the
+  // wrapper's treasury).
+  if (HAS_TESSERA) {
+  for (let te = 0; te < MS_CAP; te = te + 1) {
+    const teamt: Uint256 = teinp[te];
+    if (teamt > 0) {
+      const tepool: Address = teven[te];
+      let teOk: Uint256 = 1;
+      ITesseraSwap.at(tepool).tesseraSwapViewAmounts(tokenIn, tokenOut, teamt).catch(() => { teOk = 0; });
+      if (teOk === 1) {
+        // amountSpecified is a SIGNED int256; teamt is a realistic-size POSITIVE amount ⇒ encodes as
+        // +int256 (exact-in). The quote returns (amountIn, amountOut) — take [1] for the out.
+        const teOut: Uint256 = ITesseraSwap.at(tepool).tesseraSwapViewAmounts(tokenIn, tokenOut, teamt)[1];
+        if (teOut > 0) {
+          const teEmpty: bytes = abi.encode(tokenIn).slice(0, 0);
+          token.approve(tepool, teamt);
+          ITesseraSwap.at(tepool).tesseraSwapWithAllowances(tokenIn, tokenOut, teamt, teOut, address.self, teEmpty);
+        }
+      }
+    }
+  }
+  }
+  // ElfomoFi (vault-funded PMM priced by an on-chain pricing module + oracle feed) → CALLBACK-FREE (NO
+  // engine SwapPoolType). Elfomo prices off its pricing module's oracle feed + vault inventory, NOT xy=k,
+  // so the engine's _swapV2 would mis-price it. Execute exactly as the Elfomo taker would, against the REAL
+  // verified wrapper surface: read the LIVE amountOut from the GRACEFUL getAmountOut(tokenIn, tokenOut, +Σ)
+  // (a plain single-return staticcall — 0 on a stale feed / unsupported pair, never a revert), used as
+  // limitAmount; a 0 quote SKIPS the venue soft (its share stays here and the terminal leftover refund
+  // returns it). APPROVE the wrapper for the awarded input (Elfomo PULLS via transferFrom inside swap —
+  // approve-first, like Fermi/Tessera/Wombat/Curve, unlike the transfer-first WOOFi/Solidly path), then
+  // call swap(tokenIn, tokenOut, +Σ, limitAmount, to, 0) (positive specifiedAmount = exact input;
+  // partnerId 0) with limitAmount == the just-quoted out (the exact-in slippage bound; same-tx quote+swap
+  // is wei-exact on the real Base wrapper and gas-price-insensitive — see elfomo-math.ts). compute-then-
+  // pull already transferred `cum` (incl. each Elfomo share) into this contract above, so the approved pull
+  // draws from this contract's balance and the out lands here (to == self, paid from the wrapper's vault).
+  if (HAS_ELFOMO) {
+  for (let el = 0; el < MS_CAP; el = el + 1) {
+    const elamt: Uint256 = elinp[el];
+    if (elamt > 0) {
+      const elpool: Address = elven[el];
+      const elOut: Uint256 = IElfomoFi.at(elpool).getAmountOut(tokenIn, tokenOut, elamt);
+      if (elOut > 0) {
+        token.approve(elpool, elamt);
+        IElfomoFi.at(elpool).swap(tokenIn, tokenOut, elamt, elOut, address.self, 0);
+      }
     }
   }
   }

@@ -37,6 +37,8 @@ import { WAD as WOMBAT_WAD, type WombatPool } from "./wombat-math.js";
 import { WOO_FEE_SCALE, type WooFiPool } from "./woofi-math.js";
 import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math.js";
 import { type FluidVenue, FLUID_FEE_SCALE } from "./fluid-math.js";
+import { type TesseraVenue, TESSERA_FEE_SCALE } from "./tessera-math.js";
+import { type ElfomoVenue, ELFOMO_FEE_SCALE } from "./elfomo-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -425,6 +427,30 @@ const fermiPoolAbi = parseAbi([
 const fluidResolverAbi = parseAbi([
   "function getDexTokens(address dex) external view returns (address token0, address token1)",
   "function estimateSwapIn(address dex, bool swap0to1, uint256 amountIn, uint256 amountOutMin) external view returns (uint256 amountOut)",
+]);
+
+// Tessera V (Wintermute TesseraSwap wrapper — treasury-funded proactive market maker) read surface for the
+// EcoSwap TYPED path — the REAL VERIFIED wrapper ABI (TesseraSwap 0x55555522005BcAE1c2424D474BfD5ed477749E3e,
+// Base blockscout verified; SAME address on BSC). The wrapper is a thin shell over a PRIVATE engine
+// (swapAmountView/swapAmount) + a token treasury; it exposes NO pair enumeration and NO curve state — only
+// the SIGNED-amount quote (amountSpecified positive = exact tokenIn, the propAMM taker convention) and the
+// signed-amount swap. The view is REVERT-class (unsupported pair "T33", zero amount "T10" — probed live), so
+// discovery's liveness probe is a caught quote; an oversized ask returns (in, 0) gracefully. See
+// tessera-math.ts for the fork-measured priority-fee + gas-gate behavior.
+const tesseraSwapAbi = parseAbi([
+  "function tesseraSwapViewAmounts(address tokenIn, address tokenOut, int256 amountSpecified) external view returns (uint256 amountIn, uint256 amountOut)",
+]);
+
+// ElfomoFi (vault-funded PMM + on-chain pricing module) read surface for the EcoSwap TYPED path — the REAL
+// VERIFIED wrapper ABI (ElfomoFi 0xf0f0F0F0FB0d738452EfD03A28e8be14C76d5f73, Base blockscout verified; SAME
+// address on BSC). `getSupportedPairs()` enumerates the tradeable [tokenA, tokenB] pairs (a listed pair
+// quotes in BOTH directions — verified live both ways); `getAmountOut` is the GRACEFUL single-return
+// exact-in quote (0 on an unsupported pair / zero amount / stale oracle feed — probed live). The struct
+// TokenPair mirrors IElfomoPricing.TokenPair (two addresses).
+const elfomoFiAbi = parseAbi([
+  "struct ElfomoTokenPair { address tokenA; address tokenB; }",
+  "function getSupportedPairs() external view returns (ElfomoTokenPair[])",
+  "function getAmountOut(address fromToken, address toToken, uint256 fromAmount) external view returns (uint256 toAmount)",
 ]);
 
 // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) read surface for the
@@ -2635,6 +2661,187 @@ export async function discoverFluidPoolsTyped(
       } catch {
         // Pool/resolver read failed (not a FluidDexT1, paused, or unsupported pair) — skip.
       }
+    }
+  }
+  return out;
+}
+
+// ── Tessera V discovery ──────────────────────────────────────
+
+/**
+ * Discover Tessera V (Wintermute TesseraSwap wrapper) venues for the pair AS TYPED DESCRIPTOR-ONLY
+ * `TesseraVenue`s + a liveness-probe head (the EcoSwap QUOTE-LADDER path). Tessera is a treasury-funded
+ * proactive market maker (NOT xy=k), so it must NOT be priced through the V2 synthetic-sqrt path.
+ * Discovery is KNOWN-ADDRESS based (the FactoryConfig `address` IS the wrapper — the BalancerV3
+ * known-pool pattern): the wrapper exposes NO pair enumeration, so a pair is kept only when ONE liveness
+ * quote probe (`tesseraSwapViewAmounts(tokenIn, tokenOut, +probeIn)[1]`, caught — the view REVERTS on an
+ * unsupported pair) returns strictly positive.
+ *
+ * NO SAMPLING (the QL family contract): the on-chain solver builds each venue's price ladder LIVE at
+ * cook from `tesseraSwapViewAmounts` quote-differencing (PROBE-THEN-DECODE — the view is revert-class),
+ * so discovery ships only the descriptor. The ONE probe here quotes the FIRST QL slice size
+ * (`amountIn / QL_SEED_DIV`, the ladder's seed) — it gates liveness, yields the fold head (`headOI` =
+ * the first-slice post-fee out/in sqrt) and derives the diagnostic feePpm. That is 1 RPC per candidate
+ * wrapper. Execution is CALLBACK-FREE (approve + tesseraSwapWithAllowances(..., "") — Tessera PULLS via
+ * transferFrom, approve-first like Fermi/Wombat/Curve). The engine's ~2-gwei priority-fee knob needs no
+ * discovery guard: the swap never reverts on gas price and quote+exec read the same tx.gasprice (fork-
+ * proven; see tessera-math.ts).
+ *
+ * `amountIn` sizes the probe. Mirrors `discoverFluidPoolsTyped` — off-chain discovery + one liveness
+ * read, returning the venue descriptor EcoSwap prepare consumes directly (the on-chain lens does not
+ * understand Tessera).
+ */
+export async function discoverTesseraPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  tesseraConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(TesseraVenue & { headOI: bigint })[]> {
+  if (tesseraConfigs.length === 0 || amountIn <= 0n) return [];
+
+  // The FIRST QL slice size — the on-chain ladder's seed (curve-math QL_SEED_DIV), so the probe's head
+  // is exactly the head the solver's first slice will carry when the state has not moved.
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
+
+  const out: (TesseraVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of tesseraConfigs) {
+    const key = cfg.address.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      // ONE liveness probe: the signed-amount quote for the pair (positive = exact-in). The view
+      // REVERTS on an unsupported pair ("T33") — caught ⇒ 0 ⇒ drop; an oversized/unfillable ask
+      // returns (in, 0) gracefully ⇒ also drop.
+      const probeOut = (await client
+        .readContract({
+          address: cfg.address,
+          abi: tesseraSwapAbi,
+          functionName: "tesseraSwapViewAmounts",
+          args: [tokenIn, tokenOut, probeIn],
+        })
+        .then((r) => (r as readonly [bigint, bigint])[1])
+        .catch(() => 0n)) as bigint;
+      if (probeOut <= 0n) continue;
+
+      // The fold head: the first-slice post-fee out/in sqrt — identical to the on-chain ladder's first
+      // head (qlSliceHead(sliceOut, capacity)) at an unchanged state.
+      const headOI = qlSliceHead(probeOut, probeIn);
+
+      // Derive an effective fee (ppm) from the probe for price-ordering / diagnostics: the near-par
+      // spot ratio's shortfall vs 1:1 is dominated by the fee (the engine folds everything into the
+      // quote — there is no fee getter). Best-effort; 0 when the pair is not near-par (e.g. WETH/USDC).
+      let feePpm = 0;
+      if (probeOut < probeIn) {
+        const shortfall = ((probeIn - probeOut) * TESSERA_FEE_SCALE) / probeIn;
+        if (shortfall > 0n && shortfall < TESSERA_FEE_SCALE) feePpm = Number(shortfall);
+      }
+
+      out.push({
+        address: cfg.address,
+        tokenIn,
+        tokenOut,
+        feePpm,
+        source: `${cfg.label} (Tessera V)`,
+        headOI,
+      });
+    } catch {
+      // Wrapper read failed (not a TesseraSwap, paused, or unsupported pair) — skip.
+    }
+  }
+  return out;
+}
+
+// ── ElfomoFi discovery ───────────────────────────────────────
+
+/**
+ * Discover ElfomoFi (vault-funded PMM + on-chain pricing module) venues for the pair AS TYPED
+ * DESCRIPTOR-ONLY `ElfomoVenue`s + a liveness-probe head (the EcoSwap QUOTE-LADDER path). Elfomo is an
+ * oracle-priced PMM (NOT xy=k), so it must NOT be priced through the V2 synthetic-sqrt path. Discovery
+ * is KNOWN-ADDRESS based (the FactoryConfig `address` IS the wrapper) but ENUMERABLE within it:
+ * `getSupportedPairs()` lists the tradeable [tokenA, tokenB] pairs (a listed pair quotes in BOTH
+ * directions — verified live both ways), so the pair filter is an exact unordered-set match, then ONE
+ * liveness quote probe (`getAmountOut(tokenIn, tokenOut, probeIn)` — GRACEFUL, 0 ⇒ dead/stale) gates
+ * admission.
+ *
+ * NO SAMPLING (the QL family contract): the on-chain solver builds each venue's price ladder LIVE at
+ * cook from `getAmountOut` quote-differencing (a plain single-return staticcall, 0 ⇒ stop — the
+ * WOOFi-tryQuery class), so discovery ships only the descriptor. The ONE probe here quotes the FIRST QL
+ * slice size (`amountIn / QL_SEED_DIV`) — it gates liveness, yields the fold head and derives the
+ * diagnostic feePpm. That is 2 RPCs per candidate wrapper (getSupportedPairs + one getAmountOut).
+ * Execution is CALLBACK-FREE (approve + swap(..., partnerId 0) — Elfomo PULLS via transferFrom,
+ * approve-first like Fermi/Tessera/Wombat).
+ *
+ * `amountIn` sizes the probe. Mirrors `discoverTesseraPoolsTyped` / `discoverFluidPoolsTyped` —
+ * off-chain discovery + a liveness read, returning the venue descriptor EcoSwap prepare consumes
+ * directly (the on-chain lens does not understand Elfomo).
+ */
+export async function discoverElfomoPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  elfomoConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(ElfomoVenue & { headOI: bigint })[]> {
+  if (elfomoConfigs.length === 0 || amountIn <= 0n) return [];
+
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
+
+  const inLc = tokenIn.toLowerCase();
+  const outLc = tokenOut.toLowerCase();
+  const out: (ElfomoVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of elfomoConfigs) {
+    const key = cfg.address.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      // Pair enumeration — the natural discovery surface. A pair entry supports BOTH directions, so
+      // match the unordered set {tokenA, tokenB} == {tokenIn, tokenOut}.
+      const pairs = (await client
+        .readContract({ address: cfg.address, abi: elfomoFiAbi, functionName: "getSupportedPairs" })
+        .catch(() => [])) as readonly { tokenA: Hex; tokenB: Hex }[];
+      const listed = pairs.some((p) => {
+        const a = p.tokenA.toLowerCase();
+        const b = p.tokenB.toLowerCase();
+        return (a === inLc && b === outLc) || (a === outLc && b === inLc);
+      });
+      if (!listed) continue;
+
+      // ONE liveness probe — GRACEFUL: 0 ⇒ not tradeable at this size (stale feed / paused) — drop.
+      const probeOut = (await client
+        .readContract({
+          address: cfg.address,
+          abi: elfomoFiAbi,
+          functionName: "getAmountOut",
+          args: [tokenIn, tokenOut, probeIn],
+        })
+        .then((r) => r as bigint)
+        .catch(() => 0n)) as bigint;
+      if (probeOut <= 0n) continue;
+
+      const headOI = qlSliceHead(probeOut, probeIn);
+
+      // Derived diagnostic feePpm (near-par pairs only — the pricing module folds everything in).
+      let feePpm = 0;
+      if (probeOut < probeIn) {
+        const shortfall = ((probeIn - probeOut) * ELFOMO_FEE_SCALE) / probeIn;
+        if (shortfall > 0n && shortfall < ELFOMO_FEE_SCALE) feePpm = Number(shortfall);
+      }
+
+      out.push({
+        address: cfg.address,
+        tokenIn,
+        tokenOut,
+        feePpm,
+        source: `${cfg.label} (ElfomoFi)`,
+        headOI,
+      });
+    } catch {
+      // Wrapper read failed (not an ElfomoFi, paused, or unsupported pair) — skip.
     }
   }
   return out;

@@ -57,6 +57,8 @@ import {
   discoverWooFiPoolsTyped,
   discoverFermiPoolsTyped,
   discoverFluidPoolsTyped,
+  discoverTesseraPoolsTyped,
+  discoverElfomoPoolsTyped,
   discoverMentoPoolsTyped,
   discoverBalancerV3PoolsTyped,
 } from "../shared/pool-discovery.js";
@@ -103,6 +105,8 @@ import {
   type EcoWooFi,
   type EcoFermi,
   type EcoFluid,
+  type EcoTessera,
+  type EcoElfomo,
   type EcoMento,
   type EcoBalancerV3,
   type EcoLegQlVenue,
@@ -798,7 +802,8 @@ interface EdgeQlVenue {
 /**
  * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 14 leg-capable families
  * (Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2,
- * Wombat, Fermi, EulerSwap, Balancer V3, Balancer V2 ComposableStable, Maverick V2, Fluid DEX),
+ * Wombat, Fermi, EulerSwap, Balancer V3, Balancer V2 ComposableStable, Maverick V2, Fluid DEX,
+ * Tessera V, ElfomoFi),
  * run in the canonical family-concatenation order (the same order index.ts buildQLVenues emits
  * rows in). This is the SINGLE discovery path for QL venues: the DIRECT (tokenIn, tokenOut) pair
  * calls it with `probeAmount = amountIn`, and every route-leg EDGE calls it with the edge pair +
@@ -1191,11 +1196,61 @@ async function discoverQlVenuesForPair(
     }
   }
 
+  // Tessera V (Wintermute TesseraSwap wrapper — treasury-funded prop-AMM; known-ADDRESS discovery,
+  // one caught liveness quote probe — the view is revert-class) — the on-chain solver builds the
+  // ladder LIVE from `tesseraSwapViewAmounts(edgeIn, edgeOut, +xNext)[1]` via PROBE-THEN-DECODE.
+  // The descriptor is (wrapper, edgeIn, edgeOut) — ONE wrapper serves every pair out of ONE
+  // treasury, so the claim key is the wrapper ADDRESS (see qlVenueClaimKey).
+  const tesseraConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Tessera);
+  if (tesseraConfigs.length > 0) {
+    const tesseraRaw = await discoverTesseraPoolsTyped(pairIn, pairOut, client, tesseraConfigs, probeAmount);
+    for (const tp of tesseraRaw) {
+      out.push({
+        venue: {
+          family: "tessera",
+          desc: {
+            address: tp.address,
+            fromToken: tp.tokenIn,
+            toToken: tp.tokenOut,
+            feePpm: tp.feePpm,
+            source: tp.source,
+          },
+        },
+        headOI: tp.headOI,
+      });
+    }
+  }
+
+  // ElfomoFi (vault-funded PMM + pricing module; known-ADDRESS discovery with in-wrapper
+  // getSupportedPairs enumeration + one GRACEFUL liveness probe) — the on-chain solver builds the
+  // ladder LIVE from `getAmountOut(edgeIn, edgeOut, xNext)` (a plain single-return staticcall,
+  // 0 ⇒ stop — the WOOFi-tryQuery class). The descriptor is (wrapper, edgeIn, edgeOut) — ONE
+  // wrapper serves every pair out of ONE vault, so the claim key is the wrapper ADDRESS.
+  const elfomoConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Elfomo);
+  if (elfomoConfigs.length > 0) {
+    const elfomoRaw = await discoverElfomoPoolsTyped(pairIn, pairOut, client, elfomoConfigs, probeAmount);
+    for (const ep of elfomoRaw) {
+      out.push({
+        venue: {
+          family: "elfomo",
+          desc: {
+            address: ep.address,
+            fromToken: ep.tokenIn,
+            toToken: ep.tokenOut,
+            feePpm: ep.feePpm,
+            source: ep.source,
+          },
+        },
+        headOI: ep.headOI,
+      });
+    }
+  }
+
   return out;
 }
 
 /**
- * The claim-set identity of a QL venue — the venue's POOL address for 12 families; Mento (whose
+ * The claim-set identity of a QL venue — the venue's POOL address for 14 families; Mento (whose
  * venues all share the chain-wide Broker/provider contracts) claims by `provider|exchangeId`.
  * Lowercased so it unions safely with the pool-address claim set (one shared mechanism — a UniV3
  * address never collides with a Curve address). Claiming by POOL address (not by pair) is the
@@ -1203,7 +1258,10 @@ async function discoverQlVenuesForPair(
  * Wombat pool holding {A, X, B} is discoverable on BOTH legs of one route A→X→B (and as a direct
  * (A,B) venue) — every instance prices ladders over the SAME pool inventory, so at most ONE may
  * be admitted. (For Fermi the address is the ROUTER — two pairs through one router claim-collide;
- * deliberately conservative: an excluded second instance forgoes a venue, never double-counts.)
+ * deliberately conservative: an excluded second instance forgoes a venue, never double-counts.
+ * Tessera/Elfomo are the same single-CONTRACT multi-pair class: ONE wrapper serves every pair out
+ * of ONE treasury/vault, so the wrapper-address claim admits that inventory exactly once — the
+ * multi-coin rule applied verbatim, correct and automatic.)
  */
 function mentoClaimKey(exchangeProvider: string, exchangeId: string): string {
   return `${exchangeProvider.toLowerCase()}|${exchangeId.toLowerCase()}`;
@@ -1491,6 +1549,11 @@ export async function prepareEcoSwap(
   // swap0to1 + fee), laddered LIVE on-chain from the resolver's estimateSwapIn quote at cook. The
   // shared per-pair discovery ran its single liveness probe; no sampled segments ship.
   const fluidPools = qlFamilyDescs<EcoFluid>("fluid");
+  // Tessera V + ElfomoFi are QL families like the 14 above: descriptor-only (wrapper + edge tokens +
+  // fee), laddered LIVE on-chain from each wrapper's own quote view at cook. The shared per-pair
+  // discovery ran the single liveness probe; no sampled segments ship.
+  const tesseraPools = qlFamilyDescs<EcoTessera>("tessera");
+  const elfomoPools = qlFamilyDescs<EcoElfomo>("elfomo");
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1798,6 +1861,14 @@ export async function prepareEcoSwap(
   for (const bp of balancerStables) claimed.add(bp.address.toLowerCase());
   for (const mp of maverickPools) claimed.add(mp.address.toLowerCase());
   for (const fp of fluidPools) claimed.add(fp.address.toLowerCase());
+  // Tessera + Elfomo claim by their WRAPPER address — the multi-coin rule applied to a
+  // single-CONTRACT multi-pair venue: ONE wrapper serves (A,B) directly AND could serve (A,X)+(X,B)
+  // legs out of the SAME treasury/vault inventory, so the address claim admits that inventory
+  // EXACTLY ONCE per cook (a direct instance excludes every leg instance and vice versa) — correct
+  // and automatic, no per-pair key needed (a per-pair key would let two legs price one inventory
+  // twice).
+  for (const tp of tesseraPools) claimed.add(tp.address.toLowerCase());
+  for (const ep of elfomoPools) claimed.add(ep.address.toLowerCase());
   const orderedRoutes = routes
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
@@ -1878,6 +1949,8 @@ export async function prepareEcoSwap(
     wooFiPools.length === 0 &&
     fermiPools.length === 0 &&
     fluidPools.length === 0 &&
+    tesseraPools.length === 0 &&
+    elfomoPools.length === 0 &&
     mentoPools.length === 0 &&
     balancerV3Pools.length === 0
   ) {
@@ -1905,7 +1978,8 @@ export async function prepareEcoSwap(
       `${solidlyStables.length} Solidly-stable QL, ${wooFiPools.length} WOOFi QL, ${lbs.length} LB QL, ` +
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
       `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${maverickPools.length} Maverick QL, ` +
-      `${balancerV3Pools.length} Balancer-V3 QL, ${fluidPools.length} Fluid QL`,
+      `${balancerV3Pools.length} Balancer-V3 QL, ${fluidPools.length} Fluid QL, ` +
+      `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL`,
   );
 
   const prepared: EcoSwapPrepared = {
@@ -1927,6 +2001,8 @@ export async function prepareEcoSwap(
     wooFiPools,
     fermiPools,
     fluidPools,
+    tesseraPools,
+    elfomoPools,
     mentoPools,
     balancerV3Pools,
     brackets,

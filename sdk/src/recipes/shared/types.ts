@@ -403,7 +403,9 @@ export type EcoLegQlVenue =
   | { family: "balancerV2"; desc: EcoBalancerStable }
   | { family: "balancerV3"; desc: EcoBalancerV3 }
   | { family: "maverick"; desc: EcoMaverick }
-  | { family: "fluid"; desc: EcoFluid };
+  | { family: "fluid"; desc: EcoFluid }
+  | { family: "tessera"; desc: EcoTessera }
+  | { family: "elfomo"; desc: EcoElfomo };
 
 /**
  * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
@@ -765,6 +767,72 @@ export interface EcoFluid {
 }
 
 /**
+ * One Tessera V QUOTE-LADDER (QL) venue, referenced by a qlv-row refIdx (segKind 15). Tessera V
+ * (Wintermute's TesseraSwap wrapper + private engine) is a TREASURY-funded proactive market maker (NOT
+ * xy=k): it prices off its engine's posted state + feed, so it must NOT be routed through the V2
+ * (_swapV2) path. The wrapper's `tesseraSwapViewAmounts(tokenIn, tokenOut, +xIn)` view is REVERT-class
+ * (unsupported pair "T33" / zero amount "T10" / engine pause revert; an OVERSIZED ask returns (in, 0)
+ * gracefully), so the on-chain solver builds the venue's price ladder in setup via PROBE-THEN-DECODE
+ * (the Fermi class), decoding [1] (the exact-in out). It EXECUTES the awarded Σ share CALLBACK-FREE:
+ * the same live view (probe-then-decode) yields the out (used as amountCheck), the wrapper is APPROVED
+ * for the awarded input (Tessera PULLS via transferFrom inside tesseraSwapWithAllowances — approve-first,
+ * like Fermi/Wombat/Curve, NOT transfer-first like WOOFi), and `tesseraSwapWithAllowances(tokenIn,
+ * tokenOut, +Σ, amountCheck, to, "")` lands it (empty swapData; amountCheck == the just-quoted out ⇒ it
+ * never trips when the state is unchanged — same-tx quote+swap fork-proven wei-exact at ANY gas price:
+ * the engine's ~2-gwei globalPrioFeeThresholddd1337 shifts the QUOTE by fractions of a bp above the
+ * threshold but NEVER reverts the swap, and quote+exec read the same tx.gasprice, so the pair is
+ * coherent by construction). NO engine SwapPoolType. LIVE-WALK class: the ladder is built at cook from
+ * live quotes, so the split re-anchors to any maker re-post between prepare and cook (see
+ * tessera-math.ts — including the ~18.5M gas-AVAILABILITY gate the engine enforces: starve it and the
+ * probes fail soft, the venue drops). `address` is the wrapper (SAME address Base+BSC — a single
+ * multi-pair treasury, so the claim key is this address); `fromToken`/`toToken` are the swap call's
+ * token args; feePpm is the price-ordering coordinate / diagnostic (derived from the liveness probe —
+ * there is no fee getter).
+ */
+export interface EcoTessera {
+  /** Wrapper (TesseraSwap) address — the viewAmounts/swapWithAllowances/approve target. */
+  address: Hex;
+  /** The venue's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The venue's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Derived ppm fee (the price-ordering coordinate; the on-chain out is the wrapper's view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
+ * One ElfomoFi QUOTE-LADDER (QL) venue, referenced by a qlv-row refIdx (segKind 16). ElfomoFi is a
+ * VAULT-funded PMM priced by an on-chain pricing module + oracle feed (NOT xy=k), so it must NOT be
+ * routed through the V2 (_swapV2) path. The wrapper's `getAmountOut(tokenIn, tokenOut, xIn)` view is
+ * GRACEFUL single-return (the WOOFi-tryQuery / Fluid-resolver class — 0 on an unsupported pair / zero
+ * amount / STALE oracle feed; an oversized ask quotes a real collapsing-marginal value), so the on-chain
+ * solver builds the venue's price ladder in setup with ONE plain staticcall per slice (q == 0 ⇒ stop —
+ * a stale venue self-drops, never a cook DoS). It EXECUTES the awarded Σ share CALLBACK-FREE: the same
+ * live view yields the out (used as limitAmount), the wrapper is APPROVED for the awarded input (Elfomo
+ * PULLS via transferFrom inside swap — approve-first, like Fermi/Tessera/Wombat, NOT transfer-first like
+ * WOOFi), and `swap(tokenIn, tokenOut, +Σ, limitAmount, to, 0)` lands it (partnerId 0; limitAmount ==
+ * the just-quoted out ⇒ it never trips when the state is unchanged — same-tx quote+swap fork-proven
+ * wei-exact, gas-price-insensitive). NO engine SwapPoolType. LIVE-WALK class: the ladder is built at
+ * cook from live quotes, so the split re-anchors to any oracle move / vault-inventory change between
+ * prepare and cook (see elfomo-math.ts). Discovery enumerates `getSupportedPairs()` and filters to the
+ * swap pair. `address` is the wrapper (SAME address Base+BSC — a single multi-pair vault, so the claim
+ * key is this address); `fromToken`/`toToken` are the swap call's token args; feePpm is the
+ * price-ordering coordinate / diagnostic (derived from the liveness probe — there is no fee getter).
+ */
+export interface EcoElfomo {
+  /** Wrapper (ElfomoFi) address — the getAmountOut/swap/approve target. */
+  address: Hex;
+  /** The venue's tokenIn (from-token the swap call needs). */
+  fromToken: Hex;
+  /** The venue's tokenOut (to-token the swap call needs). */
+  toToken: Hex;
+  /** Derived ppm fee (the price-ordering coordinate; the on-chain out is the wrapper's view). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * One Mento V2 venue to execute, indexed by an EcoBracket.refIdx (kind === Mento). Mento V2 (Celo
  * mento-protocol/mento-core Broker + BiPoolManager) is a BiPool oracle-priced stablecoin exchange (NOT
  * xy=k): the Broker routes to a registered exchange provider (BiPoolManager) that prices off oracle rates +
@@ -990,6 +1058,26 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   fluidPools?: EcoFluid[];
+  /**
+   * Tessera V (Wintermute TesseraSwap wrapper + private engine) QUOTE-LADDER venues (qlv segKind 15
+   * rows reference these by refIdx). DESCRIPTOR-ONLY — the on-chain solver builds each venue's price
+   * ladder in setup from the LIVE tesseraSwapViewAmounts quote (PROBE-THEN-DECODE — the view is
+   * revert-class) and executes the awarded Σ share CALLBACK-FREE (the same live view for amountCheck +
+   * approve + tesseraSwapWithAllowances(..., "") — NO engine SwapPoolType). Optional/empty when no
+   * Tessera venue was discovered (omitted ⇒ no Tessera venue, so existing test-side `EcoSwapPrepared`
+   * literals stay additive-compatible).
+   */
+  tesseraPools?: EcoTessera[];
+  /**
+   * ElfomoFi (vault-funded PMM + on-chain pricing module) QUOTE-LADDER venues (qlv segKind 16 rows
+   * reference these by refIdx). DESCRIPTOR-ONLY — the on-chain solver builds each venue's price ladder
+   * in setup from the LIVE getAmountOut quote (a GRACEFUL plain single-return staticcall, 0 ⇒ stop) and
+   * executes the awarded Σ share CALLBACK-FREE (the same live view for limitAmount + approve +
+   * swap(..., partnerId 0) — NO engine SwapPoolType). Optional/empty when no Elfomo venue was
+   * discovered (omitted ⇒ no Elfomo venue, so existing test-side `EcoSwapPrepared` literals stay
+   * additive-compatible).
+   */
+  elfomoPools?: EcoElfomo[];
   /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues (kind === Mento brackets
    * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE

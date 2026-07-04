@@ -239,6 +239,41 @@ export enum FactoryType {
    * swapV3 path consumes it unchanged. See discoverSlipstreamCLPools in pool-discovery.ts.
    */
   SlipstreamCL = "slipstream-cl",
+  /**
+   * Tessera V (Wintermute's TesseraSwap wrapper + private engine — a treasury-funded proactive market
+   * maker). Discovery is KNOWN-ADDRESS based (the BalancerV3 known-pool pattern): the FactoryConfig
+   * `address` IS the wrapper (0x55555522005BcAE1c2424D474BfD5ed477749E3e — VERIFIED source on Base
+   * blockscout, SAME address on BSC), and the wrapper exposes NO pair enumeration, so a pair is admitted
+   * by ONE caught liveness quote probe (`tesseraSwapViewAmounts(tokenIn, tokenOut, +probeIn)[1] > 0` —
+   * the view REVERTS "T33" on an unsupported pair). A QUOTE-LADDER family (segKind 15): prepare ships
+   * only the descriptor; the on-chain solver builds the ladder LIVE from the wrapper's signed-amount
+   * view via PROBE-THEN-DECODE (revert-class, like Fermi). CALLBACK-FREE exec: an on-chain
+   * tesseraSwapViewAmounts staticcall for amountCheck + approve + tesseraSwapWithAllowances(tokenIn,
+   * tokenOut, +Σ, amountCheck, to, "") — Tessera PULLS tokenIn via transferFrom and pays tokenOut from
+   * its TREASURY, so no engine change. FORK-MEASURED FLAGS (2026-07-04, see tessera-math.ts): the
+   * engine's `globalPrioFeeThresholddd1337` (= 2 gwei) shifts the QUOTE by fractions of a bp above the
+   * threshold but the swap NEVER reverts on gas price (same-tx quote+swap wei-exact at 1–50 gwei); the
+   * engine requires ~18.5M gas AVAILABLE at the call and burns all forwarded gas when starved — cook
+   * with generous gas limits when a Tessera venue is in the universe.
+   */
+  Tessera = "tessera",
+  /**
+   * ElfomoFi (a vault-funded PMM priced by an on-chain pricing module + oracle feed). Discovery is
+   * KNOWN-ADDRESS based: the FactoryConfig `address` IS the wrapper
+   * (0xf0f0F0F0FB0d738452EfD03A28e8be14C76d5f73 — VERIFIED source on Base blockscout, SAME address on
+   * BSC), and the wrapper's `getSupportedPairs()` enumerates the tradeable pairs (the natural discovery
+   * surface; a listed pair quotes BOTH directions — verified live), then ONE graceful liveness probe
+   * (`getAmountOut(tokenIn, tokenOut, probeIn) > 0`) gates admission. A QUOTE-LADDER family (segKind
+   * 16): prepare ships only the descriptor; the on-chain solver builds the ladder LIVE from
+   * `getAmountOut` — a GRACEFUL single-return staticcall (0 on an unsupported pair / STALE oracle feed ⇒
+   * the ladder self-truncates; the WOOFi-tryQuery class, no probe-then-decode). CALLBACK-FREE exec: an
+   * on-chain getAmountOut staticcall for limitAmount + approve + swap(tokenIn, tokenOut, +Σ,
+   * limitAmount, to, 0) — Elfomo PULLS tokenIn via transferFrom and pays tokenOut from its VAULT, so no
+   * engine change. FORK-MEASURED (2026-07-04, see elfomo-math.ts): same-tx quote+swap wei-exact,
+   * gas-price-insensitive; the pricing hard-zeroes quotes once its feed goes ~5–30 s stale (live chains
+   * never get there; the graceful 0 self-drops the venue, never a cook DoS).
+   */
+  Elfomo = "elfomo",
 }
 
 /**
@@ -527,6 +562,29 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
       balancerV3Pools: [
         "0x7ab124ec4029316c2a42f713828ddf2a192b36db" as Hex, // Aave USDC-Aave GHO (waUSDC/waGHO, StableSurge)
       ] },
+    // Tessera V (Wintermute TesseraSwap wrapper — treasury-funded prop-AMM; QL segKind 15). KNOWN-ADDRESS
+    // discovery: the wrapper IS the venue (no pair enumeration — admission is one caught
+    // tesseraSwapViewAmounts liveness probe). On-chain verified (2026-07-04): VERIFIED source on Base
+    // blockscout; live probes — WETH→USDC 1e18 → ~1757.8e6 (and USDC→WETH both ways), unsupported pair
+    // reverts "T33", zero amount reverts "T10", oversized returns (in, 0) graceful; same-tx quote+swap
+    // executed wei-exact at 1/2/2+1wei/5/50 gwei legacy gas price (the engine's ~2-gwei
+    // globalPrioFeeThresholddd1337 shifts the quote by <1bp above threshold, NEVER reverts the swap);
+    // engine 0x31e99E05…0c17 (unverified), treasury 0x3dBE077e…0AaE (USDC ~549k + WETH ~322 inventory,
+    // max allowance to the wrapper). GAS: the engine demands ~18.5M gas AVAILABLE at the call and burns
+    // all forwarded gas when starved — cook with generous limits (see tessera-math.ts). poolType UniV2 is
+    // INERT for Tessera (discovery keys off factoryType; Tessera executes callback-free via its own
+    // EcoTessera path, never a UniV2 router swap) — a placeholder, not a UniV2 claim.
+    { address: "0x55555522005BcAE1c2424D474BfD5ed477749E3e" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Tessera, label: "Tessera V" },
+    // ElfomoFi (vault-funded PMM + on-chain pricing module; QL segKind 16). KNOWN-ADDRESS discovery with
+    // in-wrapper pair ENUMERATION (getSupportedPairs). On-chain verified (2026-07-04): VERIFIED source on
+    // Base blockscout; getSupportedPairs = [[WETH,USDC],[cbBTC,USDC],[0xfde4…9bb2,USDC]] (a listed pair
+    // quotes BOTH directions — verified); getAmountOut GRACEFUL (0 on unsupported pair / zero / stale
+    // feed; oversized quotes a real collapsing-marginal value); same-tx quote+swap executed wei-exact,
+    // gas-price-insensitive (1 vs 5 gwei). Pricing proxy 0xFFFFffBB…d038 → impl 0x00E36cE2…FbD9, oracle
+    // feed 0xf9b0c8Ee…8081 (hard staleness cutoff ~5–30 s — live chains never get there), vault
+    // 0xBb1b19F1…0C99 (max allowance to the wrapper). poolType UniV2 is INERT for Elfomo (same placeholder
+    // convention as Tessera/Fluid/BalancerV3).
+    { address: "0xf0f0F0F0FB0d738452EfD03A28e8be14C76d5f73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Elfomo, label: "ElfomoFi" },
     // Balancer V2 / Fluid / EulerSwap / Fermi on Base: LEFT EMPTY + FLAGGED (verified, none is a deep
     // both-baseToken stable venue):
     //  · Balancer V2 — the deepest V2 stable pools holding baseTokens are dust: USDC/USDbC/axlUSDC
@@ -924,6 +982,17 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // FactoryType.Wombat path (addressOfAsset + per-asset cash/liability + ampFactor/haircutRate),
       // so poolType is unused here — UniV2 is a benign placeholder. Address is the Wombat Main Pool.
       { address: "0x312Bc7eAAF93f1C60Dc5AfC115FcCDE161055fb0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Wombat, label: "Wombat" },
+      // Tessera V (Wintermute TesseraSwap — SAME address as Base; QL segKind 15). On-chain verified
+      // (2026-07-04): live BSC probe WBNB→USDT 1e18 → ~571.77e18 (within ~1.5bp of the same-block
+      // Elfomo quote). Same wrapper surface + engine semantics as the Base entry (see the Base config
+      // + tessera-math.ts for the fork-measured prio-fee/gas-gate evidence). poolType UniV2 is INERT
+      // (discovery keys off factoryType).
+      { address: "0x55555522005BcAE1c2424D474BfD5ed477749E3e" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Tessera, label: "Tessera V" },
+      // ElfomoFi (SAME address as Base; QL segKind 16). On-chain verified (2026-07-04): live BSC
+      // getSupportedPairs = 6 pairs (WBNB/USDT, ETH/USDT, BTCB/USDT, + 3 more, all vs USDT);
+      // getAmountOut WBNB→USDT 1e18 → ~571.73e18. Same wrapper surface + oracle-staleness semantics as
+      // the Base entry (see elfomo-math.ts). poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0xf0f0F0F0FB0d738452EfD03A28e8be14C76d5f73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Elfomo, label: "ElfomoFi" },
     ],
     baseTokens: [
       "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Hex, // WBNB
