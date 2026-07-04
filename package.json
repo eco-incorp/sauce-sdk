@@ -42,6 +42,10 @@
     "./recipes": {
       "types": "./sdk/dist/recipes/index.d.ts",
       "default": "./sdk/dist/recipes/index.js"
+    },
+    "./svm": {
+      "types": "./sdk/dist/svm/index.d.ts",
+      "default": "./sdk/dist/svm/index.js"
     }
   },
   "bin": {

@@ -1,0 +1,139 @@
+import { AccountRole, address, generateKeyPairSigner, getAddressDecoder, getCompiledTransactionMessageDecoder } from '@solana/kit';
+import type { Blockhash, TransactionSigner } from '@solana/kit';
+import { createAltWithAddresses, getTransactionSize, selectAltAddresses, waitForAltActive } from '../../src/svm/index.js';
+import type { SignedExecuteTransaction } from '../../src/svm/index.js';
+
+const A = address('So11111111111111111111111111111111111111112');
+const B = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const C = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+const BLOCKHASH = {
+  blockhash: '11111111111111111111111111111111' as Blockhash,
+  lastValidBlockHeight: 1000n,
+};
+
+type SlotRpc = Parameters<typeof waitForAltActive>[0];
+
+function slotRpcStub(slots: bigint[]): { rpc: SlotRpc; calls: () => number } {
+  let calls = 0;
+  const rpc = {
+    getSlot: () => ({
+      send: async () => {
+        const slot = slots[Math.min(calls, slots.length - 1)];
+        calls += 1;
+        return slot;
+      },
+    }),
+  };
+
+  return { rpc: rpc as unknown as SlotRpc, calls: () => calls };
+}
+
+describe('selectAltAddresses', () => {
+  it('keeps non-signers only (signers cannot be looked up)', () => {
+    const addresses = selectAltAddresses([
+      { address: A, role: AccountRole.WRITABLE },
+      { address: B, role: AccountRole.WRITABLE_SIGNER },
+      { address: C, role: AccountRole.READONLY_SIGNER },
+    ]);
+
+    expect(addresses).toEqual([A]);
+  });
+
+  it('deduplicates repeated addresses in first-seen order', () => {
+    const addresses = selectAltAddresses([
+      { address: C, role: AccountRole.READONLY },
+      { address: A, role: AccountRole.WRITABLE },
+      { address: C, role: AccountRole.WRITABLE },
+    ]);
+
+    expect(addresses).toEqual([C, A]);
+  });
+});
+
+describe('createAltWithAddresses', () => {
+  // 30 unique deterministic addresses
+  const addresses = Array.from({ length: 30 }, (_, i) => getAddressDecoder().decode(new Uint8Array(32).fill(i + 1)));
+
+  function altRpcStub(): Parameters<typeof createAltWithAddresses>[0]['rpc'] {
+    const rpc = {
+      getSlot: () => ({ send: async () => 100n }),
+      getLatestBlockhash: () => ({ send: async () => ({ context: { slot: 100n }, value: BLOCKHASH }) }),
+    };
+
+    return rpc as unknown as Parameters<typeof createAltWithAddresses>[0]['rpc'];
+  }
+
+  async function runWith(payer: TransactionSigner, authority: TransactionSigner): Promise<SignedExecuteTransaction[]> {
+    const sent: SignedExecuteTransaction[] = [];
+    await createAltWithAddresses({
+      rpc: altRpcStub(),
+      payer,
+      authority,
+      addresses,
+      sendAndConfirm: async transaction => {
+        sent.push(transaction);
+      },
+    });
+
+    return sent;
+  }
+
+  /** Address count carried by the single extend instruction of a sent transaction: data = u32 discriminator + u64 count + N*32. */
+  function extendedCount(transaction: SignedExecuteTransaction): number {
+    const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+    if (compiled.version !== 0) throw new Error('expected a v0 compiled message');
+    const [instruction] = compiled.instructions;
+
+    return (instruction.data!.length - 12) / 32;
+  }
+
+  it('extends 30 addresses in one chunk when payer === authority, inside the packet limit', async () => {
+    const payer = await generateKeyPairSigner();
+
+    const sent = await runWith(payer, payer);
+
+    expect(sent).toHaveLength(2); // create + 1 extend
+    expect(extendedCount(sent[1])).toBe(30);
+    for (const transaction of sent) expect(getTransactionSize(transaction)).toBeLessThanOrEqual(1232);
+  });
+
+  it('extends in chunks of 27 when payer and authority are distinct signers, inside the packet limit', async () => {
+    // second signature (64B) + extra static account (32B) cost 3 address slots:
+    // a 30-address chunk would compile to 1308 bytes (> 1232)
+    const payer = await generateKeyPairSigner();
+    const authority = await generateKeyPairSigner();
+
+    const sent = await runWith(payer, authority);
+
+    expect(sent).toHaveLength(3); // create + 2 extends
+    expect(extendedCount(sent[1])).toBe(27);
+    expect(extendedCount(sent[2])).toBe(3);
+    for (const transaction of sent) expect(getTransactionSize(transaction)).toBeLessThanOrEqual(1232);
+  });
+});
+
+describe('waitForAltActive', () => {
+  it('resolves only once the slot passes lastExtendedSlot (extend in N, usable N+1)', async () => {
+    const { rpc, calls } = slotRpcStub([5n, 5n, 6n]);
+
+    await waitForAltActive(rpc, 5n, { pollMs: 1 });
+
+    expect(calls()).toBe(3);
+  });
+
+  it('resolves immediately when the slot has already advanced', async () => {
+    const { rpc, calls } = slotRpcStub([9n]);
+
+    await waitForAltActive(rpc, 5n, { pollMs: 1 });
+
+    expect(calls()).toBe(1);
+  });
+
+  it('times out with a clear error while the slot is stuck', async () => {
+    const { rpc } = slotRpcStub([5n]);
+
+    await expect(waitForAltActive(rpc, 5n, { timeoutMs: 10, pollMs: 1 })).rejects.toThrow(
+      'address lookup table not active after 10ms: current slot 5 has not passed last extended slot 5',
+    );
+  });
+});
