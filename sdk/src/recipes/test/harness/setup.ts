@@ -170,6 +170,21 @@ export const metricRouterArtifact = loadArtifact(
 export const metricPriceProviderArtifact = loadArtifact(
   join(FIXTURES, "MetricPriceProvider.sol", "MetricPriceProvider.json"),
 );
+/** LiquidCore (Liquid Labs, HyperEVM) — per-pair pool + discovery router + the input-keyed BBO
+ *  precompile mock (its RUNTIME is setCode'd at the CANONICAL 0x…080e precompile address). */
+export const liquidCorePoolArtifact = loadArtifact(
+  join(FIXTURES, "LiquidCorePool.sol", "LiquidCorePool.json"),
+);
+export const liquidCoreRouterArtifact = loadArtifact(
+  join(FIXTURES, "LiquidCoreRouter.sol", "LiquidCoreRouter.json"),
+);
+export const hlBboPrecompileMockArtifact = loadArtifact(
+  join(FIXTURES, "HLBboPrecompileMock.sol", "HLBboPrecompileMock.json"),
+);
+/** Integral SIZE (TwapRelayer) — single relayer holding every pair's inventory; settable price/window. */
+export const sizeRelayerArtifact = loadArtifact(
+  join(FIXTURES, "SizeRelayer.sol", "SizeRelayer.json"),
+);
 /** Mento V2 (Celo Broker + BiPoolManager) — the Broker is the swap entry; the BiPoolManager is the
  *  ENUMERABLE exchange provider (getExchanges). Both deployed normally; the Broker holds token reserves. */
 export const mentoBrokerArtifact = loadArtifact(
@@ -1619,6 +1634,158 @@ export async function deployMetricStack(
     address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
   });
   return { pool, router, provider };
+}
+
+// The REAL LIQUIDCORE surfaces the fixtures mirror (probed live on HyperEVM 2026-07-04; see
+// liquidcore-math.ts): the pool's STATICCALL-safe estimateSwap + the permissionless approve-first
+// swap (pull == approve always), the router's UNORDERED getPoolForPair + getPools enumeration (one
+// zero entry on the real list), and the INPUT-KEYED BBO precompile mock etched at the CANONICAL
+// HyperEVM read-precompile address (raw 32-byte spot-index in, (bid, ask) out — setBbo is the
+// fixture's drift lever, mirroring a Hyperliquid book re-post).
+export const liquidCorePoolFixtureAbi = parseAbi([
+  "function estimateSwap(address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256 amountOut)",
+  "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut) returns (uint256 amountOut)",
+  "function getTokens() view returns (address tokenA, address tokenB)",
+  "function getReserves() view returns (uint256 reserve0, uint256 reserve1)",
+]);
+export const liquidCoreRouterFixtureAbi = parseAbi([
+  "function registerPool(address pool, address tokenA, address tokenB)",
+  "function registerZeroEntry()",
+  "function getPools() view returns (address[] pools)",
+  "function getPoolForPair(address tokenA, address tokenB) view returns (address pool)",
+]);
+export const hlBboMockAbi = parseAbi([
+  "function setBbo(uint256 index, uint256 bid, uint256 ask)",
+]);
+
+/** The CANONICAL HyperEVM BBO read-precompile address (the mock is etched here — the pool fixture
+ *  reads the SAME address the real LiquidCore pools read on HyperEVM). */
+export const HL_BBO_ADDRESS = "0x000000000000000000000000000000000000080e" as Hex;
+
+/**
+ * Deploy a local LIQUIDCORE stack — the INPUT-KEYED BBO precompile mock ETCHED AT THE CANONICAL
+ * 0x…080e address (the exact precompile-mock pattern the real HyperEVM integration needs; seeded
+ * with (bid, ask) per spot index), a discovery Router (getPoolForPair/getPools — with the real
+ * list's zero entry), and a per-pair Pool priced off the etched BBO (linear cross + hyperbolic
+ * inventory saturation + fee — see LiquidCorePool.sol) funded with both reserves. Re-set prices
+ * via hlBboMockAbi.setBbo AT HL_BBO_ADDRESS (the drift cells' lever).
+ */
+export async function deployLiquidCoreStack(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void> },
+  token0: Hex,
+  token1: Hex,
+  index0: bigint,
+  index1: bigint,
+  bid0: bigint,
+  ask0: bigint,
+  bid1: bigint,
+  ask1: bigint,
+  feePpm: bigint,
+  reserve0: bigint,
+  reserve1: bigint,
+  minter?: Account,
+): Promise<{ pool: Hex; router: Hex; bbo: Hex }> {
+  // 1. The BBO mock: deploy normally, ETCH its runtime at the canonical precompile address, then
+  //    seed the per-index books THERE (storage lives at the etched address).
+  const scratch = await deployContract(walletClient, publicClient, {
+    abi: hlBboPrecompileMockArtifact.abi,
+    bytecode: hlBboPrecompileMockArtifact.bytecode,
+    args: [],
+  });
+  const runtime = await publicClient.getCode({ address: scratch });
+  if (!runtime || runtime === "0x") throw new Error("failed to capture HLBboPrecompileMock runtime");
+  await testClient.setCode({ address: HL_BBO_ADDRESS, bytecode: runtime });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: HL_BBO_ADDRESS, abi: hlBboMockAbi as Abi, functionName: "setBbo", args: [index0, bid0, ask0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: HL_BBO_ADDRESS, abi: hlBboMockAbi as Abi, functionName: "setBbo", args: [index1, bid1, ask1], account: acct,
+  });
+
+  // 2. The discovery router + the per-pair pool (reading the CANONICAL precompile address).
+  const router = await deployContract(walletClient, publicClient, {
+    abi: liquidCoreRouterArtifact.abi,
+    bytecode: liquidCoreRouterArtifact.bytecode,
+    args: [],
+  });
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: liquidCorePoolArtifact.abi,
+    bytecode: liquidCorePoolArtifact.bytecode,
+    args: [token0, token1, HL_BBO_ADDRESS, index0, index1, feePpm],
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: router, abi: liquidCoreRouterFixtureAbi as Abi, functionName: "registerZeroEntry", args: [], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: router, abi: liquidCoreRouterFixtureAbi as Abi, functionName: "registerPool", args: [pool, token0, token1], account: acct,
+  });
+
+  // 3. Fund the pool's two-token inventory.
+  await writeAndWait(walletClient, publicClient, {
+    address: token0, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve0], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: token1, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, reserve1], account: acct,
+  });
+  return { pool, router, bbo: HL_BBO_ADDRESS };
+}
+
+// The VERIFIED Integral SIZE (TwapRelayer) surface the fixture mirrors (TwapRelayer.sol +
+// fork-probed 2026-07-04; see size-math.ts): quoteSell/quoteBuy with the OUT-amount [min, cap]
+// window (TR03/TR3A), getTokenLimitMin, and the struct-arg sell (pull == approve always; the input
+// forwards to the DELAY sink). setPair/setLimits are fixture-only levers (TWAP drift + window
+// cells).
+export const sizeRelayerFixtureAbi = parseAbi([
+  "function quoteSell(address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256 amountOut)",
+  "function quoteBuy(address tokenIn, address tokenOut, uint256 amountOut) view returns (uint256 amountIn)",
+  "function getTokenLimitMin(address token) view returns (uint256)",
+  "function getTokenLimitMaxMultiplier(address token) view returns (uint256)",
+  "function sell((address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, bool wrapUnwrap, address to, uint32 submitDeadline) p) payable returns (uint256 orderId)",
+  "function setPair(address tokenIn, address tokenOut, uint256 price, uint256 swapFee, bool enabled)",
+  "function setLimits(address token, uint256 min, uint256 maxMult)",
+  "function delay() view returns (address)",
+]);
+
+/**
+ * Deploy a local Integral SIZE TwapRelayer fixture wired for ONE directional pair (set the reverse
+ * direction with another setPair if a cell needs it), funded with tokenOut inventory. `price` is
+ * tokenOut-per-tokenIn 1e18-scaled; `swapFee` 1e18-scaled; the OUT window is (minOut,
+ * maxMult=0.95e18) on tokenOut. `delaySink` receives the pulled input (the real relayer forwards
+ * it to its TwapDelay hedge queue — inventory-neutral for the relayer's tokenIn).
+ */
+export async function deploySizeRelayer(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  tokenIn: Hex,
+  tokenOut: Hex,
+  price: bigint,
+  swapFee: bigint,
+  minOutLimit: bigint,
+  outReserve: bigint,
+  delaySink: Hex,
+  minter?: Account,
+): Promise<Hex> {
+  const relayer = await deployContract(walletClient, publicClient, {
+    abi: sizeRelayerArtifact.abi,
+    bytecode: sizeRelayerArtifact.bytecode,
+    args: [delaySink],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: relayer, abi: sizeRelayerFixtureAbi as Abi, functionName: "setPair",
+    args: [tokenIn, tokenOut, price, swapFee, true], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: relayer, abi: sizeRelayerFixtureAbi as Abi, functionName: "setLimits",
+    args: [tokenOut, minOutLimit, 950_000_000_000_000_000n], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenOut, abi: erc20Abi as Abi, functionName: "transfer", args: [relayer, outReserve], account: acct,
+  });
+  return relayer;
 }
 
 // The REAL Fluid DEX surface the fixtures mirror: DexT1 token0/token1 + swapIn (approve-first pull, output

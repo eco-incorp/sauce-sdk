@@ -3658,6 +3658,27 @@ export interface FermiStateSnapshot {
   metricPool?: Hex;
   metricProvider?: Hex;
   metricAnchor?: { bid: string; ask: string };
+  /** SIZE snapshots only (harness/size-snapshot.ts — fermi-SHAPED: `fermiSwapper` = `vault` = the
+   *  RELAYER): the TwapDelay the sell forwards input to, the relayer's captured ETH balance (its
+   *  hedge prepay funding — the test must anvil_setBalance it), and the captured window reads.
+   *  Absent on non-SIZE snapshots. */
+  sizeDelay?: Hex;
+  sizeRelayerEth?: string;
+  sizeWindow?: {
+    minOutWETH: string;
+    minOutUSDC: string;
+    maxMultiplier: string;
+    minInUsdcToWeth: string;
+    minInWethToUsdc: string;
+    pair: Hex;
+    swapFee: string;
+  };
+  /** LIQUIDCORE snapshots only (harness/liquidcore-snapshot.ts — fermi-SHAPED: `fermiSwapper` = the
+   *  ROUTER, `vault` = the per-pair POOL): the pool address + the captured HyperEVM BBO
+   *  precompile books (spot index → (bid, ask)) the test seeds into the input-keyed mock etched at
+   *  the canonical 0x…080e. Absent on non-LiquidCore snapshots. */
+  lcPool?: Hex;
+  lcBbo?: Record<string, { bid: string; ask: string }>;
   probe: {
     target: { pair: string; ladder: { amountIn: string; amountOut: string }[] };
     second: { pair: string; ladder: { amountIn: string; amountOut: string }[] } | null;
