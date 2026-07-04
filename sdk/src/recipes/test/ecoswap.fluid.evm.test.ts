@@ -289,6 +289,14 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1 Liquidity-Layer re-centering A
     assert.equal(received, fixtureQuote(true, spent), "received == closed-form quote(share) to the wei (exact-in-dy)");
     assert.equal(received, onViewPre, "received == on-chain estimateSwapIn view (exact-in-dy)");
     assert.ok(received > 0n, "non-zero Fluid fill through the callback-free approve+swapIn path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): FluidDexT1.swapIn pulls EXACTLY amountIn via
+    // safeTransferFrom (verified fluid-contracts-public) — pull == approve, no allowance residue on the
+    // shared cooking contract.
+    const residue = (await c.publicClient.readContract({
+      address: token0, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Fluid pool allowance residue (pull == approve)");
 
     console.log(
       `  [QL Fluid solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

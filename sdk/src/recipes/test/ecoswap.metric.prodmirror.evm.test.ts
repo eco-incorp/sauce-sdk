@@ -260,6 +260,16 @@ describe("EcoSwap METRIC prod-mirror — REAL router+pool+provider+oracle byteco
     assert.equal(poolIn, spent, "the REAL router's callback pulled the input into the POOL");
     assert.equal(received, onViewPre, "received == REAL router pre-swap quoteSwap(awarded) (wei-exact-vs-live-quote)");
     assert.ok(received > 0n, "caller receives tokenOut from the pool inventory");
+    // RESIDUE SWEEP: Metric is the ONE family whose exec can BY DESIGN pull less than it approves
+    // (the router pulls only the CONSUMED input on a partial fill), so the exec arm resets the
+    // allowance with approve(0) after the swap (the d86f134 USDT-class DoS fix). Assert the reset
+    // held on the GENUINE router bytecode — a residue would brick later cooks on
+    // nonzero→nonzero-revert tokens.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, ROUTER],
+    })) as bigint;
+    assert.equal(residue, 0n, "the approve(0) reset cleared the REAL Metric router allowance (no residue)");
 
     const ms = Date.now() - t0;
     console.log(

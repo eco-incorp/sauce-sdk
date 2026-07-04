@@ -359,6 +359,17 @@ describe("EcoSwap Fermi / propAMM (FermiSwapper oracle-priced proactive AMM) pro
     const dOut = received > oracleOut ? received - oracleOut : oracleOut - received;
     assert.ok(dOut * 1_000_000n <= received, `oracle ladder-interp getAmountOut within ~1 ppm of the live dy (Δ=${dOut} of ${received})`);
 
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the UNVERIFIED FermiSwapper
+    // for the awarded Σ — the counterparty class that COULD pull less than approved (the Metric partial-fill
+    // lesson). Probed on this REAL bytecode: quoteAmounts returns aIn == the requested exact-in at every
+    // size (incl. a 100k-WETH capped-output oversize, where the swap still pulled the FULL input), so
+    // pull == approve always. Assert the residue is 0 after the genuine-bytecode cook.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.fermiSwapper],
+    })) as bigint;
+    assert.equal(residue, 0n, "no FermiSwapper allowance residue on the REAL bytecode (pull == approve)");
+
     const ms = Date.now() - t0;
     console.log(
       `  [fermi-prod-mirror:${engine}] WEI-EXACT vs neutral oracle + real view — spent=${spent} received=${received} ` +

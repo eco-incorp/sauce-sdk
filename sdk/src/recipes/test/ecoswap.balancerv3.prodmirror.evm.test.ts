@@ -43,7 +43,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Abi, type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -367,6 +367,24 @@ describe("EcoSwap Balancer V3 (on-chain StableMath quote-ladder, live-rate-scale
     const probe100k = snaps.state.probe.inToOut.find((p) => BigInt(p.amountIn) === amountIn);
     assert.ok(probe100k, "captured probe includes the 100k waUSDC size");
     assert.equal(received, BigInt(probe100k!.amountOut), "received == the CAPTURED mainnet querySwap(100k waUSDC) value to the wei");
+
+    // RESIDUE SWEEP (the Metric USDT-class lesson) — BOTH Permit2 legs: the exec raw-approves
+    // ERC20(tokenIn)→PERMIT2 for the awarded Σ (the USDT-class DoS surface: a residue there bricks the
+    // next cook's nonzero→nonzero approve) and Permit2→ROUTER for uint160(Σ). The VERIFIED pull chain
+    // consumes EXACTLY Σ (RouterCommon._takeTokenIn → permit2.transferFrom(sender, vault, amountIn) —
+    // balancer-v3-monorepo; Permit2 decrements both its own allowance and the ERC20 one by the exact
+    // transferred amount). Assert both residues are 0 on the GENUINE bytecode.
+    const erc20Residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.permit2],
+    })) as bigint;
+    assert.equal(erc20Residue, 0n, "no ERC20→Permit2 allowance residue on the REAL graph (pull == approve)");
+    const p2Allow = (await c.publicClient.readContract({
+      address: etched.permit2,
+      abi: parseAbi(["function allowance(address owner, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)"]) as Abi,
+      functionName: "allowance", args: [target, tokenIn, etched.router],
+    })) as readonly [bigint, number, number];
+    assert.equal(p2Allow[0], 0n, "no Permit2→Router allowance residue (the Router consumed exactly uint160(Σ))");
 
     const ms = Date.now() - t0;
     console.log(

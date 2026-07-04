@@ -220,6 +220,15 @@ describe("EcoSwap Fermi / propAMM QL live-walk (local fixture) — on-chain quot
     assert.equal(poolIn, amountIn, "the Fermi pool pulled the full input share (approve + pull)");
     assert.equal(received, onViewPre, "received == on-chain quoteAmounts view to the wei");
     assert.ok(received > 0n, "non-zero Fermi fill through the callback-free approve+swap path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): fermiSwapWithAllowances pulls EXACTLY the requested
+    // exact-in (probed on the REAL Ethereum bytecode: quoteAmounts returns aIn == requested at EVERY size
+    // incl. a 100k-WETH capped-output oversize, and the executed pull matched with residue 0) — pull ==
+    // approve, no allowance residue on the shared cooking contract.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Fermi allowance residue (pull == approve)");
 
     console.log(
       `  [QL Fermi solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

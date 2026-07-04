@@ -71,7 +71,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -384,6 +384,17 @@ describe("EcoSwap Fluid DEX (Instadapp FluidDexT1) prod-mirror — REAL bytecode
     const probe100k = snaps.state.probe.swap0to1.find((p) => BigInt(p.amountIn) === amountIn);
     assert.ok(probe100k, "captured probe includes the 100k USDC size");
     assert.equal(received, BigInt(probe100k!.amountOut), "received == the CAPTURED mainnet estimateSwapIn(100k USDC) value to the wei");
+
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the POOL for the awarded Σ
+    // and the VERIFIED FluidDexT1.swapIn pulls EXACTLY amountIn via safeTransferFrom into the Liquidity
+    // layer (fluid-contracts-public — no partial-fill path; liqIn == spent was asserted above). Assert
+    // pull == approve on the GENUINE bytecode: a leftover allowance on the shared cooking contract would
+    // brick later cooks on nonzero→nonzero-revert tokens (this venue's token1 IS mainnet USDT).
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no pool allowance residue on the REAL Fluid bytecode (pull == approve)");
 
     const ms = Date.now() - t0;
     console.log(

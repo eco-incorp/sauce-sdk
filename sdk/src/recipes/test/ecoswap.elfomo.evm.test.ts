@@ -221,6 +221,14 @@ describe("EcoSwap ElfomoFi QL live-walk (local fixture) — on-chain graceful ge
     assert.equal(poolIn, amountIn, "the wrapper pulled the full input share (approve + pull)");
     assert.equal(received, onViewPre, "received == on-chain getAmountOut to the wei");
     assert.ok(received > 0n, "non-zero Elfomo fill through the callback-free approve+swap path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): Elfomo's swap pulls EXACTLY the positive exact-in
+    // specifiedAmount (probed on the REAL Base bytecode: even a 100k-WETH capped-output oversize pulled
+    // the FULL input with residue 0) — pull == approve, no allowance residue on the cooking contract.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Elfomo wrapper allowance residue (pull == approve)");
 
     console.log(
       `  [QL Elfomo solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

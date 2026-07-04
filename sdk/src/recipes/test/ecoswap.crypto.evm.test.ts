@@ -272,6 +272,14 @@ describe("EcoSwap Curve CryptoSwap QL live-walk (local fixture) — on-chain lad
     assert.equal(received, getDyCrypto(op, spent), "received == getDyCrypto(share) to the wei (exact-in-dy)");
     assert.equal(received, onViewPre, "received == on-chain get_dy view (exact-in-dy)");
     assert.ok(received > 0n, "non-zero CryptoSwap fill through the callback-free exchange path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): CryptoSwap's exchange pulls EXACTLY dx via
+    // transferFrom (verified vyper source) — pull == approve, so no allowance residue survives on the
+    // shared cooking contract (a residue would brick later cooks on nonzero→nonzero-revert tokens).
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no CryptoSwap pool allowance residue (pull == approve)");
 
     console.log(
       `  [QL CryptoSwap solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

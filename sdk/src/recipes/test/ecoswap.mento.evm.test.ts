@@ -235,6 +235,14 @@ describe("EcoSwap Mento V2 QL live-walk (local fixture) — on-chain getAmountOu
     assert.equal(received, mentoQuoteClosed(op.closed!, spent), "received == getAmountOut(share) closed model to the wei");
     assert.equal(received, onViewPre, "received == on-chain getAmountOut view to the wei (exact-in-dy)");
     assert.ok(received > 0n, "non-zero Mento fill through the callback-free approve+swapIn path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): Broker.transferIn pulls EXACTLY amountIn via
+    // safeTransferFrom on BOTH branches (verified mento-core Broker.sol) — pull == approve, so no
+    // Broker allowance residue survives on the shared cooking contract.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, broker],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Broker allowance residue (pull == approve)");
 
     console.log(
       `  [QL Mento solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

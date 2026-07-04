@@ -246,6 +246,15 @@ describe("EcoSwap ElfomoFi (vault-funded PMM + pricing module) prod-mirror — R
     assert.equal(vaultIn, spent, "the REAL wrapper routed the input into the vault (approve + transferFrom)");
     assert.equal(received, onViewPre, "received == REAL wrapper pre-swap getAmountOut(awarded) (wei-exact-vs-live-quote)");
     assert.ok(received > 0n, "caller receives tokenOut from the vault");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the UNVERIFIED Elfomo
+    // wrapper for the awarded Σ — the counterparty class that COULD pull less than approved (the Metric
+    // partial-fill lesson). Probed on this REAL bytecode: even a 100k-WETH capped-output oversize pulled
+    // the FULL input with residue 0 — pull == approve always. Assert the allowance is 0 after the cook.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.fermiSwapper],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Elfomo wrapper allowance residue on the REAL bytecode (pull == approve)");
 
     const ms = Date.now() - t0;
     console.log(

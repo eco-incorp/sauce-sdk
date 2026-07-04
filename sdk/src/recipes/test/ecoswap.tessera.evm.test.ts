@@ -240,6 +240,14 @@ describe("EcoSwap Tessera V QL live-walk (local fixture) — on-chain viewAmount
     assert.equal(poolIn, amountIn, "the wrapper pulled the full input share (approve + pull)");
     assert.equal(received, onViewPre, "received == on-chain tesseraSwapViewAmounts to the wei");
     assert.ok(received > 0n, "non-zero Tessera fill through the callback-free approve+swap path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec approves the wrapper for the exact-in Σ and
+    // tesseraSwapWithAllowances pulls exactly the engine-computed amountIn (== the requested exact-in
+    // whenever the view answers > 0 — the oversized class returns (aIn, 0) and skips). Residue must be 0.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Tessera wrapper allowance residue (pull == approve)");
 
     console.log(
       `  [QL Tessera solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

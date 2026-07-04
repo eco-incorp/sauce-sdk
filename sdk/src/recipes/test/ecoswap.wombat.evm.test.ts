@@ -232,6 +232,14 @@ describe("EcoSwap Wombat QL live-walk (local fixture) — on-chain quotePotentia
     assert.equal(received, quotePotentialSwap(op, spent), "received == quotePotentialSwap(share) to the wei");
     assert.equal(received, onViewPre, "received == on-chain quotePotentialSwap view to the wei");
     assert.ok(received > 0n, "non-zero Wombat fill through the callback-free approve+swap path");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): Wombat's swap pulls EXACTLY fromAmount (verified
+    // Pool.sol safeTransferFrom) — pull == approve, so the shared cooking contract keeps NO allowance
+    // residue (a residue would brick later cooks on nonzero→nonzero-revert tokens).
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Wombat pool allowance residue (pull == approve)");
 
     console.log(
       `  [QL Wombat solo:${engine}] slices=${ladder.length} spent=${spent} received=${received} ` +

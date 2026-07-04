@@ -75,7 +75,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Abi, type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -390,6 +390,17 @@ describe("EcoSwap Mento V2 (Celo Broker + BiPoolManager) prod-mirror — REAL by
     // "on-chain QL ladder == REAL etched view at the ladder points" tie AND exact-in-dy (the Mento exec
     // re-reads getAmountOut(awarded) as amountOutMin and swaps to exactly it).
     assert.equal(received, onViewAwarded, "received == REAL Broker LIVE getAmountOut(awarded Σ) (exact-in-dy, real graph)");
+
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the BROKER for the awarded Σ
+    // and the VERIFIED Broker.transferIn pulls EXACTLY amountIn via safeTransferFrom on BOTH branches
+    // (stable: transferFrom→burn; collateral: transferFrom→reserve — mento-core Broker.sol). Assert
+    // pull == approve on the GENUINE graph: a leftover allowance on the shared cooking contract would
+    // brick later cooks on nonzero→nonzero-revert tokens.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.broker],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Broker allowance residue on the REAL Mento graph (pull == approve)");
 
     const ms = Date.now() - t0;
     console.log(

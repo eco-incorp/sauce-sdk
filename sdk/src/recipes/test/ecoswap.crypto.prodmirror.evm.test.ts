@@ -81,7 +81,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -413,6 +413,16 @@ describe("EcoSwap Curve CryptoSwap (twocrypto-NG) prod-mirror — REAL bytecode,
     // read on the PRE-swap state — exchange mutates balances, so a post-swap re-read quotes a moved pool.)
     // With spent == awarded this ties the executed output to the real pool's own twocrypto-NG curve.
     assert.equal(received, onViewPre, "received == REAL pool pre-swap get_dy(spent == awarded Σ) (exact-in-dy)");
+
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the POOL for the awarded Σ
+    // and twocrypto-NG's exchange pulls EXACTLY dx via transferFrom (verified vyper source — no
+    // partial-fill path). Assert pull == approve on the GENUINE bytecode: a leftover allowance on the
+    // shared cooking contract would brick later cooks on nonzero→nonzero-revert tokens (mainnet USDT).
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no pool allowance residue on the REAL twocrypto-NG bytecode (pull == approve)");
 
     const ms = Date.now() - t0;
     console.log(

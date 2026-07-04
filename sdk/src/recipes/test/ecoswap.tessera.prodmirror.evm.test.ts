@@ -293,6 +293,16 @@ describe("EcoSwap Tessera V (TesseraSwap wrapper + private engine) prod-mirror �
     assert.equal(treasuryIn, spent, "the REAL wrapper routed the input into the treasury (approve + transferFrom)");
     assert.equal(received, onViewPre, "received == REAL wrapper pre-swap viewAmounts(awarded)[1] (wei-exact-vs-live-quote)");
     assert.ok(received > 0n, "caller receives tokenOut from the treasury");
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the UNVERIFIED Tessera
+    // wrapper for the awarded Σ — the counterparty class that COULD pull less than approved (the Metric
+    // partial-fill lesson). treasuryIn == spent above already shows the FULL input moved; this pins the
+    // allowance itself to 0 on the GENUINE engine bytecode (a residue would brick later cooks on
+    // nonzero→nonzero-revert tokens).
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.fermiSwapper],
+    })) as bigint;
+    assert.equal(residue, 0n, "no Tessera wrapper allowance residue on the REAL engine (pull == approve)");
 
     const ms = Date.now() - t0;
     console.log(

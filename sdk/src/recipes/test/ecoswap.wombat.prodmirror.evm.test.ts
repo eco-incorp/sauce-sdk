@@ -53,7 +53,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -380,6 +380,16 @@ describe("EcoSwap Wombat (single-sided stableswap) prod-mirror — REAL bytecode
     // the awarded Σ the solver spent, ties the executed output to the real pool's own curve.
     assert.equal(received, quotePotentialSwap(op, spent), "received == neutral-oracle quotePotentialSwap(spent) (wei-exact-in-dy)");
     assert.equal(received, onViewOut, "received == REAL pool pre-swap quotePotentialSwap(awarded Σ) (exact-in-dy)");
+
+    // RESIDUE SWEEP (the Metric USDT-class lesson): the exec arm raw-approves the POOL for the awarded Σ
+    // and the VERIFIED Wombat Pool.swap pulls EXACTLY fromAmount via safeTransferFrom (wombat-exchange
+    // v1-core Pool.sol — no partial-fill path). Assert pull == approve on the GENUINE bytecode: a leftover
+    // allowance on the shared cooking contract would brick later cooks on nonzero→nonzero-revert tokens.
+    const residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.pool],
+    })) as bigint;
+    assert.equal(residue, 0n, "no pool allowance residue on the REAL Wombat bytecode (pull == approve)");
 
     const ms = Date.now() - t0;
     console.log(

@@ -37,7 +37,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type Abi, type Account, type Hex } from "viem";
+import { parseAbi, type Abi, type Account, type Hex } from "viem";
 
 import { startAnvil, type AnvilHandle } from "./harness/anvil";
 import { makeClients, type HarnessClients } from "./harness/clients";
@@ -245,7 +245,20 @@ describe("EcoSwap Balancer V3 (on-chain StableMath QL, real etched graph) — di
     assert.ok(spent > 0n && received > 0n, "non-zero fill");
     assert.equal(spent, awarded, "spent == oracle awarded input (wei-exact)");
     assert.equal(received, onViewAwarded, "received == REAL Router LIVE querySwap(awarded) (exact-in-dy)");
-    console.log(`  [BalancerV3 size:${engine}:${sizeUnits}k] spent=${spent} received=${received} (wei-exact vs oracle+query)`);
+    // RESIDUE SWEEP (the Metric USDT-class lesson) — BOTH Permit2 legs consumed exactly (the Router's
+    // _takeTokenIn pulls exactly amountIn via Permit2, which decrements the ERC20 allowance in lockstep).
+    const erc20Residue = (await c.publicClient.readContract({
+      address: tokenIn, abi: parseAbi(["function allowance(address, address) view returns (uint256)"]) as Abi,
+      functionName: "allowance", args: [target, etched.permit2],
+    })) as bigint;
+    assert.equal(erc20Residue, 0n, "no ERC20→Permit2 allowance residue (pull == approve)");
+    const p2Allow = (await c.publicClient.readContract({
+      address: etched.permit2,
+      abi: parseAbi(["function allowance(address owner, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)"]) as Abi,
+      functionName: "allowance", args: [target, tokenIn, etched.router],
+    })) as readonly [bigint, number, number];
+    assert.equal(p2Allow[0], 0n, "no Permit2→Router allowance residue (exact uint160(Σ) consumption)");
+    console.log(`  [BalancerV3 size:${engine}:${sizeUnits}k] spent=${spent} received=${received} (wei-exact vs oracle+query; residue 0)`);
   }
 
   for (const { engine, skip } of ENGINE_CELLS) {
