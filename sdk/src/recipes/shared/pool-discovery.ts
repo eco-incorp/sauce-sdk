@@ -39,6 +39,12 @@ import { type FermiPool, fermiSampleInputs, FERMI_FEE_SCALE } from "./fermi-math
 import { type FluidVenue, FLUID_FEE_SCALE } from "./fluid-math.js";
 import { type TesseraVenue, TESSERA_FEE_SCALE } from "./tessera-math.js";
 import { type ElfomoVenue, ELFOMO_FEE_SCALE } from "./elfomo-math.js";
+import {
+  type MetricVenue,
+  METRIC_FEE_SCALE,
+  METRIC_INT128_MAX,
+  METRIC_LIMIT_MAX_U128,
+} from "./metric-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -451,6 +457,26 @@ const elfomoFiAbi = parseAbi([
   "struct ElfomoTokenPair { address tokenA; address tokenB; }",
   "function getSupportedPairs() external view returns (ElfomoTokenPair[])",
   "function getAmountOut(address fromToken, address toToken, uint256 fromAmount) external view returns (uint256 toAmount)",
+]);
+
+// METRIC (metric.xyz oracle-anchored bin-curve OMM) read surface for the EcoSwap TYPED path — the REAL
+// (UNVERIFIED-source, bytecode-probed + selector-resolved) interfaces; see metric-math.ts for the full
+// probe record. `getImmutables()` word [1] = the pool's PriceProvider, [2] = token0, [3] = token1
+// (word [0] = the protocol config contract; the real Base pool returns 14 words — the tail is curve
+// parameters the recipe does not consume, and viem tolerates the extra trailing words, so ONLY the
+// leading four are declared — robust across pool code variants). `getBidAndAskPrice()` is the
+// maker-posted X64 anchor (STALENESS-REVERT class — 0x9a0423af past MAX_TIME_DELTA, so probes are
+// caught). `quoteSwap` prices DIRECTLY off the caller-supplied (bid, ask) with a DIRECTIONAL price
+// limit (0 for xToY, uint128.max for yToX; the wrong side quotes (0,0) gracefully) and returns SIGNED
+// deltas (IN positive = consumed — an oversized ask partial-fills; OUT negative).
+const metricPoolAbi = parseAbi([
+  "function getImmutables() external view returns (address factory, address priceProvider, address token0, address token1)",
+]);
+const metricProviderAbi = parseAbi([
+  "function getBidAndAskPrice() external view returns (uint128 bid, uint128 ask)",
+]);
+const metricRouterAbi = parseAbi([
+  "function quoteSwap(address pool, bool xToY, int128 amountSpecified, uint128 priceLimit, uint128 bid, uint128 ask) external view returns (int256 amount0Delta, int256 amount1Delta)",
 ]);
 
 // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) read surface for the
@@ -2842,6 +2868,135 @@ export async function discoverElfomoPoolsTyped(
       });
     } catch {
       // Wrapper read failed (not an ElfomoFi, paused, or unsupported pair) — skip.
+    }
+  }
+  return out;
+}
+
+// ── METRIC discovery ─────────────────────────────────────────
+
+/**
+ * Discover METRIC (metric.xyz oracle-anchored bin-curve OMM) venues for the pair AS TYPED
+ * DESCRIPTOR-ONLY `MetricVenue`s + a liveness-probe head (the EcoSwap QUOTE-LADDER path). A Metric pool
+ * is a per-pair inventory contract priced off a maker-posted PriceProvider anchor (NOT xy=k), so it must
+ * NOT be priced through the V2 synthetic-sqrt path. Discovery is KNOWN-POOL-ADDRESS based (the
+ * BalancerV3/Fluid pattern — NO on-chain enumeration exists; see metric-math.ts): the FactoryConfig
+ * carries `metricPools` + the per-config `metricRouter` (Base runs TWO routers over disjoint pool sets).
+ *
+ * Per candidate pool (3 RPCs):
+ *   1. `pool.getImmutables()` — provider [1] / token0 [2] / token1 [3]; skip a pool not trading EXACTLY
+ *      this pair; orient `xToY` = (tokenIn == token0).
+ *   2. `provider.getBidAndAskPrice()` — PROBE-THEN-DECODE (the provider REVERTS 0x9a0423af when the
+ *      maker's off-chain post is older than MAX_TIME_DELTA (~10 s) or under its Chainlink
+ *      deviation/sequencer guards): a stale/quiet maker drops here. Derives the diagnostic feePpm as
+ *      HALF the relative bid/ask spread (works for any pair — no near-par assumption).
+ *   3. `router.quoteSwap(pool, xToY, +probeIn, limit, bid, ask)` at the FIRST QL slice size with the
+ *      DIRECTIONAL limit (0 for xToY, uint128.max for yToX): the |negative out-delta| must be strictly
+ *      positive (an EMPTY pool quotes (0,0) gracefully — drops; garbage anchors would revert — caught).
+ *
+ * NO SAMPLING (the QL family contract): the on-chain solver hoists the SAME provider anchor once per
+ * venue in setup and builds the ladder LIVE from quoteSwap quote-differencing at the frozen (bid, ask),
+ * so discovery ships only the descriptor. Execution is CALLBACK-FREE from the cooking contract's
+ * perspective (approve ROUTER + swapExactInput — the pool pays out first and re-enters
+ * metricOmmSwapCallback ON THE ROUTER, which implements it itself; fork-proven permissionless +
+ * wei-exact both directions).
+ *
+ * `amountIn` sizes the probe (clamped at the int128 bound — see METRIC_INT128_MAX). Mirrors
+ * `discoverFluidPoolsTyped` / `discoverTesseraPoolsTyped` — off-chain discovery + liveness reads,
+ * returning the venue descriptor EcoSwap prepare consumes directly (the on-chain lens does not
+ * understand Metric).
+ */
+export async function discoverMetricPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  metricConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(MetricVenue & { headOI: bigint })[]> {
+  if (metricConfigs.length === 0 || amountIn <= 0n) return [];
+
+  // The FIRST QL slice size — the on-chain ladder's seed (curve-math QL_SEED_DIV), so the probe's head
+  // is exactly the head the solver's first slice will carry when the state has not moved. Clamped at
+  // the int128 encode bound (quoteSwap amountSpecified is int128).
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
+  if (probeIn > METRIC_INT128_MAX) probeIn = METRIC_INT128_MAX;
+
+  const inLc = tokenIn.toLowerCase();
+  const outLc = tokenOut.toLowerCase();
+  const out: (MetricVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of metricConfigs) {
+    const router = cfg.metricRouter;
+    if (!router) continue;
+    for (const pool of cfg.metricPools ?? []) {
+      const key = pool.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try {
+        // 1. Orient the pair + resolve the provider from the pool's own immutables.
+        const imm = (await client
+          .readContract({ address: pool, abi: metricPoolAbi, functionName: "getImmutables" })
+          .catch(() => null)) as readonly [Hex, Hex, Hex, Hex] | null;
+        if (!imm) continue;
+        const [, provider, t0, t1] = imm;
+        const inIs0 = t0.toLowerCase() === inLc && t1.toLowerCase() === outLc;
+        const inIs1 = t1.toLowerCase() === inLc && t0.toLowerCase() === outLc;
+        if (!inIs0 && !inIs1) continue;
+        const xToY = inIs0;
+
+        // 2. The maker anchor — PROBE-THEN-DECODE (staleness-revert class). A quiet maker drops here.
+        const anchor = (await client
+          .readContract({ address: provider, abi: metricProviderAbi, functionName: "getBidAndAskPrice" })
+          .catch(() => null)) as readonly [bigint, bigint] | null;
+        if (!anchor) continue;
+        const [bid, ask] = anchor;
+        if (bid <= 0n || ask < bid) continue;
+
+        // 3. ONE liveness quote at the first QL slice size, DIRECTIONAL limit; |negative out-delta| > 0.
+        const limit = xToY ? 0n : METRIC_LIMIT_MAX_U128;
+        const deltas = (await client
+          .readContract({
+            address: router,
+            abi: metricRouterAbi,
+            functionName: "quoteSwap",
+            args: [pool, xToY, probeIn, limit, bid, ask],
+          })
+          .catch(() => null)) as readonly [bigint, bigint] | null;
+        if (!deltas) continue;
+        const outDelta = xToY ? deltas[1] : deltas[0];
+        const inDelta = xToY ? deltas[0] : deltas[1];
+        if (outDelta >= 0n || inDelta <= 0n) continue; // empty pool / wrong-side (0,0) / nonsense
+        const probeOut = -outDelta;
+        // The probe may PARTIAL-FILL (inDelta < probeIn on a thin pool) — head over the CONSUMED input,
+        // exactly what the on-chain ladder's first slice sees at an unchanged state.
+        const consumed = inDelta < probeIn ? inDelta : probeIn;
+        const headOI = qlSliceHead(probeOut, consumed);
+        if (headOI <= 0n) continue;
+
+        // Diagnostic feePpm: HALF the relative bid/ask spread (1e6-scaled) — pair-agnostic (the quote
+        // folds the spread + any step fee in; there is no fee getter on the path).
+        const mid = (bid + ask) / 2n;
+        let feePpm = 0;
+        if (mid > 0n && ask > bid) {
+          const half = ((ask - bid) * METRIC_FEE_SCALE) / (2n * mid);
+          if (half > 0n && half < METRIC_FEE_SCALE) feePpm = Number(half);
+        }
+
+        out.push({
+          address: pool,
+          provider,
+          router,
+          xToY,
+          tokenIn,
+          tokenOut,
+          feePpm,
+          source: `${cfg.label} (Metric)`,
+          headOI,
+        });
+      } catch {
+        // Pool/provider/router read failed (not a Metric pool, stale maker, or unsupported pair) — skip.
+      }
     }
   }
   return out;

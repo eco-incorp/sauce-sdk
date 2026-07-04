@@ -623,6 +623,29 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
         16n, // segKind = ElfomoFi (getAmountOut on the ladder; approve + swap(..., partnerId 0) on the exec)
         BigInt(refIdx),
       ];
+    // METRIC (metric.xyz oracle-anchored bin-curve OMM): qd[0]=pool, qd[1]=xToY (1 ⇔ tokenIn == the
+    // pool's token0 — direction-stamped per edge by discovery), qd[6]=the pool's PriceProvider,
+    // qd[7]=the pool's Router (PER-POOL — Base runs two routers over disjoint pool sets, so neither is
+    // chain-wide cfg; c6..c9 are free for non-BalV2/V3 families). The QL ladder is TWO-STEP: the venue
+    // prelude hoists provider.getBidAndAskPrice() ONCE (probe-then-decode — a stale maker zeroes the
+    // anchor ⇒ a zero ladder, the venue self-drops), then each slice quotes
+    // router.quoteSwap(pool, xToY, +min(xNext, INT128MAX), limit, bid, ask) at the FROZEN anchor
+    // (probe-then-decode; DIRECTIONAL limit — 0 for xToY, uint128.max for yToX; decode the
+    // |negative out-delta|, 0 ⇒ stop). EXEC is callback-free from the cooking contract's perspective
+    // (derive provider/token0 via getImmutables + live quote as minAmountOut + approve ROUTER +
+    // swapExactInput — the ROUTER itself services the pool's metricOmmSwapCallback). The router
+    // travels to the direct exec through msAux (the Mento-exchangeId mechanism).
+    case "metric":
+      return [
+        BigInt(v.desc.address),
+        v.desc.xToY ? 1n : 0n, // xToY — the quoteSwap/swapExactInput direction bit
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        17n, // segKind = METRIC (anchor-hoisted quoteSwap on the ladder; approve ROUTER + swapExactInput on the exec)
+        BigInt(refIdx),
+        BigInt(v.desc.provider), // qd[6] = the pool's PriceProvider (the prelude anchor hoist target)
+        BigInt(v.desc.router), // qd[7] = the pool's Router (the quote/swap/approve target; rides msAux to the exec)
+      ];
   }
 }
 
@@ -641,9 +664,14 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
  * scalars, re-purposed per family: Curve int128 / CryptoSwap uint256 coin indices; LB packs `swapForY`
  * into `i`; Mento packs the exchangeId (bytes32 as uint256) into `i`; Balancer V3 packs inIdx/outIdx
  * into `i`/`j`; UNUSED (0) for Solidly/WOOFi, which quote by tokenIn/tokenOut. `feePpm` is informational
- * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Sixteen QL families ship today,
+ * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Seventeen QL families ship today,
  * each with a distinct `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters
- * are INDEPENDENT (0-based into each family's list). The newest two:
+ * are INDEPENDENT (0-based into each family's list). The newest:
+ *   segKind 17 = METRIC         → anchor-hoisted (getBidAndAskPrice, probe-then-decode) + per-slice
+ *                                   router.quoteSwap at the frozen anchor (probe-then-decode,
+ *                                   |negative out-delta|) + approve ROUTER + swapExactInput (refIdx →
+ *                                   the on-chain `mcinp[refIdx]`/`mcven[refIdx]`/`mcrtr[refIdx]` slot;
+ *                                   the router rides msAux like Mento's exchangeId). Then:
  *   segKind 15 = Tessera V      → callback-free tesseraSwapViewAmounts (probe-then-decode, [1]) +
  *                                   approve + tesseraSwapWithAllowances(..., "") (refIdx → the on-chain
  *                                   `teinp[refIdx]`/`teven[refIdx]` slot).
@@ -682,7 +710,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   // Family-concatenation order is LOAD-BEARING (the direct rows' positions feed the on-chain
   // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
   // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
-  // maverickPools, fluidPools, tesseraPools, elfomoPools — the historical order the per-family map
+  // maverickPools, fluidPools, tesseraPools, elfomoPools, metricPools — the historical order the per-family map
   // bodies (now qlRowFor) emitted, with Fluid appended when it migrated from the static-segment
   // stream and Tessera/Elfomo appended when they landed (new families ALWAYS append at the tail).
   const rows: bigint[][] = [];
@@ -702,6 +730,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   (prepared.fluidPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "fluid", desc }, i)));
   (prepared.tesseraPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "tessera", desc }, i)));
   (prepared.elfomoPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "elfomo", desc }, i)));
+  (prepared.metricPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "metric", desc }, i)));
   // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
   // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
   return rows.map(pad12);
@@ -776,6 +805,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_FLUID = (prepared.fluidPools?.length ?? 0) > 0 || hasLegFam("fluid");
   const HAS_TESSERA = (prepared.tesseraPools?.length ?? 0) > 0 || hasLegFam("tessera");
   const HAS_ELFOMO = (prepared.elfomoPools?.length ?? 0) > 0 || hasLegFam("elfomo");
+  const HAS_METRIC = (prepared.metricPools?.length ?? 0) > 0 || hasLegFam("metric");
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
   const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
   // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
@@ -802,6 +832,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_FLUID,
     HAS_TESSERA,
     HAS_ELFOMO,
+    HAS_METRIC,
     HAS_MENTO,
     HAS_BALANCER_V3,
     HAS_LEG_QLV,

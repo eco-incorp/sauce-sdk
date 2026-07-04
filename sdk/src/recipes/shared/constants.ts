@@ -274,6 +274,31 @@ export enum FactoryType {
    * never get there; the graceful 0 self-drops the venue, never a cook DoS).
    */
   Elfomo = "elfomo",
+  /**
+   * METRIC (metric.xyz — an oracle-anchored bin-curve OMM; per-pair pools priced off a maker-posted
+   * PriceProvider anchor). Discovery is KNOWN-POOL-ADDRESS based (the BalancerV3/Fluid pattern):
+   * `FactoryConfig.metricPools` carries the candidate per-pair pool addresses and
+   * `FactoryConfig.metricRouter` the router serving them (PER-CONFIG, not chain-wide — Base runs TWO
+   * routers over disjoint pool sets; the `address` field is the router too, an INERT placeholder for
+   * the dedup key). NO on-chain enumeration exists (probed: getImmutables()[0] is a config/fee
+   * contract whose poolDeployer() exposes only deploy+parameters — no count/index/pair getter; the
+   * pool list is the token-gated api.metric.xyz metadata). A pool is admitted by reading its
+   * getImmutables() (provider [1] / token0 [2] / token1 [3]), matching the pair, then ONE
+   * probe-then-decode provider getBidAndAskPrice() (REVERTS 0x9a0423af when the maker's post is
+   * older than MAX_TIME_DELTA ~10 s — a stale maker self-drops) + ONE router.quoteSwap liveness
+   * probe at the first QL slice size (an empty pool quotes (0,0) gracefully — also drops). A
+   * QUOTE-LADDER family (segKind 17): prepare ships only the descriptor (pool + provider + router +
+   * xToY); the on-chain solver hoists the anchor once per venue and builds the ladder LIVE from
+   * quoteSwap at the frozen (bid, ask) — the TWO-STEP quote (see metric-math.ts for the full probed
+   * surface: the DIRECTIONAL price limit resolving the reverse direction, the signed-delta partial
+   * fill, the int128 clamp, the staleness classes). CALLBACK-FREE exec from the cooking contract's
+   * perspective: approve ROUTER + swapExactInput(pool, self, xToY, +Σ, limit, minAmountOut,
+   * deadline) — the pool pays out first and re-enters metricOmmSwapCallback ON THE ROUTER (the
+   * router implements it itself — fork-proven permissionless + wei-exact both directions), so no
+   * engine change. All Metric contracts are UNVERIFIED (bytecode-probed only) — the prod-mirror
+   * etches the genuine runtime.
+   */
+  Metric = "metric",
 }
 
 /**
@@ -431,6 +456,25 @@ export interface FactoryConfig {
    * a deterministic local-fixture path. Verified: BiPoolManager 0x22d9db95E6Ae61c104A7B6F6C78D7993B94ec901.
    */
   mentoExchangeProviders?: Hex[];
+  /**
+   * METRIC (Metric factory type) only: a KNOWN list of Metric per-pair pool addresses to probe for the
+   * pair. Metric has NO on-chain enumeration (probed — see FactoryType.Metric), so discovery is
+   * known-pool-address based: `discoverMetricPoolsTyped` reads each pool's `getImmutables()`
+   * (provider [1] / token0 [2] / token1 [3]), keeps the pools trading BOTH tokenIn and tokenOut,
+   * probe-then-decodes the provider anchor (a stale maker self-drops) and runs ONE router.quoteSwap
+   * liveness probe (an empty pool quotes (0,0) — drops). PRODUCTION populates this from the
+   * api.metric.xyz metadata (token-gated); the EVM test injects the locally-deployed fixture pool.
+   * Omitted/empty ⇒ no Metric pools surfaced.
+   */
+  metricPools?: Hex[];
+  /**
+   * METRIC (Metric factory type) only: the Router serving THIS config's pools — the
+   * quoteSwap/swapExactInput/approve target, and the contract implementing the pools'
+   * metricOmmSwapCallback. PER-CONFIG (not chain-wide): Base runs TWO routers over disjoint pool
+   * sets (0xA6A16C00… and 0x50Ef014e…), so a chain wires one Metric FactoryConfig per router. The
+   * descriptor carries it per venue (qlv qd[7]). Required when `metricPools` is non-empty.
+   */
+  metricRouter?: Hex;
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */
@@ -585,6 +629,37 @@ export const BASE_CHAIN_POOL_CONFIG: ChainPoolConfig = {
     // 0xBb1b19F1…0C99 (max allowance to the wrapper). poolType UniV2 is INERT for Elfomo (same placeholder
     // convention as Tessera/Fluid/BalancerV3).
     { address: "0xf0f0F0F0FB0d738452EfD03A28e8be14C76d5f73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Elfomo, label: "ElfomoFi" },
+    // METRIC (metric.xyz oracle-anchored bin-curve OMM; QL segKind 17). KNOWN-POOL-ADDRESS discovery
+    // (no on-chain enumeration — probed; the pool list is the api.metric.xyz metadata). Base runs TWO
+    // routers over DISJOINT pool sets ⇒ one FactoryConfig per router (metricRouter is per-config; the
+    // descriptor carries it per venue). On-chain verified (2026-07-04, block ~48.19M):
+    //  · WETH/USDC 0x770004fE… (~110 WETH + ~155k USDC inventory; provider 0x69454A23…): quoteSwap
+    //    fwd 1e18 WETH → −1765.09e6 USDC @ limit 0; rev 1000e6 USDC → −0.5663e18 WETH @ limit
+    //    uint128.max (the DIRECTIONAL limit convention — the wrong side quotes (0,0) gracefully);
+    //    fork-executed swapExactInput from a random EOA BOTH directions, wei-exact vs the same-block
+    //    quote; oversize 900 WETH partial-filled (+87.94 consumed) — quote == realized to the wei.
+    //  · cbBTC/USDC 0x0fcBb3f9… (~1.34 cbBTC + ~64.5k USDC) + WETH/cbBTC 0xeF05E733… (~7.95 WETH +
+    //    ~1.30 cbBTC) live on the same router; WETH/USDC 0x49657410… (~3.76 WETH + ~11.3k USDC) on
+    //    the second router. Empty/dust same-pair pools (0x12939Ae3…, 0x37bd23Cc…, 0xa07938EA…, …)
+    //    deliberately NOT wired (an empty pool quotes (0,0) and would only self-drop — RPC waste).
+    // Provider staleness (getBidAndAskPrice REVERTS 0x9a0423af past MAX_TIME_DELTA = 10 s; measured
+    // by fork time-warp) is handled by the probe-then-decode hoist — a quiet maker self-drops. All
+    // Metric contracts are UNVERIFIED (bytecode-probed; selector-resolved via openchain) — the
+    // prod-mirror etches the genuine runtime. poolType UniV2 is INERT for Metric (discovery keys off
+    // factoryType; Metric executes callback-free via its own EcoMetric path — the ROUTER services the
+    // pool's metricOmmSwapCallback itself) — a placeholder, not a UniV2 claim.
+    { address: "0xA6A16C00B7E9DBE1D54acEd7d6FE264fc4732eaF" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Metric, label: "Metric",
+      metricRouter: "0xA6A16C00B7E9DBE1D54acEd7d6FE264fc4732eaF" as Hex,
+      metricPools: [
+        "0x770004fE4411E42eA51a7fcAca32b267d791f3D4" as Hex, // WETH/USDC (deep; provider 0x69454A23…)
+        "0x0fcBb3f9aecc556dE81EE756F01191d94a3D085E" as Hex, // cbBTC/USDC (provider 0xaF291D47…)
+        "0xeF05E733970c37b6A2f863DE0db9378eA49447cC" as Hex, // WETH/cbBTC (provider 0x1FD110A1…)
+      ] },
+    { address: "0x50Ef014e95D23b970b6AF711d882d33ae9B559C0" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Metric, label: "Metric (router 2)",
+      metricRouter: "0x50Ef014e95D23b970b6AF711d882d33ae9B559C0" as Hex,
+      metricPools: [
+        "0x4965741dC7989506672dbEB040DF56230a6dF894" as Hex, // WETH/USDC (provider 0x70286b73…)
+      ] },
     // Balancer V2 / Fluid / EulerSwap / Fermi on Base: LEFT EMPTY + FLAGGED (verified, none is a deep
     // both-baseToken stable venue):
     //  · Balancer V2 — the deepest V2 stable pools holding baseTokens are dust: USDC/USDbC/axlUSDC
@@ -697,6 +772,21 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0xb013be1D0D380C13B58e889f412895970A2Cf228" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.EulerSwap, label: "EulerSwap",
         eulerSwapPools: [
           "0x3bBCC029f312ECe579a7dEb77B13CB8aE15F28A8" as Hex, // USDC/USDT v1 (deepest live stable pool)
+        ] },
+      // METRIC (metric.xyz; QL segKind 17 — see the Base config + metric-math.ts for the full probed
+      // surface). Known-pool-address discovery; ONE Ethereum router. On-chain verified (2026-07-04):
+      // USDT/USDC 0x9C9fd348… LIVE — provider 0xb53ee9de… getBidAndAskPrice fresh; quoteSwap fwd
+      // (USDT→USDC) 1e18 raw partial-filled gracefully at the ~322k-USDT inventory cap
+      // (+3.221e11 in, −3.219e11 out) and rev capped likewise (the partial-fill class the ladder
+      // self-truncates on). The Ethereum WETH/USDC + WETH/USDT + WBTC/USDC metadata pools were ALL
+      // stale-provider AND zero-inventory at authoring (withdrawn makers — probed: getBidAndAskPrice
+      // reverts 0x9a0423af, balances 0, quoteSwap (0,0) even with an injected anchor) — deliberately
+      // NOT wired; they drop in by address alone when their makers return. poolType UniV2 is INERT
+      // (discovery keys off factoryType).
+      { address: "0xcB41C10c6414aCbea022c7662df4005dd8FBEF91" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Metric, label: "Metric",
+        metricRouter: "0xcB41C10c6414aCbea022c7662df4005dd8FBEF91" as Hex,
+        metricPools: [
+          "0x9C9fd348505A7202Fd819D8cb5003248d920d279" as Hex, // USDT/USDC (live maker; ~$320k inventory)
         ] },
       // DODO V2
       { address: "0x72d220cE168C4f361dD4deE5D826a01AD8598f6C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
@@ -813,6 +903,21 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x8e42f2F4101563bF679975178e880FD87d3eFd4e" as Hex, poolType: SwapPoolType.TraderJoeLB, factoryType: FactoryType.TraderJoeLB, label: "Trader Joe LB" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
       { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
+      // METRIC (metric.xyz; QL segKind 17 — see the Base config + metric-math.ts). Known-pool-address
+      // discovery; the LIVE Arbitrum router is 0x82A562fD… — NOTE the metadata also lists
+      // 0x080b37C6… as a router for some Arbitrum pools, but that address has NO CODE on Arbitrum
+      // (it is the HyperEVM router — a cross-chain metadata artifact), so only 0x82A562fD…-served
+      // pools are wired. On-chain verified (2026-07-04): WETH/USDC 0xefb43216… LIVE (~27 WETH +
+      // ~56.3k USDC; provider 0x3a1e540c… fresh) — quoteSwap fwd 1e18 WETH → −1768.96e6 USDC
+      // @ limit 0; rev 1e18 raw USDC capped gracefully (+49.36e9 consumed, −27.89e18 WETH out
+      // @ limit uint128.max). NOT wired: arb_wethusdc 0xDBE9a88C… (live provider, EMPTY inventory —
+      // quotes (0,0)), USDT/USDC + WBTC pools (stale providers at authoring), cbBTC/USDC (cbBTC is
+      // not an Arbitrum baseToken). poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0x82A562fD9F02d4346B95D3a2a501411979C8F920" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Metric, label: "Metric",
+        metricRouter: "0x82A562fD9F02d4346B95D3a2a501411979C8F920" as Hex,
+        metricPools: [
+          "0xefb432160e8cfce36eb937975055641ba4c3747f" as Hex, // WETH/USDC (live maker; provider 0x3a1e540c…)
+        ] },
     ],
     baseTokens: [
       "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" as Hex, // WETH
@@ -916,6 +1021,18 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x79887f65f83bdf15Bcc8736b5e5BcDB48fb8fE13" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // WOOFi (WooPPV2 sPMM — deterministic single-address deployment).
       { address: "0x5520385bFcf07Ec87C4c53A7d8d65595Dff69FA4" as Hex, poolType: SwapPoolType.WOOFi, factoryType: FactoryType.WOOFi, label: "WOOFi" },
+      // METRIC (metric.xyz; QL segKind 17 — see the Base config + metric-math.ts). Known-pool-address
+      // discovery; ONE Polygon router. On-chain verified (2026-07-04): WETH/USDC 0x65b670c5… LIVE
+      // (provider 0x907abf81… fresh) — quoteSwap fwd 1e18 WETH → −1767.20e6 USDC @ limit 0; rev 1e18
+      // raw USDC capped gracefully at the ~20.95-WETH inventory (+37.06e9 consumed) @ limit
+      // uint128.max — both directions sane, the partial-fill class. The other Polygon metadata pools
+      // (USDC.e/USDC pairs, WBTC/USDC) pair a non-baseToken or were not probed live — not wired.
+      // poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0x976c26402E1EC10454c5Fe6D2C9857DD57aE78f3" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Metric, label: "Metric",
+        metricRouter: "0x976c26402E1EC10454c5Fe6D2C9857DD57aE78f3" as Hex,
+        metricPools: [
+          "0x65b670c5cd5D7aBb229BE2e6Ac03F4666864342d" as Hex, // WETH/USDC (live maker; provider 0x907abf81…)
+        ] },
     ],
     baseTokens: [
       "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" as Hex, // WMATIC
@@ -993,6 +1110,11 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // getAmountOut WBNB→USDT 1e18 → ~571.73e18. Same wrapper surface + oracle-staleness semantics as
       // the Base entry (see elfomo-math.ts). poolType UniV2 is INERT (discovery keys off factoryType).
       { address: "0xf0f0F0F0FB0d738452EfD03A28e8be14C76d5f73" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Elfomo, label: "ElfomoFi" },
+      // METRIC on BSC: DELIBERATELY NOT WIRED (2026-07-04). The metadata lists 8 BSC pools (router
+      // 0xa9a63266…), but EVERY provider's getBidAndAskPrice() reverted 0x9a0423af (stale — no maker
+      // posting) at authoring, so no live probe evidence exists for any BSC pool. The Metric
+      // FactoryType + discovery are chain-agnostic — a BSC entry drops in by address alone once a
+      // maker is live (probe first: see the Base entry's evidence shape + metric-math.ts).
     ],
     baseTokens: [
       "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Hex, // WBNB
@@ -1238,6 +1360,19 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // 2026-07-04: getPool(WHYPE,USDT0,50) → 0xC22FaD66…8D6b, slot0() responds; liquidity ≈ 1.72e18
       // — the deepest WHYPE/USDT0 CL depth probed on the chain (ts=5/10/100 pools exist with L=0).
       { address: "0x32b9dA73215255d50D84FeB51540B75acC1324c2" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.SlipstreamCL, label: "Hybra V4", slipstreamTickSpacings: [1, 5, 10, 50, 100, 200] },
+      // METRIC (metric.xyz; QL segKind 17 — see the Base config + metric-math.ts). Known-pool-address
+      // discovery; ONE HyperEVM router (0x080b37C6… — the SAME address the metadata mis-lists for some
+      // Arbitrum pools, where it has no code; here it is live). On-chain verified via the public
+      // HyperEVM RPC (2026-07-04): WHYPE/USDC 0x1C8EE7E9… LIVE (~2172 WHYPE + ~107.4k USDC; provider
+      // 0xf0611c8e… fresh) — quoteSwap fwd 1e18 WHYPE → −70.80e6 USDC @ limit 0; rev 1e18 raw USDC
+      // capped gracefully (+153.38e9 consumed, −2164.73e18 WHYPE out) @ limit uint128.max. NOT wired:
+      // usdt0/usdc4 0x8769Adf6… (dust inventory 23197/2 — quotes (0,0)); the non-baseToken pairs
+      // (ubtc/muon/spx/khype/…). poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0x080b37C6F65cBC231f66016460782158090Fe0F7" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Metric, label: "Metric",
+        metricRouter: "0x080b37C6F65cBC231f66016460782158090Fe0F7" as Hex,
+        metricPools: [
+          "0x1C8EE7E99e2aEcD1338E111716e4744e7D088098" as Hex, // WHYPE/USDC (live maker; provider 0xf0611c8e…)
+        ] },
     ],
     baseTokens: [
       "0x5555555555555555555555555555555555555555" as Hex, // WHYPE (wrapped native, routing hub, 18 dec)

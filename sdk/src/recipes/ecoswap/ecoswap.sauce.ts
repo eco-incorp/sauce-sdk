@@ -20,6 +20,9 @@ import { IFluidDexPool } from "./IFluidDexPool.json";
 import { IFluidDexResolver } from "./IFluidDexResolver.json";
 import { ITesseraSwap } from "./ITesseraSwap.json";
 import { IElfomoFi } from "./IElfomoFi.json";
+import { IMetricRouter } from "./IMetricRouter.json";
+import { IMetricPool } from "./IMetricPool.json";
+import { IMetricPriceProvider } from "./IMetricPriceProvider.json";
 import { IMentoBroker } from "./IMentoBroker.json";
 import { IBalancerV3Router } from "./IBalancerV3Router.json";
 import { IBalancerV3Vault } from "./IBalancerV3Vault.json";
@@ -114,7 +117,7 @@ import { IPermit2 } from "./IPermit2.json";
 //                 Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE segKind 4, Wombat segKind 5,
 //                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Fluid DEX segKind 12,
 //                 Mento V2 segKind 13, Balancer V3 segKind 14, Tessera V segKind 15, ElfomoFi segKind
-//                 16). Rows [0, directQlvCount) are DIRECT venues (today's family-
+//                 16, METRIC segKind 17). Rows [0, directQlvCount) are DIRECT venues (today's family-
 //                 concatenation order; qd[10]=qd[11]=0, never read); rows [directQlvCount, …) are
 //                 ROUTE-LEG venues — qd[0..9] the SAME family row built for the leg's EDGE pair
 //                 (legIn, legOut), qd[5] refIdx = the row's GLOBAL qlv index (informational), qd[10]/
@@ -686,6 +689,7 @@ const HAS_MENTO: boolean = true;
 const HAS_BALANCER_V3: boolean = true;
 const HAS_TESSERA: boolean = true;
 const HAS_ELFOMO: boolean = true;
+const HAS_METRIC: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
 // — the cfg[12] directQlvCount override read, the leg-row LADDER build (the per-row edge-token/
 // sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude), the
@@ -803,6 +807,15 @@ function main(
   // route events (routing.length*PER_POOL extra) so the outer merge loop never itself truncates a
   // fill the per-pool caps would complete.
   const PER_POOL: Uint256 = 2048;
+  // METRIC constants: the int128 encode clamp for quoteSwap/swapExactInput amounts (the compiler
+  // truncates a uint256 into a narrower ABI slot, so an unclamped >= 2^127 value would flip the
+  // int128 sign), the yToX unbounded DIRECTIONAL price limit (uint128.max — the price RISES for
+  // yToX so the limit must sit above; xToY uses 0), the negative-word threshold for the signed
+  // out-delta decode, and the far-future swapExactInput deadline (a unix-timestamp bound).
+  const MC_I128MAX: Uint256 = 2 ** 127 - 1;
+  const MC_U128MAX: Uint256 = 2 ** 128 - 1;
+  const MC_HALF: Uint256 = 2 ** 255;
+  const MC_DEADLINE: Uint256 = 2 ** 64;
   // ── QUOTE-LADDER constants (MUST equal curve-math.ts QL_S / QL_RN / QL_RD / QL_SEED_DIV) ──
   // QL_S geometric slices per QL venue; xNext = cum*QL_RN/QL_RD + seed, seed = amountIn/QL_SEED_DIV
   // (clamped at amountIn). QL_SEED_DIV=16 < 19.84 guarantees the clamp engages on the final slice, so
@@ -877,6 +890,9 @@ function main(
   let teven: Tuple = new Array(MS_CAP); // Tessera V venue (wrapper) address
   let elinp: Tuple = new Array(MS_CAP); // ElfomoFi per-venue Σ input
   let elven: Tuple = new Array(MS_CAP); // ElfomoFi venue (wrapper) address
+  let mcinp: Tuple = new Array(MS_CAP); // METRIC per-venue Σ input
+  let mcven: Tuple = new Array(MS_CAP); // METRIC venue (per-pair pool) address
+  let mcrtr: Tuple = new Array(MS_CAP); // METRIC venue Router address (rides msAux, like Mento's exchangeId)
 
   // ── MERGED SAMPLED-SEGMENT STREAM (parallel scalar arrays) ──
   // The bestKind===1 cursor consumes ONE globally-DESC-sorted segment stream. It is built ON-CHAIN
@@ -1044,7 +1060,7 @@ function main(
   // ── BUILD THE MERGED SAMPLED-SEGMENT STREAM (static segs + live QL ladders, then DESC sort) ──
   // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
   // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
-  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO) &&true) {
+  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) &&true) {
     // 1. Copy any static segments VERBATIM into the parallel-array stream. VESTIGIAL: production
     // always ships segs == [] (every family is QL — the ladders below feed the whole stream); a
     // hand-built test universe may still supply static rows and they merge unchanged.
@@ -1074,7 +1090,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) {
       // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
@@ -1265,6 +1281,25 @@ function main(
         if (HAS_FLUID && qKind === 12) {
           const flqT0: Address = IFluidDexResolver.at(fluidResolver).getDexTokens(qPool)[0];
           if (flqT0 === qTokIn) { flQz = 1; }
+        }
+        // METRIC (segKind 17): hoist the LIVE maker anchor ONCE per venue — getBidAndAskPrice() on the
+        // venue's PriceProvider (qd[6]). PROBE-THEN-DECODE: the provider REVERTS (0x9a0423af) when the
+        // maker's off-chain post is older than MAX_TIME_DELTA (~10 s) or under its Chainlink
+        // deviation/sequencer guards — a stale/quiet maker leaves the anchor at 0 and the qKind-17
+        // slice branch below builds a ZERO ladder (the venue self-drops; never a cook DoS). The frozen
+        // (bid, ask) then feeds EVERY per-slice quoteSwap — the router's quote prices DIRECTLY off the
+        // caller-supplied anchor (probed: doubling both doubles the out), and the SWAP path re-reads
+        // the SAME provider in-tx, so the ladder, the exec quote and the realized fill share one
+        // anchor by construction (the TWO-STEP quote — the BalV2 state-hoist shape).
+        let mcBidV: Uint256 = 0;
+        let mcAskV: Uint256 = 0;
+        if (HAS_METRIC && qKind === 17) {
+          let mcPok: Uint256 = 1;
+          IMetricPriceProvider.at(qd[6]).getBidAndAskPrice().catch(() => { mcPok = 0; });
+          if (mcPok === 1) {
+            mcBidV = IMetricPriceProvider.at(qd[6]).getBidAndAskPrice()[0];
+            mcAskV = IMetricPriceProvider.at(qd[6]).getBidAndAskPrice()[1];
+          }
         }
         // Maverick V2 (segKind 8) — LIVE bin-WALK. UNLIKE the geometric quote-difference ladder below (which
         // no-ops for qKind 8: no branch matches ⇒ q stays 0 ⇒ stop), Maverick has no cumulative-out view, so
@@ -1604,6 +1639,40 @@ function main(
               if (HAS_ELFOMO && qKind === 16) {
                 q = IElfomoFi.at(qPool).getAmountOut(qTokIn, qTokOut, xNext);
               }
+              // METRIC (segKind 17) — the router's anchor-parameterized quote at the venue's FROZEN
+              // hoisted (bid, ask) (mcBidV == 0 ⇒ stale maker ⇒ q stays 0 ⇒ zero ladder). NB a plain
+              // CALL, not a staticcall (the recipe ABI marks quoteSwap nonpayable): the REAL pool's
+              // quote fn WRITES then REVERTS with the result (the Quoter pattern; the router catches
+              // + decodes), so a static context kills the write before the result-revert and the
+              // probe fails — the Fluid estimateSwapIn class; the write rolls back with the pool's
+              // own revert, so the CALL is state-neutral. qi (qd[1])
+              // is the xToY direction bit; the price limit is DIRECTIONAL (0 for xToY — the price
+              // falls; uint128.max for yToX — it rises; the wrong side quotes (0,0) gracefully — the
+              // resolved reverse-direction convention). The amount is clamped at the int128 encode
+              // bound. PROBE-THEN-DECODE (the router reverts a typed error on garbage anchors), then
+              // decode the OUT-side delta — NEGATIVE two's complement, Math.neg for |out| (an
+              // oversized xNext PARTIAL-FILLS: the quote flatlines at capacity, the differenced
+              // slice-out hits 0 and the ladder stops — at most one final slice carries capacity the
+              // pool cannot absorb; the exec's partial fill + terminal refund cover it, minOut-
+              // guarded). auxV = the venue's ROUTER (qd[7]) — it rides msAux into the accumulate/exec
+              // (the Mento-exchangeId mechanism), since the direct exec loop sees only the ms columns.
+              if (HAS_METRIC && qKind === 17) {
+                if (mcBidV > 0) {
+                  let mcqLim: Uint256 = 0;
+                  if (qi === 0) { mcqLim = MC_U128MAX; }
+                  let mcqAmt: Uint256 = xNext;
+                  if (mcqAmt > MC_I128MAX) { mcqAmt = MC_I128MAX; }
+                  let mcqOk: Uint256 = 1;
+                  IMetricRouter.at(qd[7]).quoteSwap(qPool, qi, mcqAmt, mcqLim, mcBidV, mcAskV).catch(() => { mcqOk = 0; });
+                  if (mcqOk === 1) {
+                    let mcqW: Uint256 = 0;
+                    if (qi === 1) { mcqW = IMetricRouter.at(qd[7]).quoteSwap(qPool, qi, mcqAmt, mcqLim, mcBidV, mcAskV)[1]; }
+                    else { mcqW = IMetricRouter.at(qd[7]).quoteSwap(qPool, qi, mcqAmt, mcqLim, mcBidV, mcAskV)[0]; }
+                    if (mcqW >= MC_HALF) { q = Math.neg(mcqW); }
+                  }
+                  auxV = qd[7];
+                }
+              }
               if (q === 0) {
                 stop = 1;
               } else {
@@ -1860,7 +1929,7 @@ function main(
       // (next-best); its near/far are ALREADY post-fee out/in (adjNear==adjFar==the post-fee
       // marginal), so they compare directly. Same tie-break as the pools/routes (near DESC, then
       // far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO) &&segCur < msSorted) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) &&segCur < msSorted) {
         const sNear: Uint256 = msNear[segCur];
         const sFar: Uint256 = msFar[segCur];
         if (sNear >= bestPrice) {
@@ -2367,7 +2436,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) &&bestKind === 1) {
             // ── sampled-segment slice: a fixed capacity slice at a fixed post-fee price. Consume the
             // [segCur] merged-stream row (parallel arrays), clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -2485,6 +2554,17 @@ function main(
                                           if (HAS_ELFOMO && sKind === 16) {
                                             elinp[sIdx] = elinp[sIdx] + stake;
                                             elven[sIdx] = sVenue;
+                                          } else {
+                                            // segKind 17 — METRIC (oracle-anchored bin-curve OMM):
+                                            // callback-free from this contract's perspective, executed
+                                            // below via the anchor probe + quoteSwap (minAmountOut) +
+                                            // approve ROUTER + swapExactInput. sVenue = the pool;
+                                            // msAux = the venue's ROUTER (stamped by the QL emit).
+                                            if (HAS_METRIC && sKind === 17) {
+                                              mcinp[sIdx] = mcinp[sIdx] + stake;
+                                              mcven[sIdx] = sVenue;
+                                              mcrtr[sIdx] = msAux[segCur];
+                                            }
                                           }
                                         }
                                       }
@@ -2913,6 +2993,43 @@ function main(
                   if (qelOut > 0) {
                     IERC20.at(legIn).approve(qPool, share);
                     IElfomoFi.at(qPool).swap(legIn, legOut, share, qelOut, address.self, 0);
+                  }
+                }
+                // METRIC (segKind 17) — callback-free from this contract's perspective: derive the
+                // provider + direction ON-CHAIN from the pool's immutables ([1]/[2] — the Fluid
+                // derive-don't-trust rule, so the arm is edge-correct for ANY leg), probe the anchor
+                // (a stale maker skips soft — the share strands in legIn and the per-route
+                // intermediate sweep / terminal refund returns it), probe the live quote at the
+                // frozen anchor (DIRECTIONAL limit; |negative out-delta|) as minAmountOut, approve
+                // the venue's ROUTER (qd[7]) and swapExactInput. The pool pays out first and
+                // re-enters metricOmmSwapCallback ON THE ROUTER (never this contract).
+                if (HAS_METRIC && qk === 17) {
+                  const qmcRtr: Address = qd[7];
+                  const qmcProv: Address = IMetricPool.at(qPool).getImmutables()[1];
+                  const qmcT0: Address = IMetricPool.at(qPool).getImmutables()[2];
+                  let qmcXy: Uint256 = 0;
+                  if (qmcT0 === legIn) { qmcXy = 1; }
+                  let qmcLim: Uint256 = 0;
+                  if (qmcXy === 0) { qmcLim = MC_U128MAX; }
+                  let qmcAmt: Uint256 = share;
+                  if (qmcAmt > MC_I128MAX) { qmcAmt = MC_I128MAX; }
+                  let qmcOk: Uint256 = 1;
+                  IMetricPriceProvider.at(qmcProv).getBidAndAskPrice().catch(() => { qmcOk = 0; });
+                  if (qmcOk === 1) {
+                    const qmcBid: Uint256 = IMetricPriceProvider.at(qmcProv).getBidAndAskPrice()[0];
+                    const qmcAsk: Uint256 = IMetricPriceProvider.at(qmcProv).getBidAndAskPrice()[1];
+                    IMetricRouter.at(qmcRtr).quoteSwap(qPool, qmcXy, qmcAmt, qmcLim, qmcBid, qmcAsk).catch(() => { qmcOk = 0; });
+                    if (qmcOk === 1) {
+                      let qmcW: Uint256 = 0;
+                      if (qmcXy === 1) { qmcW = IMetricRouter.at(qmcRtr).quoteSwap(qPool, qmcXy, qmcAmt, qmcLim, qmcBid, qmcAsk)[1]; }
+                      else { qmcW = IMetricRouter.at(qmcRtr).quoteSwap(qPool, qmcXy, qmcAmt, qmcLim, qmcBid, qmcAsk)[0]; }
+                      let qmcOut: Uint256 = 0;
+                      if (qmcW >= MC_HALF) { qmcOut = Math.neg(qmcW); }
+                      if (qmcOut > 0) {
+                        IERC20.at(legIn).approve(qmcRtr, qmcAmt);
+                        IMetricRouter.at(qmcRtr).swapExactInput(qPool, address.self, qmcXy, qmcAmt, qmcLim, qmcOut, MC_DEADLINE);
+                      }
+                    }
                   }
                 }
                 spent = spent + share;
@@ -3410,6 +3527,59 @@ function main(
       if (elOut > 0) {
         token.approve(elpool, elamt);
         IElfomoFi.at(elpool).swap(tokenIn, tokenOut, elamt, elOut, address.self, 0);
+      }
+    }
+  }
+  }
+  // METRIC (metric.xyz oracle-anchored bin-curve OMM) → CALLBACK-FREE from this contract's perspective
+  // (NO engine SwapPoolType). A Metric pool prices off its maker-posted PriceProvider anchor + its bin
+  // state, NOT xy=k, so the engine's _swapV2 would mis-price it. Execute exactly as the Metric taker
+  // would, against the REAL router surface (fork-proven permissionless + wei-exact both directions):
+  // derive the provider + direction ON-CHAIN from the pool's immutables ([1]/[2] — derive-don't-trust;
+  // the accumulators carry only pool + router), PROBE the anchor (the provider REVERTS when the
+  // maker's post is stale — a dead venue at exec time SKIPS SOFT: its share stays in this contract and
+  // the terminal leftover refund returns it, never a bricked cook), PROBE the live
+  // quoteSwap(pool, xToY, +Σ, limit, bid, ask) at the SAME anchor for the out (the DIRECTIONAL limit:
+  // 0 for xToY, uint128.max for yToX), APPROVE the venue's ROUTER (mcrtr — it rides msAux from the QL
+  // emit) for the awarded input, then swapExactInput(pool, self, xToY, +Σ, limit, minAmountOut,
+  // deadline) with minAmountOut == the just-quoted out — the swap re-reads the SAME provider in-tx, so
+  // the pair never trips when the state is unchanged (same-block quote+swap fork-proven wei-exact).
+  // The pool pays the out to this contract FIRST, then re-enters metricOmmSwapCallback ON THE ROUTER
+  // (the router implements it itself — the engine services nothing); the router pulls exactly the
+  // CONSUMED input (an oversized share partial-fills; the remainder stays here for the terminal
+  // refund). compute-then-pull already transferred `cum` (incl. each Metric share) into this contract
+  // above, so the approved pull draws from this contract's balance.
+  if (HAS_METRIC) {
+  for (let mc = 0; mc < MS_CAP; mc = mc + 1) {
+    const mcamt: Uint256 = mcinp[mc];
+    if (mcamt > 0) {
+      const mcpool: Address = mcven[mc];
+      const mcrtrA: Address = mcrtr[mc];
+      const mcprov: Address = IMetricPool.at(mcpool).getImmutables()[1];
+      const mct0: Address = IMetricPool.at(mcpool).getImmutables()[2];
+      let mcxy: Uint256 = 0;
+      if (mct0 === tokenIn) { mcxy = 1; }
+      let mcLim: Uint256 = 0;
+      if (mcxy === 0) { mcLim = MC_U128MAX; }
+      let mcAmt: Uint256 = mcamt;
+      if (mcAmt > MC_I128MAX) { mcAmt = MC_I128MAX; }
+      let mcOk: Uint256 = 1;
+      IMetricPriceProvider.at(mcprov).getBidAndAskPrice().catch(() => { mcOk = 0; });
+      if (mcOk === 1) {
+        const mcBid: Uint256 = IMetricPriceProvider.at(mcprov).getBidAndAskPrice()[0];
+        const mcAsk: Uint256 = IMetricPriceProvider.at(mcprov).getBidAndAskPrice()[1];
+        IMetricRouter.at(mcrtrA).quoteSwap(mcpool, mcxy, mcAmt, mcLim, mcBid, mcAsk).catch(() => { mcOk = 0; });
+        if (mcOk === 1) {
+          let mcW: Uint256 = 0;
+          if (mcxy === 1) { mcW = IMetricRouter.at(mcrtrA).quoteSwap(mcpool, mcxy, mcAmt, mcLim, mcBid, mcAsk)[1]; }
+          else { mcW = IMetricRouter.at(mcrtrA).quoteSwap(mcpool, mcxy, mcAmt, mcLim, mcBid, mcAsk)[0]; }
+          let mcOut: Uint256 = 0;
+          if (mcW >= MC_HALF) { mcOut = Math.neg(mcW); }
+          if (mcOut > 0) {
+            token.approve(mcrtrA, mcAmt);
+            IMetricRouter.at(mcrtrA).swapExactInput(mcpool, address.self, mcxy, mcAmt, mcLim, mcOut, MC_DEADLINE);
+          }
+        }
       }
     }
   }

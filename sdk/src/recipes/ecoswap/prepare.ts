@@ -59,6 +59,7 @@ import {
   discoverFluidPoolsTyped,
   discoverTesseraPoolsTyped,
   discoverElfomoPoolsTyped,
+  discoverMetricPoolsTyped,
   discoverMentoPoolsTyped,
   discoverBalancerV3PoolsTyped,
 } from "../shared/pool-discovery.js";
@@ -107,6 +108,7 @@ import {
   type EcoFluid,
   type EcoTessera,
   type EcoElfomo,
+  type EcoMetric,
   type EcoMento,
   type EcoBalancerV3,
   type EcoLegQlVenue,
@@ -1246,11 +1248,44 @@ async function discoverQlVenuesForPair(
     }
   }
 
+  // METRIC (metric.xyz oracle-anchored bin-curve OMM; known-POOL-address discovery via
+  // FactoryConfig.metricPools + the per-config metricRouter) — the on-chain solver hoists the venue's
+  // provider anchor (getBidAndAskPrice, probe-then-decode — a stale maker self-drops) once in setup and
+  // builds the ladder LIVE from `router.quoteSwap(pool, xToY, +xNext, limit, bid, ask)` at the frozen
+  // anchor (probe-then-decode, |negative out-delta|; DIRECTIONAL limit). The descriptor is
+  // (pool, provider, router, xToY) — a Metric pool is a PER-PAIR inventory contract, so the claim key
+  // is the POOL address (the qlVenueClaimKey default — UNLIKE the single-contract multi-pair
+  // Tessera/Elfomo wrappers) and two same-pair pools are two independent venues. `xToY` is stamped for
+  // THIS edge's direction (tokenIn == token0), so a leg venue is direction-correct by construction
+  // (the exec additionally re-derives it on-chain from getImmutables — derive-don't-trust).
+  const metricConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Metric);
+  if (metricConfigs.length > 0) {
+    const metricRaw = await discoverMetricPoolsTyped(pairIn, pairOut, client, metricConfigs, probeAmount);
+    for (const mp of metricRaw) {
+      out.push({
+        venue: {
+          family: "metric",
+          desc: {
+            address: mp.address,
+            provider: mp.provider,
+            router: mp.router,
+            xToY: mp.xToY,
+            fromToken: mp.tokenIn,
+            toToken: mp.tokenOut,
+            feePpm: mp.feePpm,
+            source: mp.source,
+          },
+        },
+        headOI: mp.headOI,
+      });
+    }
+  }
+
   return out;
 }
 
 /**
- * The claim-set identity of a QL venue — the venue's POOL address for 14 families; Mento (whose
+ * The claim-set identity of a QL venue — the venue's POOL address for 15 families; Mento (whose
  * venues all share the chain-wide Broker/provider contracts) claims by `provider|exchangeId`.
  * Lowercased so it unions safely with the pool-address claim set (one shared mechanism — a UniV3
  * address never collides with a Curve address). Claiming by POOL address (not by pair) is the
@@ -1261,7 +1296,9 @@ async function discoverQlVenuesForPair(
  * deliberately conservative: an excluded second instance forgoes a venue, never double-counts.
  * Tessera/Elfomo are the same single-CONTRACT multi-pair class: ONE wrapper serves every pair out
  * of ONE treasury/vault, so the wrapper-address claim admits that inventory exactly once — the
- * multi-coin rule applied verbatim, correct and automatic.)
+ * multi-coin rule applied verbatim, correct and automatic. METRIC is the OPPOSITE shape — per-PAIR
+ * pool contracts each holding their OWN inventory — so its default pool-address claim admits two
+ * same-pair Metric pools as two independent venues, which is exactly right.)
  */
 function mentoClaimKey(exchangeProvider: string, exchangeId: string): string {
   return `${exchangeProvider.toLowerCase()}|${exchangeId.toLowerCase()}`;
@@ -1554,6 +1591,10 @@ export async function prepareEcoSwap(
   // discovery ran the single liveness probe; no sampled segments ship.
   const tesseraPools = qlFamilyDescs<EcoTessera>("tessera");
   const elfomoPools = qlFamilyDescs<EcoElfomo>("elfomo");
+  // METRIC is a QL family like the 16 above: descriptor-only (pool + provider + router + xToY),
+  // anchor-hoisted + laddered LIVE on-chain from router.quoteSwap at cook. The shared per-pair
+  // discovery ran the immutables/anchor/quote liveness probes; no sampled segments ship.
+  const metricPools = qlFamilyDescs<EcoMetric>("metric");
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1869,6 +1910,8 @@ export async function prepareEcoSwap(
   // twice).
   for (const tp of tesseraPools) claimed.add(tp.address.toLowerCase());
   for (const ep of elfomoPools) claimed.add(ep.address.toLowerCase());
+  // Metric claims by POOL address (per-pair inventory contracts — the qlVenueClaimKey default).
+  for (const mp of metricPools) claimed.add(mp.address.toLowerCase());
   const orderedRoutes = routes
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
@@ -1951,6 +1994,7 @@ export async function prepareEcoSwap(
     fluidPools.length === 0 &&
     tesseraPools.length === 0 &&
     elfomoPools.length === 0 &&
+    metricPools.length === 0 &&
     mentoPools.length === 0 &&
     balancerV3Pools.length === 0
   ) {
@@ -1979,7 +2023,7 @@ export async function prepareEcoSwap(
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
       `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${maverickPools.length} Maverick QL, ` +
       `${balancerV3Pools.length} Balancer-V3 QL, ${fluidPools.length} Fluid QL, ` +
-      `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL`,
+      `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL, ${metricPools.length} Metric QL`,
   );
 
   const prepared: EcoSwapPrepared = {
@@ -2003,6 +2047,7 @@ export async function prepareEcoSwap(
     fluidPools,
     tesseraPools,
     elfomoPools,
+    metricPools,
     mentoPools,
     balancerV3Pools,
     brackets,

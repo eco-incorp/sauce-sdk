@@ -405,7 +405,8 @@ export type EcoLegQlVenue =
   | { family: "maverick"; desc: EcoMaverick }
   | { family: "fluid"; desc: EcoFluid }
   | { family: "tessera"; desc: EcoTessera }
-  | { family: "elfomo"; desc: EcoElfomo };
+  | { family: "elfomo"; desc: EcoElfomo }
+  | { family: "metric"; desc: EcoMetric };
 
 /**
  * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
@@ -833,6 +834,53 @@ export interface EcoElfomo {
 }
 
 /**
+ * One METRIC (metric.xyz oracle-anchored bin-curve OMM) QUOTE-LADDER (QL) venue, referenced by a
+ * qlv-row refIdx (segKind 17). A Metric pool is a PER-PAIR inventory contract priced off a
+ * maker-posted PriceProvider anchor (NOT xy=k), so it must NOT be routed through the V2 (_swapV2)
+ * path. The quote is TWO-STEP (unique among the QL families): the venue prelude hoists
+ * `provider.getBidAndAskPrice()` ONCE per venue (PROBE-THEN-DECODE — the provider REVERTS 0x9a0423af
+ * when the maker's post is older than MAX_TIME_DELTA (~10 s) or under its Chainlink
+ * deviation/sequencer guards; a stale provider zeroes the anchor ⇒ a zero ladder, the venue
+ * self-drops), then each slice quotes `router.quoteSwap(pool, xToY, +xNext, limit, bid, ask)` with
+ * the FROZEN (bid, ask) threaded through (the quote prices DIRECTLY off the caller-supplied anchor —
+ * probed; the swap re-reads the SAME provider in-tx, so quote/exec cohere). The price limit is
+ * DIRECTIONAL (0 for xToY — price falls; type(uint128).max for yToX — price rises; the wrong side
+ * quotes (0,0) gracefully — the resolved reverse-direction convention). The quote returns SIGNED
+ * deltas: the IN delta is the POSITIVE amount actually consumed (an oversized ask PARTIAL-FILLS),
+ * the OUT delta is NEGATIVE — decode |outDelta|, q == 0 ⇒ stop (probe-then-decode; the router
+ * reverts a typed error on garbage anchors). It EXECUTES the awarded Σ share CALLBACK-FREE from the
+ * cooking contract's perspective: derive provider/token0 on-chain via pool.getImmutables() ([1]/[2]
+ * — the Fluid derive-don't-trust rule, so a leg venue is edge-correct), probe the anchor + the live
+ * quote for minAmountOut, APPROVE the ROUTER for the awarded input, then
+ * `router.swapExactInput(pool, self, xToY, +Σ, limit, minAmountOut, deadline)` — the pool pays the
+ * out FIRST and re-enters `metricOmmSwapCallback` on the ROUTER (which the router implements
+ * ITSELF), pulling the input via transferFrom — the engine services NOTHING. NO engine SwapPoolType.
+ * LIVE-WALK class: the ladder is built at cook from live quotes at the live anchor, so the split
+ * re-anchors to any maker re-post / bin-state drift (see metric-math.ts — the full probed surface +
+ * the int128 clamp + the fork-proven wei-exact quote↔swap agreement). `address` is the POOL (a
+ * per-pair inventory ⇒ the claim key is the pool address — the qlVenueClaimKey default, UNLIKE the
+ * single-contract multi-pair Tessera/Elfomo wrappers); `provider`/`router` ride qlv qd[6]/qd[7]
+ * (free non-BalV2/V3 descriptor columns); `xToY` is qd[1].
+ */
+export interface EcoMetric {
+  /** Pool address — the per-pair inventory contract (quoteSwap/swapExactInput `pool` arg; the claim key). */
+  address: Hex;
+  /** The pool's PriceProvider — the venue-prelude getBidAndAskPrice() hoist target (qd[6]). */
+  provider: Hex;
+  /** The pool's Router — the quoteSwap/swapExactInput/approve target (qd[7]; per-pool — Base runs two routers). */
+  router: Hex;
+  /** Swap direction: true ⇔ tokenIn == the pool's token0 (the quote/swap `xToY` bit; qd[1]). */
+  xToY: boolean;
+  /** The venue's tokenIn (the edge from-token; diagnostics — the quote keys on pool + xToY). */
+  fromToken: Hex;
+  /** The venue's tokenOut (the edge to-token; diagnostics). */
+  toToken: Hex;
+  /** Half the provider's relative bid/ask spread in ppm (price-ordering / diagnostics; the quote is post-fee). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * One Mento V2 venue to execute, indexed by an EcoBracket.refIdx (kind === Mento). Mento V2 (Celo
  * mento-protocol/mento-core Broker + BiPoolManager) is a BiPool oracle-priced stablecoin exchange (NOT
  * xy=k): the Broker routes to a registered exchange provider (BiPoolManager) that prices off oracle rates +
@@ -1078,6 +1126,18 @@ export interface EcoSwapPrepared {
    * additive-compatible).
    */
   elfomoPools?: EcoElfomo[];
+  /**
+   * METRIC (metric.xyz oracle-anchored bin-curve OMM) QUOTE-LADDER venues (qlv segKind 17 rows
+   * reference these by refIdx). DESCRIPTOR-ONLY — the on-chain solver hoists the venue's provider
+   * anchor (getBidAndAskPrice, probe-then-decode — a stale provider self-drops the venue) ONCE in
+   * setup, builds the price ladder LIVE from router.quoteSwap at the frozen anchor (probe-then-decode,
+   * |negative out-delta|), and executes the awarded Σ share CALLBACK-FREE from the cooking contract's
+   * perspective (derive via getImmutables + live quote as minAmountOut + approve ROUTER +
+   * swapExactInput — the router itself services the pool's metricOmmSwapCallback; NO engine
+   * SwapPoolType). Optional/empty when no Metric venue was discovered (omitted ⇒ no Metric venue, so
+   * existing test-side `EcoSwapPrepared` literals stay additive-compatible).
+   */
+  metricPools?: EcoMetric[];
   /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues (kind === Mento brackets
    * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE
