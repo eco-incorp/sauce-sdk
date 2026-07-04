@@ -5,7 +5,9 @@ Port Solana as a compile + execution target for the TypeScript compiler and SDK,
 2026-07-03; grounded against the Solana MCP docs and the engine as shipped in that PR.
 
 **Work happens in this worktree** (`~/Documents/Projects/sauce-sdk-svm`, branch `feat/svm-support`)
-— the main checkout has active unrelated work (`feat/more-liquidity-sources`).
+— the main checkout has active unrelated work (`feat/more-liquidity-sources`). The branch is
+stacked on `feat/compiler-source-imports` (PR #23), the tip of the compiler stack — this base
+includes the v12 bytecode target (PR #18) that Phase A extends; `origin/main` does not have it.
 
 ---
 
