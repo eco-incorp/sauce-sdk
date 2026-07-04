@@ -800,7 +800,7 @@ interface EdgeQlVenue {
 }
 
 /**
- * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 14 leg-capable families
+ * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 16 leg-capable families
  * (Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2,
  * Wombat, Fermi, EulerSwap, Balancer V3, Balancer V2 ComposableStable, Maverick V2, Fluid DEX,
  * Tessera V, ElfomoFi),
@@ -1509,7 +1509,7 @@ export async function prepareEcoSwap(
     }
   }
 
-  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 14 leg-capable families) ──
+  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 16 leg-capable families) ──
   // Runs the SHARED per-pair discovery (discoverQlVenuesForPair — the exact path every route-leg
   // EDGE runs below), then splits the tagged descriptors back into the per-family prepared lists
   // (family order preserved: the shared function emits families in the canonical buildQLVenues
@@ -1843,7 +1843,7 @@ export async function prepareEcoSwap(
   // — the per-route produce-then-consume order in ecoswap.sauce.ts is the load-bearing guarantee.
   const claimed = new Set<string>();
   for (const p of pools) claimed.add(p.address.toLowerCase());
-  // Direct QL venue identities (rule 1) — all 14 QL families, Fluid included (a DexT1 pool's
+  // Direct QL venue identities (rule 1) — all 16 QL families, Fluid included (a DexT1 pool's
   // Liquidity-layer inventory is one shared depth like any other venue's).
   for (const c of curves) claimed.add(c.address.toLowerCase());
   for (const cp of cryptoSwaps) claimed.add(cp.address.toLowerCase());

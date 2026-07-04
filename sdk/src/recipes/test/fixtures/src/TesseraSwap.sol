@@ -20,8 +20,10 @@ interface IERC20Min {
 /// TUPLE (amountIn, amountOut).
 ///
 /// REVERT-CLASS QUOTE (probed on the real Base wrapper 2026-07-04, reproduced here): an unsupported pair
-/// REVERTS "T33", a zero/negative amount REVERTS "T10", while an OVERSIZED ask returns (amountIn, 0)
-/// GRACEFULLY — so the recipe's ladder/exec quote is PROBE-THEN-DECODE.
+/// REVERTS "T33", a zero amount REVERTS "T10", while an OVERSIZED ask returns (amountIn, 0)
+/// GRACEFULLY — so the recipe's ladder/exec quote is PROBE-THEN-DECODE. (The REAL wrapper additionally
+/// accepts a NEGATIVE amount as exact-OUT — probed live; the recipe only ever quotes exact-in, so this
+/// fixture rejects negatives with "T10" for simplicity.)
 ///
 /// PRIORITY-FEE SEMANTICS (fork-measured on the real engine, reproduced here): when tx.gasprice EXCEEDS
 /// `globalPrioFeeThresholddd1337` the engine widens the spread by a small factor (`prioWidenPpm`) on BOTH
@@ -113,8 +115,9 @@ contract TesseraSwap {
     }
 
     /// @notice REAL wrapper quote surface — signed amountSpecified, returns (amountIn, amountOut).
-    /// REVERT-class: unsupported pair "T33" (in _netOut), zero/negative amount "T10"; oversized returns
-    /// (amountIn, 0) gracefully (the closed form flattens — matches the real wrapper's probes).
+    /// REVERT-class: unsupported pair "T33" (in _netOut), zero amount "T10"; oversized returns
+    /// (amountIn, 0) gracefully (the closed form flattens — matches the real wrapper's probes). Negative
+    /// (exact-out — real-wrapper-supported, recipe-unused) is rejected "T10" here for simplicity.
     function tesseraSwapViewAmounts(address tokenIn, address tokenOut, int256 amountSpecified)
         public
         view

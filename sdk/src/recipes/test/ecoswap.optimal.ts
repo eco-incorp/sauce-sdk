@@ -322,7 +322,7 @@ export interface OptimalRouteLeg {
   pools: OptimalPool[];
   /**
    * The leg's QL VENUE members (optional — every existing leg literal stays valid): each is one
-   * of the 13 QL families as the SAME shared-math model type the direct-QL oracle path
+   * of the 16 QL families as the SAME shared-math model type the direct-QL oracle path
    * enumerates, direction-stamped for THIS hop's (legIn, legOut). The oracle builds each
    * venue's slice ladder via the SHARED build*QLLadder (identical builders the on-chain
    * families replay ⇒ identical grids), SIZED by the chain-order fold of `amountIn` through

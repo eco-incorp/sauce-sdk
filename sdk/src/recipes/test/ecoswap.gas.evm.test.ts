@@ -423,8 +423,8 @@ function writeGasMd(): void {
       "`[legCount, {poolBase, poolCount, qlvBase, qlvCount, inter} × legCount]`), the VESTIGIAL static " +
       "sampled-segment stream `segs` (always [] — every family is quote-ladder now; kept for the stable " +
       "6-arg shape), and the QUOTE-LADDER venue descriptors `qlv` " +
-      "(the 14 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/" +
-      "BalV2/BalV3/Maverick/Fluid — each a UNIFORM 12-column row the solver expands into an on-chain price " +
+      "(the 16 quote-ladder families — Curve/CryptoSwap/Solidly/WOOFi/Mento/LB/DODO/Wombat/Fermi/Euler/" +
+      "BalV2/BalV3/Maverick/Fluid/Tessera/Elfomo — each a UNIFORM 12-column row the solver expands into an on-chain price " +
       "ladder; rows [0, directQlvCount) are DIRECT venues, rows [directQlvCount, …) are ROUTE-LEG venues " +
       "carrying qd[10]/qd[11] routeIdx/legIdx backrefs, grouped per (route, leg) so routing's " +
       "qlvBase/qlvCount point at them). `zeroForOne` is DERIVED on-chain from the token sort order. The " +
@@ -727,7 +727,7 @@ function writeGasMd(): void {
   // Live-walk / quote-ladder architecture (always emitted — architectural, not run-dependent).
   bullets.push(
     "**Live-walk architecture.** Every venue now LIVE-WALKS: V2/V3/V4 walk a live frontier from the " +
-      "on-chain spot (reusing a drift-invariant per-pool net cache), and the 14 quote-ladder families " +
+      "on-chain spot (reusing a drift-invariant per-pool net cache), and the 16 quote-ladder families " +
       `build a price ladder of QL_S = ${QL_S} slices ON-CHAIN in setup (Table 3). This trades the old static ` +
       `sampled-segment shipping for on-chain freshness: a QL venue costs up to 2·QL_S = ${QL_2S} view staticcalls at ` +
       "ladder-build (probe-then-decode revert-class views cost 2/slice — a probe + a guarded decode; the " +

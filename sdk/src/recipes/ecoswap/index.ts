@@ -650,7 +650,7 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
  *   segKind 16 = ElfomoFi       → callback-free GRACEFUL getAmountOut (plain staticcall, 0 ⇒ stop) +
  *                                   approve + swap(..., partnerId 0) (refIdx → the on-chain
  *                                   `elinp[refIdx]`/`elven[refIdx]` slot).
- * The historical five:
+ * Of the historical fourteen, the ones with family-specific quirks worth pinning here:
  *   segKind 1  = Curve StableSwap → bestKind===1 cursor → engine swap(poolType:3) → _swapCurve
  *                                   (refIdx → the on-chain `cinp[refIdx]`/`cven[refIdx]` slot).
  *   segKind 2  = Trader Joe LB   → engine swap(poolType:6) → _swapTraderJoeLB (transfer-first; refIdx →
