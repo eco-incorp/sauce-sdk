@@ -204,6 +204,7 @@ export const svmCook = async (
     // provided 'payer' fixture would be a second, random-address account — and
     // with signer:true it could precede the real payer and hijack MSG_SENDER.
     if (spec.ref === 'payer') throw new Error(`test account ref 'payer' is reserved for the harness payer`);
+
     if (byRef.has(spec.ref)) throw new Error(`duplicate test account ref '${spec.ref}'`);
 
     const acct = await materializeAccount(harness, spec);

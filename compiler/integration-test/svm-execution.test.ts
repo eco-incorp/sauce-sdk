@@ -228,7 +228,8 @@ describeSvm('integration: svm accountData / writeAccountData', () => {
     // Raw mode: the plan is empty and the provided accounts ARE user indices
     // 0..n-1 in list order (the payer is appended after them). Each raw read
     // must hit its own fixture — the success-path proof of the raw mapping.
-    const src = 'function main() { const a = accountData(0, 0, 1); const b = accountData(1, 0, 1); return a[0] * 256 + b[0] }';
+    const src =
+      'function main() { const a = accountData(0, 0, 1); const b = accountData(1, 0, 1); return a[0] * 256 + b[0] }';
     const r = await svmCook(h, src, {
       accounts: [
         { ref: 'first', data: Uint8Array.from([0x11]) },

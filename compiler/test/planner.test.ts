@@ -81,7 +81,7 @@ describe('planner — estimatePacket wire math', () => {
   });
 
   it('plan-declared signer metas raise the default signature count', () => {
-    const plan: AccountPlan = { metas: [{ ref: 'payer', writable: false, signer: true }] };
+    const plan: AccountPlan = { metas: [{ ref: 'delegate', writable: false, signer: true }] };
     const b = estimatePacket(plan, 900);
 
     // 2 signatures — fee payer + the plan-declared signer: 129 (1 + 64x2)
@@ -94,6 +94,31 @@ describe('planner — estimatePacket wire math', () => {
     ]);
     // an explicit count overrides the plan-derived default (signer ref bound to the fee payer)
     expect(estimatePacket(plan, 900, { signers: 1 }).overflowBytes).toBe(0);
+  });
+
+  it("the reserved 'payer' ref adds no signature, static key, or lock — only its index byte", () => {
+    const plan: AccountPlan = {
+      metas: [
+        { ref: 'payer', writable: true, signer: true },
+        { ref: 'pool', writable: false, signer: false },
+      ],
+    };
+    const b = estimatePacket(plan, 100);
+
+    expect(b.staticAccountKeys).toBe(6); // 5 fixed (fee payer included) + pool only
+    expect(b.accountLocks).toBe(6);
+    // 65 signatures (1 + 64x1 — the payer meta IS the fee payer) + 229 message
+    // (1+3+1 + 6x32 + 32) + 117 instructions (1 + 1 + 1 + 5 indices (3 PDAs +
+    // BOTH metas) + 1 data len + 108 data) + 1 empty ALT
+    expect(b.messageBytes).toBe(412);
+    expect(b.warnings).toEqual([]);
+  });
+
+  it('prependBytes reserves headroom byte-for-byte (e.g. 40 for a ComputeBudget unit-limit prepend)', () => {
+    const base = estimatePacket(planWith(0), 100);
+    const withPrepend = estimatePacket(planWith(0), 100, { prependBytes: 40 });
+
+    expect(withPrepend.messageBytes).toBe(base.messageBytes + 40);
   });
 
   it('key-count prefix grows to 2 bytes at 128 static keys (metas >= 123)', () => {

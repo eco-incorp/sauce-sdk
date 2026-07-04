@@ -8,30 +8,46 @@
  * engine PDAs + the plan's user accounts, execute as the only instruction) and
  * reports overflow before anything hits the wire. Pure function of its inputs;
  * raw-index plans have empty metas, so their user accounts are not counted.
+ *
+ * The ref 'payer' is reserved: the SDK's resolveAccounts binds it to the fee
+ * payer, whose signature, key, and lock the fixed terms already count — a plan
+ * meta under that ref adds only its 1-byte instruction account index.
  */
 import type { AccountPlan } from './registry.js';
+
+/** Reserved ref, bound to the fee payer by the SDK send layer (resolveAccounts' PAYER_REF). */
+const PAYER_REF = 'payer';
 
 export interface PacketBudgetOptions {
   /**
    * Transaction signature count (fee payer included). Default: 1 (fee payer)
-   * + one per plan meta flagged signer — conservative, since the estimator
-   * cannot tell when a signer ref is bound to the fee payer's own key (pass an
-   * explicit count for that case).
+   * + one per plan meta flagged signer, except the reserved 'payer' ref (it is
+   * guaranteed-bound to the fee payer). Still conservative for any OTHER
+   * signer ref the sender happens to resolve to the fee payer's own key —
+   * pass an explicit count for that case.
    */
   signers?: number;
   /** Address lookup tables referenced by the message. Default 0. */
   lookupTables?: number;
   /** Account metas resolved via those tables (moved out of the static key section). Default 0. */
   lookupAddresses?: number;
+  /**
+   * Serialized bytes of instructions the send layer prepends to execute —
+   * the estimate models execute as the ONLY instruction. The SDK's
+   * computeUnitLimit option prepends one ComputeBudget SetComputeUnitLimit
+   * instruction: +40 bytes (32-byte program key + 8-byte instruction); a
+   * microLamportsPerCu price prepend adds 12 more. Default 0.
+   */
+  prependBytes?: number;
 }
 
 export interface PacketBudget {
   bytecodeBytes: number;
   /** 8 (execute discriminator) + bytecodeBytes. */
   instructionDataBytes: number;
-  /** payer + engine program + 3 engine PDAs + non-ALT user metas. */
+  /** payer + engine program + 3 engine PDAs + non-ALT user metas (a reserved 'payer' meta dedupes into the fee payer). */
   staticAccountKeys: number;
-  /** Full serialized v0 transaction estimate. */
+  /** Full serialized v0 transaction estimate (prependBytes headroom included). */
   messageBytes: number;
   /** 1232 — the wire packet cap. */
   limitBytes: number;
@@ -64,15 +80,20 @@ export function estimatePacket(
   opts: PacketBudgetOptions = {},
 ): PacketBudget {
   // Every plan meta flagged signer contributes its own 64-byte signature on
-  // top of the fee payer's — the runtime rejects the tx without it.
-  const planSigners = plan.metas.reduce((n, m) => (m.signer ? n + 1 : n), 0);
+  // top of the fee payer's — the runtime rejects the tx without it. The
+  // reserved 'payer' ref IS the fee payer: no extra signature, key, or lock.
+  const planSigners = plan.metas.reduce((n, m) => (m.signer && m.ref !== PAYER_REF ? n + 1 : n), 0);
   const signers = opts.signers ?? 1 + planSigners;
   const lookupTables = opts.lookupTables ?? 0;
   const lookupAddresses = opts.lookupAddresses ?? 0;
+  const prependBytes = opts.prependBytes ?? 0;
   const userMetas = plan.metas.length;
+  // Metas whose key occupies a slot outside FIXED_STATIC_KEYS (the fee payer's
+  // key is deduplicated at message compile).
+  const nonPayerMetas = plan.metas.reduce((n, m) => (m.ref === PAYER_REF ? n : n + 1), 0);
 
-  if (lookupAddresses > userMetas) {
-    throw new Error(`lookupAddresses (${lookupAddresses}) exceeds the plan's account metas (${userMetas})`);
+  if (lookupAddresses > nonPayerMetas) {
+    throw new Error(`lookupAddresses (${lookupAddresses}) exceeds the plan's account metas (${nonPayerMetas})`);
   }
 
   if (lookupAddresses > 0 && lookupTables === 0) {
@@ -81,7 +102,7 @@ export function estimatePacket(
 
   const bytecodeBytes = bytecodeLength;
   const instructionDataBytes = 8 + bytecodeBytes;
-  const staticAccountKeys = FIXED_STATIC_KEYS + (userMetas - lookupAddresses);
+  const staticAccountKeys = FIXED_STATIC_KEYS + (nonPayerMetas - lookupAddresses);
   // Every account the execute instruction references, ALT-resolved included
   // (ALT moves key BYTES out of the message, not the instruction's index list).
   const ixAccounts = 3 + userMetas;
@@ -106,7 +127,7 @@ export function estimatePacket(
     1 + (1 + compactU16Len(ixAccounts) + ixAccounts + compactU16Len(instructionDataBytes) + instructionDataBytes);
   const altSection =
     compactU16Len(lookupTables) + lookupTables * (32 + compactU16Len(perTableAddresses) + 1) + lookupAddresses;
-  const messageBytes = signaturesSection + messageSection + instructionsSection + altSection;
+  const messageBytes = signaturesSection + messageSection + instructionsSection + altSection + prependBytes;
 
   const overflowBytes = Math.max(0, messageBytes - PACKET_LIMIT_BYTES);
   const accountLocks = staticAccountKeys + lookupAddresses;

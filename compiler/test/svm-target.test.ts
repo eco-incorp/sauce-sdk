@@ -7,7 +7,7 @@
  */
 import { compile } from '../src/index.js';
 import type { ContractsConfig } from '../src/index.js';
-import { OPS } from '../src/saucer/index.js';
+import { OPS, SVM_UNSUPPORTED } from '../src/saucer/index.js';
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 const compileSvm = (src: string) => compile(src, { target: 'svm' });
@@ -223,6 +223,18 @@ describe('svm target — gating errors', () => {
       'function main() { return contract.delegate(1, Uint8Array.from([0x00])) }',
       "delegatecall is not supported on target 'svm'",
     );
+  });
+
+  it('SVM_UNSUPPORTED mirrors the opcode table byte-for-byte (the map hand-writes the bytes)', () => {
+    expect(SVM_UNSUPPORTED).toEqual({
+      create: OPS.CREATE,
+      createAddress: OPS.CREATE_ADDRESS,
+      create2: OPS.CREATE2,
+      create2Address: OPS.CREATE2_ADDRESS,
+      create3: OPS.CREATE3,
+      create3Address: OPS.CREATE3_ADDRESS,
+      delegatecall: OPS.DELEGATE,
+    });
   });
 
   it('EVM slot storage is rejected with the accountData replacement named', () => {

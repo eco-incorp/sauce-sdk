@@ -135,8 +135,9 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
       // The account plan is the interned-ref registry in first-use order (empty
       // metas for pure-compute programs or raw-index programs). The packet-budget
       // check runs with default send options (fee payer + plan-declared signers,
-      // no lookup tables) and is non-fatal — its warnings ride along with the
-      // compile warnings.
+      // the reserved 'payer' ref counted as the fee payer, no lookup tables, no
+      // prepends) and is non-fatal — its warnings ride along with the compile
+      // warnings.
       const accountPlan = ctx.buildAccountPlan();
       const budget = estimatePacket(accountPlan, bytecode[0].length);
 
