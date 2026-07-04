@@ -453,11 +453,14 @@ export function buildLensCook(
       // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep] — isAlgebra=1 ⇒ the
       // lens discovers via poolByPair + reads globalState() (price/tick + dynamic fee) instead
       // of getPool + slot0(); 0 ⇒ standard Uniswap-V3 path. Both reuse the V3 tick walk.
-      // algebraTs/algebraStep are the Algebra factory's fixed per-pool tickSpacing and its
-      // precomputed multiplicative step ratio (getSqrtRatioAtTick(ts)) — the lens steps √price
-      // by THIS ratio (it has no on-chain TickMath). Algebra v1 forks (Camelot/QuickSwap/Ramses)
-      // use a fixed per-factory tickSpacing; configure it via FactoryConfig.algebraTickSpacing
-      // (default 60). Standard-V3 rows carry 0 for both (unused — they read the tier's step).
+      // algebraTs/algebraStep are the FALLBACK tickSpacing + step ratio pair: Algebra spacing
+      // is PER-POOL (Integral heterogeneous — nest 5/60, Kittenswap 10/60/500; even 1.9/V1
+      // pools drift from 60: Camelot 10, SwapX 5), so the lens reads each Algebra pool's OWN
+      // tickSpacing() LIVE and derives the step ratio ON-CHAIN (its stepRatioTs helper — the
+      // exact TickMath mirror of stepRatioForSpacing below); this config pair is consumed only
+      // when that staticcall REVERTS (no probed lineage — a defensive graceful class). Source
+      // it from FactoryConfig.algebraTickSpacing (default 60). Standard-V3 rows carry 0 for
+      // both (unused — they read the tier's step).
       // v3Factories[i] = [factoryAddr, isAlgebra, algebraTs, algebraStep, isSlipstream, algSingleFee]. A
       // Slipstream row (isSlipstream=1) discovers via getPool(a,b,int24 tickSpacing) — where the
       // tickSpacing is the v3FeeTiers[j][0] value — and reads the pool's OWN fee(). algebraTs/

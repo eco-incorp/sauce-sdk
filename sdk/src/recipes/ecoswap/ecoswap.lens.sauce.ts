@@ -101,9 +101,16 @@ import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 //                    directional (word 2 for zeroForOne, word 3 for oneForZero); algSingleFee=1 ⇒
 //                    Algebra V1/Integral single fee ALWAYS at word 2 (word 3 is a timepointIndex /
 //                    pluginConfig, NOT a fee — decoding it would feed a garbage fee up to 65535 ppm).
-//                    algebraTs/algebraStep are the
-//                    factory's fixed per-pool tickSpacing + its precomputed step ratio (the
-//                    lens has no on-chain TickMath). For isAlgebra=1 the inner v3FeeTiers loop
+//                    Algebra tickSpacing is a PER-POOL property (Integral setTickSpacing —
+//                    nest hub ts=5 vs factory default 60, Kittenswap 10/60/500; even 1.9/V1
+//                    pools drift from 60: Camelot WETH/USDC=10, SwapX wS/USDC=5), so the lens
+//                    reads each Algebra pool's OWN tickSpacing() LIVE (selector shared with
+//                    V3) and derives the step ratio ON-CHAIN via stepRatioTs (exact TickMath
+//                    mirror). algebraTs/algebraStep are the CONFIG FALLBACK, used only when
+//                    the pool's tickSpacing() staticcall REVERTS (no probed lineage does —
+//                    QuickSwap/THENA-Fusion V1, Camelot 1.9, THENA/SwapX/nest/Kittenswap
+//                    Integral all expose it — a defensive graceful class, probe-then-decode).
+//                    For isAlgebra=1 the inner v3FeeTiers loop
 //                    runs ONCE (ti===0) — Algebra has one pool per pair, no fee tiers. The tick
 //                    walk (ticks()[1]=liquidityDelta shares the V3 selector + int128 layout),
 //                    the capacity/floor math and the emitted V3 pool row are reused verbatim
@@ -272,6 +279,84 @@ function effTicks(ts: Uint256, bandTicks: Uint256, maxTicks: Uint256): Uint256 {
     n = maxTicks;
   }
   return n;
+}
+
+// Exact Uniswap TickMath.getSqrtRatioAtTick for a POSITIVE tick (Q96) — the ON-CHAIN analogue
+// of lens.ts stepRatioForSpacing / getSqrtRatioAtTickLocal, bit-for-bit: the same Q128
+// bit-ladder constants folded by (ratio*C)>>128, the same MaxUint256/ratio inversion (ts>0
+// always — a tickSpacing), the same >>32 round-up. Used ONLY for Algebra pools, whose
+// tickSpacing is PER-POOL and read LIVE (not knowable off-chain before the lens runs), so
+// their step ratio cannot be precomputed like the standard-V3 tier / Slipstream / V4 spec
+// columns. Every product fits uint256: ratio <= 2^128 and each constant < 2^128. MaxUint256
+// is Math.neg(1) (two's-complement; a 2**256 literal would wrap and 0-1 panics — SUB is
+// checked). Hex literals compile via BigInt(raw) — exact at any width.
+function stepRatioTs(ts: Uint256): Uint256 {
+  let ratio: Uint256 = 0x100000000000000000000000000000000;
+  if ((ts & 0x1) !== 0) {
+    ratio = 0xfffcb933bd6fad37aa2d162d1a594001;
+  }
+  if ((ts & 0x2) !== 0) {
+    ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
+  }
+  if ((ts & 0x4) !== 0) {
+    ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) >> 128;
+  }
+  if ((ts & 0x8) !== 0) {
+    ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0) >> 128;
+  }
+  if ((ts & 0x10) !== 0) {
+    ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644) >> 128;
+  }
+  if ((ts & 0x20) !== 0) {
+    ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0) >> 128;
+  }
+  if ((ts & 0x40) !== 0) {
+    ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861) >> 128;
+  }
+  if ((ts & 0x80) !== 0) {
+    ratio = (ratio * 0xfe5dee046a99a2a811c461f1969c3053) >> 128;
+  }
+  if ((ts & 0x100) !== 0) {
+    ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4) >> 128;
+  }
+  if ((ts & 0x200) !== 0) {
+    ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54) >> 128;
+  }
+  if ((ts & 0x400) !== 0) {
+    ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3) >> 128;
+  }
+  if ((ts & 0x800) !== 0) {
+    ratio = (ratio * 0xe7159475a2c29b7443b29c7fa6e889d9) >> 128;
+  }
+  if ((ts & 0x1000) !== 0) {
+    ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825) >> 128;
+  }
+  if ((ts & 0x2000) !== 0) {
+    ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5) >> 128;
+  }
+  if ((ts & 0x4000) !== 0) {
+    ratio = (ratio * 0x70d869a156d2a1b890bb3df62baf32f7) >> 128;
+  }
+  if ((ts & 0x8000) !== 0) {
+    ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6) >> 128;
+  }
+  if ((ts & 0x10000) !== 0) {
+    ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9) >> 128;
+  }
+  if ((ts & 0x20000) !== 0) {
+    ratio = (ratio * 0x5d6af8dedb81196699c329225ee604) >> 128;
+  }
+  if ((ts & 0x40000) !== 0) {
+    ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98) >> 128;
+  }
+  if ((ts & 0x80000) !== 0) {
+    ratio = (ratio * 0x48a170391f7dc42444e8fa2) >> 128;
+  }
+  // ts > 0 always: invert (floor(MaxUint256 / ratio)), then Q128 → Q96 with round-up.
+  const inv: Uint256 = Math.neg(1) / ratio;
+  const rem: Uint256 = inv & 0xffffffff;
+  const up: Uint256 = rem === 0 ? 0 : 1;
+  return (inv >> 32) + up;
 }
 
 function main(
@@ -501,9 +586,25 @@ function main(
         const liqA3: Uint256 = IUniswapV3PoolFull.at(poolA3).liquidity();
         if (sqrtA3 > 0) {
           if (liqA3 > 0) {
-            let tsA3: Uint256 = IUniswapV3PoolFull.at(poolA3).tickSpacing();
+            // Algebra tickSpacing is PER-POOL (nest hub 5, Kittenswap 10/60/500, Camelot 10 —
+            // a fixed per-factory value mis-strides every non-hub pool), so read the pool's
+            // OWN tickSpacing() (selector shared with V3) and derive the step ON-CHAIN
+            // (stepRatioTs — exact TickMath). PROBE-THEN-DECODE: on a revert (no probed
+            // lineage reverts — defensive) fall back to the CONFIG pair algebraTs/algebraStep
+            // (stepA3 already holds algStepA3 from the resolve above), never mixing a live
+            // stride with a config step. Standard V3/Slipstream keep the plain live read.
+            let tsA3: Uint256 = 0;
             if (isAlgA3 === 1) {
-              tsA3 = algTsA3;
+              let tsOkA3: Uint256 = 1;
+              IUniswapV3PoolFull.at(poolA3).tickSpacing().catch(() => { tsOkA3 = 0; });
+              if (tsOkA3 === 1) {
+                tsA3 = IUniswapV3PoolFull.at(poolA3).tickSpacing();
+                stepA3 = stepRatioTs(tsA3);
+              } else {
+                tsA3 = algTsA3;
+              }
+            } else {
+              tsA3 = IUniswapV3PoolFull.at(poolA3).tickSpacing();
             }
             // Tick from globalState (Algebra) or slot0 (standard V3). A real Algebra pool has NO
             // slot0(), so the read MUST branch on isAlg — calling slot0() on an Algebra pool would
@@ -765,9 +866,21 @@ function main(
         const liqM: Uint256 = IUniswapV3PoolFull.at(poolM).liquidity();
         if (sqrtM > 0) {
           if (liqM > 0) {
-            let tsM: Uint256 = IUniswapV3PoolFull.at(poolM).tickSpacing();
+            // Algebra: LIVE per-pool tickSpacing() + on-chain step (stepRatioTs); config
+            // algebraTs/algebraStep only on a tickSpacing() revert (stepM already holds
+            // algStepM from the resolve above). See the MEASURE-A site comment.
+            let tsM: Uint256 = 0;
             if (isAlgM === 1) {
-              tsM = algTsM;
+              let tsOkM: Uint256 = 1;
+              IUniswapV3PoolFull.at(poolM).tickSpacing().catch(() => { tsOkM = 0; });
+              if (tsOkM === 1) {
+                tsM = IUniswapV3PoolFull.at(poolM).tickSpacing();
+                stepM = stepRatioTs(tsM);
+              } else {
+                tsM = algTsM;
+              }
+            } else {
+              tsM = IUniswapV3PoolFull.at(poolM).tickSpacing();
             }
             // Tick from globalState (Algebra) or slot0 (standard V3) — a real Algebra pool has no
             // slot0(), so branch on isAlg (calling slot0() on Algebra would revert the lens).
@@ -1083,9 +1196,24 @@ function main(
         }
         if (sqrt3 > 0) {
           if (surv3 === 1) {
-            let ts3: Uint256 = IUniswapV3PoolFull.at(poolAddr3).tickSpacing();
+            // Algebra: LIVE per-pool tickSpacing() + on-chain step (stepRatioTs); config
+            // algebraTs/algebraStep only on a tickSpacing() revert (step3 already holds
+            // algStep3 from the resolve above). ts3 also rides the EMITTED pool row, so
+            // prepare stamps the TRUE per-pool grid (stepRatio = getSqrtRatioAtTick(ts3))
+            // and the solver/oracle walk it — the nest/Kittenswap non-hub mis-stride is
+            // fixed at the source. See the MEASURE-A site comment.
+            let ts3: Uint256 = 0;
             if (isAlg3 === 1) {
-              ts3 = algTs3;
+              let tsOk3: Uint256 = 1;
+              IUniswapV3PoolFull.at(poolAddr3).tickSpacing().catch(() => { tsOk3 = 0; });
+              if (tsOk3 === 1) {
+                ts3 = IUniswapV3PoolFull.at(poolAddr3).tickSpacing();
+                step3 = stepRatioTs(ts3);
+              } else {
+                ts3 = algTs3;
+              }
+            } else {
+              ts3 = IUniswapV3PoolFull.at(poolAddr3).tickSpacing();
             }
             // Tick from globalState (Algebra) or slot0 (standard V3) — a real Algebra pool has no
             // slot0(), so branch on isAlg (calling slot0() on Algebra would revert the lens).

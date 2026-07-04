@@ -106,9 +106,10 @@ import {
   maybeDeployV12Stack,
   cookTarget,
 } from "./harness/engine";
-import { SwapPoolType, FactoryType, type ChainPoolConfig } from "../shared/constants";
+import { SwapPoolType, FactoryType, type ChainPoolConfig, type FactoryConfig } from "../shared/constants";
 import { EcoBracketKind } from "../shared/types";
 import { ecoSwap } from "../ecoswap/index";
+import { discoverTraderJoeLBPoolsTyped } from "../shared/pool-discovery";
 import { optimalSplit, type OptimalPool } from "./ecoswap.optimal";
 import { getSwapOut as lbGetSwapOut, buildLbSegments, type LbPool } from "../shared/lb-math";
 
@@ -315,6 +316,47 @@ describe("EcoSwap Trader Joe LB v2.2 prod-mirror — REAL bytecode, no fork, off
         `binStep ${etched.binStep} baseFactor ${etched.baseFactor} activeId ${etched.activeId}; ` +
         `reserves X=${etched.reserveX} Y=${etched.reserveY}; ${snaps.state.binWindow.bins.length} bins + tree reconstructed. ` +
         `variableFeeControl neutralized (transient volatility surcharge → base-fee-only, disclosed).`,
+    );
+  });
+
+  // Per-factory binSteps override (FactoryConfig.lbBinSteps — the Metropolis gap): the typed LB
+  // discovery must enumerate the FACTORY'S OWN menu when configured, replacing (not augmenting)
+  // the global TRADER_JOE_BIN_STEPS default. The etched pair sits at binStep 1 (in the default
+  // set), so: default ⇒ found (the Arbitrum-Joe default-preserved behavior); an override
+  // EXCLUDING 1 ⇒ invisible; a Metropolis-style override INCLUDING 1 ⇒ found exactly once.
+  it("per-factory lbBinSteps override threads through discoverTraderJoeLBPoolsTyped", async () => {
+    const mkFactory = (lbBinSteps?: number[]): FactoryConfig => ({
+      address: etched.factory,
+      poolType: SwapPoolType.TraderJoeLB,
+      factoryType: FactoryType.TraderJoeLB,
+      label: "Local LB v2.2 (binSteps cell)",
+      ...(lbBinSteps ? { lbBinSteps } : {}),
+    });
+
+    // (1) No override — the canonical TRADER_JOE_BIN_STEPS default enumerates binStep 1.
+    const viaDefault = await discoverTraderJoeLBPoolsTyped(
+      etched.tokenX, etched.tokenY, c.publicClient, [mkFactory()],
+    );
+    assert.equal(viaDefault.length, 1, "default enumeration finds the binStep-1 pair (behavior preserved)");
+    assert.equal(viaDefault[0].binStep, etched.binStep, "pair discovered on its true binStep");
+
+    // (2) Override EXCLUDING the true step — the pair is INVISIBLE (the override REPLACES the default).
+    const viaMiss = await discoverTraderJoeLBPoolsTyped(
+      etched.tokenX, etched.tokenY, c.publicClient, [mkFactory([4, 50, 100])],
+    );
+    assert.equal(viaMiss.length, 0, "override without the true step replaces the default (pair not found)");
+
+    // (3) Metropolis-style override INCLUDING the true step — found exactly once (absent steps
+    // return pair=0, harmless over-query).
+    const viaMenu = await discoverTraderJoeLBPoolsTyped(
+      etched.tokenX, etched.tokenY, c.publicClient, [mkFactory([1, 2, 4, 5, 10, 15, 20, 25, 30, 50, 100, 200])],
+    );
+    assert.equal(viaMenu.length, 1, "factory-menu override finds the pair exactly once");
+    assert.equal(viaMenu[0].address.toLowerCase(), etched.pool.toLowerCase(), "the discovered pair is the etched pool");
+
+    console.log(
+      `  [lb-binSteps] default→1 pair; override[4,50,100]→0 (replaced); ` +
+        `menu[1..200]→1 pair @ binStep ${viaMenu[0].binStep}`,
     );
   });
 

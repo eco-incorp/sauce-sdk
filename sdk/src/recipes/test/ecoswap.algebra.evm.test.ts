@@ -70,7 +70,9 @@ const ENGINE_CELLS = engineCells();
 // (500/3000/10000). We enable it on the V3 factory so the inner pool charges EXACTLY this, and
 // the adapter reports it as the globalState dynamic fee — so the oracle prices at the same fee
 // the inner pool executes at (wei-exact). tickSpacing 10 (a valid spacing for the enabled tier);
-// the lens reads the Algebra tickSpacing from the factory config, so it MUST match (set below).
+// the lens reads each Algebra pool's OWN tickSpacing() LIVE (per-pool spacing — the config
+// algebraTickSpacing is only the fallback for a revert), so the config does NOT have to match —
+// the per-pool-ts cell below proves it by configuring a deliberately WRONG value.
 const ALG_DYN_FEE = 450;
 const ALG_TICK_SPACING = 10;
 
@@ -407,9 +409,89 @@ describe("EcoSwap Algebra-fork (local adapter over real V3) — engine algebraSw
     );
   }
 
+  // ── PER-POOL tickSpacing (the nest/Kittenswap heterogeneity class) ──
+  // Algebra Integral spacing is a PER-POOL property (nest hub ts=5 vs factory default 60;
+  // Kittenswap 10/60/500), which a single per-factory algebraTickSpacing cannot represent. The
+  // lens therefore reads each Algebra pool's OWN tickSpacing() live and derives the step ratio
+  // ON-CHAIN (stepRatioTs); the config value is only the revert fallback. This cell configures a
+  // DELIBERATELY WRONG algebraTickSpacing (60) against a pool whose true spacing is 10, with a
+  // liquidity edge (±11990) representable ONLY on the 10-grid — pre-fix the lens walked the
+  // config 60-grid (mis-stride); post-fix the emitted row must carry the TRUE per-pool spacing
+  // and the round-trip stays wei-exact end to end.
+  const LYING_TS = 60; // config says 60; the pool's real tickSpacing() is ALG_TICK_SPACING = 10
+  async function runPerPoolTs(engine: Engine): Promise<void> {
+    await reset();
+    const target = cookTarget(engine, stack, v12);
+    const caller = c.account0;
+
+    // Liquidity edges ±11990: multiples of the TRUE spacing 10, NOT of the lying config 60 —
+    // a config-strided walk could never land on this pool's real boundary grid.
+    const { pool: alg, inner } = await setupAlgebraPool(
+      c.walletClient, c.publicClient, stack.factory, algebraFactory, stack.helper,
+      tokenIn, tokenOut, ALG_DYN_FEE, ALG_DYN_FEE, SQRT_PRICE_1_1,
+      [[-11990, 11990, parseEther("400000")]],
+    );
+
+    const lyingConfig: ChainPoolConfig = {
+      factories: [
+        {
+          address: algebraFactory,
+          poolType: SwapPoolType.UniV3,
+          factoryType: FactoryType.AlgebraV3,
+          label: "Local Algebra (lying config ts)",
+          algebraTickSpacing: LYING_TS,
+        },
+      ],
+      feeTiers: [500, 3000, 10000],
+      baseTokens: [tokenIn, tokenOut],
+    };
+
+    const amountIn = parseEther("5000");
+    const callerInBefore = await balanceOf(c.publicClient, tokenIn, caller);
+    const innerInBefore = await balanceOf(c.publicClient, tokenIn, inner);
+
+    const { bytecodes, prepared } = await ecoSwap(
+      { tokenIn, tokenOut, amountIn },
+      anvil.rpcUrl,
+      cookTarget(engine, stack, v12),
+      caller,
+      lyingConfig,
+      undefined,
+      engine,
+    );
+
+    assert.equal(prepared.pools.length, 1, "exactly one direct pool (the Algebra pool)");
+    // THE FIX: the emitted pool row carries the pool's OWN tickSpacing() (10), NOT the lying
+    // config value (60) — so prepare stamps the TRUE grid (stepRatio = getSqrtRatioAtTick(10))
+    // and the solver/oracle walk it.
+    assert.equal(
+      prepared.pools[0].tickSpacing,
+      ALG_TICK_SPACING,
+      `lens read the PER-POOL tickSpacing() (${ALG_TICK_SPACING}), not the config fallback (${LYING_TS})`,
+    );
+
+    await approve(c.walletClient, c.publicClient, tokenIn, target, amountIn);
+    const { receipt } = await cook(c.walletClient, c.publicClient, target, bytecodes);
+    assert.equal(receipt.status, "success", "per-pool-ts Algebra cook() must succeed");
+
+    const spent = callerInBefore - (await balanceOf(c.publicClient, tokenIn, caller));
+    const innerIn = (await balanceOf(c.publicClient, tokenIn, inner)) - innerInBefore;
+    const ref = ecoSwapReference(prepared, amountIn);
+    assert.equal(spent, ref.totalInput, "single-pass: spent == oracle totalInput EXACTLY");
+    assert.equal(innerIn, amountIn, "all of amountIn routed into the Algebra pool (true-grid walk)");
+
+    console.log(
+      `  [Algebra per-pool ts:${engine}] config(lying)=${LYING_TS} live tickSpacing()=` +
+        `${prepared.pools[0].tickSpacing} spent=${spent} (oracle ${ref.totalInput})`,
+    );
+  }
+
   for (const { engine, skip } of ENGINE_CELLS) {
     it(`Algebra solo [${engine}] — discover+price+execute: received tokenOut, spent == oracle to the wei`, { skip }, async () => {
       await runSolo(engine);
+    });
+    it(`Algebra per-pool tickSpacing [${engine}] — live tickSpacing() beats a lying config (Integral heterogeneity)`, { skip }, async () => {
+      await runPerPoolTs(engine);
     });
     it(`Algebra split [${engine}] — splits with a standard V3 pool, per-pool input == oracle to the wei`, { skip }, async () => {
       await runSplit(engine);

@@ -380,11 +380,15 @@ export interface FactoryConfig {
    */
   v2FeePpm?: number;
   /**
-   * Algebra (AlgebraV3) only: the factory's fixed per-pool `tickSpacing`. Algebra v1 forks
-   * (Camelot/QuickSwap V3, Ramses V2) carry the same spacing across all their pools (commonly
-   * 60). The on-chain LENS has no TickMath, so it steps √price by a PRECOMPUTED step ratio
-   * (getSqrtRatioAtTick(tickSpacing)) derived off-chain from this value — the same way V4 specs
-   * precompute their step ratio. Defaults to 60 when omitted. Ignored for non-Algebra factories.
+   * Algebra (AlgebraV3) only: the FALLBACK per-pool `tickSpacing`. The lens reads every Algebra
+   * pool's OWN `tickSpacing()` LIVE (shared selector with Uniswap V3) and derives its step ratio
+   * ON-CHAIN (exact TickMath mirror — see the lens `stepRatioTs` helper), because Algebra spacing
+   * is a PER-POOL property, not a factory constant: Integral pools are heterogeneous (nest hub 5
+   * vs factory default 60; Kittenswap 10/60/500), and even Algebra 1.9/V1 pools drift from the 60
+   * default (Camelot WETH/USDC = 10, SwapX wS/USDC = 5 — both probed on-chain 2026-07-04, as were
+   * QuickSwap V3 / THENA Fusion / THENA Integral, ALL of which expose the getter). This config
+   * value (default 60 when omitted) is used ONLY when a pool's `tickSpacing()` staticcall REVERTS
+   * (no such lineage probed — a defensive graceful class). Ignored for non-Algebra factories.
    */
   algebraTickSpacing?: number;
   /**
@@ -412,6 +416,17 @@ export interface FactoryConfig {
    * narrower spacing menu. Ignored for non-Slipstream factories.
    */
   slipstreamTickSpacings?: number[];
+  /**
+   * Trader Joe LB (TraderJoeLB factory type) only: the binSteps this LBFactory enables. LB keys
+   * pairs by binStep — `getLBPairInformation(tokenX, tokenY, binStep)` — so discovery enumerates
+   * this list (defaulting to the Joe-common `TRADER_JOE_BIN_STEPS` = [1, 5, 10, 15, 20, 25] when
+   * omitted). Over-querying a binStep the factory does not enable is harmless (the pair slot
+   * returns address(0)); set it for a fork whose preset menu differs — Metropolis on Sonic
+   * enables {2, 4, 30, 50, 100, 200} beyond the default set (its deepest wS/USDC pair sits at
+   * binStep 4, INVISIBLE to the default enumeration). Verify a fork's menu on-chain via
+   * `LBFactory.getAllBinSteps()` (v2.1+ presets list). Ignored for non-LB factories.
+   */
+  lbBinSteps?: number[];
   /**
    * Balancer V2 (BalancerV2 factory type) only: a KNOWN list of ComposableStable pool addresses to
    * probe for the pair. Balancer has NO pair→pool getter (the `address` here is the Vault, shared on
@@ -1221,11 +1236,14 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // {1,4,10,20,25,50,100}, (USDC,USDT,1) live two-sided (~3.2k USDC + ~2.4k USDT); pairs answer
       // getReserves/getActiveId/getStaticFeeParameters (baseFactor read live — USDC/USDT bs=1 uses
       // 10000, not the 5000 default).
-      // NOTE: Metropolis enables binSteps 4/50/100 that the global TRADER_JOE_BIN_STEPS
-      // [1,5,10,15,20,25] does not enumerate — the deepest wS/USDC pair (binStep=4) is missed until
-      // the constant is extended (extra steps are harmless for Joe: absent steps return pair=0) or a
-      // per-factory binSteps override is added.
-      { address: "0x39D966c1BaFe7D3F1F53dA4845805E15f7D6EE43" as Hex, poolType: SwapPoolType.TraderJoeLB, factoryType: FactoryType.TraderJoeLB, label: "Metropolis DLMM (Joe LB)" },
+      // lbBinSteps: the FULL on-chain preset menu — getAllBinSteps() = [1,2,4,5,10,15,20,25,30,
+      // 50,100,200] (probed 2026-07-04). The default TRADER_JOE_BIN_STEPS [1,5,10,15,20,25]
+      // missed 2/4/30/50/100/200; the DEEPEST wS/USDC pair sits at binStep=4 (0x32c0D873…,
+      // ~36.9k wS — pair-probed live via getLBPairInformation, ignoredForRouting=false) and was
+      // INVISIBLE to discovery before this per-factory override. Absent steps return pair=0
+      // (harmless over-query).
+      { address: "0x39D966c1BaFe7D3F1F53dA4845805E15f7D6EE43" as Hex, poolType: SwapPoolType.TraderJoeLB, factoryType: FactoryType.TraderJoeLB, label: "Metropolis DLMM (Joe LB)",
+        lbBinSteps: [1, 2, 4, 5, 10, 15, 20, 25, 30, 50, 100, 200] },
       // SwapX Classic (Solidly ve(3,3), stable + volatile)
       { address: "0x05c1be79d3aC21Cc4B727eeD58C9B2fF757F5663" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.SolidlyV2, label: "SwapX Classic (Solidly)" },
       // Shadow Exchange Legacy (Solidly PairFactory, stable + volatile)
@@ -1385,9 +1403,10 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // (docs.usenest.xyz), back-referenced by the live WHYPE/USDT0 pool. On-chain re-verified
       // 2026-07-04: poolByPair(WHYPE,USDT0) → 0x20e6E73C…623E, globalState() = 6 words
       // (lastFee=0x12c=300, pluginConfig=0xd7), liquidity ≈ 2.65e17; pool bytecode carries the
-      // algebraSwapCallback selector. CAVEAT: Integral tickSpacing is PER-POOL (the WHYPE/USDT0 hub
-      // pool is 5; factory defaultTickspacing()=60) — algebraTickSpacing matches the hub pool;
-      // other-spacing pools get a mismatched lens step ratio.
+      // algebraSwapCallback selector. Integral tickSpacing is PER-POOL (the WHYPE/USDT0 hub pool
+      // tickSpacing()=5 — probed live 2026-07-04; factory defaultTickspacing()=60): the lens reads
+      // each pool's OWN tickSpacing() live + derives the step on-chain, so every spacing walks its
+      // true grid — algebraTickSpacing:5 is only the fallback for a tickSpacing() revert.
       { address: "0xF77Bd082c627aA54591cF2f2EaA811fd1AB3b1F3" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "nest CL", algebraFeeLayout: "integral", algebraTickSpacing: 5 },
       // Ramses CL (HyperRAM) — the factory formerly MIS-PLACED on Arbitrum (see the Arbitrum note).
       // On HyperEVM it is TICKSPACING-keyed (getPool(a,b,int24); fee-keyed getPool(a,b,uint24)
@@ -1406,10 +1425,11 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // deployed-contracts docs, back-referenced by the live WHYPE/USDT0 pool. On-chain re-verified
       // 2026-07-04: poolByPair(WHYPE,USDT0) → 0x3c140333…b809, globalState() = 6 words
       // (lastFee=0x1f4=500, pluginConfig=0xc3), liquidity ≈ 2.86e17; WHYPE/USDe pool L ≈ 2.60e17.
-      // CAVEAT: per-pool tickSpacing is HETEROGENEOUS (WHYPE/USDT0=10, WHYPE/USDe=60,
-      // WHYPE/KITTEN=500; factory default 60) — algebraTickSpacing:10 matches the deep WHYPE/USDT0
-      // hub pool; the 60-spacing WHYPE/USDe pool's lens step ratio will be off-grid (dense-stepped)
-      // until per-pool spacing is threaded through.
+      // Per-pool tickSpacing is HETEROGENEOUS — tickSpacing() probed live 2026-07-04:
+      // WHYPE/USDT0=10, WHYPE/USDe (0xCCe0285f…)=60, WHYPE/KITTEN (0x71d1FDE7…, L≈5.7e23)=500;
+      // factory defaultTickspacing()=60. The lens reads each pool's OWN tickSpacing() live +
+      // derives the step on-chain, so every spacing walks its true grid — algebraTickSpacing:10
+      // is only the fallback for a tickSpacing() revert.
       { address: "0x5f95E92c338e6453111Fc55ee66D4AafccE661A7" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Kittenswap CL", algebraFeeLayout: "integral", algebraTickSpacing: 10 },
       // Hybra V3 — plain fee-keyed Uniswap V3 fork (their CL "uses Uniswap V3 contracts without
       // modification"). NON-standard tier menu: feeAmountTickSpacing enables 200->4, 2500->50
@@ -1572,7 +1592,12 @@ export const MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342n
 /** Balancer V2 Vault — same address on all EVM chains */
 export const BALANCER_V2_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Hex;
 
-/** Trader Joe LB bin steps to query per factory */
+/**
+ * Trader Joe LB bin steps to query per factory — the DEFAULT enumeration when a factory's
+ * `FactoryConfig.lbBinSteps` override is absent (canonical Joe menu; the Arbitrum Joe entry
+ * relies on this default). Forks with a different preset menu (Metropolis on Sonic) set
+ * `lbBinSteps` per factory — see the FactoryConfig field doc.
+ */
 export const TRADER_JOE_BIN_STEPS = [1, 5, 10, 15, 20, 25] as const;
 
 /**

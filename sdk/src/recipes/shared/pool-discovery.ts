@@ -2072,8 +2072,10 @@ async function discoverTraderJoeLBPools(
 
   const pools: PoolInfo[] = [];
   for (const factory of factories) {
-    // Query each known bin step
-    const calls = TRADER_JOE_BIN_STEPS.map((binStep) => ({
+    // Query each enabled bin step — the factory's own menu when configured (Metropolis enables
+    // 2/4/30/50/100/200 beyond the Joe defaults), else the canonical TRADER_JOE_BIN_STEPS.
+    const binSteps: readonly number[] = factory.lbBinSteps ?? TRADER_JOE_BIN_STEPS;
+    const calls = binSteps.map((binStep) => ({
       address: factory.address,
       abi: traderJoeLBFactoryAbi,
       functionName: "getLBPairInformation" as const,
@@ -2190,9 +2192,13 @@ export async function discoverTraderJoeLBPoolsTyped(
   const pools: LbPool[] = [];
   const inLower = tokenIn.toLowerCase();
   for (const factory of factories) {
-    // Find the pair for each known bin step (both token orderings resolve the same pair —
-    // getLBPairInformation is order-independent on (tokenX, tokenY) within a binStep).
-    const infoCalls = TRADER_JOE_BIN_STEPS.map((binStep) => ({
+    // Find the pair for each enabled bin step (both token orderings resolve the same pair —
+    // getLBPairInformation is order-independent on (tokenX, tokenY) within a binStep). The
+    // enumerated menu is per-factory when configured (`FactoryConfig.lbBinSteps` — Metropolis
+    // enables 2/4/30/50/100/200 beyond the Joe defaults, and its deepest wS/USDC pair sits at
+    // binStep 4), else the canonical TRADER_JOE_BIN_STEPS default.
+    const binSteps: readonly number[] = factory.lbBinSteps ?? TRADER_JOE_BIN_STEPS;
+    const infoCalls = binSteps.map((binStep) => ({
       address: factory.address,
       abi: traderJoeLBFactoryAbi,
       functionName: "getLBPairInformation" as const,
@@ -2211,7 +2217,7 @@ export async function discoverTraderJoeLBPoolsTyped(
       if (r.status !== "success") continue;
       const [, pairAddr, , ignoredForRouting] = r.result as [bigint, string, boolean, boolean];
       if (pairAddr && pairAddr !== ZERO_ADDRESS && !ignoredForRouting) {
-        validPairs.push({ address: pairAddr as Hex, binStep: TRADER_JOE_BIN_STEPS[i] });
+        validPairs.push({ address: pairAddr as Hex, binStep: binSteps[i] });
       }
     }
     if (validPairs.length === 0) continue;
