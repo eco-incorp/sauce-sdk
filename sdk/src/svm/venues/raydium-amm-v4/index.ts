@@ -36,7 +36,7 @@ const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 // the whole program (AUTHORITY_AMM, processor.rs:111), pinned mainnet value.
 const AMM_AUTHORITY = address('5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1');
 
-// AmmInfo field offsets (state.rs AmmInfo, facts: raydium-amm-v4.json poolAccountLayout).
+// AmmInfo field offsets (state.rs AmmInfo, layout table in docs/svm-venues.md).
 const AMM_INFO_SIZE = 752;
 const OFF_STATUS = 0;
 const OFF_COIN_DECIMALS = 32;
@@ -144,6 +144,14 @@ export const raydiumAmmV4: SvmVenueAdapter = {
       throw new Error(`${SLUG} pool ${pool} status ${status} is not quotable: only status 6 (SwapOnly) and 7 (WaitingTrade) swap without the orderbook`);
     }
 
+    // Status 7 (WaitingTrade) rejects swaps on-chain until pool_open_time;
+    // referenceQuote re-checks it against the live state snapshot.
+    const poolOpenTime = readUintLE(data, OFF_POOL_OPEN_TIME, 8);
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    if (status === 7n && now < poolOpenTime) {
+      throw new Error(`${SLUG} pool ${pool} is not open yet (pool_open_time ${poolOpenTime}, now ${now})`);
+    }
+
     const codec = getAddressCodec();
     const pubkey = (offset: number): Address => codec.decode(data.slice(offset, offset + 32));
 
@@ -158,7 +166,7 @@ export const raydiumAmmV4: SvmVenueAdapter = {
       venue: SLUG,
       pool,
       status,
-      poolOpenTime: readUintLE(data, OFF_POOL_OPEN_TIME, 8),
+      poolOpenTime,
       coinDecimals: Number(readUintLE(data, OFF_COIN_DECIMALS, 8)),
       pcDecimals: Number(readUintLE(data, OFF_PC_DECIMALS, 8)),
       swapFeeNumerator: readUintLE(data, OFF_SWAP_FEE_NUMERATOR, 8),

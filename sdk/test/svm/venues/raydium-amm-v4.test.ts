@@ -1,11 +1,11 @@
 /**
  * Raydium AMM v4 adapter units (no engine, no RPC): fetchPoolConfig decodes
  * the real mainnet fixture (SOL/USDC pool 58oQChx4..., snapshot 2026-07-04),
- * referenceQuote reproduces the facts file's pinned worked examples exactly,
+ * referenceQuote reproduces docs/svm-venues.md's pinned worked examples exactly,
  * every scope gate throws on a doctored fixture, buildSwap emits the
  * swap_base_in_v2 wire bytes + ordered metas, and emitQuote's fragment
  * compiles as target-'svm' SauceScript. Expected constants come from
- * raydium-amm-v4.json (source-verified against raydium-io/raydium-amm and the
+ * docs/svm-venues.md (source-verified against raydium-io/raydium-amm and the
  * deployed mainnet binary), never from the adapter's own output.
  */
 import { resolve } from 'path';
@@ -25,8 +25,8 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const AMM_AUTHORITY = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
 
-// Pinned fixture-snapshot constants from raydium-amm-v4.json
-// quoteRecipe.workedExample_fixtureSnapshot_2026-07-04.
+// Pinned fixture-snapshot constants from the docs/svm-venues.md worked
+// example (2026-07-04 snapshot).
 const COIN_VAULT_AMOUNT = 66_599_328_743_661n;
 const SOL_IN = 1_000_000_000n; //  1 SOL  -> 81.386311 USDC (fee 2_500_000)
 const SOL_TO_USDC_OUT = 81_386_311n;
@@ -70,7 +70,7 @@ describe('raydium-amm-v4 adapter identity', () => {
 });
 
 describe('raydium-amm-v4 fetchPoolConfig', () => {
-  it('decodes the mainnet AmmInfo fixture (spot-checked against the facts file)', async () => {
+  it('decodes the mainnet AmmInfo fixture (spot-checked against docs/svm-venues.md)', async () => {
     const cfg = await fetchConfig();
 
     expect(cfg.venue).toBe('raydium-amm-v4');
@@ -140,6 +140,27 @@ describe('raydium-amm-v4 fetchPoolConfig', () => {
       `does not match pool coin mint ${WSOL_MINT}`,
     );
   });
+
+  it('gates a status-7 pool whose pool_open_time is in the future', async () => {
+    const future = BigInt(Math.floor(Date.now() / 1000)) + 86_400n;
+    const waiting = doctored(POOL, (data) => {
+      writeU64(data, 0, 7n); // WaitingTrade
+      writeU64(data, 224, future); // state_data.pool_open_time
+    });
+    await expect(fetchConfig(waiting)).rejects.toThrow(
+      `raydium-amm-v4 pool ${POOL} is not open yet (pool_open_time ${future}, now `,
+    );
+  });
+
+  it('accepts a status-7 pool once pool_open_time has passed', async () => {
+    const open = doctored(POOL, (data) => {
+      writeU64(data, 0, 7n);
+      writeU64(data, 224, 1n);
+    });
+    const cfg = await fetchConfig(open);
+    expect(cfg.status).toBe(7n);
+    expect(cfg.poolOpenTime).toBe(1n);
+  });
 });
 
 describe('raydium-amm-v4 referenceQuote (pinned worked examples)', () => {
@@ -155,11 +176,13 @@ describe('raydium-amm-v4 referenceQuote (pinned worked examples)', () => {
 
   it('gates a status-7 pool on pool_open_time, then quotes identically once open', async () => {
     const openTime = 2_000_000_000n;
+    // Fetch from an already-open status-7 snapshot (a future open_time is
+    // gated at fetch); referenceQuote reads open_time from the LIVE state.
+    const cfg = await fetchConfig(doctored(POOL, (data) => writeU64(data, 0, 7n)));
     const waiting = doctored(POOL, (data) => {
       writeU64(data, 0, 7n); // WaitingTrade
       writeU64(data, 224, openTime); // state_data.pool_open_time
     });
-    const cfg = await fetchConfig(waiting);
     const state = fixtureBytesMap(waiting);
 
     expect(() => raydiumAmmV4.referenceQuote(cfg, state, SOL_IN, openTime - 1n)).toThrow(
@@ -280,7 +303,7 @@ describe('raydium-amm-v4 buildSwap (swap_base_in_v2)', () => {
     expect(Buffer.from(swap.data).toString('hex')).toBe('1000ca9a3b000000000100000000000000');
   });
 
-  it('orders the 8 account metas exactly as the facts file documents', async () => {
+  it('orders the 8 account metas exactly as docs/svm-venues.md documents', async () => {
     const cfg = await fetchConfig();
     const swap = raydiumAmmV4.buildSwap(cfg, user, SOL_IN);
 

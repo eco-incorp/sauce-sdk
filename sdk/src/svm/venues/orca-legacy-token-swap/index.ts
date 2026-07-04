@@ -176,7 +176,7 @@ export const orcaLegacyTokenSwap = {
     // amountOut = rsOut - ceil(rsIn * rsOut / (rsIn + netIn)), ceiled via
     // (num + den - 1) / den. Reserves are u64, so rsIn * rsOut <= 2^128 and
     // nothing here approaches the engine's 256-bit wrap ("All arithmetic in
-    // u128" — facts file roundingNotes); no Math.mulDiv needed.
+    // u128" — docs/svm-venues.md); no Math.mulDiv needed.
     const vaultIn = JSON.stringify(poolRef(cfg, 'vault-in'));
     const vaultOut = JSON.stringify(poolRef(cfg, 'vault-out'));
     return [

@@ -1,6 +1,6 @@
 /**
  * Shared bigint helpers for venue adapters. All venue math is bigint with
- * floors/ceils exactly as the facts files state; division floors natively.
+ * floors/ceils exactly as docs/svm-venues.md states; division floors natively.
  */
 
 /** Ceiling division: smallest q with q * b >= a. Non-negative dividends only. */

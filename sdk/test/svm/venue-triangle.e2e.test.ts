@@ -4,11 +4,11 @@
  * one-pool quote program (`return q0`), load the venue's mainnet fixture
  * dumps into the bank, pin the cluster clock, execute — and assert
  *
- *     in-VM quote == adapter.referenceQuote == facts-file pinned constant
+ *     in-VM quote == adapter.referenceQuote == docs/svm-venues.md pinned constant
  *
- * closing the emitQuote ↔ referenceQuote ↔ facts triangle. The pinned
- * constants are copied from each venue's facts-file worked example over the
- * untouched fixture snapshot (the same pins the per-venue unit suites use) —
+ * closing the emitQuote ↔ referenceQuote ↔ docs triangle. The pinned
+ * constants are copied from each venue's worked example in docs/svm-venues.md
+ * over the untouched fixture snapshot (the same pins the per-venue unit suites use) —
  * NEVER derived from the adapter's own output, so a shared formula bug cannot
  * self-verify. Requires the engine .so (SAUCE_ENGINE_SO); skips cleanly
  * without it.
@@ -18,6 +18,7 @@ import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import { venueAdapter } from '../../src/svm/venues/registry.js';
+import type { PoolConfig } from '../../src/svm/venues/types.js';
 import { SOLSWAP_STABLE_HELPERS } from '../../src/recipes/solswap/index.js';
 import type { AccountResolution } from '../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from './fixtures.js';
@@ -35,14 +36,14 @@ interface TriangleCase {
   pool: Address;
   amountIn: bigint;
   /**
-   * The facts-file pinned worked example over the untouched fixture snapshot
+   * The docs/svm-venues.md pinned worked example over the untouched fixture snapshot
    * (independently recomputed constants, same pins as the venue unit suites).
    */
   pinned: bigint;
   /**
    * Clock the quote is evaluated at, in-VM (LiteSVM Clock sysvar) and
    * off-chain (referenceQuote `now`) alike. Time-dependent venues use their
-   * facts example's exact timestamp; the rest use any post-gate instant.
+   * worked example's exact timestamp; the rest use any post-gate instant.
    */
   clock: bigint;
 }
@@ -66,14 +67,14 @@ const CASES: TriangleCase[] = [
 
 const fixturesDir = (slug: string) => resolve(process.cwd(), 'test', 'svm', 'fixtures', slug);
 
-describeSvm('venue quote triangle: emitQuote (real engine) == referenceQuote == facts pin', () => {
+describeSvm('venue quote triangle: emitQuote (real engine) == referenceQuote == svm-venues.md pin', () => {
   for (const { slug, pool, amountIn, pinned, clock } of CASES) {
     it(`${slug}: one-pool quote program returns the pinned quote`, async () => {
       const adapter = venueAdapter(slug);
       const fixtures = loadFixtures(fixturesDir(slug));
       const cfg = await adapter.fetchPoolConfig(fixtureLoader(fixtures), pool);
 
-      // Leg 1: the TS mirror over the same snapshot reproduces the facts pin.
+      // Leg 1: the TS mirror over the same snapshot reproduces the documented pin.
       const reference = adapter.referenceQuote(cfg, fixtureBytesMap(fixtures), amountIn, clock);
       expect(reference).toBe(pinned);
 
@@ -98,4 +99,59 @@ describeSvm('venue quote triangle: emitQuote (real engine) == referenceQuote == 
       expect(toBigInt(result.returnData)).toBe(pinned);
     });
   }
+});
+
+/**
+ * meteora-damm-v2 clamp semantics on the real engine: a quote that crosses the
+ * pool's sqrt-price band, or evaluates before a timestamp activation point,
+ * returns 0 instead of aborting — the rest of a multi-venue solswapBest
+ * program stays quotable. referenceQuote mirrors the band clamp (0n).
+ */
+describeSvm('meteora-damm-v2 clamps quote 0 in-VM instead of throwing', () => {
+  const slug = 'meteora-damm-v2';
+  const pool = address('8Pm2kZpnxD3hoMmt4bjStX2Pw2Z9abpbHzZxMPqxPmie');
+  const adapter = venueAdapter(slug);
+  const fixtures = loadFixtures(fixturesDir(slug));
+  // Fixture pins (same as the triangle case): activation_point 1_754_985_927
+  // (unix), post-activation clock 1_780_000_000.
+  const ACTIVATION = 1_754_985_927n;
+  const CLOCK = 1_780_000_000n;
+  const ONE_SOL = 1_000_000_000n;
+
+  const runInVm = async (cfg: PoolConfig, amountIn: bigint, clock: bigint): Promise<bigint> => {
+    const source = `function main() {\n${adapter.emitQuote(cfg, 0, amountIn)}\n  return q0;\n}`;
+    const { bytecode, accountPlan } = compile(source, { target: 'svm' });
+    if (!accountPlan) throw new Error('svm compile produced no account plan');
+    const resolution: AccountResolution = {};
+    for (const account of adapter.quoteAccounts(cfg)) {
+      if (account.address === undefined) throw new Error(`quote account ref '${account.ref}' has no address`);
+      resolution[account.ref] = account.address;
+    }
+    const harness = await startEngine(clock);
+    loadFixtureAccounts(harness, fixtures);
+    const result = expectOk(await execute(harness, { bytecode: bytecode[0], accountPlan }, resolution));
+    return toBigInt(result.returnData);
+  };
+
+  it('aToB amountIn crossing sqrt_min_price: 0 in-VM and from referenceQuote', async () => {
+    const cfg = await adapter.fetchPoolConfig(fixtureLoader(fixtures), pool);
+    const amountIn = 10_000n * ONE_SOL; // pushes next_sqrt_price below sqrt_min_price
+    expect(adapter.referenceQuote(cfg, fixtureBytesMap(fixtures), amountIn, CLOCK)).toBe(0n);
+    expect(await runInVm(cfg, amountIn, CLOCK)).toBe(0n);
+  });
+
+  it('bToA amountIn crossing sqrt_max_price: 0 in-VM and from referenceQuote', async () => {
+    const cfg = { ...(await adapter.fetchPoolConfig(fixtureLoader(fixtures), pool)), direction: 'bToA' };
+    const amountIn = (1n << 64n) - 1n; // pushes next_sqrt_price above sqrt_max_price
+    expect(adapter.referenceQuote(cfg, fixtureBytesMap(fixtures), amountIn, CLOCK)).toBe(0n);
+    expect(await runInVm(cfg, amountIn, CLOCK)).toBe(0n);
+  });
+
+  it('clock before the timestamp activation point: 0 in-VM (referenceQuote throws)', async () => {
+    const cfg = await adapter.fetchPoolConfig(fixtureLoader(fixtures), pool);
+    expect(() => adapter.referenceQuote(cfg, fixtureBytesMap(fixtures), ONE_SOL, ACTIVATION - 1n)).toThrow(
+      'not activated',
+    );
+    expect(await runInVm(cfg, ONE_SOL, ACTIVATION - 1n)).toBe(0n);
+  });
 });

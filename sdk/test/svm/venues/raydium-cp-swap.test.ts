@@ -1,7 +1,7 @@
 /**
  * Raydium CP-Swap adapter units (no engine, no RPC): the fixture set is the
  * real mainnet WSOL/USDC pool 7Juw... snapshot of 2026-07-04, and every pinned
- * constant below comes from the source-verified facts sheet for program
+ * constant below comes from docs/svm-venues.md, source-verified for program
  * CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C (or is hand-derived from its
  * quote formula, with the derivation spelled out at the assertion).
  */
@@ -16,7 +16,7 @@ import type { AccountFixture } from '../fixtures.js';
 
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'raydium-cp-swap');
 
-// Mainnet fixture addresses (facts file `mainnetFixture`).
+// Mainnet fixture addresses (docs/svm-venues.md worked example).
 const POOL = address('7JuwJuNU88gurFnyWeiyGKbFmExMWcmRZntn9imEzdny');
 const AMM_CONFIG = 'D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2';
 const VAULT0 = '7VLUXrnSSDo9BfCa4NWaQs68g7ddDY1sdXBKW6Xswj9Y';
@@ -79,7 +79,7 @@ describe('raydium-cp-swap adapter identity', () => {
 });
 
 describe('raydium-cp-swap fixtures', () => {
-  it('pin the 2026-07-04 snapshot values from the facts sheet', () => {
+  it('pin the 2026-07-04 snapshot values from docs/svm-venues.md', () => {
     const state = fixtureBytesMap(fixtures);
     // SPL vault amounts (u64 LE @64).
     expect(readUintLE(state[VAULT0], 64, 8)).toBe(1_927_052_254n);
@@ -209,7 +209,7 @@ describe('raydium-cp-swap fetchPoolConfig', () => {
 describe('raydium-cp-swap referenceQuote', () => {
   const state = fixtureBytesMap(fixtures);
 
-  it('reproduces the facts-sheet worked example: 1_000_000 WSOL lamports -> 81443 USDC', async () => {
+  it('reproduces the docs/svm-venues.md worked example: 1_000_000 WSOL lamports -> 81443 USDC', async () => {
     // reserve_in = 1927052254 - 69220427 - 86140625 - 0 = 1771691202
     // reserve_out = 146870650 - 869850 - 1264457 - 0 = 144736343
     // fee = ceil(1e6 * 2500 / 1e6) = 2500, out = floor(997500 * rOut / (rIn + 997500)) = 81443

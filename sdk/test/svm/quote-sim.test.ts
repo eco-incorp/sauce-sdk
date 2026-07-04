@@ -121,7 +121,7 @@ describe('quoteViaSimulation', () => {
 
   it('throws when the simulation returns no post-state for the outAta', async () => {
     const payer = await generateKeyPairSigner();
-    for (const accounts of [null, [null]] as const) {
+    for (const accounts of [null, [null]] as SimulateValue['accounts'][]) {
       const { rpc } = stubRpc({ data: [tokenAccountBase64(1n), 'base64'] }, { err: null, accounts });
       await expect(quoteViaSimulation({ rpc, swapIx, payer, outAta: OUT_ATA })).rejects.toThrow(
         `swap simulation did not return the out token account ${OUT_ATA}`,

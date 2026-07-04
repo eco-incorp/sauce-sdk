@@ -100,7 +100,8 @@ export interface SvmVenueAdapter {
   buildSwap(cfg: PoolConfig, user: SwapUser, amountIn: bigint): VenueSwap;
   /**
    * TS mirror of emitQuote for tests — MUST be independently derived from the
-   * facts file's formula, not from reading the emitted SauceScript. `state`
+   * venue's quote formula in docs/svm-venues.md, not from reading the emitted
+   * SauceScript. `state`
    * carries the accounts emitQuote reads; `now` is the unix timestamp for
    * time-dependent venues (amp ramps, locked-profit decay).
    */

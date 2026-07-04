@@ -15,7 +15,7 @@
  *  3. stable-only pair: the shared Newton helpers are declared once, and the
  *     in-VM bestOut is pinned exactly via the minOut revert bracket.
  *  4. DAMM v2 sqrt-price pool next to CP pools: the sqrt quote wins the scan
- *     with its facts-pinned value.
+ *     with its svm-venues.md-pinned value.
  *  5. minOut over every quote: reverts with "minOut" BEFORE any CPI.
  *  6. ALT path: a fabricated lookup-table account compresses the transaction
  *     and the compressed v0 message executes.
@@ -68,13 +68,13 @@ const VENUE_POOL: Record<string, Address> = {
   'meteora-damm-v1-stable': address('32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG'),
 };
 
-// Facts-file pins re-asserted where a scenario's clock matches the pin's.
+// docs/svm-venues.md pins re-asserted where a scenario's clock matches the pin's.
 const DAMM_V2_PIN = 81_533_661n; // 1 SOL -> 81.533661 USDC
 const DAMM_V1S_PIN = 1_000_605_351n; // 1e9 uUSDC -> 1000605351 uUSDT at CLOCK_T
 const SABER_PIN = 1_000_603n; // 1.0 USDC -> 1.000603 USDT (post-ramp)
 
 // Post-gate clocks: the CP venues are time-free, the pins above hold at their
-// facts timestamps (see venue-triangle.e2e.test.ts for the full triangle).
+// svm-venues.md timestamps (see venue-triangle.e2e.test.ts for the full triangle).
 const CLOCK_CP = 1_783_123_200n;
 const CLOCK_DAMM_V2 = 1_780_000_000n;
 const CLOCK_STABLE = 1_783_175_236n; // meteora-damm-v1-stable snapshot clock
@@ -238,7 +238,7 @@ describeSvm('solswapBest e2e: external quote wins over a live venue', () => {
     const amountIn = 1_000_000n;
     const fixtures = venueFixtures(['raydium-cp-swap']);
     const liveRef = await referenceFor('raydium-cp-swap', fixtures, amountIn, CLOCK_CP);
-    expect(liveRef).toBe(81_443n); // facts pin: 1_000_000 WSOL lamports -> 81443 USDC
+    expect(liveRef).toBe(81_443n); // svm-venues.md pin: 1_000_000 WSOL lamports -> 81443 USDC
 
     const quoted = 100_000n; // beats the live 81_443
     const paid = 100_005n; // the venue over-delivers relative to its quote
@@ -272,7 +272,7 @@ describeSvm('solswapBest e2e: stable-only pair shares one Newton helper set', ()
   it('declares stableD/stableY once and computes the exact pinned bestOut in-VM', async () => {
     const fixtures = venueFixtures(slugs);
     const refs = await Promise.all(slugs.map((slug) => referenceFor(slug, fixtures, AMOUNT_IN, CLOCK_STABLE)));
-    expect(refs[1]).toBe(DAMM_V1S_PIN); // facts pin at this exact clock
+    expect(refs[1]).toBe(DAMM_V1S_PIN); // svm-venues.md pin at this exact clock
     const best = refs[0] > refs[1] ? refs[0] : refs[1];
 
     // No stand-in and no deployed venue program, so the exact in-VM bestOut
@@ -299,7 +299,7 @@ describeSvm('solswapBest e2e: stable-only pair shares one Newton helper set', ()
 describeSvm('solswapBest e2e: DAMM v2 sqrt pool wins next to CP pools', () => {
   const slugs = ['raydium-cp-swap', 'raydium-amm-v4', 'meteora-damm-v2'];
 
-  it('the sqrt-price quote beats both CP quotes with its facts-pinned value', async () => {
+  it('the sqrt-price quote beats both CP quotes with its svm-venues.md-pinned value', async () => {
     const fixtures = venueFixtures(slugs);
     const [cpRef, v4Ref, dammV2Ref] = await Promise.all(
       slugs.map((slug) => referenceFor(slug, fixtures, AMOUNT_IN, CLOCK_DAMM_V2)),
@@ -393,7 +393,7 @@ const SABER_SO = VENUE_PROGRAMS_DIR ? join(VENUE_PROGRAMS_DIR, 'saber-stableswap
 const describeRealCpi = existsSync(ENGINE_SO) && SABER_SO !== undefined && existsSync(SABER_SO) ? describe : describe.skip;
 
 describeRealCpi('solswapBest e2e: real saber-stableswap binary CPI', () => {
-  it('the realized on-chain output equals the in-VM quote and the facts pin', async () => {
+  it('the realized on-chain output equals the in-VM quote and the svm-venues.md pin', async () => {
     const amountIn = 1_000_000n;
     const slug = 'saber-stableswap';
     const fixtures = loadFixtures(fixturesDir(slug));
@@ -427,7 +427,7 @@ describeRealCpi('solswapBest e2e: real saber-stableswap binary CPI', () => {
 
     const result = expectOk(await execute(harness, output, resolution));
 
-    // The quadrilateral: facts pin == referenceQuote == in-VM quote ==
+    // The quadrilateral: svm-venues.md pin == referenceQuote == in-VM quote ==
     // realized output of the REAL venue binary.
     expect(toBigInt(result.returnData)).toBe(SABER_PIN);
     expect(tokenAmount(harness, outAta)).toBe(OUT_ATA_START + SABER_PIN);

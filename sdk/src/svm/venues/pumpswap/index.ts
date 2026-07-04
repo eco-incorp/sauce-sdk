@@ -3,7 +3,8 @@
  * balances (nothing subtracted: protocol/creator/buyback fees leave to their
  * own ATAs at swap time and the LP fee stays in the vault). Layouts follow the
  * official Anchor IDL, quote math the official SDK, both verified byte-exact
- * against mainnet simulation events (see the pumpswap facts file).
+ * against mainnet simulation events (see the pumpswap section of
+ * docs/svm-venues.md).
  *
  * Fees come from the fee program's FeeConfig PDA, re-read on every
  * fetchPoolConfig (they are admin-mutable): non-canonical pools pay flat_fees;
@@ -18,7 +19,7 @@
  * depends on compile-time constants, so the in-VM fragment reads exactly two
  * accounts: the pool's base and quote vault amounts (u64 LE at offset 64).
  *
- * Overflow bound (facts file: all reserve/amount fields are SPL u64): every
+ * Overflow bound (docs/svm-venues.md: all reserve/amount fields are SPL u64): every
  * in-VM product is u64 * u64-or-bps < 2^128, far inside the engine's 256-bit
  * wrap-free range; Math.mulDiv is used for the invariant products anyway.
  */
@@ -127,8 +128,8 @@ async function ata(owner: Address, mint: Address, tokenProgram: Address): Promis
  * Which token program serves this mint, from its account data alone: a classic
  * layout is exactly 82 bytes (assumed Tokenkeg — an extensionless token-2022
  * mint is indistinguishable, and every pump token-2022 mint carries
- * extensions), anything longer must be token-2022 TLV. Gate (facts file
- * quoteRecipe.tokenPrograms): a TransferFeeConfig extension makes vault deltas
+ * extensions), anything longer must be token-2022 TLV. Gate (documented in
+ * docs/svm-venues.md): a TransferFeeConfig extension makes vault deltas
  * diverge from user amounts, so such mints are rejected.
  */
 function detectTokenProgram(mint: Address, data: Uint8Array): Address {
@@ -180,7 +181,7 @@ function parseFeeTiers(data: Uint8Array): FeeTier[] {
   return tiers;
 }
 
-/** Facts file feeSelection.step2_canonical: below tiers[0] -> tiers[0]; else highest tier with mc >= threshold. */
+/** Tier scan (docs/svm-venues.md fee selection): below tiers[0] -> tiers[0]; else highest tier with mc >= threshold. */
 function pickFeeTier(tiers: FeeTier[], marketCap: bigint): FeeTier {
   if (marketCap < tiers[0].marketCapThreshold) return tiers[0];
   for (let i = tiers.length - 1; i >= 0; i--) {
@@ -196,8 +197,8 @@ async function loadAccount(load: AccountLoader, addr: Address, what: string): Pr
 }
 
 /**
- * buy_exact_quote_in effective quote input (facts file
- * quoteRecipe.buy_exactQuoteIn): strip the fee share off the spendable budget,
+ * buy_exact_quote_in effective quote input (docs/svm-venues.md buy
+ * formula): strip the fee share off the spendable budget,
  * ceil-rounding each fee component separately, and hand back effQ after the
  * over-budget correction. The on-chain invariant swap then uses effQ - 1.
  */
@@ -207,7 +208,7 @@ function buyEffectiveQuoteIn(spendable: bigint, lp: bigint, protocol: bigint, cr
   const fees = ceilDiv(eff * lp, BPS) + ceilDiv(eff * protocol, BPS) + ceilDiv(eff * creator, BPS);
   const over = eff + fees - spendable;
   if (over > 0n) eff -= over;
-  // Unverified edge on-chain (facts file openQuestions): guard eff >= 2.
+  // Unverified edge on-chain (docs/svm-venues.md caveats): guard eff >= 2.
   if (eff < 2n) throw new Error(`pumpswap quote amountIn ${spendable} is too small (effective quote input below 2)`);
   return eff;
 }
@@ -236,8 +237,8 @@ export const pumpswapAdapter = {
       throw new Error(`pumpswap pool ${pool} discriminator mismatch (not a pump amm Pool account)`);
     }
     // Core fields run through lp_supply at 203..211; pools shorter than 243
-    // predate coin_creator, which then reads as Pubkey::default (facts file
-    // poolAccount.observedSizes).
+    // predate coin_creator, which then reads as Pubkey::default (observed
+    // sizes in docs/svm-venues.md).
     if (poolData.length < 211) {
       throw new Error(`pumpswap pool ${pool} data is ${poolData.length} bytes, expected at least 211`);
     }
@@ -282,7 +283,7 @@ export const pumpswapAdapter = {
 
     // Canonical pump pools (creator == the bonding curve's pool-authority PDA
     // for the base mint) pay the market-cap fee tier; everything else pays
-    // flat_fees (facts file quoteRecipe.feeSelection).
+    // flat_fees (docs/svm-venues.md fee selection).
     const encoder = getAddressEncoder();
     const poolAuthority = await pda(
       ['pool-authority', new Uint8Array(encoder.encode(baseMint))],
@@ -376,7 +377,7 @@ export const pumpswapAdapter = {
     if (c.direction === 'quoteToBase') {
       // The fee arithmetic only involves compile-time constants, so it folds
       // off-chain and the live quote is one invariant division over the
-      // reserves (with the on-chain effQ - 1, facts file buy_exactQuoteIn).
+      // reserves (with the on-chain effQ - 1, docs/svm-venues.md buy formula).
       const inAmount = buyEffectiveQuoteIn(amountIn, c.lpFeeBps, c.protocolFeeBps, c.creatorFeeBps) - 1n;
       lines.push(`  const q${i} = Math.mulDiv(psBase${i}, ${inAmount}, psQuote${i} + ${inAmount});`);
     } else {
@@ -438,7 +439,7 @@ export const pumpswapAdapter = {
       accounts.push({ ref: USER_VOLUME_ACCUMULATOR_REF, writable: true });
     }
     accounts.push(readonly(FEE_CONFIG), readonly(FEE_PROGRAM));
-    // Remaining accounts (facts file order): pool-v2 PDA when a coin creator
+    // Remaining accounts (order per docs/svm-venues.md): pool-v2 PDA when a coin creator
     // is set, then ALWAYS the buyback recipient pair (error 6058 otherwise).
     if (c.poolV2 !== undefined) accounts.push(readonly(c.poolV2));
     accounts.push(readonly(c.buybackFeeRecipient), writable(c.buybackFeeRecipientTokenAccount));
@@ -446,9 +447,9 @@ export const pumpswapAdapter = {
     return { programId: PUMPSWAP_PROGRAM_ID, data, accounts };
   },
 
-  // Written from the facts file quote formulas (buy_exactQuoteIn /
-  // sell_exactBaseIn), deliberately NOT sharing the emitQuote fold above so
-  // the two stay independently derived.
+  // Written from the docs/svm-venues.md quote formulas (buy and sell),
+  // deliberately NOT sharing the emitQuote fold above so the two stay
+  // independently derived.
   referenceQuote(cfg: PoolConfig, state: AccountBytesMap, amountIn: bigint, _now: bigint): bigint {
     const c = asPumpswapConfig(cfg);
     checkAmountIn(amountIn);

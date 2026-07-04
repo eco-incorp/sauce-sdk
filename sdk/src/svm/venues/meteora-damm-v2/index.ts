@@ -3,8 +3,8 @@
  * account ONLY. Vault balances must never enter the quote: they overstate
  * reserves by unclaimed LP/protocol fees, and for concentrated pools the
  * virtual reserves differ from real reserves. All byte offsets, formulas and
- * rounding rules follow the source-verified facts sheet for the cp-amm
- * program (github.com/MeteoraAg/damm-v2, Pool = 8-byte discriminator +
+ * rounding rules follow docs/svm-venues.md, source-verified against the
+ * cp-amm program (github.com/MeteoraAg/damm-v2, Pool = 8-byte discriminator +
  * 1104-byte zero-copy struct).
  *
  * Accepted pools (everything else is gated with a named error):
@@ -13,14 +13,20 @@
  * - base_fee_mode in {0, 1} with period_frequency == 0 (static base fee,
  *   the common case) — rate-limiter/market-cap fees are amount-dependent,
  *   and time-scheduled fees need a clock the in-VM quote does not have;
- * - classic SPL or token-2022 mints WITHOUT a transfer-fee extension.
+ * - classic SPL or token-2022 mints WITHOUT a transfer-fee extension;
+ * - activation_point == 0 when activation_type == 0 (slot) — a slot-typed
+ *   point cannot be evaluated against the unix clock off-chain nor in the
+ *   fragment; timestamp-typed (activation_type == 1) points gate in-fragment
+ *   on block.timestamp instead (quote 0 before activation).
  *
  * Overflow bound for the in-VM fragment (engine arithmetic wraps at 2^256):
  * liquidity is u128 and every sqrt price is validated into
  * [MIN_SQRT_PRICE, MAX_SQRT_PRICE] with MAX_SQRT_PRICE < 2^97, so the largest
- * products are liquidity * sqrt_price < 2^225, amount_in << 128 < 2^192 and
- * sqrt_price * next_sqrt_price < 2^194 — all comfortably below 2^256, so
- * plain ops are exact and Math.mulDiv is unnecessary.
+ * products are liquidity * sqrt_price < 2^225, amount_in << 128 < 2^192 and,
+ * within the band, sqrt_price * next_sqrt_price < 2^194 — all comfortably
+ * below 2^256, so plain ops are exact and Math.mulDiv is unnecessary. A
+ * band-violating bToA next_sqrt_price can push sqrt_price * next_sqrt_price
+ * past the wrap, but every such quote is clamped to 0 before it is used.
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
@@ -254,7 +260,8 @@ async function assertNoTransferFee(load: AccountLoader, pool: string, side: stri
 /**
  * total_fee_numerator = min(base + variable, cap). Base is static (scheduler
  * pools are gated); variable uses the STORED volatility accumulator, the
- * facts-sheet approximation that is exact within filter_period.
+ * documented approximation (docs/svm-venues.md) that is exact within
+ * filter_period.
  */
 function totalFeeNumerator(d: DecodedPool): bigint {
   let fee = d.cliffFeeNumerator;
@@ -274,6 +281,13 @@ export const meteoraDammV2 = {
     const data = await load(pool);
     if (data === null) throw new Error(`meteora-damm-v2 pool ${pool} account not found`);
     const d = decodePool(pool, data);
+    // A slot-typed activation point cannot be evaluated against the unix
+    // clock off-chain nor in the fragment; every settled pool carries 0.
+    if (d.activationType === 0 && d.activationPoint !== 0n) {
+      throw new Error(
+        `meteora-damm-v2 pool ${pool} has slot-based activation_point ${d.activationPoint} — slot-gated pools are out of scope`,
+      );
+    }
     const tokenAProgram = tokenProgramFor(pool, 'a', d.tokenAFlag);
     const tokenBProgram = tokenProgramFor(pool, 'b', d.tokenBFlag);
     if (d.tokenAFlag === 1) await assertNoTransferFee(load, pool, 'a', d.tokenAMint);
@@ -330,17 +344,21 @@ export const meteoraDammV2 = {
     lines.push(`const l${i} = accountUint(${ref}, 360, 16);`, `const s${i} = accountUint(${ref}, 456, 16);`);
     if (c.direction === 'aToB') {
       // next = ceil(L * sqrtP / (L + dIn * sqrtP)); delta_b floors; fee ceils
-      // on OUTPUT (fees are never on input for aToB).
+      // on OUTPUT (fees are never on input for aToB). A band-crossing next
+      // clamps the quote to 0 (never wraps: next <= sqrtP here) so the other
+      // venues in a multi-pool program stay quotable.
       lines.push(
         `const d${i} = l${i} + ${amountIn} * s${i};`,
         `const n${i} = (l${i} * s${i} + d${i} - 1) / d${i};`,
-        `if (n${i} < ${c.sqrtMinPrice}) { throw "dammv2 price range" }`,
         `const g${i} = (l${i} * (s${i} - n${i})) / ${Q128};`,
-        `const q${i} = g${i} - (g${i} * f${i} + 999999999) / 1000000000;`,
+        `let q${i} = g${i} - (g${i} * f${i} + 999999999) / 1000000000;`,
+        `if (n${i} < ${c.sqrtMinPrice}) { q${i} = 0 }`,
       );
     } else {
       // next = sqrtP + floor(dIn << 128 / L); delta_a floors; fee ceils on
-      // INPUT for collect_fee_mode 1 (OnlyB), on output for mode 0.
+      // INPUT for collect_fee_mode 1 (OnlyB), on output for mode 0. A
+      // band-crossing next may wrap the g/q intermediates (see the header
+      // bound) — the clamp to 0 discards them before use.
       const feesOnInput = c.collectFeeMode >= 1;
       const dIn = feesOnInput ? `a${i}` : `${amountIn}`;
       if (feesOnInput) {
@@ -348,12 +366,17 @@ export const meteoraDammV2 = {
       }
       lines.push(
         `const n${i} = s${i} + (${dIn} * ${Q128}) / l${i};`,
-        `if (n${i} > ${c.sqrtMaxPrice}) { throw "dammv2 price range" }`,
         `const g${i} = (l${i} * (n${i} - s${i})) / (s${i} * n${i});`,
         feesOnInput
-          ? `const q${i} = g${i};`
-          : `const q${i} = g${i} - (g${i} * f${i} + 999999999) / 1000000000;`,
+          ? `let q${i} = g${i};`
+          : `let q${i} = g${i} - (g${i} * f${i} + 999999999) / 1000000000;`,
+        `if (n${i} > ${c.sqrtMaxPrice}) { q${i} = 0 }`,
       );
+    }
+    // Timestamp-typed activation gates in-fragment (slot-typed nonzero points
+    // are rejected at fetch); block.timestamp is the Clock sysvar.
+    if (c.activationType === 1 && c.activationPoint > 0n) {
+      lines.push(`if (block.timestamp < ${c.activationPoint}) { q${i} = 0 }`);
     }
     return lines.join('\n');
   },
@@ -399,9 +422,9 @@ export const meteoraDammV2 = {
     if (data === undefined) throw new Error(`meteora-damm-v2 pool ${c.pool} missing from state`);
     checkAmountIn('meteora-damm-v2 referenceQuote', amountIn);
     const d = decodePool(c.pool, data);
-    // current_point is a slot when activation_type == 0 and a unix timestamp
-    // when it is 1 — `now` must be in the pool's unit.
-    if (now < d.activationPoint) {
+    // Only timestamp-typed points compare against unix `now`; slot-typed
+    // nonzero points never reach here (rejected at fetch).
+    if (d.activationType === 1 && now < d.activationPoint) {
       throw new Error(
         `meteora-damm-v2 pool ${c.pool} not activated (activation_point=${d.activationPoint}, now=${now})`,
       );
@@ -417,15 +440,13 @@ export const meteoraDammV2 = {
     let outGross: bigint;
     if (aToB) {
       const next = ceilDiv(L * sp, L + dIn * sp); // rounds UP: price moves down
-      if (next < d.sqrtMinPrice) {
-        throw new Error(`meteora-damm-v2 pool ${c.pool} price range violation (next_sqrt_price ${next} < sqrt_min_price ${d.sqrtMinPrice})`);
-      }
+      // Band violations mirror the fragment's clamp so the triangle invariant
+      // (in-VM == reference) holds and the other venues stay quotable.
+      if (next < d.sqrtMinPrice) return 0n;
       outGross = (L * (sp - next)) >> 128n; // delta_b, rounds DOWN
     } else {
       const next = sp + (dIn << 128n) / L; // rounds DOWN: price moves up
-      if (next > d.sqrtMaxPrice) {
-        throw new Error(`meteora-damm-v2 pool ${c.pool} price range violation (next_sqrt_price ${next} > sqrt_max_price ${d.sqrtMaxPrice})`);
-      }
+      if (next > d.sqrtMaxPrice) return 0n;
       outGross = (L * (next - sp)) / (sp * next); // delta_a, rounds DOWN
     }
     return feesOnInput ? outGross : outGross - ceilDiv(outGross * fee, FEE_DENOMINATOR);

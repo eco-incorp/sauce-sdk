@@ -1,7 +1,7 @@
 /**
  * orca-legacy-token-swap adapter units (no engine, no RPC): SwapV1 fixture
- * decode spot-checked against the facts file, referenceQuote pinned to the
- * facts file's worked examples, every fetch gate on a doctored fixture,
+ * decode spot-checked against docs/svm-venues.md, referenceQuote pinned to
+ * its worked examples, every fetch gate on a doctored fixture,
  * buildSwap byte/meta encoding, and emitQuote compiling as SauceScript with
  * the fee constants baked.
  */
@@ -49,7 +49,7 @@ beforeAll(async () => {
 });
 
 describe('orca-legacy-token-swap adapter identity', () => {
-  it('slug, kind and mainnet v2 program id match the facts file', () => {
+  it('slug, kind and mainnet v2 program id match docs/svm-venues.md', () => {
     expect(orcaLegacyTokenSwap.slug).toBe('orca-legacy-token-swap');
     expect(orcaLegacyTokenSwap.kind).toBe('constant-product');
     expect(orcaLegacyTokenSwap.programId).toBe('9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP');
@@ -139,7 +139,7 @@ describe('quoteAccounts', () => {
   });
 });
 
-describe('referenceQuote (facts-file formula, independent of emitQuote)', () => {
+describe('referenceQuote (docs/svm-venues.md formula, independent of emitQuote)', () => {
   it('reproduces the pinned worked example: 1 SOL -> 81330481 USDC raw', () => {
     // tradeFee 2500000, ownerFee 500000, netIn 997000000.
     expect(orcaLegacyTokenSwap.referenceQuote(cfg, state, 1_000_000_000n, 0n)).toBe(81330481n);

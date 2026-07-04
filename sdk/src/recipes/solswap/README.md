@@ -40,10 +40,10 @@ fetch time with a named **gate** error — a gated pool never reaches the genera
 | venue (slug)             | kind             | program                                        | in-VM quote reads                                | fetch-time gates |
 | ------------------------ | ---------------- | ---------------------------------------------- | ------------------------------------------------ | ---------------- |
 | `raydium-cp-swap`        | constant-product | `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` | 4: pool + AmmConfig + both vaults                 | swap-disabled status bit, future `open_time`, vault/mint integrity, token-2022 transfer-fee mints |
-| `raydium-amm-v4`         | constant-product | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` | 3: AmmInfo + both vaults                          | status must be 6 (SwapOnly) or 7 (WaitingTrade) — orderbook-enabled pools (status 1/5) are rejected |
+| `raydium-amm-v4`         | constant-product | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` | 3: AmmInfo + both vaults                          | status must be 6 (SwapOnly) or 7 (WaitingTrade) — orderbook-enabled pools (status 1/5) are rejected; status-7 pools with a future `pool_open_time` are rejected |
 | `pumpswap`               | constant-product | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`  | 2: base + quote vaults (fee tier baked at fetch)  | mayhem-mode pools, cashback coins, global disable flags, fee-config integrity |
 | `orca-legacy-token-swap` | constant-product | `9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP` | 2: both vaults (fees are pool constants)          | SwapV1 version + initialized, `curve_type` must be 0 (constant product), zero fee denominators |
-| `meteora-damm-v2`        | sqrt-price       | `cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG`  | 1: the pool account only (never vault balances)   | pool enabled, `collect_fee_mode` in {0, 1}, static base fee only (no rate-limiter/scheduler), no transfer-fee mints |
+| `meteora-damm-v2`        | sqrt-price       | `cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG`  | 1: the pool account only (never vault balances)   | pool enabled, `collect_fee_mode` in {0, 1}, static base fee only (no rate-limiter/scheduler), no transfer-fee mints, timestamp (not slot) activation only |
 | `saber-stableswap`       | stable           | `SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ`  | 3: pool (live pause byte) + both vaults           | initialized, not paused, positive trade-fee denominator |
 | `meteora-damm-v1-stable` | stable           | `Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB` | 8: pool, dynamic vaults, vault LP accounts, LP mints | pool enabled, Stable curve only, depeg pools out of scope, timestamp (not slot) activation only |
 
@@ -125,9 +125,10 @@ across CPIs — that is not expressible on this platform.
 
 ## Packet budget and the ALT path
 
-Both generators run `estimatePacket` over the final plan (fee payer + engine accounts + the execute
-instruction) and surface its warnings on the result's `warnings` (deduplicated against the
-compiler's own copy). Real venues cost real accounts — a raydium-cp-swap CPI alone is 13 accounts —
+`solswapBest` runs `estimatePacket` over the final plan (fee payer + engine accounts + the execute
+instruction) and merges its warnings into the result's `warnings`, deduplicated against the
+compiler's own copy; the v1 `solswap` surfaces the compiler's own `estimatePacket` warnings as
+emitted by `compile()`. Real venues cost real accounts — a raydium-cp-swap CPI alone is 13 accounts —
 so a multi-venue plan overruns the 1232-byte packet cap quickly. An overflow warning means the send
 needs an address lookup table: move the venue-resolved metas (every meta the recipe stamped with a
 `pubkey`) into an ALT and keep caller-resolved refs (outAta/inAta/owner) in the static section. The
@@ -143,7 +144,7 @@ there: the winning CPI is either an SPL-token-transfer stand-in or bracketed thr
 `"minOut"` revert.
 
 The **real-binary CPI suite** (bottom of `solswap-best.e2e.test.ts`) additionally loads a venue
-program dumped from mainnet and asserts the full quadrilateral — facts pin == `referenceQuote` ==
+program dumped from mainnet and asserts the full quadrilateral — the `docs/svm-venues.md` pin == `referenceQuote` ==
 in-VM quote == the realized output of the actual venue binary. Point `SAUCE_VENUE_PROGRAMS` at a
 directory of dumps named `<venue slug>.so`:
 

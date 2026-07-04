@@ -1,14 +1,15 @@
 /**
- * Pumpswap adapter units (no engine): fixture decoding against the facts
- * file's byte offsets, the mainnet-sim-verified worked examples reproduced
- * exactly, every fetch gate on doctored fixtures, buy/sell instruction
- * encoding + ordered account metas, and emitted-fragment compilation.
+ * Pumpswap adapter units (no engine): fixture decoding against the
+ * docs/svm-venues.md byte offsets, the mainnet-sim-verified worked examples
+ * reproduced exactly, every fetch gate on doctored fixtures, buy/sell
+ * instruction encoding + ordered account metas, and emitted-fragment
+ * compilation.
  *
- * Pinned constants come from the pumpswap facts file (quote recipe verified
- * against BuyEvent/SellEvent mainnet simulations) and from the recorded
- * simulation events themselves (protocol_fee_recipient_token_account); the
- * fixture-snapshot quotes were recomputed from the facts formulas outside
- * this package.
+ * Pinned constants come from the pumpswap section of docs/svm-venues.md
+ * (quote recipe verified against BuyEvent/SellEvent mainnet simulations) and
+ * from the recorded simulation events themselves
+ * (protocol_fee_recipient_token_account); the fixture-snapshot quotes were
+ * recomputed from the documented formulas outside this package.
  */
 import { join } from 'path';
 import { compile } from '@eco-incorp/sauce-compiler';
@@ -21,13 +22,13 @@ import type { AccountFixture } from '../fixtures.js';
 
 const addr = (value: string): Address => value as Address;
 
-// PUMP/USDC pool (facts file testFixtures.primary — non-canonical, flat fees).
+// PUMP/USDC pool (docs/svm-venues.md primary fixture — non-canonical, flat fees).
 const POOL = addr('2uF4Xh61rDwxnG9woyxsVQP7zuA6kLFpb3NvnRQeoiSd');
 const PUMP_MINT = addr('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn');
 const USDC_MINT = addr('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 const BASE_VAULT = addr('8TqK4PL3x7zWR2dNinr1LMi8Uf4vTRSFE2Ev1yYW9bhC');
 const QUOTE_VAULT = addr('68Vdm7mQJ7RBxWioLVEUXbeTTpTtyiR1CL9vLRxmdr8t');
-// Canonical bonding-curve migration pool (facts file testFixtures.canonicalExample).
+// Canonical bonding-curve migration pool (docs/svm-venues.md canonical fixture).
 const CANONICAL_POOL = addr('GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J');
 const CANONICAL_QUOTE_VAULT = addr('43DVcZR4kQFjh4Xm2i3DcneRxNjZp7HMud8yDrJWrDr8');
 
@@ -42,7 +43,7 @@ const ASSOCIATED_TOKEN_PROGRAM = addr('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8
 const TOKENKEG = addr('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const TOKEN_2022 = addr('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 
-// GlobalConfig recipients[0] / buyback_fee_recipients[0] (facts file offsets 57/643).
+// GlobalConfig recipients[0] / buyback_fee_recipients[0] (docs/svm-venues.md offsets 57/643).
 const PROTOCOL_FEE_RECIPIENT = addr('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
 const BUYBACK_FEE_RECIPIENT = addr('5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD');
 // ATA(62qc..., USDC) — echoed by the recorded mainnet BuyEvent simulation.
@@ -54,12 +55,12 @@ const BUYBACK_USDC_ATA = addr('6oCkp6gpyjxVTeL6ahMYcekN2x2pzt1KY8g2LqemaTNE');
 const CANONICAL_COIN_CREATOR = addr('5L5k7gtNLbeXdzpvNrFshg1E1id1ceUDfc6vPUTxp98q');
 const CANONICAL_POOL_V2 = addr('4Jjna3h73QbgmdqwnV5NJxjCidKWB7Q26jeuj9jtFetC');
 
-// buy_exact_quote_in verified example (facts file): reserves at simulation time.
+// buy_exact_quote_in verified example (docs/svm-venues.md): reserves at simulation time.
 const BUY_EXAMPLE = { base: 4154251682177570n, quote: 6515063678232n, spend: 1_000_000_000n, out: 635633459193n };
 // sell verified example.
 const SELL_EXAMPLE = { base: 4153516048718377n, quote: 6516220452584n, baseIn: 50_000_000_000n, out: 78205951n };
 // Quotes over the untouched fixture snapshot (vault amounts 4144782727340999 /
-// 6530283775547), recomputed from the facts formulas outside this package.
+// 6530283775547), recomputed from the documented formulas outside this package.
 const FIXTURE_BUY_OUT = 632706768908n;
 const FIXTURE_SELL_OUT = 78539874n;
 
@@ -111,7 +112,7 @@ describe('pumpswap adapter', () => {
 });
 
 describe('fetchPoolConfig', () => {
-  it('decodes the PUMP/USDC pool fixture per the facts-file offsets', async () => {
+  it('decodes the PUMP/USDC pool fixture per the docs/svm-venues.md offsets', async () => {
     const cfg = await fetchConfig(POOL);
     expect(cfg.venue).toBe('pumpswap');
     expect(cfg.pool).toBe(POOL);
@@ -150,8 +151,8 @@ describe('fetchPoolConfig', () => {
     expect(cfg.canonical).toBe(true);
     expect(cfg.coinCreator).toBe(CANONICAL_COIN_CREATOR);
     // Fixture market cap is 220432822880 lamports (~220 SOL), below the
-    // 420-SOL tier-1 threshold -> tier 0 fees 2/93/30 (facts file
-    // feeTiersObserved2026_07, verified on-chain for this pool).
+    // 420-SOL tier-1 threshold -> tier 0 fees 2/93/30 (2026-07 tiers in
+    // docs/svm-venues.md, verified on-chain for this pool).
     expect(cfg.lpFeeBps).toBe(2n);
     expect(cfg.protocolFeeBps).toBe(93n);
     expect(cfg.creatorFeeBps).toBe(30n); // coin_creator set -> kept
@@ -362,7 +363,7 @@ describe('buildSwap', () => {
     expect(swap.programId).toBe(AMM_PROGRAM);
     expect(swap.data).toEqual(
       new Uint8Array([
-        198, 46, 21, 82, 180, 217, 232, 112, // facts file discriminatorBytes
+        198, 46, 21, 82, 180, 217, 232, 112, // docs/svm-venues.md discriminator
         ...u64LEBytes(1_000_000_000n),
         ...u64LEBytes(1n),
         0, // OptionBool track_volume = false
@@ -370,7 +371,7 @@ describe('buildSwap', () => {
     );
   });
 
-  it('orders the buy accounts exactly as the facts file lists them', async () => {
+  it('orders the buy accounts exactly as docs/svm-venues.md lists them', async () => {
     const cfg = await fetchConfig(POOL);
     const swap = pumpswapAdapter.buildSwap(cfg, user, 1_000_000_000n);
     const expected: VenueAccount[] = [
@@ -410,7 +411,7 @@ describe('buildSwap', () => {
     const swap = pumpswapAdapter.buildSwap(sellCfg, user, 50_000_000_000n);
     expect(swap.data).toEqual(
       new Uint8Array([
-        51, 230, 133, 164, 1, 127, 131, 173, // facts file discriminatorBytes
+        51, 230, 133, 164, 1, 127, 131, 173, // docs/svm-venues.md discriminator
         ...u64LEBytes(50_000_000_000n),
         ...u64LEBytes(1n),
       ]),

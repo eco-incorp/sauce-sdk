@@ -6,7 +6,7 @@
  * quote fragment. Fixtures are the real USDC/USDT pool
  * YAkoNb6HKmSxQN9L8hiBE5tPJRsniSSMzND1boHmZxe dumped from mainnet; all pinned
  * expectations were computed with an independent bigint implementation of the
- * facts file's quote recipe, not with the adapter under test.
+ * docs/svm-venues.md quote recipe, not with the adapter under test.
  */
 import { resolve } from 'path';
 import { address } from '@solana/kit';

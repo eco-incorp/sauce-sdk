@@ -1,12 +1,12 @@
 /**
  * Meteora DAMM v2 adapter units (no engine, no RPC): fixture decode against
- * the facts-sheet field values, the pinned worked example (1 SOL -> 81.533661
+ * the docs/svm-venues.md field values, the pinned worked example (1 SOL -> 81.533661
  * USDC on pool 8Pm2... at the dumped state), every fetch gate on doctored
  * fixtures, swap instruction encoding, and SauceScript validity of the quote
  * fragment (compiled with target 'svm').
  *
  * referenceQuote expectations are pinned constants recomputed independently
- * from the facts sheet's quote recipe (sqrt-price step + rounding rules), not
+ * from the docs/svm-venues.md quote recipe (sqrt-price step + rounding rules), not
  * from the adapter or its emitted SauceScript.
  */
 import { resolve } from 'path';
@@ -69,7 +69,7 @@ function mintWithTransferFee(): Uint8Array {
 const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 
 describe('meteora-damm-v2 adapter identity', () => {
-  it('carries the facts-sheet slug, kind and mainnet program id', () => {
+  it('carries the documented slug, kind and mainnet program id', () => {
     expect(meteoraDammV2.slug).toBe('meteora-damm-v2');
     expect(meteoraDammV2.kind).toBe('sqrt-price');
     expect(meteoraDammV2.programId).toBe(PROGRAM);
@@ -77,7 +77,7 @@ describe('meteora-damm-v2 adapter identity', () => {
 });
 
 describe('meteora-damm-v2 fetchPoolConfig', () => {
-  it('decodes the WSOL/USDC fixture to the facts-sheet field values', async () => {
+  it('decodes the WSOL/USDC fixture to the docs/svm-venues.md field values', async () => {
     const cfg = await fetchCfg();
     expect(cfg.venue).toBe('meteora-damm-v2');
     expect(cfg.pool).toBe(POOL);
@@ -186,6 +186,32 @@ describe('meteora-damm-v2 fetchPoolConfig', () => {
     await expect(meteoraDammV2.fetchPoolConfig(load, POOL)).rejects.toThrow('has zero liquidity');
   });
 
+  it('gates on a slot-typed nonzero activation_point', async () => {
+    const load = doctoredLoader((data) => {
+      data[480] = 0; // activation_type = slot; fixture activation_point stays 1754985927
+    });
+    await expect(meteoraDammV2.fetchPoolConfig(load, POOL)).rejects.toThrow(
+      `meteora-damm-v2 pool ${POOL} has slot-based activation_point 1754985927 — slot-gated pools are out of scope`,
+    );
+  });
+
+  it('accepts a slot-typed pool with activation_point 0', async () => {
+    const load = doctoredLoader((data) => {
+      data[480] = 0;
+      writeLE(data, 472, 8, 0n);
+    });
+    const cfg = await meteoraDammV2.fetchPoolConfig(load, POOL);
+    expect(cfg.activationType).toBe(0);
+    expect(cfg.activationPoint).toBe(0n);
+  });
+
+  it('accepts a timestamp-typed pool whose activation point is in the future (gated in-fragment)', async () => {
+    const load = doctoredLoader((data) => writeLE(data, 472, 8, NOW + 1n));
+    const cfg = await meteoraDammV2.fetchPoolConfig(load, POOL);
+    expect(cfg.activationType).toBe(1);
+    expect(cfg.activationPoint).toBe(NOW + 1n);
+  });
+
   it('gates on an unknown token program flag', async () => {
     const load = doctoredLoader((data) => {
       data[482] = 3;
@@ -232,14 +258,14 @@ describe('meteora-damm-v2 fetchPoolConfig', () => {
 describe('meteora-damm-v2 referenceQuote', () => {
   it('reproduces the pinned worked example: 1 SOL -> 81.533661 USDC', async () => {
     const cfg = await fetchCfg();
-    // Facts sheet: next_sqrt_price 5268247074206624762, gross 81566288,
+    // docs/svm-venues.md: next_sqrt_price 5268247074206624762, gross 81566288,
     // output fee 32627 -> 81533661.
     expect(meteoraDammV2.referenceQuote(cfg, state, ONE_SOL, NOW)).toBe(81_533_661n);
   });
 
   it('reproduces the pinned bToA example: 100 USDC -> SOL (fee on output)', async () => {
     const cfg: MeteoraDammV2PoolConfig = { ...(await fetchCfg()), direction: 'bToA' };
-    // Facts sheet pins gross 1225884357; collect_fee_mode 0 puts the 0.04%
+    // docs/svm-venues.md pins gross 1225884357; collect_fee_mode 0 puts the 0.04%
     // fee on the output: 1225884357 - ceil(1225884357 * 400000 / 1e9)
     // = 1225884357 - 490354.
     expect(meteoraDammV2.referenceQuote(cfg, state, HUNDRED_USDC, NOW)).toBe(1_225_394_003n);
@@ -284,18 +310,14 @@ describe('meteora-damm-v2 referenceQuote', () => {
     expect(meteoraDammV2.referenceQuote(cfg, { [POOL]: doctored }, ONE_SOL, NOW)).toBe(40_783_144n);
   });
 
-  it('throws PriceRangeViolation when aToB input pushes past sqrt_min_price', async () => {
+  it('quotes 0 when aToB input pushes past sqrt_min_price (mirrors the fragment clamp)', async () => {
     const cfg = await fetchCfg();
-    expect(() => meteoraDammV2.referenceQuote(cfg, state, 10_000n * ONE_SOL, NOW)).toThrow(
-      'price range violation',
-    );
+    expect(meteoraDammV2.referenceQuote(cfg, state, 10_000n * ONE_SOL, NOW)).toBe(0n);
   });
 
-  it('throws PriceRangeViolation when bToA input pushes past sqrt_max_price', async () => {
+  it('quotes 0 when bToA input pushes past sqrt_max_price (mirrors the fragment clamp)', async () => {
     const cfg: MeteoraDammV2PoolConfig = { ...(await fetchCfg()), direction: 'bToA' };
-    expect(() => meteoraDammV2.referenceQuote(cfg, state, (1n << 64n) - 1n, NOW)).toThrow(
-      'price range violation',
-    );
+    expect(meteoraDammV2.referenceQuote(cfg, state, (1n << 64n) - 1n, NOW)).toBe(0n);
   });
 
   it('throws before the activation point', async () => {
@@ -343,7 +365,7 @@ describe('meteora-damm-v2 emitQuote', () => {
   it('defines q<i> and reads pool state only via accountUint on the pool account', async () => {
     const cfg = await fetchCfg();
     const fragment = meteoraDammV2.emitQuote(cfg, 7, ONE_SOL);
-    expect(fragment).toContain('const q7 =');
+    expect(fragment).toContain('let q7 =');
     expect(fragment).not.toContain('accountData(');
     const reads = [...fragment.matchAll(/accountUint\(([^,]+),/g)].map((m) => m[1]);
     expect(reads.length).toBeGreaterThan(0);
@@ -359,7 +381,7 @@ describe('meteora-damm-v2 emitQuote', () => {
   it('compiles for bToA with fee on output (collect_fee_mode 0)', async () => {
     const cfg: MeteoraDammV2PoolConfig = { ...(await fetchCfg()), direction: 'bToA' };
     const fragment = meteoraDammV2.emitQuote(cfg, 1, HUNDRED_USDC);
-    expect(fragment).toContain('const q1 =');
+    expect(fragment).toContain('let q1 =');
     expect(compileFragment(fragment, 1).bytecode[0].length).toBeGreaterThan(0);
   });
 
@@ -371,8 +393,31 @@ describe('meteora-damm-v2 emitQuote', () => {
     };
     const fragment = meteoraDammV2.emitQuote(cfg, 2, HUNDRED_USDC);
     // Fee comes off the input before the curve; the curve output IS the quote.
-    expect(fragment).toContain('const q2 = g2;');
+    expect(fragment).toContain('let q2 = g2;');
     expect(compileFragment(fragment, 2).bytecode[0].length).toBeGreaterThan(0);
+  });
+
+  it('clamps a band-crossing quote to 0 instead of throwing, in both directions', async () => {
+    const cfg = await fetchCfg();
+    const aToB = meteoraDammV2.emitQuote(cfg, 4, ONE_SOL);
+    expect(aToB).toContain(`if (n4 < ${cfg.sqrtMinPrice}) { q4 = 0 }`);
+    expect(aToB).not.toContain('throw');
+    const bToACfg: MeteoraDammV2PoolConfig = { ...cfg, direction: 'bToA' };
+    const bToA = meteoraDammV2.emitQuote(bToACfg, 5, HUNDRED_USDC);
+    expect(bToA).toContain(`if (n5 > ${cfg.sqrtMaxPrice}) { q5 = 0 }`);
+    expect(bToA).not.toContain('throw');
+  });
+
+  it('emits the block.timestamp activation gate for a timestamp-typed nonzero activation point', async () => {
+    const cfg = await fetchCfg(); // fixture: activation_type 1, activation_point 1754985927
+    const fragment = meteoraDammV2.emitQuote(cfg, 6, ONE_SOL);
+    expect(fragment).toContain('if (block.timestamp < 1754985927) { q6 = 0 }');
+    expect(compileFragment(fragment, 6).bytecode[0].length).toBeGreaterThan(0);
+  });
+
+  it('omits the activation gate when activation_point is 0', async () => {
+    const cfg: MeteoraDammV2PoolConfig = { ...(await fetchCfg()), activationPoint: 0n };
+    expect(meteoraDammV2.emitQuote(cfg, 8, ONE_SOL)).not.toContain('block.timestamp');
   });
 
   it('compiles the dynamic-fee variant with the capped fee', async () => {
@@ -412,7 +457,7 @@ describe('meteora-damm-v2 buildSwap', () => {
     expect(hex(swap.data)).toBe('f8c69e91e17587c8' + '00ca9a3b00000000' + '0100000000000000');
   });
 
-  it('orders the account metas exactly as the facts-sheet swap list', async () => {
+  it('orders the account metas exactly as the docs/svm-venues.md swap list', async () => {
     const cfg = await fetchCfg();
     const swap = meteoraDammV2.buildSwap(cfg, user, ONE_SOL);
     expect(swap.accounts).toEqual([

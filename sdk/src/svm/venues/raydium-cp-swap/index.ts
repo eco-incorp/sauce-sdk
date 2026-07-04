@@ -1,8 +1,8 @@
 /**
  * Raydium CP-Swap (CPMM, non-OpenBook constant product) venue adapter.
  *
- * Byte layout, quote recipe and swap encoding follow the source-verified facts
- * for program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C (raydium-cp-swap
+ * Byte layout, quote recipe and swap encoding follow docs/svm-venues.md,
+ * source-verified for program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C (raydium-cp-swap
  * commit 78f254e): reserves are the SPL vault balances minus the PoolState
  * protocol/fund/creator fee accumulators, trade_fee_rate and creator_fee_rate
  * come from AmmConfig (/1e6, ceil on the fee), and the creator fee lands on the

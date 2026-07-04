@@ -19,7 +19,7 @@
  *   function stableY(amp, x, d)    — Newton y: <=256 iterations, |y - yPrev| <= 1
  *
  * Overflow bounds (engine arithmetic wraps): every in-fragment product is at
- * most u64 * u64 or u64 * 1e12 < 2^128; the facts file bounds the curve
+ * most u64 * u64 or u64 * 1e12 < 2^128; docs/svm-venues.md bounds the curve
  * intermediates for stable pairs at D < 2^100 (u128 suffices, amp <= 10000,
  * 6-decimal magnitudes), so no fragment product approaches 2^256.
  */

@@ -46,8 +46,16 @@ async function fetchConfig(from: AccountFixture[] = fixtures): Promise<MeteoraDa
   return (await meteoraDammV1Stable.fetchPoolConfig(fixtureLoader(from), POOL)) as MeteoraDammV1StablePoolConfig;
 }
 
+describe('meteora-damm-v1-stable adapter identity', () => {
+  it('declares the slug, stable kind and mainnet program id', () => {
+    expect(meteoraDammV1Stable.slug).toBe('meteora-damm-v1-stable');
+    expect(meteoraDammV1Stable.kind).toBe('stable');
+    expect(meteoraDammV1Stable.programId).toBe('Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB');
+  });
+});
+
 describe('meteora-damm-v1-stable fetchPoolConfig', () => {
-  it('decodes the mainnet USDC/USDT pool fixture (facts-file field values)', async () => {
+  it('decodes the mainnet USDC/USDT pool fixture (docs/svm-venues.md field values)', async () => {
     const cfg = await fetchConfig();
     expect(cfg.venue).toBe('meteora-damm-v1-stable');
     expect(cfg.pool).toBe(POOL);
@@ -252,7 +260,7 @@ describe('meteora-damm-v1-stable buildSwap', () => {
     );
   });
 
-  it('orders the 15 documented account metas with the facts-file flags', async () => {
+  it('orders the 15 documented account metas with the docs/svm-venues.md flags', async () => {
     const cfg = await fetchConfig();
     const swap = meteoraDammV1Stable.buildSwap(cfg, user, AMOUNT_IN);
     expect(swap.accounts).toEqual([
