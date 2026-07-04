@@ -346,10 +346,15 @@ export function qlSliceHead(sliceOut: bigint, capacity: bigint): bigint {
  * on-chain solver's live-quote ladder to the wei. (Curve/WOOFi/etc. with a bit-exact closed replay do NOT
  * need this — their replay matches the live view at any input.)
  */
-export function qlLadderInputs(amountIn: bigint): bigint[] {
+export function qlLadderInputs(amountIn: bigint, seedFloor: bigint = 0n): bigint[] {
   if (amountIn <= 0n) return [];
   let seed = amountIn / QL_SEED_DIV;
   if (seed <= 0n) seed = 1n;
+  // SEED FLOOR (the SIZE out-window class — see size-math.ts): a venue whose quote view REVERTS
+  // below a live minimum input RAISES the seed to that minimum, so the grid's low end never sits in
+  // the reverting region while the recurrence stays byte-identical (the on-chain mirror is the
+  // per-venue `if (floor > seed) seed = floor` right after the shared seed derivation).
+  if (seedFloor > seed) seed = seedFloor;
   const pts: bigint[] = [];
   let cum = 0n;
   for (let k = 0; k < QL_S; k++) {
@@ -366,10 +371,14 @@ export function qlLadderInputs(amountIn: bigint): bigint[] {
 export function buildQLLadder(
   getDy: (dx: bigint) => bigint,
   amountIn: bigint,
+  seedFloor: bigint = 0n,
+  flatLadder: boolean = false,
 ): MergeSegment[] {
   if (amountIn <= 0n) return [];
   let seed = amountIn / QL_SEED_DIV;
   if (seed <= 0n) seed = 1n;
+  // SEED FLOOR (see qlLadderInputs) — 0 for every family but the out-window class (SIZE).
+  if (seedFloor > seed) seed = seedFloor;
   const segs: MergeSegment[] = [];
   let cum = 0n;
   let prevOut = 0n;
@@ -383,9 +392,23 @@ export function buildQLLadder(
     if (q === 0n) break;
     const effOut = q - prevOut;
     if (effOut === 0n) break;
-    const marginalOI = qlSliceHead(effOut, capacity);
-    // Non-convex guard: a non-descending head ends the ladder here (mirrors the on-chain guard).
-    if (segs.length > 0 && marginalOI >= prevHead) break;
+    let marginalOI = qlSliceHead(effOut, capacity);
+    if (segs.length > 0 && marginalOI >= prevHead) {
+      if (flatLadder) {
+        // FLAT-LADDER mode (the SIZE class — a venue whose price is genuinely CONSTANT over amount,
+        // TWAP-priced to the inventory cap): a linear curve's differenced slice heads are EQUAL up
+        // to ±1-wei integer rounding, so the strict non-descending guard below would truncate the
+        // ladder at slice 1 and strand real capacity. Instead CLAMP the head at prevHead (keeping
+        // the merged stream non-increasing — the merge's ordering invariant) and keep walking; the
+        // ladder then stops only on the cap clamp / a window revert / a flatlined quote. The ≤1-wei
+        // sqrt-head clamp only steers the split (the exec re-quotes the full award live), and the
+        // on-chain solver mirrors this clamp bit-for-bit, so parity is preserved by construction.
+        if (marginalOI > prevHead) marginalOI = prevHead;
+      } else {
+        // Non-convex guard: a non-descending head ends the ladder here (mirrors the on-chain guard).
+        break;
+      }
+    }
     segs.push({ capacity, effOut, marginalOI });
     prevHead = marginalOI;
     cum = xNext;

@@ -21,6 +21,8 @@ import { IFluidDexResolver } from "./IFluidDexResolver.json";
 import { ITesseraSwap } from "./ITesseraSwap.json";
 import { IElfomoFi } from "./IElfomoFi.json";
 import { IMetricRouter } from "./IMetricRouter.json";
+import { ILiquidCorePool } from "./ILiquidCorePool.json";
+import { ISizeRelayer } from "./ISizeRelayer.json";
 import { IMetricPool } from "./IMetricPool.json";
 import { IMetricPriceProvider } from "./IMetricPriceProvider.json";
 import { IMentoBroker } from "./IMentoBroker.json";
@@ -117,7 +119,8 @@ import { IPermit2 } from "./IPermit2.json";
 //                 Trader Joe LB segKind 2, DODO V2 segKind 3, Solidly STABLE segKind 4, Wombat segKind 5,
 //                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Fluid DEX segKind 12,
 //                 Mento V2 segKind 13, Balancer V3 segKind 14, Tessera V segKind 15, ElfomoFi segKind
-//                 16, METRIC segKind 17). Rows [0, directQlvCount) are DIRECT venues (today's family-
+//                 16, METRIC segKind 17, LIQUIDCORE segKind 18, INTEGRAL SIZE segKind 19). Rows
+//                 [0, directQlvCount) are DIRECT venues (today's family-
 //                 concatenation order; qd[10]=qd[11]=0, never read); rows [directQlvCount, …) are
 //                 ROUTE-LEG venues — qd[0..9] the SAME family row built for the leg's EDGE pair
 //                 (legIn, legOut), qd[5] refIdx = the row's GLOBAL qlv index (informational), qd[10]/
@@ -690,6 +693,8 @@ const HAS_BALANCER_V3: boolean = true;
 const HAS_TESSERA: boolean = true;
 const HAS_ELFOMO: boolean = true;
 const HAS_METRIC: boolean = true;
+const HAS_LIQUIDCORE: boolean = true;
+const HAS_SIZE: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
 // — the cfg[12] directQlvCount override read, the leg-row LADDER build (the per-row edge-token/
 // sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude), the
@@ -816,6 +821,9 @@ function main(
   const MC_U128MAX: Uint256 = 2 ** 128 - 1;
   const MC_HALF: Uint256 = 2 ** 255;
   const MC_DEADLINE: Uint256 = 2 ** 64;
+  // INTEGRAL SIZE constant: the sell() submitDeadline — uint32 max (fork-proven accepted, so the
+  // exec needs no block.timestamp read; the deadline slot is uint32, so 2^32−1 is the far bound).
+  const SZ_DEADLINE: Uint256 = 2 ** 32 - 1;
   // ── QUOTE-LADDER constants (MUST equal curve-math.ts QL_S / QL_RN / QL_RD / QL_SEED_DIV) ──
   // QL_S geometric slices per QL venue; xNext = cum*QL_RN/QL_RD + seed, seed = amountIn/QL_SEED_DIV
   // (clamped at amountIn). QL_SEED_DIV=16 < 19.84 guarantees the clamp engages on the final slice, so
@@ -893,6 +901,10 @@ function main(
   let mcinp: Tuple = new Array(MS_CAP); // METRIC per-venue Σ input
   let mcven: Tuple = new Array(MS_CAP); // METRIC venue (per-pair pool) address
   let mcrtr: Tuple = new Array(MS_CAP); // METRIC venue Router address (rides msAux, like Mento's exchangeId)
+  let lcinp: Tuple = new Array(MS_CAP); // LIQUIDCORE per-venue Σ input
+  let lcven: Tuple = new Array(MS_CAP); // LIQUIDCORE venue (per-pair pool) address
+  let szinp: Tuple = new Array(MS_CAP); // INTEGRAL SIZE per-venue Σ input
+  let szven: Tuple = new Array(MS_CAP); // INTEGRAL SIZE venue (TwapRelayer) address
 
   // ── MERGED SAMPLED-SEGMENT STREAM (parallel scalar arrays) ──
   // The bestKind===1 cursor consumes ONE globally-DESC-sorted segment stream. It is built ON-CHAIN
@@ -1060,7 +1072,7 @@ function main(
   // ── BUILD THE MERGED SAMPLED-SEGMENT STREAM (static segs + live QL ladders, then DESC sort) ──
   // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
   // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
-  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) &&true) {
+  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) &&true) {
     // 1. Copy any static segments VERBATIM into the parallel-array stream. VESTIGIAL: production
     // always ships segs == [] (every family is QL — the ladders below feed the whole stream); a
     // hand-built test universe may still supply static rows and they merge unchanged.
@@ -1090,7 +1102,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) {
       // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
@@ -1299,6 +1311,33 @@ function main(
           if (mcPok === 1) {
             mcBidV = IMetricPriceProvider.at(qd[6]).getBidAndAskPrice()[0];
             mcAskV = IMetricPriceProvider.at(qd[6]).getBidAndAskPrice()[1];
+          }
+        }
+        // INTEGRAL SIZE (segKind 19): hoist the LIVE OUT-WINDOW once per venue and RAISE THE LADDER
+        // SEED to the lowest quotable input. The relayer's quote domain REVERTS on BOTH ends
+        // (checkLimits(tokenOut, amountOut) in the VERIFIED source: TR03 below
+        // getTokenLimitMin(tokenOut), TR3A above inventory × maxMultiplier), so an unfloored grid
+        // whose first slice quotes below the out-min would ZERO the whole ladder even when the full
+        // trade is quotable. The floor is minIn = quoteBuy(tokenIn, tokenOut,
+        // getTokenLimitMin(tokenOut)) — quoteBuy CEIL-rounds the fee gross-up, so
+        // quoteSell(minIn) >= minOut ALWAYS (fork-proven: quoteSell at minIn−1 reverts TR03, at
+        // minIn returns just above the min). PROBE-THEN-DECODE both reads: a quoteBuy revert (TR3A
+        // — even the min out exceeds the live inventory cap; TR5A/TR17 — no enabled pair) leaves
+        // the floor at 0 and the first quoteSell probe then reverts ⇒ a ZERO ladder (the venue
+        // self-drops, never a cook DoS). Mirrored bit-for-bit by buildSizeQLLadder's seedFloor
+        // (size-math.ts) — one recurrence, one grid, one floor.
+        if (HAS_SIZE && qKind === 19) {
+          let szPok: Uint256 = 1;
+          ISizeRelayer.at(qPool).getTokenLimitMin(qTokOut).catch(() => { szPok = 0; });
+          if (szPok === 1) {
+            const szMinOut: Uint256 = ISizeRelayer.at(qPool).getTokenLimitMin(qTokOut);
+            if (szMinOut > 0) {
+              ISizeRelayer.at(qPool).quoteBuy(qTokIn, qTokOut, szMinOut).catch(() => { szPok = 0; });
+              if (szPok === 1) {
+                const szMinInV: Uint256 = ISizeRelayer.at(qPool).quoteBuy(qTokIn, qTokOut, szMinOut);
+                if (szMinInV > seed) { seed = szMinInV; }
+              }
+            }
           }
         }
         // Maverick V2 (segKind 8) — LIVE bin-WALK. UNLIKE the geometric quote-difference ladder below (which
@@ -1673,6 +1712,26 @@ function main(
                   auxV = qd[7];
                 }
               }
+              // LIQUIDCORE (segKind 18) — the pool's own exact-in view (STATICCALL-safe — verified
+              // via a raw-STATICCALL probe against the live pool), keyed on the edge tokens.
+              // PROBE-THEN-DECODE (the Fermi class): a zero/unsupported input REVERTS (0x1f2a2005 /
+              // 0xc1ab6dc1) and a DRAINED pool returns 0 gracefully — either way q = 0 ⇒ stop. An
+              // OVERSIZED xNext returns a graceful CAPPED quote (the asymptotic imbalance-fee
+              // curve), so the differenced slice-out collapses and the non-descending-head guard
+              // truncates the ladder where the marginal dies.
+              if (HAS_LIQUIDCORE && qKind === 18) {
+                ILiquidCorePool.at(qPool).estimateSwap(qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
+                if (ok === 1) { q = ILiquidCorePool.at(qPool).estimateSwap(qTokIn, qTokOut, xNext); }
+              }
+              // INTEGRAL SIZE (segKind 19) — the relayer's TWAP-priced exact-in view at the
+              // WINDOW-FLOORED grid (the venue prelude raised `seed` to the live minIn, so the
+              // grid's low end never sits in the TR03-reverting region). PROBE-THEN-DECODE: a TR3A
+              // revert past the live inventory cap truncates the ladder at the last in-window grid
+              // point (the venue's fillable capacity); TR03/TR5A/TR24 ⇒ q = 0 ⇒ stop.
+              if (HAS_SIZE && qKind === 19) {
+                ISizeRelayer.at(qPool).quoteSell(qTokIn, qTokOut, xNext).catch(() => { ok = 0; });
+                if (ok === 1) { q = ISizeRelayer.at(qPool).quoteSell(qTokIn, qTokOut, xNext); }
+              }
               if (q === 0) {
                 stop = 1;
               } else {
@@ -1685,9 +1744,27 @@ function main(
                   if (sliceOut === 0) {
                     stop = 1;
                   } else {
-                    const head: Uint256 = qlSliceHead(sliceOut, sliceCapV);
-                    // Non-convex guard: a non-descending head ends this venue's ladder here.
-                    if (nv > 0) { if (head >= prevHead) { stop = 1; } }
+                    let head: Uint256 = qlSliceHead(sliceOut, sliceCapV);
+                    // Non-convex guard: a non-descending head ends this venue's ladder here — EXCEPT
+                    // for the FLAT-LADDER family (SIZE, segKind 19): its TWAP price is genuinely
+                    // CONSTANT over amount, so consecutive slice heads are EQUAL up to ±1-wei
+                    // integer rounding and the strict guard would truncate the ladder at slice 1,
+                    // stranding real in-window capacity. For kind 19 the head is CLAMPED at
+                    // prevHead instead (the merged stream stays non-increasing — the ordering
+                    // invariant the sort/cursor need) and the walk continues; the ladder then stops
+                    // on the cap clamp, a TR3A window revert, or a flatlined quote. Mirrored
+                    // bit-for-bit by buildQLLadder's flatLadder mode (curve-math.ts), so the ≤1-wei
+                    // clamp steers solver and oracle identically (the exec re-quotes the full award
+                    // live, so the realized out is always the true quote).
+                    if (nv > 0) {
+                      if (head >= prevHead) {
+                        if (HAS_SIZE && qKind === 19) {
+                          if (head > prevHead) { head = prevHead; }
+                        } else {
+                          stop = 1;
+                        }
+                      }
+                    }
                     if (stop === 0) {
                       msRef[msN] = qRef;
                       msCap[msN] = sliceCapV;
@@ -1929,7 +2006,7 @@ function main(
       // (next-best); its near/far are ALREADY post-fee out/in (adjNear==adjFar==the post-fee
       // marginal), so they compare directly. Same tie-break as the pools/routes (near DESC, then
       // far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) &&segCur < msSorted) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) &&segCur < msSorted) {
         const sNear: Uint256 = msNear[segCur];
         const sFar: Uint256 = msFar[segCur];
         if (sNear >= bestPrice) {
@@ -2436,7 +2513,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE) &&bestKind === 1) {
             // ── sampled-segment slice: a fixed capacity slice at a fixed post-fee price. Consume the
             // [segCur] merged-stream row (parallel arrays), clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -2564,6 +2641,23 @@ function main(
                                               mcinp[sIdx] = mcinp[sIdx] + stake;
                                               mcven[sIdx] = sVenue;
                                               mcrtr[sIdx] = msAux[segCur];
+                                            } else {
+                                              // segKind 18 — LIQUIDCORE: callback-free, executed
+                                              // below via estimateSwap (minAmountOut) + approve
+                                              // POOL + pool.swap. sVenue = the per-pair pool.
+                                              if (HAS_LIQUIDCORE && sKind === 18) {
+                                                lcinp[sIdx] = lcinp[sIdx] + stake;
+                                                lcven[sIdx] = sVenue;
+                                              } else {
+                                                // segKind 19 — INTEGRAL SIZE: callback-free,
+                                                // executed below via quoteSell (amountOutMin;
+                                                // probe-then-decode — a sub-min award soft-skips)
+                                                // + approve RELAYER + sell. sVenue = the relayer.
+                                                if (HAS_SIZE && sKind === 19) {
+                                                  szinp[sIdx] = szinp[sIdx] + stake;
+                                                  szven[sIdx] = sVenue;
+                                                }
+                                              }
                                             }
                                           }
                                         }
@@ -3032,6 +3126,37 @@ function main(
                         // legIn would revert a later nonzero→nonzero approve — see the direct arm).
                         IERC20.at(legIn).approve(qmcRtr, 0);
                       }
+                    }
+                  }
+                }
+                // LIQUIDCORE (segKind 18) — callback-free: probe the live estimateSwap for the out
+                // (a dead/drained venue skips soft — the share strands in legIn and the per-route
+                // intermediate sweep / terminal refund returns it), approve the POOL and swap. The
+                // pool pulls EXACTLY the share via transferFrom (pull == approve always — no
+                // residue path, fork-proven).
+                if (HAS_LIQUIDCORE && qk === 18) {
+                  let qlcOk: Uint256 = 1;
+                  ILiquidCorePool.at(qPool).estimateSwap(legIn, legOut, share).catch(() => { qlcOk = 0; });
+                  if (qlcOk === 1) {
+                    const qlcOut: Uint256 = ILiquidCorePool.at(qPool).estimateSwap(legIn, legOut, share);
+                    if (qlcOut > 0) {
+                      IERC20.at(legIn).approve(qPool, share);
+                      ILiquidCorePool.at(qPool).swap(legIn, legOut, share, qlcOut);
+                    }
+                  }
+                }
+                // INTEGRAL SIZE (segKind 19) — callback-free: probe the live quoteSell (a SUB-MIN
+                // award reverts TR03 / an over-cap award TR3A / a disabled pair TR5A — each skips
+                // SOFT into the sweep/refund), approve the RELAYER and sell (to = this contract;
+                // TR26 only bars tokenIn/tokenOut/0). Pull == approve always — no residue path.
+                if (HAS_SIZE && qk === 19) {
+                  let qszOk: Uint256 = 1;
+                  ISizeRelayer.at(qPool).quoteSell(legIn, legOut, share).catch(() => { qszOk = 0; });
+                  if (qszOk === 1) {
+                    const qszOut: Uint256 = ISizeRelayer.at(qPool).quoteSell(legIn, legOut, share);
+                    if (qszOut > 0) {
+                      IERC20.at(legIn).approve(qPool, share);
+                      ISizeRelayer.at(qPool).sell({ tokenIn: legIn, tokenOut: legOut, amountIn: share, amountOutMin: qszOut, wrapUnwrap: 0, to: address.self, submitDeadline: SZ_DEADLINE });
                     }
                   }
                 }
@@ -3590,6 +3715,67 @@ function main(
             // QL exec is exact-consume), so only Metric needs the reset.
             token.approve(mcrtrA, 0);
           }
+        }
+      }
+    }
+  }
+  }
+  // LIQUIDCORE (Liquid Labs, HyperEVM) → CALLBACK-FREE (NO engine SwapPoolType). A LiquidCore pool
+  // prices off the Hyperliquid BBO read precompile + its own inventory (adaptive imbalance fee),
+  // NOT xy=k, so the engine's _swapV2 would mis-price it. Execute exactly as the LiquidCore taker
+  // would, against the REAL pool surface (fork-proven permissionless + wei-exact same-block): PROBE
+  // the live estimateSwap(tokenIn, tokenOut, Σ) for the out (a dead/drained venue at exec time
+  // SKIPS SOFT — its share stays in this contract for the terminal refund, never a bricked cook),
+  // APPROVE the POOL for the awarded input, then swap(tokenIn, tokenOut, Σ, minAmountOut) with
+  // minAmountOut == the just-quoted out — the swap recomputes the SAME quote in-tx, so the pair
+  // never trips (the adaptive fee makes quote == exec same-block ONLY, and this pairing IS
+  // same-block). The pool pulls EXACTLY Σ via transferFrom (pull == approve ALWAYS — fork-proven
+  // even on a capped-output oversize, so NO allowance-residue path exists; the residue==0 test
+  // cells pin it) and pays the out to this contract. compute-then-pull already transferred `cum`
+  // (incl. each LiquidCore share) above, so the approved pull draws from this contract's balance.
+  if (HAS_LIQUIDCORE) {
+  for (let lc = 0; lc < MS_CAP; lc = lc + 1) {
+    const lcamt: Uint256 = lcinp[lc];
+    if (lcamt > 0) {
+      const lcpool: Address = lcven[lc];
+      let lcOk: Uint256 = 1;
+      ILiquidCorePool.at(lcpool).estimateSwap(tokenIn, tokenOut, lcamt).catch(() => { lcOk = 0; });
+      if (lcOk === 1) {
+        const lcOut: Uint256 = ILiquidCorePool.at(lcpool).estimateSwap(tokenIn, tokenOut, lcamt);
+        if (lcOut > 0) {
+          token.approve(lcpool, lcamt);
+          ILiquidCorePool.at(lcpool).swap(tokenIn, tokenOut, lcamt, lcOut);
+        }
+      }
+    }
+  }
+  }
+  // INTEGRAL SIZE (TwapRelayer) → CALLBACK-FREE (NO engine SwapPoolType). The relayer sells from
+  // ITS OWN inventory at the Uniswap-V3-TWAP price inside an OUT-amount [min, cap] window that
+  // binds AT EXEC TOO (transferOut re-runs checkLimits in the VERIFIED source): PROBE the live
+  // quoteSell(tokenIn, tokenOut, Σ) — a SUB-MIN AWARD (the merge can award a PARTIAL first slice
+  // below the venue's minIn when the global budget exhausts mid-slice) reverts TR03 and SKIPS SOFT
+  // (the share strands for the terminal refund — funds preserved, never a cook DoS; the
+  // seed-floored ladder makes this the rare partial-slice edge), as does an over-cap TR3A or a
+  // disabled-pair TR5A. Then APPROVE the RELAYER and sell({tokenIn, tokenOut, amountIn: Σ,
+  // amountOutMin: quote, wrapUnwrap: false, to: self, submitDeadline: 2^32−1}) — `to` = this
+  // contract (allowed: TR26 only bars tokenIn/tokenOut/0); msg.value 0 (TR58 — the relayer pays
+  // its own hedge prepay from its ETH balance); the sell re-prices at the SAME in-tx TWAP state,
+  // so received == the probe quote WEI-EXACT and amountOutMin never trips. The relayer pulls
+  // EXACTLY Σ via transferFrom (pull == approve ALWAYS, fork-proven — no residue path; the
+  // residue==0 test cells pin it). compute-then-pull already transferred `cum` above.
+  if (HAS_SIZE) {
+  for (let sz = 0; sz < MS_CAP; sz = sz + 1) {
+    const szamt: Uint256 = szinp[sz];
+    if (szamt > 0) {
+      const szrel: Address = szven[sz];
+      let szOk: Uint256 = 1;
+      ISizeRelayer.at(szrel).quoteSell(tokenIn, tokenOut, szamt).catch(() => { szOk = 0; });
+      if (szOk === 1) {
+        const szOut: Uint256 = ISizeRelayer.at(szrel).quoteSell(tokenIn, tokenOut, szamt);
+        if (szOut > 0) {
+          token.approve(szrel, szamt);
+          ISizeRelayer.at(szrel).sell({ tokenIn: tokenIn, tokenOut: tokenOut, amountIn: szamt, amountOutMin: szOut, wrapUnwrap: 0, to: address.self, submitDeadline: SZ_DEADLINE });
         }
       }
     }

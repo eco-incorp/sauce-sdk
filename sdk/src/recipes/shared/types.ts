@@ -406,7 +406,9 @@ export type EcoLegQlVenue =
   | { family: "fluid"; desc: EcoFluid }
   | { family: "tessera"; desc: EcoTessera }
   | { family: "elfomo"; desc: EcoElfomo }
-  | { family: "metric"; desc: EcoMetric };
+  | { family: "metric"; desc: EcoMetric }
+  | { family: "liquidcore"; desc: EcoLiquidCore }
+  | { family: "size"; desc: EcoSize };
 
 /**
  * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
@@ -881,6 +883,76 @@ export interface EcoMetric {
 }
 
 /**
+ * One LIQUIDCORE (Liquid Labs liquidcore.xyz, HyperEVM) QUOTE-LADDER (QL) venue, referenced by a
+ * qlv-row refIdx (segKind 18). A LiquidCore pool is a PER-PAIR proxy holding its own two-token
+ * inventory, priced off the Hyperliquid L1 spot book via the HyperEVM BBO READ PRECOMPILE (NOT
+ * xy=k), so it must NOT be routed through the V2 (_swapV2) path. The quote is the SIMPLEST QL class
+ * — a single STATICCALL-safe view keyed on (tokenIn, tokenOut): `pool.estimateSwap(tokenIn,
+ * tokenOut, xNext)`, PROBE-THEN-DECODE (zero amount / unsupported pair REVERT; a DRAINED pool
+ * returns 0 gracefully; an OVERSIZED amount returns a CAPPED quote gracefully — the asymptotic
+ * imbalance-fee curve, so the ladder's non-descending-head guard truncates where the marginal
+ * collapses). It EXECUTES the awarded Σ share CALLBACK-FREE: probe the live estimateSwap for
+ * minAmountOut (a dead/drained venue skips soft — the share strands and the terminal refund returns
+ * it), APPROVE the POOL for the awarded input, then `pool.swap(tokenIn, tokenOut, +Σ, minOut)` —
+ * the pool pulls EXACTLY the full input via transferFrom (pull == approve ALWAYS, fork-proven even
+ * on capped-output oversize — no allowance-residue path) and pays the out to msg.sender. NO engine
+ * SwapPoolType. LIVE-WALK class: the ladder is built at cook from live quotes, so the split
+ * re-anchors to any Hyperliquid book move / inventory drift (the adaptive imbalance fee makes
+ * quote == execution same-block only — exactly the in-tx pairing the solver runs). See
+ * liquidcore-math.ts for the full probed surface. `address` is the POOL (per-pair inventory ⇒ the
+ * claim key is the pool address — the qlVenueClaimKey default).
+ */
+export interface EcoLiquidCore {
+  /** Pool address — the per-pair inventory proxy (the estimateSwap/swap/approve target; the claim key). */
+  address: Hex;
+  /** The router that enumerated this pool (getPoolForPair) — diagnostics only. */
+  router: Hex;
+  /** The venue's tokenIn (the edge from-token; the estimateSwap/swap `tokenIn` arg). */
+  fromToken: Hex;
+  /** The venue's tokenOut (the edge to-token). */
+  toToken: Hex;
+  /** Diagnostic spread/fee in ppm derived at discovery (the quote is post-fee; no flat fee getter). */
+  feePpm: number;
+  source: string;
+}
+
+/**
+ * One INTEGRAL SIZE (integral.link TwapRelayer) QUOTE-LADDER (QL) venue, referenced by a qlv-row
+ * refIdx (segKind 19). The relayer executes swaps INSTANTLY from ITS OWN inventory at the pair's
+ * Uniswap-V3-TWAP price (VERIFIED source), inside an OUT-amount WINDOW: quotes revert TR03 below
+ * `getTokenLimitMin(tokenOut)` and TR3A above `inventory × maxMultiplier` — the probe-then-decode
+ * class with a LOW-end revert too. The solver's venue prelude hoists the LIVE window
+ * (getTokenLimitMin → quoteBuy ⇒ minIn) and RAISES THE LADDER SEED to minIn (the buildQLLadder
+ * seedFloor — see size-math.ts) so the grid never starts in the reverting region; the ladder then
+ * builds LIVE from `quoteSell(tokenIn, tokenOut, xNext)` (STATICCALL, probe-then-decode — a TR3A
+ * cap revert truncates the top). It EXECUTES the awarded Σ share CALLBACK-FREE: probe the live
+ * quoteSell(share) (a SUB-MIN AWARD — the merge can award a partial first slice — reverts TR03 and
+ * SKIPS SOFT, stranding the share for the terminal refund), APPROVE the RELAYER, then
+ * `sell({tokenIn, tokenOut, amountIn: Σ, amountOutMin: quote, wrapUnwrap: false, to: self,
+ * submitDeadline: 2^32−1})` — the relayer pulls EXACTLY amountIn (pull == approve ALWAYS,
+ * fork-proven; no residue path) and pays the quoted out same-tx wei-exact. NO engine SwapPoolType.
+ * LIVE-WALK class. `address` is the RELAYER — ONE contract holds EVERY pair's inventory, so the
+ * claim key is the relayer address (the Tessera/Elfomo single-wrapper class: one SIZE venue per
+ * cook, shared inventory never double-counted). `minOut`/`minIn` are DISCOVERY-time diagnostics
+ * (the solver re-hoists the window LIVE at cook).
+ */
+export interface EcoSize {
+  /** The TwapRelayer proxy — the quoteSell/quoteBuy/sell/approve target (the claim key). */
+  address: Hex;
+  /** The venue's tokenIn (the edge from-token; the quoteSell/sell `tokenIn` arg). */
+  fromToken: Hex;
+  /** The venue's tokenOut (the edge to-token). */
+  toToken: Hex;
+  /** Discovery-time getTokenLimitMin(tokenOut) — diagnostics (the solver re-reads live at cook). */
+  minOut: bigint;
+  /** Discovery-time quoteBuy(tokenIn, tokenOut, minOut) — the lowest quotable input (diagnostics). */
+  minIn: bigint;
+  /** swapFee[pair] in ppm at discovery (price-ordering diagnostics; the quote is post-fee). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * One Mento V2 venue to execute, indexed by an EcoBracket.refIdx (kind === Mento). Mento V2 (Celo
  * mento-protocol/mento-core Broker + BiPoolManager) is a BiPool oracle-priced stablecoin exchange (NOT
  * xy=k): the Broker routes to a registered exchange provider (BiPoolManager) that prices off oracle rates +
@@ -1138,6 +1210,24 @@ export interface EcoSwapPrepared {
    * existing test-side `EcoSwapPrepared` literals stay additive-compatible).
    */
   metricPools?: EcoMetric[];
+  /**
+   * LIQUIDCORE (Liquid Labs, HyperEVM) QUOTE-LADDER venues (qlv segKind 18 rows reference these by
+   * refIdx). DESCRIPTOR-ONLY — the on-chain solver builds the ladder LIVE from pool.estimateSwap
+   * (probe-then-decode) and executes CALLBACK-FREE (live estimateSwap as minAmountOut + approve POOL
+   * + pool.swap; pull == approve always — NO engine SwapPoolType). Optional/empty when no LiquidCore
+   * venue was discovered (omitted ⇒ additive-compatible).
+   */
+  liquidCorePools?: EcoLiquidCore[];
+  /**
+   * INTEGRAL SIZE (TwapRelayer) QUOTE-LADDER venues (qlv segKind 19 rows reference these by refIdx).
+   * DESCRIPTOR-ONLY — the on-chain solver hoists the LIVE out-window per venue (getTokenLimitMin +
+   * quoteBuy ⇒ the ladder's seed floor), builds the ladder LIVE from quoteSell (probe-then-decode —
+   * TR03/TR3A window reverts self-truncate), and executes CALLBACK-FREE (live quoteSell as
+   * amountOutMin + approve RELAYER + sell(SellParams); a sub-min award soft-skips into the terminal
+   * refund; NO engine SwapPoolType). Optional/empty when no SIZE venue was discovered (omitted ⇒
+   * additive-compatible).
+   */
+  sizePools?: EcoSize[];
   /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues (kind === Mento brackets
    * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE

@@ -84,6 +84,8 @@ import { buildFluidQLLadder, type FluidPool } from "../shared/fluid-math.js";
 import { buildTesseraQLLadder, type TesseraPool } from "../shared/tessera-math.js";
 import { buildElfomoQLLadder, type ElfomoPool } from "../shared/elfomo-math.js";
 import { buildMetricQLLadder, type MetricPool } from "../shared/metric-math.js";
+import { buildLiquidCoreQLLadder, type LiquidCorePool } from "../shared/liquidcore-math.js";
+import { buildSizeQLLadder, type SizePool } from "../shared/size-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
 
@@ -285,6 +287,29 @@ export interface OptimalPool {
    */
   metric?: MetricPool;
   /**
+   * LIQUIDCORE (Liquid Labs, HyperEVM oracle-priced RFQ pools) venue — when present this pool is a
+   * QUOTE-LADDER (QL) LIQUIDCORE venue (NOT any of the above). The oracle builds its segments via
+   * the SHARED buildLiquidCoreQLLadder — the IDENTICAL geometric quote ladder the on-chain solver
+   * builds in setup from the LIVE pool.estimateSwap (PROBE-THEN-DECODE; a revert / a graceful 0 /
+   * a capped oversize quote truncates both ladders in lockstep) — driven by the descriptor's
+   * `getDy` quote model (a bit-exact fixture replay locally; a prefetched real-pool quote grid in
+   * the prod-mirror), so the split is wei-exact vs the solver by construction. marginalOI is the
+   * post-fee execution price; adjNear == adjFar == marginalOI. All the other venue fields are
+   * ignored when `liquidcore` is set.
+   */
+  liquidcore?: LiquidCorePool;
+  /**
+   * INTEGRAL SIZE (TwapRelayer) venue — when present this pool is a QUOTE-LADDER (QL) SIZE venue
+   * (NOT any of the above). The oracle builds its segments via the SHARED buildSizeQLLadder — the
+   * IDENTICAL WINDOW-FLOORED geometric ladder the on-chain solver builds in setup (the venue
+   * prelude hoists minIn = quoteBuy(getTokenLimitMin(tokenOut)) and raises the ladder seed to it;
+   * the model's `liveMinIn` must carry the SAME live value) from the LIVE quoteSell
+   * (PROBE-THEN-DECODE — the TR03/TR3A out-window reverts truncate both ladders in lockstep) —
+   * driven by the descriptor's `getDy` quote model, so the split is wei-exact vs the solver by
+   * construction. All the other venue fields are ignored when `size` is set.
+   */
+  size?: SizePool;
+  /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) venue — when
    * present this pool is a MENTO venue (NOT any of the above). The oracle enumerates its segments via the
    * SHARED sampler (buildMentoSegments) from the venue's LIVE Broker getAmountOut ladder (the same
@@ -369,7 +394,9 @@ export type OptimalLegQlVenue =
   | { family: "fluid"; model: FluidPool }
   | { family: "tessera"; model: TesseraPool }
   | { family: "elfomo"; model: ElfomoPool }
-  | { family: "metric"; model: MetricPool };
+  | { family: "metric"; model: MetricPool }
+  | { family: "liquidcore"; model: LiquidCorePool }
+  | { family: "size"; model: SizePool };
 
 /**
  * Build one leg QL venue's slice ladder via the family's SHARED builder, sized by the leg's
@@ -398,6 +425,8 @@ export function buildLegQlVenueLadder(v: OptimalLegQlVenue, cap: bigint): QlSlic
     case "tessera": return buildTesseraQLLadder(v.model, cap);
     case "elfomo": return buildElfomoQLLadder(v.model, cap);
     case "metric": return buildMetricQLLadder(v.model, cap);
+    case "liquidcore": return buildLiquidCoreQLLadder(v.model, cap);
+    case "size": return buildSizeQLLadder(v.model, cap);
   }
 }
 
@@ -888,6 +917,39 @@ function metricSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segm
 }
 
 /**
+ * Enumerate one LIQUIDCORE (Liquid Labs, HyperEVM) venue's segments via the QUOTE-LADDER live walk
+ * (buildLiquidCoreQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup
+ * from the LIVE pool.estimateSwap (PROBE-THEN-DECODE — a revert / a graceful 0 / a flatlined capped
+ * quote truncates both ladders in lockstep). Driven by the descriptor's `getDy` quote model (a
+ * bit-exact BBO-mock fixture replay locally; a prefetched real-pool quote grid in the prod-mirror),
+ * so the oracle == solver wei-exact BY CONSTRUCTION. marginalOI is the post-fee execution price.
+ * Awarded as a "pool" venue.
+ */
+function liquidCoreSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildLiquidCoreQLLadder(p.liquidcore!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
+ * Enumerate one INTEGRAL SIZE (TwapRelayer) venue's segments via the WINDOW-FLOORED QUOTE-LADDER
+ * live walk (buildSizeQLLadder) — the SAME seed-floored geometric ladder the on-chain solver builds
+ * in setup (the prelude hoists minIn and raises the seed; the model's `liveMinIn` carries the same
+ * live value) from the LIVE quoteSell (PROBE-THEN-DECODE — TR03/TR3A window reverts truncate both
+ * ladders in lockstep). Driven by the descriptor's `getDy` quote model, so the oracle == solver
+ * wei-exact BY CONSTRUCTION. Awarded as a "pool" venue.
+ */
+function sizeSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildSizeQLLadder(p.size!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
  * Enumerate one Mento V2 (Celo Broker + BiPoolManager) venue's segments via the QUOTE-LADDER live walk
  * (buildMentoQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from the live
  * broker.getAmountOut view. The ladder is driven by the venue's closed-form bucket model (mentoQuoteClosed,
@@ -1248,6 +1310,10 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       allSegs.push(...elfomoSegments(p, i, amountIn));
     } else if (p.metric) {
       allSegs.push(...metricSegments(p, i, amountIn));
+    } else if (p.liquidcore) {
+      allSegs.push(...liquidCoreSegments(p, i, amountIn));
+    } else if (p.size) {
+      allSegs.push(...sizeSegments(p, i, amountIn));
     } else if (p.fermi) {
       allSegs.push(...fermiSegments(p, i, amountIn));
     } else if (p.woofi) {

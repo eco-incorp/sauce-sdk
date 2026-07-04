@@ -60,6 +60,8 @@ import {
   discoverTesseraPoolsTyped,
   discoverElfomoPoolsTyped,
   discoverMetricPoolsTyped,
+  discoverLiquidCorePoolsTyped,
+  discoverSizePoolsTyped,
   discoverMentoPoolsTyped,
   discoverBalancerV3PoolsTyped,
 } from "../shared/pool-discovery.js";
@@ -109,6 +111,8 @@ import {
   type EcoTessera,
   type EcoElfomo,
   type EcoMetric,
+  type EcoLiquidCore,
+  type EcoSize,
   type EcoMento,
   type EcoBalancerV3,
   type EcoLegQlVenue,
@@ -1281,11 +1285,67 @@ async function discoverQlVenuesForPair(
     }
   }
 
+  // LIQUIDCORE (Liquid Labs, HyperEVM; ROUTER-enumerated discovery — getPoolForPair is unordered and
+  // returns the pair's SINGLE per-pair pool) — the on-chain solver builds the ladder LIVE from
+  // `pool.estimateSwap(tokenIn, tokenOut, xNext)` (probe-then-decode) and executes CALLBACK-FREE
+  // (approve POOL + pool.swap; pull == approve always). The descriptor is (pool, tokens) — a
+  // per-pair inventory proxy, so the claim key is the POOL address (the qlVenueClaimKey default).
+  const liquidCoreConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.LiquidCore);
+  if (liquidCoreConfigs.length > 0) {
+    const lcRaw = await discoverLiquidCorePoolsTyped(pairIn, pairOut, client, liquidCoreConfigs, probeAmount);
+    for (const lp of lcRaw) {
+      out.push({
+        venue: {
+          family: "liquidcore",
+          desc: {
+            address: lp.address,
+            router: lp.router,
+            fromToken: lp.tokenIn,
+            toToken: lp.tokenOut,
+            feePpm: lp.feePpm,
+            source: lp.source,
+          },
+        },
+        headOI: lp.headOI,
+      });
+    }
+  }
+
+  // INTEGRAL SIZE (TwapRelayer; single-contract discovery — the config address IS the relayer) —
+  // the on-chain solver RE-HOISTS the live out-window per venue (getTokenLimitMin + quoteBuy ⇒ the
+  // ladder's seed floor), builds the ladder LIVE from quoteSell (probe-then-decode — the TR03/TR3A
+  // window reverts self-truncate), and executes CALLBACK-FREE (approve RELAYER + sell(SellParams);
+  // pull == approve always; a sub-min award soft-skips). The claim key is the RELAYER address (ONE
+  // contract holds every pair's inventory — the Tessera/Elfomo single-wrapper class).
+  const sizeConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.IntegralSize);
+  if (sizeConfigs.length > 0) {
+    const szRaw = await discoverSizePoolsTyped(pairIn, pairOut, client, sizeConfigs, probeAmount);
+    for (const sp of szRaw) {
+      out.push({
+        venue: {
+          family: "size",
+          desc: {
+            address: sp.address,
+            fromToken: sp.tokenIn,
+            toToken: sp.tokenOut,
+            minOut: sp.minOut,
+            minIn: sp.minIn,
+            feePpm: sp.feePpm,
+            source: sp.source,
+          },
+        },
+        headOI: sp.headOI,
+      });
+    }
+  }
+
   return out;
 }
 
 /**
- * The claim-set identity of a QL venue — the venue's POOL address for 15 families; Mento (whose
+ * The claim-set identity of a QL venue — the venue's POOL address for 16 families (incl. LiquidCore's
+ * per-pair pool proxies) and the wrapper/relayer contract for the single-contract multi-pair
+ * families (Tessera/Elfomo/SIZE — desc.address IS that contract); Mento (whose
  * venues all share the chain-wide Broker/provider contracts) claims by `provider|exchangeId`.
  * Lowercased so it unions safely with the pool-address claim set (one shared mechanism — a UniV3
  * address never collides with a Curve address). Claiming by POOL address (not by pair) is the
@@ -1595,6 +1655,11 @@ export async function prepareEcoSwap(
   // anchor-hoisted + laddered LIVE on-chain from router.quoteSwap at cook. The shared per-pair
   // discovery ran the immutables/anchor/quote liveness probes; no sampled segments ship.
   const metricPools = qlFamilyDescs<EcoMetric>("metric");
+  // LIQUIDCORE (segKind 18): descriptor-only (pool + tokens), laddered LIVE on-chain from
+  // pool.estimateSwap at cook. SIZE (segKind 19): descriptor-only (relayer + tokens + the
+  // diagnostic window reads), window-hoisted + laddered LIVE from quoteSell at cook.
+  const liquidCorePools = qlFamilyDescs<EcoLiquidCore>("liquidcore");
+  const sizePools = qlFamilyDescs<EcoSize>("size");
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1912,6 +1977,10 @@ export async function prepareEcoSwap(
   for (const ep of elfomoPools) claimed.add(ep.address.toLowerCase());
   // Metric claims by POOL address (per-pair inventory contracts — the qlVenueClaimKey default).
   for (const mp of metricPools) claimed.add(mp.address.toLowerCase());
+  // LiquidCore claims by POOL address (per-pair inventory proxies — the qlVenueClaimKey default);
+  // SIZE claims by the RELAYER address (single-contract multi-pair — the Tessera/Elfomo class).
+  for (const lp of liquidCorePools) claimed.add(lp.address.toLowerCase());
+  for (const sp of sizePools) claimed.add(sp.address.toLowerCase());
   const orderedRoutes = routes
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
@@ -1995,6 +2064,8 @@ export async function prepareEcoSwap(
     tesseraPools.length === 0 &&
     elfomoPools.length === 0 &&
     metricPools.length === 0 &&
+    liquidCorePools.length === 0 &&
+    sizePools.length === 0 &&
     mentoPools.length === 0 &&
     balancerV3Pools.length === 0
   ) {
@@ -2023,7 +2094,8 @@ export async function prepareEcoSwap(
       `${mentoPools.length} Mento QL, ${dodos.length} DODO QL, ${wombats.length} Wombat QL, ` +
       `${fermiPools.length} Fermi QL, ${eulerSwaps.length} Euler QL, ${maverickPools.length} Maverick QL, ` +
       `${balancerV3Pools.length} Balancer-V3 QL, ${fluidPools.length} Fluid QL, ` +
-      `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL, ${metricPools.length} Metric QL`,
+      `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL, ${metricPools.length} Metric QL, ` +
+      `${liquidCorePools.length} LiquidCore QL, ${sizePools.length} SIZE QL`,
   );
 
   const prepared: EcoSwapPrepared = {
@@ -2048,6 +2120,8 @@ export async function prepareEcoSwap(
     tesseraPools,
     elfomoPools,
     metricPools,
+    liquidCorePools,
+    sizePools,
     mentoPools,
     balancerV3Pools,
     brackets,

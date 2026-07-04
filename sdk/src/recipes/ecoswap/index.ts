@@ -646,6 +646,40 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
         BigInt(v.desc.provider), // qd[6] = the pool's PriceProvider (the prelude anchor hoist target)
         BigInt(v.desc.router), // qd[7] = the pool's Router (the quote/swap/approve target; rides msAux to the exec)
       ];
+    // LIQUIDCORE (Liquid Labs, HyperEVM): qd[0]=the per-pair POOL (the estimateSwap/swap/approve
+    // target AND the claim key). The SIMPLEST QL row — the quote keys on (tokenIn, tokenOut) which
+    // the solver already threads per edge (qTokIn/qTokOut), so i/j and c6..c9 are all unused. The
+    // ladder quotes pool.estimateSwap PROBE-THEN-DECODE (zero/unsupported REVERT; drained ⇒ 0;
+    // oversize ⇒ a graceful capped quote the non-descending-head guard truncates); the exec is
+    // callback-free (live estimateSwap as minAmountOut + approve POOL + pool.swap — pull == approve
+    // ALWAYS, fork-proven).
+    case "liquidcore":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (the quote keys on tokenIn/tokenOut)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        18n, // segKind = LIQUIDCORE (estimateSwap ladder; approve POOL + swap on the exec)
+        BigInt(refIdx),
+      ];
+    // INTEGRAL SIZE (TwapRelayer): qd[0]=the RELAYER (the quoteSell/quoteBuy/sell/approve target AND
+    // the claim key — single-contract multi-pair, the Tessera/Elfomo class). The venue prelude
+    // hoists the LIVE out-window (getTokenLimitMin(tokenOut) → quoteBuy ⇒ minIn) and RAISES the
+    // ladder seed to it (the buildQLLadder seedFloor — the low end of the quote domain REVERTS
+    // TR03); the ladder quotes quoteSell PROBE-THEN-DECODE (TR3A truncates the top at the live
+    // inventory cap); the exec is callback-free (live quoteSell as amountOutMin + approve RELAYER +
+    // sell(SellParams{…, to: self, submitDeadline: 2^32−1}) — pull == approve ALWAYS; a sub-min
+    // award soft-skips into the terminal refund). The descriptor's minOut/minIn are DIAGNOSTIC —
+    // the solver re-hoists the window live at cook (the live-walk charter).
+    case "size":
+      return [
+        BigInt(v.desc.address),
+        0n, // i unused (the quote keys on tokenIn/tokenOut; the window is hoisted live on-chain)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        19n, // segKind = SIZE (window-hoisted quoteSell ladder; approve RELAYER + sell on the exec)
+        BigInt(refIdx),
+      ];
   }
 }
 
@@ -664,9 +698,17 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
  * scalars, re-purposed per family: Curve int128 / CryptoSwap uint256 coin indices; LB packs `swapForY`
  * into `i`; Mento packs the exchangeId (bytes32 as uint256) into `i`; Balancer V3 packs inIdx/outIdx
  * into `i`/`j`; UNUSED (0) for Solidly/WOOFi, which quote by tokenIn/tokenOut. `feePpm` is informational
- * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Seventeen QL families ship today,
+ * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Nineteen QL families ship today,
  * each with a distinct `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters
  * are INDEPENDENT (0-based into each family's list). The newest:
+ *   segKind 18 = LIQUIDCORE     → callback-free pool.estimateSwap (probe-then-decode: zero/unsupported
+ *                                   REVERT, drained ⇒ 0, oversize ⇒ graceful cap) + approve POOL +
+ *                                   pool.swap(tokenIn, tokenOut, Σ, minOut) (refIdx → the on-chain
+ *                                   `lcinp[refIdx]`/`lcven[refIdx]` slot).
+ *   segKind 19 = INTEGRAL SIZE  → window-hoisted (getTokenLimitMin + quoteBuy ⇒ the ladder seed floor)
+ *                                   quoteSell ladder (probe-then-decode: TR03 below the out-min, TR3A
+ *                                   above the inventory cap) + approve RELAYER + sell(SellParams)
+ *                                   (refIdx → the on-chain `szinp[refIdx]`/`szven[refIdx]` slot).
  *   segKind 17 = METRIC         → anchor-hoisted (getBidAndAskPrice, probe-then-decode) + per-slice
  *                                   router.quoteSwap at the frozen anchor (probe-then-decode,
  *                                   |negative out-delta|) + approve ROUTER + swapExactInput (refIdx →
@@ -710,7 +752,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   // Family-concatenation order is LOAD-BEARING (the direct rows' positions feed the on-chain
   // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
   // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
-  // maverickPools, fluidPools, tesseraPools, elfomoPools, metricPools — the historical order the per-family map
+  // maverickPools, fluidPools, tesseraPools, elfomoPools, metricPools, liquidCorePools, sizePools — the historical order the per-family map
   // bodies (now qlRowFor) emitted, with Fluid appended when it migrated from the static-segment
   // stream and Tessera/Elfomo appended when they landed (new families ALWAYS append at the tail).
   const rows: bigint[][] = [];
@@ -731,6 +773,8 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   (prepared.tesseraPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "tessera", desc }, i)));
   (prepared.elfomoPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "elfomo", desc }, i)));
   (prepared.metricPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "metric", desc }, i)));
+  (prepared.liquidCorePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "liquidcore", desc }, i)));
+  (prepared.sizePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "size", desc }, i)));
   // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
   // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
   return rows.map(pad12);
@@ -806,6 +850,8 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_TESSERA = (prepared.tesseraPools?.length ?? 0) > 0 || hasLegFam("tessera");
   const HAS_ELFOMO = (prepared.elfomoPools?.length ?? 0) > 0 || hasLegFam("elfomo");
   const HAS_METRIC = (prepared.metricPools?.length ?? 0) > 0 || hasLegFam("metric");
+  const HAS_LIQUIDCORE = (prepared.liquidCorePools?.length ?? 0) > 0 || hasLegFam("liquidcore");
+  const HAS_SIZE = (prepared.sizePools?.length ?? 0) > 0 || hasLegFam("size");
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
   const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
   // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
@@ -833,6 +879,8 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_TESSERA,
     HAS_ELFOMO,
     HAS_METRIC,
+    HAS_LIQUIDCORE,
+    HAS_SIZE,
     HAS_MENTO,
     HAS_BALANCER_V3,
     HAS_LEG_QLV,

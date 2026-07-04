@@ -299,6 +299,37 @@ export enum FactoryType {
    * etches the genuine runtime.
    */
   Metric = "metric",
+  /**
+   * LIQUIDCORE (Liquid Labs liquidcore.xyz — HyperEVM-only oracle-priced RFQ pools, 100%
+   * protocol-owned liquidity, priced off the Hyperliquid L1 spot book via the BBO READ PRECOMPILE
+   * 0x…080e). Discovery is ROUTER-ENUMERATED (unlike Metric's known-pool-list): the config's
+   * `address` is the ROUTER and `discoverLiquidCorePoolsTyped` calls its UNORDERED
+   * `getPoolForPair(tokenIn, tokenOut)` (probed: both argument orders return the same pool; ONE
+   * pool per pair) — 1 RPC per pair — then runs ONE `pool.estimateSwap` liveness probe at the first
+   * QL slice size (probe-then-decode: zero/unsupported REVERT 0x1f2a2005/0xc1ab6dc1, a DRAINED pool
+   * quotes 0 gracefully — either drops the pool). A QUOTE-LADDER family (segKind 18): prepare ships
+   * only the descriptor (pool + tokens); the on-chain solver builds the ladder LIVE from
+   * pool.estimateSwap and executes CALLBACK-FREE (approve POOL + pool.swap(tokenIn, tokenOut, Σ,
+   * minOut) — permissionless, pull == approve always; fork-proven wei-exact same-block). See
+   * liquidcore-math.ts for the full probe record (incl. the precompile-mock requirement for local
+   * tests).
+   */
+  LiquidCore = "liquidcore",
+  /**
+   * INTEGRAL SIZE (integral.link TwapRelayer — instant swaps from relayer-held inventory at the
+   * Uniswap-V3-TWAP price; VERIFIED source). Discovery is SINGLE-CONTRACT (the config's `address`
+   * IS the chain's TwapRelayer proxy): `discoverSizePoolsTyped` probes `quoteBuy(tokenIn, tokenOut,
+   * getTokenLimitMin(tokenOut))` (⇒ the lowest quotable input `minIn`; a TR3A revert means even the
+   * min exceeds the live inventory cap — the venue drops) and ONE `quoteSell` liveness probe at
+   * max(first-QL-slice, minIn) (probe-then-decode: TR03 below the OUT-window min, TR3A above the
+   * inventory cap, TR5A disabled pair, TR17 no pair — the [min, cap] window is on the OUT amount).
+   * A QUOTE-LADDER family (segKind 19): the on-chain solver RE-HOISTS the window LIVE per venue and
+   * raises the ladder seed to minIn (the buildQLLadder seedFloor — see size-math.ts), builds the
+   * ladder LIVE from quoteSell, and executes CALLBACK-FREE (approve RELAYER +
+   * sell(SellParams{…, to: self, submitDeadline: 2^32−1}) — permissionless, pull == approve always;
+   * fork-proven wei-exact same-block; a sub-min award soft-skips into the terminal refund).
+   */
+  IntegralSize = "integral-size",
 }
 
 /**
@@ -788,6 +819,20 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
         metricPools: [
           "0x9C9fd348505A7202Fd819D8cb5003248d920d279" as Hex, // USDT/USDC (live maker; ~$320k inventory)
         ] },
+      // INTEGRAL SIZE (integral.link TwapRelayer; QL segKind 19 — see size-math.ts for the full
+      // probe record + the out-window design). `address` IS the relayer proxy (VERIFIED impl
+      // 0xaf780de0…). On-chain re-verified 2026-07-04 (block ~25.46M + anvil-fork execution):
+      // quoteSell USDC→WETH 6000e6 → 3.3526e18; USDT→WETH 6000e6 → 3.3509e18 (WETH/USDC + WETH/USDT
+      // pairs live; WBTC/USDC TR17 no pair, USDC/USDT TR5A disabled). OUT-window (checkLimits on
+      // tokenOut): getTokenLimitMin WETH 1.2e18 / USDC 5000e6 / USDT 5000e6, maxMultiplier 0.95e18
+      // × relayer inventory (WETH→USDC 2e18 quoted ~3580 USDC < the 5000e6 USDC min → TR03 — the
+      // min binds on the OUT side; 1e22 → TR3A). quoteBuy(USDC, WETH, 1.2e18) = 2148.02e6 — the
+      // exact minIn conversion (quoteSell at it = 1.20000000077e18 ≥ min; −1e6 → TR03). Fork-sold
+      // 6000 USDC from a random EOA: pulled EXACTLY 6000e6, received == same-block quoteSell
+      // WEI-EXACT, allowance residue 0, TR03 enforced at exec on a sub-min sell, submitDeadline
+      // uint32-max accepted. The TWAP source is the pair's configured Uniswap-V3 pool (observe).
+      // poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0xd17b3c9784510E33cD5B87b490E79253BcD81e2E" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.IntegralSize, label: "Integral SIZE" },
       // DODO V2
       { address: "0x72d220cE168C4f361dD4deE5D826a01AD8598f6C" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       // DODO V2 DSP (DODOStablePool factory — the SAME getDODOPool(base,quote)→address[] surface as the
@@ -918,6 +963,16 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
         metricPools: [
           "0xefb432160e8cfce36eb937975055641ba4c3747f" as Hex, // WETH/USDC (live maker; provider 0x3a1e540c…)
         ] },
+      // INTEGRAL SIZE (integral.link TwapRelayer; QL segKind 19 — see the Ethereum entry +
+      // size-math.ts). The Arbitrum relayer proxy is 0x3c6951FD… (per the official deployment;
+      // labeled "Integral: TWAP Relayer" on the explorer). On-chain re-verified 2026-07-04 (block
+      // ~480.36M): quoteSell USDC→WETH 6000e6 → 3.35277e18 (native USDC), USDC.e→WETH → same,
+      // USDT→WETH 6000e6 → 3.35009e18. OUT-window mins are SMALLER than Ethereum's:
+      // getTokenLimitMin WETH 4e16, USDC/USDC.e/USDT 100e6 (maxMultiplier 0.95e18). WETH→USDC 4e18
+      // → 7150.76e6 quotable; WETH→USDC.e and WETH→USDT reverted TR3A at 4e18 at probe (thin
+      // relayer-side stable inventory — the cap binds; the live window hoist + ladder truncation
+      // handle it per-cook). poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0x3c6951FDB433b5b8442e7aa126D50fBFB54b5f42" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.IntegralSize, label: "Integral SIZE" },
     ],
     baseTokens: [
       "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" as Hex, // WETH
@@ -1115,6 +1170,22 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // posting) at authoring, so no live probe evidence exists for any BSC pool. The Metric
       // FactoryType + discovery are chain-agnostic — a BSC entry drops in by address alone once a
       // maker is live (probe first: see the Base entry's evidence shape + metric-math.ts).
+      // DODO V2 on BSC (~$12.3M/30d — the family is integrated, BSC just lacked the entries). BOTH
+      // zoos verified on-chain 2026-07-04 (block ~108.05M) with the SAME getDODOPool(base,quote) →
+      // address[] surface the discovery iterates (both orderings, de-duped):
+      //  · DVMFactory 0x790B4A80… — getDODOPool(WBNB,USDT) → 73 pools / (USDT,WBNB) → 15 /
+      //    (USDC,USDT) → 23 / (WBNB,USDC) → 6; sampled live pools respond version "DVM 1.0.2" and
+      //    quote querySellBase (e.g. USDC/USDT 0x4ab9Fb94… querySellBase(1e18) → 0.1201e18 —
+      //    imbalanced but quoting; dead/killed pools in the list revert the probe and are dropped by
+      //    the discovery's per-pool sampling, exactly as on the other chains).
+      //  · DSPFactory 0x0fb98159… (DODOStablePool zoo — same getter surface, mirrors the Ethereum
+      //    dual-zoo wiring) — getDODOPool(WBNB,USDT) → 5 / (USDT,USDC) → 7 / (BUSD,USDT) → 14;
+      //    sampled pools respond version "DSP 1.0.0/1.0.1" and quote (e.g. USDT/USDC 0xD5F05644…
+      //    baseInv ≈ 1006e18, querySellBase(1e18) → 0.99934e18 — a live near-par stable pool).
+      // Addresses per the DODO contract API (chainId 56), cross-verified by the live getDODOPool
+      // probes above. Per-pool depth is judged by the standard sampling + relative-depth filter.
+      { address: "0x790B4A80Fb1094589A3c0eFC8740aA9b0C1733fB" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
+      { address: "0x0fb9815938Ad069Bf90E14FE6C596c514BEDe767" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2 DSP" },
     ],
     baseTokens: [
       "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Hex, // WBNB
@@ -1373,6 +1444,22 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
         metricPools: [
           "0x1C8EE7E99e2aEcD1338E111716e4744e7D088098" as Hex, // WHYPE/USDC (live maker; provider 0xf0611c8e…)
         ] },
+      // LIQUIDCORE (Liquid Labs liquidcore.xyz; QL segKind 18 — see liquidcore-math.ts for the full
+      // probe record). ROUTER-enumerated discovery: `address` IS the router — getPoolForPair(a,b) is
+      // UNORDERED and returns the pair's SINGLE pool (1 RPC/pair); getPools() enumerates 20 live
+      // per-pair proxies. On-chain re-verified 2026-07-04 (block ~39.57M, public RPC + anvil-fork
+      // execution): WHYPE/USDT0 pool 0xA7478A5f… (~893 WHYPE + ~2.8k USDT0) estimateSwap 1e18 WHYPE
+      // → 70.47 USDT0 (router quote == pool quote IDENTICAL); WHYPE/USDC pool 0xD3994A6C… (~1052
+      // WHYPE + ~61.9k USDC) fork-swapped from a random EOA: pulled EXACTLY 1e18, received == quote
+      // wei-exact, allowance residue 0; minOut enforced (0x8199f5f3 @ quote+1); zero-amount reverts
+      // 0x1f2a2005; unsupported pair reverts 0xc1ab6dc1; DRAINED pool quotes 0 gracefully; OVERSIZE
+      // 5000 WHYPE pulled in FULL against a capped 2154-USDT0 out (pull == approve ALWAYS — no
+      // residue path). isPublic=false does NOT gate swaps (probed — it gates LP deposits). Pools
+      // price off the HyperEVM BBO read precompile 0x…080e (WHYPE/USDT0 reads spot indexes 10107 +
+      // 10166; local tests etch an input-keyed mock — see liquidcore-math.ts). Quotes drift with the
+      // book/timestamp (adaptive imbalance fee) ⇒ quote == exec same-block only — the live-walk
+      // in-tx pairing. poolType UniV2 is INERT (discovery keys off factoryType).
+      { address: "0x625aC1D165c776121A52ff158e76e3544B4a0b8B" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.LiquidCore, label: "LiquidCore" },
     ],
     baseTokens: [
       "0x5555555555555555555555555555555555555555" as Hex, // WHYPE (wrapped native, routing hub, 18 dec)

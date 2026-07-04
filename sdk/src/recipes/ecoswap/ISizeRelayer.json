@@ -1,0 +1,54 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "quoteSell",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "tokenIn", "type": "address" },
+        { "name": "tokenOut", "type": "address" },
+        { "name": "amountIn", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "amountOut", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "quoteBuy",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "tokenIn", "type": "address" },
+        { "name": "tokenOut", "type": "address" },
+        { "name": "amountOut", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "amountIn", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "getTokenLimitMin",
+      "stateMutability": "view",
+      "inputs": [{ "name": "token", "type": "address" }],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "sell",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "name": "sellParams",
+          "type": "tuple",
+          "components": [
+            { "name": "tokenIn", "type": "address" },
+            { "name": "tokenOut", "type": "address" },
+            { "name": "amountIn", "type": "uint256" },
+            { "name": "amountOutMin", "type": "uint256" },
+            { "name": "wrapUnwrap", "type": "bool" },
+            { "name": "to", "type": "address" },
+            { "name": "submitDeadline", "type": "uint32" }
+          ]
+        }
+      ],
+      "outputs": [{ "name": "orderId", "type": "uint256" }]
+    }
+  ]
+}

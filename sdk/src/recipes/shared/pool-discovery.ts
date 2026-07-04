@@ -45,6 +45,8 @@ import {
   METRIC_INT128_MAX,
   METRIC_LIMIT_MAX_U128,
 } from "./metric-math.js";
+import type { LiquidCoreVenue } from "./liquidcore-math.js";
+import { type SizeVenue, SIZE_PRECISION } from "./size-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -477,6 +479,36 @@ const metricProviderAbi = parseAbi([
 ]);
 const metricRouterAbi = parseAbi([
   "function quoteSwap(address pool, bool xToY, int128 amountSpecified, uint128 priceLimit, uint128 bid, uint128 ask) external view returns (int256 amount0Delta, int256 amount1Delta)",
+]);
+
+// LIQUIDCORE (Liquid Labs, HyperEVM) read surface for the EcoSwap TYPED path — the REAL
+// (proxy/unverified-impl, bytecode-probed + selector-resolved + fork-executed) interfaces; see
+// liquidcore-math.ts for the full probe record. `getPoolForPair` is UNORDERED (both orders return
+// the pair's SINGLE pool); `estimateSwap` is the STATICCALL-safe quote (REVERT on zero/unsupported,
+// graceful 0 on a drained pool, graceful CAPPED quote on oversize); `getSpotPrices` is the
+// discovery-diagnostic mid (REVERTS on a zero reserve — probed, so it is probe-then-decode here).
+const liquidCoreRouterAbi = parseAbi([
+  "function getPoolForPair(address tokenA, address tokenB) external view returns (address pool)",
+]);
+const liquidCorePoolAbi = parseAbi([
+  "function estimateSwap(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut)",
+  "function getSpotPrices() external view returns (uint256 price0, uint256 price1)",
+]);
+
+// INTEGRAL SIZE (TwapRelayer) read surface for the EcoSwap TYPED path — the REAL VERIFIED interface
+// (IntegralHQ/Integral-SIZE-Smart-Contracts TwapRelayer.sol; see size-math.ts). The [min, cap]
+// window is on the OUT amount (checkLimits(tokenOut, amountOut) — TR03 below getTokenLimitMin,
+// TR3A above inventory × maxMultiplier); quoteBuy CEIL-rounds so quoteSell(quoteBuy(minOut)) >=
+// minOut always — the exact minIn conversion the window hoist uses.
+const sizeRelayerAbi = parseAbi([
+  "function quoteSell(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut)",
+  "function quoteBuy(address tokenIn, address tokenOut, uint256 amountOut) external view returns (uint256 amountIn)",
+  "function getTokenLimitMin(address token) external view returns (uint256)",
+  "function swapFee(address pair) external view returns (uint256)",
+  "function factory() external view returns (address)",
+]);
+const sizeFactoryAbi = parseAbi([
+  "function getPair(address tokenA, address tokenB) external view returns (address pair)",
 ]);
 
 // Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager stablecoin exchange) read surface for the
@@ -3000,6 +3032,186 @@ export async function discoverMetricPoolsTyped(
       } catch {
         // Pool/provider/router read failed (not a Metric pool, stale maker, or unsupported pair) — skip.
       }
+    }
+  }
+  return out;
+}
+
+// ── LIQUIDCORE discovery ─────────────────────────────────────
+
+/**
+ * Discover LIQUIDCORE (Liquid Labs, HyperEVM) venues for the pair AS TYPED DESCRIPTOR-ONLY
+ * `LiquidCoreVenue`s + a liveness-probe head (the EcoSwap QUOTE-LADDER path). A LiquidCore pool is a
+ * per-pair proxy priced off the Hyperliquid BBO read precompile (NOT xy=k), so it must NOT be priced
+ * through the V2 synthetic-sqrt path. Discovery is ROUTER-ENUMERATED (the config `address` is the
+ * router):
+ *
+ *   1. `router.getPoolForPair(tokenIn, tokenOut)` — UNORDERED (probed: both orders return the same
+ *      pool), ONE pool per pair; the zero address ⇒ no pool, skip. (1 RPC.)
+ *   2. `pool.estimateSwap(tokenIn, tokenOut, probeIn)` at the FIRST QL slice size — PROBE-THEN-
+ *      DECODE (zero/unsupported REVERT; a DRAINED pool returns 0 gracefully — either drops). The
+ *      probe out is the liveness head. (1 RPC.)
+ *
+ * NO SAMPLING (the QL family contract): the on-chain solver builds the ladder LIVE from the SAME
+ * estimateSwap view at cook. Execution is CALLBACK-FREE (approve POOL + pool.swap — permissionless,
+ * pull == approve always; fork-proven wei-exact same-block — see liquidcore-math.ts). The
+ * diagnostic feePpm derives from the probe's realized price vs the pool's getSpotPrices mid when
+ * that view answers (it REVERTS on a zero reserve — probe-then-decode, 0 fallback).
+ */
+export async function discoverLiquidCorePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  liquidCoreConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(LiquidCoreVenue & { headOI: bigint })[]> {
+  if (liquidCoreConfigs.length === 0 || amountIn <= 0n) return [];
+
+  // The FIRST QL slice size — the on-chain ladder's seed, so the probe's head is exactly the head
+  // the solver's first slice will carry when the state has not moved.
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
+
+  const out: (LiquidCoreVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of liquidCoreConfigs) {
+    try {
+      // 1. The pair's single pool via the router's unordered getter.
+      const pool = (await client
+        .readContract({
+          address: cfg.address,
+          abi: liquidCoreRouterAbi,
+          functionName: "getPoolForPair",
+          args: [tokenIn, tokenOut],
+        })
+        .catch(() => null)) as Hex | null;
+      if (!pool || BigInt(pool) === 0n) continue;
+      const key = pool.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // 2. ONE liveness quote at the first QL slice size — PROBE-THEN-DECODE (revert/0 ⇒ drop).
+      const probeOut = (await client
+        .readContract({
+          address: pool,
+          abi: liquidCorePoolAbi,
+          functionName: "estimateSwap",
+          args: [tokenIn, tokenOut, probeIn],
+        })
+        .catch(() => null)) as bigint | null;
+      if (!probeOut || probeOut <= 0n) continue;
+      const headOI = qlSliceHead(probeOut, probeIn);
+      if (headOI <= 0n) continue;
+
+      out.push({
+        address: pool,
+        router: cfg.address,
+        tokenIn,
+        tokenOut,
+        feePpm: 0, // no flat fee getter (adaptive imbalance fee) — the quote is post-fee; diagnostics only
+        source: `${cfg.label} (LiquidCore)`,
+        headOI,
+      });
+    } catch {
+      // Router/pool read failed (no pool for the pair / drained / unsupported) — skip.
+    }
+  }
+  return out;
+}
+
+// ── INTEGRAL SIZE discovery ──────────────────────────────────
+
+/**
+ * Discover INTEGRAL SIZE (TwapRelayer) venues for the pair AS TYPED DESCRIPTOR-ONLY `SizeVenue`s +
+ * a liveness-probe head (the EcoSwap QUOTE-LADDER path). The relayer executes instantly from ITS
+ * OWN inventory at the Uniswap-V3-TWAP price inside an OUT-amount [min, cap] WINDOW (see
+ * size-math.ts) — the descriptor is the single per-chain relayer (the config `address`).
+ *
+ * Per config (4-5 RPCs):
+ *   1. `getTokenLimitMin(tokenOut)` — the out-window low end (a pure config read).
+ *   2. `quoteBuy(tokenIn, tokenOut, minOut)` — the EXACT lowest quotable input `minIn`
+ *      (quoteBuy CEIL-rounds, so quoteSell(minIn) >= minOut always). PROBE-THEN-DECODE: a TR3A
+ *      revert here means even the minimum out exceeds the live inventory cap ⇒ the venue is dead;
+ *      TR17/TR5A ⇒ no enabled pair — drop.
+ *   3. ONE liveness `quoteSell(tokenIn, tokenOut, max(firstSlice, minIn))` — the grid's actual
+ *      first point (the ladder seed is FLOORED at minIn on-chain), probe-then-decode.
+ *   4. `factory()` → `getPair` → `swapFee(pair)` for the diagnostic feePpm (1e18 PRECISION → ppm).
+ *
+ * The descriptor carries the DISCOVERY-time `minOut`/`minIn` for diagnostics + test plumbing ONLY —
+ * the on-chain solver RE-HOISTS the window LIVE per venue at cook (the live-walk charter: a
+ * prepare-time min is a stale cache the cook must not trust).
+ */
+export async function discoverSizePoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  sizeConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(SizeVenue & { headOI: bigint })[]> {
+  if (sizeConfigs.length === 0 || amountIn <= 0n) return [];
+
+  let firstSlice = amountIn / QL_SEED_DIV;
+  if (firstSlice <= 0n) firstSlice = 1n;
+
+  const out: (SizeVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of sizeConfigs) {
+    const relayer = cfg.address;
+    const key = relayer.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      // 1. The out-window low end.
+      const minOut = (await client
+        .readContract({ address: relayer, abi: sizeRelayerAbi, functionName: "getTokenLimitMin", args: [tokenOut] })
+        .catch(() => null)) as bigint | null;
+      if (minOut === null) continue;
+
+      // 2. minOut → minIn (the exact lowest quotable input; reverts ⇒ dead venue / no pair).
+      let minIn = 0n;
+      if (minOut > 0n) {
+        const conv = (await client
+          .readContract({ address: relayer, abi: sizeRelayerAbi, functionName: "quoteBuy", args: [tokenIn, tokenOut, minOut] })
+          .catch(() => null)) as bigint | null;
+        if (conv === null) continue; // TR3A (inventory below the min) / TR5A / TR17 — the venue is dead
+        minIn = conv;
+      }
+
+      // 3. ONE liveness quote at the grid's REAL first point (the seed floored at minIn).
+      const probeIn = minIn > firstSlice ? minIn : firstSlice;
+      const probeOut = (await client
+        .readContract({ address: relayer, abi: sizeRelayerAbi, functionName: "quoteSell", args: [tokenIn, tokenOut, probeIn] })
+        .catch(() => null)) as bigint | null;
+      if (!probeOut || probeOut <= 0n) continue;
+      const headOI = qlSliceHead(probeOut, probeIn);
+      if (headOI <= 0n) continue;
+
+      // 4. Diagnostic feePpm from swapFee[pair] (1e18 PRECISION → 1e6 ppm); best-effort.
+      let feePpm = 0;
+      try {
+        const factory = (await client.readContract({ address: relayer, abi: sizeRelayerAbi, functionName: "factory" })) as Hex;
+        const pair = (await client.readContract({ address: factory, abi: sizeFactoryAbi, functionName: "getPair", args: [tokenIn, tokenOut] })) as Hex;
+        if (BigInt(pair) !== 0n) {
+          const fee = (await client.readContract({ address: relayer, abi: sizeRelayerAbi, functionName: "swapFee", args: [pair] })) as bigint;
+          const ppm = (fee * 10n ** 6n) / SIZE_PRECISION;
+          if (ppm > 0n && ppm < 10n ** 6n) feePpm = Number(ppm);
+        }
+      } catch {
+        // diagnostics only
+      }
+
+      out.push({
+        address: relayer,
+        tokenIn,
+        tokenOut,
+        minOut,
+        minIn,
+        feePpm,
+        source: `${cfg.label} (Integral SIZE)`,
+        headOI,
+      });
+    } catch {
+      // Relayer read failed (no pair / disabled / out-of-window) — skip.
     }
   }
   return out;
