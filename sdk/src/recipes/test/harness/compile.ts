@@ -65,9 +65,18 @@ export function compileSauce(
   opts: { treeshake?: boolean; defines?: Record<string, boolean> } = {},
 ): { bytecodes: Hex[]; warnings: unknown[] } {
   const jsSource = stripTypes(tsSource);
+  // UNDER-merge defaults for the NEWEST HAS_* flags: every per-family test carries an explicit,
+  // historically-complete define map, and a family added AFTER a test was written would otherwise
+  // keep its source-default `true` in that test's "my-family-only" build (dead venue code shipping
+  // silently — or, pre-declaration, an undefined-variable compile error). Defaulting the new flags
+  // to false preserves each old map's exact treeshake semantics; a caller that mentions the flag
+  // explicitly (a new-family test / production protocolDefines, which is always complete) wins.
+  const defines = opts.defines
+    ? { HAS_TESSERA: false, HAS_ELFOMO: false, ...opts.defines }
+    : undefined;
   const result = compile(jsSource, {
     baseDirs: [SRC_ROOT, recipeDir], args, target,
-    treeshake: opts.treeshake, defines: opts.defines,
+    treeshake: opts.treeshake, defines,
   });
   const segments = result.bytecode ?? result.bytecodes ?? [];
   return { bytecodes: segments.map(toHex), warnings: result.warnings ?? [] };

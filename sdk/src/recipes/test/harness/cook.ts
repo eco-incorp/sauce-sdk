@@ -34,13 +34,18 @@ export interface CookResult {
   transfers: TransferEvent[];
 }
 
-/** Send SauceRouter.cook(bytecodes) and decode Transfer logs. */
+/** Send SauceRouter.cook(bytecodes) and decode Transfer logs.
+ *  `gasPrice` (optional) pins a LEGACY tx gas price — the Tessera prio-fee cells cook once below and
+ *  once above the engine's ~2-gwei `globalPrioFeeThresholddd1337` (tx.gasprice-keyed), so the test must
+ *  control the exact tx.gasprice the solver's quote+exec read. Omitted ⇒ viem's default fee fields
+ *  (EIP-1559), the historical behavior for every other test. */
 export async function cook(
   walletClient: WalletClient,
   publicClient: PublicClient,
   sauceRouter: Hex,
   bytecodes: Hex[],
   caller?: Account,
+  gasPrice?: bigint,
 ): Promise<CookResult> {
   const account = (caller ?? walletClient.account) as Account;
   const hash = await walletClient.writeContract({
@@ -56,6 +61,7 @@ export async function cook(
     // even though the call itself is valid. The block gas limit is 2e9 (anvil.ts),
     // so a fixed 1.9e9 ceiling stays under the block cap while never undershooting.
     gas: 1_900_000_000n,
+    ...(gasPrice !== undefined ? { gasPrice } : {}),
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
 

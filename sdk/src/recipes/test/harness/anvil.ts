@@ -8,6 +8,9 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export interface AnvilHandle {
   rpcUrl: string;
@@ -66,13 +69,39 @@ async function rpcReady(rpcUrl: string, timeoutMs: number): Promise<void> {
  * deterministic. Used by the manual network-tier fork smokes
  * (ecoswap.chains.fork.test.ts); omitted ⇒ the fresh no-fork node all the
  * local EVM tests boot (unchanged behavior).
+ *
+ * `initGenesisNumber` (optional, additive; no-fork only) boots the chain at a HIGH genesis
+ * BLOCK NUMBER via a minimal `--init` genesis.json (anvil honors its `number` field; chainId
+ * stays 31337 and the dev accounts stay funded — verified). Needed by prod-mirror etches whose
+ * captured contracts gate on block.number vs an on-chain last-update BLOCK (the Tessera engine
+ * class — a fresh anvil's block ~5 makes the real pricing read as prehistoric and quote 0), the
+ * block-number analogue of pinFermiBlockTimestamp's clock pin. NB with --init the genesis
+ * timestamp is 0 — callers must still pin the clock (anvil_setTime) after boot.
  */
 export async function startAnvil(
-  opts: { timeoutMs?: number; forkUrl?: string; forkBlock?: number } = {},
+  opts: { timeoutMs?: number; forkUrl?: string; forkBlock?: number; initGenesisNumber?: bigint } = {},
 ): Promise<AnvilHandle> {
   // Forked boots pull state from a remote RPC — allow much longer to come up.
   const timeoutMs = opts.timeoutMs ?? (opts.forkUrl ? 120_000 : 30_000);
   let lastErr: unknown;
+
+  // High-genesis boot (see docstring): a minimal London+Cancun genesis whose `number` anvil honors.
+  let initPath: string | null = null;
+  if (opts.initGenesisNumber !== undefined) {
+    const genesis = {
+      config: {
+        chainId: 31337, homesteadBlock: 0, eip150Block: 0, eip155Block: 0, eip158Block: 0,
+        byzantiumBlock: 0, constantinopleBlock: 0, petersburgBlock: 0, istanbulBlock: 0,
+        berlinBlock: 0, londonBlock: 0, terminalTotalDifficulty: 0, shanghaiTime: 0, cancunTime: 0,
+      },
+      number: "0x" + opts.initGenesisNumber.toString(16),
+      gasLimit: "0x77359400",
+      difficulty: "0x0",
+      alloc: {},
+    };
+    initPath = join(mkdtempSync(join(tmpdir(), "anvil-genesis-")), "genesis.json");
+    writeFileSync(initPath, JSON.stringify(genesis));
+  }
 
   for (let attempt = 0; attempt < 5; attempt++) {
     const port = await freePort();
@@ -100,6 +129,8 @@ export async function startAnvil(
         ...(opts.forkUrl && opts.forkBlock !== undefined
           ? ["--fork-block-number", String(opts.forkBlock)]
           : []),
+        // High-genesis boot (no-fork): start the chain at the captured block number (see docstring).
+        ...(initPath ? ["--init", initPath] : []),
       ],
       { stdio: ["ignore", "ignore", "pipe"] },
     );

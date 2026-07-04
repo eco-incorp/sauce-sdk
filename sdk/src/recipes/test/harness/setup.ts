@@ -151,6 +151,16 @@ export const permit2Runtime = loadDeployedBytecode(
 export const fermiPoolArtifact = loadArtifact(
   join(FIXTURES, "FermiPool.sol", "FermiPool.json"),
 );
+/** Tessera V (Wintermute TesseraSwap wrapper — treasury-funded prop-AMM) — deployed normally (constructor
+ *  sets tokenX/tokenY + the settable private curve state K/base + feePpm + the prio-fee knob). */
+export const tesseraSwapArtifact = loadArtifact(
+  join(FIXTURES, "TesseraSwap.sol", "TesseraSwap.json"),
+);
+/** ElfomoFi (vault-funded PMM + pricing module) — deployed normally (constructor sets tokenX/tokenY + the
+ *  settable private pricing state K/base + feePpm; oracle staleness settable post-deploy). */
+export const elfomoFiArtifact = loadArtifact(
+  join(FIXTURES, "ElfomoFi.sol", "ElfomoFi.json"),
+);
 /** Mento V2 (Celo Broker + BiPoolManager) — the Broker is the swap entry; the BiPoolManager is the
  *  ENUMERABLE exchange provider (getExchanges). Both deployed normally; the Broker holds token reserves. */
 export const mentoBrokerArtifact = loadArtifact(
@@ -1431,6 +1441,100 @@ export async function deployFermiPool(
   const pool = await deployContract(walletClient, publicClient, {
     abi: fermiPoolArtifact.abi,
     bytecode: fermiPoolArtifact.bytecode,
+    args: [tokenX, tokenY, K, base, feePpm],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenX, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, xReserve], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenY, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, yReserve], account: acct,
+  });
+  return pool;
+}
+
+// The REAL TesseraSwap surface the fixture mirrors: signed-amount view/swap (tuple quote; empty-bytes
+// swapData taker path) + the engine's prio-fee knob. `setState` is a fixture-only helper (drives the drift
+// cell); the real wrapper has no curve-state getters.
+export const tesseraSwapFixtureAbi = parseAbi([
+  "function setState(uint256 K, uint256 base)",
+  "function globalPrioFeeThresholddd1337() view returns (uint256)",
+  "function tesseraSwapViewAmounts(address tokenIn, address tokenOut, int256 amountSpecified) view returns (uint256 amountIn, uint256 amountOut)",
+  "function tesseraSwapWithAllowances(address tokenIn, address tokenOut, int256 amountSpecified, uint256 amountCheck, address recipient, bytes swapData)",
+]);
+
+/**
+ * Deploy a local Tessera V (TesseraSwap) wrapper and fund it with both X + Y reserves (the fixture is its
+ * own treasury). The pricing uses the Obric closed form (K, base) with the fee off the output, plus the
+ * fork-observed priority-fee spread widening above `prioThreshold` (tx.gasprice-keyed; the swap never
+ * reverts on gas price) — but exposes only the REAL wrapper SURFACE (tuple view + 6-arg swap with bytes
+ * swapData). EcoSwap executes it callback-free (approve + tesseraSwapWithAllowances; Tessera PULLS via
+ * transferFrom), so the wrapper must HOLD both tokens — `minter` transfers xReserve/yReserve in. `feePpm` /
+ * `prioWidenPpm` are 1e6-scaled; `prioThreshold` is wei of gas price (the real knob is 2 gwei).
+ */
+export async function deployTesseraSwap(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  tokenX: Hex,
+  tokenY: Hex,
+  K: bigint,
+  base: bigint,
+  feePpm: bigint,
+  prioThreshold: bigint,
+  prioWidenPpm: bigint,
+  xReserve: bigint,
+  yReserve: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: tesseraSwapArtifact.abi,
+    bytecode: tesseraSwapArtifact.bytecode,
+    args: [tokenX, tokenY, K, base, feePpm, prioThreshold, prioWidenPpm],
+  });
+  const acct = (minter ?? walletClient.account) as Account;
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenX, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, xReserve], account: acct,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: tokenY, abi: erc20Abi as Abi, functionName: "transfer", args: [pool, yReserve], account: acct,
+  });
+  return pool;
+}
+
+// The REAL ElfomoFi surface the fixture mirrors: graceful getAmountOut + getSupportedPairs enumeration +
+// the 6-arg swap (partnerId). `setState`/`setOracleTimestamp` are fixture-only helpers (drift + staleness
+// cells); the real pricing impl exposes no state getters.
+export const elfomoFiFixtureAbi = parseAbi([
+  "function setState(uint256 K, uint256 base)",
+  "function setOracleTimestamp(uint256 ts, uint256 staleAfter)",
+  "function getSupportedPairs() view returns ((address tokenA, address tokenB)[])",
+  "function getAmountOut(address fromToken, address toToken, uint256 fromAmount) view returns (uint256 toAmount)",
+  "function swap(address fromToken, address toToken, int256 specifiedAmount, uint256 limitAmount, address receiver, uint256 partnerId)",
+]);
+
+/**
+ * Deploy a local ElfomoFi wrapper and fund it with both X + Y reserves (the fixture is its own vault).
+ * The pricing uses the Obric closed form (K, base) with the fee off the output and a GRACEFUL quote (0 on
+ * an unsupported pair / stale feed — never a revert), exposing only the REAL wrapper SURFACE
+ * (getAmountOut + getSupportedPairs + swap(..., partnerId)). EcoSwap executes it callback-free (approve +
+ * swap; Elfomo PULLS via transferFrom), so the wrapper must HOLD both tokens — `minter` transfers
+ * xReserve/yReserve in. `feePpm` is 1e6-scaled.
+ */
+export async function deployElfomoFi(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  tokenX: Hex,
+  tokenY: Hex,
+  K: bigint,
+  base: bigint,
+  feePpm: bigint,
+  xReserve: bigint,
+  yReserve: bigint,
+  minter?: Account,
+): Promise<Hex> {
+  const pool = await deployContract(walletClient, publicClient, {
+    abi: elfomoFiArtifact.abi,
+    bytecode: elfomoFiArtifact.bytecode,
     args: [tokenX, tokenY, K, base, feePpm],
   });
   const acct = (minter ?? walletClient.account) as Account;
