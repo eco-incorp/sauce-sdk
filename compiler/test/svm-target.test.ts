@@ -186,17 +186,17 @@ describe('svm target — accountData / writeAccountData', () => {
   });
 });
 
-describe('svm target — uint() lowering divergence and the accountUint sugar (CAST 0x54 / CAST_LE 0x55)', () => {
-  it('uint(bytes) lowers to the platform-native cast: CAST_LE on svm, CAST on v12', () => {
+describe('svm target — uint() lowering divergence and the accountUint sugar (CAST_BE 0x54 / CAST_LE 0x55)', () => {
+  it('uint(bytes) lowers to the platform-native cast: CAST_LE on svm, CAST_BE on v12', () => {
     const src = 'function main() { return uint(Uint8Array.from([0x01, 0x02])) }';
 
     // svm: [BYTES,2,01,02] [CAST_LE] [MSTORE (scalar main result)]
     expect(hex(compileSvm(src).bytecode[0])).toBe('9002010255f2');
-    // same source on v12: [BYTES,2,01,02] [CAST] [MSTORE]
+    // same source on v12: [BYTES,2,01,02] [CAST_BE] [MSTORE]
     expect(hex(compile(src, { target: 'v12' }).bytecode[0])).toBe('9002010254f2');
   });
 
-  it('accountUint(ref, offset, width) is uint over the accountData read — ONE op, CAST_LE, no CAST', () => {
+  it('accountUint(ref, offset, width) is uint over the accountData read — ONE op, CAST_LE, no CAST_BE', () => {
     const r = compileSvm(`function main() { return accountUint('pool', 64, 8) }`);
 
     // [BYTE_1,8 (len)] [BYTE_1,64 (offset)] [BYTE_1,0 (index)] [SLOAD] [CAST_LE] [MSTORE]

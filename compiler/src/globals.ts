@@ -188,9 +188,9 @@ const svmAccountRef = (
 
 /**
  * Lower the accountUint sugar's data read: accountData(ref, offset, width)
- * with the width pinned to an integer literal 1-32 — the CAST band only holds
- * up to a 32-byte word, and a runtime-computed width would defeat the "one op
- * per field" point of the sugar.
+ * with the width pinned to an integer literal 1-32 — the cast ops' scalar band
+ * only holds up to a 32-byte word, and a runtime-computed width would defeat
+ * the "one op per field" point of the sugar.
  */
 const svmAccountUintData = (
   name: string,
@@ -732,7 +732,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   // uint(data) — scalar from dynamic bytes read in the PLATFORM's byte order:
   //   EVM bytes are big-endian, Solana account bytes are little-endian, and the
   //   native cast reads each correctly (len ≤ 32, len 0 → 0). A LOWERING
-  //   divergence (see svm-profile.ts): the same source emits CAST (0x54) on
+  //   divergence (see svm-profile.ts): the same source emits CAST_BE (0x54) on
   //   target 'v12' and CAST_LE (0x55) on 'svm'. Not on 'v1' — the v1 engine
   //   implements the cast ops, but its Saucer builder has no cast surface.
   //   uint(accountData('pool', 64, 8))
@@ -745,7 +745,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
 
       const data = process(args[0]);
 
-      return s.ctx.isSvm ? (s as V12Saucer).castLe(data) : (s as V12Saucer).cast(data);
+      return s.ctx.isSvm ? (s as V12Saucer).castLe(data) : (s as V12Saucer).castBe(data);
     },
   },
   // accountData(ref, offset, len) — svm-only: read len bytes at offset from the

@@ -276,10 +276,10 @@ describeSvm('integration: svm uint / accountUint (CAST_LE 0x55)', () => {
     h = await startSvm();
   });
 
-  it('accountUint reads a u64 LE field at a non-zero offset in ONE op (CAST_LE, never CAST)', async () => {
+  it('accountUint reads a u64 LE field at a non-zero offset in ONE op (CAST_LE, never CAST_BE)', async () => {
     const src = `function main() { return accountUint('pool', 16, 8) }`;
-    // The LE read must not lean on a byte-reverse + CAST chain: the emitted
-    // bytecode carries CAST_LE (0x55) and no CAST (0x54) anywhere.
+    // The LE read must not lean on a byte-reverse + CAST_BE chain: the emitted
+    // bytecode carries CAST_LE (0x55) and no CAST_BE (0x54) anywhere.
     const { bytecode } = compile(src, { target: 'svm' });
 
     expect(bytecode[0]).toContain(0x55);
@@ -312,7 +312,7 @@ describeSvm('integration: svm uint / accountUint (CAST_LE 0x55)', () => {
     const v12Bytes = compile(src, { target: 'v12' }).bytecode[0];
 
     // Same source, same shape — the ONLY diverging byte is the platform-native
-    // cast: CAST_LE (0x55) on svm where v12 emits CAST (0x54).
+    // cast: CAST_LE (0x55) on svm where v12 emits CAST_BE (0x54).
     expect(svmBytes.length).toBe(v12Bytes.length);
     const diffs = [...svmBytes].flatMap((b, i) => (b !== v12Bytes[i] ? [i] : []));
     expect(diffs).toHaveLength(1);

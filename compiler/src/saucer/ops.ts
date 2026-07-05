@@ -6,7 +6,7 @@ export const OPS = {
   LENGTH: 0x51,
   KECCAK256: 0x52,
   ECDSA_VERIFY: 0x53,
-  CAST: 0x54,
+  CAST_BE: 0x54,
   CAST_LE: 0x55,
 
   ALLOCATE_HEAP: 0xc2,

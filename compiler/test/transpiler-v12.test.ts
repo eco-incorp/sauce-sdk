@@ -11,7 +11,7 @@
  * SauceScript here is the LOCAL surface (namespaced `storage.write`, `msg.sender`,
  * `crypto.keccak256`, `contract.call`, `Math.*`), not the prototype's uppercase
  * builtins — so signed ops (no local surface) are covered by the builder unit
- * suite (saucer-v12.test.ts) instead (CAST's surface, uint(), is pinned per
+ * suite (saucer-v12.test.ts) instead (CAST_BE's surface, uint(), is pinned per
  * target in svm-target.test.ts). Multi-function (helper) cases assert against
  * captured hex (the cross-function assembly is validated end-to-end by the engine
  * execution + Solidity-parity integration suites).

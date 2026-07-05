@@ -345,7 +345,7 @@ describe('V12Saucer — signed/extended ops (v12-only)', () => {
   });
   it('cast/addMod/mulMod emit their opcodes', () => {
     const s = S();
-    expect(s.cast(s.bytes(new Uint8Array([1])))._bytes.at(-1)).toBe(OPS.CAST);
+    expect(s.castBe(s.bytes(new Uint8Array([1])))._bytes.at(-1)).toBe(OPS.CAST_BE);
     expect(s.addMod(s.int(1n), s.int(2n), s.int(3n))._bytes.at(-1)).toBe(OPS.ADD_MOD);
     expect(s.mulMod(s.int(1n), s.int(2n), s.int(3n))._bytes.at(-1)).toBe(OPS.MUL_MOD);
   });

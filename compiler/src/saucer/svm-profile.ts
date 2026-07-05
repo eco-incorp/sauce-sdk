@@ -22,7 +22,7 @@ import type { CompilerContext } from '../context.js';
  *     writes the bytes into the account's data (surface: writeAccountData).
  *
  * DIVERGENT LOWERING (same SauceScript source, different opcode byte):
- *   - uint(data): lowers to the platform-native cast — CAST (0x54) on 'v12',
+ *   - uint(data): lowers to the platform-native cast — CAST_BE (0x54) on 'v12',
  *     CAST_LE (0x55) on 'svm'. The endianness rule lives on the builtin in
  *     globals.ts.
  *

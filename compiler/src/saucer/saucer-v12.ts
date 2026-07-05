@@ -480,12 +480,12 @@ export class V12Saucer implements SaucerLike {
     );
   }
 
-  /** v12-only: CAST a dynamic value to a scalar word. */
-  cast(data: SaucerLike): V12Saucer {
-    return this.unary(OPS.CAST, data, false);
+  /** v12-only: CAST_BE — cast a dynamic value to a scalar word, big-endian. */
+  castBe(data: SaucerLike): V12Saucer {
+    return this.unary(OPS.CAST_BE, data, false);
   }
 
-  /** v12-only: CAST_LE — CAST with the dereferenced bytes read little-endian (byte 0 least significant). The svm-native cast: uint() lowers to it on target 'svm'. */
+  /** v12-only: CAST_LE — CAST_BE with the dereferenced bytes read little-endian (byte 0 least significant). The svm-native cast: uint() lowers to it on target 'svm'. */
   castLe(data: SaucerLike): V12Saucer {
     return this.unary(OPS.CAST_LE, data, false);
   }
