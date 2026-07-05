@@ -399,9 +399,12 @@ Also **verified end-to-end on a Base mainnet fork** for direct V3 swaps + multi-
 
 ## Supported sources & compromises
 
-- **Sources:** Uniswap **V2** (constant-product), **V3** (concentrated), and **V4** (singleton), plus any
-  V3-style **fork** (e.g. **PancakeSwap V3**) registered as a `V3Standard`/`V2Standard` factory — each
-  queried across its own `FactoryConfig.feeTiers` — AND the quote-ladder venue families
+- **Sources:** Uniswap **V2** (constant-product), **V3** (concentrated), **V4** (singleton), and
+  **PancakeSwap Infinity CL** (the Vault-lock singleton — a tick-walk family riding the engine's
+  `swapInfinityCL`/`lockAcquired`, live per-direction protocol⊕lp fee combine, hookless Tier A at
+  launch + a default-empty hook allowlist), plus any V3-style **fork** (e.g. **PancakeSwap V3**)
+  registered as a `V3Standard`/`V2Standard` factory — each queried across its own
+  `FactoryConfig.feeTiers` — AND the quote-ladder venue families
   (Curve StableSwap/CryptoSwap, Solidly-stable, WOOFi, Trader Joe LB, Mento, DODO V2, Wombat, Fermi,
   EulerSwap, Balancer V2/V3, Maverick V2, Fluid DEX, Tessera V, ElfomoFi, Metric, LiquidCore, Integral
   SIZE, PancakeSwap StableSwap, Ekubo V3). All 21 leg-capable families compete both as DIRECT venues and as ROUTE-LEG members. **Algebra** (Camelot/QuickSwap V3, Ramses V2) is

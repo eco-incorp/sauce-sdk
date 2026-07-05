@@ -314,8 +314,13 @@ those paths, so the `!`-negation entries in `files` are the mechanism.)
    wei-exact both engines + a drift case; the newest lineages are `ecoswap.algebraintegral.prodmirror`
    (BSC THENA Integral — 6-word `globalState` with a poisoned word 3, reconstructed via
    `harness/reproduce-pool-shifted.ts` for its negative-prefix net profile), `ecoswap.topaz.prodmirror`
-   (BSC Topaz CL, dynamic per-pool `fee()` read live) and `ecoswap.projectx.prodmirror` (HyperEVM
-   Project X, complete 1064-boundary profile + the odd fee-400/ts-8 tier).
+   (BSC Topaz CL, dynamic per-pool `fee()` read live), `ecoswap.projectx.prodmirror` (HyperEVM
+   Project X, complete 1064-boundary profile + the odd fee-400/ts-8 tier),
+   `ecoswap.infinity.prodmirror` (BSC PancakeSwap Infinity CL — the GENUINE Vault/CLPoolManager/
+   CLTickLens runtime etched at the canonical create3 addresses, real USDT/Beat tick profile,
+   cooked through the engine's `swapInfinityCL` Vault lock) and `ecoswap.ekubo.prodmirror`
+   (Ethereum Ekubo — the genuine CLZ-dependent runtime on an **osaka-hardfork anvil**, slot-union
+   capture via `eth_createAccessList` oversize quotes both directions).
    Recapture the prod SNAPSHOTS with `BASE_RPC_URL=<url> npx tsx src/recipes/test/harness/<x>-snapshot.ts`
    (V3/Pancake take an optional source-tag arg → `base-WETHUSDC-pancake<fee>.json`).
    **Anvil-state cache (fast setup).** Reconstruction is deterministic given the engine artifacts +
