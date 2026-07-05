@@ -64,6 +64,8 @@ export async function driftPoolPrice(
   amountIn: bigint,
   caller: Hex,
   priceLimitOverride?: bigint,
+  /** PancakeSwap Infinity Vault — REQUIRED for a pType-9 (Infinity CL) pool; ignored otherwise. */
+  infinityVault?: Hex,
 ): Promise<void> {
   const priceLimit =
     priceLimitOverride ?? (zeroForOne ? MIN_SQRT_RATIO + 1n : MAX_SQRT_RATIO - 1n);
@@ -80,6 +82,7 @@ export async function driftPoolPrice(
       zeroForOne ? 1n : 0n,
       priceLimit,
       poolTuple(pool),
+      infinityVault ? BigInt(infinityVault) : 0n,
     ],
     ECOSWAP_DIR,
   );

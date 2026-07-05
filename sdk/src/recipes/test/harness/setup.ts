@@ -2815,3 +2815,244 @@ export async function deployMaverickV2Pool(
   }
   return pool;
 }
+
+// ── PancakeSwap INFINITY CL (etched genuine singletons + Vault-lock mint helper) ──────────────
+//
+// The Infinity mirror of the V4 block above: the GENUINE BSC runtime of the three singletons
+// (Vault + CLPoolManager + CLTickLens — captured by harness/infinity-snapshot.ts, create3 ⇒ the
+// SAME canonical addresses on BSC/Base) is etched at its canonical addresses, then re-animated:
+// the CLPoolManager bakes the Vault address as an IMMUTABLE (so both must sit at the real
+// addresses — the V4 PoolManager/StateView precedent), while the app REGISTRATION lives in
+// Vault STORAGE (registerApp is onlyOwner and the etched owner slot is empty), so the harness
+// pokes `isAppRegistered[CLPM] = 1` directly at the snapshot-scanned mapping slot. Pools are
+// initialized + minted through the InfinityLiquidityHelper fixture (lock → lockAcquired →
+// modifyLiquidity → sync/transfer/settle — the verified Vault order). The REAL packed 12+12
+// protocol fee is reproduced through the genuine code path: poke the CLPM's
+// protocolFeeController slot to a test EOA, then call the real setProtocolFee(key, fee).
+
+export const infinityHelperArtifact = loadArtifact(
+  join(FIXTURES, "InfinityLiquidityHelper.sol", "InfinityLiquidityHelper.json"),
+);
+export const infinityMockHookArtifact = loadArtifact(
+  join(FIXTURES, "InfinityLiquidityHelper.sol", "InfinityMockHook.json"),
+);
+
+/** Captured BSC mainnet runtime + re-animation slots for the Infinity singletons. */
+const INFINITY_BYTECODE = JSON.parse(
+  readFileSync(join(__dirname, "..", "fixtures", "snapshots", "infinity-bytecode.json"), "utf-8"),
+) as {
+  vault: { address: Hex; runtime: Hex };
+  clPoolManager: { address: Hex; runtime: Hex };
+  clTickLens: { address: Hex; runtime: Hex };
+  vaultIsAppRegisteredSlot: number;
+  clpmProtocolFeeControllerSlot: number;
+};
+
+export const infinityHelperAbi = parseAbi([
+  "struct InfinityPoolKey { address currency0; address currency1; address hooks; address poolManager; uint24 fee; bytes32 parameters; }",
+  "function initialize(InfinityPoolKey key, uint160 sqrtPriceX96) returns (int24)",
+  "function addLiquidity(InfinityPoolKey key, int24 tickLower, int24 tickUpper, uint128 liquidity)",
+  "function batchAddLiquidity(InfinityPoolKey key, int24[] tickLowers, int24[] tickUppers, uint128[] liquidities)",
+]);
+
+export const infinityClpmSetupAbi = parseAbi([
+  "struct InfinityPoolKey { address currency0; address currency1; address hooks; address poolManager; uint24 fee; bytes32 parameters; }",
+  "function getSlot0(bytes32 id) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "function getLiquidity(bytes32 id) view returns (uint128)",
+  "function setProtocolFee(InfinityPoolKey key, uint24 newProtocolFee)",
+  "function poolIdToPoolKey(bytes32 id) view returns (address currency0, address currency1, address hooks, address poolManager, uint24 fee, bytes32 parameters)",
+]);
+
+export interface InfinitySingletons {
+  vault: Hex;
+  clPoolManager: Hex;
+  clTickLens: Hex;
+}
+
+/**
+ * Etch the GENUINE Infinity singletons at their canonical addresses and register the
+ * CLPoolManager as a Vault app (storage poke at the snapshot-scanned mapping slot — the etched
+ * Vault has empty storage, and registerApp is onlyOwner).
+ */
+export async function etchInfinitySingletons(
+  publicClient: PublicClient,
+  testClient: {
+    setCode: (a: { address: Hex; bytecode: Hex }) => Promise<void>;
+    setStorageAt: (a: { address: Hex; index: Hex; value: Hex }) => Promise<void>;
+  },
+): Promise<InfinitySingletons> {
+  await testClient.setCode({ address: INFINITY_BYTECODE.vault.address, bytecode: INFINITY_BYTECODE.vault.runtime });
+  await testClient.setCode({ address: INFINITY_BYTECODE.clPoolManager.address, bytecode: INFINITY_BYTECODE.clPoolManager.runtime });
+  await testClient.setCode({ address: INFINITY_BYTECODE.clTickLens.address, bytecode: INFINITY_BYTECODE.clTickLens.runtime });
+  for (const a of [INFINITY_BYTECODE.vault.address, INFINITY_BYTECODE.clPoolManager.address, INFINITY_BYTECODE.clTickLens.address]) {
+    const code = await publicClient.getCode({ address: a });
+    if (!code || code === "0x") throw new Error(`failed to etch Infinity singleton ${a}`);
+  }
+  // isAppRegistered[clpm] = true — keccak256(abi.encode(clpm, slot)).
+  const appKey = keccak256(
+    encodeAbiParameters(
+      [{ type: "address" }, { type: "uint256" }],
+      [INFINITY_BYTECODE.clPoolManager.address, BigInt(INFINITY_BYTECODE.vaultIsAppRegisteredSlot)],
+    ),
+  );
+  await testClient.setStorageAt({
+    address: INFINITY_BYTECODE.vault.address,
+    index: appKey,
+    value: ("0x" + "1".padStart(64, "0")) as Hex,
+  });
+  return {
+    vault: INFINITY_BYTECODE.vault.address,
+    clPoolManager: INFINITY_BYTECODE.clPoolManager.address,
+    clTickLens: INFINITY_BYTECODE.clTickLens.address,
+  };
+}
+
+/** Deploy the Infinity liquidity helper bound to the (etched) Vault + CLPoolManager. */
+export async function deployInfinityHelper(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  vault: Hex,
+  manager: Hex,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: infinityHelperArtifact.abi,
+    bytecode: infinityHelperArtifact.bytecode,
+    args: [vault, manager],
+  });
+}
+
+/** Deploy the beforeSwap-only (bitmap 0x0040) static-fee mock hook — the Tier-B test class. */
+export async function deployInfinityMockHook(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+): Promise<Hex> {
+  return deployContract(walletClient, publicClient, {
+    abi: infinityMockHookArtifact.abi,
+    bytecode: infinityMockHookArtifact.bytecode,
+    args: [],
+  });
+}
+
+/** Pack a CL `parameters` bytes32: tickSpacing at bits [16..39], hook bitmap in the low 16. */
+export function encodeInfinityParams(tickSpacing: number, hookBitmap = 0): Hex {
+  const packed = (BigInt(tickSpacing) << 16n) | BigInt(hookBitmap);
+  return ("0x" + packed.toString(16).padStart(64, "0")) as Hex;
+}
+
+/** Infinity poolId = keccak256(abi.encode(6-field key)). Mirrors shared/infinity-math.ts. */
+export function computeInfinityPoolIdLocal(
+  currency0: Hex,
+  currency1: Hex,
+  fee: number,
+  tickSpacing: number,
+  hooks: Hex = ZERO_ADDR,
+  hookBitmap = 0,
+): Hex {
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { type: "address" }, { type: "address" }, { type: "address" }, { type: "address" },
+        { type: "uint24" }, { type: "bytes32" },
+      ],
+      [currency0, currency1, hooks, INFINITY_BYTECODE.clPoolManager.address, fee, encodeInfinityParams(tickSpacing, hookBitmap)],
+    ),
+  );
+}
+
+/**
+ * Reproduce a packed 12+12 protocol fee through the GENUINE code path: poke the CLPM's
+ * protocolFeeController slot to `controller` (a test EOA), then call the REAL
+ * setProtocolFee(key, fee) from it. The pool must already be initialized.
+ */
+export async function setInfinityProtocolFee(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  testClient: { setStorageAt: (a: { address: Hex; index: Hex; value: Hex }) => Promise<void> },
+  key: { currency0: Hex; currency1: Hex; hooks: Hex; poolManager: Hex; fee: number; parameters: Hex },
+  protocolFee: number,
+  controller: Hex,
+): Promise<void> {
+  const slotHex = ("0x" +
+    INFINITY_BYTECODE.clpmProtocolFeeControllerSlot.toString(16).padStart(64, "0")) as Hex;
+  await testClient.setStorageAt({
+    address: INFINITY_BYTECODE.clPoolManager.address,
+    index: slotHex,
+    value: ("0x" + controller.slice(2).toLowerCase().padStart(64, "0")) as Hex,
+  });
+  await writeAndWait(walletClient, publicClient, {
+    address: INFINITY_BYTECODE.clPoolManager.address,
+    abi: infinityClpmSetupAbi as Abi,
+    functionName: "setProtocolFee",
+    args: [key, protocolFee],
+  });
+  // Restore the pre-poke controller (0 on a fresh etch) so later initializes fetch their
+  // initial protocol fee exactly as before the poke.
+  await testClient.setStorageAt({
+    address: INFINITY_BYTECODE.clPoolManager.address,
+    index: slotHex,
+    value: ("0x" + "0".repeat(64)) as Hex,
+  });
+}
+
+/**
+ * Initialize an Infinity CL pool on the etched CLPoolManager and add one liquidity position via
+ * the helper (funded with both tokens to pay the Vault on settle). Returns the poolId.
+ * token0/token1 must be sorted (currency0 < currency1). Hookless (Tier A) by default; pass
+ * `hooks`+`hookBitmap` for a hooked (Tier-B-class) pool.
+ */
+export async function setupInfinityPool(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  helper: Hex,
+  token0: Hex,
+  token1: Hex,
+  fee: number,
+  tickSpacing: number,
+  sqrtPriceX96: bigint,
+  tickLower: number,
+  tickUpper: number,
+  liquidity: bigint,
+  fundAmount: bigint,
+  hooks: Hex = ZERO_ADDR,
+  hookBitmap = 0,
+): Promise<Hex> {
+  const key = {
+    currency0: token0,
+    currency1: token1,
+    hooks,
+    poolManager: INFINITY_BYTECODE.clPoolManager.address,
+    fee,
+    parameters: encodeInfinityParams(tickSpacing, hookBitmap),
+  };
+  await writeAndWait(walletClient, publicClient, {
+    address: helper, abi: infinityHelperAbi as Abi, functionName: "initialize", args: [key, sqrtPriceX96],
+  });
+  await mint(walletClient, publicClient, token0, helper, fundAmount);
+  await mint(walletClient, publicClient, token1, helper, fundAmount);
+  await writeAndWait(walletClient, publicClient, {
+    address: helper, abi: infinityHelperAbi as Abi, functionName: "addLiquidity",
+    args: [key, tickLower, tickUpper, liquidity],
+  });
+  return computeInfinityPoolIdLocal(token0, token1, fee, tickSpacing, hooks, hookBitmap);
+}
+
+export async function getInfinitySlot0(
+  publicClient: PublicClient,
+  clPoolManager: Hex,
+  poolId: Hex,
+): Promise<{ sqrtPriceX96: bigint; tick: number; protocolFee: number; lpFee: number }> {
+  const r = (await publicClient.readContract({
+    address: clPoolManager, abi: infinityClpmSetupAbi as Abi, functionName: "getSlot0", args: [poolId],
+  })) as readonly [bigint, number, number, number];
+  return { sqrtPriceX96: r[0], tick: Number(r[1]), protocolFee: Number(r[2]), lpFee: Number(r[3]) };
+}
+
+export async function getInfinityLiquidity(
+  publicClient: PublicClient,
+  clPoolManager: Hex,
+  poolId: Hex,
+): Promise<bigint> {
+  return publicClient.readContract({
+    address: clPoolManager, abi: infinityClpmSetupAbi as Abi, functionName: "getLiquidity", args: [poolId],
+  }) as Promise<bigint>;
+}

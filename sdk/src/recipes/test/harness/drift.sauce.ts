@@ -13,9 +13,11 @@ import { IERC20 } from "./artifacts/IERC20.json";
 //
 //   pool = [poolType, address, fee, tickSpacing, hooks, feePpm, isV2, inIsToken0,
 //           stateView, poolId]   (same 10-field tuple as ecoswap.sauce.ts pools[i])
+//   infVault = the chain's PancakeSwap Infinity Vault (used ONLY for pType 9 —
+//              swapInfinityCL(vault, key, …); 0 for every other family).
 function main(
   tokenIn: Address, tokenOut: Address, amountIn: Uint256, caller: Address,
-  zeroForOne: Uint256, priceLimit: Uint256, pool: Tuple
+  zeroForOne: Uint256, priceLimit: Uint256, pool: Tuple, infVault: Address
 ): Uint256 {
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -40,7 +42,17 @@ function main(
       recipient: address.self,
     });
   } else {
-    if (pType === 2) {
+    if (pType === 9) {
+      // PancakeSwap Infinity CL — the flat entrypoint (Vault lock serviced by the engine's
+      // lockAcquired). Hookless key reconstructed from the tuple (parameters = ts<<16).
+      const ik0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
+      const ik1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
+      router.swapInfinityCL(
+        infVault,
+        { currency0: ik0, currency1: ik1, hooks: pool[4], poolManager: pool[1], fee: pool[2], parameters: pool[3] * 65536 },
+        zeroForOne, Math.neg(amountIn), 0, address.self, address.self
+      );
+    } else if (pType === 2) {
       const k0: Address = zeroForOne === 1 ? tokenIn : tokenOut;
       const k1: Address = zeroForOne === 1 ? tokenOut : tokenIn;
       router.swap({
