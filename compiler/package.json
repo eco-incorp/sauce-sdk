@@ -42,7 +42,7 @@
     "eslint": "^9.39.2",
     "jest": "^30.2.0",
     "prettier": "^3.8.1",
-    "sauce": "github:eco-incorp/sauce#fix/engine-maverick-callback-funding",
+    "sauce": "github:eco-incorp/sauce#feat/svm-v12-port",
     "ts-jest": "^29.4.6",
     "typescript": "^5.7.0"
   },
