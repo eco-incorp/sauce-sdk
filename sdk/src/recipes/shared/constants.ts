@@ -928,7 +928,8 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       { address: "0x4Db9D624F67E00dbF8ef7AE0e0e8eE54aF1dee49" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.V3Standard, label: "Chronos CL" },
       // Algebra (V3-compatible swap with dynamic fees, different factory query)
       { address: "0x1a3c9B1d2F0529D97f2afC5136Cc23e58f1FD35B" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Camelot V3" },
-      { address: "0xAA2cd7477c451E703f3B9231d37de3ECDf0bc45A" as Hex, poolType: SwapPoolType.UniV3, factoryType: FactoryType.AlgebraV3, label: "Ramses V2" },
+      // (A "Ramses V2" AlgebraV3 entry at 0xAA2cd747…bc45A was REMOVED: the address has NO CODE on
+      // Arbitrum — cast code returns 0x. The LIVE Ramses CL is the fee-keyed V3Standard entry above.)
       // V4 singleton (PoolManager + StateView lens). Official Uniswap V4 Arbitrum deployment.
       { address: "0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32" as Hex, stateView: "0x76Fd297e2D437cd7f76d50F01AfE6160f86e9990" as Hex, poolType: SwapPoolType.UniV4, factoryType: FactoryType.UniswapV4, label: "Uniswap V4", feeTiers: [100, 500, 3000, 10000] },
       // V2 constant-product (no price limit)
