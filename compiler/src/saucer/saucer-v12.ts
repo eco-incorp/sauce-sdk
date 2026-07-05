@@ -262,6 +262,15 @@ export class V12Saucer implements SaucerLike {
     return this.withBytes([OPS.CALL_VALUE], this.stackEffect + 1, false);
   }
   msgData(): V12Saucer {
+    // Staged svm programs must never emit CALLDATA: the engine copies the WHOLE
+    // program to the 65,535-byte heap (25% of it at 16 KB), and staged args ride
+    // the args PDA anyway — there is nothing in the payload to read.
+    if (this.ctx.isSvm && this.ctx.staged) {
+      throw new Error(
+        'msg.data is not supported in staged svm mode (CALLDATA copies the whole staged program to the heap); read per-execution values from the args PDA instead',
+      );
+    }
+
     return this.withBytes([OPS.CALLDATA], this.stackEffect + 1, true);
   }
   blockNumber(): V12Saucer {

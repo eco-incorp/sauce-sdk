@@ -29,6 +29,7 @@ import {
   createTransactionMessage,
   generateKeyPairSigner,
   getAddressCodec,
+  getAddressEncoder,
   getProgramDerivedAddress,
   lamports,
   pipe,
@@ -40,10 +41,17 @@ import { FailedTransactionMetadata, LiteSVM } from 'litesvm';
 import { compile } from '../src/index.js';
 import type { CompileOptions } from '../src/index.js';
 
-// Mirrored from the engine crate: sha256("global:execute")[..8] and the full
-// PDA sizes (1 bump byte + payload).
+// Mirrored from the engine crate: sha256("global:execute")[..8], the full PDA
+// sizes (3-byte [kind, bump, session] header + payload), and the kind bytes
+// (the SSTORE write-protection discriminant).
 const EXECUTE_DISCRIMINATOR = new Uint8Array([0x82, 0xdd, 0xf2, 0x9a, 0x0d, 0xc1, 0xbd, 0x1d]);
-const PDA_SIZES = { stack: 33793, heap: 65536, frames: 67585 } as const;
+const PDA_SIZES = { stack: 33795, heap: 65538, frames: 67587, args: 8224 } as const;
+const PDA_KINDS = { stack: 1, heap: 2, frames: 3, args: 4 } as const;
+export const KIND_ARGS = PDA_KINDS.args;
+/** SSTORE writes engine-owned accounts only at/past this offset (KIND_ARGS targets). */
+export const ARGS_REGION_OFFSET = 32;
+/** The memory-set session byte (the harness provisions session 0, the SDK default). */
+const SESSION = 0;
 
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111' as Address;
 
@@ -58,7 +66,7 @@ export interface SvmHarness {
   svm: LiteSVM;
   programId: Address;
   payer: KeyPairSigner;
-  pdas: { stack: Address; heap: Address; frames: Address };
+  pdas: { stack: Address; heap: Address; frames: Address; args: Address };
 }
 
 /**
@@ -91,22 +99,33 @@ export const startSvm = async (): Promise<SvmHarness> => {
   const payer = await generateKeyPairSigner();
   svm.airdrop(payer.address, lamports(1_000_000_000_000n));
 
-  const [stack, heap, frames] = await Promise.all(
-    (['stack', 'heap', 'frames'] as const).map((seed) => provisionPda(svm, programId, seed)),
+  const [stack, heap, frames, args] = await Promise.all(
+    (['stack', 'heap', 'frames', 'args'] as const).map((seed) => provisionPda(svm, programId, payer.address, seed)),
   );
 
-  return { svm, programId, payer, pdas: { stack, heap, frames } };
+  return { svm, programId, payer, pdas: { stack, heap, frames, args } };
 };
 
 // Fast-path PDA provisioning: setAccount with full-size zeroed data and the
-// canonical bump at data[0] — exactly what the on-chain init_* growth loop
-// builds, minus the transactions (the sdk bootstrap path is covered by sdk
-// tests). The PDA seed is the single literal word; owner must be the engine.
-const provisionPda = async (svm: LiteSVM, programId: Address, seed: keyof typeof PDA_SIZES): Promise<Address> => {
-  const [address, bump] = await getProgramDerivedAddress({ programAddress: programId, seeds: [seed] });
+// canonical [kind, bump, session] header — exactly what the on-chain init_*
+// growth loop builds, minus the transactions (the sdk bootstrap path is
+// covered by sdk tests). Memory PDAs derive per (owner, session): the owner is
+// the execute instruction's first in-list signer — the harness payer.
+const provisionPda = async (
+  svm: LiteSVM,
+  programId: Address,
+  owner: Address,
+  seed: keyof typeof PDA_SIZES,
+): Promise<Address> => {
+  const [address, bump] = await getProgramDerivedAddress({
+    programAddress: programId,
+    seeds: [seed, getAddressEncoder().encode(owner), new Uint8Array([SESSION])],
+  });
   const size = PDA_SIZES[seed];
   const data = new Uint8Array(size);
-  data[0] = bump;
+  data[0] = PDA_KINDS[seed];
+  data[1] = bump;
+  data[2] = SESSION;
 
   svm.setAccount({
     address,
@@ -154,6 +173,9 @@ const materializeAccount = async (harness: SvmHarness, spec: SvmTestAccount): Pr
       lamports: lamports(spec.lamports ?? harness.svm.minimumBalanceForRentExemption(BigInt(data.length))),
       // Default owner is the engine so writeAccountData can mutate the data
       // (the runtime rejects writes to accounts the program does not own).
+      // The engine's SSTORE kind guard additionally requires an engine-owned
+      // target to look like an args PDA: data[0] == KIND_ARGS and write
+      // offsets >= ARGS_REGION_OFFSET — writable fixtures must be shaped so.
       programAddress: spec.owner ?? harness.programId,
       space: BigInt(data.length),
     });

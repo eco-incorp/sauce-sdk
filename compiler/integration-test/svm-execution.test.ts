@@ -12,7 +12,17 @@
  */
 import { getAddressCodec } from '@solana/kit';
 import { compile } from '../src/index.js';
-import { canRunSvm, randomSvmAddress, startSvm, svmCook, svmHex, svmUint, SYSTEM_PROGRAM } from './svm-utils.js';
+import {
+  ARGS_REGION_OFFSET,
+  canRunSvm,
+  KIND_ARGS,
+  randomSvmAddress,
+  startSvm,
+  svmCook,
+  svmHex,
+  svmUint,
+  SYSTEM_PROGRAM,
+} from './svm-utils.js';
 import type { SvmCookResult, SvmHarness } from './svm-utils.js';
 
 const describeSvm = canRunSvm() ? describe : describe.skip;
@@ -195,19 +205,43 @@ describeSvm('integration: svm accountData / writeAccountData', () => {
     expectFail(r);
   });
 
-  it('writes a writable account, reads back in a second execute', async () => {
+  it('writes a writable args-shaped account, reads back in a second execute', async () => {
+    // Engine-owned writable fixtures must satisfy the SSTORE kind guard:
+    // data[0] == KIND_ARGS, write offsets >= ARGS_REGION_OFFSET.
     const vault = randomSvmAddress();
-    const w = await svmCook(h, `function main() { writeAccountData('vault', 8, Uint8Array.from([0xde, 0xad])) }`, {
-      accounts: [{ ref: 'vault', address: vault, data: new Uint8Array(32) }],
+    const scratch = new Uint8Array(64);
+    scratch[0] = KIND_ARGS;
+    const w = await svmCook(h, `function main() { writeAccountData('vault', 40, Uint8Array.from([0xde, 0xad])) }`, {
+      accounts: [{ ref: 'vault', address: vault, data: scratch }],
     });
 
     expect(w.ok).toBe(true);
 
-    const r = await svmCook(h, `function main() { return accountData('vault', 8, 2) }`, {
+    const r = await svmCook(h, `function main() { return accountData('vault', 40, 2) }`, {
       accounts: [{ ref: 'vault', address: vault }],
     });
 
     expect(svmHex(r)).toBe('0xdead');
+  });
+
+  it('SSTORE kind guard: an engine-owned non-args target is refused (ProtectedAccount)', async () => {
+    const r = await svmCook(h, `function main() { writeAccountData('vault', 40, Uint8Array.from([0x01])) }`, {
+      accounts: [{ ref: 'vault', data: new Uint8Array(64) }], // kind byte 0 — not an args PDA
+    });
+
+    expect(expectFail(r).logs.join('\n')).toContain(`Program ${h.programId} invoke`);
+  });
+
+  it('SSTORE kind guard: an args-shaped target below ARGS_REGION_OFFSET is refused', async () => {
+    const scratch = new Uint8Array(64);
+    scratch[0] = KIND_ARGS;
+    const r = await svmCook(
+      h,
+      `function main() { writeAccountData('vault', ${ARGS_REGION_OFFSET - 1}, Uint8Array.from([0x01])) }`,
+      { accounts: [{ ref: 'vault', data: scratch }] },
+    );
+
+    expectFail(r);
   });
 
   it('plan meta order IS the user-account index space (refs resolve by name, not position)', async () => {
@@ -241,15 +275,17 @@ describeSvm('integration: svm accountData / writeAccountData', () => {
     expect(svmUint(r)).toBe(0x1122n);
   });
 
-  it('raw-index write to a writable account succeeds, reads back in a second execute', async () => {
+  it('raw-index write to a writable args-shaped account succeeds, reads back in a second execute', async () => {
     const vault = randomSvmAddress();
-    const w = await svmCook(h, 'function main() { writeAccountData(0, 4, Uint8Array.from([0xbe, 0xef])) }', {
-      accounts: [{ ref: 'vault', address: vault, data: new Uint8Array(16), writable: true }],
+    const scratch = new Uint8Array(48);
+    scratch[0] = KIND_ARGS;
+    const w = await svmCook(h, 'function main() { writeAccountData(0, 36, Uint8Array.from([0xbe, 0xef])) }', {
+      accounts: [{ ref: 'vault', address: vault, data: scratch, writable: true }],
     });
 
     expect(w.ok).toBe(true);
 
-    const r = await svmCook(h, 'function main() { return accountData(0, 4, 2) }', {
+    const r = await svmCook(h, 'function main() { return accountData(0, 36, 2) }', {
       accounts: [{ ref: 'vault', address: vault }],
     });
 

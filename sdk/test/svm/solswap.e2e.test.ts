@@ -30,6 +30,11 @@ import { estimatePacket } from '@eco-incorp/sauce-compiler';
 import {
   buildExecuteInstruction,
   deriveEnginePdas,
+  KIND_ARGS,
+  KIND_FRAMES,
+  KIND_HEAP,
+  KIND_STACK,
+  PDA_ARGS_BYTES,
   PDA_FRAMES_BYTES,
   PDA_HEAP_BYTES,
   PDA_STACK_BYTES,
@@ -183,18 +188,23 @@ const startEngine = async (): Promise<Harness> => {
   const payer = await generateKeyPairSigner();
   svm.airdrop(payer.address, lamports(1_000_000_000_000n));
 
-  // Fast-path PDA provisioning: full-size zeroed data with the canonical bump
-  // at data[0] — what the on-chain init growth loop builds, minus the
-  // transactions (the init path itself is covered by instructions.test.ts).
-  const pdas = await deriveEnginePdas(programId);
-  const specs: [EnginePda, number][] = [
-    [pdas.stack, PDA_STACK_BYTES],
-    [pdas.heap, PDA_HEAP_BYTES],
-    [pdas.frames, PDA_FRAMES_BYTES],
+  // Fast-path PDA provisioning: full-size zeroed data behind the canonical
+  // [kind, bump, session] header — what the on-chain init growth loop builds,
+  // minus the transactions (the init path itself is covered by
+  // instructions.test.ts). Memory PDAs derive per (owner, session 0); the
+  // owner is the payer — the plan's first in-list signer.
+  const pdas = await deriveEnginePdas(programId, payer.address);
+  const specs: [EnginePda, number, number][] = [
+    [pdas.stack, KIND_STACK, PDA_STACK_BYTES],
+    [pdas.heap, KIND_HEAP, PDA_HEAP_BYTES],
+    [pdas.frames, KIND_FRAMES, PDA_FRAMES_BYTES],
+    [pdas.args, KIND_ARGS, PDA_ARGS_BYTES],
   ];
-  for (const [pda, size] of specs) {
+  for (const [pda, kind, size] of specs) {
     const data = new Uint8Array(size);
-    data[0] = pda.bump;
+    data[0] = kind;
+    data[1] = pda.bump;
+    data[2] = 0;
     svm.setAccount({
       address: pda.address,
       data,

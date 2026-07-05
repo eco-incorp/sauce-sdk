@@ -108,7 +108,11 @@ describe('resolveAccounts', () => {
     const plan: AccountPlan = { metas: [{ ref: 'pool', pubkey: POOL, writable: false, signer: false }] };
     const metas = resolveAccounts(plan, {}, PAYER);
 
-    expect(metas).toEqual([{ address: POOL, role: AccountRole.READONLY }]);
+    // No plan signer → the payer is appended as the engine-required in-list signer.
+    expect(metas).toEqual([
+      { address: POOL, role: AccountRole.READONLY },
+      { address: PAYER, role: AccountRole.READONLY_SIGNER },
+    ]);
   });
 
   it('allows duplicate addresses across refs', () => {
@@ -120,7 +124,37 @@ describe('resolveAccounts', () => {
     };
     const metas = resolveAccounts(plan, { a: POOL, b: POOL }, PAYER);
 
-    expect(metas.map(m => m.address)).toEqual([POOL, POOL]);
+    expect(metas.map(m => m.address)).toEqual([POOL, POOL, PAYER]);
+  });
+
+  it('appends the payer as a readonly signer AT THE END when the plan yields no signer (indices stable)', () => {
+    const plan: AccountPlan = {
+      metas: [
+        { ref: 'pool', writable: true, signer: false },
+        { ref: 'oracle', writable: false, signer: false },
+      ],
+    };
+    const metas = resolveAccounts(plan, { pool: POOL, oracle: ORACLE }, PAYER);
+
+    // The engine fails NoSigner without an in-list signer; appending keeps
+    // user-account indices 0..n-1 exactly the plan's.
+    expect(metas).toEqual([
+      { address: POOL, role: AccountRole.WRITABLE },
+      { address: ORACLE, role: AccountRole.READONLY },
+      { address: PAYER, role: AccountRole.READONLY_SIGNER },
+    ]);
+  });
+
+  it('does NOT append the payer when any resolved meta already signs', () => {
+    const viaPlanFlag = resolveAccounts(
+      { metas: [{ ref: 'auth', writable: false, signer: true }] },
+      { auth: ORACLE },
+      PAYER,
+    );
+    const viaPayerRef = resolveAccounts({ metas: [{ ref: PAYER_REF, writable: false, signer: false }] }, {}, PAYER);
+
+    expect(viaPlanFlag).toHaveLength(1);
+    expect(viaPayerRef).toHaveLength(1);
   });
 
   it('rejects raw-index plans (the caller owns the ordering)', () => {

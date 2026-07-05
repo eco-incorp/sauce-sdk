@@ -10,6 +10,8 @@ import {
 } from '../../src/svm/index.js';
 
 const PROGRAM_ID = address('Stake11111111111111111111111111111111111111');
+// Memory PDAs derive per (owner, session); a fixed owner keeps the fixtures stable.
+const PAYER_OWNER = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 // 32 base58 '1's decode to the 32-byte zero blockhash
 const BLOCKHASH = {
   blockhash: '11111111111111111111111111111111' as Blockhash,
@@ -24,7 +26,7 @@ beforeAll(async () => {
 
 describe('buildExecuteTransaction', () => {
   it('signs a version-0 transaction with the fee payer and all instructions', async () => {
-    const pdas = await deriveEnginePdas(PROGRAM_ID);
+    const pdas = await deriveEnginePdas(PROGRAM_ID, PAYER_OWNER);
     const instructions = [
       ...buildComputeBudgetPrepend({ unitLimit: 200_000 }),
       buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts: [] }),
@@ -53,7 +55,7 @@ describe('buildExecuteTransaction', () => {
 
   it('signs for a non-payer plan signer attached to the execute metas via resolveAccounts', async () => {
     const delegate = await generateKeyPairSigner();
-    const pdas = await deriveEnginePdas(PROGRAM_ID);
+    const pdas = await deriveEnginePdas(PROGRAM_ID, PAYER_OWNER);
     const plan = { metas: [{ ref: 'delegate', writable: false, signer: true }] };
     const accounts = resolveAccounts(plan, { delegate: { address: delegate.address, signer: delegate } }, payer.address);
     const instructions = [

@@ -12,6 +12,8 @@ import {
 import type { SignedExecuteTransaction } from '../../src/svm/index.js';
 
 const PROGRAM_ID = address('Stake11111111111111111111111111111111111111');
+// Memory PDAs derive per (owner, session); a fixed owner keeps the fixtures stable.
+const PAYER_OWNER = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 const BLOCKHASH = {
   blockhash: '11111111111111111111111111111111' as Blockhash,
   lastValidBlockHeight: 10_000n,
@@ -24,7 +26,7 @@ let transactionWithPrepend: SignedExecuteTransaction; // [compute budget, execut
 
 beforeAll(async () => {
   const payer = await generateKeyPairSigner();
-  const pdas = await deriveEnginePdas(PROGRAM_ID);
+  const pdas = await deriveEnginePdas(PROGRAM_ID, PAYER_OWNER);
   const instruction = buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts: [] });
   transaction = await buildExecuteTransaction({ payer, instructions: [instruction], latestBlockhash: BLOCKHASH });
   transactionWithPrepend = await buildExecuteTransaction({

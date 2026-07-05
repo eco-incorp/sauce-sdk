@@ -23,6 +23,16 @@ export interface AccountMeta {
   signer: boolean;
 }
 
+/** Reserved ref: the SDK's resolveAccounts binds it to the fee payer (signer). */
+export const PAYER_REF = 'payer';
+
+/**
+ * Reserved ref (staged mode): the caller's args PDA, pinned at user-account
+ * index 0 so the staged arg-prologue's SLOADs hit a stable index. The SDK's
+ * executeStaged resolves it to the derived per-(owner, session) args PDA.
+ */
+export const STAGED_ARGS_REF = 'args';
+
 /** Ordered account plan: metas[i] is user-account index i (after the 3 engine PDAs). */
 export interface AccountPlan {
   metas: AccountMeta[];
@@ -50,6 +60,22 @@ export class AccountRegistry {
   intern(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
     this.setMode('refs');
 
+    return this.place(ref, flags);
+  }
+
+  /**
+   * Pre-intern a reserved ref WITHOUT locking the registry mode. Staged-mode
+   * plumbing: compile() reserves the args PDA (index 0) and the payer signer
+   * (index 1) before processing so user refs start at index 2, but a program
+   * that then uses raw numeric indices keeps owning the whole ordering (the
+   * reserved metas ride along in the plan; resolveAccounts rejects raw plans
+   * regardless, and the staged convention still pins args at user index 0).
+   */
+  reserve(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
+    return this.place(ref, flags);
+  }
+
+  private place(ref: string, flags: { writable?: boolean; signer?: boolean }): number {
     let entry = this.entries.get(ref);
 
     if (!entry) {

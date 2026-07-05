@@ -18,6 +18,11 @@ import {
   buildExecuteTransaction,
   deriveEnginePdas,
   getTransactionSize,
+  KIND_ARGS,
+  KIND_FRAMES,
+  KIND_HEAP,
+  KIND_STACK,
+  PDA_ARGS_BYTES,
   PDA_FRAMES_BYTES,
   PDA_HEAP_BYTES,
   PDA_STACK_BYTES,
@@ -49,11 +54,47 @@ export interface EngineHarness {
 
 export const randomAddress = (): Address => getAddressCodec().decode(crypto.getRandomValues(new Uint8Array(32)));
 
+/** The memory-set session byte the harness provisions (the SDK default). */
+export const HARNESS_SESSION = 0;
+
 /**
- * Boots LiteSVM with the engine program, a funded payer, full-size PDAs
- * (zeroed data + canonical bump, what the on-chain init loop builds), and the
- * cluster clock pinned to `unixTimestamp` — the venue quote fragments read
- * block.timestamp, so engine-side quotes evaluate at exactly this instant.
+ * Full-size setAccount provisioning of one owner's memory set: zeroed data
+ * behind the canonical [kind, bump, session] header — exactly what the
+ * on-chain init loop builds, minus the transactions. Memory PDAs derive per
+ * (owner, session); the owner must be the execute instruction's FIRST in-list
+ * signer.
+ */
+export const provisionEnginePdas = async (svm: LiteSVM, programId: Address, owner: Address): Promise<EnginePdas> => {
+  const pdas = await deriveEnginePdas(programId, owner, HARNESS_SESSION);
+  const specs: [EnginePda, number, number][] = [
+    [pdas.stack, KIND_STACK, PDA_STACK_BYTES],
+    [pdas.heap, KIND_HEAP, PDA_HEAP_BYTES],
+    [pdas.frames, KIND_FRAMES, PDA_FRAMES_BYTES],
+    [pdas.args, KIND_ARGS, PDA_ARGS_BYTES],
+  ];
+  for (const [pda, kind, size] of specs) {
+    const data = new Uint8Array(size);
+    data[0] = kind;
+    data[1] = pda.bump;
+    data[2] = HARNESS_SESSION;
+    svm.setAccount({
+      address: pda.address,
+      data,
+      executable: false,
+      lamports: lamports(svm.minimumBalanceForRentExemption(BigInt(size))),
+      programAddress: programId,
+      space: BigInt(size),
+    });
+  }
+
+  return pdas;
+};
+
+/**
+ * Boots LiteSVM with the engine program, a funded payer, the payer's full-size
+ * memory PDAs, and the cluster clock pinned to `unixTimestamp` — the venue
+ * quote fragments read block.timestamp, so engine-side quotes evaluate at
+ * exactly this instant.
  */
 export const startEngine = async (unixTimestamp: bigint): Promise<EngineHarness> => {
   const svm = new LiteSVM();
@@ -66,24 +107,7 @@ export const startEngine = async (unixTimestamp: bigint): Promise<EngineHarness>
   const payer = await generateKeyPairSigner();
   svm.airdrop(payer.address, lamports(1_000_000_000_000n));
 
-  const pdas = await deriveEnginePdas(programId);
-  const specs: [EnginePda, number][] = [
-    [pdas.stack, PDA_STACK_BYTES],
-    [pdas.heap, PDA_HEAP_BYTES],
-    [pdas.frames, PDA_FRAMES_BYTES],
-  ];
-  for (const [pda, size] of specs) {
-    const data = new Uint8Array(size);
-    data[0] = pda.bump;
-    svm.setAccount({
-      address: pda.address,
-      data,
-      executable: false,
-      lamports: lamports(svm.minimumBalanceForRentExemption(BigInt(size))),
-      programAddress: programId,
-      space: BigInt(size),
-    });
-  }
+  const pdas = await provisionEnginePdas(svm, programId, payer.address);
 
   return { svm, programId, payer, pdas };
 };
@@ -218,6 +242,31 @@ export const signExecuteTransaction = async (
     lookupTables,
   });
 };
+
+/**
+ * Signs (but does not send) arbitrary instructions as one payer-fee-paid v0
+ * transaction on a fresh blockhash — the staging-protocol building block
+ * (init/write/finalize/close txs and the [args-writer, execute_from_account]
+ * pair are all built through it).
+ */
+export const buildExecuteTransactionForHarness = async (
+  harness: EngineHarness,
+  instructions: readonly Instruction[],
+): Promise<SignedExecuteTransaction> => {
+  // A fresh blockhash per send keeps signatures unique — LiteSVM's history
+  // rejects a byte-identical resend.
+  harness.svm.expireBlockhash();
+
+  return buildExecuteTransaction({
+    payer: harness.payer,
+    instructions,
+    latestBlockhash: { blockhash: harness.svm.latestBlockhash(), lastValidBlockHeight: 1_000_000n },
+  });
+};
+
+/** Builds, signs, and sends one transaction of `instructions`; returns the run result. */
+export const sendInstructions = async (harness: EngineHarness, instructions: readonly Instruction[]): Promise<RunResult> =>
+  sendSigned(harness, await buildExecuteTransactionForHarness(harness, instructions));
 
 export const sendSigned = (harness: EngineHarness, transaction: SignedExecuteTransaction): RunResult => {
   const result = harness.svm.sendTransaction(transaction);

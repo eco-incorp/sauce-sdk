@@ -63,6 +63,14 @@ interface SharedModule {
   defines: Map<string, bigint>;
   /** svm: symbolic account refs → user-account indices, shared so helper functions share numbering. */
   accounts: AccountRegistry;
+  /**
+   * svm: compiling for staged execution (execute_from_account). Compile-time
+   * args are NOT baked into the blob — the prologue SLOADs them from the args
+   * PDA at user-tail index 0 — and CALLDATA emission is rejected (it copies
+   * the whole staged program to the heap). Module-shared so every function
+   * context sees the gate.
+   */
+  staged: boolean;
 }
 
 export class CompilerContext {
@@ -160,6 +168,7 @@ export class CompilerContext {
       funcMeta: [],
       defines: new Map(),
       accounts: new AccountRegistry(),
+      staged: false,
     };
 
     for (const [name, config] of Object.entries(contracts)) {
@@ -175,6 +184,16 @@ export class CompilerContext {
   /** True only for the Solana target ('svm' is a v12 dialect with divergent call/storage lowering). */
   get isSvm(): boolean {
     return this.target === 'svm';
+  }
+
+  /** svm: compiling for staged execution — args read from the args PDA, CALLDATA rejected. */
+  get staged(): boolean {
+    return this.module.staged;
+  }
+
+  /** svm: mark the module staged (set once by compile() before processing). */
+  setStaged(staged: boolean): void {
+    this.module.staged = staged;
   }
 
   /** The function index table (shared across a v12 module's contexts). */
@@ -197,6 +216,11 @@ export class CompilerContext {
   /** svm: intern a symbolic account ref → stable user-account index (first-use order). */
   internAccount(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
     return this.module.accounts.intern(ref, flags);
+  }
+
+  /** svm staged: pre-place a reserved ref (args PDA / payer) without locking the registry mode. */
+  reserveAccount(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
+    return this.module.accounts.reserve(ref, flags);
   }
 
   /** svm: record that a raw numeric account index was used (locks out symbolic refs). */

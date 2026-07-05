@@ -1,4 +1,4 @@
-import { AccountRole } from '@solana/kit';
+import { AccountRole, isSignerRole } from '@solana/kit';
 import type { Address, TransactionSigner } from '@solana/kit';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 
@@ -20,6 +20,14 @@ export interface AccountResolution {
  */
 export const PAYER_REF = 'payer';
 
+/**
+ * Reserved ref in STAGED plans: the caller's args PDA, pinned at user-account
+ * index 0 so the staged arg-prologue's baked SLOAD index is stable. The
+ * client's staged flows resolve it automatically to the derived per-(owner,
+ * session) args PDA; resolveAccounts itself treats it as an ordinary ref.
+ */
+export const ARGS_REF = 'args';
+
 export interface ResolvedAccountMeta {
   address: Address;
   role: AccountRole;
@@ -39,6 +47,12 @@ export interface ResolvedAccountMeta {
  * PAYER_REF. An attached TransactionSigner rides on the meta so the
  * transaction builder signs with it. Duplicate addresses across refs are
  * fine — Solana dedupes at message compile.
+ *
+ * The engine REQUIRES an in-list signer on both execute paths (NoSigner
+ * otherwise) — the first one, in list order, is MSG_SENDER and the memory
+ * owner. When neither the plan nor the resolution yields a signer, the fee
+ * payer is APPENDED as a readonly signer at the END of the tail, so every
+ * plan-baked account index stays stable.
  */
 export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution, payer: Address): ResolvedAccountMeta[] {
   if (plan.usesRawIndices) {
@@ -101,6 +115,10 @@ export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution
 
   if (unresolved.length > 0) {
     throw new Error(`unresolved account refs: ${unresolved.join(', ')} (provide addresses in the resolution map)`);
+  }
+
+  if (!metas.some(meta => isSignerRole(meta.role))) {
+    metas.push({ address: payer, role: AccountRole.READONLY_SIGNER });
   }
 
   return metas;
