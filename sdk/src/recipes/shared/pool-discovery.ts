@@ -48,6 +48,16 @@ import {
 import type { LiquidCoreVenue } from "./liquidcore-math.js";
 import { type SizeVenue, SIZE_PRECISION } from "./size-math.js";
 import { type PancakeStableVenue, PANCAKE_STABLE_FEE_DENOMINATOR } from "./pancakestable-math.js";
+import {
+  type EkuboVenue,
+  EKUBO_DEFAULT_PRESETS,
+  EKUBO_INT128_MAX,
+  EKUBO_SLOAD_SELECTOR,
+  ekuboConcentratedConfig,
+  ekuboPoolId,
+  ekuboFeePpm,
+  decodeEkuboBalanceUpdate,
+} from "./ekubo-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -3352,6 +3362,139 @@ export async function discoverPancakeStablePoolsTyped(
       });
     } catch {
       // Factory/pool read failed (no pool for the pair / drained / killed) — skip.
+    }
+  }
+  return out;
+}
+
+// ── EKUBO V3 discovery ───────────────────────────────────────
+
+// The periphery MEVCaptureRouter's quote — E0-frozen (selector 0x3bc52842, checked present in the
+// DEPLOYED runtime; re-probed live). NONPAYABLE on-chain (the lock protocol TSTOREs — the solver
+// calls it with a plain CALL); declared `view` HERE only so viem readContract issues the eth_call
+// (an eth_call is not a static context — the Metric-quoteSwap convention). Returns the packed
+// PoolBalanceUpdate (delta0 int128 high | delta1 int128 low) + the PoolState word.
+const ekuboRouterQuoteAbi = parseAbi([
+  "function quote((address token0, address token1, bytes32 config) poolKey, bool isToken1, int128 amount, uint96 sqrtRatioLimit, uint256 skipAhead) view returns (bytes32 balanceUpdate, bytes32 stateAfter)",
+]);
+
+/**
+ * Discover EKUBO V3 (the till-based flash-accounting singleton CL — every pool VIRTUAL inside ONE
+ * Core) venues for the pair AS TYPED DESCRIPTOR-ONLY `EkuboVenue`s + a liveness-probe head (the
+ * EcoSwap QUOTE-LADDER path, segKind 21). Discovery is the V4-PRESET-CLONE, pure RPC:
+ *
+ *   1. Sort the pair ascending → (token0, token1); isToken1 = tokenIn == token1. Both recipe
+ *      tokens are ERC20 contracts, so the native-ETH keys (token0 == address(0) — Phase-2) cannot
+ *      arise here.
+ *   2. Candidate configs from the FROZEN preset menu (`cfg.ekuboPresets` ??
+ *      EKUBO_DEFAULT_PRESETS — extension 0, concentrated bit set) → poolId = keccak256(pad32(t0) ‖
+ *      pad32(t1) ‖ config) (E0: re-derived vs 5/5 API-verified live ids).
+ *   3. ONE raw `Core.sload` batch call — selector 0x380eb4e0 ++ ALL candidate poolIds as RAW
+ *      32-byte keys (NOT ABI-encoded; the poolState slot IS the poolId) → N packed poolState words
+ *      (sqrtRatio u96 | tick i32 | liquidity u128). sqrtRatio != 0 ⇔ initialized; dead candidates
+ *      read 0 and drop. (1 RPC for the WHOLE menu.)
+ *   4. Per initialized candidate, ONE `Router.quote(key, isToken1, +probeIn, 0, 0)` eth_call at
+ *      the first QL slice size (PROBE-THEN-DECODE: PoolNotInitialized/garbage ⇒ drop; decode the
+ *      |negative out lane| of the PoolBalanceUpdate — a zero out has no depth ⇒ drop). The probe
+ *      out is the liveness head. (1 RPC per initialized pool — typically ≤ 2 per pair.)
+ *
+ * NO SAMPLING (the QL family contract): the on-chain solver builds the ladder LIVE from the SAME
+ * router quote at cook. Execution is CALLBACK-FREE (in-tx re-quote → approve ROUTER for the quoted
+ * CONSUMED input → the full-fill `swap(key, isToken1, +consumed, 0, 0, quoted out, self)` — the
+ * router pulls EXACTLY consumed via transferFrom(swapper → Core); fork-executed wei-exact,
+ * residue 0). The descriptor's claim key is the POOLID (`ekubo|<poolId>` — virtual pools share the
+ * router/Core addresses; several same-pair fee tiers compete as independent venues).
+ */
+export async function discoverEkuboPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  ekuboConfigs: FactoryConfig[],
+  amountIn: bigint,
+): Promise<(EkuboVenue & { headOI: bigint })[]> {
+  if (ekuboConfigs.length === 0 || amountIn <= 0n) return [];
+
+  // The FIRST QL slice size — the on-chain ladder's seed, so the probe's head is exactly the head
+  // the solver's first slice will carry when the state has not moved (int128-clamped like the
+  // solver's encode clamp).
+  let probeIn = amountIn / QL_SEED_DIV;
+  if (probeIn <= 0n) probeIn = 1n;
+  if (probeIn > EKUBO_INT128_MAX) probeIn = EKUBO_INT128_MAX;
+
+  // Sort ascending — the PoolKey token order (tokens are the recipe's ERC20s, never address(0)).
+  const inIsLower = BigInt(tokenIn) < BigInt(tokenOut);
+  const token0 = inIsLower ? tokenIn : tokenOut;
+  const token1 = inIsLower ? tokenOut : tokenIn;
+  const isToken1 = !inIsLower;
+
+  const out: (EkuboVenue & { headOI: bigint })[] = [];
+  const seen = new Set<string>();
+  for (const cfg of ekuboConfigs) {
+    const router = cfg.ekuboRouter;
+    if (!router) continue; // misconfigured entry — the router is the quote/swap surface
+    const presets = cfg.ekuboPresets ?? EKUBO_DEFAULT_PRESETS;
+    if (presets.length === 0) continue;
+    try {
+      // 2. Candidate (config, poolId) grid from the frozen preset menu.
+      const candidates = presets.map((p) => {
+        const config = ekuboConcentratedConfig(p.fee, p.tickSpacing);
+        return { config, poolId: ekuboPoolId(token0, token1, config), fee: p.fee };
+      });
+
+      // 3. ONE raw sload batch — selector ++ raw keys; the return is N concatenated words.
+      const calldata = (EKUBO_SLOAD_SELECTOR +
+        candidates.map((c) => c.poolId.slice(2)).join("")) as Hex;
+      const res = await client.call({ to: cfg.address, data: calldata });
+      const words = (res.data ?? "0x").slice(2);
+      if (words.length < candidates.length * 64) continue; // not the Core surface — skip config
+
+      for (let k = 0; k < candidates.length; k++) {
+        const cand = candidates[k];
+        const stateWord = BigInt("0x" + words.slice(k * 64, k * 64 + 64));
+        if (stateWord === 0n || stateWord >> 160n === 0n) continue; // sqrtRatio == 0 ⇒ uninitialized
+        const key = cand.poolId.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        // 4. ONE liveness quote at the first QL slice size — PROBE-THEN-DECODE (revert/0 ⇒ drop).
+        const bu = (await client
+          .readContract({
+            address: router,
+            abi: ekuboRouterQuoteAbi,
+            functionName: "quote",
+            args: [
+              { token0, token1, config: cand.config },
+              isToken1,
+              probeIn,
+              0n, // sqrtRatioLimit 0 ⇒ the router substitutes the direction-correct MIN/MAX bound
+              0n,
+            ],
+          })
+          .catch(() => null)) as readonly [Hex, Hex] | null;
+        if (!bu) continue;
+        const { delta0, delta1 } = decodeEkuboBalanceUpdate(BigInt(bu[0]));
+        const outDelta = isToken1 ? delta0 : delta1;
+        const probeOut = outDelta < 0n ? -outDelta : 0n;
+        if (probeOut <= 0n) continue;
+        const headOI = qlSliceHead(probeOut, probeIn);
+        if (headOI <= 0n) continue;
+
+        out.push({
+          router,
+          token0,
+          token1,
+          config: cand.config,
+          isToken1,
+          poolId: cand.poolId,
+          tokenIn,
+          tokenOut,
+          feePpm: ekuboFeePpm(cand.fee),
+          source: `${cfg.label} (Ekubo)`,
+          headOI,
+        });
+      }
+    } catch {
+      // Core/router read failed (no Ekubo surface at the config address) — skip the config.
     }
   }
   return out;

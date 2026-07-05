@@ -409,7 +409,8 @@ export type EcoLegQlVenue =
   | { family: "metric"; desc: EcoMetric }
   | { family: "liquidcore"; desc: EcoLiquidCore }
   | { family: "size"; desc: EcoSize }
-  | { family: "pancakeStable"; desc: EcoPancakeStable };
+  | { family: "pancakeStable"; desc: EcoPancakeStable }
+  | { family: "ekubo"; desc: EcoEkubo };
 
 /**
  * One LEG of a multi-hop route — a single hop (hopIn → hopOut) served by a SET of pools the
@@ -986,6 +987,53 @@ export interface EcoPancakeStable {
 }
 
 /**
+ * One EKUBO V3 (till-based flash-accounting SINGLETON CL AMM — EkuboProtocol/evm-contracts v3.1.1)
+ * QUOTE-LADDER (QL) venue, referenced by a qlv-row refIdx (segKind 21). Every Ekubo pool is a
+ * VIRTUAL pool inside the ONE Core singleton, keyed by PoolKey = (token0, token1, config) with
+ * poolId = keccak256 of the packed key (ALSO the pool's Core storage slot) — so the descriptor
+ * carries the FULL key, not a pool address, and the CLAIM key is `ekubo|<poolId>` (the router/Core
+ * addresses are shared by every Ekubo venue — see prepare.ts qlVenueClaimKey). Ekubo's math is a
+ * bespoke family (micro-ticks base 1.000001, uint96 compact-float sqrt ratios, 0.64-fixed
+ * fee-on-input) that is deliberately NOT ported: the ladder quotes the periphery
+ * `MEVCaptureRouter.quote(key, isToken1, +xNext, 0, 0)` — a PLAIN CALL (the lock protocol TSTOREs ⇒
+ * staticcall-illegal; the recipe ABI marks it nonpayable — the Fluid/Metric quoter class),
+ * PROBE-THEN-DECODE (an uninitialized/dead pool reverts PoolNotInitialized 0x486aa307 ⇒ the venue
+ * self-drops; an OVERSIZE ask partial-fills gracefully and the differenced ladder flatlines), which
+ * EXECUTES THE REAL POOL MATH in simulation and unwinds — ground truth at any input. It EXECUTES
+ * the awarded Σ CALLBACK-FREE via the E0-pinned Option-A full-fill overload: re-quote the award
+ * in-tx (same state ⇒ deterministic), decode the CONSUMED input + |out| from the packed
+ * PoolBalanceUpdate int128 lanes, approve the ROUTER for exactly the consumed amount, then
+ * `swap(key, isToken1, +consumed, 0, 0, threshold = the quoted out, self)` — the router pulls
+ * EXACTLY consumed via transferFrom(swapper → Core) and withdraws the out from the Core till to
+ * this contract (pull == approve ⇒ residue 0; fork-EXECUTED wei-exact, threshold == quote never
+ * trips in-tx; an over-award's unconsumed remainder strands for the terminal refund). NO engine
+ * SwapPoolType. LIVE-WALK class. Direction is DERIVED on-chain from the key tokens
+ * (tokenIn == token1 ⇔ isToken1 — leg-edge-correct for free); the `isToken1` stamp below serves the
+ * oracle/diagnostics. See ekubo-math.ts for the full E0 freeze record.
+ */
+export interface EcoEkubo {
+  /** MEVCaptureRouter — the quote/swap/approve target (qlv qd[0]; rides msVen to the exec). */
+  router: Hex;
+  /** PoolKey token0 (ascending; native-ETH pools — token0 == 0 — are Phase-2, never surfaced). */
+  token0: Hex;
+  /** PoolKey token1. */
+  token1: Hex;
+  /** The packed bytes32 pool config (extension u160 | fee u64 | poolTypeConfig u32). */
+  config: Hex;
+  /** Direction stamp: true ⇔ tokenIn == token1 (oracle/diagnostics; the exec re-derives). */
+  isToken1: boolean;
+  /** keccak256(pad32(token0) ‖ pad32(token1) ‖ config) — the virtual pool's identity + claim key. */
+  poolId: Hex;
+  /** The venue's tokenIn (the edge from-token; diagnostics). */
+  tokenIn: Hex;
+  /** The venue's tokenOut (diagnostics). */
+  tokenOut: Hex;
+  /** Rounded ppm of the preset fee word (diagnostic — the quote is post-fee). */
+  feePpm: number;
+  source: string;
+}
+
+/**
  * One Mento V2 venue to execute, indexed by an EcoBracket.refIdx (kind === Mento). Mento V2 (Celo
  * mento-protocol/mento-core Broker + BiPoolManager) is a BiPool oracle-priced stablecoin exchange (NOT
  * xy=k): the Broker routes to a registered exchange provider (BiPoolManager) that prices off oracle rates +
@@ -1271,6 +1319,18 @@ export interface EcoSwapPrepared {
    * Optional/empty when no Pancake stable venue was discovered (omitted ⇒ additive-compatible).
    */
   pancakeStablePools?: EcoPancakeStable[];
+  /**
+   * EKUBO V3 (till-based singleton CL; virtual pools inside ONE Core) QUOTE-LADDER venues (qlv
+   * segKind 21 rows reference these by refIdx). DESCRIPTOR-ONLY — the on-chain solver builds the
+   * ladder LIVE from the periphery MEVCaptureRouter.quote (a PLAIN CALL, probe-then-decode —
+   * PoolNotInitialized/dead ⇒ self-drop; oversize ⇒ graceful partial fill that flatlines the
+   * ladder) and executes CALLBACK-FREE via the full-fill swap overload (re-quote the award in-tx →
+   * approve ROUTER for exactly the quoted CONSUMED input → swap(key, isToken1, +consumed, 0, 0,
+   * threshold = quoted out, self); the router pulls exactly consumed via transferFrom ⇒ residue 0;
+   * NO engine SwapPoolType). Claims are by POOLID (virtual pools — see qlVenueClaimKey).
+   * Optional/empty when no Ekubo venue was discovered (omitted ⇒ additive-compatible).
+   */
+  ekuboPools?: EcoEkubo[];
   /**
    * Mento V2 (Celo mento-protocol/mento-core Broker + BiPoolManager) venues (kind === Mento brackets
    * reference these by refIdx). The on-chain solver executes the awarded Σ share CALLBACK-FREE

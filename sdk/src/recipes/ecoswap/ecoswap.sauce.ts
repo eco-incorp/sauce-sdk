@@ -24,6 +24,7 @@ import { IMetricRouter } from "./IMetricRouter.json";
 import { ILiquidCorePool } from "./ILiquidCorePool.json";
 import { ISizeRelayer } from "./ISizeRelayer.json";
 import { IPancakeStablePool } from "./IPancakeStablePool.json";
+import { IEkuboRouter } from "./IEkuboRouter.json";
 import { IMetricPool } from "./IMetricPool.json";
 import { IMetricPriceProvider } from "./IMetricPriceProvider.json";
 import { IMentoBroker } from "./IMentoBroker.json";
@@ -121,7 +122,7 @@ import { IPermit2 } from "./IPermit2.json";
 //                 Curve CryptoSwap segKind 9, WOOFi segKind 10, Fermi segKind 11, Fluid DEX segKind 12,
 //                 Mento V2 segKind 13, Balancer V3 segKind 14, Tessera V segKind 15, ElfomoFi segKind
 //                 16, METRIC segKind 17, LIQUIDCORE segKind 18, INTEGRAL SIZE segKind 19,
-//                 PANCAKE STABLESWAP segKind 20). Rows
+//                 PANCAKE STABLESWAP segKind 20, EKUBO V3 segKind 21). Rows
 //                 [0, directQlvCount) are DIRECT venues (today's family-
 //                 concatenation order; qd[10]=qd[11]=0, never read); rows [directQlvCount, …) are
 //                 ROUTE-LEG venues — qd[0..9] the SAME family row built for the leg's EDGE pair
@@ -698,6 +699,7 @@ const HAS_METRIC: boolean = true;
 const HAS_LIQUIDCORE: boolean = true;
 const HAS_SIZE: boolean = true;
 const HAS_PANCAKE_STABLE: boolean = true;
+const HAS_EKUBO: boolean = true;
 // ROUTE-LEG QL venues (true ⇔ any route leg carries qlVenues). Gates ALL leg-QL solver branches
 // — the cfg[12] directQlvCount override read, the leg-row LADDER build (the per-row edge-token/
 // sizing-fold prelude, the ladderCap==0 dead-leg guards, the per-venue cursor postlude), the
@@ -824,6 +826,13 @@ function main(
   const MC_U128MAX: Uint256 = 2 ** 128 - 1;
   const MC_HALF: Uint256 = 2 ** 255;
   const MC_DEADLINE: Uint256 = 2 ** 64;
+  // EKUBO constants: the int128 encode clamp for quote/swap amounts (the compiler truncates a
+  // uint256 into a narrower ABI slot, so an unclamped >= 2^127 value would flip the int128 sign),
+  // and the 128-bit lane size for decoding the packed PoolBalanceUpdate (delta0 int128 HIGH |
+  // delta1 int128 LOW; a NEGATIVE delta is two's-complement IN ITS LANE, so |v| = 2^128 - lane —
+  // never a 256-bit Math.neg).
+  const EK_I128MAX: Uint256 = 2 ** 127 - 1;
+  const EK_2P128: Uint256 = 2 ** 128;
   // INTEGRAL SIZE constant: the sell() submitDeadline — uint32 max (fork-proven accepted, so the
   // exec needs no block.timestamp read; the deadline slot is uint32, so 2^32−1 is the far bound).
   const SZ_DEADLINE: Uint256 = 2 ** 32 - 1;
@@ -910,6 +919,15 @@ function main(
   let szven: Tuple = new Array(MS_CAP); // INTEGRAL SIZE venue (TwapRelayer) address
   let pksinp: Tuple = new Array(MS_CAP); // PancakeStableSwap per-venue Σ input
   let pksven: Tuple = new Array(MS_CAP); // PancakeStableSwap venue (pool) address
+  let ekinp: Tuple = new Array(MS_CAP); // EKUBO per-venue Σ input
+  let ekven: Tuple = new Array(MS_CAP); // EKUBO venue router (MEVCaptureRouter) address
+  // EKUBO virtual-pool KEY stash — written by the qlv LADDER pass (direct rows only, indexed by
+  // the family refIdx qd[5]); the direct exec loop reads the 3-word PoolKey from here (token0,
+  // token1, config — three words cannot ride the single msAux column the Mento/Metric mechanism
+  // uses). Leg rows read qd[6..8] directly in the unified per-leg exec, so they never touch these.
+  let ekt0: Tuple = new Array(MS_CAP); // EKUBO PoolKey token0 (per direct refIdx)
+  let ekt1: Tuple = new Array(MS_CAP); // EKUBO PoolKey token1 (per direct refIdx)
+  let ekcfg: Tuple = new Array(MS_CAP); // EKUBO PoolKey config word (per direct refIdx)
 
   // ── MERGED SAMPLED-SEGMENT STREAM (parallel scalar arrays) ──
   // The bestKind===1 cursor consumes ONE globally-DESC-sorted segment stream. It is built ON-CHAIN
@@ -1077,7 +1095,7 @@ function main(
   // ── BUILD THE MERGED SAMPLED-SEGMENT STREAM (static segs + live QL ladders, then DESC sort) ──
   // Consumed by the bestKind===1 cursor below. The merge body is logic-unchanged; only the stream's
   // SOURCE moved on-chain (parallel-array stream instead of a pre-sorted compiler arg).
-  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) &&true) {
+  if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE || HAS_EKUBO) &&true) {
     // 1. Copy any static segments VERBATIM into the parallel-array stream. VESTIGIAL: production
     // always ships segs == [] (every family is QL — the ladders below feed the whole stream); a
     // hand-built test universe may still supply static rows and they merge unchanged.
@@ -1107,7 +1125,7 @@ function main(
     // (one call, no `.catch`). Everything AFTER obtaining q (the differencing / head / emit / sort below)
     // is SHARED and adapter-agnostic. All slices are built from ONE frozen live state, so this is exactly
     // as live as re-quoting per merge step; bounded to ≤ 2*QL_S staticcalls per venue.
-    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) {
+    if (HAS_CURVE || HAS_CRYPTO || HAS_SOLIDLY_STABLE || HAS_WOOFI || HAS_MENTO || HAS_LB || HAS_WOMBAT || HAS_FERMI || HAS_DODO || HAS_EULER || HAS_BALANCER_V3 || HAS_BALANCER || HAS_MAVERICK || HAS_FLUID || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE || HAS_EKUBO) {
       // ONE flat pass over ALL qlv rows: DIRECT rows ([0, directQlvCount)) ladder into the SORTED
       // merged stream (the bestKind===1 cursor's feed) exactly as before; ROUTE-LEG rows
       // ([directQlvCount, qlv.length), gated HAS_LEG_QLV) ladder into per-venue regions PAST
@@ -1316,6 +1334,24 @@ function main(
           if (mcPok === 1) {
             mcBidV = IMetricPriceProvider.at(qd[6]).getBidAndAskPrice()[0];
             mcAskV = IMetricPriceProvider.at(qd[6]).getBidAndAskPrice()[1];
+          }
+        }
+        // EKUBO (segKind 21) venue prelude: derive the direction bit LIVE (qTokIn vs the key's
+        // token1 — derive-don't-trust; == the qd[1] discovery stamp for direct rows and
+        // leg-edge-correct for ANY leg by construction), and stash the DIRECT row's 3-word
+        // virtual-pool key (token0/token1/config — qd[6..8]) per family refIdx so the direct exec
+        // loop below can rebuild the PoolKey (the accumulate sees only the ms columns, and three
+        // words cannot ride the single msAux slot the Mento/Metric mechanism uses). Written for
+        // EVERY direct qKind-21 row — the exec reads it only when ekinp[refIdx] > 0. Leg rows SKIP
+        // the stash (their qd[5] is the GLOBAL qlv index, out of the MS_CAP index space; the
+        // unified per-leg exec reads qd[6..8] directly).
+        let qEkT1: Uint256 = 0;
+        if (HAS_EKUBO && qKind === 21) {
+          if (qTokIn === qd[7]) { qEkT1 = 1; }
+          if (isLegV === 0) {
+            ekt0[qRef] = qd[6];
+            ekt1[qRef] = qd[7];
+            ekcfg[qRef] = qd[8];
           }
         }
         // INTEGRAL SIZE (segKind 19): hoist the LIVE OUT-WINDOW once per venue and RAISE THE LADDER
@@ -1749,6 +1785,39 @@ function main(
                 IPancakeStablePool.at(qPool).get_dy(qi, qj, xNext).catch(() => { ok = 0; });
                 if (ok === 1) { q = IPancakeStablePool.at(qPool).get_dy(qi, qj, xNext); }
               }
+              // EKUBO V3 (segKind 21) — the periphery router's quote over the VIRTUAL pool key
+              // (qPool = the MEVCaptureRouter, qd[6..8] = token0/token1/config; qEkT1 = the
+              // prelude's live-derived isToken1 bit). NB a PLAIN CALL, not a staticcall (the
+              // recipe ABI marks quote nonpayable): the lock protocol TSTOREs, so a static
+              // context breaks it — the Fluid/Metric quoter class; the inner lock unwinds via
+              // the internal QuoteReturnValue revert, so the CALL is state-neutral and safe to
+              // issue twice. sqrtRatioLimit 0 ⇒ the router substitutes the DIRECTION-CORRECT
+              // MIN/MAX bound (never a wrong-side revert). The amount is clamped at the int128
+              // encode bound. PROBE-THEN-DECODE (an uninitialized/dead pool reverts
+              // PoolNotInitialized ⇒ q stays 0 ⇒ the venue self-drops), then decode the OUT-side
+              // int128 LANE of the packed PoolBalanceUpdate word ([0]): isToken1 ⇒ out = delta0
+              // (HIGH lane, ekqBU / 2^128), else out = delta1 (LOW lane, mod 2^128); a NEGATIVE
+              // lane (> 2^127-1) is two's-complement IN THE LANE ⇒ |out| = 2^128 − lane (an
+              // OVERSIZED xNext PARTIAL-FILLS gracefully: the quote flatlines at the pool's live
+              // liquidity, the differenced slice-out hits 0 and the ladder stops — at most one
+              // final slice carries capacity the pool cannot absorb; the exec swaps only the
+              // quoted CONSUMED input and the terminal refund returns the rest).
+              if (HAS_EKUBO && qKind === 21) {
+                const ekqT0: Address = qd[6];
+                const ekqT1: Address = qd[7];
+                const ekqCfg: Uint256 = qd[8];
+                let ekqAmt: Uint256 = xNext;
+                if (ekqAmt > EK_I128MAX) { ekqAmt = EK_I128MAX; }
+                let ekqOk: Uint256 = 1;
+                IEkuboRouter.at(qPool).quote({ token0: ekqT0, token1: ekqT1, config: ekqCfg }, qEkT1, ekqAmt, 0, 0).catch(() => { ekqOk = 0; });
+                if (ekqOk === 1) {
+                  const ekqBU: Uint256 = IEkuboRouter.at(qPool).quote({ token0: ekqT0, token1: ekqT1, config: ekqCfg }, qEkT1, ekqAmt, 0, 0)[0];
+                  let ekqW: Uint256 = 0;
+                  if (qEkT1 === 1) { ekqW = ekqBU / EK_2P128; }
+                  else { ekqW = ekqBU - ekqBU / EK_2P128 * EK_2P128; }
+                  if (ekqW > EK_I128MAX) { q = EK_2P128 - ekqW; }
+                }
+              }
               if (q === 0) {
                 stop = 1;
               } else {
@@ -2023,7 +2092,7 @@ function main(
       // (next-best); its near/far are ALREADY post-fee out/in (adjNear==adjFar==the post-fee
       // marginal), so they compare directly. Same tie-break as the pools/routes (near DESC, then
       // far DESC).
-      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) &&segCur < msSorted) {
+      if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE || HAS_EKUBO) &&segCur < msSorted) {
         const sNear: Uint256 = msNear[segCur];
         const sFar: Uint256 = msFar[segCur];
         if (sNear >= bestPrice) {
@@ -2530,7 +2599,7 @@ function main(
           rinp[bestRoute] = rinp[bestRoute] + rtake;
           cum = cum + rtake;
         } else {
-          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE) &&bestKind === 1) {
+          if ((HAS_CURVE || HAS_LB || HAS_DODO || HAS_SOLIDLY_STABLE || HAS_WOMBAT || HAS_BALANCER || HAS_EULER || HAS_MAVERICK || HAS_CRYPTO || HAS_WOOFI || HAS_FERMI || HAS_FLUID || HAS_MENTO || HAS_BALANCER_V3 || HAS_TESSERA || HAS_ELFOMO || HAS_METRIC || HAS_LIQUIDCORE || HAS_SIZE || HAS_PANCAKE_STABLE || HAS_EKUBO) &&bestKind === 1) {
             // ── sampled-segment slice: a fixed capacity slice at a fixed post-fee price. Consume the
             // [segCur] merged-stream row (parallel arrays), clamp to the remaining global budget, and
             // accumulate the take into the per-venue Σ keyed by segKind (1 Curve → cinp/cven,
@@ -2681,6 +2750,18 @@ function main(
                                                   if (HAS_PANCAKE_STABLE && sKind === 20) {
                                                     pksinp[sIdx] = pksinp[sIdx] + stake;
                                                     pksven[sIdx] = sVenue;
+                                                  } else {
+                                                    // segKind 21 — EKUBO V3: callback-free,
+                                                    // executed below via the in-tx re-quote +
+                                                    // approve ROUTER + the full-fill swap.
+                                                    // sVenue = the MEVCaptureRouter; the 3-word
+                                                    // virtual-pool key rides the ladder-pass
+                                                    // ekt0/ekt1/ekcfg stash (keyed by this same
+                                                    // refIdx), not the ms columns.
+                                                    if (HAS_EKUBO && sKind === 21) {
+                                                      ekinp[sIdx] = ekinp[sIdx] + stake;
+                                                      ekven[sIdx] = sVenue;
+                                                    }
                                                   }
                                                 }
                                               }
@@ -3207,6 +3288,43 @@ function main(
                       // mixed-decimal pools — see the direct arm + pancakestable-math.ts).
                       IPancakeStablePool.at(qPool).exchange(qpki, qpkj, share, qpkOut - 1);
                     }
+                  }
+                }
+                // EKUBO V3 (segKind 21) — callback-free: the leg row carries the FULL virtual-pool
+                // key (qd[6..8]; qPool = the MEVCaptureRouter), direction derived from the LEG's
+                // in-token vs the key's token1 (derive-don't-trust — edge-correct for any leg).
+                // Probe the live quote (a dead pool reverts PoolNotInitialized and skips SOFT —
+                // the share strands in legIn for the intermediate sweep / terminal refund), decode
+                // the CONSUMED input + |out| from the packed PoolBalanceUpdate lanes, approve the
+                // ROUTER for exactly the consumed amount, then the FULL-FILL swap of the consumed
+                // amount with threshold = the quoted out (deterministic in-tx — the pair never
+                // trips; the router pulls exactly consumed via transferFrom ⇒ residue 0; an
+                // over-share's unconsumed remainder strands for the sweep/refund).
+                if (HAS_EKUBO && qk === 21) {
+                  const qekT0: Address = qd[6];
+                  const qekT1: Address = qd[7];
+                  const qekCfg: Uint256 = qd[8];
+                  let qekD1: Uint256 = 0;
+                  if (legIn === qekT1) { qekD1 = 1; }
+                  let qekAmt: Uint256 = share;
+                  if (qekAmt > EK_I128MAX) { qekAmt = EK_I128MAX; }
+                  let qekOk: Uint256 = 1;
+                  IEkuboRouter.at(qPool).quote({ token0: qekT0, token1: qekT1, config: qekCfg }, qekD1, qekAmt, 0, 0).catch(() => { qekOk = 0; });
+                  if (qekOk === 1) {
+                    const qekBU: Uint256 = IEkuboRouter.at(qPool).quote({ token0: qekT0, token1: qekT1, config: qekCfg }, qekD1, qekAmt, 0, 0)[0];
+                    const qekHi: Uint256 = qekBU / EK_2P128;
+                    const qekLo: Uint256 = qekBU - qekHi * EK_2P128;
+                    let qekInW: Uint256 = qekHi;
+                    let qekOutW: Uint256 = qekLo;
+                    if (qekD1 === 1) { qekInW = qekLo; qekOutW = qekHi; }
+                    let qekOut: Uint256 = 0;
+                    if (qekOutW > EK_I128MAX) { qekOut = EK_2P128 - qekOutW; }
+                    let qekCons: Uint256 = qekInW;
+                    if (qekCons > EK_I128MAX) { qekCons = 0; } // defensive: exact-in never yields a negative in-delta
+                    if (qekCons > 0) { if (qekOut > 0) {
+                      IERC20.at(legIn).approve(qPool, qekCons);
+                      IEkuboRouter.at(qPool).swap({ token0: qekT0, token1: qekT1, config: qekCfg }, qekD1, qekCons, 0, 0, qekOut, address.self);
+                    } }
                   }
                 }
                 spent = spent + share;
@@ -3868,6 +3986,62 @@ function main(
           // cfg[9] minOut floor guards the aggregate.
           IPancakeStablePool.at(pkpool).exchange(pki, pkj, pkamt, pkOut - 1);
         }
+      }
+    }
+  }
+  }
+  // EKUBO V3 (EkuboProtocol v3.1.1 till-based singleton CL) → CALLBACK-FREE (NO engine
+  // SwapPoolType). Every Ekubo pool is a VIRTUAL pool inside the ONE Core, so there is no pool
+  // contract to call — execution goes through the periphery MEVCaptureRouter (ekven; msVen carried
+  // it from the qlv row) against the 3-word PoolKey the LADDER pass stashed per refIdx
+  // (ekt0/ekt1/ekcfg). Direction is DERIVED on-chain (tokenIn == the key's token1 ⇔ isToken1 —
+  // derive-don't-trust). The exec is the E0-pinned OPTION A (the QL-family minOut discipline —
+  // `swapAllowPartialFill` carries NO threshold, its overloads hardcode type(int256).min and
+  // DISABLE the slippage check, so the full-fill `swap` overload is the guarded path):
+  //   1. RE-QUOTE the awarded Σ LIVE (plain CALL, probe-then-decode — a pool drained/killed
+  //      between the merge read and the exec reverts PoolNotInitialized and SKIPS SOFT: the share
+  //      strands for the terminal refund, never a bricked cook);
+  //   2. decode the CONSUMED input (+in lane) and |out| (−out lane) from the packed
+  //      PoolBalanceUpdate — an over-award past the pool's live liquidity partial-fills the QUOTE,
+  //      so swapping `consumed` keeps the full-fill invariant while the unconsumed remainder rides
+  //      the terminal refund (the limit-price-edge shape every frontier venue shares);
+  //   3. approve the ROUTER for EXACTLY consumed (the router's payFrom transferFroms exactly
+  //      uint128(consumed) from this contract into Core — source-verified + fork-proven ⇒ pull ==
+  //      approve, allowance residue 0 with no reset needed);
+  //   4. swap(key, isToken1, +consumed, 0, 0, threshold = the quoted out, self) — the SAME state
+  //      in the SAME tx re-runs deterministically, so PartialSwapsDisallowed/SlippageCheckFailed
+  //      never trip (fork-proven wei-exact at threshold == quote); the out is withdrawn from the
+  //      Core till straight to this contract. compute-then-pull already transferred `cum` (incl.
+  //      each Ekubo share) into this contract above, so the approved pull draws from its balance.
+  if (HAS_EKUBO) {
+  for (let ek = 0; ek < MS_CAP; ek = ek + 1) {
+    const ekamt: Uint256 = ekinp[ek];
+    if (ekamt > 0) {
+      const ekrtr: Address = ekven[ek];
+      const ekT0: Address = ekt0[ek];
+      const ekT1: Address = ekt1[ek];
+      const ekCfg: Uint256 = ekcfg[ek];
+      let ekD1: Uint256 = 0;
+      if (ekT1 === tokenIn) { ekD1 = 1; }
+      let ekAmt: Uint256 = ekamt;
+      if (ekAmt > EK_I128MAX) { ekAmt = EK_I128MAX; }
+      let ekOk: Uint256 = 1;
+      IEkuboRouter.at(ekrtr).quote({ token0: ekT0, token1: ekT1, config: ekCfg }, ekD1, ekAmt, 0, 0).catch(() => { ekOk = 0; });
+      if (ekOk === 1) {
+        const ekBU: Uint256 = IEkuboRouter.at(ekrtr).quote({ token0: ekT0, token1: ekT1, config: ekCfg }, ekD1, ekAmt, 0, 0)[0];
+        const ekHi: Uint256 = ekBU / EK_2P128;
+        const ekLo: Uint256 = ekBU - ekHi * EK_2P128;
+        let ekInW: Uint256 = ekHi;
+        let ekOutW: Uint256 = ekLo;
+        if (ekD1 === 1) { ekInW = ekLo; ekOutW = ekHi; }
+        let ekOut: Uint256 = 0;
+        if (ekOutW > EK_I128MAX) { ekOut = EK_2P128 - ekOutW; }
+        let ekCons: Uint256 = ekInW;
+        if (ekCons > EK_I128MAX) { ekCons = 0; } // defensive: exact-in never yields a negative in-delta
+        if (ekCons > 0) { if (ekOut > 0) {
+          token.approve(ekrtr, ekCons);
+          IEkuboRouter.at(ekrtr).swap({ token0: ekT0, token1: ekT1, config: ekCfg }, ekD1, ekCons, 0, 0, ekOut, address.self);
+        } }
       }
     }
   }

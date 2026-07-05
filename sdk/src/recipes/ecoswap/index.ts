@@ -695,6 +695,35 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
         20n, // segKind = PancakeStableSwap (uint256-index get_dy ladder; approve + exchange on the exec)
         BigInt(refIdx),
       ];
+    // EKUBO V3 (till-based SINGLETON CL — every pool VIRTUAL inside the ONE Core): qd[0]=the
+    // MEVCaptureRouter (the quote/swap/approve target — the "venue address" that rides msVen to
+    // the exec), qd[1]=isToken1 (1 ⇔ tokenIn == the key's token1 — an oracle/diagnostic stamp; the
+    // solver DERIVES the bit on-chain from qTokIn vs qd[7], leg-edge-correct for free), qd[6]/
+    // qd[7]/qd[8]=the FULL virtual-pool key (token0, token1, config bytes32 as uint), qd[9]=the
+    // poolId (diagnostics — also the claim key `ekubo|<poolId>` in prepare). The QL ladder quotes
+    // router.quote(key, isToken1, +min(xNext, INT128MAX), 0, 0) — a PLAIN CALL (the lock TSTOREs ⇒
+    // staticcall-illegal; the recipe ABI marks quote nonpayable), PROBE-THEN-DECODE
+    // (PoolNotInitialized ⇒ the venue self-drops; an OVERSIZE ask partial-fills gracefully and the
+    // differenced ladder flatlines) — decoding |the negative out int128 LANE| of the packed
+    // PoolBalanceUpdate. EXEC is callback-free (the E0-pinned Option A): in-tx re-quote → approve
+    // ROUTER for the quoted CONSUMED input → the full-fill swap(key, isToken1, +consumed, 0, 0,
+    // threshold = the quoted out, self) — the router pulls exactly consumed via transferFrom
+    // (pull == approve ⇒ residue 0); an over-award's unconsumed remainder rides the terminal
+    // refund. The direct exec reads the key from the per-refIdx stash the ladder pass writes
+    // (ekt0/ekt1/ekcfg) — three words cannot ride the one msAux column.
+    case "ekubo":
+      return [
+        BigInt(v.desc.router),
+        v.desc.isToken1 ? 1n : 0n, // isToken1 (diagnostic stamp; the solver derives live)
+        0n, // j unused
+        BigInt(v.desc.feePpm),
+        21n, // segKind = Ekubo V3 (plain-CALL router.quote ladder; approve ROUTER + full-fill swap on the exec)
+        BigInt(refIdx),
+        BigInt(v.desc.token0), // qd[6] = PoolKey token0
+        BigInt(v.desc.token1), // qd[7] = PoolKey token1
+        BigInt(v.desc.config), // qd[8] = PoolKey config (bytes32 as uint)
+        BigInt(v.desc.poolId), // qd[9] = poolId (diagnostics; the prepare-side claim key)
+      ];
   }
 }
 
@@ -713,9 +742,17 @@ function qlRowFor(v: EcoLegQlVenue, refIdx: number): bigint[] {
  * scalars, re-purposed per family: Curve int128 / CryptoSwap uint256 coin indices; LB packs `swapForY`
  * into `i`; Mento packs the exchangeId (bytes32 as uint256) into `i`; Balancer V3 packs inIdx/outIdx
  * into `i`/`j`; UNUSED (0) for Solidly/WOOFi, which quote by tokenIn/tokenOut. `feePpm` is informational
- * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Twenty QL families ship today,
- * each with a distinct `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx` counters
- * are INDEPENDENT (0-based into each family's list). The newest:
+ * (every QL quote is post-fee, so the on-chain head needs no fee-adjust). Twenty-one QL families ship
+ * today, each with a distinct `segKind` + a SEPARATE on-chain per-venue accumulator, so their `refIdx`
+ * counters are INDEPENDENT (0-based into each family's list). The newest:
+ *   segKind 21 = EKUBO V3       → plain-CALL router.quote(key, isToken1, +xNext, 0, 0) ladder
+ *                                   (probe-then-decode: PoolNotInitialized ⇒ self-drop; oversize ⇒
+ *                                   a graceful PARTIAL fill that flatlines the differencing) +
+ *                                   in-tx re-quote + approve ROUTER for the quoted CONSUMED input +
+ *                                   the full-fill swap(key, isToken1, +consumed, 0, 0, quoted out,
+ *                                   self) (refIdx → the on-chain `ekinp[refIdx]`/`ekven[refIdx]` +
+ *                                   the ladder-pass `ekt0/ekt1/ekcfg[refIdx]` key stash — the
+ *                                   3-word virtual-pool key cannot ride the one msAux column).
  *   segKind 20 = PANCAKE STABLESWAP → callback-free get_dy(uint256,uint256,uint256) ladder
  *                                   (probe-then-decode: an empty/killed pool REVERTS; zero/oversize
  *                                   quote gracefully) + coins(0) orient + approve POOL +
@@ -773,7 +810,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   // sorted stream + the directQlvCount prefix): curves, cryptoSwaps, solidlyStables, wooFiPools,
   // lbs, mentoPools, dodos, wombats, fermiPools, eulerSwaps, balancerV3Pools, balancerStables,
   // maverickPools, fluidPools, tesseraPools, elfomoPools, metricPools, liquidCorePools, sizePools,
-  // pancakeStablePools — the historical order the per-family map
+  // pancakeStablePools, ekuboPools — the historical order the per-family map
   // bodies (now qlRowFor) emitted, with Fluid appended when it migrated from the static-segment
   // stream and Tessera/Elfomo appended when they landed (new families ALWAYS append at the tail).
   const rows: bigint[][] = [];
@@ -797,6 +834,7 @@ function buildQLVenues(prepared: EcoSwapPrepared): bigint[][] {
   (prepared.liquidCorePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "liquidcore", desc }, i)));
   (prepared.sizePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "size", desc }, i)));
   (prepared.pancakeStablePools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "pancakeStable", desc }, i)));
+  (prepared.ekuboPools ?? []).forEach((desc, i) => rows.push(qlRowFor({ family: "ekubo", desc }, i)));
   // PAD every row to the UNIFORM 12-column width (0-fill) so the qlv tuple is uniform-width and
   // the solver's qd[6..9] (+ the leg branch's future qd[10..11]) reads are always in range.
   return rows.map(pad12);
@@ -876,6 +914,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_SIZE = (prepared.sizePools?.length ?? 0) > 0 || hasLegFam("size");
   const HAS_PANCAKE_STABLE =
     (prepared.pancakeStablePools?.length ?? 0) > 0 || hasLegFam("pancakeStable");
+  const HAS_EKUBO = (prepared.ekuboPools?.length ?? 0) > 0 || hasLegFam("ekubo");
   const HAS_MENTO = (prepared.mentoPools?.length ?? 0) > 0 || hasLegFam("mento");
   const HAS_BALANCER_V3 = (prepared.balancerV3Pools?.length ?? 0) > 0 || hasLegFam("balancerV3");
   // HAS_LEG_QLV gates ALL leg-QL solver branches (this lane ships only the cfg[12] read behind
@@ -906,6 +945,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_LIQUIDCORE,
     HAS_SIZE,
     HAS_PANCAKE_STABLE,
+    HAS_EKUBO,
     HAS_MENTO,
     HAS_BALANCER_V3,
     HAS_LEG_QLV,

@@ -86,6 +86,7 @@ import { buildElfomoQLLadder, type ElfomoPool } from "../shared/elfomo-math.js";
 import { buildMetricQLLadder, type MetricPool } from "../shared/metric-math.js";
 import { buildLiquidCoreQLLadder, type LiquidCorePool } from "../shared/liquidcore-math.js";
 import { buildPancakeStableQLLadder, type PancakeStablePool } from "../shared/pancakestable-math.js";
+import { buildEkuboQLLadder, type EkuboPool } from "../shared/ekubo-math.js";
 import { buildSizeQLLadder, type SizePool } from "../shared/size-math.js";
 import { buildMentoQLLadder, type MentoPool } from "../shared/mento-math.js";
 import { buildBalancerV3QLLadder, type BalancerV3Pool } from "../shared/balancer-v3-math.js";
@@ -313,6 +314,21 @@ export interface OptimalPool {
    */
   pancakeStable?: PancakeStablePool;
   /**
+   * EKUBO V3 (till-based flash-accounting singleton CL — virtual pools inside ONE Core) venue —
+   * when present this pool is a QUOTE-LADDER (QL) EKUBO venue (NOT any of the above). The oracle
+   * builds its segments via the SHARED buildEkuboQLLadder — the IDENTICAL geometric quote ladder
+   * the on-chain solver builds in setup from the LIVE periphery
+   * `MEVCaptureRouter.quote(key, isToken1, +xNext, 0, 0)` (a PLAIN CALL, PROBE-THEN-DECODE; a
+   * PoolNotInitialized/dead revert / a zero out / a flatlined oversize PARTIAL-FILL quote
+   * truncates both ladders in lockstep) — driven by the descriptor's `getDy` quote model (a
+   * bit-exact fixture replay locally; a prefetched real-router quote grid at the deterministic
+   * ekuboQLGridInputs in the prod-mirror — Ekubo's bespoke micro-tick math is deliberately NOT
+   * ported), so the split is wei-exact vs the solver by construction. marginalOI is the post-fee
+   * execution price; adjNear == adjFar == marginalOI. All the other venue fields are ignored when
+   * `ekubo` is set.
+   */
+  ekubo?: EkuboPool;
+  /**
    * INTEGRAL SIZE (TwapRelayer) venue — when present this pool is a QUOTE-LADDER (QL) SIZE venue
    * (NOT any of the above). The oracle builds its segments via the SHARED buildSizeQLLadder — the
    * IDENTICAL WINDOW-FLOORED geometric ladder the on-chain solver builds in setup (the venue
@@ -411,7 +427,8 @@ export type OptimalLegQlVenue =
   | { family: "metric"; model: MetricPool }
   | { family: "liquidcore"; model: LiquidCorePool }
   | { family: "size"; model: SizePool }
-  | { family: "pancakeStable"; model: PancakeStablePool };
+  | { family: "pancakeStable"; model: PancakeStablePool }
+  | { family: "ekubo"; model: EkuboPool };
 
 /**
  * Build one leg QL venue's slice ladder via the family's SHARED builder, sized by the leg's
@@ -443,6 +460,7 @@ export function buildLegQlVenueLadder(v: OptimalLegQlVenue, cap: bigint): QlSlic
     case "liquidcore": return buildLiquidCoreQLLadder(v.model, cap);
     case "size": return buildSizeQLLadder(v.model, cap);
     case "pancakeStable": return buildPancakeStableQLLadder(v.model, cap);
+    case "ekubo": return buildEkuboQLLadder(v.model, cap);
   }
 }
 
@@ -968,6 +986,24 @@ function pancakeStableSegments(p: OptimalPool, poolIdx: number, amountIn: bigint
 }
 
 /**
+ * Enumerate one EKUBO V3 (till-based singleton CL) venue's segments via the QUOTE-LADDER live walk
+ * (buildEkuboQLLadder) — the SAME geometric-slice ladder the on-chain solver builds in setup from
+ * the LIVE periphery `MEVCaptureRouter.quote(key, isToken1, +xNext, 0, 0)` (a PLAIN CALL,
+ * PROBE-THEN-DECODE — a PoolNotInitialized/dead revert / a zero out / a flatlined oversize
+ * PARTIAL-FILL quote truncates both ladders in lockstep). Driven by the descriptor's `getDy` quote
+ * model (a bit-exact fixture replay locally; the prefetched real-router grid in the prod-mirror —
+ * the bespoke micro-tick math is deliberately NOT ported), so the oracle == solver wei-exact BY
+ * CONSTRUCTION. marginalOI is the post-fee execution price. Awarded as a "pool" venue.
+ */
+function ekuboSegments(p: OptimalPool, poolIdx: number, amountIn: bigint): Segment[] {
+  const segs: Segment[] = [];
+  for (const s of buildEkuboQLLadder(p.ekubo!, amountIn)) {
+    segs.push({ venue: "pool", idx: poolIdx, adjNear: s.marginalOI, adjFar: s.marginalOI, gross: s.capacity });
+  }
+  return segs;
+}
+
+/**
  * Enumerate one INTEGRAL SIZE (TwapRelayer) venue's segments via the WINDOW-FLOORED QUOTE-LADDER
  * live walk (buildSizeQLLadder) — the SAME seed-floored geometric ladder the on-chain solver builds
  * in setup (the prelude hoists minIn and raises the seed; the model's `liveMinIn` carries the same
@@ -1348,6 +1384,8 @@ export function optimalSplit(input: OptimalInput): OptimalResult {
       allSegs.push(...liquidCoreSegments(p, i, amountIn));
     } else if (p.pancakeStable) {
       allSegs.push(...pancakeStableSegments(p, i, amountIn));
+    } else if (p.ekubo) {
+      allSegs.push(...ekuboSegments(p, i, amountIn));
     } else if (p.size) {
       allSegs.push(...sizeSegments(p, i, amountIn));
     } else if (p.fermi) {

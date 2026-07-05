@@ -351,6 +351,35 @@ export enum FactoryType {
    * lisUSD/USDT live depth) + the A_PRECISION=1 legacy replay.
    */
   PancakeStableSwap = "pancake-stable",
+  /**
+   * EKUBO V3 (EkuboProtocol/evm-contracts v3.1.1 — a till-based flash-accounting SINGLETON CL AMM:
+   * ONE Core holds every pool as a storage-keyed VIRTUAL pool; micro-ticks base 1.000001, uint96
+   * compact-float sqrt ratios; requires EIP-7939 CLZ — live on ETH mainnet). Discovery is the
+   * V4-PRESET-CLONE, pure RPC: the config's `address` is the Core singleton
+   * (0x00000000000014aA86C5d3c41765bb24e11bd701) and `discoverEkuboPoolsTyped` derives candidate
+   * poolIds = keccak256(pad32(token0) ‖ pad32(token1) ‖ config) from the FROZEN (fee, tickSpacing)
+   * preset menu (`ekuboPresets`, default EKUBO_DEFAULT_PRESETS — every entry attested by a live ETH
+   * pool; fee word = round(pct × 2^64), live-confirmed per tier), then liveness-probes ALL
+   * candidates in ONE raw `Core.sload` batch call (selector 0x380eb4e0 ++ N raw 32-byte keys — NOT
+   * ABI-encoded; the poolState slot IS the poolId; sqrtRatio != 0 ⇔ initialized) + ONE
+   * `Router.quote` eth_call per survivor at the first QL slice size. Extension pools are excluded
+   * BY CONSTRUCTION (the menu packs extension 0 — MEVCapture pools add a same-block dynamic
+   * anti-MEV fee); native-ETH pools (token0 == address(0)) are Phase-2 (ERC20 custody only). A
+   * QUOTE-LADDER family (segKind 21): prepare ships only the descriptor (router + token0/token1/
+   * config/poolId); the on-chain solver builds the ladder LIVE from
+   * `MEVCaptureRouter.quote(key, isToken1, +xNext, 0, 0)` — a PLAIN CALL (the lock TSTOREs ⇒
+   * staticcall-illegal; state-neutral on completion), PROBE-THEN-DECODE (PoolNotInitialized
+   * 0x486aa307 ⇒ self-drop; oversize ⇒ a graceful PARTIAL fill that flatlines the ladder) — and
+   * executes CALLBACK-FREE via the E0-pinned Option-A full-fill
+   * `swap(key, isToken1, +consumed, 0, 0, threshold = quoted out, self)`: the exec re-quotes the
+   * award in-tx, swaps exactly the quoted CONSUMED input (partial-fill-safe), and the router pulls
+   * EXACTLY that via transferFrom(swapper → Core) — pull == approve, residue 0, fork-EXECUTED
+   * wei-exact vs the same-state quote. CLAIMS are by POOLID (`ekubo|<poolId>` — the pools are
+   * virtual inside ONE Core behind ONE router, so the address key would collide; see
+   * qlVenueClaimKey). See ekubo-math.ts for the full E0 freeze record (selectors, revert classes,
+   * the preset probe transcript).
+   */
+  Ekubo = "ekubo",
 }
 
 /**
@@ -542,6 +571,24 @@ export interface FactoryConfig {
    * descriptor carries it per venue (qlv qd[7]). Required when `metricPools` is non-empty.
    */
   metricRouter?: Hex;
+  /**
+   * EKUBO (Ekubo factory type) only: the periphery MEVCaptureRouter — the quote/swap/approve target
+   * (its extension==0 path is the base Router `CORE.swap`, source-verified identical; it also
+   * transparently `forward`s MEVCapture-extension pools, which this recipe does not enumerate).
+   * The descriptor carries it per venue (qlv qd[0]). PER-CONFIG (the create3 deployment reuses one
+   * address across chains, but each chain's entry pins its own). Required when the entry's
+   * factoryType is Ekubo.
+   */
+  ekuboRouter?: Hex;
+  /**
+   * EKUBO (Ekubo factory type) only: the FROZEN (fee u64, tickSpacing) preset menu the V4-clone
+   * discovery derives candidate pool configs from (extension 0, concentrated bit set — see
+   * ekubo-math.ts ekuboConcentratedConfig). Defaults to EKUBO_DEFAULT_PRESETS (every entry attested
+   * by a live initialized ETH pool, 2026-07-04 batch probe). Over-probing a dead combo is harmless
+   * (its poolState word reads 0 in the ONE batched sload); set this to extend/trim the menu per
+   * chain without code.
+   */
+  ekuboPresets?: { fee: bigint; tickSpacing: number }[];
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */
@@ -892,6 +939,25 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // stale, so the pair cannot produce a quote at read time. `discoverFermiPoolsTyped` keeps only
       // strictly-positive sampled quotes, so every sample maps to 0 → the pool is dropped. No verifiable
       // quotable stable pair, so no Fermi FactoryConfig entry is wired (re-light when the feed is live).
+      // EKUBO V3 (v3.1.1 singleton CL; QL segKind 21 — see FactoryType.Ekubo + ekubo-math.ts for the
+      // full E0 freeze record). `address` = the Core singleton (all pools VIRTUAL inside it; the
+      // poolState slot IS the poolId), `ekuboRouter` = the MEVCaptureRouter (quote 0x3bc52842 +
+      // 7-arg swap 0xf196187f, both selector-checked in the DEPLOYED runtime). Preset-clone
+      // discovery over EKUBO_DEFAULT_PRESETS — every menu entry attested by a live ETH pool in the
+      // 2026-07-04 batch probe (ONE raw Core.sload over the candidate grid): USDe/USDC 0.003%/100
+      // (id 0xc86d5ef1…, L≈3.55e21 — the venue's top pool, ~$0.9M/side, $4.19M/24h), USDe/sUSDe
+      // 0.01%/100 (0xe5be1568…), USDe/USDT 0.003%/100 (0xdc4333ea…), ETH/USDC 0.05%+0.3%+0.5%/4988,
+      // ETH/USDT 0.05%/4988, ETH/WBTC 0.1%/1000, USDC/USDT 0.5%/100 (initialized but a zero-L husk
+      // at the review re-probe — harmless, drops at the quote probe) + 0.0005%/50 (id
+      // 0x6fde3244…895d — the LIVE top USDT/USDC tier, ~$5.6M/24h; added on review),
+      // EKUBO/USDC 1%/19802. Live
+      // quote re-probed (+1000e18 USDe → −998.69e6 USDC) and the swap fork-EXECUTED wei-exact vs
+      // the same-state quote (residue 0). Native-ETH pools (token0 == 0 — the ETH/* rows above)
+      // are Phase-2: discovery keys on the ERC20 recipe tokens, so they cannot surface yet.
+      // 30d ETH volume $619.3M (DefiLlama). poolType UniV2 is INERT (discovery keys off
+      // factoryType; Ekubo executes callback-free through its own router, never a V2 swap).
+      { address: "0x00000000000014aA86C5d3c41765bb24e11bd701" as Hex, poolType: SwapPoolType.UniV2, factoryType: FactoryType.Ekubo, label: "Ekubo V3",
+        ekuboRouter: "0xd26f20001a72a18C002b00e6710000d68700ce00" as Hex },
     ],
     baseTokens: [
       "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as Hex, // WETH

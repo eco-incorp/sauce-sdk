@@ -63,6 +63,7 @@ import {
   discoverLiquidCorePoolsTyped,
   discoverSizePoolsTyped,
   discoverPancakeStablePoolsTyped,
+  discoverEkuboPoolsTyped,
   discoverMentoPoolsTyped,
   discoverBalancerV3PoolsTyped,
 } from "../shared/pool-discovery.js";
@@ -115,6 +116,7 @@ import {
   type EcoLiquidCore,
   type EcoSize,
   type EcoPancakeStable,
+  type EcoEkubo,
   type EcoMento,
   type EcoBalancerV3,
   type EcoLegQlVenue,
@@ -808,10 +810,10 @@ interface EdgeQlVenue {
 }
 
 /**
- * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 20 leg-capable families
+ * Discover every QUOTE-LADDER (QL) venue serving ONE token pair — the 21 leg-capable families
  * (Curve StableSwap, Curve CryptoSwap, Solidly STABLE, WOOFi, Trader Joe LB, Mento V2, DODO V2,
  * Wombat, Fermi, EulerSwap, Balancer V3, Balancer V2 ComposableStable, Maverick V2, Fluid DEX,
- * Tessera V, ElfomoFi, METRIC, LiquidCore, Integral SIZE, PancakeStableSwap),
+ * Tessera V, ElfomoFi, METRIC, LiquidCore, Integral SIZE, PancakeStableSwap, Ekubo V3),
  * run in the canonical family-concatenation order (the same order index.ts buildQLVenues emits
  * rows in). This is the SINGLE discovery path for QL venues: the DIRECT (tokenIn, tokenOut) pair
  * calls it with `probeAmount = amountIn`, and every route-leg EDGE calls it with the edge pair +
@@ -1372,6 +1374,40 @@ async function discoverQlVenuesForPair(
     }
   }
 
+  // EKUBO V3 (till-based flash-accounting SINGLETON CL — every pool VIRTUAL inside ONE Core,
+  // keyed by (token0, token1, config); V4-preset-clone discovery: frozen (fee, tickSpacing) menu →
+  // poolIds → ONE raw Core.sload liveness batch → ONE Router.quote head probe per survivor) — the
+  // on-chain solver builds the ladder LIVE from the periphery MEVCaptureRouter.quote (a PLAIN CALL,
+  // probe-then-decode: PoolNotInitialized/dead ⇒ self-drop; oversize ⇒ graceful partial fill) and
+  // executes CALLBACK-FREE (in-tx re-quote → approve ROUTER for the quoted CONSUMED input → the
+  // full-fill swap(key, isToken1, +consumed, 0, 0, quoted out, self); pull == approve ⇒ residue 0).
+  // The descriptor carries the FULL virtual-pool key, so the claim key is the POOLID
+  // (`ekubo|<poolId>` — see qlVenueClaimKey; the router/Core addresses are shared venue-wide).
+  const ekuboConfigs = poolConfig.factories.filter((f) => f.factoryType === FactoryType.Ekubo);
+  if (ekuboConfigs.length > 0) {
+    const ekRaw = await discoverEkuboPoolsTyped(pairIn, pairOut, client, ekuboConfigs, probeAmount);
+    for (const ev of ekRaw) {
+      out.push({
+        venue: {
+          family: "ekubo",
+          desc: {
+            router: ev.router,
+            token0: ev.token0,
+            token1: ev.token1,
+            config: ev.config,
+            isToken1: ev.isToken1,
+            poolId: ev.poolId,
+            tokenIn: ev.tokenIn,
+            tokenOut: ev.tokenOut,
+            feePpm: ev.feePpm,
+            source: ev.source,
+          },
+        },
+        headOI: ev.headOI,
+      });
+    }
+  }
+
   return out;
 }
 
@@ -1391,15 +1427,26 @@ async function discoverQlVenuesForPair(
  * of ONE treasury/vault, so the wrapper-address claim admits that inventory exactly once — the
  * multi-coin rule applied verbatim, correct and automatic. METRIC is the OPPOSITE shape — per-PAIR
  * pool contracts each holding their OWN inventory — so its default pool-address claim admits two
- * same-pair Metric pools as two independent venues, which is exactly right.)
+ * same-pair Metric pools as two independent venues, which is exactly right. EKUBO pools are
+ * VIRTUAL — every pool lives inside the ONE Core singleton behind the ONE router, so the ADDRESS
+ * key would collapse every Ekubo venue into one claim (and squat the router address globally);
+ * the pool's identity is its POOLID, so Ekubo claims `ekubo|<poolId>` — each virtual pool's
+ * inventory admitted exactly once while same-pair fee tiers stay independent venues.)
  */
 function mentoClaimKey(exchangeProvider: string, exchangeId: string): string {
   return `${exchangeProvider.toLowerCase()}|${exchangeId.toLowerCase()}`;
 }
 
+function ekuboClaimKey(poolId: string): string {
+  return `ekubo|${poolId.toLowerCase()}`;
+}
+
 function qlVenueClaimKey(v: EcoLegQlVenue): string {
   if (v.family === "mento") {
     return mentoClaimKey(v.desc.exchangeProvider, v.desc.exchangeId);
+  }
+  if (v.family === "ekubo") {
+    return ekuboClaimKey(v.desc.poolId);
   }
   return v.desc.address.toLowerCase();
 }
@@ -1639,7 +1686,7 @@ export async function prepareEcoSwap(
     }
   }
 
-  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 20 leg-capable families) ──
+  // ── QUOTE-LADDER (QL) venue discovery for the DIRECT pair (the 21 leg-capable families) ──
   // Runs the SHARED per-pair discovery (discoverQlVenuesForPair — the exact path every route-leg
   // EDGE runs below), then splits the tagged descriptors back into the per-family prepared lists
   // (family order preserved: the shared function emits families in the canonical buildQLVenues
@@ -1697,6 +1744,10 @@ export async function prepareEcoSwap(
   // LIVE on-chain from get_dy at cook (probe-then-decode — the CryptoSwap class with a
   // getPairInfo-keyed discovery).
   const pancakeStablePools = qlFamilyDescs<EcoPancakeStable>("pancakeStable");
+  // EKUBO V3 (segKind 21): descriptor-only (router + the full virtual-pool key + poolId), laddered
+  // LIVE on-chain from the periphery router's quote at cook (a PLAIN CALL, probe-then-decode —
+  // the singleton-CL preset-clone discovery with poolId claims).
+  const ekuboPools = qlFamilyDescs<EcoEkubo>("ekubo");
 
   // ── Discover multi-hop ROUTES — N-hop, every survivor pool per leg, walked LIVE ──
   // A k-hop route A→T1→…→B is k legs; each leg is a SET of pools the leg splits across (NOT one
@@ -1986,7 +2037,7 @@ export async function prepareEcoSwap(
   // — the per-route produce-then-consume order in ecoswap.sauce.ts is the load-bearing guarantee.
   const claimed = new Set<string>();
   for (const p of pools) claimed.add(p.address.toLowerCase());
-  // Direct QL venue identities (rule 1) — all 20 QL families, Fluid included (a DexT1 pool's
+  // Direct QL venue identities (rule 1) — all 21 QL families, Fluid included (a DexT1 pool's
   // Liquidity-layer inventory is one shared depth like any other venue's).
   for (const c of curves) claimed.add(c.address.toLowerCase());
   for (const cp of cryptoSwaps) claimed.add(cp.address.toLowerCase());
@@ -2022,6 +2073,11 @@ export async function prepareEcoSwap(
   // default; every registered pool is N_COINS=2, so the multi-coin both-legs case cannot arise,
   // but the shared claim set still excludes a direct instance from any route leg and vice versa).
   for (const pp of pancakeStablePools) claimed.add(pp.address.toLowerCase());
+  // Ekubo claims by POOLID (`ekubo|<poolId>` — the pools are VIRTUAL inside the ONE Core behind
+  // the ONE router, so the address key would collapse every Ekubo venue into one claim; the poolId
+  // admits each virtual pool's inventory exactly once — direct XOR one route leg — while same-pair
+  // fee tiers compete as independent venues).
+  for (const ev of ekuboPools) claimed.add(ekuboClaimKey(ev.poolId));
   const orderedRoutes = routes
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.legs.length - b.r.legs.length || a.i - b.i)
@@ -2108,6 +2164,7 @@ export async function prepareEcoSwap(
     liquidCorePools.length === 0 &&
     sizePools.length === 0 &&
     pancakeStablePools.length === 0 &&
+    ekuboPools.length === 0 &&
     mentoPools.length === 0 &&
     balancerV3Pools.length === 0
   ) {
@@ -2138,7 +2195,7 @@ export async function prepareEcoSwap(
       `${balancerV3Pools.length} Balancer-V3 QL, ${fluidPools.length} Fluid QL, ` +
       `${tesseraPools.length} Tessera QL, ${elfomoPools.length} Elfomo QL, ${metricPools.length} Metric QL, ` +
       `${liquidCorePools.length} LiquidCore QL, ${sizePools.length} SIZE QL, ` +
-      `${pancakeStablePools.length} PancakeStable QL`,
+      `${pancakeStablePools.length} PancakeStable QL, ${ekuboPools.length} Ekubo QL`,
   );
 
   const prepared: EcoSwapPrepared = {
@@ -2166,6 +2223,7 @@ export async function prepareEcoSwap(
     liquidCorePools,
     sizePools,
     pancakeStablePools,
+    ekuboPools,
     mentoPools,
     balancerV3Pools,
     brackets,
