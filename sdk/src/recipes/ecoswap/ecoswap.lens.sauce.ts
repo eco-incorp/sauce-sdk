@@ -6,6 +6,7 @@ import { IStateViewFull } from "./IStateViewFull.json";
 import { IAlgebraFactory } from "./IAlgebraFactory.json";
 import { IAlgebraPool } from "./IAlgebraPool.json";
 import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
+import { ICLPoolManager } from "./ICLPoolManager.json";
 
 // EcoSwap on-chain PREPARE LENS (v2, LAZY / dynamic tick reading).
 //
@@ -130,9 +131,27 @@ import { ISlipstreamCLFactory } from "./ISlipstreamCLFactory.json";
 //                                            (3000 for canonical UniswapV2); the engine
 //                                            _swapV2 hardcodes 0.30%, so a non-3000 pool
 //                                            executes via the callback-free Sauce path.
-//   v4Factories[i] = [poolManager, stateView]
-//   v4Specs[j]     = [fee, tickSpacing, stepRatio]
-//   v4PoolIds[i*J+j] = [poolId]
+//   v4Factories[i] = [poolManager, stateView, isInfinity]
+//                    isInfinity=1 ⇒ a PancakeSwap Infinity CL row (the V4-class singleton
+//                    sibling): `poolManager` AND `stateView` are BOTH the CLPoolManager (the
+//                    manager exposes the concrete getters itself — getSlot0/getLiquidity share
+//                    the V4-StateView selectors, so PASS 1 needs no branch at all). The walk
+//                    passes branch on it in exactly TWO places: (a) the boundary net read is
+//                    ICLPoolManager.getPoolTickInfo(id, tick)[1] (net at word [1] — the SAME
+//                    position as getTickLiquidity[1]/ticks()[1]); (b) the fee is combined LIVE
+//                    per direction from slot0 words [2]/[3] (infFeeCombine — protocolFee is
+//                    NONZERO on every probed pool), replacing the spec fee for
+//                    capacity/floor/survivorship AND for the emitted row's fee word (the
+//                    PRICING fee; prepare recovers the KEY fee from its own candidate map by
+//                    poolId). The emitted row's poolType is 9 (PancakeInfinityCL). NOTE: the
+//                    per-boundary getPoolBitmapInfo word-skip optimization is deliberately NOT
+//                    taken — the walk mirrors the V4 arm boundary-for-boundary so the
+//                    effTicks/price-band survivorship semantics stay family-uniform.
+//   v4Specs[j]     = [fee, tickSpacing, stepRatio]  (shared column: V4 fee tiers + Infinity
+//                    presets — a spec that does not apply to a factory has poolId 0 in
+//                    v4PoolIds, and getSlot0(0) reads sqrtPrice 0 ⇒ dead, skipped by the
+//                    aliveness gate in every pass with NO explicit guard)
+//   v4PoolIds[i*J+j] = [poolId]  (0 for non-applicable (factory, spec) combos)
 //
 // ── Return shape (off-chain abi.decode against this EXACTLY) ──────────────────
 //   abi.encode(poolBlob: bytes, tickBlob: bytes)
@@ -231,6 +250,21 @@ function tickShiftedBase(tickRaw: Uint256, OFFSET: Uint256, ts: Uint256): Uint25
 function feeAdj(sqrtV: Uint256, fee: Uint256): Uint256 {
   const sf: Uint256 = Math.sqrt((1000000 - fee) * 1000000);
   return Math.mulDiv(sqrtV, sf, 1000000);
+}
+
+// PancakeSwap Infinity CL LIVE combined swap fee (ppm) — the exact
+// ProtocolFeeLibrary.calculateSwapFee: prot + lp − floor(prot·lp/1e6), where prot is the
+// DIRECTION slice of the 12+12-packed protocolFee (slot0 word [2]; zeroForOne = low 12 bits,
+// oneForZero = the next 12) and lp is slot0 word [3] (the static lpFee — Tier A admits only
+// static-fee pools, so lp == the key fee). Nonzero protocolFee on EVERY probed pool ⇒ the
+// combine is load-bearing for pricing/survivorship, not decorative. Mirrored off-chain by
+// shared/infinity-math.ts combineInfinityFee (the oracle/prepare input).
+function infFeeCombine(pf: Uint256, lp: Uint256, zeroForOne: Uint256): Uint256 {
+  let prot: Uint256 = pf & 4095;
+  if (zeroForOne === 0) {
+    prot = (pf >> 12) & 4095;
+  }
+  return prot + lp - (prot * lp) / 1000000;
 }
 
 // Convert a real pool sqrt (token1/token0) into unified out/in sqrt.
@@ -714,13 +748,14 @@ function main(
     }
   }
 
-  // — V4 solo walks (StateView) —
+  // — V4 + Infinity CL solo walks (StateView / CLPoolManager) —
   for (let qa = 0; qa < v4Factories.length; qa = qa + 1) {
     const vfa4: Tuple = v4Factories[qa];
     const stateViewA: Address = vfa4[1];
+    const isInfA: Uint256 = vfa4[2]; // 1 ⇒ Infinity CL (getPoolTickInfo net + live fee combine)
     for (let sa = 0; sa < v4Specs.length; sa = sa + 1) {
       const specA: Tuple = v4Specs[sa];
-      const feeA4: Uint256 = specA[0];
+      let feeA4: Uint256 = specA[0];
       const tsA4: Uint256 = specA[1];
       const stepA4: Uint256 = specA[2];
       const idRowA: Tuple = v4PoolIds[qa * v4Specs.length + sa];
@@ -730,6 +765,15 @@ function main(
         const liqA4: Uint256 = IStateViewFull.at(stateViewA).getLiquidity(poolIdA);
         if (liqA4 > 0) {
           const tickA4: Uint256 = IStateViewFull.at(stateViewA).getSlot0(poolIdA)[1];
+          // Infinity CL: the LIVE combined per-direction swap fee replaces the spec (key) fee
+          // for the solo-floor walk (the SAME value the solver combines at cook).
+          if (isInfA === 1) {
+            feeA4 = infFeeCombine(
+              IStateViewFull.at(stateViewA).getSlot0(poolIdA)[2],
+              IStateViewFull.at(stateViewA).getSlot0(poolIdA)[3],
+              zeroForOne
+            );
+          }
           const baseA4: Uint256 = tickShiftedBase(tickA4, OFFSET, tsA4);
           let curA4: Uint256 = baseA4;
           if (zeroForOne === 0) {
@@ -755,7 +799,14 @@ function main(
                 }
               }
               const argA4: Uint256 = tickArg(curA4, OFFSET);
-              const netA4: Uint256 = IStateViewFull.at(stateViewA).getTickLiquidity(poolIdA, argA4)[1];
+              // Boundary net: Infinity reads getPoolTickInfo (net at word [1] — the same
+              // position as getTickLiquidity[1]); V4 keeps the StateView read.
+              let netA4: Uint256 = 0;
+              if (isInfA === 1) {
+                netA4 = ICLPoolManager.at(stateViewA).getPoolTickInfo(poolIdA, argA4)[1];
+              } else {
+                netA4 = IStateViewFull.at(stateViewA).getTickLiquidity(poolIdA, argA4)[1];
+              }
               const isNegA4: Uint256 = netA4 >= HALF128 ? 1 : 0;
               if (zeroForOne === 1) {
                 if (isNegA4 === 1) {
@@ -1013,9 +1064,10 @@ function main(
     const vfm4: Tuple = v4Factories[qm];
     const poolMgrM: Address = vfm4[0];
     const stateViewM: Address = vfm4[1];
+    const isInfM: Uint256 = vfm4[2]; // 1 ⇒ Infinity CL (getPoolTickInfo net + live fee combine)
     for (let sm = 0; sm < v4Specs.length; sm = sm + 1) {
       const specM: Tuple = v4Specs[sm];
-      const v4feeM: Uint256 = specM[0];
+      let v4feeM: Uint256 = specM[0];
       const v4tsM: Uint256 = specM[1];
       const v4stepM: Uint256 = specM[2];
       const idRowM: Tuple = v4PoolIds[qm * v4Specs.length + sm];
@@ -1025,8 +1077,18 @@ function main(
         const liqM4: Uint256 = IStateViewFull.at(stateViewM).getLiquidity(poolIdM);
         if (liqM4 > 0) {
           const tickM4: Uint256 = IStateViewFull.at(stateViewM).getSlot0(poolIdM)[1];
-          // IN-RANGE capacity walk (V4 via StateView.getTickLiquidity) — same body
-          // as the V3 measure walk above; inlined (no helper→helper calls).
+          // Infinity CL: live per-direction combined fee for the capacity/floor math (the
+          // survivorship metric prices with the fee the solver will actually combine).
+          if (isInfM === 1) {
+            v4feeM = infFeeCombine(
+              IStateViewFull.at(stateViewM).getSlot0(poolIdM)[2],
+              IStateViewFull.at(stateViewM).getSlot0(poolIdM)[3],
+              zeroForOne
+            );
+          }
+          // IN-RANGE capacity walk (V4 via StateView.getTickLiquidity; Infinity via
+          // CLPoolManager.getPoolTickInfo) — same body as the V3 measure walk above;
+          // inlined (no helper→helper calls).
           const baseShiftM4: Uint256 = tickShiftedBase(tickM4, OFFSET, v4tsM);
           let curShiftM4: Uint256 = baseShiftM4;
           if (zeroForOne === 0) {
@@ -1052,7 +1114,12 @@ function main(
                 }
               }
               const argWM4: Uint256 = tickArg(curShiftM4, OFFSET);
-              const netM4: Uint256 = IStateViewFull.at(stateViewM).getTickLiquidity(poolIdM, argWM4)[1];
+              let netM4: Uint256 = 0;
+              if (isInfM === 1) {
+                netM4 = ICLPoolManager.at(stateViewM).getPoolTickInfo(poolIdM, argWM4)[1];
+              } else {
+                netM4 = IStateViewFull.at(stateViewM).getTickLiquidity(poolIdM, argWM4)[1];
+              }
               const isNegM4: Uint256 = netM4 >= HALF128 ? 1 : 0;
               if (zeroForOne === 1) {
                 if (isNegM4 === 1) {
@@ -1409,14 +1476,15 @@ function main(
     }
   }
 
-  // ── V4 survivors (lazy walk via StateView) ──
+  // ── V4 + Infinity CL survivors (lazy walk via StateView / CLPoolManager) ──
   for (let qi3 = 0; qi3 < v4Factories.length; qi3 = qi3 + 1) {
     const vf43: Tuple = v4Factories[qi3];
     const poolManager3: Address = vf43[0];
     const stateView3: Address = vf43[1];
+    const isInf3: Uint256 = vf43[2]; // 1 ⇒ Infinity CL (getPoolTickInfo net + live fee combine)
     for (let si3 = 0; si3 < v4Specs.length; si3 = si3 + 1) {
       const spec3: Tuple = v4Specs[si3];
-      const v4fee3: Uint256 = spec3[0];
+      let v4fee3: Uint256 = spec3[0];
       const v4ts3: Uint256 = spec3[1];
       const v4step3: Uint256 = spec3[2];
       const idRow3: Tuple = v4PoolIds[qi3 * v4Specs.length + si3];
@@ -1440,6 +1508,17 @@ function main(
         }
         if (surv4 === 1) {
           const tick43: Uint256 = IStateViewFull.at(stateView3).getSlot0(poolId3)[1];
+          // Infinity CL: the emitted row's fee word is the LIVE combined per-direction fee
+          // (the PRICING value — the exact number the solver recombines at cook; prepare
+          // recovers the KEY fee from its candidate map by poolId). The walk below prices
+          // with it too, so the emitted window spans the same band survivorship measured.
+          if (isInf3 === 1) {
+            v4fee3 = infFeeCombine(
+              IStateViewFull.at(stateView3).getSlot0(poolId3)[2],
+              IStateViewFull.at(stateView3).getSlot0(poolId3)[3],
+              zeroForOne
+            );
+          }
           const idx43: Uint256 = poolCount;
 
           // Per-pool chunked tick-row accumulation — the V4 mirror of the V3 EMIT
@@ -1456,7 +1535,12 @@ function main(
           let scanRev4: Uint256 = 0; // reverse boundaries walked (= count emitted)
           for (let rd4 = 0; rd4 < driftTicks; rd4 = rd4 + 1) {
             const ra4: Uint256 = tickArg(revShift4, OFFSET);
-            const rn4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, ra4)[1];
+            let rn4: Uint256 = 0;
+            if (isInf3 === 1) {
+              rn4 = ICLPoolManager.at(stateView3).getPoolTickInfo(poolId3, ra4)[1];
+            } else {
+              rn4 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, ra4)[1];
+            }
             rows4 = rows4.concat(abi.encode(idx43, ra4, rn4));
             rcnt4 = rcnt4 + 1;
             if (rcnt4 >= EMIT_CHUNK) {
@@ -1489,7 +1573,12 @@ function main(
           for (let k4 = 0; k4 < maxTicks; k4 = k4 + 1) {
             if (done4 === 0) {
               const argW4: Uint256 = tickArg(curShift4, OFFSET);
-              const net4: Uint256 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, argW4)[1];
+              let net4: Uint256 = 0;
+              if (isInf3 === 1) {
+                net4 = ICLPoolManager.at(stateView3).getPoolTickInfo(poolId3, argW4)[1];
+              } else {
+                net4 = IStateViewFull.at(stateView3).getTickLiquidity(poolId3, argW4)[1];
+              }
               rows4 = rows4.concat(abi.encode(idx43, argW4, net4));
               rcnt4 = rcnt4 + 1;
               if (rcnt4 >= EMIT_CHUNK) {
@@ -1562,8 +1651,14 @@ function main(
           }
           tickBlob = tickBlob.concat(poolTicks4);
 
+          // Row poolType: 2 = UniV4, 9 = PancakeInfinityCL (the SwapPoolType values — prepare
+          // keys its family handling off this word).
+          let pt4: Uint256 = 2;
+          if (isInf3 === 1) {
+            pt4 = 9;
+          }
           poolBlob = poolBlob.concat(
-            abi.encode(2, poolManager3, v4fee3, v4ts3, 0, sqrtP43, liq43, tick43, 0, stateView3, poolId3, scanned4, scanRev4)
+            abi.encode(pt4, poolManager3, v4fee3, v4ts3, 0, sqrtP43, liq43, tick43, 0, stateView3, poolId3, scanned4, scanRev4)
           );
           poolCount = poolCount + 1;
         }

@@ -42,8 +42,14 @@
 import type { PublicClient, Hex } from "viem";
 import { runLens, LENS_MAX_TICKS, LENS_BAND_TICKS, type LensPool, type LensResult } from "./lens.js";
 import {
+  INFINITY_DEFAULT_CL_PRESETS,
+  computeInfinityPoolId,
+  encodeInfinityCLParameters,
+} from "../shared/infinity-math.js";
+import {
   discoverKyberClassicPools,
   discoverAlgebraPoolAddresses,
+  discoverInfinityCLPoolsTyped,
   discoverSolidlyVolatilePoolsTyped,
   discoverCurvePoolsTyped,
   discoverTraderJoeLBPoolsTyped,
@@ -441,12 +447,43 @@ function stampPoolCache(r: V3Read, zeroForOne: boolean, seed: EcoPool): void {
  * leg block executes V2 legs via the engine's hardcoded-0.30% router swap (poolType:0), so the
  * leg geometry must match what executes. V3/V4 (incl. Algebra mapped to V3) always carry p.fee.
  */
+/**
+ * The Tier-A Infinity CL poolId → KEY fee map for one (hopIn, hopOut) pair. The lens emits an
+ * Infinity row's fee word as the LIVE COMBINED per-direction swap fee (the pricing value —
+ * EcoPool.feePpm), while the exec PoolKey needs the KEY fee (the static lpFee that is part of
+ * the pool's identity). prepare built the candidate grid itself, so the key fee is recovered
+ * by pure keccak over the preset menu — no RPC, no poolIdToPoolKey read.
+ */
+function infinityKeyFeeByPoolId(
+  hopIn: Hex,
+  hopOut: Hex,
+  poolConfig: ChainPoolConfig,
+): Map<string, number> {
+  const map = new Map<string, number>();
+  const factories = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.PancakeInfinityCL,
+  );
+  if (factories.length === 0) return map;
+  const [c0, c1] =
+    BigInt(hopIn) < BigInt(hopOut) ? [hopIn, hopOut] : [hopOut, hopIn];
+  for (const f of factories) {
+    for (const p of f.infinityPresets ?? INFINITY_DEFAULT_CL_PRESETS) {
+      const id = computeInfinityPoolId(
+        c0, c1, ZERO_ADDRESS, f.address, p.fee, encodeInfinityCLParameters(p.tickSpacing),
+      );
+      map.set(id.toLowerCase(), p.fee);
+    }
+  }
+  return map;
+}
+
 function lensToEcoPool(
   p: LensPool,
   zHop: boolean,
   sourceLabel: string,
   isDirect: boolean,
   isAlgebra = false,
+  infinityKeyFee?: number,
 ): EcoPool {
   if (p.poolType === SwapPoolType.UniV2) {
     // Constant-product: no tick cache (the solver streams constant-L geometric slices from the
@@ -471,20 +508,25 @@ function lensToEcoPool(
     };
   }
   const isV4 = p.poolType === SwapPoolType.UniV4;
+  // PancakeSwap Infinity CL (pType 9): the V4-class singleton sibling. The lens row's `fee`
+  // word is the LIVE COMBINED per-direction swap fee (→ feePpm, the pricing stamp; the solver
+  // recombines it live at cook), while the exec PoolKey needs the KEY fee — recovered by the
+  // caller from its own preset candidate grid (infinityKeyFeeByPoolId) and passed in.
+  const isInf = p.poolType === SwapPoolType.PancakeInfinityCL;
   const pool: EcoPool = {
     poolType: p.poolType,
-    address: p.address, // V4: PoolManager singleton
-    fee: p.fee,
+    address: p.address, // V4: PoolManager singleton; Infinity: CLPoolManager singleton
+    fee: isInf ? infinityKeyFee ?? p.fee : p.fee,
     tickSpacing: p.tickSpacing,
     hooks: isV4 ? p.hooks ?? ZERO_ADDRESS : ZERO_ADDRESS,
     feePpm: p.fee,
     isV2: false,
     // Algebra dynamic-fee CL forks surface as UniV3 rows (lens); the solver reads globalState() (not
-    // slot0()) for their spot — a real Algebra pool has NO slot0(). V4 is never Algebra.
-    isAlgebra: isAlgebra && !isV4,
-    inIsToken0: zHop, // V3/V4 PoolKey orientation = this hop's token sort order (zHop)
-    stateView: isV4 ? p.stateView : ZERO_ADDRESS,
-    poolId: isV4 ? p.poolId : ZERO_BYTES32,
+    // slot0()) for their spot — a real Algebra pool has NO slot0(). V4/Infinity are never Algebra.
+    isAlgebra: isAlgebra && !isV4 && !isInf,
+    inIsToken0: zHop, // V3/V4/Infinity PoolKey orientation = this hop's token sort order (zHop)
+    stateView: isV4 || isInf ? p.stateView : ZERO_ADDRESS,
+    poolId: isV4 || isInf ? p.poolId : ZERO_BYTES32,
     source: sourceLabel,
   };
   // The net cache is built in THIS hop's swap direction (zHop): the net-row sort, the window
@@ -1596,6 +1638,11 @@ export async function prepareEcoSwap(
 
   const v3Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV3);
   const v4Raw = usableDirect.filter((p) => p.poolType === SwapPoolType.UniV4);
+  // PancakeSwap Infinity CL survivors (the V4-class singleton sibling, pType 9): surfaced by
+  // the lens's Infinity arm (Tier A hookless preset pools) with the LIVE combined fee in the
+  // row's fee word; the KEY fee (exec PoolKey identity) is recovered from prepare's own preset
+  // candidate grid by poolId (pure keccak, no RPC).
+  const infRaw = usableDirect.filter((p) => p.poolType === SwapPoolType.PancakeInfinityCL);
   // Constant-product (Uniswap-V2-style) pools execute via the unified
   // swap(SwapParams) entry (poolType=UniV2); the on-chain solver streams them
   // from live reserves. The engine's _swapV2 hardcodes the 0.3% fee.
@@ -1606,8 +1653,14 @@ export async function prepareEcoSwap(
   // on-chain solver walks each pool's LIVE frontier and reuses the net. V2 streams constant-L
   // from live reserves (no tick cache). The single lensToEcoPool builder is reused for routes.
   const pools: EcoPool[] = [];
+  const infKeyFees = infRaw.length > 0 ? infinityKeyFeeByPoolId(tokenIn, tokenOut, poolConfig) : null;
   for (const p of v3Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V3", true, isAlgebraPool(p)));
   for (const p of v4Raw) pools.push(lensToEcoPool(p, zeroForOne, "lens V4", true));
+  for (const p of infRaw) {
+    pools.push(
+      lensToEcoPool(p, zeroForOne, "lens InfinityCL", true, false, infKeyFees?.get(p.poolId.toLowerCase())),
+    );
+  }
   for (const p of v2Raw) pools.push(lensToEcoPool(p, p.inIsToken0, "lens V2", true));
 
   // ── KyberSwap Classic / DMM (off-chain discovery — NOT in the lens) ──
@@ -1682,6 +1735,53 @@ export async function prepareEcoSwap(
         spotNearReal: spotOI, // out/in spot (V2 frontier seed)
         spotActiveL: synthL, // √(rIn·rOut)
         source: v.source,
+      });
+    }
+  }
+
+  // ── Tier-B HOOKED Infinity CL pools (config-gated, DEFAULT-OFF — off-chain typed discovery) ──
+  // Tier A (hookless preset pools) rides the LENS's Infinity arm above. Tier-B hooked pools are
+  // config-listed poolIds whose keys are RECOVERED + re-verified on-chain (poolIdToPoolKey +
+  // allowlist + static fee + no returns-delta bits — see discoverInfinityCLPoolsTyped) and join
+  // like Kyber/Solidly-volatile: appended on the `>0` aliveness gate with NO net cache
+  // (windowTop=0 ⇒ the on-chain walk staticcalls every boundary live — the 1-RPC-quote-path
+  // mechanics). The `infinityHookAllowlist` ships EMPTY, so this block is dormant at launch.
+  const infinityFactoriesCfg = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.PancakeInfinityCL,
+  );
+  const hasInfinityTierB = infinityFactoriesCfg.some(
+    (f) => (f.infinityHookedPools?.length ?? 0) > 0 && (f.infinityHookAllowlist?.length ?? 0) > 0,
+  );
+  if (hasInfinityTierB) {
+    const infTyped = await discoverInfinityCLPoolsTyped(tokenIn, tokenOut, client, infinityFactoriesCfg);
+    for (const ip of infTyped) {
+      const hooks = ip.hooks ?? ZERO_ADDRESS;
+      if (hooks.toLowerCase() === ZERO_ADDRESS.toLowerCase()) continue; // Tier A rides the lens
+      const ts = ip.tickSpacing ?? 1;
+      const tick = ip.tick ?? 0;
+      const base = Math.floor(tick / ts) * ts;
+      pools.push({
+        poolType: SwapPoolType.PancakeInfinityCL,
+        address: ip.address, // CLPoolManager singleton
+        fee: ip.fee, // KEY fee (recovered from poolIdToPoolKey)
+        tickSpacing: ts,
+        hooks,
+        feePpm: ip.liveFeePpm ?? ip.fee, // pricing stamp (solver recombines live)
+        isV2: false,
+        inIsToken0: zeroForOne,
+        stateView: ip.stateView ?? ip.address,
+        poolId: ip.poolId ?? ZERO_BYTES32,
+        stepRatio: getSqrtRatioAtTick(ts),
+        // ZERO-CACHE: no scanned window ⇒ the solver staticcalls getPoolTickInfo per boundary.
+        windowTopShifted: 0n,
+        windowBotShifted: 0n,
+        extremeShifted: 0n,
+        netRows: [],
+        // Off-chain spot seed (reference/oracle walk start; the solver reads live).
+        spotTickShifted: BigInt((zeroForOne ? base : base + ts) + OFFSET_TICK),
+        spotNearReal: ip.sqrtPriceX96,
+        spotActiveL: ip.liquidity,
+        source: `${ip.source} (Tier-B hooked)`,
       });
     }
   }
@@ -1887,6 +1987,12 @@ export async function prepareEcoSwap(
         const hooks = p.hooks ?? ZERO_ADDRESS;
         if (hooks.toLowerCase() !== ZERO_ADDRESS.toLowerCase()) continue;
         legPools.push(lensToEcoPool(p, zHop, "lens route leg V4", false));
+      } else if (p.poolType === SwapPoolType.PancakeInfinityCL) {
+        // Infinity CL leg member (the lens emits Tier-A hookless preset pools only): reuses the
+        // per-pool frontier byte-identically via pd[7]=zHop; exec via the leg swapInfinityCL arm.
+        // KEY fee recovered from the EDGE pair's preset candidate grid (pure keccak).
+        const keyFee = infinityKeyFeeByPoolId(hopIn, hopOut, poolConfig).get(p.poolId.toLowerCase());
+        legPools.push(lensToEcoPool(p, zHop, "lens route leg InfinityCL", false, false, keyFee));
       }
     }
     if (legPools.length + edgeQl.length === 0) return null;
@@ -2172,6 +2278,7 @@ export async function prepareEcoSwap(
   }
 
   const nV4 = pools.filter((p) => p.poolType === SwapPoolType.UniV4).length;
+  const nInf = pools.filter((p) => p.poolType === SwapPoolType.PancakeInfinityCL).length;
   const nV3 = pools.filter((p) => p.poolType === SwapPoolType.UniV3).length;
   const nKyber = pools.filter((p) => p.isKyber).length;
   const nV2 = pools.filter((p) => p.isV2 && !p.isKyber).length;
@@ -2185,7 +2292,7 @@ export async function prepareEcoSwap(
   // segments — the on-chain solver builds each ladder live from its quote view / state replay / bin-walk —
   // so they are all reported below as "QL". `brackets` is always empty (no static-sampled source remains).
   console.log(
-    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nV2} V2 direct, ${nKyber} Kyber, ` +
+    `  EcoSwap prepared: ${nV3} V3, ${nV4} V4, ${nInf} InfinityCL, ${nV2} V2 direct, ${nKyber} Kyber, ` +
       `${balancerStables.length} Balancer-stable, ` +
       `${routes.length} routes (${legPoolCount} leg pools, ${legQlvCount} leg QL venues), ${directNetRows} direct net-cache rows ` +
       `(all pools walked live), ${curves.length} Curve QL, ${cryptoSwaps.length} CryptoSwap QL, ` +
@@ -2241,6 +2348,14 @@ export async function prepareEcoSwap(
     // (no estimable venue) minOut is 0 too — the safe (no-floor) default.
     minOut: 0n,
   };
+  // Chain-wide PancakeSwap Infinity Vault (solver cfg[13]) — stamped whenever the chain config
+  // carries an Infinity CL entry (the flat swapInfinityCL exec passes it for every Infinity
+  // member, direct or leg). Harmless when no Infinity pool survived (the HAS_INFINITY_CL
+  // treeshake guard folds the read away).
+  const infinityVaultCfg = poolConfig.factories.find(
+    (f) => f.factoryType === FactoryType.PancakeInfinityCL && !!f.infinityVault,
+  )?.infinityVault;
+  if (infinityVaultCfg) prepared.infinityVault = infinityVaultCfg;
   if (opts.minOut !== undefined) {
     // Explicit override — used verbatim (a caller-supplied min, or a test forcing the floor).
     prepared.minOut = opts.minOut;

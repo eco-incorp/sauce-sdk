@@ -70,13 +70,16 @@ export function ecoSwapReference(prepared: EcoSwapPrepared, amountIn: bigint): E
       }
       return undefined;
     }
-    // V3/V4 DRIFT: the test models the live (drifted) real sqrt + tick + active L.
-    if (pd.liveCurRealOverride !== undefined) {
+    // V3/V4 DRIFT: the test models the live (drifted) real sqrt + tick + active L — and, for
+    // an Infinity CL pool, optionally the modeled LIVE combined fee (liveFeePpmOverride; a
+    // price drift alone never moves the fee, so it usually stays unset ⇒ pd.feePpm).
+    if (pd.liveCurRealOverride !== undefined || pd.liveFeePpmOverride !== undefined) {
       return {
         curOI: 0n, // V3/V4 curOI is unused by kwayReference (it derives from liveRealSqrt)
         liveRealSqrt: pd.liveCurRealOverride,
         liveTick: pd.liveTickOverride ?? 0,
         liveL: pd.liveLOverride ?? pd.spotActiveL ?? 0n,
+        liveFeePpm: pd.liveFeePpmOverride,
       };
     }
     // V3/V4 NO DRIFT: kwayReference reads the prepare-time spot fields directly — pass undefined.

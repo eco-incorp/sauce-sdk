@@ -3,6 +3,7 @@ import { IERC20 } from "./artifacts/IERC20.json";
 import { IUniswapV3PoolFull } from "./IUniswapV3PoolFull.json";
 import { IAlgebraPool } from "./IAlgebraPool.json";
 import { IStateViewFull } from "./IStateViewFull.json";
+import { ICLPoolManager } from "./ICLPoolManager.json";
 import { IUniswapV2Pair } from "./IUniswapV2Pair.json";
 import { IKyberPool } from "./IKyberPool.json";
 import { IDODOPool } from "./IDODOPool.json";
@@ -662,6 +663,22 @@ function mavEndSqrt(binAmt: Uint256, sqrtP: Uint256, L: Uint256, tokenAIn: Uint2
   return end;
 }
 
+// PancakeSwap Infinity CL LIVE combined swap fee (ppm) — the exact
+// ProtocolFeeLibrary.calculateSwapFee: prot + lp − floor(prot·lp/1e6), where prot is the
+// DIRECTION slice of the 12+12-packed protocolFee (getSlot0 word [2]: zeroForOne = low 12 bits,
+// oneForZero = the next 12) and lp is word [3] (the static lpFee — Tier A admits only
+// static-fee pools). Mirrored by shared/infinity-math.ts combineInfinityFee (prepare/oracle)
+// and the lens's identical helper — all three combine from the SAME read surface, so the split
+// is wei-exact by construction. Reachable only from the HAS_INFINITY_CL branches (treeshaken
+// away for Infinity-free universes).
+function infFeeCombine(pf: Uint256, lp: Uint256, zeroForOne: Uint256): Uint256 {
+  let prot: Uint256 = pf & 4095;
+  if (zeroForOne === 0) {
+    prot = (pf >> 12) & 4095;
+  }
+  return prot + lp - (prot * lp) / 1000000;
+}
+
 // ── Compile-time protocol-presence flags (conditional compilation) ──
 // Each guards the per-protocol-SEPARABLE on-chain code below. index.ts derives each from the
 // prepared universe and passes them as compiler `defines` (with treeshake on) so a cook carries
@@ -672,6 +689,17 @@ function mavEndSqrt(binAmt: Uint256, sqrtP: Uint256, L: Uint256, tokenAIn: Uint2
 // The type-agnostic k-way merge core + the live V3/V4 frontier walk are unguarded (always on).
 const HAS_V2: boolean = true;
 const HAS_V4: boolean = true;
+// PancakeSwap Infinity CL (the V4-class singleton sibling; pType 9 = SwapPoolType.
+// PancakeInfinityCL). V4-identical micro-structure (Q96 sqrts, int24 ticks, drift-invariant
+// nets) ⇒ the frontier walk/merge/bracket math is SHARED; HAS_INFINITY_CL gates ONLY the
+// Infinity-specific deltas: the SETUP spot read + LIVE per-direction fee combine (slot0 words
+// [2]/[3] on the CLPoolManager — protocolFee is nonzero on every probed pool, so pd[5] feePpm
+// is the DIAGNOSTIC and the combined value drives sfArr + the walk gross-up), the boundary net
+// read (getPoolTickInfo(id, tick)[1] — net at the same word position as getTickLiquidity[1]),
+// the cfg[13] Vault read, and the flat swapInfinityCL exec (direct + leg arms). The engine's
+// lockAcquired services the Vault lock mid-swap; the flat method returns direction-NORMALIZED
+// (−amountIn, +amountOut).
+const HAS_INFINITY_CL: boolean = true;
 // Algebra dynamic-fee CL (Camelot/QuickSwap V3, Ramses V2, THENA Fusion, SwapX): V3-shaped in
 // every respect the solver touches EXCEPT the SETUP spot read — a real Algebra pool has NO slot0()
 // (it exposes globalState()), so slot0() would revert the whole cook. HAS_ALGEBRA gates ONLY the
@@ -780,6 +808,16 @@ function main(
   if (HAS_LEG_QLV) {
     if (cfg.length > 12) { directQlvCount = cfg[12]; }
   }
+  // cfg[13] = the chain-wide PancakeSwap Infinity Vault singleton (0 when no Infinity CL pool).
+  // The flat swapInfinityCL exec passes it (the engine locks it; funds custody lives there —
+  // the BalancerV2-Vault-as-cfg precedent). OPTIONAL 14th cfg field — guarded by cfg.length so
+  // the many venue EVM tests that hand-build a shorter cfg stay valid; production always emits
+  // it (index.ts). Gated HAS_INFINITY_CL (false ⇒ no Infinity pool exists ⇒ the read treeshakes
+  // away with zero behavior change).
+  let infinityVault: Address = 0;
+  if (HAS_INFINITY_CL) {
+    if (cfg.length > 13) { infinityVault = cfg[13]; }
+  }
 
   const router = ISauceRouter.at(address.self);
   const token = IERC20.at(tokenIn);
@@ -865,6 +903,11 @@ function main(
   let netCur: Tuple = new Array(pools.length); // cursor into this pool's netCache rows
   let sfArr: Tuple = new Array(pools.length); // per-pool sqrt fee factor (constant)
   let zArr: Tuple = new Array(pools.length); // per-pool zeroForOne (== pd[7] inIsToken0)
+  // Per-pool LIVE Infinity CL combined fee (ppm), written in SETUP for pType-9 pools only
+  // (slots stay 0 for every other family — the leg-QL uniform-indexing precedent). The merge's
+  // walk gross-up + the leg election read it in place of the DIAGNOSTIC pd[5] under the
+  // HAS_INFINITY_CL gate; sfArr already absorbs it for the head-scan (overridden in SETUP).
+  let infFeeArr: Tuple = new Array(pools.length);
   // Route-leg bracket far (real sqrt for V3/V4, out/in for V2): the FIXED far edge of the leg
   // pool's CURRENT bracket. A route PARTIAL fill moves the pool's near (dnNear) WITHIN the bracket
   // while keeping this far fixed; a FULL cross re-anchors it to one stepReal past the new near.
@@ -1041,7 +1084,22 @@ function main(
       // emits it (index.ts buildPoolTuple). Mirrors the cfg.length optional-scalar guards.
       let isAlg: Uint256 = 0;
       if (HAS_ALGEBRA) { if (pd.length > 17) { isAlg = pd[17]; } }
-      if (HAS_V4 && pType === 2) {
+      if (HAS_INFINITY_CL && pType === 9) {
+        // PancakeSwap Infinity CL: the CLPoolManager exposes the StateView-shaped getters
+        // itself (pd[8] == the CLPM). Read the spot + ALSO combine the LIVE per-direction fee
+        // (slot0 [2] protocolFee packed 12+12, [3] lpFee — the Algebra live-fee pattern):
+        // override sfArr (the head-scan coordinate) and stash the ppm for the walk gross-up +
+        // leg election (pd[5] is the diagnostic). Index getSlot0() inline per read — the v1
+        // engine loses a contract-return tuple descriptor on a variable round-trip.
+        srReal = ICLPoolManager.at(pd[8]).getSlot0(pd[9])[0];
+        liveTick = ICLPoolManager.at(pd[8]).getSlot0(pd[9])[1];
+        liveL = ICLPoolManager.at(pd[8]).getLiquidity(pd[9]);
+        const ipf: Uint256 = ICLPoolManager.at(pd[8]).getSlot0(pd[9])[2];
+        const ilp: Uint256 = ICLPoolManager.at(pd[8]).getSlot0(pd[9])[3];
+        const icfee: Uint256 = infFeeCombine(ipf, ilp, zfo);
+        infFeeArr[i] = icfee;
+        sfArr[i] = Math.sqrt((FEE_DENOM - icfee) * FEE_DENOM);
+      } else if (HAS_V4 && pType === 2) {
         srReal = IStateViewFull.at(pd[8]).getSlot0(pd[9])[0];
         liveTick = IStateViewFull.at(pd[8]).getSlot0(pd[9])[1];
         liveL = IStateViewFull.at(pd[8]).getLiquidity(pd[9]);
@@ -2110,7 +2168,10 @@ function main(
       if (bestKind === 3) {
         // ── direct pool frontier step ──
         const dd: Tuple = pools[bestPool];
-        const dfee: Uint256 = dd[5];
+        let dfee: Uint256 = dd[5];
+        // Infinity CL prices with the LIVE combined per-direction fee (SETUP's infFeeArr), not
+        // the diagnostic pd[5] — the oracle/reference combine the identical value.
+        if (HAS_INFINITY_CL) { if (dd[0] === 9) { dfee = infFeeArr[bestPool]; } }
         const ddz: Uint256 = zArr[bestPool];
         if ((HAS_V2 || HAS_KYBER) && dd[6] === 1) {
           // V2 frontier step (constant-L geometric slice from the live spot).
@@ -2175,7 +2236,8 @@ function main(
             }
           } else {
             const darg: Uint256 = tickArg(dsh, OFFSET);
-            if (HAS_V4 && dd[0] === 2) { dnet = IStateViewFull.at(dd[8]).getTickLiquidity(dd[9], darg)[1]; }
+            if (HAS_INFINITY_CL && dd[0] === 9) { dnet = ICLPoolManager.at(dd[8]).getPoolTickInfo(dd[9], darg)[1]; }
+            else if (HAS_V4 && dd[0] === 2) { dnet = IStateViewFull.at(dd[8]).getTickLiquidity(dd[9], darg)[1]; }
             else { dnet = IUniswapV3PoolFull.at(dd[1]).ticks(darg)[1]; }
           }
           const dneg: Uint256 = dnet >= HALF128 ? 1 : 0;
@@ -2295,6 +2357,9 @@ function main(
             lgP[L] = pBest;
             lgL[L] = dnL[pBest];
             lgFee[L] = db[5];
+            // Infinity CL leg pool: the leg event math grosses with the LIVE combined fee
+            // (SETUP's infFeeArr — pd[5] is the diagnostic), mirroring the direct walk's dfee.
+            if (HAS_INFINITY_CL) { if (db[0] === 9) { lgFee[L] = infFeeArr[pBest]; } }
             // V2 leg pool: near is out/in directly + the far is a constant-L geometric slice (no real
             // sqrt grid; brFar latch is unused — V2 always recomputes from the current near). V3/V4:
             // near = toOutIn(real), far = one stepReal ahead (or the latched bracket far brFar).
@@ -2551,7 +2616,8 @@ function main(
                   }
                 } else {
                   const darg: Uint256 = tickArg(dsh, OFFSET);
-                  if (db[0] === 2) { dnet = IStateViewFull.at(db[8]).getTickLiquidity(db[9], darg)[1]; }
+                  if (HAS_INFINITY_CL && db[0] === 9) { dnet = ICLPoolManager.at(db[8]).getPoolTickInfo(db[9], darg)[1]; }
+                  else if (db[0] === 2) { dnet = IStateViewFull.at(db[8]).getTickLiquidity(db[9], darg)[1]; }
                   else { dnet = IUniswapV3PoolFull.at(db[1]).ticks(darg)[1]; }
                 }
                 const dneg: Uint256 = dnet >= HALF128 ? 1 : 0;
@@ -2875,7 +2941,26 @@ function main(
             }
           }
         } else {
-          if (HAS_V4 && pType === 2) {
+          if (HAS_INFINITY_CL && pType === 9) {
+            // PancakeSwap Infinity CL — the flat engine entrypoint (the Vault lock +
+            // lockAcquired + sync/settle/take live in the Router; returns direction-NORMALIZED
+            // (−amountIn, +amountOut)). The 6-field key is RECONSTRUCTED from the tuple:
+            // currencies from the swap pair by pd[7], poolManager = pd[1], fee = pd[2] (the KEY
+            // fee — identity, not the live combine), parameters = tickSpacing<<16 for the
+            // hookless Tier-A shape; a (future, config-gated) Tier-B hooked pool recovers its
+            // EXACT parameters live via poolIdToPoolKey (the bitmap is part of the key and is
+            // not derivable off the 18-col tuple). Negative amountSpecified = exact input;
+            // limit 0 ⇒ the engine substitutes the MIN/MAX sqrt bound (the V4-exec convention).
+            const ik0: Address = pz === 1 ? tokenIn : tokenOut;
+            const ik1: Address = pz === 1 ? tokenOut : tokenIn;
+            let iparams: Uint256 = dp[3] * 65536;
+            if (dp[4] !== 0) { iparams = ICLPoolManager.at(dp[1]).poolIdToPoolKey(dp[9])[5]; }
+            router.swapInfinityCL(
+              infinityVault,
+              { currency0: ik0, currency1: ik1, hooks: dp[4], poolManager: dp[1], fee: dp[2], parameters: iparams },
+              pz, Math.neg(amt), 0, address.self, address.self
+            );
+          } else if (HAS_V4 && pType === 2) {
             const k0: Address = pz === 1 ? tokenIn : tokenOut;
             const k1: Address = pz === 1 ? tokenOut : tokenIn;
             router.swap({
@@ -2980,7 +3065,19 @@ function main(
                       sqrtPriceLimitX96: 0, payer: address.self, recipient: address.self,
                     });
                   } else {
-                    if (lType === 2) {
+                    if (HAS_INFINITY_CL && lType === 9) {
+                      // Infinity CL leg member — the direct swapInfinityCL block with
+                      // (tokenIn, tokenOut) → (legIn, legOut) and the leg's lz orientation.
+                      const ik0: Address = lz === 1 ? legIn : legOut;
+                      const ik1: Address = lz === 1 ? legOut : legIn;
+                      let iparams: Uint256 = lp[3] * 65536;
+                      if (lp[4] !== 0) { iparams = ICLPoolManager.at(lp[1]).poolIdToPoolKey(lp[9])[5]; }
+                      router.swapInfinityCL(
+                        infinityVault,
+                        { currency0: ik0, currency1: ik1, hooks: lp[4], poolManager: lp[1], fee: lp[2], parameters: iparams },
+                        lz, Math.neg(share), 0, address.self, address.self
+                      );
+                    } else if (lType === 2) {
                       const k0: Address = lz === 1 ? legIn : legOut;
                       const k1: Address = lz === 1 ? legOut : legIn;
                       router.swap({

@@ -58,6 +58,16 @@ import {
   ekuboFeePpm,
   decodeEkuboBalanceUpdate,
 } from "./ekubo-math.js";
+import {
+  INFINITY_DEFAULT_CL_PRESETS,
+  INFINITY_DYNAMIC_FEE_FLAG,
+  INFINITY_MAX_FEE_PPM,
+  INFINITY_RETURNS_DELTA_MASK,
+  computeInfinityPoolId,
+  combineInfinityFee,
+  decodeInfinityCLTickSpacing,
+  encodeInfinityCLParameters,
+} from "./infinity-math.js";
 import { type MentoPool, mentoSampleInputs, MENTO_FEE_SCALE } from "./mento-math.js";
 import {
   type BalancerV3Pool,
@@ -4613,6 +4623,180 @@ async function discoverV4Pools(
   return pools;
 }
 
+// ── PancakeSwap INFINITY CL discovery ───────────────────────
+
+// The CLPoolManager's own read surface (no StateView — the manager exposes concrete getters;
+// getSlot0/getLiquidity share the V4-StateView shape) + the public poolIdToPoolKey mapping
+// getter (the Tier-B reverse-verification surface, probed live on BSC).
+const infinityClpmAbi = parseAbi([
+  "function getSlot0(bytes32 id) external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+  "function getLiquidity(bytes32 id) external view returns (uint128 liquidity)",
+  "function poolIdToPoolKey(bytes32 id) external view returns (address currency0, address currency1, address hooks, address poolManager, uint24 fee, bytes32 parameters)",
+]);
+
+/**
+ * Discover PancakeSwap Infinity CL pools for the pair — the V4-preset CLONE over the singleton
+ * CLPoolManager (`f.address`; there is NO factory — pools are virtual, keyed by
+ * poolId = keccak256(abi.encode(6-field PoolKey))).
+ *
+ * TIER A (launch): hookless static-fee candidates from the DATA-DERIVED joint (fee, tickSpacing)
+ * preset menu (`infinityPresets` / INFINITY_DEFAULT_CL_PRESETS) — hooks = 0, parameters =
+ * tickSpacing<<16 (bitmap 0), fee static by menu construction. ONE batched multicall of
+ * getSlot0 + getLiquidity per candidate keeps initialized (sqrtPriceX96 > 0) pools with
+ * liquidity.
+ *
+ * TIER B (config-gated, DEFAULT-OFF — `infinityHookAllowlist` ships empty): each
+ * `infinityHookedPools` poolId's FULL key is recovered ON-CHAIN via the public
+ * `poolIdToPoolKey(bytes32)` getter and re-verified from the RECOVERED key (never
+ * config-trusted): hook ∈ allowlist AND static fee AND fee <= the honeypot cap AND NO
+ * returns-delta parameter bits (amounts stay deterministic). Admitted Tier-B pools carry their
+ * recovered (fee, tickSpacing, hooks).
+ *
+ * Every returned PoolInfo carries: address/stateView = the CLPoolManager, poolId, currencies
+ * (sorted; ERC20 recipe tokens — native pools are Phase 2), `fee` = the KEY fee (pool identity —
+ * the exec PoolKey field), and `liveFeePpm` = the LIVE combined swap fee (prot⊕lp per direction,
+ * from slot0 words [2]/[3] — the PRICING stamp; the on-chain solver/lens recombine it live).
+ */
+async function discoverInfinityCLPools(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<PoolInfo[]> {
+  if (factories.length === 0) return [];
+
+  const zeroForOne = BigInt(tokenIn) < BigInt(tokenOut);
+  const [currency0, currency1] = zeroForOne ? [tokenIn, tokenOut] : [tokenOut, tokenIn];
+
+  type Candidate = {
+    factory: FactoryConfig;
+    fee: number;
+    tickSpacing: number;
+    hooks: Hex;
+    poolId: Hex;
+  };
+  const candidates: Candidate[] = [];
+  for (const f of factories) {
+    for (const p of f.infinityPresets ?? INFINITY_DEFAULT_CL_PRESETS) {
+      candidates.push({
+        factory: f,
+        fee: p.fee,
+        tickSpacing: p.tickSpacing,
+        hooks: ZERO_HOOKS,
+        poolId: computeInfinityPoolId(
+          currency0, currency1, ZERO_HOOKS, f.address, p.fee,
+          encodeInfinityCLParameters(p.tickSpacing),
+        ),
+      });
+    }
+    // Tier B (default-off): recover each configured hooked poolId's key on-chain and re-verify
+    // the tier policy from the RECOVERED key. Empty allowlist ⇒ nothing admitted (launch).
+    const allowlist = (f.infinityHookAllowlist ?? []).map((h) => h.toLowerCase());
+    const hookedIds = f.infinityHookedPools ?? [];
+    if (hookedIds.length > 0 && allowlist.length > 0) {
+      const keys = await client.multicall({
+        contracts: hookedIds.map((id) => ({
+          address: f.address,
+          abi: infinityClpmAbi,
+          functionName: "poolIdToPoolKey" as const,
+          args: [id] as const,
+        })),
+        allowFailure: true,
+      });
+      for (let i = 0; i < hookedIds.length; i++) {
+        const k = keys[i];
+        if (k.status !== "success") continue;
+        const [c0, c1, hooks, poolManager, fee, parameters] = k.result as readonly [
+          Hex, Hex, Hex, Hex, number, Hex,
+        ];
+        // The recovered key must be for THIS pair on THIS manager (an uninitialized id reads
+        // the zero key and fails the pair check).
+        if (c0.toLowerCase() !== currency0.toLowerCase()) continue;
+        if (c1.toLowerCase() !== currency1.toLowerCase()) continue;
+        if (poolManager.toLowerCase() !== f.address.toLowerCase()) continue;
+        if (!allowlist.includes(hooks.toLowerCase())) continue;
+        if (fee === INFINITY_DYNAMIC_FEE_FLAG) continue; // Tier C: dynamic fee — quoter-only
+        if (fee > INFINITY_MAX_FEE_PPM) continue; // honeypot fee cap
+        if ((BigInt(parameters) & INFINITY_RETURNS_DELTA_MASK) !== 0n) continue; // non-deterministic amounts
+        const ts = decodeInfinityCLTickSpacing(parameters);
+        if (ts <= 0) continue;
+        // Hookless-bitmap sanity: a Tier-B pool is hooked by definition; a bitmap-0 pool with a
+        // nonzero hook address cannot exist (validateHookConfig), so no extra check needed.
+        candidates.push({ factory: f, fee, tickSpacing: ts, hooks, poolId: hookedIds[i] });
+      }
+    }
+  }
+  if (candidates.length === 0) return [];
+
+  const [slot0Results, liqResults] = await Promise.all([
+    client.multicall({
+      contracts: candidates.map((c) => ({
+        address: c.factory.address,
+        abi: infinityClpmAbi,
+        functionName: "getSlot0" as const,
+        args: [c.poolId] as const,
+      })),
+      allowFailure: true,
+    }),
+    client.multicall({
+      contracts: candidates.map((c) => ({
+        address: c.factory.address,
+        abi: infinityClpmAbi,
+        functionName: "getLiquidity" as const,
+        args: [c.poolId] as const,
+      })),
+      allowFailure: true,
+    }),
+  ]);
+
+  const pools: PoolInfo[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const s = slot0Results[i];
+    const l = liqResults[i];
+    if (s.status !== "success" || l.status !== "success") continue;
+    const [sqrtPriceX96, tick, protocolFee, lpFee] = s.result as readonly [bigint, number, number, number];
+    const liquidity = l.result as bigint;
+    if (sqrtPriceX96 === 0n || liquidity === 0n) continue;
+    pools.push({
+      address: c.factory.address, // CLPoolManager singleton
+      tokenIn,
+      tokenOut,
+      fee: c.fee, // the KEY fee (pool identity / exec PoolKey field)
+      poolType: SwapPoolType.PancakeInfinityCL,
+      priceLimited: true,
+      sqrtPriceX96,
+      liquidity,
+      source: c.factory.label,
+      poolId: c.poolId,
+      stateView: c.factory.address, // read target == the CLPoolManager (no separate lens)
+      currency0,
+      currency1,
+      tickSpacing: c.tickSpacing,
+      hooks: c.hooks,
+      tick, // signed current tick (viem decodes int24 signed) — the typed-path spot seed
+      // The LIVE combined swap fee (pricing) — direction-sliced protocolFee ⊕ lpFee.
+      liveFeePpm: combineInfinityFee(protocolFee, lpFee, zeroForOne),
+    });
+  }
+  return pools;
+}
+
+/**
+ * Public typed wrapper (the per-family discovery surface the tests/prepare drive directly).
+ */
+export async function discoverInfinityCLPoolsTyped(
+  tokenIn: Hex,
+  tokenOut: Hex,
+  client: PublicClient,
+  factories: FactoryConfig[],
+): Promise<PoolInfo[]> {
+  return discoverInfinityCLPools(
+    tokenIn, tokenOut, client,
+    factories.filter((f) => f.factoryType === FactoryType.PancakeInfinityCL),
+  );
+}
+
 // ── Unified discovery ───────────────────────────────────────
 
 /**
@@ -4641,11 +4825,12 @@ export async function discoverPools(
   const traderJoeFactories = factories.filter((f) => f.factoryType === FactoryType.TraderJoeLB);
   const maverickFactories = factories.filter((f) => f.factoryType === FactoryType.MaverickV2Factory);
   const woofiConfigs = factories.filter((f) => f.factoryType === FactoryType.WOOFi);
+  const infinityFactories = factories.filter((f) => f.factoryType === FactoryType.PancakeInfinityCL);
 
   // Discover all in parallel
   const [v3Pools, slipstreamPools, v4Pools, algebraPools, v2Pools, solidlyV2Pools,
          curvePools, balancerPools, dodoPools, traderJoePools,
-         maverickPools, woofiPools] = await Promise.all([
+         maverickPools, woofiPools, infinityPools] = await Promise.all([
     discoverV3Pools(tokenIn, tokenOut, client, v3Factories, feeTiers),
     discoverSlipstreamCLPools(tokenIn, tokenOut, client, slipstreamFactories),
     discoverV4Pools(tokenIn, tokenOut, client, v4Factories, feeTiers),
@@ -4658,6 +4843,7 @@ export async function discoverPools(
     discoverTraderJoeLBPools(tokenIn, tokenOut, client, traderJoeFactories),
     discoverMaverickV2Pools(tokenIn, tokenOut, client, maverickFactories),
     discoverWOOFiPools(tokenIn, tokenOut, client, woofiConfigs),
+    discoverInfinityCLPools(tokenIn, tokenOut, client, infinityFactories),
   ]);
 
   // Algebra pools are EXECUTABLE: the engine implements algebraSwapCallback (sauce#186), so
@@ -4667,9 +4853,13 @@ export async function discoverPools(
   // Slipstream CL pools are V3-priced and V3-executable (swapV3 via uniswapV3SwapCallback), so they
   // sit alongside the V3 pools in the executable set — discovered by tickSpacing key with their own
   // fee() read. See discoverSlipstreamCLPools + FactoryType.SlipstreamCL.
+  // Infinity CL pools are TICK-WALK members (the V4 sibling, pType 9): executed via the flat
+  // engine swapInfinityCL (the Vault lock is serviced by the Router's lockAcquired), priced by
+  // the SAME frontier walk as V3/V4 with the live per-direction fee combine. See
+  // FactoryType.PancakeInfinityCL + infinity-math.ts.
   return [
     ...v3Pools, ...slipstreamPools, ...v4Pools, ...algebraPools, ...v2Pools, ...solidlyV2Pools,
     ...curvePools, ...balancerPools, ...dodoPools, ...traderJoePools,
-    ...maverickPools, ...woofiPools,
+    ...maverickPools, ...woofiPools, ...infinityPools,
   ];
 }

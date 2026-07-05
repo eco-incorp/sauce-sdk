@@ -36,6 +36,23 @@ export interface PoolInfo {
   /** V4 hooks address (address(0) for hookless pools). */
   hooks?: Hex;
   /**
+   * PancakeSwap Infinity CL only (poolType === PancakeInfinityCL; the singleton fields above are
+   * reused: address/stateView = the CLPoolManager, poolId = keccak of the 6-field key, `fee` =
+   * the KEY fee — the static lpFee that is part of the pool's identity): the COMBINED live swap
+   * fee at discovery time, `prot + lp − prot·lp/1e6` ppm with the 12+12-packed protocolFee's
+   * DIRECTION slice (see infinity-math.ts combineInfinityFee). The on-chain solver/lens
+   * recombine this LIVE from slot0 words [2]/[3] at cook — this stamp is the prepare-time
+   * pricing value (EcoPool.feePpm, the diagnostic + oracle input).
+   */
+  liveFeePpm?: number;
+  /**
+   * PancakeSwap Infinity CL only: the SIGNED current tick from getSlot0 at discovery time —
+   * the off-chain spot seed for a TYPED-discovery (non-lens, Tier-B hooked) pool's EcoPool
+   * spot fields (the reference/oracle walk start; the on-chain solver reads the live tick
+   * itself). Lens-surfaced pools carry the tick on their LensPool row instead.
+   */
+  tick?: number;
+  /**
    * Solidly STABLE (sAMM) only: true ⇒ this is a Solidly stable pool (x3y+y3x invariant), NOT a
    * constant-product xy=k pool — so it must NOT be priced/executed as V2. The legacy
    * `discoverPools` aggregator tags it here (and pins `poolType` to UniV2 only for shape
@@ -374,6 +391,15 @@ export interface EcoPool {
   liveCurRealOverride?: bigint;
   liveTickOverride?: number;
   liveLOverride?: bigint;
+  /**
+   * OFF-CHAIN-ONLY drift model (reference mirror), PancakeSwap Infinity CL only: the modeled
+   * LIVE combined per-direction swap fee (ppm). The on-chain SETUP combines the Infinity fee
+   * LIVE from slot0 words [2]/[3] (feePpm is the prepare-time stamp of the same combine), so a
+   * test modeling a protocol/lp-fee change between prepare and cook sets the new combined
+   * value here. Unset ⇒ feePpm (fees unchanged — a PRICE drift alone never moves the fee).
+   * NOT in the compiler tuple.
+   */
+  liveFeePpmOverride?: number;
   source: string;
 }
 
@@ -1380,4 +1406,13 @@ export interface EcoSwapPrepared {
    * GROSS shortfall; callers wanting a tight whole-trade minimum should enforce their own.
    */
   minOut?: bigint;
+  /**
+   * The chain-wide PancakeSwap Infinity Vault singleton — carried as solver cfg[13] (the
+   * BalancerV2-Vault precedent). REQUIRED whenever any pool in the universe (direct or
+   * route-leg) has poolType === PancakeInfinityCL: the flat `swapInfinityCL(vault, key, …)`
+   * exec passes it, and the engine locks it. Stamped by prepare from
+   * `FactoryConfig.infinityVault`; 0/absent when no Infinity pool anywhere (the
+   * HAS_INFINITY_CL treeshake guard folds the read away).
+   */
+  infinityVault?: Hex;
 }

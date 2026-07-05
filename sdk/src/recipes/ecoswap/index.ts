@@ -881,7 +881,12 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
   const HAS_KYBER = allPools.some((p) => p.isKyber === true);
   const HAS_V2 = allPools.some((p) => p.isV2 && p.isKyber !== true);
   const HAS_V4 = allPools.some((p) => p.poolType === SwapPoolType.UniV4);
-  const HAS_V3 = allPools.some((p) => !p.isV2 && p.poolType !== SwapPoolType.UniV4);
+  // PancakeSwap Infinity CL (pType 9): gates the SETUP live-fee combine + getPoolTickInfo
+  // boundary reads + the cfg[13] Vault read + the flat swapInfinityCL exec (direct + leg arms).
+  const HAS_INFINITY_CL = allPools.some((p) => p.poolType === SwapPoolType.PancakeInfinityCL);
+  const HAS_V3 = allPools.some(
+    (p) => !p.isV2 && p.poolType !== SwapPoolType.UniV4 && p.poolType !== SwapPoolType.PancakeInfinityCL,
+  );
   // Algebra dynamic-fee CL (Camelot/QuickSwap V3, Ramses V2, THENA Fusion, SwapX): V3-shaped, so
   // HAS_V3 covers its tick walk + swapV3 exec; HAS_ALGEBRA lights ONLY the SETUP globalState()
   // spot-read branch (a real Algebra pool has no slot0(), so slot0() would revert the cook — this
@@ -924,6 +929,7 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_V2,
     HAS_V3,
     HAS_V4,
+    HAS_INFINITY_CL,
     HAS_ALGEBRA,
     HAS_KYBER,
     HAS_ROUTES,
@@ -950,6 +956,18 @@ export function protocolDefines(prepared: EcoSwapPrepared): Record<string, boole
     HAS_BALANCER_V3,
     HAS_LEG_QLV,
   };
+}
+
+/**
+ * The chain-wide PancakeSwap Infinity Vault singleton — carried as `cfg[13]`. The flat
+ * `swapInfinityCL(vault, key, …)` exec passes it for every Infinity CL member (direct or leg);
+ * one Vault serves the whole chain (the BalancerV2-Vault precedent). Stamped on
+ * `prepared.infinityVault` by prepare from `FactoryConfig.infinityVault`; 0 when no Infinity
+ * pool anywhere (the HAS_INFINITY_CL treeshake guard folds the read away, so the 0 is never
+ * dereferenced).
+ */
+function infinityVaultAddr(prepared: EcoSwapPrepared): bigint {
+  return prepared.infinityVault ? BigInt(prepared.infinityVault) : 0n;
 }
 
 /**
@@ -987,6 +1005,7 @@ export function buildSolverArgs(
       balancerV3VaultAddr(prepared), // cfg[10] — chain-wide Balancer V3 Vault (0 when no Balancer V3 venue)
       balancerV2VaultAddr(prepared), // cfg[11] — chain-wide Balancer V2 Vault (0 when no Balancer V2 venue)
       BigInt(directQlvCount), // cfg[12] — leading qlv rows that are DIRECT venues (leg rows follow)
+      infinityVaultAddr(prepared), // cfg[13] — chain-wide PancakeSwap Infinity Vault (0 when no Infinity CL pool)
     ],
     poolTuples,
     netCache,
@@ -1236,6 +1255,7 @@ export async function quoteEcoSwap(
         balancerV3VaultAddr(usePrepared), // cfg[10] — chain-wide Balancer V3 Vault (0 when no Balancer V3 venue)
         balancerV2VaultAddr(usePrepared), // cfg[11] — chain-wide Balancer V2 Vault (0 when no Balancer V2 venue)
         BigInt(directQlvCount), // cfg[12] — leading qlv rows that are DIRECT venues (leg rows follow)
+        infinityVaultAddr(usePrepared), // cfg[13] — chain-wide PancakeSwap Infinity Vault (0 when no Infinity CL pool)
       ],
       poolTuples,
       netCache,

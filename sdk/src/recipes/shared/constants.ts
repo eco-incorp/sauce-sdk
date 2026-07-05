@@ -34,6 +34,15 @@ export enum SwapPoolType {
   TraderJoeLB = 6, // Trader Joe Liquidity Book — bin-based AMM
   MaverickV2 = 7,  // Maverick V2 — directional AMM
   WOOFi = 8,       // WOOFi sPMM — synthetic proactive market making
+  // PancakeSwap INFINITY (appended engine-side values 9/10 — ABI-safe). CL is a TICK-WALK
+  // universe member (the V4-class sibling): virtual pools inside the CLPoolManager singleton,
+  // funds inside the Vault, executed via the flat onlySelf `swapInfinityCL(vault, key, …)`
+  // (the engine's lockAcquired services the Vault lock; the flat methods return
+  // direction-NORMALIZED (−amountIn, +amountOut), NOT swapV4's raw currency deltas).
+  PancakeInfinityCL = 9,
+  // Bin side (LB-class) — engine-supported (swapInfinityBin rides the same lockAcquired), SDK
+  // family DEFERRED: Bin top-50 TVL ≈ $0.4M / vol7d ≈ $0.1M — CL-only ≈ full venue coverage.
+  PancakeInfinityBin = 10,
 }
 
 // ── Factory discovery types ─────────────────────────────────
@@ -380,6 +389,53 @@ export enum FactoryType {
    * the preset probe transcript).
    */
   Ekubo = "ekubo",
+  /**
+   * PANCAKESWAP INFINITY CL (pancakeswap/infinity-core — the V4-class singleton CL venue on
+   * BSC/Base, same addresses via create3; ~$5.9B/30d CL run-rate on BSC). There is NO factory:
+   * pools are VIRTUAL inside the CLPoolManager (state) with funds inside the Vault (accounting),
+   * identified by `PoolId = keccak256(abi.encode(6-field PoolKey))` — key =
+   * {currency0, currency1, hooks, poolManager, fee, parameters} where `parameters` packs the CL
+   * tickSpacing at bits [16..39] and the hook-callback bitmap in the low 16 bits. Discovery is
+   * the V4-PRESET CLONE: the config `address` IS the CLPoolManager and
+   * `discoverInfinityCLPoolsTyped` derives candidate poolIds from the DATA-DERIVED joint
+   * (fee, tickSpacing) preset menu (`infinityPresets`, default INFINITY_DEFAULT_CL_PRESETS —
+   * from the full BSC Initialize-event scan; see infinity-math.ts), then batch-probes
+   * getSlot0 + getLiquidity liveness directly on the CLPoolManager (no StateView needed — the
+   * managers expose concrete getters; getSlot0 shares the V4-StateView selector/shape).
+   *
+   * A TICK-WALK universe member (pType 9 — the V4 sibling): micro-structure is
+   * Uniswap-V4-identical (Q96 sqrt ratios, int24 ticks, drift-invariant `liquidityNet` at
+   * getPoolTickInfo word [1]), so the bracket/frontier/oracle math is reused byte-identically.
+   * TWO Infinity-specific deltas: (a) the boundary net read is `getPoolTickInfo(id, tick)[1]`
+   * (vs StateView.getTickLiquidity); (b) the fee is combined LIVE ON-CHAIN per direction from
+   * slot0 words [2]/[3] — `swapFee = prot + lp − prot·lp/1e6`, protocolFee packed 12+12 bits
+   * per direction (nonzero on EVERY probed pool: 32/32 static, 300/300 dynamic) — the Algebra
+   * live-fee pattern; the pool tuple's feePpm is the DIAGNOSTIC. EXECUTION goes through the
+   * engine (every swap needs the Vault lock + `lockAcquired` serviced by compiled router code —
+   * the V4-unlockCallback class): the recipe calls the flat onlySelf
+   * `swapInfinityCL(vault, key, zeroForOne, −amt, limit, self, self)`, which returns
+   * direction-NORMALIZED (−amountIn, +amountOut). The chain-wide Vault rides `infinityVault`
+   * (solver cfg[13]).
+   *
+   * HOOK POLICY (tiered; 46/50 top-TVL CL pools are hooked, but 91.8% of the universe is
+   * hookless): Tier A (LAUNCH) = hookless static-fee only — hooks == 0 AND parameters&0xFFFF
+   * == 0 AND fee != 0x800000 (the preset menu enumerates exactly these). Tier B (config-gated,
+   * SHIPS EMPTY/default-off) = hooked static-fee pools with NO returns-delta bitmap bits,
+   * admitted ONLY when `infinityHookedPools` lists the poolId AND the on-chain-recovered key's
+   * hook (`poolIdToPoolKey(bytes32)` — a PUBLIC CLPoolManager getter, probed live) is in
+   * `infinityHookAllowlist` — amounts are deterministic (a static-fee hook cannot override the
+   * fee — CLHooks source-verified) but a hook can revert/gate (anti-bot), so admission is a
+   * config decision. Tier C (dynamic-fee, `fee == 0x800000`, slot0 lpFee=0) is quoter-only —
+   * NOT walkable, excluded. Discovery hygiene: honeypot fee cap (INFINITY_MAX_FEE_PPM — the
+   * permissionless 0..100% fee space carries thousands of ~99%-fee pools). Native-BNB pools
+   * (currency0 == address(0) — 3 of the top-5) are engine-supported but SDK-Phase-2: discovery
+   * keys on the recipe's ERC20 tokens. On-chain verified (BSC ~108.12M, 2026-07-04): Vault
+   * 0x238a3588…, CLPoolManager 0xa0FfB9c1…, CLTickLens 0x8BcF3028…; USDT/Beat (fee 67, ts 1,
+   * HOOKLESS — the venue's #1 TVL pool) slot0 (4.718e28, −10368, 131104, 67), L=7.67e23;
+   * poolId keccak-reproduced 3/3. See infinity-math.ts + the IPancakeInfinity.sol header in
+   * the engine repo (selector records).
+   */
+  PancakeInfinityCL = "infinity-cl",
 }
 
 /**
@@ -589,6 +645,48 @@ export interface FactoryConfig {
    * chain without code.
    */
   ekuboPresets?: { fee: bigint; tickSpacing: number }[];
+  /**
+   * PANCAKESWAP INFINITY CL (PancakeInfinityCL factory type) only: the chain's singleton Vault
+   * (the flat `swapInfinityCL(vault, …)` arg + the engine's lock target; funds custody). The
+   * `address` field on an Infinity entry is the CLPoolManager (state + getters + part of the
+   * PoolKey). Chain-wide — threaded to the solver as cfg[13]. Required for an Infinity entry.
+   */
+  infinityVault?: Hex;
+  /**
+   * PANCAKESWAP INFINITY CL only: the periphery CLTickLens
+   * (`getPopulatedTicksInWord(PoolId, int16)` — one call replaces bitmap-parse + N tick reads).
+   * NOT used by the recipe runtime path (the on-chain lens walks getPoolTickInfo directly and
+   * prepare consumes its emitted rows); carried for the snapshot/capture tooling
+   * (harness/infinity-snapshot.ts) + future bulk net-cache fills. Optional.
+   */
+  infinityTickLens?: Hex;
+  /**
+   * PANCAKESWAP INFINITY CL only: the Tier-A (fee, tickSpacing) preset menu the V4-clone
+   * discovery derives hookless candidate poolIds from. Defaults to INFINITY_DEFAULT_CL_PRESETS
+   * (the DATA-DERIVED top joint pairs of the BSC hookless static-fee Initialize scan — see
+   * infinity-math.ts; NOT a fee×ts cross-product). Over-probing a dead combo is harmless (its
+   * getSlot0 reads sqrtPrice 0); each combo costs one discovery multicall row + one lens
+   * candidate. Set per chain to extend/trim without code.
+   */
+  infinityPresets?: { fee: number; tickSpacing: number }[];
+  /**
+   * PANCAKESWAP INFINITY CL only, Tier B (default-off): KNOWN hooked-pool candidate poolIds.
+   * Discovery recovers each id's FULL 6-field key on-chain via the CLPoolManager's public
+   * `poolIdToPoolKey(bytes32)` getter and admits the pool ONLY IF the recovered (not
+   * config-trusted) key passes: hook ∈ `infinityHookAllowlist` AND fee != 0x800000 (static)
+   * AND fee <= INFINITY_MAX_FEE_PPM AND parameters has NO returns-delta bits (amounts stay
+   * deterministic — the launchpad 0x0045-class). Empty/omitted ⇒ Tier A only (the LAUNCH
+   * shape). Tier-B pools join the walk via typed discovery (zero-cache: every boundary
+   * staticcalls getPoolTickInfo — the 1-RPC-quote-path mechanics), not the lens.
+   */
+  infinityHookedPools?: Hex[];
+  /**
+   * PANCAKESWAP INFINITY CL only, Tier B (default-off): the hook-address ALLOWLIST gating
+   * `infinityHookedPools` admission. SHIPS EMPTY — a hooked pool's hook can revert/gate the
+   * sender mid-swap (anti-bot), so admitting a hook class is a product/risk call made per
+   * config, never a code default.
+   */
+  infinityHookAllowlist?: Hex[];
 }
 
 /** Canonical UniswapV2 constant-product fee (ppm): 0.30%. */
@@ -1296,6 +1394,27 @@ export const CHAIN_POOL_CONFIGS: Record<string, ChainPoolConfig> = {
       // probes above. Per-pool depth is judged by the standard sampling + relative-depth filter.
       { address: "0x790B4A80Fb1094589A3c0eFC8740aA9b0C1733fB" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2" },
       { address: "0x0fb9815938Ad069Bf90E14FE6C596c514BEDe767" as Hex, poolType: SwapPoolType.DODOV2, factoryType: FactoryType.DODOZoo, label: "DODO V2 DSP" },
+      // PancakeSwap INFINITY CL (the V4-class singleton; tick-walk pType 9 — see
+      // FactoryType.PancakeInfinityCL + infinity-math.ts). `address` = the CLPoolManager
+      // (state + getters + part of the 6-field PoolKey); `infinityVault` = the singleton Vault
+      // (lock/custody; the flat swapInfinityCL arg, solver cfg[13]); `infinityTickLens` = the
+      // periphery CLTickLens (snapshot tooling). Preset-clone discovery over
+      // INFINITY_DEFAULT_CL_PRESETS (the data-derived joint (fee, ts) menu). On-chain verified
+      // (BSC block ~108,123,094, 2026-07-04, all cross-wired): Vault.isAppRegistered(CLPM) ==
+      // true, CLPM.vault() == Vault; USDT/Beat 0xb2842060… (fee 67 static, ts 1, HOOKLESS —
+      // the venue's #1 TVL pool, ~$64.1M top-50 TVL / ~$5.9B/30d CL run-rate) getSlot0 =
+      // (4.718e28, −10368, protocolFee 131104 = 32|32 packed 12+12, lpFee 67), L = 7.67e23;
+      // getPoolTickInfo(−10561) net at word [1]; poolId = keccak256(abi.encode(6-field key))
+      // reproduced exactly (also BNB/CAKE + BNB/ASTER); poolIdToPoolKey probed live (returns
+      // the full key — the Tier-B reverse-verification getter). HOOK POLICY: Tier A
+      // hookless-static-fee only at launch; `infinityHookAllowlist` deliberately EMPTY
+      // (default-off — 46/50 top-TVL pools are hooked launchpad classes, admitting a hook is a
+      // product/risk call per config). Native-BNB pools (BNB/CAKE, BNB/ASTER, BNB/ETH) are
+      // engine-supported but SDK-Phase-2 (discovery keys on ERC20 recipe tokens). Dynamic-fee
+      // pools (BNB/CAKE, USDT/USDC — fee 0x800000, slot0 lpFee 0) are quoter-only, excluded.
+      { address: "0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b" as Hex, poolType: SwapPoolType.PancakeInfinityCL, factoryType: FactoryType.PancakeInfinityCL, label: "PancakeSwap Infinity CL",
+        infinityVault: "0x238a358808379702088667322f80aC48bAd5e6c4" as Hex,
+        infinityTickLens: "0x8BcF30285413F25032fb983C2bF4deFe29a33f3a" as Hex },
     ],
     baseTokens: [
       "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" as Hex, // WBNB

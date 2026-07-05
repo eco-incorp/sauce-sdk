@@ -3724,3 +3724,53 @@ describe("EcoSwap Curve QUOTE-LADDER split optimality (vs continuous water-fill 
     });
   }
 });
+
+// ── PancakeSwap Infinity CL — descriptor/fee KATs (pure, no RPC) ─────────────────────────────
+// Pins the 6-field poolId derivation + the parameters packing + the LIVE fee combine against
+// the ON-CHAIN-VERIFIED BSC values (USDT/Beat — the venue's #1 TVL pool; key recovered live
+// via poolIdToPoolKey and slot0 probed 2026-07-04). The on-chain solver/lens combine the fee
+// in SauceScript with the identical integer formula — these KATs pin the off-chain mirror.
+describe("Infinity CL math KATs (poolId + parameters + live fee combine)", () => {
+  it("reproduces the REAL USDT/Beat poolId from the 6-field key (keccak(abi.encode))", async () => {
+    const { computeInfinityPoolId, encodeInfinityCLParameters } = await import("../shared/infinity-math");
+    const id = computeInfinityPoolId(
+      "0x55d398326f99059fF775485246999027B3197955", // USDT (currency0)
+      "0xcf3232B85b43BCa90E51D38cc06Cc8bB8C8A3E36", // Beat (currency1)
+      "0x0000000000000000000000000000000000000000", // hookless
+      "0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b", // CLPoolManager
+      67,
+      encodeInfinityCLParameters(1),
+    );
+    assert.equal(id, "0xb2842060d68177ff202e81b3bd8588630fe7ede60e1a19f4d327125f73ae92be");
+  });
+
+  it("parameters pack/unpack round-trips (tickSpacing at bits [16..39], bitmap low 16)", async () => {
+    const { encodeInfinityCLParameters, decodeInfinityCLTickSpacing, decodeInfinityHookBitmap } =
+      await import("../shared/infinity-math");
+    for (const ts of [1, 10, 60, 200, 32767]) {
+      const p = encodeInfinityCLParameters(ts);
+      assert.equal(decodeInfinityCLTickSpacing(p), ts, `ts ${ts} round-trips`);
+      assert.equal(decodeInfinityHookBitmap(p), 0, "hookless bitmap");
+    }
+    // The REAL USDT/Beat parameters word: ts=1, bitmap 0.
+    assert.equal(
+      decodeInfinityCLTickSpacing("0x0000000000000000000000000000000000000000000000000000000000010000"),
+      1,
+    );
+  });
+
+  it("combines the live fee exactly like ProtocolFeeLibrary.calculateSwapFee (12+12 packed)", async () => {
+    const { combineInfinityFee } = await import("../shared/infinity-math");
+    // The probed USDT/Beat slot0: protocolFee 131104 = 32 | (32 << 12), lpFee 67.
+    assert.equal(combineInfinityFee(131104, 67, true), 99, "zeroForOne: 32 + 67 - 0");
+    assert.equal(combineInfinityFee(131104, 67, false), 99, "oneForZero: symmetric 32|32");
+    // Asymmetric packing picks the DIRECTION slice: zeroForOne = low 12 bits.
+    const packed = 100 | (400 << 12);
+    assert.equal(combineInfinityFee(packed, 3000, true), 100 + 3000 - Math.floor((100 * 3000) / 1e6));
+    assert.equal(combineInfinityFee(packed, 3000, false), 400 + 3000 - Math.floor((400 * 3000) / 1e6));
+    // The 4000-per-direction cap edge at a fat lpFee: floor division, never negative.
+    assert.equal(combineInfinityFee(4000 | (4000 << 12), 100000, true), 4000 + 100000 - 400);
+    // Zero protocol fee degenerates to the bare lpFee.
+    assert.equal(combineInfinityFee(0, 67, true), 67);
+  });
+});

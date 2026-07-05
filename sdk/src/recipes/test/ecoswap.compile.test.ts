@@ -306,7 +306,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
     const stripped = stripTypes(source);
     const args = [cfgTuple(1), pools.slice(0, 1), [netCache[0]], routing, segs];
     const ALL = {
-      HAS_V2: true, HAS_V4: true, HAS_ALGEBRA: true, HAS_KYBER: true, HAS_ROUTES: true,
+      HAS_V2: true, HAS_V4: true, HAS_INFINITY_CL: true, HAS_ALGEBRA: true, HAS_KYBER: true, HAS_ROUTES: true,
       HAS_CURVE: true, HAS_LB: true, HAS_DODO: true, HAS_SOLIDLY_STABLE: true, HAS_WOMBAT: true,
       HAS_BALANCER: true, HAS_EULER: true, HAS_MAVERICK: true, HAS_CRYPTO: true, HAS_WOOFI: true,
       HAS_FERMI: true, HAS_FLUID: true, HAS_MENTO: true, HAS_BALANCER_V3: true, HAS_LEG_QLV: true,
@@ -314,7 +314,7 @@ describe("ecoswap.sauce.ts (unified-walk merge solver)", () => {
       HAS_PANCAKE_STABLE: true, HAS_EKUBO: true,
     };
     const V3_ONLY = {
-      HAS_V2: false, HAS_V4: false, HAS_ALGEBRA: false, HAS_KYBER: false, HAS_ROUTES: false,
+      HAS_V2: false, HAS_V4: false, HAS_INFINITY_CL: false, HAS_ALGEBRA: false, HAS_KYBER: false, HAS_ROUTES: false,
       HAS_CURVE: false, HAS_LB: false, HAS_DODO: false, HAS_SOLIDLY_STABLE: false, HAS_WOMBAT: false,
       HAS_BALANCER: false, HAS_EULER: false, HAS_MAVERICK: false, HAS_CRYPTO: false, HAS_WOOFI: false,
       HAS_FERMI: false, HAS_FLUID: false, HAS_MENTO: false, HAS_BALANCER_V3: false, HAS_LEG_QLV: false,
@@ -491,10 +491,12 @@ describe("index.ts buildSolverArgs (leg-QL ordering contract + cfg[12])", () => 
     const routing = args[3] as bigint[][];
     const qlv = args[5] as bigint[][];
 
-    // cfg[12] = directQlvCount (1 direct Curve row); cfg[7] = the Mento broker via the LEG fallback.
-    assert.equal(cfg.length, 13);
+    // cfg[12] = directQlvCount (1 direct Curve row); cfg[7] = the Mento broker via the LEG fallback;
+    // cfg[13] = the chain-wide Infinity Vault (0 — no Infinity CL pool in this universe).
+    assert.equal(cfg.length, 14);
     assert.equal(cfg[12], 1n);
     assert.equal(cfg[7], BigInt(BROKER));
+    assert.equal(cfg[13], 0n);
 
     // Stride-5 routing: [legCount, {poolBase,poolCount,qlvBase,qlvCount,inter} × 2].
     assert.equal(routing.length, 1);

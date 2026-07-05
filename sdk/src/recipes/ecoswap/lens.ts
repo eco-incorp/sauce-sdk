@@ -56,6 +56,11 @@ import {
   type ChainPoolConfig,
   type FactoryConfig,
 } from "../shared/constants.js";
+import {
+  INFINITY_DEFAULT_CL_PRESETS,
+  computeInfinityPoolId,
+  encodeInfinityCLParameters,
+} from "../shared/infinity-math.js";
 
 const require = createRequire(import.meta.url);
 const { compile } = require("@eco-incorp/sauce-compiler");
@@ -373,6 +378,15 @@ export function buildLensCook(
   const v4Factories: FactoryConfig[] = poolConfig.factories.filter(
     (f) => f.factoryType === FactoryType.UniswapV4 && !!f.stateView,
   );
+  // PancakeSwap Infinity CL rides the v4Factories param (the V4-class singleton sibling),
+  // tagged isInfinity — its `address` IS the CLPoolManager, which exposes the getSlot0/
+  // getLiquidity getters itself (V4-StateView-selector-compatible), so the row's stateView
+  // column is the CLPoolManager too. Folding Infinity into the existing param (rather than a
+  // new top-level param) keeps main() at 7 params — the v12 arg-prologue SDUP window is
+  // unchanged (the Algebra-into-v3Factories precedent).
+  const infinityFactories: FactoryConfig[] = poolConfig.factories.filter(
+    (f) => f.factoryType === FactoryType.PancakeInfinityCL,
+  );
 
   // For per-factory fee tiers, the lens currently uses ONE global v3FeeTiers list.
   // To honor per-factory tiers (Pancake 2500 ≠ Uni 3000) we expand the V3 list as
@@ -405,21 +419,65 @@ export function buildLensCook(
   }
   const v3FeeTiers = [...v3FeeSet];
 
-  // V4: sorted currencies + precomputed poolIds per (factory × spec).
+  // V4 + Infinity CL: sorted currencies + precomputed poolIds per (factory × spec).
+  //
+  // ONE shared spec column serves BOTH families: the V4 fee tiers (tickSpacing derived by
+  // feeToTickSpacing) FOLLOWED by the Infinity (fee, tickSpacing) presets (the data-derived
+  // JOINT menu — see infinity-math.ts; deduped per (fee, ts, family)). A spec that does not
+  // apply to a factory gets poolId 0 in the row-major poolIds grid — getSlot0(0) reads
+  // sqrtPrice 0, so the lens's aliveness gate skips the combo in every pass with no explicit
+  // guard (cost: |factories|×|specs| cheap dead getSlot0 staticcalls).
   const [currency0, currency1] =
     BigInt(tokenIn) < BigInt(tokenOut) ? [tokenIn, tokenOut] : [tokenOut, tokenIn];
   const v4SpecSet = new Set<number>();
   for (const f of v4Factories) for (const fee of f.feeTiers ?? poolConfig.feeTiers) v4SpecSet.add(fee);
   const v4Fees = [...v4SpecSet];
-  const v4Specs = v4Fees.map((fee) => {
+  type SingletonSpec = { fee: number; tickSpacing: number; stepRatio: bigint; isInfinity: boolean };
+  const v4Specs: SingletonSpec[] = v4Fees.map((fee) => {
     const tickSpacing = feeToTickSpacing(fee);
-    return { fee, tickSpacing, stepRatio: stepRatioForSpacing(tickSpacing) };
+    return { fee, tickSpacing, stepRatio: stepRatioForSpacing(tickSpacing), isInfinity: false };
   });
-  // poolIds row-major over (factory, spec): index = qi*specs.length + si.
+  if (infinityFactories.length > 0) {
+    const seen = new Set<string>();
+    for (const f of infinityFactories) {
+      for (const p of f.infinityPresets ?? INFINITY_DEFAULT_CL_PRESETS) {
+        const key = `${p.fee}|${p.tickSpacing}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        v4Specs.push({
+          fee: p.fee,
+          tickSpacing: p.tickSpacing,
+          stepRatio: stepRatioForSpacing(p.tickSpacing),
+          isInfinity: true,
+        });
+      }
+    }
+  }
+  // The combined singleton-factory rows: V4 rows first (isInfinity 0), then Infinity rows
+  // (poolManager == stateView == the CLPoolManager, isInfinity 1). The ORDER here defines the
+  // lens's per-pool ordinal, so it must be identical in every pass (it is — one list).
+  const singletonFactories: { poolManager: Hex; stateView: Hex; isInfinity: boolean; cfg: FactoryConfig }[] = [
+    ...v4Factories.map((f) => ({ poolManager: f.address, stateView: f.stateView as Hex, isInfinity: false, cfg: f })),
+    ...infinityFactories.map((f) => ({ poolManager: f.address, stateView: f.address, isInfinity: true, cfg: f })),
+  ];
+  // poolIds row-major over (factory, spec): index = qi*specs.length + si. Family-mismatched
+  // combos carry 0 (dead — skipped by the aliveness gate on-chain).
   const v4PoolIds: Hex[] = [];
-  for (let qi = 0; qi < v4Factories.length; qi++) {
+  const ZERO_ID = ("0x" + "0".repeat(64)) as Hex;
+  for (const fac of singletonFactories) {
     for (const spec of v4Specs) {
-      v4PoolIds.push(computeV4PoolId(currency0, currency1, spec.fee, spec.tickSpacing, ZERO_HOOKS));
+      if (fac.isInfinity !== spec.isInfinity) {
+        v4PoolIds.push(ZERO_ID);
+      } else if (fac.isInfinity) {
+        v4PoolIds.push(
+          computeInfinityPoolId(
+            currency0, currency1, ZERO_HOOKS, fac.poolManager, spec.fee,
+            encodeInfinityCLParameters(spec.tickSpacing),
+          ),
+        );
+      } else {
+        v4PoolIds.push(computeV4PoolId(currency0, currency1, spec.fee, spec.tickSpacing, ZERO_HOOKS));
+      }
     }
   }
 
@@ -500,7 +558,10 @@ export function buildLensCook(
       // (V2_DEFAULT_FEE_PPM=3000 for canonical UniswapV2). Threaded so the lens grosses
       // V2 capacity/floor by the REAL fee, not a hardcoded 0.30%.
       v2Factories.map((f) => [BigInt(f.address), BigInt(f.v2FeePpm ?? V2_DEFAULT_FEE_PPM)]),
-      v4Factories.map((f) => [BigInt(f.address), BigInt(f.stateView as Hex)]),
+      // v4Factories[i] = [poolManager, stateView, isInfinity] — Infinity CL rows carry the
+      // CLPoolManager in BOTH address columns (it exposes the StateView-shaped getters itself)
+      // and isInfinity=1 (⇒ getPoolTickInfo net reads + the live per-direction fee combine).
+      singletonFactories.map((f) => [BigInt(f.poolManager), BigInt(f.stateView), f.isInfinity ? 1n : 0n]),
       v4Specs.map((s) => [BigInt(s.fee), BigInt(s.tickSpacing), s.stepRatio]),
       v4PoolIds.map((id) => [BigInt(id)]),
     ],

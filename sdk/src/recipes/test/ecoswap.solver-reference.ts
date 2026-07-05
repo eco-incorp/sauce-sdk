@@ -106,6 +106,15 @@ export interface KwayLivePool {
   liveL?: bigint;
   // V2 live state:
   liveV2L?: bigint; // sqrt(reserveIn*reserveOut)
+  /**
+   * Modeled LIVE per-pool fee (ppm). PancakeSwap Infinity CL's on-chain SETUP combines its fee
+   * LIVE per direction from slot0 words [2]/[3] (prot ⊕ lp — see infinity-math.ts
+   * combineInfinityFee), so a test modeling a protocol/lp-fee change between prepare and cook
+   * sets the combined value here. Unset ⇒ the prepared `pd.feePpm` (which prepare stamped as
+   * the SAME combine at prepare time — identical when fees did not move, the common case; a
+   * PRICE drift alone never moves the fee).
+   */
+  liveFeePpm?: number;
 }
 
 export interface KwayReferenceResult {
@@ -214,7 +223,9 @@ function seedFrontier(pd: EcoPool, lp: KwayLivePool | undefined): Frontier {
     isV2: pd.isV2,
     pType: pd.poolType,
     zeroForOne: z,
-    feePpm: pd.feePpm,
+    // The SETUP fee: a modeled LIVE override (Infinity CL's live combine) wins over the
+    // prepared stamp — mirrors the on-chain SETUP's infFeeArr/sfArr override.
+    feePpm: lp?.liveFeePpm ?? pd.feePpm,
     ts: BigInt(pd.tickSpacing),
     stepRatio: pd.stepRatio ?? 0n,
     on: false,
