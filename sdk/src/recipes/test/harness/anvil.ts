@@ -77,9 +77,20 @@ async function rpcReady(rpcUrl: string, timeoutMs: number): Promise<void> {
  * class — a fresh anvil's block ~5 makes the real pricing read as prehistoric and quote 0), the
  * block-number analogue of pinFermiBlockTimestamp's clock pin. NB with --init the genesis
  * timestamp is 0 — callers must still pin the clock (anvil_setTime) after boot.
+ *
+ * `hardfork` (optional, additive) pins anvil's EVM hardfork — the Ekubo prod-mirror boots
+ * `"osaka"` because the GENUINE etched Core/Router runtime executes the CLZ opcode (EIP-7939,
+ * Osaka; anvil 1.5.1 accepts the name — boot-probed). Omitted ⇒ anvil's default (unchanged for
+ * every existing test).
  */
 export async function startAnvil(
-  opts: { timeoutMs?: number; forkUrl?: string; forkBlock?: number; initGenesisNumber?: bigint } = {},
+  opts: {
+    timeoutMs?: number;
+    forkUrl?: string;
+    forkBlock?: number;
+    initGenesisNumber?: bigint;
+    hardfork?: string;
+  } = {},
 ): Promise<AnvilHandle> {
   // Forked boots pull state from a remote RPC — allow much longer to come up.
   const timeoutMs = opts.timeoutMs ?? (opts.forkUrl ? 120_000 : 30_000);
@@ -131,6 +142,8 @@ export async function startAnvil(
           : []),
         // High-genesis boot (no-fork): start the chain at the captured block number (see docstring).
         ...(initPath ? ["--init", initPath] : []),
+        // Hardfork pin (see docstring) — the Ekubo prod-mirror needs osaka (EIP-7939 CLZ).
+        ...(opts.hardfork ? ["--hardfork", opts.hardfork] : []),
       ],
       { stdio: ["ignore", "ignore", "pipe"] },
     );

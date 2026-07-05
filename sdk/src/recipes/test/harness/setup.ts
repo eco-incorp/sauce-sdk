@@ -106,6 +106,15 @@ export const pancakeStablePoolArtifact = loadArtifact(
 export const pancakeStableFactoryMockArtifact = loadArtifact(
   join(FIXTURES, "PancakeStableSwapPool.sol", "PancakeStableSwapFactoryMock.json"),
 );
+/** EKUBO V3 fixtures — the E0-frozen Core sload/till + router quote/swap surfaces over a
+ *  deterministic fee-on-input constant-product curve (virtual pools keyed by the REAL poolId
+ *  derivation, so production discoverEkuboPoolsTyped runs against them unchanged). */
+export const ekuboCoreFixtureArtifact = loadArtifact(
+  join(FIXTURES, "EkuboFixture.sol", "EkuboCoreFixture.json"),
+);
+export const ekuboRouterFixtureArtifact = loadArtifact(
+  join(FIXTURES, "EkuboFixture.sol", "EkuboRouterFixture.json"),
+);
 /** DODO V2 PMM pool — deployed normally (constructor sets base/quote + i/K/B/Q/B0/Q0 + fees). */
 export const dodoV2PoolArtifact = loadArtifact(
   join(FIXTURES, "DodoV2Pool.sol", "DodoV2Pool.json"),
@@ -1068,6 +1077,82 @@ export async function deployPancakeStableSwap(
     account: acct,
   });
   return { pool, factory: fac };
+}
+
+/** EKUBO fixture ABIs — the Core registry/till surface + the router's E0-frozen quote/swap
+ *  (signature-identical to the real MEVCaptureRouter: quote 0x3bc52842 / 7-arg swap 0xf196187f;
+ *  quote declared `view` here ONLY so viem readContract issues the eth_call — on-chain it is
+ *  nonpayable + state-writing, the staticcall-illegal class the recipe plain-CALLs). */
+export const ekuboCoreFixtureAbi = parseAbi([
+  "function setRouter(address r)",
+  "function toPoolId(address token0, address token1, bytes32 config) view returns (bytes32)",
+  "function registerPool(address token0, address token1, bytes32 config, uint128 reserve0, uint128 reserve1, uint64 fee, uint128 maxIn0, uint128 maxIn1) returns (bytes32 poolId)",
+  "function setReserves(bytes32 poolId, uint128 reserve0, uint128 reserve1)",
+  "function pools(bytes32 poolId) view returns (address token0, address token1, uint128 reserve0, uint128 reserve1, uint64 fee, uint128 maxIn0, uint128 maxIn1, bool initialized)",
+]);
+export const ekuboRouterFixtureAbi = parseAbi([
+  "function quote((address token0, address token1, bytes32 config) poolKey, bool isToken1, int128 amount, uint96 sqrtRatioLimit, uint256 skipAhead) view returns (bytes32 balanceUpdate, bytes32 stateAfter)",
+  "function swap((address token0, address token1, bytes32 config) poolKey, bool isToken1, int128 amount, uint96 sqrtRatioLimit, uint256 skipAhead, int256 calculatedAmountThreshold, address recipient) payable returns (bytes32 balanceUpdate)",
+  "function probeNonce() view returns (uint256)",
+]);
+
+/**
+ * Deploy the EKUBO local fixture graph: the Core (virtual-pool registry + raw-key sload + till) +
+ * the Router (quote/swap), register ONE virtual pool under the REAL poolId derivation and fund the
+ * Core till with the pool's inventory. Returns the addresses + the poolId. The `maxIn` caps model
+ * the end of initialized liquidity (an over-ask partial-fills the QUOTE gracefully — the real
+ * class); pass 0 to default them to effectively-unbounded.
+ */
+export async function deployEkuboFixture(
+  walletClient: WalletClient,
+  publicClient: PublicClient,
+  tokens: [Hex, Hex], // ascending (token0 < token1)
+  reserves: [bigint, bigint],
+  fee: bigint, // u64 0.64-fixed fee-on-input (e.g. 9223372036854776n = 0.05%)
+  config: Hex, // the packed pool config word (ekuboConcentratedConfig)
+  opts: { maxIn0?: bigint; maxIn1?: bigint; core?: Hex; router?: Hex; minter?: Account } = {},
+): Promise<{ core: Hex; router: Hex; poolId: Hex }> {
+  const acct = (opts.minter ?? walletClient.account) as Account;
+  const UNCAPPED = (1n << 120n) - 1n;
+  let core = opts.core;
+  let router = opts.router;
+  if (!core) {
+    core = await deployContract(walletClient, publicClient, {
+      abi: ekuboCoreFixtureArtifact.abi,
+      bytecode: ekuboCoreFixtureArtifact.bytecode,
+      args: [],
+    });
+    router = await deployContract(walletClient, publicClient, {
+      abi: ekuboRouterFixtureArtifact.abi,
+      bytecode: ekuboRouterFixtureArtifact.bytecode,
+      args: [core],
+    });
+    await writeAndWait(walletClient, publicClient, {
+      address: core, abi: ekuboCoreFixtureAbi as Abi, functionName: "setRouter",
+      args: [router], account: acct,
+    });
+  }
+  await writeAndWait(walletClient, publicClient, {
+    address: core!, abi: ekuboCoreFixtureAbi as Abi, functionName: "registerPool",
+    args: [
+      tokens[0], tokens[1], config, reserves[0], reserves[1], fee,
+      opts.maxIn0 ?? UNCAPPED, opts.maxIn1 ?? UNCAPPED,
+    ],
+    account: acct,
+  });
+  const poolId = (await publicClient.readContract({
+    address: core!, abi: ekuboCoreFixtureAbi as Abi, functionName: "toPoolId",
+    args: [tokens[0], tokens[1], config],
+  })) as Hex;
+  // Fund the Core till with the pool inventory (the swap pays the out from Core).
+  for (let k = 0; k < 2; k++) {
+    if (reserves[k] <= 0n) continue;
+    await writeAndWait(walletClient, publicClient, {
+      address: tokens[k], abi: erc20Abi as Abi, functionName: "transfer",
+      args: [core!, reserves[k]], account: acct,
+    });
+  }
+  return { core: core!, router: router!, poolId };
 }
 
 /** Register/read surface of the pair-aware discovery mocks (DiscoveryRegistryMocks.sol). */

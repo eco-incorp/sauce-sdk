@@ -3689,6 +3689,14 @@ export interface FermiStateSnapshot {
    *  the canonical 0x…080e. Absent on non-LiquidCore snapshots. */
   lcPool?: Hex;
   lcBbo?: Record<string, { bid: string; ask: string }>;
+  /** EKUBO snapshots only (harness/ekubo-snapshot.ts — fermi-SHAPED: `fermiSwapper` = the
+   *  MEVCaptureRouter, `vault` = the CORE singleton holding the whole till inventory): the Core
+   *  address + the captured VIRTUAL pool's full key (token0/token1/config) + its poolId (== its
+   *  Core storage slot). The etched anvil MUST boot `--hardfork osaka` — the genuine runtime
+   *  executes CLZ (EIP-7939). Absent on non-Ekubo snapshots. */
+  ekuboCore?: Hex;
+  ekuboPoolKey?: { token0: Hex; token1: Hex; config: Hex };
+  ekuboPoolId?: Hex;
   probe: {
     target: { pair: string; ladder: { amountIn: string; amountOut: string }[] };
     second: { pair: string; ladder: { amountIn: string; amountOut: string }[] } | null;
