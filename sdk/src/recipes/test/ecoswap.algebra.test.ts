@@ -138,7 +138,9 @@ describe("Algebra factory config — type + grouping", () => {
   it("real chain configs carry Algebra dynamic-fee factories (arbitrum + polygon)", () => {
     const arb = CHAIN_POOL_CONFIGS.arbitrum.factories.filter((f) => f.factoryType === FactoryType.AlgebraV3);
     const poly = CHAIN_POOL_CONFIGS.polygon.factories.filter((f) => f.factoryType === FactoryType.AlgebraV3);
-    assert.ok(arb.length >= 2, "arbitrum has Camelot V3 + Ramses V2 Algebra factories");
+    // (Was >= 2 with "Camelot V3 + Ramses V2": the dead Ramses V2 AlgebraV3 entry was removed —
+    // its address has no code on Arbitrum; the live Ramses CL is a fee-keyed V3Standard entry.)
+    assert.ok(arb.length >= 1, "arbitrum has the Camelot V3 Algebra factory");
     assert.ok(poly.length >= 1, "polygon has QuickSwap V3 Algebra factory");
     // Every Algebra factory maps to UniV3 (V3-shaped state read AND V3 swap path — the engine
     // services algebraSwapCallback, so these are cooked via swapV3).
