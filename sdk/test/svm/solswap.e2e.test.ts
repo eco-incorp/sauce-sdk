@@ -27,20 +27,8 @@ import type { Address, KeyPairSigner } from '@solana/kit';
 import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import { FailedTransactionMetadata, LiteSVM } from 'litesvm';
 import { estimatePacket } from '@eco-incorp/sauce-compiler';
-import {
-  buildExecuteInstruction,
-  deriveEnginePdas,
-  KIND_ARGS,
-  KIND_FRAMES,
-  KIND_HEAP,
-  KIND_STACK,
-  PDA_ARGS_BYTES,
-  PDA_FRAMES_BYTES,
-  PDA_HEAP_BYTES,
-  PDA_STACK_BYTES,
-  resolveAccounts,
-} from '../../src/svm/index.js';
-import type { AccountResolution, EnginePda, EnginePdas } from '../../src/svm/index.js';
+import { buildExecuteInstruction, buildHeapFramePrepend, resolveAccounts } from '../../src/svm/index.js';
+import type { AccountResolution } from '../../src/svm/index.js';
 import { solswap, solswapQuote } from '../../src/recipes/solswap/index.js';
 import type { SolswapConfig, SolswapOutput } from '../../src/recipes/solswap/index.js';
 
@@ -175,7 +163,6 @@ interface Harness {
   svm: LiteSVM;
   programId: Address;
   payer: KeyPairSigner;
-  pdas: EnginePdas;
 }
 
 const randomAddress = (): Address => getAddressCodec().decode(crypto.getRandomValues(new Uint8Array(32)));
@@ -188,34 +175,9 @@ const startEngine = async (): Promise<Harness> => {
   const payer = await generateKeyPairSigner();
   svm.airdrop(payer.address, lamports(1_000_000_000_000n));
 
-  // Fast-path PDA provisioning: full-size zeroed data behind the canonical
-  // [kind, bump, session] header — what the on-chain init growth loop builds,
-  // minus the transactions (the init path itself is covered by
-  // instructions.test.ts). Memory PDAs derive per (owner, session 0); the
-  // owner is the payer — the plan's first in-list signer.
-  const pdas = await deriveEnginePdas(programId, payer.address);
-  const specs: [EnginePda, number, number][] = [
-    [pdas.stack, KIND_STACK, PDA_STACK_BYTES],
-    [pdas.heap, KIND_HEAP, PDA_HEAP_BYTES],
-    [pdas.frames, KIND_FRAMES, PDA_FRAMES_BYTES],
-    [pdas.args, KIND_ARGS, PDA_ARGS_BYTES],
-  ];
-  for (const [pda, kind, size] of specs) {
-    const data = new Uint8Array(size);
-    data[0] = kind;
-    data[1] = pda.bump;
-    data[2] = 0;
-    svm.setAccount({
-      address: pda.address,
-      data,
-      executable: false,
-      lamports: lamports(svm.minimumBalanceForRentExemption(BigInt(size))),
-      programAddress: programId,
-      space: BigInt(size),
-    });
-  }
-
-  return { svm, programId, payer, pdas };
+  // No memory setup: interpreter memory is the transaction's 256 KiB heap
+  // frame, requested by the RequestHeapFrame prepend on every execute.
+  return { svm, programId, payer };
 };
 
 interface Scenario {
@@ -272,7 +234,6 @@ const execute = async ({ harness, output, resolution }: Scenario): Promise<RunRe
   const accounts = resolveAccounts(output.accountPlan, resolution, harness.payer.address);
   const instruction = buildExecuteInstruction({
     programId: harness.programId,
-    pdas: harness.pdas,
     bytecode: output.bytecode,
     accounts,
   });
@@ -284,7 +245,7 @@ const execute = async ({ harness, output, resolution }: Scenario): Promise<RunRe
   const message = pipe(
     createTransactionMessage({ version: 0 }),
     (m) => setTransactionMessageFeePayerSigner(harness.payer, m),
-    (m) => appendTransactionMessageInstructions([instruction], m),
+    (m) => appendTransactionMessageInstructions([buildHeapFramePrepend(), instruction], m),
     (m) => harness.svm.setTransactionMessageLifetimeUsingLatestBlockhash(m),
   );
   const transaction = await signTransactionMessageWithSigners(message);

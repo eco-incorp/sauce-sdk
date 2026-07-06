@@ -4,14 +4,12 @@ import {
   buildComputeBudgetPrepend,
   buildExecuteInstruction,
   buildExecuteTransaction,
-  deriveEnginePdas,
+  buildHeapFramePrepend,
   getTransactionSize,
   resolveAccounts,
 } from '../../src/svm/index.js';
 
 const PROGRAM_ID = address('Stake11111111111111111111111111111111111111');
-// Memory PDAs derive per (owner, session); a fixed owner keeps the fixtures stable.
-const PAYER_OWNER = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 // 32 base58 '1's decode to the 32-byte zero blockhash
 const BLOCKHASH = {
   blockhash: '11111111111111111111111111111111' as Blockhash,
@@ -26,10 +24,10 @@ beforeAll(async () => {
 
 describe('buildExecuteTransaction', () => {
   it('signs a version-0 transaction with the fee payer and all instructions', async () => {
-    const pdas = await deriveEnginePdas(PROGRAM_ID, PAYER_OWNER);
     const instructions = [
       ...buildComputeBudgetPrepend({ unitLimit: 200_000 }),
-      buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts: [] }),
+      buildHeapFramePrepend(),
+      buildExecuteInstruction({ programId: PROGRAM_ID, bytecode: new Uint8Array([0x00]), accounts: [] }),
     ];
 
     const transaction = await buildExecuteTransaction({ payer, instructions, latestBlockhash: BLOCKHASH });
@@ -37,7 +35,7 @@ describe('buildExecuteTransaction', () => {
     const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
     expect(compiled.version).toBe(0);
     if (compiled.version !== 0) throw new Error('expected a v0 compiled message');
-    expect(compiled.instructions).toHaveLength(2);
+    expect(compiled.instructions).toHaveLength(3);
     // fee payer is the first static account
     expect(compiled.staticAccounts[0]).toBe(payer.address);
 
@@ -55,11 +53,11 @@ describe('buildExecuteTransaction', () => {
 
   it('signs for a non-payer plan signer attached to the execute metas via resolveAccounts', async () => {
     const delegate = await generateKeyPairSigner();
-    const pdas = await deriveEnginePdas(PROGRAM_ID, PAYER_OWNER);
     const plan = { metas: [{ ref: 'delegate', writable: false, signer: true }] };
     const accounts = resolveAccounts(plan, { delegate: { address: delegate.address, signer: delegate } }, payer.address);
     const instructions = [
-      buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts }),
+      buildHeapFramePrepend(),
+      buildExecuteInstruction({ programId: PROGRAM_ID, bytecode: new Uint8Array([0x00]), accounts }),
     ];
 
     const transaction = await buildExecuteTransaction({ payer, instructions, latestBlockhash: BLOCKHASH });

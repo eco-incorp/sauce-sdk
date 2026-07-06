@@ -1,144 +1,42 @@
 import { AccountRole, address } from '@solana/kit';
 import {
   BUFFER_HEADER_BYTES,
+  BYTECODE_FORMAT_EPOCH,
   CLOSE_BUFFER_DISCRIMINATOR,
-  CLOSE_MEMORY_DISCRIMINATOR,
   EXECUTE_DISCRIMINATOR,
   EXECUTE_FROM_ACCOUNT_DISCRIMINATOR,
   FINALIZE_BUFFER_DISCRIMINATOR,
-  INIT_ARGS_DISCRIMINATOR,
   INIT_BUFFER_DISCRIMINATOR,
-  INIT_FRAMES_DISCRIMINATOR,
-  INIT_HEAP_DISCRIMINATOR,
-  INIT_STACK_DISCRIMINATOR,
   MAX_BUFFER_CAPACITY,
-  PDA_ARGS_BYTES,
-  PDA_FRAMES_BYTES,
   PDA_GROWTH_STEP,
-  PDA_HEAP_BYTES,
-  PDA_STACK_BYTES,
   WRITE_BUFFER_DISCRIMINATOR,
   buildCloseBufferInstruction,
-  buildCloseMemoryInstruction,
   buildExecuteFromAccountInstruction,
   buildExecuteInstruction,
   buildFinalizeBufferInstruction,
   buildInitBufferInstructions,
-  buildInitInstructions,
   buildStagingPlan,
   buildWriteBufferInstruction,
-  deriveEnginePdas,
+  stagedArgsBudget,
 } from '../../src/svm/index.js';
-import type { EnginePdas } from '../../src/svm/index.js';
 
 const PROGRAM_ID = address('Stake11111111111111111111111111111111111111');
 const PAYER = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 const BUFFER = address('So11111111111111111111111111111111111111112');
 const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
 
-let pdas: EnginePdas;
-
-beforeAll(async () => {
-  pdas = await deriveEnginePdas(PROGRAM_ID, PAYER);
-});
-
-describe('engine PDA constants', () => {
+describe('engine constants', () => {
   it('match the engine crate values', () => {
-    expect(PDA_STACK_BYTES).toBe(3 + 1024 * 33); // [kind, bump, session] + 1024 slots of 33 bytes
-    expect(PDA_HEAP_BYTES).toBe(3 + 0xffff); // header + u16::MAX
-    expect(PDA_FRAMES_BYTES).toBe(3 + 4 * (256 + 256) * 33); // header + 4 eval depths * (value+heap slots) * 33
-    expect(PDA_ARGS_BYTES).toBe(32 + 8192); // reserved 32-byte header word + arg region
-    expect(PDA_GROWTH_STEP).toBe(10240); // MAX_PERMITTED_DATA_INCREASE
     expect(BUFFER_HEADER_BYTES).toBe(80);
     expect(MAX_BUFFER_CAPACITY).toBe(0xffff); // the last addressable 16-bit pc
-  });
-});
-
-describe('buildInitInstructions', () => {
-  it('emits the exact 4 + 7 + 7 + 1 grow-to-size sequence with the session payload', () => {
-    const instructions = buildInitInstructions(PROGRAM_ID, pdas, PAYER);
-
-    expect(instructions).toHaveLength(19);
-    expect(Math.ceil(PDA_STACK_BYTES / PDA_GROWTH_STEP)).toBe(4);
-    expect(Math.ceil(PDA_HEAP_BYTES / PDA_GROWTH_STEP)).toBe(7);
-    expect(Math.ceil(PDA_FRAMES_BYTES / PDA_GROWTH_STEP)).toBe(7);
-    expect(Math.ceil(PDA_ARGS_BYTES / PDA_GROWTH_STEP)).toBe(1);
-
-    for (const [i, instruction] of instructions.entries()) {
-      const [discriminator, pda] =
-        i < 4
-          ? [INIT_STACK_DISCRIMINATOR, pdas.stack]
-          : i < 11
-            ? [INIT_HEAP_DISCRIMINATOR, pdas.heap]
-            : i < 18
-              ? [INIT_FRAMES_DISCRIMINATOR, pdas.frames]
-              : [INIT_ARGS_DISCRIMINATOR, pdas.args];
-
-      // data is the 8-byte discriminator + EXACTLY one session byte
-      expect(instruction.data).toEqual(new Uint8Array([...discriminator, 0]));
-      expect(instruction.programAddress).toBe(PROGRAM_ID);
-      expect(instruction.accounts).toEqual([
-        { address: PAYER, role: AccountRole.WRITABLE_SIGNER },
-        { address: pda.address, role: AccountRole.WRITABLE },
-        { address: SYSTEM_PROGRAM, role: AccountRole.READONLY },
-      ]);
-    }
+    expect(BYTECODE_FORMAT_EPOCH).toBe(2); // Wave D — all epoch-1 buffers are dead
+    expect(PDA_GROWTH_STEP).toBe(10240); // MAX_PERMITTED_DATA_INCREASE
   });
 
-  it('stamps a non-zero session byte into every payload', () => {
-    const instructions = buildInitInstructions(PROGRAM_ID, pdas, PAYER, {}, 7);
-
-    for (const instruction of instructions) expect(instruction.data?.[8]).toBe(7);
-  });
-
-  it('emits only the missing growth steps when current sizes are provided', () => {
-    const instructions = buildInitInstructions(PROGRAM_ID, pdas, PAYER, {
-      stack: PDA_STACK_BYTES,
-      heap: 30000, // ceil((65538 - 30000) / 10240) = 4 steps left
-      frames: PDA_FRAMES_BYTES,
-      args: PDA_ARGS_BYTES,
-    });
-
-    expect(instructions).toHaveLength(4);
-    for (const ix of instructions) expect(ix.data?.subarray(0, 8)).toEqual(INIT_HEAP_DISCRIMINATOR);
-  });
-
-  it('returns fresh instruction objects that do not alias the discriminator constants', () => {
-    const instructions = buildInitInstructions(PROGRAM_ID, pdas, PAYER);
-
-    expect(instructions[0]).not.toBe(instructions[1]);
-    expect(instructions[0].data).not.toBe(instructions[1].data);
-    expect(instructions[0].data).not.toBe(INIT_STACK_DISCRIMINATOR);
-  });
-
-  it('emits nothing when all PDAs are at full size', () => {
-    const instructions = buildInitInstructions(PROGRAM_ID, pdas, PAYER, {
-      stack: PDA_STACK_BYTES,
-      heap: PDA_HEAP_BYTES,
-      frames: PDA_FRAMES_BYTES,
-      args: PDA_ARGS_BYTES,
-    });
-
-    expect(instructions).toHaveLength(0);
-  });
-
-  it('rejects a non-u8 session', () => {
-    expect(() => buildInitInstructions(PROGRAM_ID, pdas, PAYER, {}, 256)).toThrow('session must be a u8 (0-255), got 256');
-  });
-});
-
-describe('buildCloseMemoryInstruction', () => {
-  it('lists [owner WS, stack, heap, frames, args W] with the session payload', () => {
-    const instruction = buildCloseMemoryInstruction({ programId: PROGRAM_ID, pdas, owner: PAYER, session: 3 });
-
-    expect(instruction.data).toEqual(new Uint8Array([...CLOSE_MEMORY_DISCRIMINATOR, 3]));
-    expect(instruction.accounts).toEqual([
-      { address: PAYER, role: AccountRole.WRITABLE_SIGNER },
-      { address: pdas.stack.address, role: AccountRole.WRITABLE },
-      { address: pdas.heap.address, role: AccountRole.WRITABLE },
-      { address: pdas.frames.address, role: AccountRole.WRITABLE },
-      { address: pdas.args.address, role: AccountRole.WRITABLE },
-    ]);
+  it('staged args budget follows the measured 939 - 33N packet line', () => {
+    expect(stagedArgsBudget(0)).toBe(939);
+    expect(stagedArgsBudget(6)).toBe(939 - 33 * 6);
+    expect(stagedArgsBudget(10)).toBe(939 - 33 * 10);
   });
 });
 
@@ -148,16 +46,15 @@ describe('buildExecuteInstruction', () => {
   const userB = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
 
   it('prefixes the bytecode with the execute discriminator', () => {
-    const instruction = buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode, accounts: [] });
+    const instruction = buildExecuteInstruction({ programId: PROGRAM_ID, bytecode, accounts: [] });
 
     expect(instruction.data).toEqual(new Uint8Array([...EXECUTE_DISCRIMINATOR, 0x01, 0xaa, 0x00]));
     expect(instruction.programAddress).toBe(PROGRAM_ID);
   });
 
-  it('orders accounts [stack W, heap W, frames W, ...user metas]', () => {
+  it('the account list IS the user-account index space (no fixed prefix)', () => {
     const instruction = buildExecuteInstruction({
       programId: PROGRAM_ID,
-      pdas,
       bytecode,
       accounts: [
         { address: userA, role: AccountRole.WRITABLE },
@@ -166,37 +63,28 @@ describe('buildExecuteInstruction', () => {
       ],
     });
 
-    // user-account index 0 = instruction account 3
+    // user-account index i = instruction account i
     expect(instruction.accounts).toEqual([
-      { address: pdas.stack.address, role: AccountRole.WRITABLE },
-      { address: pdas.heap.address, role: AccountRole.WRITABLE },
-      { address: pdas.frames.address, role: AccountRole.WRITABLE },
       { address: userA, role: AccountRole.WRITABLE },
       { address: PAYER, role: AccountRole.WRITABLE_SIGNER },
       { address: userB, role: AccountRole.READONLY },
     ]);
   });
 
-  it('keeps the payer meta a signer so MSG_SENDER resolves', () => {
-    const instruction = buildExecuteInstruction({
-      programId: PROGRAM_ID,
-      pdas,
-      bytecode,
-      accounts: [{ address: PAYER, role: AccountRole.WRITABLE_SIGNER }],
-    });
+  it('a signerless account list is valid (NoSigner is lazy)', () => {
+    const instruction = buildExecuteInstruction({ programId: PROGRAM_ID, bytecode, accounts: [] });
 
-    expect(instruction.accounts?.[3]).toEqual({ address: PAYER, role: AccountRole.WRITABLE_SIGNER });
+    expect(instruction.accounts).toEqual([]);
   });
 });
 
-describe('buildExecuteFromAccountInstruction', () => {
+describe('buildExecuteFromAccountInstruction — the v2 payload grammar', () => {
   const user = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
 
   it('prepends the buffer READ-ONLY: the user tail is byte-identical to inline execute', () => {
     const instruction = buildExecuteFromAccountInstruction({
       programId: PROGRAM_ID,
       buffer: BUFFER,
-      pdas,
       accounts: [
         { address: user, role: AccountRole.WRITABLE },
         { address: PAYER, role: AccountRole.READONLY_SIGNER },
@@ -205,27 +93,44 @@ describe('buildExecuteFromAccountInstruction', () => {
 
     expect(instruction.accounts).toEqual([
       { address: BUFFER, role: AccountRole.READONLY },
-      { address: pdas.stack.address, role: AccountRole.WRITABLE },
-      { address: pdas.heap.address, role: AccountRole.WRITABLE },
-      { address: pdas.frames.address, role: AccountRole.WRITABLE },
       { address: user, role: AccountRole.WRITABLE },
       { address: PAYER, role: AccountRole.READONLY_SIGNER },
     ]);
-    // no pin: the data is the bare discriminator
-    expect(instruction.data).toEqual(EXECUTE_FROM_ACCOUNT_DISCRIMINATOR);
   });
 
-  it('appends the optional 32-byte content-hash pin to the data', () => {
+  it('pinless, argless: the payload is exactly the required flags byte [0x00] — never empty', () => {
+    const instruction = buildExecuteFromAccountInstruction({ programId: PROGRAM_ID, buffer: BUFFER, accounts: [] });
+
+    expect(instruction.data).toEqual(new Uint8Array([...EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, 0x00]));
+  });
+
+  it('pin: flags 0x01 + the 32-byte content-hash pin', () => {
     const pin = new Uint8Array(32).fill(0xcd);
     const instruction = buildExecuteFromAccountInstruction({
       programId: PROGRAM_ID,
       buffer: BUFFER,
-      pdas,
       accounts: [],
       expectedSha256: pin,
     });
 
-    expect(instruction.data).toEqual(new Uint8Array([...EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, ...pin]));
+    expect(instruction.data).toEqual(new Uint8Array([...EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, 0x01, ...pin]));
+  });
+
+  it('args ride after the flags byte (pinless) and after the pin (pinned)', () => {
+    const args = new Uint8Array([0xca, 0xfe]);
+    const pin = new Uint8Array(32).fill(0xef);
+
+    const pinless = buildExecuteFromAccountInstruction({ programId: PROGRAM_ID, buffer: BUFFER, accounts: [], args });
+    expect(pinless.data).toEqual(new Uint8Array([...EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, 0x00, 0xca, 0xfe]));
+
+    const pinned = buildExecuteFromAccountInstruction({
+      programId: PROGRAM_ID,
+      buffer: BUFFER,
+      accounts: [],
+      expectedSha256: pin,
+      args,
+    });
+    expect(pinned.data).toEqual(new Uint8Array([...EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, 0x01, ...pin, 0xca, 0xfe]));
   });
 
   it('rejects a pin that is not exactly 32 bytes', () => {
@@ -233,7 +138,6 @@ describe('buildExecuteFromAccountInstruction', () => {
       buildExecuteFromAccountInstruction({
         programId: PROGRAM_ID,
         buffer: BUFFER,
-        pdas,
         accounts: [],
         expectedSha256: new Uint8Array(31),
       }),

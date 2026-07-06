@@ -65,10 +65,11 @@ interface SharedModule {
   accounts: AccountRegistry;
   /**
    * svm: compiling for staged execution (execute_from_account). Compile-time
-   * args are NOT baked into the blob — the prologue SLOADs them from the args
-   * PDA at user-tail index 0 — and CALLDATA emission is rejected (it copies
-   * the whole staged program to the heap). Module-shared so every function
-   * context sees the gate.
+   * args are NOT baked into the blob — the prologue SLICEs them out of the
+   * CALLDATA composite (`program ++ payload args`) — and user-level msg.data
+   * is rejected (the prologue owns the single CALLDATA; a second one copies
+   * the whole staged program to the heap again). Module-shared so every
+   * function context sees the gate.
    */
   staged: boolean;
 }
@@ -186,7 +187,7 @@ export class CompilerContext {
     return this.target === 'svm';
   }
 
-  /** svm: compiling for staged execution — args read from the args PDA, CALLDATA rejected. */
+  /** svm: compiling for staged execution — args read from the payload via CALLDATA; msg.data rejected. */
   get staged(): boolean {
     return this.module.staged;
   }
@@ -216,11 +217,6 @@ export class CompilerContext {
   /** svm: intern a symbolic account ref → stable user-account index (first-use order). */
   internAccount(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
     return this.module.accounts.intern(ref, flags);
-  }
-
-  /** svm staged: pre-place a reserved ref (args PDA / payer) without locking the registry mode. */
-  reserveAccount(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
-    return this.module.accounts.reserve(ref, flags);
   }
 
   /** svm: record that a raw numeric account index was used (locks out symbolic refs). */

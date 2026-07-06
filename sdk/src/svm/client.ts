@@ -1,21 +1,19 @@
 import { createSolanaRpc, createSolanaRpcSubscriptions } from '@solana/kit';
 import type { Address, AddressesByLookupTableAddress, Instruction, Signature, TransactionSigner } from '@solana/kit';
 import type { AccountPlan, ArgsLayout, ArgValue } from '@eco-incorp/sauce-compiler';
-import { buildArgsWriteInstruction } from './args.js';
+import { encodePayloadArgs } from './args.js';
 import {
   buildCloseBufferInstruction,
   buildExecuteFromAccountInstruction,
   buildExecuteInstruction,
   buildFinalizeBufferInstruction,
   buildInitBufferInstructions,
-  buildInitInstructions,
   buildStagingPlan,
   buildWriteBufferInstruction,
 } from './instructions.js';
-import { deriveBufferPda, deriveEnginePdas } from './pda.js';
-import type { EnginePdas } from './pda.js';
-import { buildComputeBudgetPrepend } from './prepends.js';
-import { ARGS_REF, resolveAccounts } from './resolve.js';
+import { deriveBufferPda } from './pda.js';
+import { buildComputeBudgetPrepend, buildHeapFramePrepend } from './prepends.js';
+import { resolveAccounts } from './resolve.js';
 import type { AccountResolution } from './resolve.js';
 import { recommendedComputeUnitLimit, sendExecute, simulateExecute } from './send.js';
 import type { SendExecuteResult, SimulateExecuteResult } from './send.js';
@@ -28,17 +26,17 @@ export interface SauceSvmClientConfig {
   wsUrl?: string;
   programId: Address;
   payer: TransactionSigner;
-  /**
-   * Memory-set session byte (default 0). The engine derives the memory PDAs
-   * per (owner, session); rotate sessions to run parallel executes as one
-   * identity (each session carries its own refundable rent deposit).
-   */
-  session?: number;
 }
 
 export interface SimulateOpts {
   prepends?: readonly Instruction[];
   lookupTables?: AddressesByLookupTableAddress;
+  /**
+   * Append the fee payer as an in-list readonly signer when the plan yields no
+   * signer meta. Needed ONLY for programs that read MSG_SENDER/TX_ORIGIN —
+   * NoSigner is lazy, so everything else runs (and simulates) signerless.
+   */
+  appendPayerSigner?: boolean;
 }
 
 export interface ExecuteOpts extends SimulateOpts {
@@ -77,9 +75,6 @@ export interface ExecuteStagedOpts extends SimulateStagedOpts {
 }
 
 export interface SauceSvmClient {
-  pdas: EnginePdas;
-  /** Grows the engine memory PDAs (stack/heap/frames/args) to full size; no-op when already initialized. */
-  bootstrap(): Promise<void>;
   simulate(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateOpts): Promise<SimulateExecuteResult>;
   execute(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: ExecuteOpts): Promise<SendExecuteResult>;
   /**
@@ -93,18 +88,18 @@ export interface SauceSvmClient {
   closeBuffer(index: number): Promise<SendExecuteResult>;
   simulateStaged(buffer: Address | StagedBuffer, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateStagedOpts): Promise<SimulateExecuteResult>;
   /**
-   * Executes a finalized buffer, hash-pinned. With `args`, the transaction is
-   * [prepends…, inline args-writer execute, execute_from_account] — the writer
-   * SSTOREs fresh values into the args PDA the staged prologue reads, so one
-   * staged buffer serves every argument set without restaging.
+   * Executes a finalized buffer, hash-pinned, in ONE instruction. With `args`,
+   * the per-execution values are encoded into the instruction payload
+   * (encodePayloadArgs) after the flags byte and pin — the staged program
+   * reads them through its CALLDATA prologue, so one staged buffer serves
+   * every argument set without restaging.
    */
   executeStaged(buffer: Address | StagedBuffer, plan: AccountPlan, resolution: AccountResolution, opts?: ExecuteStagedOpts): Promise<SendExecuteResult>;
 }
 
-export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, session = 0 }: SauceSvmClientConfig): Promise<SauceSvmClient> {
+export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }: SauceSvmClientConfig): Promise<SauceSvmClient> {
   const rpc = createSolanaRpc(rpcUrl);
   const rpcSubscriptions = createSolanaRpcSubscriptions(wsUrl ?? rpcUrl.replace(/^http/, 'ws'));
-  const pdas = await deriveEnginePdas(programId, payer.address, session);
   /** Content hashes of buffers staged by THIS client — the automatic execute pins. */
   const stagedHashes = new Map<Address, Uint8Array>();
 
@@ -114,6 +109,7 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
     return value === null ? 0 : Number(value.space);
   }
 
+  /** Sends staging/lifecycle instructions — NO heap frame (they never touch interpreter memory). */
   async function sendInstructions(instructions: readonly Instruction[]): Promise<SendExecuteResult> {
     const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
     const transaction = await buildExecuteTransaction({ payer, instructions, latestBlockhash });
@@ -121,18 +117,37 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
     return sendExecute({ rpc, rpcSubscriptions, transaction });
   }
 
+  /**
+   * Signs an execute transaction: RequestHeapFrame(262144) FIRST (required on
+   * every execute/simulate; add-once — caller prepends must not carry their
+   * own), then the prepends, then the execute instruction.
+   */
+  async function signExecuteTransaction(
+    executeInstruction: Instruction,
+    prepends: readonly Instruction[],
+    lookupTables?: AddressesByLookupTableAddress,
+  ): Promise<SignedExecuteTransaction> {
+    const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
+
+    return buildExecuteTransaction({
+      payer,
+      instructions: [buildHeapFramePrepend(), ...prepends, executeInstruction],
+      latestBlockhash,
+      lookupTables,
+    });
+  }
+
   async function buildTransaction(
     bytecode: Uint8Array,
     plan: AccountPlan,
     resolution: AccountResolution,
     prepends: readonly Instruction[],
-    lookupTables?: AddressesByLookupTableAddress,
+    opts: SimulateOpts,
   ): Promise<SignedExecuteTransaction> {
-    const accounts = resolveAccounts(plan, resolution, payer.address);
-    const executeInstruction = buildExecuteInstruction({ programId, pdas, bytecode, accounts });
-    const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
+    const accounts = resolveAccounts(plan, resolution, payer.address, { appendPayerSigner: opts.appendPayerSigner });
+    const executeInstruction = buildExecuteInstruction({ programId, bytecode, accounts });
 
-    return buildExecuteTransaction({ payer, instructions: [...prepends, executeInstruction], latestBlockhash, lookupTables });
+    return signExecuteTransaction(executeInstruction, prepends, opts.lookupTables);
   }
 
   async function simulate(
@@ -141,24 +156,9 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
     resolution: AccountResolution,
     opts: SimulateOpts = {},
   ): Promise<SimulateExecuteResult> {
-    const transaction = await buildTransaction(bytecode, plan, resolution, opts.prepends ?? [], opts.lookupTables);
+    const transaction = await buildTransaction(bytecode, plan, resolution, opts.prepends ?? [], opts);
 
     return simulateExecute(rpc, transaction);
-  }
-
-  /**
-   * Resolves the staged plan: the reserved 'args' ref (user index 0) binds to
-   * the derived args PDA — a conflicting resolution entry is refused rather
-   * than silently redirecting the writer's target.
-   */
-  function stagedResolution(resolution: AccountResolution): AccountResolution {
-    const provided = resolution[ARGS_REF];
-
-    if (provided !== undefined && (typeof provided === 'string' ? provided : provided.address) !== pdas.args.address) {
-      throw new Error(`account ref 'args' is reserved for the args PDA ${pdas.args.address} in staged mode`);
-    }
-
-    return { ...resolution, [ARGS_REF]: pdas.args.address };
   }
 
   function stagedPin(address: Address, expectedSha256?: Uint8Array): Uint8Array {
@@ -182,18 +182,11 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
   ): Promise<SignedExecuteTransaction> {
     const address = typeof buffer === 'string' ? buffer : buffer.address;
     const expectedSha256 = stagedPin(address, opts.expectedSha256 ?? (typeof buffer === 'string' ? undefined : buffer.sha256));
-    const accounts = resolveAccounts(plan, stagedResolution(resolution), payer.address);
-    const instructions: Instruction[] = [...prepends];
+    const accounts = resolveAccounts(plan, resolution, payer.address, { appendPayerSigner: opts.appendPayerSigner });
+    const args = opts.args && opts.args.layout.slots.length > 0 ? encodePayloadArgs(opts.args.layout, opts.args.values) : undefined;
+    const executeInstruction = buildExecuteFromAccountInstruction({ programId, buffer: address, accounts, expectedSha256, args });
 
-    if (opts.args && opts.args.layout.slots.length > 0) {
-      instructions.push(buildArgsWriteInstruction({ programId, pdas, payer: payer.address, layout: opts.args.layout, values: opts.args.values }));
-    }
-
-    instructions.push(buildExecuteFromAccountInstruction({ programId, buffer: address, pdas, accounts, expectedSha256 }));
-
-    const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-
-    return buildExecuteTransaction({ payer, instructions, latestBlockhash, lookupTables: opts.lookupTables });
+    return signExecuteTransaction(executeInstruction, prepends, opts.lookupTables);
   }
 
   async function simulateStaged(
@@ -232,22 +225,6 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
   }
 
   return {
-    pdas,
-
-    async bootstrap(): Promise<void> {
-      const [stack, heap, frames, args] = await Promise.all([
-        currentDataSize(pdas.stack.address),
-        currentDataSize(pdas.heap.address),
-        currentDataSize(pdas.frames.address),
-        currentDataSize(pdas.args.address),
-      ]);
-      const instructions = buildInitInstructions(programId, pdas, payer.address, { stack, heap, frames, args }, session);
-
-      if (instructions.length === 0) return;
-
-      await sendInstructions(instructions);
-    },
-
     simulate,
 
     async execute(
@@ -257,10 +234,15 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
       opts: ExecuteOpts = {},
     ): Promise<SendExecuteResult> {
       const prepends = await autoComputeUnitPrepends(
-        () => simulate(bytecode, plan, resolution, { prepends: opts.prepends, lookupTables: opts.lookupTables }),
+        () =>
+          simulate(bytecode, plan, resolution, {
+            prepends: opts.prepends,
+            lookupTables: opts.lookupTables,
+            appendPayerSigner: opts.appendPayerSigner,
+          }),
         opts,
       );
-      const transaction = await buildTransaction(bytecode, plan, resolution, prepends, opts.lookupTables);
+      const transaction = await buildTransaction(bytecode, plan, resolution, prepends, opts);
 
       return sendExecute({ rpc, rpcSubscriptions, transaction });
     },
@@ -332,7 +314,14 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer, se
       opts: ExecuteStagedOpts = {},
     ): Promise<SendExecuteResult> {
       const prepends = await autoComputeUnitPrepends(
-        () => simulateStaged(buffer, plan, resolution, { ...opts, prepends: opts.prepends }),
+        () =>
+          simulateStaged(buffer, plan, resolution, {
+            prepends: opts.prepends,
+            lookupTables: opts.lookupTables,
+            appendPayerSigner: opts.appendPayerSigner,
+            args: opts.args,
+            expectedSha256: opts.expectedSha256,
+          }),
         opts,
       );
       const transaction = await buildStagedTransaction(buffer, plan, resolution, prepends, opts);

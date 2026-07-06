@@ -1,8 +1,9 @@
 /**
- * Staged svm compilation (execute_from_account) — the staged arg lowering
- * (SLOAD + CAST_LE off the args PDA instead of baked literals), the argsLayout
- * writer contract, the reserved account-plan slots, and the staged-mode gates.
- * Byte fixtures follow the house style: hex string + a comment decoding them.
+ * Staged svm compilation (execute_from_account) — the payload-args lowering
+ * (ONE CALLDATA parked in VALUES slot 0, then per-arg SLICE(L + offset, len)
+ * + CAST_BE instead of baked literals), the argsLayout payload contract, and
+ * the staged-mode gates. Byte fixtures follow the house style: hex string + a
+ * comment decoding them.
  */
 import { compile } from '../src/index.js';
 
@@ -19,20 +20,22 @@ describe('staged svm — arg lowering (byte-exact, 2-arg program in both modes)'
     expect(r.argsLayout).toBeUndefined();
   });
 
-  it('staged mode reads each arg from the args PDA: [len 32][offset][index 0][SLOAD][CAST_LE]', () => {
+  it('staged mode reads each arg from the CALLDATA composite: park once, SLICE + CAST_BE per arg', () => {
     const r = compile(src, { target: 'svm', staged: true, args: [7n, 5n] });
 
-    // arg0: [BYTE_1 20][BYTE_1 20][BYTE_1 00][SLOAD 81][CAST_LE 55]  (32 bytes at offset 32, account 0)
-    // arg1: [BYTE_1 20][BYTE_1 40][BYTE_1 00][SLOAD 81][CAST_LE 55]  (32 bytes at offset 64)
+    // L = 26 (0x001a): [CALLDATA a5][WRITE_VALUE 0 c100] — the composite parked once — then
+    // arg0: [READ_VALUE 0 5000][BYTE_2 001a][BYTE_1 20][SLICE 95][CAST_BE 54]  (32 bytes at L + 0)
+    // arg1: [READ_VALUE 0 5000][BYTE_2 003a][BYTE_1 20][SLICE 95][CAST_BE 54]  (32 bytes at L + 32)
     // main body unchanged: [SDUP2][SDUP2][ADD][MSTORE][STOP]
-    expect(hex(r.bytecode[0])).toBe('01200120010081550120014001008155d1d121f200');
+    expect(hex(r.bytecode[0])).toBe('a5c100500002001a01209554500002003a01209554d1d121f200');
+    expect(r.bytecode[0].length).toBe(26); // the SLICE offsets embed exactly this length
     expect(r.argsLayout).toEqual({
-      accountIndex: 0,
-      regionOffset: 32,
+      mode: 'calldata',
+      programLength: 26,
       byteLength: 64,
       slots: [
-        { arg: 0, kind: 'scalar', offset: 32, length: 32 },
-        { arg: 1, kind: 'scalar', offset: 64, length: 32 },
+        { arg: 0, kind: 'scalar', offset: 0, length: 32 },
+        { arg: 1, kind: 'scalar', offset: 32, length: 32 },
       ],
     });
   });
@@ -44,24 +47,25 @@ describe('staged svm — arg lowering (byte-exact, 2-arg program in both modes)'
     expect(hex(a.bytecode[0])).toBe(hex(b.bytecode[0]));
   });
 
-  it('a bytes arg reads its slot WITHOUT CAST_LE (Bytes descriptor, like the inline literal)', () => {
+  it('a bytes arg SLICEs its slot WITHOUT CAST_BE (Bytes descriptor, like the inline literal)', () => {
     const src = 'function main(d) { return d }';
     const inline = compile(src, { target: 'svm', args: ['0xdeadbeef'] });
     const staged = compile(src, { target: 'svm', staged: true, args: ['0xdeadbeef'] });
 
     // inline: [BYTES 90][len 04][de ad be ef] then [SDUP1][MSTORE][STOP]
     expect(hex(inline.bytecode[0])).toBe('9004deadbeefd0f200');
-    // staged: [BYTE_1 04][BYTE_1 20][BYTE_1 00][SLOAD] — 4 bytes at offset 32, no cast
-    expect(hex(staged.bytecode[0])).toBe('01040120010081d0f200');
+    // staged (L = 14, 0x000e): [CALLDATA][WRITE_VALUE 0] then
+    // [READ_VALUE 0][BYTE_2 000e][BYTE_1 04][SLICE] — 4 bytes at L + 0, no cast
+    expect(hex(staged.bytecode[0])).toBe('a5c100500002000e010495d0f200');
     expect(staged.argsLayout).toEqual({
-      accountIndex: 0,
-      regionOffset: 32,
-      byteLength: 32,
-      slots: [{ arg: 0, kind: 'bytes', offset: 32, length: 4 }],
+      mode: 'calldata',
+      programLength: 14,
+      byteLength: 4,
+      slots: [{ arg: 0, kind: 'bytes', offset: 0, length: 4 }],
     });
   });
 
-  it('slots stride 32-byte-aligned: a 40-byte bytes arg advances the next slot by 64', () => {
+  it('slots pack back to back: a 40-byte bytes arg advances the next slot by exactly 40', () => {
     const r = compile('function main(a, d, b) { return a + b }', {
       target: 'svm',
       staged: true,
@@ -69,47 +73,62 @@ describe('staged svm — arg lowering (byte-exact, 2-arg program in both modes)'
     });
 
     expect(r.argsLayout).toEqual({
-      accountIndex: 0,
-      regionOffset: 32,
-      byteLength: 128,
+      mode: 'calldata',
+      programLength: r.bytecode[0].length,
+      byteLength: 104,
       slots: [
-        { arg: 0, kind: 'scalar', offset: 32, length: 32 },
-        { arg: 1, kind: 'bytes', offset: 64, length: 40 },
-        { arg: 2, kind: 'scalar', offset: 128, length: 32 },
+        { arg: 0, kind: 'scalar', offset: 0, length: 32 },
+        { arg: 1, kind: 'bytes', offset: 32, length: 40 },
+        { arg: 2, kind: 'scalar', offset: 72, length: 32 },
       ],
     });
   });
 
-  it('a no-arg staged program still carries an (empty) argsLayout', () => {
+  it('emits exactly ONE CALLDATA however many args there are (the composite copy is paid once)', () => {
+    const r = compile('function main(a, b, c, d) { return a + b + c + d }', {
+      target: 'svm',
+      staged: true,
+      args: [1n, 2n, 3n, 4n],
+    });
+
+    // 0xa5 appears once as an opcode; the fixture's SLICE offsets/lengths stay
+    // clear of the byte, so counting occurrences pins the single emission.
+    expect(r.bytecode[0].filter((b) => b === 0xa5)).toHaveLength(1);
+  });
+
+  it('a no-arg staged program carries an (empty) argsLayout with the program length', () => {
     const r = compile('function main() { return 1 }', { target: 'svm', staged: true });
 
-    expect(r.argsLayout).toEqual({ accountIndex: 0, regionOffset: 32, byteLength: 0, slots: [] });
+    expect(r.argsLayout).toEqual({
+      mode: 'calldata',
+      programLength: r.bytecode[0].length,
+      byteLength: 0,
+      slots: [],
+    });
+    // no args → no prologue: byte-identical to the inline compile
+    expect(hex(r.bytecode[0])).toBe(hex(compile('function main() { return 1 }', { target: 'svm' }).bytecode[0]));
   });
 });
 
-describe('staged svm — account plan reservation', () => {
-  it("reserves 'args' (writable) at user index 0 and 'payer' (signer) at index 1", () => {
+describe('staged svm — account plan', () => {
+  it('reserves nothing: user refs intern from index 0 (no args PDA, no payer slot)', () => {
     const r = compile('function main(a) { return a }', { target: 'svm', staged: true, args: [1n] });
 
-    expect(r.accountPlan).toEqual({
-      metas: [
-        { ref: 'args', writable: true, signer: false },
-        { ref: 'payer', writable: false, signer: true },
-      ],
-    });
+    expect(r.accountPlan).toEqual({ metas: [] });
   });
 
-  it('user refs intern from index 2, after the reserved slots', () => {
-    const r = compile("function main() { return accountData('pool', 0, 8) }", { target: 'svm', staged: true });
+  it('user refs occupy the same indices as an inline compile', () => {
+    const src = "function main() { return accountData('pool', 0, 8) }";
+    const staged = compile(src, { target: 'svm', staged: true });
+    const inline = compile(src, { target: 'svm' });
 
-    expect(r.accountPlan!.metas.map((m) => m.ref)).toEqual(['args', 'payer', 'pool']);
+    expect(staged.accountPlan).toEqual(inline.accountPlan);
+    expect(staged.accountPlan!.metas.map((m) => m.ref)).toEqual(['pool']);
   });
 
-  it('a raw-index staged program still compiles (reservation does not lock the registry mode)', () => {
+  it('a raw-index staged program still compiles (the caller owns the whole ordering)', () => {
     const r = compile('function main() { return accountData(0, 0, 8) }', { target: 'svm', staged: true });
 
-    // The caller owns the whole ordering in raw mode; the staged convention
-    // (args at user index 0) is theirs to honor.
     expect(r.accountPlan!.usesRawIndices).toBe(true);
   });
 });
@@ -124,7 +143,7 @@ describe('staged svm — gates and validation', () => {
     );
   });
 
-  it('rejects msg.data (CALLDATA would copy the whole staged program to the heap)', () => {
+  it('rejects msg.data (the arg prologue owns the single CALLDATA)', () => {
     const src = 'function main() { const d = msg.data; return d[0] }';
 
     expect(() => compile(src, { target: 'svm', staged: true })).toThrow(
@@ -140,13 +159,15 @@ describe('staged svm — gates and validation', () => {
     );
   });
 
-  it('rejects an arg set that overflows the 8,192-byte args region', () => {
-    const args = Array.from({ length: 257 }, () => 1n); // 257 x 32 = 8,224 > 8,192
-    const params = Array.from({ length: 257 }, (_, i) => `p${i}`).join(', ');
+  it('rejects an arg set that overflows the 65,535-byte CALLDATA composite', () => {
+    const r = () =>
+      compile('function main(d) { return d }', {
+        target: 'svm',
+        staged: true,
+        args: ['0x' + '00'.repeat(66_000)],
+      });
 
-    expect(() => compile(`function main(${params}) { return p0 }`, { target: 'svm', staged: true, args })).toThrow(
-      'staged svm args need 8224 bytes; the args PDA region holds 8192',
-    );
+    expect(r).toThrow(/exceeds the 65535-byte CALLDATA composite ceiling/);
   });
 
   it('staged bytecode is budgeted against the staged packet shape (no bytecode-size warning)', () => {

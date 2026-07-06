@@ -1,6 +1,11 @@
 import { address } from '@solana/kit';
 import type { Address, Instruction, TransactionSigner } from '@solana/kit';
-import { getSetComputeUnitLimitInstruction, getSetComputeUnitPriceInstruction } from '@solana-program/compute-budget';
+import {
+  getRequestHeapFrameInstruction,
+  getSetComputeUnitLimitInstruction,
+  getSetComputeUnitPriceInstruction,
+} from '@solana-program/compute-budget';
+import { HEAP_FRAME_BYTES } from './engine.js';
 import {
   TOKEN_PROGRAM_ADDRESS,
   findAssociatedTokenPda,
@@ -11,6 +16,19 @@ import { getTransferSolInstruction } from '@solana-program/system';
 
 /** Wrapped SOL mint (not exported by @solana-program/token). */
 export const NATIVE_MINT: Address = address('So11111111111111111111111111111111111111112');
+
+/**
+ * RequestHeapFrame(262144) — REQUIRED on every execute/simulate transaction:
+ * interpreter memory lives in the transaction's 256 KiB BPF heap frame, and a
+ * transaction without the request aborts deterministically before any opcode.
+ * **Add-once** beside SetComputeUnitLimit — duplicate ComputeBudget instruction
+ * types fail the whole transaction (the client's execute flows attach it
+ * automatically; use this when assembling transactions by hand). Buffer
+ * staging transactions do not need it.
+ */
+export function buildHeapFramePrepend(bytes: number = HEAP_FRAME_BYTES): Instruction {
+  return getRequestHeapFrameInstruction({ bytes });
+}
 
 export interface ComputeBudgetPrependInput {
   unitLimit: number;

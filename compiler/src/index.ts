@@ -14,7 +14,7 @@ import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import type { RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
 import type { ContractsConfig } from './contracts.js';
-import { estimatePacket, PAYER_REF, STAGED_ARGS_REF } from './planner/index.js';
+import { estimatePacket } from './planner/index.js';
 import type { AccountPlan } from './planner/index.js';
 
 export { Saucer } from './saucer/saucer.js';
@@ -25,7 +25,7 @@ export type { CompileTarget } from './context.js';
 export { OPS } from './saucer/ops.js';
 export { OPS_V12 } from './saucer/ops-v12.js';
 export { SVM_UNSUPPORTED } from './saucer/svm-profile.js';
-export { estimatePacket, stagingTransactionCount, PAYER_REF, STAGED_ARGS_REF } from './planner/index.js';
+export { estimatePacket, stagingTransactionCount, PAYER_REF } from './planner/index.js';
 export type { AccountMeta, AccountPlan, PacketBudget, PacketBudgetOptions, PacketMode } from './planner/index.js';
 
 export type {
@@ -40,27 +40,33 @@ export type {
 
 export type ArgValue = bigint | string | ArgValue[];
 
-// ── staged svm arg ABI ──
+// ── staged svm arg ABI (payload args over CALLDATA) ──
 //
 // A staged program (target 'svm', staged: true) does NOT bake compile-time args
 // into the blob — restaging 16 KB to change one amount is the exact failure the
-// buffer split exists to avoid. Instead the assembly prologue reads each arg
-// from the caller's ARGS PDA (user-tail account index 0 by SDK convention, the
-// one engine-owned account bytecode may SSTORE at offsets ≥ 32) and pushes it
-// exactly where the inline arg-prologue would have:
+// buffer split exists to avoid. Per-execution args ride the execute_from_account
+// INSTRUCTION PAYLOAD (after the flags byte and optional hash pin) and the engine
+// exposes the composite `buffer bytecode ++ args` through CALLDATA — byte-identical
+// to an inline execute with the args appended after the compiled STOP. The
+// assembly prologue materializes the composite ONCE (a second CALLDATA would copy
+// the whole program to the heap again), parks the descriptor in VALUES slot 0,
+// and reads each arg exactly where the inline arg-prologue would have pushed it:
 //
-//   scalar arg (bigint): one 32-byte slot, u256 LITTLE-ENDIAN (byte 0 least
-//     significant — the Solana-native field order CAST_LE consumes);
-//     prologue emits [len=32][offset][index=0][SLOAD][CAST_LE] → scalar.
-//   bytes arg (hex string): the raw bytes at the slot, length fixed at compile
-//     time; the region stride pads to the next 32-byte boundary;
-//     prologue emits [len][offset][index=0][SLOAD] → Bytes descriptor.
+//   [CALLDATA][WRITE_VALUE 0]                              — once
+//   scalar arg (bigint): a 32-byte BIG-ENDIAN word in the payload;
+//     [READ_VALUE 0][BYTE_2 L+offset][BYTE_1 32][SLICE][CAST_BE] → scalar.
+//   bytes arg (hex string): the raw bytes, length fixed at compile time;
+//     [READ_VALUE 0][BYTE_2 L+offset][len][SLICE] → Bytes descriptor (no copy).
 //   array args: unsupported in staged mode (ABI-encode to a bytes arg and
 //     abi.decode on-chain instead).
 //
-// Slots are laid out in arg order from ARGS_REGION_OFFSET (32). The SDK writer
-// (executeStaged's same-tx inline SSTORE instruction) encodes values with this
-// exact layout — argsLayout on the CompileResult is the writer's contract.
+// `L` = programLength, the compiled program byte length — a compile-time
+// constant, so every SLICE offset is an immediate. Slot offsets are relative to
+// the start of the payload args (composite offset = L + slot.offset). The SDK
+// encodes execute payloads against this exact layout — argsLayout on the
+// CompileResult is that contract. The parked slot 0 is safe: the prologue
+// finishes with it before main's body runs, and every compiled variable is
+// written before it is read (declarations require initializers).
 
 export type ArgsLayoutKind = 'scalar' | 'bytes';
 
@@ -68,26 +74,24 @@ export interface ArgsLayoutSlot {
   /** main() parameter position this slot feeds (slot i ↔ arg i, in order). */
   arg: number;
   kind: ArgsLayoutKind;
-  /** Absolute byte offset in the args PDA account data (≥ 32). */
+  /** Byte offset within the payload args (composite CALLDATA offset = programLength + offset). */
   offset: number;
-  /** Bytes the staged prologue SLOADs at `offset` (32 for scalars). */
+  /** Slot byte length (32 for scalars; the fixed compile-time length for bytes). */
   length: number;
 }
 
 export interface ArgsLayout {
-  /** User-tail account index of the args PDA (staged convention: 0). */
-  accountIndex: number;
-  /** First bytecode-writable byte of the args PDA (the engine's ARGS_REGION_OFFSET). */
-  regionOffset: number;
-  /** Total arg-region bytes consumed (32-byte-strided slots). */
+  /** Args transport: per-execution values ride the instruction payload, read via CALLDATA. */
+  mode: 'calldata';
+  /** Compiled program byte length L — arg i lives at composite offset L + slots[i].offset. */
+  programLength: number;
+  /** Total payload-arg bytes (slots laid out back to back, no padding). */
   byteLength: number;
   slots: ArgsLayoutSlot[];
 }
 
-/** Mirrors the engine's ARGS_REGION_OFFSET — the args PDA's protected 32-byte header word. */
-const ARGS_REGION_OFFSET = 32;
-/** Mirrors the engine's arg region size (PDA_ARGS_BYTES − ARGS_REGION_OFFSET). */
-const ARGS_REGION_BYTES = 8192;
+/** Mirrors the engine's MAX_BUFFER_CAPACITY (u16::MAX) — the composite `program ++ args` ceiling. */
+const MAX_COMPOSITE_BYTES = 65_535;
 
 export interface CompileOptions {
   label?: string;
@@ -103,11 +107,11 @@ export interface CompileOptions {
   /**
    * Target 'svm' only: compile for STAGED execution (execute_from_account).
    * Compile-time `args` are not baked into the bytecode — the prologue reads
-   * them from the args PDA (see the staged arg ABI above) so one staged buffer
-   * serves every per-execution argument set; the account plan reserves user
-   * index 0 for the args PDA and index 1 for the payer signer; CALLDATA
-   * (msg.data) emission is rejected. The result carries `argsLayout`, the
-   * writer contract for the SDK's same-tx args instruction.
+   * them from the instruction payload via CALLDATA (see the staged arg ABI
+   * above) so one staged buffer serves every per-execution argument set. User
+   * refs intern from index 0 (no reserved accounts); msg.data is rejected (the
+   * prologue owns the single CALLDATA). The result carries `argsLayout`, the
+   * contract the SDK encodes execute payload args against.
    */
   staged?: boolean;
   /**
@@ -139,7 +143,7 @@ export interface CompileResult {
   warnings: string[];
   /** target 'svm' only: ordered user-account plan (metas[i] = user-account index i). */
   accountPlan?: AccountPlan;
-  /** target 'svm' + staged only: the args-PDA slot layout the SDK writer encodes against. */
+  /** target 'svm' + staged only: the payload-args layout the SDK encodes execute args against. */
   argsLayout?: ArgsLayout;
 }
 
@@ -181,16 +185,6 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
   ctx.treeshake = options.treeshake ?? false;
   ctx.setStaged(staged);
 
-  if (staged) {
-    // Staged account-plan convention: the args PDA at user index 0 (the staged
-    // arg-prologue bakes SLOADs against it) and the payer signer at index 1
-    // (both execute paths require an in-list signer). Reserved BEFORE
-    // processing so user refs intern from index 2; both refs are reserved
-    // words in staged mode — user code interning them lands on these slots.
-    ctx.reserveAccount(STAGED_ARGS_REF, { writable: true });
-    ctx.reserveAccount(PAYER_REF, { signer: true });
-  }
-
   if (options.defines) ctx.setDefines(options.defines);
 
   if (options.args && options.args.length > 0) {
@@ -206,10 +200,22 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
     // we synthesize a no-param WRAPPER entry that pushes the args and CALL_FUNCTIONs
     // the original main (now a normal table function whose params arrive via the call
     // frame) — the v12 analogue of v1's appended [CALL_FUNCTION, mainIndex, argCount, …args].
-    // In staged svm mode the prologue does not PUSH literal values — it SLOADs each
-    // arg from the args PDA per argsLayout (same count, order, and stack shape).
+    // In staged svm mode the prologue does not PUSH literal values — it SLICEs each
+    // arg out of the CALLDATA composite per argsLayout (same count, order, and
+    // stack shape); the layout's programLength is stamped after assembly.
     const argsLayout = staged ? buildArgsLayout(options.args ?? []) : undefined;
     const bytecode = [assembleV12(ctx, options.args ?? [], argsLayout)];
+
+    if (argsLayout) {
+      argsLayout.programLength = bytecode[0].length;
+
+      if (argsLayout.programLength + argsLayout.byteLength > MAX_COMPOSITE_BYTES) {
+        throw new Error(
+          `staged svm program (${argsLayout.programLength} bytes) plus payload args (${argsLayout.byteLength} bytes) ` +
+            `exceeds the ${MAX_COMPOSITE_BYTES}-byte CALLDATA composite ceiling`,
+        );
+      }
+    }
 
     if (target === 'svm') {
       // The account plan is the interned-ref registry in first-use order (empty
@@ -218,9 +224,13 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
       // the reserved 'payer' ref counted as the fee payer, no lookup tables, no
       // prepends) and is non-fatal — its warnings ride along with the compile
       // warnings. Staged compiles are budgeted against the execute_from_account
-      // packet shape (hash-pin data, buffer account, 65,535-byte code ceiling).
+      // packet shape (flags + hash-pin + payload args data, buffer account,
+      // 65,535-byte composite ceiling).
       const accountPlan = ctx.buildAccountPlan();
-      const budget = estimatePacket(accountPlan, bytecode[0].length, { mode: staged ? 'staged' : 'inline' });
+      const budget = estimatePacket(accountPlan, bytecode[0].length, {
+        mode: staged ? 'staged' : 'inline',
+        ...(argsLayout ? { argsBytes: argsLayout.byteLength } : {}),
+      });
 
       return {
         bytecode,
@@ -287,12 +297,16 @@ function patchSdup(bc: Uint8Array, position: number, realPos: number): void {
 }
 
 /**
- * Lays the staged arg slots out in arg order from ARGS_REGION_OFFSET, one
- * 32-byte-strided slot per arg (see the staged arg ABI doc above).
+ * Lays the staged payload-arg slots out back to back in arg order: scalars are
+ * 32-byte big-endian words, bytes args their fixed compile-time length (no
+ * padding — SLICE addresses arbitrary byte offsets). Offsets are relative to
+ * the payload-args start; `programLength` is stamped after assembly (the
+ * prologue length is a pure function of the slots, so the total is known
+ * before the offsets are emitted).
  */
 function buildArgsLayout(args: ArgValue[]): ArgsLayout {
   const slots: ArgsLayoutSlot[] = [];
-  let offset = ARGS_REGION_OFFSET;
+  let offset = 0;
 
   args.forEach((value, arg) => {
     if (Array.isArray(value)) {
@@ -305,7 +319,7 @@ function buildArgsLayout(args: ArgValue[]): ArgsLayout {
       const length = hexToBytes(value).length;
 
       slots.push({ arg, kind: 'bytes', offset, length });
-      offset += Math.ceil(length / 32) * 32;
+      offset += length;
 
       return;
     }
@@ -314,30 +328,51 @@ function buildArgsLayout(args: ArgValue[]): ArgsLayout {
     offset += 32;
   });
 
-  const byteLength = offset - ARGS_REGION_OFFSET;
+  return { mode: 'calldata', programLength: 0, byteLength: offset, slots };
+}
 
-  if (byteLength > ARGS_REGION_BYTES) {
-    throw new Error(`staged svm args need ${byteLength} bytes; the args PDA region holds ${ARGS_REGION_BYTES}`);
-  }
+// The staged prologue's per-slot byte cost: [READ_VALUE 0] (2) + [BYTE_2 offset]
+// (3, always 2-byte — the composite ceiling is u16::MAX) + the length push
+// (BYTE_1/BYTE_2) + [SLICE] (1) + [CAST_BE] (1, scalars only). Fixed widths keep
+// the prologue length a pure function of the layout, breaking the length ↔
+// offset circularity (offsets embed the total program length).
+function stagedSlotReadLen(slot: ArgsLayoutSlot): number {
+  return 2 + 3 + (slot.length <= 0xff ? 2 : 3) + 1 + (slot.kind === 'scalar' ? 1 : 0);
+}
 
-  return { accountIndex: 0, regionOffset: ARGS_REGION_OFFSET, byteLength, slots };
+/** [CALLDATA][WRITE_VALUE 0] (3) + the per-slot reads; empty for a no-arg layout. */
+function stagedPrologueLen(layout: ArgsLayout): number {
+  return layout.slots.length === 0 ? 0 : 3 + layout.slots.reduce((n, slot) => n + stagedSlotReadLen(slot), 0);
 }
 
 /**
- * The staged arg-prologue read for one slot: [len][offset][index 0][SLOAD]
- * pushes the slot's bytes as a Bytes descriptor off the args PDA; scalars add
- * CAST_LE (the slot ABI is u256 little-endian). Net stack effect +1 per arg —
- * identical shape to the inline literal push it replaces, so SDUP patching and
- * the arg order contract (arg0 deepest) are untouched.
+ * The staged arg prologue: ONE CALLDATA (the `program ++ args` composite,
+ * materialized once) parked in VALUES slot 0, then per slot
+ * [READ_VALUE 0][BYTE_2 L+offset][len][SLICE] (+[CAST_BE] for scalars —
+ * payload scalars are 32-byte big-endian words). Net stack effect +1 per arg —
+ * identical shape to the inline literal pushes it replaces, so SDUP patching
+ * and the arg order contract (arg0 deepest) are untouched.
  */
-function stagedArgRead(ctx: CompilerContext, layout: ArgsLayout, slot: ArgsLayoutSlot): V12Saucer {
-  const read = new V12Saucer(ctx).svmAccountData(
-    new V12Saucer(ctx).int(BigInt(layout.accountIndex)),
-    new V12Saucer(ctx).int(BigInt(slot.offset)),
-    new V12Saucer(ctx).int(BigInt(slot.length)),
-  );
+function buildStagedPrologue(layout: ArgsLayout, programLength: number): Uint8Array {
+  if (layout.slots.length === 0) return new Uint8Array(0);
 
-  return slot.kind === 'scalar' ? new V12Saucer(ctx).castLe(read) : read;
+  const parts: number[] = [OPS.CALLDATA, OPS.WRITE_VALUE, 0x00];
+
+  for (const slot of layout.slots) {
+    const offset = programLength + slot.offset;
+
+    parts.push(OPS.READ_VALUE, 0x00);
+    parts.push(OPS.BYTE_2, (offset >> 8) & 0xff, offset & 0xff);
+
+    if (slot.length <= 0xff) parts.push(OPS.BYTE_1, slot.length);
+    else parts.push(OPS.BYTE_2, (slot.length >> 8) & 0xff, slot.length & 0xff);
+
+    parts.push(OPS.SLICE);
+
+    if (slot.kind === 'scalar') parts.push(OPS.CAST_BE);
+  }
+
+  return new Uint8Array(parts);
 }
 
 function assembleV12(ctx: CompilerContext, args: ArgValue[], argsLayout?: ArgsLayout): Uint8Array {
@@ -433,13 +468,12 @@ function assembleV12WithArgs(
   argsLayout?: ArgsLayout,
 ): Uint8Array {
   // Prologue: push each arg (postfix, forward order so arg0 is deepest = paramIndex 0).
-  // Inline: literal pushes of the compile-time values. Staged: SLOAD(+CAST_LE)
-  // reads off the args PDA per argsLayout — same count, order, and net +1 per arg.
-  const argBytes = argsLayout
-    ? argsLayout.slots.map((slot) => stagedArgRead(ctx, argsLayout, slot)._bytes)
-    : args.map((a) => encodeArgValueV12(ctx, a)._bytes);
-  const prologue = concatBytes(argBytes);
-  const prologueLen = prologue.length;
+  // Inline: literal pushes of the compile-time values. Staged: CALLDATA-composite
+  // SLICEs per argsLayout — same count, order, and net +1 per arg. The staged
+  // prologue's offsets embed the TOTAL program length, so its bytes are emitted
+  // after the total is known; its length is a pure function of the layout.
+  const inlinePrologue = argsLayout ? undefined : concatBytes(args.map((a) => encodeArgValueV12(ctx, a)._bytes));
+  const prologueLen = argsLayout ? stagedPrologueLen(argsLayout) : inlinePrologue!.length;
 
   const main = mainMeta.saucer;
   // main carries its ALLOCATE_VALUE/ALLOCATE_HEAP prefix (frame-stride declaration)
@@ -466,6 +500,11 @@ function assembleV12WithArgs(
     funcOffsets[ctx.getFunc(h.meta.name)] = off;
     off += h.bc.length + 1; // body + FUNC_RETURN
   }
+
+  // `off` is now the total program length L — the staged prologue's composite
+  // SLICE offsets are L + slot.offset (arg i rides the payload right after the
+  // program bytes).
+  const prologue = argsLayout ? buildStagedPrologue(argsLayout, off) : inlinePrologue!;
 
   // main's sentinels are patched in its own standalone array; shift recorded positions
   // past the ALLOCATE prefix. main reads params with the MAIN formula — the args are

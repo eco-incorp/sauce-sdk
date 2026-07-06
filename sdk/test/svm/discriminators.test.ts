@@ -1,41 +1,36 @@
 import { createHash } from 'node:crypto';
 import {
   CLOSE_BUFFER_DISCRIMINATOR,
-  CLOSE_MEMORY_DISCRIMINATOR,
   EXECUTE_DISCRIMINATOR,
   EXECUTE_FROM_ACCOUNT_DISCRIMINATOR,
   FINALIZE_BUFFER_DISCRIMINATOR,
-  INIT_ARGS_DISCRIMINATOR,
   INIT_BUFFER_DISCRIMINATOR,
-  INIT_FRAMES_DISCRIMINATOR,
-  INIT_HEAP_DISCRIMINATOR,
-  INIT_STACK_DISCRIMINATOR,
   WRITE_BUFFER_DISCRIMINATOR,
 } from '../../src/svm/index.js';
+import * as svm from '../../src/svm/index.js';
 
 // Anchor-style discriminator: sha256("global:<instruction_name>")[..8]
 function anchorDiscriminator(name: string): Uint8Array {
   return new Uint8Array(createHash('sha256').update(`global:${name}`).digest().subarray(0, 8));
 }
 
-// All 11 engine instructions, name → exported constant.
+// All 6 engine instructions, name → exported constant.
 const DISCRIMINATORS: Record<string, Uint8Array> = {
   execute: EXECUTE_DISCRIMINATOR,
   execute_from_account: EXECUTE_FROM_ACCOUNT_DISCRIMINATOR,
-  init_stack: INIT_STACK_DISCRIMINATOR,
-  init_heap: INIT_HEAP_DISCRIMINATOR,
-  init_frames: INIT_FRAMES_DISCRIMINATOR,
-  init_args: INIT_ARGS_DISCRIMINATOR,
-  close_memory: CLOSE_MEMORY_DISCRIMINATOR,
   init_buffer: INIT_BUFFER_DISCRIMINATOR,
   write_buffer: WRITE_BUFFER_DISCRIMINATOR,
   finalize_buffer: FINALIZE_BUFFER_DISCRIMINATOR,
   close_buffer: CLOSE_BUFFER_DISCRIMINATOR,
 };
 
+// The Wave C memory-PDA instructions, deleted from the engine surface — their
+// discriminator constants must be gone from the SDK too.
+const RETIRED = ['init_stack', 'init_heap', 'init_frames', 'init_args', 'close_memory'];
+
 describe('engine instruction discriminators', () => {
-  it('covers the full 11-instruction surface', () => {
-    expect(Object.keys(DISCRIMINATORS)).toHaveLength(11);
+  it('covers the full 6-instruction surface', () => {
+    expect(Object.keys(DISCRIMINATORS)).toHaveLength(6);
   });
 
   for (const [name, constant] of Object.entries(DISCRIMINATORS)) {
@@ -48,5 +43,20 @@ describe('engine instruction discriminators', () => {
     const hexes = Object.values(DISCRIMINATORS).map(d => Buffer.from(d).toString('hex'));
 
     expect(new Set(hexes).size).toBe(hexes.length);
+  });
+
+  it('the 5 retired memory-PDA discriminators are no longer exported', () => {
+    const exportedHexes = new Set(
+      Object.values(svm)
+        .filter((v): v is Uint8Array => v instanceof Uint8Array && v.length === 8)
+        .map(d => Buffer.from(d).toString('hex')),
+    );
+
+    for (const name of RETIRED) {
+      const constantName = `${name.toUpperCase()}_DISCRIMINATOR`;
+
+      expect(svm).not.toHaveProperty(constantName);
+      expect(exportedHexes.has(Buffer.from(anchorDiscriminator(name)).toString('hex'))).toBe(false);
+    }
   });
 });

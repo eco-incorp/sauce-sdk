@@ -5,33 +5,16 @@ import {
   BUFFER_HEADER_BYTES,
   BUFFER_WRITE_CHUNK_BYTES,
   CLOSE_BUFFER_DISCRIMINATOR,
-  CLOSE_MEMORY_DISCRIMINATOR,
   EXECUTE_DISCRIMINATOR,
+  EXECUTE_FLAG_HAS_PIN,
   EXECUTE_FROM_ACCOUNT_DISCRIMINATOR,
   FINALIZE_BUFFER_DISCRIMINATOR,
-  INIT_ARGS_DISCRIMINATOR,
   INIT_BUFFER_DISCRIMINATOR,
-  INIT_FRAMES_DISCRIMINATOR,
-  INIT_HEAP_DISCRIMINATOR,
-  INIT_STACK_DISCRIMINATOR,
   MAX_BUFFER_CAPACITY,
-  PDA_ARGS_BYTES,
-  PDA_FRAMES_BYTES,
   PDA_GROWTH_STEP,
-  PDA_HEAP_BYTES,
-  PDA_STACK_BYTES,
   WRITE_BUFFER_DISCRIMINATOR,
 } from './engine.js';
-import type { EnginePdas } from './pda.js';
 import type { ResolvedAccountMeta } from './resolve.js';
-
-/** Current data lengths of the engine PDAs (0 or absent = not created yet). */
-export interface EnginePdaSizes {
-  stack?: number;
-  heap?: number;
-  frames?: number;
-  args?: number;
-}
 
 function assertU8(value: number, name: string): void {
   if (!Number.isInteger(value) || value < 0 || value > 0xff) {
@@ -59,112 +42,25 @@ function withDiscriminator(discriminator: Uint8Array, ...parts: (Uint8Array | nu
   return data;
 }
 
-function growInstructions(
-  programId: Address,
-  payer: Address,
-  pda: Address,
-  discriminator: Uint8Array,
-  session: number,
-  targetBytes: number,
-  currentBytes: number,
-): Instruction[] {
-  const missing = Math.max(0, targetBytes - currentBytes);
-  const steps = Math.ceil(missing / PDA_GROWTH_STEP);
-
-  // Fresh objects per step, with fresh data arrays, so mutating one returned
-  // instruction cannot corrupt the others.
-  return Array.from({ length: steps }, (): Instruction => ({
-    programAddress: programId,
-    accounts: [
-      { address: payer, role: AccountRole.WRITABLE_SIGNER },
-      { address: pda, role: AccountRole.WRITABLE },
-      { address: SYSTEM_PROGRAM_ADDRESS, role: AccountRole.READONLY },
-    ],
-    data: withDiscriminator(discriminator, [session]),
-  }));
-}
-
-/**
- * Builds the grow-to-size init sequence for the four engine memory PDAs of one
- * (payer, session). Each PDA grows at most 10240 bytes per instruction, so a
- * fresh onboarding needs ceil(33795/10240)=4 stack + 7 heap + 7 frames +
- * 1 args = 19 instructions — all of which fit in one transaction. Each init
- * payload is the 1-byte session. Re-running at full size is a no-op (engine
- * init is idempotent), so over-sending is safe. Pass `currentSizes` (from
- * getAccountInfo) to emit only the missing growth steps. The payer is the
- * memory OWNER — only it can initialize (and close) its own set.
- */
-export function buildInitInstructions(
-  programId: Address,
-  pdas: EnginePdas,
-  payer: Address,
-  currentSizes: EnginePdaSizes = {},
-  session = 0,
-): Instruction[] {
-  assertU8(session, 'session');
-
-  return [
-    ...growInstructions(programId, payer, pdas.stack.address, INIT_STACK_DISCRIMINATOR, session, PDA_STACK_BYTES, currentSizes.stack ?? 0),
-    ...growInstructions(programId, payer, pdas.heap.address, INIT_HEAP_DISCRIMINATOR, session, PDA_HEAP_BYTES, currentSizes.heap ?? 0),
-    ...growInstructions(programId, payer, pdas.frames.address, INIT_FRAMES_DISCRIMINATOR, session, PDA_FRAMES_BYTES, currentSizes.frames ?? 0),
-    ...growInstructions(programId, payer, pdas.args.address, INIT_ARGS_DISCRIMINATOR, session, PDA_ARGS_BYTES, currentSizes.args ?? 0),
-  ];
-}
-
-export interface CloseMemoryInstructionInput {
-  programId: Address;
-  pdas: EnginePdas;
-  /** The memory owner — must sign; receives the drained rent deposit. */
-  owner: Address;
-  session?: number;
-}
-
-/**
- * Drains and reaps a session's memory set, refunding the rent deposit
- * (~1.2226 SOL for a full set) to the owner. Idempotent per PDA — a partially
- * initialized (or already closed) set closes what exists and skips the rest.
- */
-export function buildCloseMemoryInstruction({ programId, pdas, owner, session = 0 }: CloseMemoryInstructionInput): Instruction {
-  assertU8(session, 'session');
-
-  return {
-    programAddress: programId,
-    accounts: [
-      { address: owner, role: AccountRole.WRITABLE_SIGNER },
-      { address: pdas.stack.address, role: AccountRole.WRITABLE },
-      { address: pdas.heap.address, role: AccountRole.WRITABLE },
-      { address: pdas.frames.address, role: AccountRole.WRITABLE },
-      { address: pdas.args.address, role: AccountRole.WRITABLE },
-    ],
-    data: withDiscriminator(CLOSE_MEMORY_DISCRIMINATOR, [session]),
-  };
-}
-
 export interface ExecuteInstructionInput {
   programId: Address;
-  pdas: EnginePdas;
   bytecode: Uint8Array;
   accounts: readonly ResolvedAccountMeta[];
 }
 
 /**
- * Builds the engine execute instruction. Three laws bind the account list:
- * - user-account index 0 = instruction account 3 (the engine addresses
- *   SLOAD/SSTORE/CALL indices relative to the accounts after the 3 memory PDAs);
- * - MSG_SENDER (and the memory OWNER the PDAs must be derived from) = the
- *   first signer in the FULL instruction account list;
- * - an in-list signer is REQUIRED — the engine fails NoSigner without one
- *   (resolveAccounts appends the fee payer when the plan declares no signer).
+ * Builds the engine execute instruction. The account list IS the user-account
+ * index space: accounts[i] is user index i (no fixed prefix — interpreter
+ * memory lives in the transaction's heap frame, not accounts). MSG_SENDER is
+ * the first in-list signer, resolved LAZILY: a signerless list is valid unless
+ * the program reads MSG_SENDER/TX_ORIGIN (NoSigner then). Every transaction
+ * carrying this instruction MUST also carry RequestHeapFrame(262144) — see
+ * buildHeapFramePrepend.
  */
-export function buildExecuteInstruction({ programId, pdas, bytecode, accounts }: ExecuteInstructionInput): Instruction {
+export function buildExecuteInstruction({ programId, bytecode, accounts }: ExecuteInstructionInput): Instruction {
   return {
     programAddress: programId,
-    accounts: [
-      { address: pdas.stack.address, role: AccountRole.WRITABLE },
-      { address: pdas.heap.address, role: AccountRole.WRITABLE },
-      { address: pdas.frames.address, role: AccountRole.WRITABLE },
-      ...accounts,
-    ],
+    accounts: [...accounts],
     data: withDiscriminator(EXECUTE_DISCRIMINATOR, bytecode),
   };
 }
@@ -173,7 +69,6 @@ export interface ExecuteFromAccountInstructionInput {
   programId: Address;
   /** The finalized bytecode buffer — listed FIRST and read-only (mandated by the engine). */
   buffer: Address;
-  pdas: EnginePdas;
   accounts: readonly ResolvedAccountMeta[];
   /**
    * Optional 32-byte content-hash pin: must equal the buffer's stored
@@ -182,35 +77,45 @@ export interface ExecuteFromAccountInstructionInput {
    * did not stage itself (close→re-init legitimately reuses the address).
    */
   expectedSha256?: Uint8Array;
+  /**
+   * Per-execution payload args (already encoded — encodePayloadArgs), appended
+   * after the flags byte and optional pin. Surfaces to the bytecode through
+   * CALLDATA as the composite `buffer bytecode ++ args`.
+   */
+  args?: Uint8Array;
 }
 
 /**
  * Builds the staged execute instruction. Account order is
- * [buffer (read-only), stack, heap, frames, ...user] — the buffer rides FIRST
- * so the user tail (and every account index baked into compiled bytecode) is
- * byte-identical to inline execute's list.
+ * [buffer (read-only), ...user] — the buffer rides FIRST so the user tail (and
+ * every account index baked into compiled bytecode) is byte-identical to
+ * inline execute's list. Data is the v2 payload grammar
+ * [discriminator][flags: u8][pin: 32B iff flags & 0x01][args…] — the flags
+ * byte is REQUIRED (an empty payload is InvalidInstruction), so the minimal
+ * pinless, argless payload is [0x00].
  */
 export function buildExecuteFromAccountInstruction({
   programId,
   buffer,
-  pdas,
   accounts,
   expectedSha256,
+  args,
 }: ExecuteFromAccountInstructionInput): Instruction {
   if (expectedSha256 !== undefined && expectedSha256.length !== 32) {
     throw new Error(`expectedSha256 must be exactly 32 bytes, got ${expectedSha256.length}`);
   }
 
+  const flags = expectedSha256 === undefined ? 0x00 : EXECUTE_FLAG_HAS_PIN;
+
   return {
     programAddress: programId,
-    accounts: [
-      { address: buffer, role: AccountRole.READONLY },
-      { address: pdas.stack.address, role: AccountRole.WRITABLE },
-      { address: pdas.heap.address, role: AccountRole.WRITABLE },
-      { address: pdas.frames.address, role: AccountRole.WRITABLE },
-      ...accounts,
-    ],
-    data: withDiscriminator(EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, expectedSha256 ?? new Uint8Array(0)),
+    accounts: [{ address: buffer, role: AccountRole.READONLY }, ...accounts],
+    data: withDiscriminator(
+      EXECUTE_FROM_ACCOUNT_DISCRIMINATOR,
+      [flags],
+      expectedSha256 ?? new Uint8Array(0),
+      args ?? new Uint8Array(0),
+    ),
   };
 }
 
@@ -252,6 +157,8 @@ export function buildInitBufferInstructions({
   const targetBytes = BUFFER_HEADER_BYTES + capacity;
   const steps = Math.ceil(Math.max(0, targetBytes - currentBytes) / PDA_GROWTH_STEP);
 
+  // Fresh objects per step, with fresh data arrays, so mutating one returned
+  // instruction cannot corrupt the others.
   return Array.from({ length: steps }, (): Instruction => ({
     programAddress: programId,
     accounts: [

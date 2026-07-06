@@ -12,17 +12,7 @@
  */
 import { getAddressCodec } from '@solana/kit';
 import { compile } from '../src/index.js';
-import {
-  ARGS_REGION_OFFSET,
-  canRunSvm,
-  KIND_ARGS,
-  randomSvmAddress,
-  startSvm,
-  svmCook,
-  svmHex,
-  svmUint,
-  SYSTEM_PROGRAM,
-} from './svm-utils.js';
+import { canRunSvm, randomSvmAddress, startSvm, svmCook, svmHex, svmUint, SYSTEM_PROGRAM } from './svm-utils.js';
 import type { SvmCookResult, SvmHarness } from './svm-utils.js';
 
 const describeSvm = canRunSvm() ? describe : describe.skip;
@@ -205,41 +195,24 @@ describeSvm('integration: svm accountData / writeAccountData', () => {
     expectFail(r);
   });
 
-  it('writes a writable args-shaped account, reads back in a second execute', async () => {
-    // Engine-owned writable fixtures must satisfy the SSTORE kind guard:
-    // data[0] == KIND_ARGS, write offsets >= ARGS_REGION_OFFSET.
-    const vault = randomSvmAddress();
-    const scratch = new Uint8Array(64);
-    scratch[0] = KIND_ARGS;
-    const w = await svmCook(h, `function main() { writeAccountData('vault', 40, Uint8Array.from([0xde, 0xad])) }`, {
-      accounts: [{ ref: 'vault', address: vault, data: scratch }],
-    });
-
-    expect(w.ok).toBe(true);
-
-    const r = await svmCook(h, `function main() { return accountData('vault', 40, 2) }`, {
-      accounts: [{ ref: 'vault', address: vault }],
-    });
-
-    expect(svmHex(r)).toBe('0xdead');
-  });
-
-  it('SSTORE kind guard: an engine-owned non-args target is refused (ProtectedAccount)', async () => {
-    const r = await svmCook(h, `function main() { writeAccountData('vault', 40, Uint8Array.from([0x01])) }`, {
-      accounts: [{ ref: 'vault', data: new Uint8Array(64) }], // kind byte 0 — not an args PDA
+  it('writeAccountData into ANY engine-owned account is refused (ProtectedAccount)', async () => {
+    // Wave D: every engine-owned target is bytecode-unwritable, unconditionally
+    // — that is what keeps finalized buffers unscribblable from any transaction.
+    const r = await svmCook(h, `function main() { writeAccountData('vault', 40, Uint8Array.from([0xde, 0xad])) }`, {
+      accounts: [{ ref: 'vault', data: new Uint8Array(64) }], // engine-owned by default
     });
 
     expect(expectFail(r).logs.join('\n')).toContain(`Program ${h.programId} invoke`);
   });
 
-  it('SSTORE kind guard: an args-shaped target below ARGS_REGION_OFFSET is refused', async () => {
-    const scratch = new Uint8Array(64);
-    scratch[0] = KIND_ARGS;
-    const r = await svmCook(
-      h,
-      `function main() { writeAccountData('vault', ${ARGS_REGION_OFFSET - 1}, Uint8Array.from([0x01])) }`,
-      { accounts: [{ ref: 'vault', data: scratch }] },
-    );
+  it('writeAccountData to a foreign-owned writable account fails at the runtime wall', async () => {
+    // The engine performs the write, then the runtime rejects the data
+    // modification (the engine does not own the account) — so SSTORE has NO
+    // effectively-writable target class on SVM; it stays in the ISA for fork
+    // parity and a future sanctioned scratch class.
+    const r = await svmCook(h, `function main() { writeAccountData('vault', 8, Uint8Array.from([0x01])) }`, {
+      accounts: [{ ref: 'vault', data: new Uint8Array(64), owner: SYSTEM_PROGRAM }],
+    });
 
     expectFail(r);
   });
@@ -275,21 +248,13 @@ describeSvm('integration: svm accountData / writeAccountData', () => {
     expect(svmUint(r)).toBe(0x1122n);
   });
 
-  it('raw-index write to a writable args-shaped account succeeds, reads back in a second execute', async () => {
+  it('raw-index write to a writable engine-owned account is refused too (same wall)', async () => {
     const vault = randomSvmAddress();
-    const scratch = new Uint8Array(48);
-    scratch[0] = KIND_ARGS;
-    const w = await svmCook(h, 'function main() { writeAccountData(0, 36, Uint8Array.from([0xbe, 0xef])) }', {
-      accounts: [{ ref: 'vault', address: vault, data: scratch, writable: true }],
+    const r = await svmCook(h, 'function main() { writeAccountData(0, 36, Uint8Array.from([0xbe, 0xef])) }', {
+      accounts: [{ ref: 'vault', address: vault, data: new Uint8Array(48), writable: true }],
     });
 
-    expect(w.ok).toBe(true);
-
-    const r = await svmCook(h, 'function main() { return accountData(0, 36, 2) }', {
-      accounts: [{ ref: 'vault', address: vault }],
-    });
-
-    expect(svmHex(r)).toBe('0xbeef');
+    expectFail(r);
   });
 
   it('write to a non-writable account fails the transaction', async () => {

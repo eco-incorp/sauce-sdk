@@ -1,33 +1,29 @@
 /**
  * Staged execution end-to-end on LiteSVM: the full buffer lifecycle through
  * the sdk's pure builders (init_buffer → chunked write_buffer → finalize_buffer
- * → execute_from_account → close_buffer), the same-tx args pattern (stage once,
- * execute many with different args), the hash-pin trust anchor, and the whole
- * point of staging — a program too large for the 1232-byte packet running from
- * a buffer.
+ * → execute_from_account → close_buffer), the payload-args pattern (stage once,
+ * execute many with different args in ONE instruction), the hash-pin trust
+ * anchor, the lazy-NoSigner contract, and the whole point of staging — a
+ * program too large for the 1232-byte packet running from a buffer.
  *
  * Requires the engine .so (SAUCE_ENGINE_SO or the sibling sauce checkout);
  * skips cleanly when absent (same gate as the other engine-bound suites).
  */
 import { createHash } from 'node:crypto';
-import { generateKeyPairSigner, lamports } from '@solana/kit';
 import type { Address, Instruction } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import {
-  buildArgsWriteInstruction,
   buildCloseBufferInstruction,
-  buildCloseMemoryInstruction,
   buildComputeBudgetPrepend,
   buildExecuteFromAccountInstruction,
   buildExecuteInstruction,
-  buildExecuteTransaction,
   buildFinalizeBufferInstruction,
+  buildHeapFramePrepend,
   buildInitBufferInstructions,
-  buildInitInstructions,
   buildStagingPlan,
   buildWriteBufferInstruction,
   deriveBufferPda,
-  deriveEnginePdas,
+  encodePayloadArgs,
   getTransactionSize,
   resolveAccounts,
 } from '../../src/svm/index.js';
@@ -52,7 +48,9 @@ const stageBytecode = async (harness: EngineHarness, index: number, bytecode: Ui
   const shared = { programId: harness.programId, authority: harness.payer.address, buffer };
 
   // init tx (all growth steps pack into one), then one tx per chunk, then the
-  // DEDICATED finalize tx — every tx must clear the 1232-byte wire cap.
+  // DEDICATED finalize tx — every tx must clear the 1232-byte wire cap. None
+  // of these carry the heap-frame request: staging never touches interpreter
+  // memory.
   const initInstructions = buildInitBufferInstructions({
     programId: harness.programId,
     payer: harness.payer.address,
@@ -79,6 +77,11 @@ const stageBytecode = async (harness: EngineHarness, index: number, bytecode: Ui
   return buffer;
 };
 
+/**
+ * ONE-instruction staged execute: [CU limit, RequestHeapFrame, execute_from_account]
+ * — the payload args ride the execute instruction's own data (no writer
+ * instruction exists on the Wave D surface).
+ */
 const executeStaged = async (
   harness: EngineHarness,
   buffer: Address,
@@ -86,29 +89,17 @@ const executeStaged = async (
   opts: { pin?: Uint8Array; args?: StagedArgs } = {},
 ): Promise<RunResult> => {
   // Generous CU limit — the default 200K/tx starves multi-KB staged programs.
-  const instructions: Instruction[] = [...buildComputeBudgetPrepend({ unitLimit: 1_400_000 })];
-
-  if (opts.args) {
-    instructions.push(
-      buildArgsWriteInstruction({
-        programId: harness.programId,
-        pdas: harness.pdas,
-        payer: harness.payer.address,
-        layout: opts.args.layout,
-        values: opts.args.values,
-      }),
-    );
-  }
-
-  instructions.push(
+  const instructions: Instruction[] = [
+    ...buildComputeBudgetPrepend({ unitLimit: 1_400_000 }),
+    buildHeapFramePrepend(),
     buildExecuteFromAccountInstruction({
       programId: harness.programId,
       buffer,
-      pdas: harness.pdas,
       accounts,
       expectedSha256: opts.pin,
+      args: opts.args ? encodePayloadArgs(opts.args.layout, opts.args.values) : undefined,
     }),
-  );
+  ];
 
   return sendInstructions(harness, instructions);
 };
@@ -128,7 +119,7 @@ describeSvm('staged e2e: buffer lifecycle (stage 4 KB → execute_from_account �
     expect(buildStagingPlan(bytecode.length).transactions.total).toBe(8);
 
     const buffer = await stageBytecode(harness, 0, bytecode);
-    // no plan refs: the payer signer is all the tail needs
+    // no plan refs, no signer needed: pure compute never reads MSG_SENDER
     const accounts = resolveAccounts({ metas: [] }, {}, harness.payer.address);
 
     const result = expectOk(await executeStaged(harness, buffer, accounts, { pin: sha256(bytecode) }));
@@ -160,9 +151,25 @@ describeSvm('staged e2e: buffer lifecycle (stage 4 KB → execute_from_account �
     expect(toBigInt(expectOk(await executeStaged(harness, buffer, accounts, { pin: sha256(bytecode) })).returnData)).toBe(42n);
     expect(toBigInt(expectOk(await executeStaged(harness, buffer, accounts)).returnData)).toBe(42n);
   });
+
+  it('an execute transaction without RequestHeapFrame aborts before any opcode', async () => {
+    const bytecode = new Uint8Array([0x01, 0x2a, 0x00]); // BYTE_1 42, STOP
+    const buffer = await stageBytecode(harness, 5, bytecode);
+    const accounts = resolveAccounts({ metas: [] }, {}, harness.payer.address);
+
+    // Same instruction, no heap-frame request: the claim probe hits unmapped
+    // memory (SBF AccessViolation) — deterministic, zero state at risk.
+    const bare = buildExecuteFromAccountInstruction({
+      programId: harness.programId,
+      buffer,
+      accounts,
+      expectedSha256: sha256(bytecode),
+    });
+    expectFail(await sendInstructions(harness, [bare]));
+  });
 });
 
-describeSvm('staged e2e: the same-tx args pattern (stage once, execute many)', () => {
+describeSvm('staged e2e: payload args (stage once, execute many, ONE instruction)', () => {
   let harness: EngineHarness;
 
   beforeAll(async () => {
@@ -176,8 +183,11 @@ describeSvm('staged e2e: the same-tx args pattern (stage once, execute many)', (
       staged: true,
       args: [0n, 0n],
     });
+    expect(argsLayout!.mode).toBe('calldata');
+    expect(argsLayout!.programLength).toBe(bytecode[0].length);
+
     const buffer = await stageBytecode(harness, 2, bytecode[0]);
-    const accounts = resolveAccounts(accountPlan!, { args: harness.pdas.args.address }, harness.payer.address);
+    const accounts = resolveAccounts(accountPlan!, {}, harness.payer.address);
     const pin = sha256(bytecode[0]);
 
     const first = expectOk(
@@ -192,14 +202,14 @@ describeSvm('staged e2e: the same-tx args pattern (stage once, execute many)', (
     expect(toBigInt(second.returnData)).toBe(123_000_456n);
   });
 
-  it('mixed scalar + bytes args ride the same pattern', async () => {
+  it('mixed scalar + bytes args ride the same payload', async () => {
     const { bytecode, accountPlan, argsLayout } = compile('function main(a, d) { return a + d[0] }', {
       target: 'svm',
       staged: true,
       args: [0n, '0x00'],
     });
     const buffer = await stageBytecode(harness, 3, bytecode[0]);
-    const accounts = resolveAccounts(accountPlan!, { args: harness.pdas.args.address }, harness.payer.address);
+    const accounts = resolveAccounts(accountPlan!, {}, harness.payer.address);
 
     const result = expectOk(
       await executeStaged(harness, buffer, accounts, {
@@ -211,50 +221,54 @@ describeSvm('staged e2e: the same-tx args pattern (stage once, execute many)', (
   });
 });
 
-describeSvm('memory onboarding e2e: the real 19-ix init, execute, close_memory refund', () => {
-  it('onboards a fresh owner in ONE transaction, executes, and reclaims the full deposit', async () => {
-    const harness = await startEngine(1_700_000_000n);
-    const owner = await generateKeyPairSigner();
-    harness.svm.airdrop(owner.address, lamports(10_000_000_000n));
-    const pdas = await deriveEnginePdas(harness.programId, owner.address);
+describeSvm('lazy NoSigner: signerless executes are valid unless MSG_SENDER is read', () => {
+  let harness: EngineHarness;
 
-    const send = async (instructions: readonly Instruction[]) => {
-      harness.svm.expireBlockhash();
-      const transaction = await buildExecuteTransaction({
-        payer: owner,
-        instructions,
-        latestBlockhash: { blockhash: harness.svm.latestBlockhash(), lastValidBlockHeight: 1_000_000n },
-      });
-      const result = harness.svm.sendTransaction(transaction);
-      if ('err' in result && typeof result.err === 'function') throw new Error(String(result.err()));
-    };
+  beforeAll(async () => {
+    harness = await startEngine(1_700_000_000n);
+  });
 
-    // Full onboarding: 4 stack + 7 heap + 7 frames + 1 args = 19 instructions, one tx.
-    const initInstructions = buildInitInstructions(harness.programId, pdas, owner.address);
-    expect(initInstructions).toHaveLength(19);
-    await send(initInstructions);
+  it('a pure-compute program executes with an EMPTY instruction account list', async () => {
+    const { bytecode, accountPlan } = compile('function main() { return 41 + 1 }', { target: 'svm' });
+    const accounts = resolveAccounts(accountPlan!, {}, harness.payer.address);
+    expect(accounts).toHaveLength(0); // signerless — and valid
 
-    // The freshly initialized set executes (the owner is the in-list signer).
-    const accounts = resolveAccounts({ metas: [] }, {}, owner.address);
-    const execute = buildExecuteInstruction({
+    const execute = buildExecuteInstruction({ programId: harness.programId, bytecode: bytecode[0], accounts });
+    const result = expectOk(await sendInstructions(harness, [buildHeapFramePrepend(), execute]));
+    expect(toBigInt(result.returnData)).toBe(42n);
+  });
+
+  it('a MSG_SENDER-reading program fails NoSigner without an in-list signer, passes with appendPayerSigner', async () => {
+    const { bytecode, accountPlan } = compile('function main() { return msg.sender }', { target: 'svm' });
+
+    const signerless = buildExecuteInstruction({
       programId: harness.programId,
-      pdas,
-      bytecode: new Uint8Array([0x01, 0x2a, 0x00]), // BYTE_1 42, STOP
-      accounts,
+      bytecode: bytecode[0],
+      accounts: resolveAccounts(accountPlan!, {}, harness.payer.address),
     });
-    await send([execute]);
+    expectFail(await sendInstructions(harness, [buildHeapFramePrepend(), signerless]));
 
-    // close_memory drains all four PDAs back to the owner (minus the tx fee).
-    const deposit = [pdas.stack, pdas.heap, pdas.frames, pdas.args].reduce(
-      (sum, pda) => sum + (harness.svm.getBalance(pda.address) ?? 0n),
-      0n,
-    );
-    expect(deposit).toBeGreaterThan(1_000_000_000n); // ~1.2226 SOL rent deposit
-    const before = harness.svm.getBalance(owner.address);
-    await send([buildCloseMemoryInstruction({ programId: harness.programId, pdas, owner: owner.address })]);
-    expect(harness.svm.getBalance(owner.address)).toBe(before + deposit - 5000n);
-    expect(harness.svm.getBalance(pdas.stack.address) ?? 0n).toBe(0n);
-    expect(harness.svm.getBalance(pdas.args.address) ?? 0n).toBe(0n);
+    const signed = buildExecuteInstruction({
+      programId: harness.programId,
+      bytecode: bytecode[0],
+      accounts: resolveAccounts(accountPlan!, {}, harness.payer.address, { appendPayerSigner: true }),
+    });
+    const result = expectOk(await sendInstructions(harness, [buildHeapFramePrepend(), signed]));
+    expect(result.returnData).toHaveLength(32);
+  });
+
+  it('a signerless staged execute works too (the buffer is not a signer)', async () => {
+    const bytecode = new Uint8Array([0x01, 0x07, 0x01, 0x06, 0x23, 0x00]); // 7 * 6, STOP
+    const buffer = await stageBytecode(harness, 0, bytecode);
+
+    const execute = buildExecuteFromAccountInstruction({
+      programId: harness.programId,
+      buffer,
+      accounts: [],
+      expectedSha256: sha256(bytecode),
+    });
+    const result = expectOk(await sendInstructions(harness, [buildHeapFramePrepend(), execute]));
+    expect(toBigInt(result.returnData)).toBe(42n);
   });
 });
 
@@ -281,7 +295,7 @@ describeSvm('staged e2e: a program too large for the packet runs staged — the 
     expect(staged.warnings).toEqual([]);
 
     const buffer = await stageBytecode(harness, 4, staged.bytecode[0]);
-    const accounts = resolveAccounts(staged.accountPlan!, { args: harness.pdas.args.address }, harness.payer.address);
+    const accounts = resolveAccounts(staged.accountPlan!, {}, harness.payer.address);
 
     const result = expectOk(
       await executeStaged(harness, buffer, accounts, { pin: sha256(staged.bytecode[0]) }),

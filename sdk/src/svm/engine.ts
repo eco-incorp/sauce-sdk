@@ -6,61 +6,54 @@
  * Discriminators are Anchor-style: sha256("global:<instruction_name>")[..8].
  */
 
-// ── instruction discriminators (all 11) ──
+// ── instruction discriminators (all 6) ──
 
 export const EXECUTE_DISCRIMINATOR = new Uint8Array([0x82, 0xdd, 0xf2, 0x9a, 0x0d, 0xc1, 0xbd, 0x1d]);
 export const EXECUTE_FROM_ACCOUNT_DISCRIMINATOR = new Uint8Array([0x71, 0x2c, 0xd5, 0x72, 0x82, 0x95, 0x58, 0xc3]);
-export const INIT_STACK_DISCRIMINATOR = new Uint8Array([0xe2, 0x74, 0x1c, 0x78, 0x56, 0x04, 0x15, 0xbc]);
-export const INIT_HEAP_DISCRIMINATOR = new Uint8Array([0x7b, 0x3e, 0x07, 0x35, 0xfa, 0x4d, 0x90, 0x67]);
-export const INIT_FRAMES_DISCRIMINATOR = new Uint8Array([0xed, 0x41, 0x89, 0x2a, 0x39, 0xba, 0x12, 0x8d]);
-export const INIT_ARGS_DISCRIMINATOR = new Uint8Array([0x19, 0x57, 0xf3, 0x3c, 0xec, 0xdd, 0x25, 0xd5]);
-export const CLOSE_MEMORY_DISCRIMINATOR = new Uint8Array([0x34, 0x8b, 0xf4, 0xd3, 0x18, 0x44, 0x08, 0xaa]);
 export const INIT_BUFFER_DISCRIMINATOR = new Uint8Array([0x7b, 0xd3, 0xe9, 0xd2, 0xa6, 0x8b, 0xda, 0x3c]);
 export const WRITE_BUFFER_DISCRIMINATOR = new Uint8Array([0xa4, 0xc2, 0x45, 0x9a, 0x4b, 0xa9, 0xe4, 0x55]);
 export const FINALIZE_BUFFER_DISCRIMINATOR = new Uint8Array([0x21, 0x9c, 0x88, 0xb1, 0x14, 0xc3, 0x7a, 0x43]);
 export const CLOSE_BUFFER_DISCRIMINATOR = new Uint8Array([0x2e, 0x72, 0xb3, 0x3a, 0x39, 0x2d, 0xc2, 0xac]);
 
-// ── PDA seeds ──
+/**
+ * execute_from_account payload flag bit 0: a 32-byte content-hash pin follows
+ * the flags byte. Bits 1-7 are reserved and must be zero. The flags byte is
+ * REQUIRED — an empty payload is InvalidInstruction (one canonical encoding
+ * per meaning): the minimal pinless, argless payload is [0x00].
+ */
+export const EXECUTE_FLAG_HAS_PIN = 0x01;
+
+// ── interpreter memory (BPF heap frame) ──
 
 /**
- * Memory PDA seeds. Every memory PDA is derived per (owner, session):
- * [seed, owner_pubkey, [session: u8]] — the owner is the execute instruction's
- * FIRST in-list signer, the session a u8 discriminant (SDK default 0).
+ * The 256 KiB BPF heap frame every execute transaction MUST request:
+ * interpreter memory (operand stack, heap, frames) lives above the default
+ * 32 KiB Rust bump arena, not in accounts. Attach RequestHeapFrame(262144)
+ * beside SetComputeUnitLimit on every execute/simulate transaction —
+ * **add-once**: duplicate ComputeBudget instruction types fail the whole
+ * transaction. A transaction without it aborts deterministically (SBF
+ * AccessViolation) before any opcode runs. Buffer staging transactions do
+ * not need it — their instructions never touch interpreter memory.
  */
-export type EnginePdaSeed = 'stack' | 'heap' | 'frames' | 'args';
-export const STACK_SEED: EnginePdaSeed = 'stack';
-export const HEAP_SEED: EnginePdaSeed = 'heap';
-export const FRAMES_SEED: EnginePdaSeed = 'frames';
-export const ARGS_SEED: EnginePdaSeed = 'args';
+export const HEAP_FRAME_BYTES = 262_144;
+
+/** CU cost of the heap-frame request, charged per program invocation in the transaction. */
+export const HEAP_FRAME_CU_PER_INVOCATION = 56;
+
+/**
+ * Wire cost of the RequestHeapFrame instruction: 8 bytes beside an existing
+ * ComputeBudget instruction (the program key and count byte are already paid),
+ * 9 standalone. Measured — engine tests/cu_budget.rs.
+ */
+export const REQUEST_HEAP_FRAME_WIRE_BYTES = 9;
+
+// ── PDA seeds ──
+
 /** Bytecode buffer seed: ["buffer", authority_pubkey, [index: u8]]. */
 export const BUFFER_SEED = 'buffer';
 
-// ── memory PDA layout ──
-
-/** Every engine-owned PDA starts with a [kind, bump, session] header. */
-export const PDA_HEADER_BYTES = 3;
-
-/** Kind bytes (header byte 0) — the SSTORE write-protection discriminant. */
-export const KIND_STACK = 1;
-export const KIND_HEAP = 2;
-export const KIND_FRAMES = 3;
-export const KIND_ARGS = 4;
+/** Buffer header byte 0 (the engine's account-kind discriminant). */
 export const KIND_BUFFER = 5;
-
-/** Full PDA sizes: 3-byte header + payload (stack 1024*33, heap u16::MAX, frames 4*(256+256)*33). */
-export const PDA_STACK_BYTES = 33795;
-export const PDA_HEAP_BYTES = 65538;
-export const PDA_FRAMES_BYTES = 67587;
-/** Args PDA: a full 32-byte reserved header word + the 8,192-byte arg region. */
-export const PDA_ARGS_BYTES = 8224;
-/**
- * First bytecode-writable byte of the args PDA: SSTORE into an engine-owned
- * account is permitted ONLY for KIND_ARGS at offsets ≥ 32; everything else is
- * ProtectedAccount. Staged arg slots are laid out from here.
- */
-export const ARGS_REGION_OFFSET = 32;
-/** MAX_PERMITTED_DATA_INCREASE — max account growth per init instruction invocation. */
-export const PDA_GROWTH_STEP = 10240;
 
 // ── bytecode buffer layout (staged execution) ──
 
@@ -94,16 +87,22 @@ export const BUFFER_OFFSET_HASH = 48;
 
 /**
  * u16::MAX — the last pc a 16-bit CALL_FUNCTION return address / JUMP_2 /
- * CALLDATA length can reach; a larger program could never execute.
+ * CALLDATA length can reach; a larger program could never execute. Also the
+ * ceiling of the CALLDATA composite `buffer bytecode ++ payload args`.
  */
 export const MAX_BUFFER_CAPACITY = 65535;
 
 /**
  * Version of the bytecode format the engine executes; finalize stamps it into
  * the buffer and execute_from_account asserts it (BufferEpochMismatch means:
- * recompile + re-stage).
+ * recompile + re-stage). Epoch 2 = Wave D (heap-frame memory — the memory-PDA
+ * account prefix is gone, so every account index baked into older bytecode
+ * resolves differently; all epoch-1 buffers are dead).
  */
-export const BYTECODE_FORMAT_EPOCH = 1;
+export const BYTECODE_FORMAT_EPOCH = 2;
+
+/** MAX_PERMITTED_DATA_INCREASE — max account growth per init_buffer invocation. */
+export const PDA_GROWTH_STEP = 10240;
 
 /**
  * The SDK's staging write chunk. The hard packet ceiling for a minimal
@@ -112,6 +111,27 @@ export const BYTECODE_FORMAT_EPOCH = 1;
  * program stages-and-executes in 8/12/20 transactions.
  */
 export const BUFFER_WRITE_CHUNK_BYTES = 1000;
+
+// ── packet budgets (measured, engine tests/payload_args.rs) ──
+
+/**
+ * Fixed wire cost of the staged execute transaction (legacy shape): signature,
+ * message overhead, both ComputeBudget instructions, the pinned
+ * execute_from_account instruction, buffer + payer accounts — 293 bytes plus
+ * 33 per extra user account (32-byte key + 1-byte index).
+ */
+export const STAGED_PACKET_FIXED_BYTES = 293;
+export const STAGED_PACKET_BYTES_PER_ACCOUNT = 33;
+
+/**
+ * Payload-args budget of a pinned staged execute in the 1,232-byte packet with
+ * `extraAccounts` user accounts beyond the payer: 939 − 33·N (+32 unpinned).
+ * Bigger args belong in a second buffer used as a data account, read on-chain
+ * with accountData.
+ */
+export function stagedArgsBudget(extraAccounts: number): number {
+  return 1232 - STAGED_PACKET_FIXED_BYTES - STAGED_PACKET_BYTES_PER_ACCOUNT * extraAccounts;
+}
 
 // ── execution limits ──
 
@@ -122,10 +142,11 @@ export const ENGINE_GAS_LIMIT_CU = 1_400_000;
 /**
  * Measured staged-minus-inline CU premium on identical bytecode (buffer
  * validation: one create_program_address, the header parse, the hash-pin
- * compare, the buffer's loaded-accounts contribution). Informational — the
- * engine's cu_budget suite pins it under a 5,000 CU ceiling.
+ * compare, the payload-args parse, the buffer's loaded-accounts contribution).
+ * Informational — the engine's cu_budget suite pins it under a 5,000 CU
+ * ceiling; a staged 16 KB (or max-capacity) program executes in ~194,978 CU.
  */
-export const STAGED_EXECUTE_CU_PREMIUM = 2194;
+export const STAGED_EXECUTE_CU_PREMIUM = 2216;
 
 /**
  * Synthetic CHAIN_ID values reported by the engine's CHAIN_ID opcode. The

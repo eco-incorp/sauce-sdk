@@ -108,11 +108,7 @@ describe('resolveAccounts', () => {
     const plan: AccountPlan = { metas: [{ ref: 'pool', pubkey: POOL, writable: false, signer: false }] };
     const metas = resolveAccounts(plan, {}, PAYER);
 
-    // No plan signer → the payer is appended as the engine-required in-list signer.
-    expect(metas).toEqual([
-      { address: POOL, role: AccountRole.READONLY },
-      { address: PAYER, role: AccountRole.READONLY_SIGNER },
-    ]);
+    expect(metas).toEqual([{ address: POOL, role: AccountRole.READONLY }]);
   });
 
   it('allows duplicate addresses across refs', () => {
@@ -124,10 +120,10 @@ describe('resolveAccounts', () => {
     };
     const metas = resolveAccounts(plan, { a: POOL, b: POOL }, PAYER);
 
-    expect(metas.map(m => m.address)).toEqual([POOL, POOL, PAYER]);
+    expect(metas.map(m => m.address)).toEqual([POOL, POOL]);
   });
 
-  it('appends the payer as a readonly signer AT THE END when the plan yields no signer (indices stable)', () => {
+  it('a signerless plan stays signerless by default (NoSigner is lazy — only MSG_SENDER readers need one)', () => {
     const plan: AccountPlan = {
       metas: [
         { ref: 'pool', writable: true, signer: false },
@@ -136,8 +132,23 @@ describe('resolveAccounts', () => {
     };
     const metas = resolveAccounts(plan, { pool: POOL, oracle: ORACLE }, PAYER);
 
-    // The engine fails NoSigner without an in-list signer; appending keeps
-    // user-account indices 0..n-1 exactly the plan's.
+    expect(metas).toEqual([
+      { address: POOL, role: AccountRole.WRITABLE },
+      { address: ORACLE, role: AccountRole.READONLY },
+    ]);
+  });
+
+  it('appendPayerSigner appends the payer AT THE END when no meta signs (plan indices stable)', () => {
+    const plan: AccountPlan = {
+      metas: [
+        { ref: 'pool', writable: true, signer: false },
+        { ref: 'oracle', writable: false, signer: false },
+      ],
+    };
+    const metas = resolveAccounts(plan, { pool: POOL, oracle: ORACLE }, PAYER, { appendPayerSigner: true });
+
+    // For MSG_SENDER-reading programs whose plan carries no signer meta; the
+    // append keeps user-account indices 0..n-1 exactly the plan's.
     expect(metas).toEqual([
       { address: POOL, role: AccountRole.WRITABLE },
       { address: ORACLE, role: AccountRole.READONLY },
@@ -145,13 +156,16 @@ describe('resolveAccounts', () => {
     ]);
   });
 
-  it('does NOT append the payer when any resolved meta already signs', () => {
+  it('appendPayerSigner does NOT append when any resolved meta already signs', () => {
     const viaPlanFlag = resolveAccounts(
       { metas: [{ ref: 'auth', writable: false, signer: true }] },
       { auth: ORACLE },
       PAYER,
+      { appendPayerSigner: true },
     );
-    const viaPayerRef = resolveAccounts({ metas: [{ ref: PAYER_REF, writable: false, signer: false }] }, {}, PAYER);
+    const viaPayerRef = resolveAccounts({ metas: [{ ref: PAYER_REF, writable: false, signer: false }] }, {}, PAYER, {
+      appendPayerSigner: true,
+    });
 
     expect(viaPlanFlag).toHaveLength(1);
     expect(viaPayerRef).toHaveLength(1);
