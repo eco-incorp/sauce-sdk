@@ -20,6 +20,40 @@ export type { EcoSwapOutput, QuoteEcoSwapResult, Erc20Slots } from "./ecoswap/in
 export { prepareEcoSwap } from "./ecoswap/prepare.js";
 export type { EcoSwapPrepareOpts } from "./ecoswap/prepare.js";
 
+export {
+  ecoSwapSvm,
+  quoteEcoSwapSvm,
+  stageEcoSwapSvm,
+  executeEcoSwapSvm,
+  encodeEcoSwapSvmTrade,
+  generateEcoSwapSvm,
+  ecoSwapSvmShapeKey,
+  buildLadder,
+  solveReference,
+  solveOptimal,
+  efficiencyLoss,
+  bigintSqrt,
+  QL_S,
+  ECO_SVM_MAX_SLOTS,
+  ECO_SVM_MIN_REL_BPS,
+} from "./ecoswap/svm/index.js";
+export type {
+  EcoSwapSvmConfig,
+  EcoSwapSvmOutput,
+  EcoSwapSvmPoolSpec,
+  EcoSwapSvmPreparedSlot,
+  EcoSwapSvmQuote,
+  EcoSwapSvmSlot,
+  QuoteEcoSwapSvmConfig,
+  GeneratedEcoSwapSvm,
+  GenerateEcoSwapSvmInput,
+  ContinuousVenue,
+  OptimalSplitResult,
+  LadderRung,
+  SolverReferenceResult,
+  SolverSlotInput,
+} from "./ecoswap/svm/index.js";
+
 export { terraSwap } from "./terraswap/index.js";
 export type { TerraSwapOutput, ChainSeriesResult } from "./terraswap/index.js";
 export { prepareTerraSwap, prepareNextSeries } from "./terraswap/prepare.js";
