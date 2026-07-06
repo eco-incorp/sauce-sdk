@@ -38,6 +38,12 @@ import type { MeteoraDammV2PoolConfig } from '../../../svm/venues/meteora-damm-v
 import { meteoraDammV2Ladder } from '../../../svm/venues/meteora-damm-v2/ladder.js';
 import { orcaLegacyTokenSwap } from '../../../svm/venues/orca-legacy-token-swap/index.js';
 import { orcaLegacyTokenSwapLadder } from '../../../svm/venues/orca-legacy-token-swap/ladder.js';
+import { orcaWhirlpool, windowFor } from '../../../svm/venues/orca-whirlpool/index.js';
+import type { OrcaWhirlpoolPoolConfig } from '../../../svm/venues/orca-whirlpool/index.js';
+import { orcaWhirlpoolLadder } from '../../../svm/venues/orca-whirlpool/ladder.js';
+import { manifest, manifestWindowFor } from '../../../svm/venues/manifest/index.js';
+import type { ManifestPoolConfig } from '../../../svm/venues/manifest/index.js';
+import { manifestLadder } from '../../../svm/venues/manifest/ladder.js';
 import { pumpswapAdapter } from '../../../svm/venues/pumpswap/index.js';
 import type { PumpswapPoolConfig } from '../../../svm/venues/pumpswap/index.js';
 import { pumpswapLadder } from '../../../svm/venues/pumpswap/ladder.js';
@@ -97,6 +103,8 @@ type LadderVenueSlug =
   | 'raydium-amm-v4'
   | 'pumpswap'
   | 'orca-legacy-token-swap'
+  | 'orca-whirlpool'
+  | 'manifest'
   | 'meteora-damm-v2'
   | 'saber-stableswap'
   | 'meteora-damm-v1-stable';
@@ -149,6 +157,46 @@ const FAMILIES: Record<LadderVenueSlug, FamilyEntry> = {
     applyDirection: (cfg, direction) => {
       if (direction === undefined || direction === 'AtoB') return cfg;
       throw new Error(`orca-legacy-token-swap only quotes A -> B, got direction '${direction}'`);
+    },
+  },
+  'orca-whirlpool': {
+    ladder: orcaWhirlpoolLadder,
+    programId: orcaWhirlpool.programId,
+    fetch: (load, pool) => orcaWhirlpool.fetchPoolConfig(load, pool),
+    applyDirection: (cfg, direction) => {
+      if (direction === undefined || direction === 'aToB') return cfg;
+      if (direction === 'bToA') return { ...(cfg as OrcaWhirlpoolPoolConfig), direction: 'bToA' };
+      throw new Error(`orca-whirlpool direction must be 'aToB' or 'bToA', got '${direction}'`);
+    },
+    gate: (cfg) => {
+      // The fragment walks the prepare-shipped boundary window; readable == 0
+      // (the array holding the live tick is missing or non-fixed) means no
+      // boundaries and no edge were shippable — nothing to walk in-VM, the
+      // pool is unquotable for this direction.
+      const c = cfg as OrcaWhirlpoolPoolConfig;
+      if (windowFor(c).readable === 0) {
+        throw new Error(
+          `orca-whirlpool pool ${c.pool} has no initialized fixed tick array covering the live tick for ${c.direction}`,
+        );
+      }
+    },
+  },
+  manifest: {
+    ladder: manifestLadder,
+    programId: manifest.programId,
+    fetch: (load, pool) => manifest.fetchPoolConfig(load, pool),
+    applyDirection: (cfg, direction) => {
+      if (direction === undefined || direction === 'baseIn') return cfg;
+      if (direction === 'quoteIn') return { ...(cfg as ManifestPoolConfig), direction: 'quoteIn' };
+      throw new Error(`manifest direction must be 'baseIn' or 'quoteIn', got '${direction}'`);
+    },
+    gate: (cfg) => {
+      // The fragment walks the prepare-shipped order window; an empty side (no
+      // resting orders, or the first order is global/expiring) is unquotable.
+      const c = cfg as ManifestPoolConfig;
+      if (manifestWindowFor(c).orders.length === 0) {
+        throw new Error(`manifest market ${c.pool} has no shippable resting orders on the ${c.direction} side`);
+      }
     },
   },
   'meteora-damm-v2': {
@@ -206,8 +254,9 @@ export interface EcoSwapSvmPoolSpec {
   /**
    * exactIn side, per family: raydium-cp-swap '0to1' (default) | '1to0';
    * raydium-amm-v4 'coinToPc' (default) | 'pcToCoin'; pumpswap 'quoteToBase'
-   * (default) | 'baseToQuote'; meteora-damm-v2 'aToB' (default) | 'bToA';
-   * saber-stableswap and meteora-damm-v1-stable only 'AtoB'.
+   * (default) | 'baseToQuote'; meteora-damm-v2 and orca-whirlpool 'aToB'
+   * (default) | 'bToA'; manifest 'baseIn' (default, sell base) | 'quoteIn'
+   * (buy base); saber-stableswap and meteora-damm-v1-stable only 'AtoB'.
    */
   direction?: string;
   /** Test/integration hook: replace the venue swap CPI (the quote stays live). */
@@ -379,12 +428,20 @@ async function resolveCandidates(
       entry.gate?.(cfg, now);
 
       const refs = entry.ladder.quoteRefs(cfg, 0).filter((account) => account.address !== undefined);
+      // An address is optional only if EVERY ref claiming it is optional
+      // (whirlpool tick arrays beyond the readable window may not exist).
+      const required = new Set(refs.filter((account) => account.optional !== true).map((account) => account.address!));
       const unique = [...new Set(refs.map((account) => account.address!))];
       const state: AccountBytesMap = {};
       await Promise.all(
         unique.map(async (address) => {
           const data = await load(address);
-          if (data === null) throw new Error(`ecoSwapSvm quote account ${address} of pool ${spec.pool} not found`);
+          if (data === null) {
+            if (required.has(address)) {
+              throw new Error(`ecoSwapSvm quote account ${address} of pool ${spec.pool} not found`);
+            }
+            return;
+          }
           state[address] = data;
         }),
       );

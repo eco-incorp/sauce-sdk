@@ -77,6 +77,25 @@ export const CU_FAMILIES: Record<string, FamilyCuCoefficients> = {
   'raydium-amm-v4': { kind: 'cp', slot: 163_374, rung: 62_149 },
   pumpswap: { kind: 'cp', slot: 175_949, rung: 70_379 },
   'orca-legacy-token-swap': { kind: 'cp', slot: 195_664, rung: 87_681 },
+  // CLMM: slot folds the shipped-boundary live verification and the final
+  // predicted quote (usually the reused top rung); rung folds one COLD rung
+  // walk (each is a full compute_swap walk from the live spot; crossed
+  // boundaries after the first walk replay from the full-step memo). 'stable'
+  // kind = the 2-rung default + degrade-first class. Calibrated on the
+  // SOL/USDC ts=4 fixture at 100 SOL (one boundary crossing); CU rises with
+  // crossing depth (~+130k at four crossings), still under the 1.4M cap with
+  // a CP co-slot — the admission headroom absorbs the state-dependence, like
+  // the stable families' Newton-iteration variance.
+  'orca-whirlpool': { kind: 'stable', slot: 443_056, rung: 185_725 },
+  // CLOB: slot folds the shipped-order live seq-verification (MANIFEST_MAX_ORDERS
+  // unrolled market reads over the whole book account) + the cold final quote —
+  // a heavy fixed cost, so 'stable' kind (2-rung default + degrade-FIRST class,
+  // like whirlpool). rung folds one cold best-first walk over the shipped
+  // levels. Calibrated on the SOL/USDC fixture (10 shipped bid levels); the slot
+  // term scales with the shipped-order count (state-dependent, like whirlpool's
+  // crossing depth). Re-pin with ECO_SVM_CU_PRINT=1
+  // (test/svm/ecoswap-svm.cu.e2e.test.ts).
+  manifest: { kind: 'stable', slot: 664_190, rung: 85_224 },
   'meteora-damm-v2': { kind: 'cp', slot: 185_290, rung: 82_405 },
   'saber-stableswap': { kind: 'stable', slot: 503_243, rung: 159_258 },
   'meteora-damm-v1-stable': { kind: 'stable', slot: 570_859, rung: 206_414 },

@@ -25,10 +25,51 @@ ladder depth and slot count deterministically), the **batched account loader**, 
 | meteora-damm-v2 | sqrt-price | 4 | liquidity, sqrt_price, base+dynamic fee, version cap, band bounds, collect_fee_mode — zero params |
 | saber-stableswap | STABLE | 2 | pause byte, vault balances, the four amp-ramp fields, trade fee — zero params |
 | meteora-damm-v1-stable | STABLE | 2 | vault share math with locked-profit decay, fees (min-1), amp, multipliers, idle float — zero params |
+| orca-whirlpool | CLMM | 2 | sqrt_price, tick, liquidity, fee_rate, per-boundary initialized flags + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, with their pure-function sqrt prices) rides the params |
+| manifest | CLOB | 2 | the whole order book in one market account; per shipped level a live sequence_number (identity) + price (u128) + num_base_atoms; the top-of-book WINDOW (up to 16 best-first levels as DataIndex+seq) rides the params; zero fee |
 
 A v2 fragment reads the trade amount and the live state at RUNTIME — nothing about the trade is
 baked. Direction stays part of the shape (and rung count joined it in Phase 1: `~r<n>` in the
 shape key when off the 4-rung default).
+
+**The CLMM window (orca-whirlpool, the first Phase 2 family).** A tick walk needs boundary
+STRUCTURE that is unaffordable to discover in-VM (measured: ~8k CU per scanned tick slot, ~54k
+per in-VM `sqrt_price_from_tick_index`), so prepare walks the tick arrays off-chain and ships
+up to 4 initialized-tick boundaries + the swap-sequence edge as per-trade cfg words — each as
+(biased tick, array cell, sqrt price), all THREE drift-invariant by construction (a TickArray
+PDA pins its start index; the sqrt price is a pure function of the tick). Everything
+value-bearing stays live: the fragment re-reads the pool's sqrt_price/tick/liquidity/fee and
+every boundary's initialized flag + liquidity_net i128 at cook time, skips boundaries behind
+the live tick (drift re-anchoring, the venue's own search semantics), skips removed ticks, and
+SELF-DEACTIVATES when the live tick leaves the shipped window — the SVM shape of the EVM
+net-cache thesis. Ladder rungs are COLD walks from the live spot (each rung = the venue's own
+compute_swap loop; crossed boundaries memoize their full-step results across walks —
+value-transparent, so the mirror stays plain); a rung whose walk exhausts the window reports
+the previous cumulative output (dOut 0 — merge-safe self-deactivation), and the final
+predicted quote clamps to 0 past capacity, skipping the CPI. One documented one-sided drift:
+a tick NEWLY initialized inside a shipped gap adds a venue step the model misses — added
+liquidity only improves the realized output, and the terminal delta check still enforces
+minOut.
+
+**The CLOB window (manifest, the second Phase 2 family).** An order book is a red-black tree of
+resting orders inside ONE market account; the taker match walks best-first via
+`get_next_lower_index` (successor pointer-chasing with a data-dependent inner loop — unbounded and
+unaffordable in-VM, the whirlpool tick-discovery class). So prepare walks the tree OFF-CHAIN from
+the side's best index and ships up to `MANIFEST_MAX_ORDERS = 16` price levels as `(DataIndex,
+sequence_number)` cfg params; the fragment reads each shipped order's price + size LIVE. **Price
+levels ARE the ladder** — each order a discrete step, capacity = its size, marginal price = its
+listed price, ZERO fee — so the book side is exact at every point (a CLOB quote is piecewise-linear
+in the levels), and only the shared geometric split-grid quantizes. The `sequence_number` (a
+monotonic per-order id, stable across partial fills, unique across free-list reuse) is the
+drift-invariant identity anchor: the fragment validates it live per order and STOPS the walk on the
+first mismatch (an order filled/cancelled + its block reused) — the CLOB shape of self-deactivation.
+The off-chain walk STOPS at the first GLOBAL order (a taker IOC halts there without the extra global
+accounts, so globals are gated out) and the first EXPIRING order (the in-VM model carries no clock).
+The `swap` is walletless direct settlement (a temporary seat, virtual credit, match, settle,
+release); one-sided drifts (a new better order missed, an expiring order matched past the window)
+are favorable or minOut-caught. The two directions are the venue's two taker paths exactly
+(`place_order` for base-in sells, `impact_base_atoms` for quote-in buys), transcribed with the same
+UP/DOWN rounding.
 
 ## The quantized water-fill
 
@@ -161,12 +202,16 @@ Per-family single-slot trades (stand-in CPI), the calibration suite's raw number
 | meteora-damm-v2 | 306,903 CU | 471,714 CU |
 | saber-stableswap | 778,562 CU | 1,097,079 CU |
 | meteora-damm-v1-stable | 940,490 CU | 1,353,318 CU |
+| orca-whirlpool | 771,309 CU | 1,142,759 CU |
+| manifest | 791,441 CU | 961,890 CU |
 
 | metric | value |
 | --- | --- |
 | cp+stable split (pumpswap@3 + saber@2, both engaged) | **1,112,787 CU** (floor 1,165,648; cap 1,400,000) |
 | 3-slot CP trade after budgeter degradation [4,3,3] | 1,080,963 CU (was 1,306,797 at [4,4,4] — same split) |
-| real-binary quadrilaterals (full trade incl. the venue CPI) | raydium-cp 423,358 CU; pumpswap 506,963 CU; saber 800,198 CU |
+| real-binary quadrilaterals (full trade incl. the venue CPI) | raydium-cp 423,358 CU; pumpswap 506,963 CU; saber 800,198 CU; orca-whirlpool 814,040 CU (real tick cross); manifest 827,465 CU (real CLOB taker match, reverse maker crossed) |
+| cp+whirlpool split (whirl@2 + pump@3, both engaged, cut inside the tick window) | 1,127,977 CU |
+| cp+manifest split (manifest@2 + pump@3, both engaged, cut mid-level) | 1,146,799 CU |
 | quantization loss vs continuous | 0.63% on the deliberately shallow Phase-0 universe; second-order on deep pools |
 
 ## Real-binary CPI lane (`SAUCE_VENUE_PROGRAMS`)
@@ -181,10 +226,28 @@ beyond the quote fixtures (saber's admin-fee destination, pumpswap's fee ATAs) a
 the adapter-derived addresses; the PUMP mint is Token-2022, so the user's base account rides that
 program.
 
-## Honest limits (Phase 1)
+## Honest limits (Phase 1 + the Phase 2 whirlpool & manifest families)
 
-- **No CLMM/DLMM, no multihop routes yet** (Whirlpools/Raydium-CLMM need a tick-array walk over a
-  data-dependent account set; Phase 2 candidates alongside Manifest).
+- **No multihop routes yet**; Raydium CLMM / Meteora DLMM are future families on the whirlpool
+  pattern, Phoenix / OpenBook on the manifest CLOB pattern (Whirlpools + Manifest landed in Phase 2
+  — see the CLMM/CLOB window notes above).
+- **The whirlpool window is 4 boundaries deep per direction** (WHIRLPOOL_MAX_BOUNDARIES): a
+  trade needing more crossings self-caps and the merge reroutes the tail; a live tick that
+  drifts past the whole shipped window deactivates the slot until re-prepare. CU is
+  state-dependent (~45k per crossed boundary per walk; calibrated at one crossing).
+- **The manifest window is 16 top-of-book levels deep per direction** (MANIFEST_MAX_ORDERS): a
+  trade beyond that depth saturates and the merge reroutes the tail; a shipped order filled/reused
+  since prepare (live sequence_number mismatch) stops the walk from that level (self-deactivation).
+  The 16 unrolled live reads over the whole book account are a heavy fixed cost — a manifest slot
+  is a degrade-first 'stable'-class family (2-rung default), and the slot CU term scales with the
+  shipped-order count.
+- **Manifest global orders are gated** (they draw from a separate global account the swap would
+  need extra accounts for): the off-chain walk STOPS at the first global maker, exactly as the
+  venue's taker IOC halts there without those accounts. Expiring orders (last_valid_slot != 0) are
+  likewise a walk-stop (the in-VM model carries no clock). A new better global appearing between
+  prepare and execute is the one adverse manifest drift — caught by the terminal minOut, atomic.
+- **Whirlpool + manifest Token-2022 markets are gated** (the v1 `swap` instructions are Tokenkeg-only;
+  swap_v2 / the optional mint accounts are a follow-up).
 - **Ladder quantization**: only the binding venue's marginal rung splits exactly; non-binding
   slots quantize to rung boundaries. Stable slots run 2 rungs by default — their curves are flat,
   so quantization loss there is even lower than CP's.
@@ -213,7 +276,13 @@ program.
 
 ## Phase 2 notes
 
-Whirlpools (tick-array CLMM — needs a data-dependent account plan and a windowed in-VM walk),
-Manifest (CLOB), multihop route legs (each hop its own slot set, the EVM QL-legs shape), an ALT
-path for 3-4-slot shapes whose account lists outgrow the 1,232-byte packet, and per-slot
-`swapOverride`-style external quotes once a router-integration consumer shows up.
+Whirlpools + Manifest LANDED (prepare-declared windows + live-value walks; see the CLMM/CLOB window
+notes above — the whirlpool ships tick boundaries, the CLOB ships top-of-book order levels, both
+read all value-bearing state live). Remaining: Raydium CLMM / Meteora DLMM on the whirlpool pattern
+and Phoenix / OpenBook on the CLOB pattern, multihop route legs (each hop its own slot set, the EVM
+QL-legs shape), an ALT path for shapes whose account lists outgrow the 1,232-byte packet (a
+two-whirlpool shape already needs it: 16 cfg words per CLMM slot plus ~6 accounts; a manifest slot's
+cfg is ~33 words but only one account), per-level (rather than geometric-grid) rungs for the CLOB
+side to remove the residual split quantization (needs per-family grid support in codegen +
+solver-reference), and per-slot `swapOverride`-style external quotes once a router-integration
+consumer shows up.

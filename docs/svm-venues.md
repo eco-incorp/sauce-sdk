@@ -1,10 +1,11 @@
 # SVM venue facts
 
-Normative reference for the seven venue adapters in `sdk/src/svm/venues/`. Every byte offset,
-quote formula, rounding rule, gate and pinned constant that the adapters and their test suites
-cite lives here. The adapters were written against the venues' published sources and deployed
-mainnet binaries; this document is regenerated from that code and its fixtures and is the
-companion the adapter doc comments point at.
+Normative reference for the venue adapters in `sdk/src/svm/venues/` — seven v1 (solswap)
+adapters plus the ladder-only orca-whirlpool CLMM and manifest CLOB families. Every byte offset, quote formula,
+rounding rule, gate and pinned constant that the adapters and their test suites cite lives
+here. The adapters were written against the venues' published sources and deployed mainnet
+binaries; this document is regenerated from that code and its fixtures and is the companion
+the adapter doc comments point at.
 
 ## How quoting works
 
@@ -35,9 +36,14 @@ under `sdk/test/svm/fixtures/<slug>/` as `{ address, owner, base64Data }`.
 
 ## Exclusions
 
-- **CLMM venues** (Orca Whirlpools, Raydium CLMM, Meteora DLMM): quoting requires a tick-array
-  walk across a data-dependent set of accounts — it does not fit the one-adapter-one-pool,
-  fixed-account-plan shape. No adapter.
+- **CLMM venues**: quoting requires a tick walk across a data-dependent account set, which does
+  not fit the one-adapter-one-pool v1 shape — no v1 adapter for any of them. **Orca Whirlpools
+  is covered as a LADDER-ONLY family** (adapter contract v2, EcoSwapSVM — see its section
+  below); Raydium CLMM and Meteora DLMM remain future candidates on the same pattern.
+- **CLOB venues**: an order-book quote is a best-first tree walk over resting orders, likewise
+  data-dependent and unfit for the v1 shape. **Manifest is covered as a LADDER-ONLY family**
+  (adapter contract v2 — see its section below); other CLOBs (Phoenix, OpenBook) are future
+  candidates on the same order-window pattern.
 - **Proprietary AMMs** (SolFi, Obric v2, ZeroFi, HumidiFi, ...): over 92% of aggregator flow, but
   closed-source — no published math, often no published layouts, nothing for an in-VM quote to
   read. Covered exclusively through the external-quote path (`quoteViaSimulation` + the recipe's
@@ -484,6 +490,276 @@ authority `JU8kmKzDHF9sXWsnoznaFDFezLsE5uomX2JkRMbmsQP` (derivation verified:
 - Quote direction is token A → token B (matching the pinned example); the reverse direction needs
   the roles swapped by the caller.
 - The emitted ceiling is spelled `(rIn·rOut + rIn + netIn − 1) / (rIn + netIn)`.
+
+---
+
+## orca-whirlpool (ladder-only)
+
+Orca Whirlpools CLMM — the first tick-walk family, EcoSwapSVM adapter contract v2 ONLY (no v1
+adapter, not in the v1 registry: the account set depends on the price path). Program
+`whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc`; source-verified against
+`github.com/orca-so/whirlpools` `programs/whirlpool/src` (state/{whirlpool,tick,
+fixed_tick_array}.rs, math/{tick_math,token_math,bit_math,swap_math}.rs,
+manager/swap_manager.rs, util/{swap_tick_sequence,sparse_swap}.rs) and a mainnet dump
+(`sdk/test/svm/fixtures/orca-whirlpool/`, snapshot slot 431094837).
+
+### Whirlpool account (653 bytes, Anchor)
+
+Discriminator `sha256("account:Whirlpool")[0..8]` = `3f 95 d1 0c e1 80 63 09`. All integers LE.
+
+| field | offset | encoding |
+| --- | --- | --- |
+| tick_spacing | 41 | u16 LE |
+| fee_tier_index_seed | 43 | u16 LE (== tick_spacing for static-fee pools) |
+| fee_rate | 45 | u16 LE (hundredths of a bp, denominator 1e6) |
+| protocol_fee_rate | 47 | u16 LE (bps of the fee — never reaches the trader) |
+| liquidity | 49 | u128 LE |
+| sqrt_price | 65 | u128 LE (Q64.64) |
+| tick_current_index | 81 | i32 LE two's-complement |
+| token_mint_a / token_vault_a | 101 / 133 | pubkey |
+| token_mint_b / token_vault_b | 181 / 213 | pubkey |
+| reward_last_updated_timestamp | 261 | u64 LE (swap clock must exceed it) |
+
+### TickArray account (FixedTickArray, 9988 bytes)
+
+Discriminator `sha256("account:TickArray")[0..8]` = `45 61 bd be 6e 07 42 bb`. Layout:
+start_tick_index i32 LE @8; ticks[88] @12, 113 bytes each — `initialized` u8 @+0,
+`liquidity_net` **i128 LE two's-complement** @+1, `liquidity_gross` u128 LE @+17 (rest is fee/
+reward growth); whirlpool pubkey @9956. PDA `['tick_array', whirlpool, ascii(start_tick_index)]`
+— the seeds PIN the start index, which is what makes a shipped (array, offset) → tick mapping
+drift-invariant. `DynamicTickArray` (variable size, discriminator
+`sha256("account:DynamicTickArray")[0..8]` = `11 d8 f6 8e e1 c7 da 38`) cannot be read at fixed
+offsets and truncates the readable window at prepare.
+
+### The prepare-declared window
+
+The swap instruction takes exactly three TickArray PDAs; the program derives their expected
+start indexes from the LIVE tick (sparse_swap.rs `get_start_tick_indexes`): `base =
+floor(tick / (88*ts)) * (88*ts)`, offsets `[0,-1,-2]` for aToB, `[0,1,2]` for bToA — shifted to
+`[1,2,3]` when `tick + ts >= base + 88*ts`. Uninitialized PDAs are proxied as zeroed arrays
+(sparse swap), so real capacity is always >= the modeled window.
+
+Because a live per-slot flag scan plus in-VM `sqrt_price_from_tick_index` bit ladders is
+unaffordable on the interpreter (measured ~8k CU per scanned slot, ~54k per tick-sqrt),
+prepare walks the arrays OFF-CHAIN and ships up to **4 boundaries** per direction (biased
+tick, array index, offset, Q64.64 sqrt price — the sqrt is a pure function of the PDA-pinned
+tick) plus the swap-sequence EDGE (last readable array's start for aToB / start + 88*ts − 1
+for bToA, clamped to ±443636; shipped only when the boundary scan exhausted the window rather
+than hitting the 4-boundary cap). Everything value-bearing is read LIVE in-VM: pool sqrt_price
+/ tick / liquidity / fee_rate, and each boundary's initialized flag + liquidity_net. Boundaries
+behind the live tick are skipped in-VM (aToB keeps tick <= live — the venue's inclusive
+down-search; bToA keeps tick > live), flag-0 boundaries are skipped (the venue no longer steps
+there), and a live tick past the whole shipped set self-deactivates the venue (quote 0 — no
+out-of-window fallback exists). The one non-exact drift case: a tick NEWLY initialized inside a
+shipped gap adds a step (and liquidity) the model misses — added liquidity only improves the
+realized output, and the terminal outAta delta still enforces minOut.
+
+### Quote (exactIn, both directions — the venue's compute_swap loop)
+
+Per step toward the next boundary target, with `fn = 1e6 − fee_rate`:
+
+```
+amount_calc = floor(remaining * fn / 1e6)
+fixed       = delta_in(curr, target, L, CEIL)          (SENT sentinel when the venue would refuse)
+full step (fixed <= amount_calc): in = fixed; fee = ceil(in * fee_rate / fn);
+     out += delta_out(curr, target, L, FLOOR); remaining -= in + fee; cross liquidity_net
+partial   : next = next_sqrt_price(curr, L, amount_calc); in = delta_in(curr, next, CEIL);
+     fee = remaining - in; out += delta_out(curr, next, FLOOR); remaining = 0
+```
+
+with `delta_a = ceil_or_floor((L*(hi−lo) << 64) / (hi*lo))`, `delta_b = (L*(hi−lo)) >> 64`
+(round-up on the low 64 bits), `next_sqrt_from_a = ceil((L*sp << 64)/((L << 64) + calc*sp))`,
+`next_sqrt_from_b = sp + floor((calc << 64)/L)` — token_math.rs exactly. Crossing applies
+`-liquidity_net` going down / `+liquidity_net` going up over the raw two's-complement word.
+Every venue abort (delta > u64::MAX on a taken step, L*ds >= 2^192 U256 shift overflow,
+liquidity over/underflow on a cross, amount_remaining underflow) maps to a conservative clamp:
+the walk marks itself exhausted and the quote past that point is 0 — a clamped ladder rung
+reports the previous cumulative output (dOut 0, never elected) and a clamped final quote skips
+the CPI. Protocol fees split off the fee and never affect the trader.
+
+### Swap instruction: `swap` (v1, Tokenkeg-only)
+
+Data (34 bytes): discriminator `sha256("global:swap")[0..8]` =
+`[248, 198, 158, 145, 225, 117, 135, 200]`, `amount` u64 LE (runtime-patched), 
+`other_amount_threshold` u64 LE = 1, `sqrt_price_limit` u128 LE = 0 (NO_EXPLICIT — the program
+substitutes the global MIN/MAX bound; the capacity clamp keeps the walk inside the window),
+`amount_specified_is_input` = 1, `a_to_b`.
+
+| # | account | flags |
+| --- | --- | --- |
+| 0 | token program (Tokenkeg) | |
+| 1 | token authority (user owner) | signer |
+| 2 | whirlpool | writable |
+| 3 | token_owner_account_a (user in for aToB, out for bToA) | writable |
+| 4 | token_vault_a | writable |
+| 5 | token_owner_account_b (user out for aToB, in for bToA) | writable |
+| 6 | token_vault_b | writable |
+| 7-9 | tick_array_0..2 (window PDAs, nearest first) | writable |
+| 10 | oracle PDA `['oracle', whirlpool]` (uninitialized for static-fee pools) | |
+
+Gates (fetch time): size/discriminator; **adaptive-fee pools** (`fee_tier_index !=
+tick_spacing` — the effective fee depends on Oracle volatility state the fragment does not
+read); **non-Tokenkeg mints** (the v1 swap is classic-SPL only; Token-2022 pools need swap_v2 —
+follow-up); a direction with no shipped boundaries and no edge.
+
+### Pinned worked examples
+
+SOL/USDC 0.04% ts=4 pool `Czfq3xZZ...` at snapshot slot 431094837 (sqrt_price
+5244461737044097829, tick -25156, liquidity 832740502930995) — pinned from an INDEPENDENT
+direct port of the whirlpool sources (`test/svm/venues/orca-whirlpool.test.ts` header):
+
+- aToB 1 SOL -> **80_795_746** USDC raw; 100 SOL -> **8_079_301_632** (crosses tick -25156);
+  1000 SOL -> **80_768_189_284** (walks to tick -25163); 10_000 SOL -> 0 (past the 4-boundary
+  window capacity — self-deactivation).
+- bToA 81 USDC -> **1_001_725_479** lamports; 81_000 USDC -> **1_001_383_338_471** (walks to
+  tick -25149).
+- The 100-SOL vector is also the real-binary quadrilateral pin (realized on the dumped mainnet
+  program, tick crossed, 814k CU total).
+
+### Caveats
+
+- Boundary count is `WHIRLPOOL_MAX_BOUNDARIES = 4` per direction (each crossed boundary is
+  ~45k CU in a walk; each rung is a full cold walk) — deep trades self-cap at the shipped
+  window and the merge reroutes the tail. Raising it costs 3 cfg words + one walk iteration
+  per boundary and must move in lockstep with the fragment's unrolled setup and the mirror.
+- The ladder mirror (`referenceQuote`/`referenceLadderQuotes`) models the FRAGMENT given the
+  prepare-time cfg + params over live bytes — mirror a drifted execution with the ORIGINAL
+  prepared cfg/params, not a refetched one.
+- CU is state-dependent (crossing depth): calibrated at 100 SOL / one crossing; a
+  four-crossing walk runs ~130k CU hotter — headroom absorbs it (see budget.ts).
+
+---
+
+## manifest (ladder-only)
+
+Manifest CLOB — the first order-book family, EcoSwapSVM adapter contract v2 ONLY (no v1
+adapter, not in the v1 registry: the account set is one market, but the quote is a tree walk).
+Program `MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms`; source-verified against
+`github.com/CKS-Systems/manifest` `programs/manifest/src` (state/{market,resting_order}.rs,
+program/{instruction,processor/swap}.rs, quantities.rs) + `lib/src/red_black_tree.rs`, and a
+mainnet dump of the SOL/USDC market `ENhU8LsaR7...` (`sdk/test/svm/fixtures/manifest/`,
+2026-07-06). **Zero taker fee.**
+
+### MarketFixed account (256-byte header + dynamic hypertree)
+
+The whole order book lives in ONE market account: a 256-byte `MarketFixed` header then a dynamic
+byte array of 80-byte blocks (a 16-byte red-black-tree node overhead + a 64-byte `RestingOrder`
+or `ClaimedSeat` payload), interleaved as three RB trees (bids, asks, seats) + a free list — the
+"hypertree". Discriminant (u64 LE @0) = `4859840929024028656`. All integers LE.
+
+| field | offset | encoding |
+| --- | --- | --- |
+| discriminant | 0 | u64 LE = 4859840929024028656 |
+| base_mint_decimals | 9 | u8 |
+| quote_mint_decimals | 10 | u8 |
+| base_mint / quote_mint | 16 / 48 | pubkey |
+| base_vault / quote_vault | 80 / 112 | pubkey (PDA `['vault', market, mint]`) |
+| bids_root_index / bids_best_index | 156 / 160 | DataIndex (u32; NIL = u32::MAX) |
+| asks_root_index / asks_best_index | 164 / 168 | DataIndex |
+
+A `DataIndex` is a **byte offset into the dynamic region** (`get_helper` reads `dynamic[idx..]`),
+so a block sits at absolute `256 + DataIndex`.
+
+### RBNode + RestingOrder block (80 bytes)
+
+Node overhead @ block base: `left` u32 @0, `right` u32 @4, `parent` u32 @8, `color` u8 @12,
+`payload_type` u8 @13, padding @14. `RestingOrder` payload @ block+16: `price`
+QuoteAtomsPerBaseAtom (u128 LE) @+0, `num_base_atoms` u64 @+16, `sequence_number` u64 @+24,
+`trader_index` u32 @+32, `last_valid_slot` u32 @+36, `is_bid` u8 @+40, `order_type` u8 @+41. So
+for an order at DataIndex `ix`: price @ `ix+272`, size @ `ix+288`, seq @ `ix+296`.
+
+The price `inner` is a u128 = **quote_atoms_per_base_atom × 1e18** (`from_mantissa_and_exponent`:
+`inner = mantissa × 10^(18+exp)`). `order_type`: 0 Limit, 1 IOC, 2 PostOnly, 3 Global, 4 Reverse,
+5 ReverseTight. `sequence_number` is a monotonic per-order id (survives partial fills, unique
+across free-list reuse) — the drift-invariant identity anchor.
+
+### The prepare-declared order window
+
+The taker match walks best-first: `bids_best_index` / `asks_best_index` (the header points at the
+best order) then `get_next_lower_index` (the in-order predecessor — because the tree's Ord makes
+the MAX the best order, its predecessor is the next-worse). This successor walk chases
+parent/child pointers with a data-dependent inner loop — **unbounded and unaffordable in-VM**, the
+same class as whirlpool's rejected tick discovery. So prepare walks the tree OFF-CHAIN and ships up
+to **`MANIFEST_MAX_ORDERS = 16`** price levels per direction as `(DataIndex, sequence_number)` cfg
+params; the fragment reads each shipped order's price + size LIVE. It **STOPS the off-chain walk at
+the first Global order** (a taker IOC halts there without the global accounts — `place_order` /
+`impact_base_atoms`) and at the first order with `last_valid_slot != 0` (the in-VM model carries no
+clock). Global orders draw from a separate global account the swap would need extra accounts for —
+they are gated out this way; Reverse / PostOnly makers ARE takeable and are shipped.
+
+Drift is handled by the live seq check per order: the fragment reads each shipped order's live
+`sequence_number` and **STOPS on the first mismatch** (the block was filled/cancelled + reused —
+self-deactivation from that level). A shipped order partially filled since prepare keeps its seq and
+is priced on its live (smaller) size — exact. A NEW better order inside the shipped range is missed
+(favorable — a better price only improves the realized output, minOut enforced). A new better Global
+that halts the venue's taker early is the one adverse case, caught by the terminal minOut.
+
+### Quote (exactIn, both directions — the venue's taker match)
+
+Price levels ARE the ladder: each shipped order is a discrete step, capacity = its size, marginal
+price = its listed price, zero fee. Conversions (quantities.rs), `inner = price × 1e18`:
+
+```
+quote_for_base(base, up) = round(inner * base / 1e18)     // checked_quote_for_base
+base_for_quote(quote, up) = round(1e18 * quote / inner)   // checked_base_for_quote
+```
+
+- **baseIn** (sell base, matches BIDS, `place_order`): per maker, `traded = min(remaining_base,
+  size)`; a full fill rounds quote **UP** (taker favor), the marginal partial rounds **DOWN**
+  (`round_up = is_bid != did_fully_match`, `is_bid=false`). Output = Σ quote.
+- **quoteIn** (buy base, matches ASKS, `impact_base_atoms`): per maker, `base_limit =
+  floor(1e18 * remaining_quote / price)`; full when `base_limit >= size` (consume `size` base,
+  subtract `floor(price*size/1e18)` quote — round DOWN), else the marginal partial takes
+  `base_limit` and stops. Output = Σ base.
+
+A conversion the venue would reject (u128 product overflow / a u64-exceeding result) surfaces as
+the SENT sentinel (2^65) and the walk clamps — the merge patches a smaller fill that never triggers
+the abort. The quote saturates (no out-of-window fallback) once the shipped depth is exhausted.
+
+### Swap instruction: `Swap` (disc 4, Tokenkeg-only, walletless direct-settlement)
+
+Data (19 bytes): a 1-byte instruction discriminant `4` then Borsh `SwapParams { in_atoms u64 LE
+(runtime-patched), out_atoms u64 LE = 1, is_base_in u8, is_exact_in u8 = 1 }`. The swap claims a
+temporary seat for the owner (if none), virtually credits `in_atoms`, matches, settles the real
+token transfers, and releases the seat — no pre-existing deposit needed. `out_atoms` (min out) = 1;
+the recipe's terminal outAta delta enforces the real bound.
+
+| # | account | flags |
+| --- | --- | --- |
+| 0 | owner (== payer; the single-account form, market is manifest-owned) | signer, writable |
+| 1 | market | writable |
+| 2 | system program (for the temp-seat / reverse-order expansion) | |
+| 3 | trader_base (base-in: user in; quote-in: user out) | writable |
+| 4 | trader_quote (base-in: user out; quote-in: user in) | writable |
+| 5 / 6 | base_vault / quote_vault | writable |
+| 7 | token program (Tokenkeg) | |
+
+Optional accounts 8-12 (base/quote mints for Token-2022, global + global_vault) are omitted for the
+classic-SPL, no-global class. Gates (fetch time): size / discriminant; non-classic-SPL mints (the
+Swap ix is Tokenkeg-only here); a direction with no shippable levels.
+
+### Pinned worked examples
+
+SOL/USDC market `ENhU8LsaR7...` (2026-07-06 dump) — pinned from an INDEPENDENT direct port of the
+venue's taker math (`test/svm/venues/manifest.test.ts` header), K = 16 shipped levels:
+
+- **quoteIn** (USDC in -> SOL out): 1 USDC -> **12_445_225** SOL raw; 100 USDC -> **1_244_522_576**;
+  1000 USDC -> **12_381_694_976**; 5000 USDC -> **36_607_379_770** (saturates the 16-level ask
+  window).
+- **baseIn** (SOL in -> USDC out): 1 SOL -> **80_216_939** USDC raw; 5 SOL -> **401_084_700**;
+  10 SOL -> **801_614_101**; 50 SOL -> **3_361_566_055** (saturates the bid side).
+- The 1-SOL baseIn vector is also the real-binary quadrilateral pin (realized on the dumped mainnet
+  program through the real CLOB taker match, a reverse maker crossed, ~827k CU total).
+
+### Caveats
+
+- Shipped depth is `MANIFEST_MAX_ORDERS = 16` levels per direction — a trade beyond top-of-book
+  depth saturates and the merge reroutes the tail. The setup (16 unrolled live reads over the whole
+  book account) is a heavy fixed cost, so a manifest slot is a degrade-first 'stable'-class family
+  (2-rung default) like whirlpool; the slot CU term scales with the shipped-order count.
+- The ladder mirror (`referenceQuote`) models the FRAGMENT given the prepare-time cfg + params over
+  live bytes — mirror a drifted execution with the ORIGINAL prepared params, not a refetched one.
+- The recipe's taker owns no resting orders on the market (self-trade is out of scope for a router).
 
 ---
 

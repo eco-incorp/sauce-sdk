@@ -27,12 +27,16 @@ import { fileURLToPath } from 'url';
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import {
+  fetchManifestConfig,
+  fetchOrcaWhirlpoolConfig,
+  manifestLadder,
   meteoraDammV1Stable,
   meteoraDammV1StableLadder,
   meteoraDammV2,
   meteoraDammV2Ladder,
   orcaLegacyTokenSwap,
   orcaLegacyTokenSwapLadder,
+  orcaWhirlpoolLadder,
   pumpswapAdapter,
   pumpswapLadder,
   raydiumAmmV4,
@@ -65,6 +69,8 @@ const OUT_ATA_START = 5_000_000n;
 
 const VENUE_POOL: Record<string, Address> = {
   'raydium-cp-swap': address('7JuwJuNU88gurFnyWeiyGKbFmExMWcmRZntn9imEzdny'),
+  'orca-whirlpool': address('Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE'),
+  manifest: address('ENhU8LsaR7vDD2G1CsWcsuSGNrih9Cv5WZEk7q9kPapQ'),
   'raydium-amm-v4': address('58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'),
   pumpswap: address('2uF4Xh61rDwxnG9woyxsVQP7zuA6kLFpb3NvnRQeoiSd'),
   'orca-legacy-token-swap': address('EGZ7tiLeH62TPV1gL8WwbXGzEPa9zmcpVnnkPKKnrE2U'),
@@ -124,6 +130,11 @@ describeSvm('ecoswap-svm CU calibration: per-family coefficients on the real eng
         },
       },
       { slug: 'orca-legacy-token-swap', adapter: orcaLegacyTokenSwapLadder, amountIn: 1_000_000_000n, fetch: () => orcaLegacyTokenSwap.fetchPoolConfig(liveLoader, VENUE_POOL['orca-legacy-token-swap']) },
+      // 100 SOL = one boundary crossing on the ts=4 fixture — the pinned
+      // calibration point (CU rises with crossing depth; see budget.ts).
+      { slug: 'orca-whirlpool', adapter: orcaWhirlpoolLadder, amountIn: 100_000_000_000n, fetch: () => fetchOrcaWhirlpoolConfig(liveLoader, VENUE_POOL['orca-whirlpool']) },
+      // 5 SOL sells across several real bid levels of the SOL/USDC CLOB.
+      { slug: 'manifest', adapter: manifestLadder, amountIn: 5_000_000_000n, fetch: () => fetchManifestConfig(liveLoader, VENUE_POOL.manifest) },
       { slug: 'meteora-damm-v2', adapter: meteoraDammV2Ladder, amountIn: 1_000_000_000n, fetch: () => meteoraDammV2.fetchPoolConfig(liveLoader, VENUE_POOL['meteora-damm-v2']) },
       { slug: 'saber-stableswap', adapter: saberStableswapLadder, amountIn: 1_000_000_000n, fetch: () => saberStableswap.fetchPoolConfig(liveLoader, VENUE_POOL['saber-stableswap']) },
       { slug: 'meteora-damm-v1-stable', adapter: meteoraDammV1StableLadder, amountIn: 1_000_000_000n, fetch: () => meteoraDammV1Stable.fetchPoolConfig(liveLoader, VENUE_POOL['meteora-damm-v1-stable']) },

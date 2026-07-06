@@ -43,6 +43,14 @@ export interface VenueAccount {
   address?: Address;
   writable?: boolean;
   signer?: boolean;
+  /**
+   * quoteRefs only: the account may legitimately NOT EXIST on-chain (e.g. an
+   * uninitialized whirlpool TickArray PDA beyond the readable window). The
+   * orchestrator's state fetch skips it when missing instead of throwing;
+   * the fragment must never read it (a param/live gate decides), though it
+   * still rides the transaction account list for the venue CPI.
+   */
+  optional?: boolean;
 }
 
 /**
