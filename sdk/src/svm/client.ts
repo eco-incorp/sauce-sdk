@@ -1,6 +1,7 @@
-import { createSolanaRpc, createSolanaRpcSubscriptions } from '@solana/kit';
-import type { Address, AddressesByLookupTableAddress, Instruction, Signature, TransactionSigner } from '@solana/kit';
+import { createSolanaRpc, createSolanaRpcSubscriptions, sendAndConfirmTransactionFactory } from '@solana/kit';
+import type { Address, AddressesByLookupTableAddress, Commitment, Instruction, Signature, TransactionSigner } from '@solana/kit';
 import type { AccountPlan, ArgsLayout, ArgValue } from '@eco-incorp/sauce-compiler';
+import { createAltWithAddresses, extendAlt, fetchAlt, waitForAltActive } from './alt.js';
 import { encodePayloadArgs } from './args.js';
 import {
   buildCloseBufferInstruction,
@@ -74,7 +75,34 @@ export interface ExecuteStagedOpts extends SimulateStagedOpts {
   computeUnitLimit?: number | 'auto';
 }
 
+/** An address lookup table this client created/extended, ready to compress a v0 transaction against. */
+export interface EnsuredLookupTable {
+  lookupTableAddress: Address;
+  /** The shape `executeStaged`/`simulate`'s `lookupTables` option consumes (table → its addresses). */
+  lookupTables: AddressesByLookupTableAddress;
+}
+
+export interface EnsureLookupTableOpts {
+  /**
+   * Reuse and EXTEND this table instead of creating a fresh one: the addresses
+   * already in it are diffed out and only the missing ones are appended (an
+   * all-present set sends nothing) — the idempotent per-universe reuse path.
+   */
+  existing?: Address;
+  commitment?: Commitment;
+}
+
 export interface SauceSvmClient {
+  /** Fee-payer / lookup-table authority public key — the ALT-address selection excludes it (signers cannot be looked up). */
+  readonly payerAddress: Address;
+  /**
+   * Creates (or, with `opts.existing`, extends) an address lookup table over
+   * `addresses`, waits for it to warm up, and returns it in the shape the
+   * execute/simulate `lookupTables` option consumes. Signers must NOT be in
+   * `addresses` — they have to stay static message accounts. Idempotent on the
+   * existing path: an already-covering table sends no transactions.
+   */
+  ensureLookupTable(addresses: readonly Address[], opts?: EnsureLookupTableOpts): Promise<EnsuredLookupTable>;
   simulate(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateOpts): Promise<SimulateExecuteResult>;
   execute(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: ExecuteOpts): Promise<SendExecuteResult>;
   /**
@@ -224,7 +252,49 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }: 
     ];
   }
 
+  const sendAndConfirmAlt = sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions });
+
+  async function ensureLookupTable(addresses: readonly Address[], opts: EnsureLookupTableOpts = {}): Promise<EnsuredLookupTable> {
+    if (addresses.length === 0) {
+      throw new Error('ensureLookupTable needs at least one address (a lookup table cannot be empty)');
+    }
+    const commitment = opts.commitment ?? 'confirmed';
+    const deduped = [...new Set(addresses)];
+
+    if (opts.existing !== undefined) {
+      const current = (await fetchAlt(rpc, opts.existing))[opts.existing] ?? [];
+      const have = new Set(current);
+      const missing = deduped.filter((address) => !have.has(address));
+      if (missing.length > 0) {
+        const { lastExtendedSlot } = await extendAlt({
+          rpc,
+          payer,
+          authority: payer,
+          lookupTableAddress: opts.existing,
+          addresses: missing,
+          sendAndConfirm: sendAndConfirmAlt,
+          commitment,
+        });
+        await waitForAltActive(rpc, lastExtendedSlot);
+      }
+      return { lookupTableAddress: opts.existing, lookupTables: await fetchAlt(rpc, opts.existing) };
+    }
+
+    const { lookupTableAddress, lastExtendedSlot } = await createAltWithAddresses({
+      rpc,
+      payer,
+      authority: payer,
+      addresses: deduped,
+      sendAndConfirm: sendAndConfirmAlt,
+      commitment,
+    });
+    await waitForAltActive(rpc, lastExtendedSlot);
+    return { lookupTableAddress, lookupTables: await fetchAlt(rpc, lookupTableAddress) };
+  }
+
   return {
+    payerAddress: payer.address,
+    ensureLookupTable,
     simulate,
 
     async execute(

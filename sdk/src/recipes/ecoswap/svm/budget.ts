@@ -87,6 +87,20 @@ export const CU_FAMILIES: Record<string, FamilyCuCoefficients> = {
   // a CP co-slot — the admission headroom absorbs the state-dependence, like
   // the stable families' Newton-iteration variance.
   'orca-whirlpool': { kind: 'stable', slot: 443_056, rung: 185_725 },
+  // Raydium CLMM: same window/walk shape as whirlpool (a rung is a full cold
+  // compute_swap walk from the live spot; crossed boundaries replay from the
+  // full-step memo), so 'stable' kind (2-rung default, degrade-first). The
+  // nested delta_0 rounding costs a little more arithmetic per boundary than
+  // whirlpool's single division. Calibrated on the SOL/USDC ts=1 fixture; the
+  // slot term scales with crossing depth — re-pin with ECO_SVM_CU_PRINT=1
+  // (test/svm/ecoswap-svm.cu.e2e.test.ts).
+  'raydium-clmm': { kind: 'stable', slot: 453_176, rung: 204_363 },
+  // Meteora DLMM: a rung is a full cold bin walk (up to METEORA_DLMM_MAX_BINS
+  // discrete bins, each a live reserve read + the dynamic-fee arithmetic), so
+  // 'stable' kind (2-rung default, degrade-first). Calibrated on the SOL/USDC
+  // bin_step=4 fixture; the slot term folds the unrolled bin unpack +
+  // update_references. Re-pin with ECO_SVM_CU_PRINT=1.
+  'meteora-dlmm': { kind: 'stable', slot: 492_722, rung: 183_395 },
   // CLOB: slot folds the shipped-order live seq-verification (MANIFEST_MAX_ORDERS
   // unrolled market reads over the whole book account) + the cold final quote —
   // a heavy fixed cost, so 'stable' kind (2-rung default + degrade-FIRST class,

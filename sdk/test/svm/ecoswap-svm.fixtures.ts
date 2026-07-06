@@ -105,6 +105,75 @@ export function syntheticMintBytes(decimals: number, supply = 10n ** 15n): Uint8
   return data;
 }
 
+export const RAYDIUM_CP_PROGRAM = address('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C');
+
+const RAYCP_POOL_DISCRIMINATOR = [0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46];
+const RAYCP_CONFIG_DISCRIMINATOR = [0xda, 0xf4, 0x21, 0x68, 0xcb, 0xcb, 0x2b, 0x6f];
+
+export interface SynthesizedRaydiumCpPool {
+  pool: Address;
+  ammConfig: Address;
+  vault0: Address;
+  vault1: Address;
+  /** Account images keyed by address — feed to a loader AND setAccount. */
+  accounts: { address: Address; owner: Address; data: Uint8Array }[];
+}
+
+/**
+ * A 637-byte raydium-cp PoolState + 236-byte AmmConfig + the two vault token
+ * accounts, on base = WSOL (token_0) / quote = USDC (token_1) by default. All
+ * fee accumulators and creator fields are zero (a pre-creator-fee pool), status
+ * is open (0, bit2 clear) and open_time is 0, so fetchPoolConfig admits it and
+ * the classic CP quote is exact. Distinct addresses per call — the
+ * account-heavy-but-CU-cheap family for stacking multiple slots (four ~313k-CU
+ * slots fit the 1.4M cap; a CLMM slot alone is ~590k). `tradeFeeRate` is parts
+ * per 1e6 of amount_in (default 2500 = 0.25%).
+ */
+export function synthesizeRaydiumCpPool(
+  reserve0: bigint,
+  reserve1: bigint,
+  opts: { mint0?: Address; mint1?: Address; tradeFeeRate?: bigint } = {},
+): SynthesizedRaydiumCpPool {
+  const codec = getAddressCodec();
+  const enc = (a: Address): Uint8Array => new Uint8Array(codec.encode(a));
+  const pool = randomAddr();
+  const ammConfig = randomAddr();
+  const vault0 = randomAddr();
+  const vault1 = randomAddr();
+  const mint0 = opts.mint0 ?? WSOL_MINT;
+  const mint1 = opts.mint1 ?? USDC_MINT;
+
+  const p = new Uint8Array(637);
+  p.set(RAYCP_POOL_DISCRIMINATOR, 0);
+  p.set(enc(ammConfig), 8);
+  p.set(enc(vault0), 72);
+  p.set(enc(vault1), 104);
+  p.set(enc(mint0), 168);
+  p.set(enc(mint1), 200);
+  p.set(enc(TOKENKEG), 232); // token0Program
+  p.set(enc(TOKENKEG), 264); // token1Program
+  p.set(enc(randomAddr()), 296); // observationKey (unread by the quote; attached only by the real swap)
+  // status @329 = 0 (open), open_time @373 = 0, all fee accumulators + creator fields = 0
+
+  const c = new Uint8Array(236);
+  c.set(RAYCP_CONFIG_DISCRIMINATOR, 0);
+  new DataView(c.buffer).setBigUint64(12, opts.tradeFeeRate ?? 2500n, true); // trade_fee_rate
+  // creator_fee_rate @108 = 0
+
+  return {
+    pool,
+    ammConfig,
+    vault0,
+    vault1,
+    accounts: [
+      { address: pool, owner: RAYDIUM_CP_PROGRAM, data: p },
+      { address: ammConfig, owner: RAYDIUM_CP_PROGRAM, data: c },
+      { address: vault0, owner: TOKENKEG, data: splTokenAccountBytes(mint0, pool, reserve0) },
+      { address: vault1, owner: TOKENKEG, data: splTokenAccountBytes(mint1, pool, reserve1) },
+    ],
+  };
+}
+
 export const SABER_PROGRAM = address('SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ');
 
 export interface SynthesizedSaberPool {

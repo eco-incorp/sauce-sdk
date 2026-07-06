@@ -36,10 +36,10 @@ under `sdk/test/svm/fixtures/<slug>/` as `{ address, owner, base64Data }`.
 
 ## Exclusions
 
-- **CLMM venues**: quoting requires a tick walk across a data-dependent account set, which does
-  not fit the one-adapter-one-pool v1 shape — no v1 adapter for any of them. **Orca Whirlpools
-  is covered as a LADDER-ONLY family** (adapter contract v2, EcoSwapSVM — see its section
-  below); Raydium CLMM and Meteora DLMM remain future candidates on the same pattern.
+- **CLMM / BIN venues**: quoting requires a tick/bin walk across a data-dependent account set, which
+  does not fit the one-adapter-one-pool v1 shape — no v1 adapter for any of them. **Orca Whirlpools
+  and Raydium CLMM (tick walks) and Meteora DLMM (bin walk) are covered as LADDER-ONLY families**
+  (adapter contract v2, EcoSwapSVM — see their sections below).
 - **CLOB venues**: an order-book quote is a best-first tree walk over resting orders, likewise
   data-dependent and unfit for the v1 shape. **Manifest is covered as a LADDER-ONLY family**
   (adapter contract v2 — see its section below); other CLOBs (Phoenix, OpenBook) are future
@@ -760,6 +760,188 @@ venue's taker math (`test/svm/venues/manifest.test.ts` header), K = 16 shipped l
 - The ladder mirror (`referenceQuote`) models the FRAGMENT given the prepare-time cfg + params over
   live bytes — mirror a drifted execution with the ORIGINAL prepared params, not a refetched one.
 - The recipe's taker owns no resting orders on the market (self-trade is out of scope for a router).
+
+---
+
+## raydium-clmm (ladder-only)
+
+Raydium concentrated liquidity — the second tick-walk family, EcoSwapSVM adapter contract v2 ONLY
+(no v1 adapter). Program `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`; source-verified against
+`github.com/raydium-io/raydium-clmm` `programs/amm/src` (states/{pool,tick_array,config,pool_fee}.rs,
+libraries/{tick_math,sqrt_price_math,liquidity_math,swap_math}.rs, instructions/swap.rs) and a
+mainnet dump (`sdk/test/svm/fixtures/raydium-clmm/`, SOL/USDC 0.04% ts=1 pool
+`3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv`, snapshot slot ~431198953).
+
+### PoolState account (1544 bytes, Anchor zero_copy)
+
+Discriminator `sha256("account:PoolState")[0..8]` = `f7 ed e3 f5 d7 c3 de 46` — **shared with
+raydium-cp-swap**; the 1544-byte size and the CAMM program owner discriminate. All integers LE.
+
+| field | offset (abs, +8 disc) | encoding |
+| --- | --- | --- |
+| amm_config | 9 | pubkey |
+| token_mint_0 / token_mint_1 | 73 / 105 | pubkey |
+| token_vault_0 / token_vault_1 | 137 / 169 | pubkey |
+| observation_key | 201 | pubkey |
+| tick_spacing | 235 | u16 LE |
+| liquidity | 237 | u128 LE |
+| sqrt_price_x64 | 253 | u128 LE (Q64.64) |
+| tick_current | 269 | i32 LE |
+| status | 389 | u8 (bit 4 = swap disabled) |
+| fee_on | 390 | u8 (0 = FromInput, 1/2 = Token0/1 only) |
+| open_time | 1080 | u64 LE |
+| dynamic_fee_info | 1096 | 80-byte struct (all-zero = classic) |
+
+AmmConfig (117 bytes, discriminator `da f4 21 68 cb cb 2b 6f`): `trade_fee_rate` u32 LE @47 (per
+1e6). TickArrayState (10240 bytes, discriminator `c0 9b 55 cd 31 f9 81 2a`): pool_id @8,
+start_tick_index i32 @40, ticks[60] @44 (168 bytes each — tick i32 @+0, liquidity_net i128 @+4,
+liquidity_gross u128 @+20). A tick is **initialized iff liquidity_gross != 0** (no per-tick byte).
+Tick array PDA `['tick_array', pool, start_tick_index.to_be_bytes()]` (4-byte **big-endian** — unlike
+whirlpool's ascii). Bitmap-extension PDA `['pool_tick_array_bitmap_extension', pool]`.
+
+### The prepare-declared window + quote
+
+The whirlpool WINDOW pattern retargeted: prepare ships up to **4 initialized-tick boundaries** per
+direction (biased tick, array cell, Q64.64 sqrt price) + the sequence edge; the fragment re-reads
+sqrt_price_x64/tick/liquidity live from the pool, trade_fee_rate live from the AmmConfig, and each
+boundary's liquidity_gross + liquidity_net live. The walk is the CLASSIC Uniswap-V3 exact-in
+compute_swap loop the program runs when `get_dynamic_fee_info()` is None: `zero_for_one` (0to1, price
+down) jumps to the next initialized tick below (inclusive down-search), fee on the input, static
+trade_fee_rate; crossing applies `-liquidity_net` down / `+liquidity_net` up (add_delta over the raw
+two's-complement word). It is structurally identical to whirlpool's loop; the primitives differ:
+`get_delta_amount_1_unsigned` and `get_next_sqrt_price_from_amount_0` are bit-identical to whirlpool's
+`wpDB`/`wpNxA`, `get_delta_amount_0_unsigned` uses NESTED rounding `round(round(L<<64·(b−a)/b)/a)`,
+and `get_sqrt_price_at_tick` is the STANDARD Uniswap-V3 magic-constant ladder in Q64.64 (MAX_SQRT_PRICE
+`79226673521066979257578248091` differs from Orca's — separate tick math). Every venue abort maps to
+the conservative self-deactivation clamp (SENT = 2^65).
+
+### Swap instruction: `swap_v2` (Tokenkeg + Token-2022 aware)
+
+Data (33 bytes): discriminator `sha256("global:swap_v2")[0..8]` = `[43, 4, 237, 11, 26, 201, 30, 98]`,
+`amount` u64 LE (runtime-patched), `other_amount_threshold` u64 LE = 1, `sqrt_price_limit_x64` u128
+LE = 0, `is_base_input` = 1. Accounts: payer(signer), amm_config, pool(w), user_in(w), user_out(w),
+input_vault(w), output_vault(w), observation(w), token_program, token_program_2022, memo_program,
+input_vault_mint, output_vault_mint, then remaining `[bitmap_extension, tick_array_0..2]`.
+
+### Gates (fetch time)
+
+size/discriminator; `fee_on != 0`; a nonzero `dynamic_fee_info` (the dynamic-fee spacing-bounded
+volatility walk is unsupported); swap-disabled status bit; non-classic-SPL mints (transfer-fee mints
+break the realized-delta bound); a direction with no shipped boundaries.
+
+### Pinned worked examples
+
+SOL/USDC ts=1 pool `3ucNos4N...` at slot ~431198953 (tick -25038, sqrt_price 5283... , classic
+dynamic_fee_info) — pinned from the adapter mirror (the venue transcription), cross-checked in-VM by
+the lamport-exact engine gate:
+
+- 0to1 (SOL -> USDC): 1 SOL -> **81_759_001** USDC raw; 10 SOL -> **817_570_824**; 100 SOL -> 0
+  (beyond the 4-boundary window capacity — self-deactivation).
+- 1to0 (USDC -> SOL): 82 USDC -> **1_002_140_234** lamports; 8_200 USDC -> **100_188_087_624**.
+
+### Caveats
+
+- Boundary count is 4 per direction; the mirror models the FRAGMENT given the prepare-time cfg/params
+  over live bytes (mirror a drifted execution with the ORIGINAL prepared params).
+- Real-binary verification is the env-gated quadrilateral lane (`raydium-clmm.so`); the default suites
+  prove the split + the fragment==mirror gate.
+
+---
+
+## meteora-dlmm (ladder-only)
+
+Meteora DLMM / Liquidity Book — the first BIN family, EcoSwapSVM adapter contract v2 ONLY. Program
+`LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`; source-verified against `github.com/MeteoraAg/dlmm-sdk`
+(idls/dlmm.json + commons/src/{quote,extensions/{bin,lb_pair},math/*}.rs) and a mainnet dump
+(`sdk/test/svm/fixtures/meteora-dlmm/`, SOL/USDC bin_step=4 pair
+`5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6`, snapshot slot ~431198953).
+
+### LbPair account (904 bytes, Anchor) + BinArray (10136 bytes)
+
+LbPair discriminator `sha256("account:LbPair")[0..8]` = `21 0b 31 62 b5 65 b1 0d`. All integers LE.
+
+| field | offset (abs, +8 disc) | encoding |
+| --- | --- | --- |
+| base_factor / filter_period / decay_period / reduction_factor | 8 / 10 / 12 / 14 | u16 (StaticParameters) |
+| variable_fee_control / max_volatility_accumulator | 16 / 20 | u32 |
+| base_fee_power_factor / function_type / collect_fee_mode | 34 / 35 / 36 | u8 |
+| volatility_accumulator / volatility_reference | 40 / 44 | u32 (VariableParameters) |
+| index_reference | 48 | i32 |
+| last_update_timestamp | 56 | i64 |
+| pair_type / active_id / bin_step / status | 75 / 76 / 80 / 82 | u8 / i32 / u16 / u8 |
+| activation_type | 86 | u8 |
+| token_x_mint / token_y_mint | 88 / 120 | pubkey |
+| reserve_x / reserve_y | 152 / 184 | pubkey |
+| reward_infos[0/1] mint | 264 / 408 | pubkey |
+| oracle | 552 | pubkey |
+| activation_point | 816 | u64 |
+| token_mint_x/y_program_flag | 880 / 881 | u8 (0 = Tokenkeg) |
+
+BinArray (discriminator `5c 8e 5c dc 05 94 46 b5`): index i64 @8, lb_pair @24, bins[70] @56 (144
+bytes each — amount_x u64 @+0, amount_y u64 @+8, price u128 @+16). Bin array PDA `['bin_array',
+lb_pair, bin_array_index.to_le_bytes()]` (8-byte LE i64; `index = floor(bin_id / 70)`).
+
+### The prepare-declared bin window + quote
+
+Bins are discrete buckets `price = (1 + bin_step/1e4)^bin_id` in Q64.64 (`get_price_from_id` via the
+u64x64 `pow` — drift-invariant, shipped as a param; equals the stored `bin.price` for any liquid
+bin). Prepare walks bins from active_id in the swap direction and ships up to **8 liquid bins**
+(biased id, array cell, price). Direction (VERIFIED against `get_bin_array_pubkeys_for_swap`
+increment −1 and `advance_active_bin`): **swap_for_y (xToY, X in / Y out) walks DOWN in bin id
+consuming amount_y**; !swap_for_y (yToX) walks UP consuming amount_x. The fragment reads active_id +
+the volatility v_parameters live from the LbPair and each shipped bin's amount live from its bin
+array. Per bin (quote_exact_in, MM-only, fee-on-input): the total fee is base + a volatility term,
+a full bin drains at ceil'd max-input + exclusive fee, the marginal bin takes the remaining input net
+of its inclusive fee; bins behind the live active_id are skipped (re-anchor), a bin drained to 0 is
+skipped, an exhausted window self-deactivates.
+
+Amount conversions (SCALE_OFFSET 64): swap_for_y out = `round(price·x / 2^64)`, in =
+`round(y·2^64 / price)`; !swap_for_y out = `round(x·2^64 / price)`, in = `round(y·price / 2^64)`.
+
+### The VARIABLE FEE (venue-exact, live)
+
+`base_fee = base_factor · bin_step · 10 · 10^base_fee_power_factor` (immutable). The volatility term
+is dynamic: the fragment replicates `update_references(clock)` (if `elapsed >= filter_period`:
+index_reference = active_id, and volatility_reference = `elapsed < decay_period ?
+volatility_accumulator·reduction_factor/1e4 : 0`) then per bin
+`vacc = min(volatility_reference + |index_reference − bin_id|·1e4, max_volatility_accumulator)`,
+`variable_fee = ceil(variable_fee_control·(vacc·bin_step)² / 1e11)`,
+`total_fee = min(base_fee + variable_fee, MAX_FEE_RATE=1e8)` over FEE_PRECISION 1e9. Because the
+fragment reads the LIVE volatility state + clock and the mirror mirrors it, the fee is venue-exact
+per bin (not a prepare snapshot); `now` feeds it like meteora-damm-v2's stored-volatility policy.
+
+### Swap instruction: `swap` (Tokenkeg-only class)
+
+Data (24 bytes): discriminator `sha256("global:swap")[0..8]` = `[248, 198, 158, 145, 225, 117, 135,
+200]`, `amount_in` u64 LE (runtime-patched), `min_amount_out` u64 LE = 1. Accounts: lb_pair(w),
+bin_array_bitmap_extension(optional), reserve_x(w), reserve_y(w), user_token_in(w), user_token_out(w),
+token_x_mint, token_y_mint, oracle(w), host_fee_in(optional → program placeholder), user(signer),
+token_x_program, token_y_program, event_authority `['__event_authority']`, program, then remaining
+`[bin_array_0..2]`.
+
+### Gates (fetch time)
+
+size/discriminator; non-Enabled status; `collect_fee_mode != 0` (only InputOnly is walked);
+`is_support_limit_order` pairs (LimitOrder function_type, or Undetermined with a set reward mint — the
+limit-order fill layers are unsupported); Token-2022 mints (program flags != 0); a slot-typed
+activation with a nonzero point; a direction with no shippable liquid bins.
+
+### Pinned worked examples
+
+SOL/USDC bin_step=4 pair `5rCf1DM8...` at slot ~431198953 (active_id -6260), clock 1783355400 (54s
+past last_update — inside the decay window, so the volatility term is live) — pinned from the mirror,
+cross-checked in-VM by the lamport-exact engine gate:
+
+- xToY (SOL -> USDC): 1 SOL -> **81_732_707** USDC raw; 5 SOL -> **408_662_622**.
+- yToX (USDC -> SOL): 100 USDC -> **1_222_030_256** lamports; 1_000 USDC -> **12_220_302_614**.
+
+### Caveats
+
+- The variable fee is time-dependent via `update_references`; the mirror evaluates at `config.now` and
+  the fragment reads the real Clock — the e2e gate pins both. Out of the decay window the volatility
+  term is 0 (base fee only).
+- The shift_active_bin_if_empty_gap edge (active bin array with no liquidity at active_id) is not
+  modeled — a rare re-anchoring case, covered by the terminal minOut like whirlpool's newly-init tick.
 
 ---
 

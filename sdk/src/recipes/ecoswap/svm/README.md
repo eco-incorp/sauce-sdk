@@ -26,6 +26,8 @@ ladder depth and slot count deterministically), the **batched account loader**, 
 | saber-stableswap | STABLE | 2 | pause byte, vault balances, the four amp-ramp fields, trade fee — zero params |
 | meteora-damm-v1-stable | STABLE | 2 | vault share math with locked-profit decay, fees (min-1), amp, multipliers, idle float — zero params |
 | orca-whirlpool | CLMM | 2 | sqrt_price, tick, liquidity, fee_rate, per-boundary initialized flags + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, with their pure-function sqrt prices) rides the params |
+| raydium-clmm | CLMM | 2 | sqrt_price_x64, tick_current, liquidity from the pool + trade_fee_rate from the AmmConfig; per-boundary liquidity_gross (initialized) + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, standard Uniswap-V3 tick math) rides the params; classic fee-on-input path only (dynamic-fee/`fee_on` pools gated) |
+| meteora-dlmm | BIN | 2 | active_id + the volatility v_parameters from the LbPair; per shipped bin amount_x/amount_y from its bin array; the WINDOW (up to 8 liquid bins as biased id + array cell + Q64.64 price) rides the params; VARIABLE FEE computed live per bin (base + volatility, update_references over the live clock); fee-on-input (collect_fee_mode 0) + no-limit-order pools only |
 | manifest | CLOB | 2 | the whole order book in one market account; per shipped level a live sequence_number (identity) + price (u128) + num_base_atoms; the top-of-book WINDOW (up to 16 best-first levels as DataIndex+seq) rides the params; zero fee |
 
 A v2 fragment reads the trade amount and the live state at RUNTIME — nothing about the trade is
@@ -179,6 +181,15 @@ const output = await ecoSwapSvm({
 const staged = await stageEcoSwapSvm(client, 0, output);                // once
 await executeEcoSwapSvm(client, staged, output, resolution);            // one instruction per trade
 await executeEcoSwapSvm(client, staged, output, resolution, { amountIn: other, minOut });
+
+// When the account list would overflow the 1,232-byte v0 packet, build an ALT
+// once per universe and thread it through — the staged blob, hash pin and
+// payload args are unchanged; only the transaction assembly gains the table.
+if (ecoSwapSvmPacketBudget(output, { resolution, payerAddress: client.payerAddress }).raw.overflowBytes > 0) {
+  const alt = await prepareAltForUniverse(client, staged, output, resolution);  // idempotent, reusable
+  await executeEcoSwapSvm(client, staged, output, resolution, undefined, { alt });
+  await executeEcoSwapSvm(client, staged, output, resolution, { amountIn: other, minOut }, { alt });
+}
 ```
 
 `prepare` reuses the v1 adapters' `fetchPoolConfig` gates (status bits, transfer-fee mints, curve
@@ -188,6 +199,42 @@ damm-v1 timestamp activation, damm-v1 fee denominators), filters on **relative d
 deepest `ECO_SVM_MAX_SLOTS` (= 4, the structural template width), and lets the CU budgeter fix
 rungs and the effective slot count. `quote.dropped` carries the reason (`depth` | `slots` |
 `budget`); `quote.warnings` the degradations.
+
+## Address lookup tables (large account lists)
+
+A staged trade is one `execute_from_account` v0 transaction: `[buffer, …user accounts]` in the
+message + the 8-byte discriminator, the flags byte, the 32-byte hash pin, and the packed cfg args
+in the instruction data. Each non-fee-payer account costs **33 wire bytes** (a 32-byte static key +
+a 1-byte instruction-account index), so the 1,232-byte packet is spent on account keys and cfg
+args. `ecoSwapSvmPacketBudget(output, { resolution, payerAddress })` models it (conservative — it
+counts plan metas, and the real message dedups repeated keys like shared token/venue programs and
+mints, so a shape it flags near the limit may still fit raw).
+
+When the raw packet overflows, **`prepareAltForUniverse(client, staged, output, resolution)`** builds
+(or, with `{ existingTable }`, extends) an address lookup table over the buffer + every **non-signer**
+account (venue pools/vaults/programs + the user's token accounts; the owner/fee-payer signer stays a
+static key — signers cannot be looked up), waits for it to activate, and returns
+`{ lookupTableAddress, lookupTables }`. Those keys are as stable as the staged blob, so the table is
+**reusable per universe** (shape + pool set + user) across every trade — create once, pass it to
+`executeEcoSwapSvm(…, { alt })`, reuse. The call is idempotent: an existing table already covering the
+set sends nothing. `RequestHeapFrame` stays add-once and signerless simulate is unaffected — the ALT
+only reshapes the account-KEYS section, never the signer set.
+
+The ALT shrinks **bytes, not locks**: `accountLocks = static keys + ALT-resolved keys` is invariant,
+so the **64 account-lock cap still binds** (the planner keeps enforcing it — an ALT over 65+ keys
+still warns). CALL itself caps at 64 CPI accounts engine-side, and today's shapes sit far below it.
+
+**Overflow threshold (real signed v0 sizes, args-and-account-heaviest family = Orca Whirlpool CLMM,
+real swap template):** a 1-slot shape is ~646 B and a **2-slot shape fits raw at ~1,147 B**; a
+**3-slot shape overflows at ~1,516 B** → ALT ~744 B (locks ~33). Constant-product families carry
+tiny cfg args (raydium-cp is 1 param/slot vs whirlpool's 16) and fewer accounts, so even a 4-slot CP
+shape stays ~1,071 B — under the packet. **So the packet is not what caps CLMM stacking: the CU cap
+is.** One CLMM/CLOB slot is ~590–790k CU, so two already exceed the 1.4M transaction cap regardless
+of the packet; the ALT is the remedy for the account-list growth that arrives with **more CP slots,
+real-CPI venue account sets, and the future multihop legs**, once the CU model admits them. See
+`test/svm/ecoswap-svm.alt.test.ts` (packet-accounting, no engine) and
+`test/svm/ecoswap-svm.alt.e2e.test.ts` (overflow→ALT sizing on a 3× whirlpool shape; a 3× raydium-cp
+shape executing lamport-exact + byte-identical through an ALT, reused across trades).
 
 ## Measured (LiteSVM `FeatureSet.allEnabled`, real engine.so, 2026-07-06)
 
@@ -203,6 +250,8 @@ Per-family single-slot trades (stand-in CPI), the calibration suite's raw number
 | saber-stableswap | 778,562 CU | 1,097,079 CU |
 | meteora-damm-v1-stable | 940,490 CU | 1,353,318 CU |
 | orca-whirlpool | 771,309 CU | 1,142,759 CU |
+| raydium-clmm | 818,705 CU | 1,227,431 CU |
+| meteora-dlmm | 816,315 CU | 1,183,105 CU |
 | manifest | 791,441 CU | 961,890 CU |
 
 | metric | value |
@@ -211,7 +260,10 @@ Per-family single-slot trades (stand-in CPI), the calibration suite's raw number
 | 3-slot CP trade after budgeter degradation [4,3,3] | 1,080,963 CU (was 1,306,797 at [4,4,4] — same split) |
 | real-binary quadrilaterals (full trade incl. the venue CPI) | raydium-cp 423,358 CU; pumpswap 506,963 CU; saber 800,198 CU; orca-whirlpool 814,040 CU (real tick cross); manifest 827,465 CU (real CLOB taker match, reverse maker crossed) |
 | cp+whirlpool split (whirl@2 + pump@3, both engaged, cut inside the tick window) | 1,127,977 CU |
+| cp+raydium-clmm split (clmm@2 + raycp@4, both engaged, CLMM window saturates) | 1,244,705 CU |
+| cp+dlmm split (dlmm@2 + raycp@4, both engaged, cut mid-bins) | 1,369,744 CU |
 | cp+manifest split (manifest@2 + pump@3, both engaged, cut mid-level) | 1,146,799 CU |
+| 2-CLMM packet (whirlpool + raydium-clmm, real swap templates) | raw 1,409 B overflows → ALT 637 B, locks 30 (packet-provable, CU-gated) |
 | quantization loss vs continuous | 0.63% on the deliberately shallow Phase-0 universe; second-order on deep pools |
 
 ## Real-binary CPI lane (`SAUCE_VENUE_PROGRAMS`)
@@ -226,11 +278,47 @@ beyond the quote fixtures (saber's admin-fee destination, pumpswap's fee ATAs) a
 the adapter-derived addresses; the PUMP mint is Token-2022, so the user's base account rides that
 program.
 
-## Honest limits (Phase 1 + the Phase 2 whirlpool & manifest families)
+## The second CLMM (raydium-clmm) and the first BIN family (meteora-dlmm)
 
-- **No multihop routes yet**; Raydium CLMM / Meteora DLMM are future families on the whirlpool
-  pattern, Phoenix / OpenBook on the manifest CLOB pattern (Whirlpools + Manifest landed in Phase 2
-  — see the CLMM/CLOB window notes above).
+**Raydium CLMM** reuses the whirlpool WINDOW pattern verbatim — up to 4 initialized-tick boundaries
++ the sequence edge shipped as drift-invariant params, all value-bearing state (sqrt_price/tick/
+liquidity live from the pool, trade_fee_rate live from the AmmConfig, per-boundary liquidity_gross +
+liquidity_net live from the tick arrays) read in-VM. The compute_swap loop is structurally identical
+to whirlpool's (fee-on-input, jump-to-next-initialized-tick), differing only in the primitives:
+`delta_1` and `next_sqrt_from_0` are bit-identical to whirlpool's; `delta_0` uses Raydium's NESTED
+rounding (Uniswap-V3 getAmount0Delta) and the tick math is the STANDARD Uniswap-V3 magic-constant
+ladder (Raydium's MAX_SQRT_PRICE differs from Orca's, so the two need separate tick math). The gate
+rejects `fee_on != 0` and any nonzero `dynamic_fee_info` (the newer Raydium program walks
+tick-spacing-bounded steps with a per-step volatility fee when dynamic fees are on — classic pools,
+all-zero dynamic_fee_info, walk the jump-to-next-tick path this fragment models).
+
+**Meteora DLMM** is the first BIN family — the WINDOW thesis on DISCRETE price bins instead of tick
+segments. Bins are buckets `price = (1 + bin_step/1e4)^bin_id` (Q64.64, drift-invariant, shipped as
+params); the fragment reads active_id + the volatility v_parameters from the LbPair and each shipped
+bin's amount_x/amount_y from its bin array live. Direction (the doc's "inverted" warning, VERIFIED
+against `get_bin_array_pubkeys_for_swap`): swap_for_y (X in, Y out) walks DOWN in bin id consuming
+amount_y; the reverse walks UP consuming amount_x. The VARIABLE FEE is venue-exact per bin, not a
+prepare snapshot: the fragment replicates `update_references(clock)` (the volatility index/reference
+decay) + per-bin `update_volatility_accumulator` (vacc grows with |index_reference − bin_id|) +
+`compute_variable_fee` over the LIVE volatility state and clock — so the merge sees the real dynamic
+fee. Only fee-on-input (collect_fee_mode 0) + no-limit-order pools are walked (the limit-order fill
+layers and the OnlyY fee mode are gated).
+
+## Honest limits (Phase 1 + the Phase 2 CLMM/BIN/CLOB families)
+
+- **No multihop routes yet**; Phoenix / OpenBook remain future families on the manifest CLOB pattern.
+  (Whirlpools + Raydium CLMM + Meteora DLMM + Manifest landed — see the window notes above.)
+- **The CLMM windows are 4 boundaries deep, the DLMM window 8 liquid bins deep, per direction**: a
+  trade beyond the shipped depth self-caps and the merge reroutes the tail; a live tick/active_id
+  drifting past the whole window deactivates the slot until re-prepare.
+- **Two CLMM/BIN/CLOB slots exceed the 1.4M CU cap** (each is ~600–830k CU): the packet ALT makes a
+  2-CLMM account list fit under 1,232 bytes (proven for whirlpool + raydium-clmm), but the CU wall
+  still binds — a CLMM/BIN slot pairs only with the cheap CP families under budget (raydium-clmm+cp
+  and dlmm+cp splits execute; whirlpool+raydium-clmm is packet-provable, not CU-executable).
+- **Raydium dynamic-fee / `fee_on` pools are gated** (the spacing-bounded volatility-fee walk is a
+  follow-up); **DLMM OnlyY-fee / limit-order pools are gated** (the OnlyY split + limit-order fill
+  layers are a follow-up); both families are classic-SPL-mint only (transfer-fee mints break the
+  realized-delta bound).
 - **The whirlpool window is 4 boundaries deep per direction** (WHIRLPOOL_MAX_BOUNDARIES): a
   trade needing more crossings self-caps and the merge reroutes the tail; a live tick that
   drifts past the whole shipped window deactivates the slot until re-prepare. CU is

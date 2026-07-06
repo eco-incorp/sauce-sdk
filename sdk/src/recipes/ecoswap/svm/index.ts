@@ -24,10 +24,15 @@
  * Read-only and offline against the loader: nothing is sent from here.
  */
 import { createHash } from 'node:crypto';
-import type { Address } from '@solana/kit';
-import type { SauceSvmClient, StagedBuffer } from '../../../svm/client.js';
+import { isSignerRole } from '@solana/kit';
+import type { Address, Commitment } from '@solana/kit';
+import { estimatePacket } from '@eco-incorp/sauce-compiler';
+import type { PacketBudget } from '@eco-incorp/sauce-compiler';
+import type { EnsuredLookupTable, SauceSvmClient, StagedBuffer } from '../../../svm/client.js';
 import type { SendExecuteResult } from '../../../svm/send.js';
+import { resolveAccounts } from '../../../svm/resolve.js';
 import type { AccountResolution } from '../../../svm/resolve.js';
+import { selectAltAddresses } from '../../../svm/alt.js';
 import { coalescingAccountLoader } from '../../../svm/loader.js';
 import type { BatchAccountLoader } from '../../../svm/loader.js';
 import { meteoraDammV1Stable } from '../../../svm/venues/meteora-damm-v1-stable/index.js';
@@ -41,6 +46,12 @@ import { orcaLegacyTokenSwapLadder } from '../../../svm/venues/orca-legacy-token
 import { orcaWhirlpool, windowFor } from '../../../svm/venues/orca-whirlpool/index.js';
 import type { OrcaWhirlpoolPoolConfig } from '../../../svm/venues/orca-whirlpool/index.js';
 import { orcaWhirlpoolLadder } from '../../../svm/venues/orca-whirlpool/ladder.js';
+import { raydiumClmm, windowFor as raydiumClmmWindowFor } from '../../../svm/venues/raydium-clmm/index.js';
+import type { RaydiumClmmPoolConfig } from '../../../svm/venues/raydium-clmm/index.js';
+import { raydiumClmmLadder } from '../../../svm/venues/raydium-clmm/ladder.js';
+import { meteoraDlmm, windowFor as meteoraDlmmWindowFor } from '../../../svm/venues/meteora-dlmm/index.js';
+import type { MeteoraDlmmPoolConfig } from '../../../svm/venues/meteora-dlmm/index.js';
+import { meteoraDlmmLadder } from '../../../svm/venues/meteora-dlmm/ladder.js';
 import { manifest, manifestWindowFor } from '../../../svm/venues/manifest/index.js';
 import type { ManifestPoolConfig } from '../../../svm/venues/manifest/index.js';
 import { manifestLadder } from '../../../svm/venues/manifest/ladder.js';
@@ -104,6 +115,8 @@ type LadderVenueSlug =
   | 'pumpswap'
   | 'orca-legacy-token-swap'
   | 'orca-whirlpool'
+  | 'raydium-clmm'
+  | 'meteora-dlmm'
   | 'manifest'
   | 'meteora-damm-v2'
   | 'saber-stableswap'
@@ -181,6 +194,42 @@ const FAMILIES: Record<LadderVenueSlug, FamilyEntry> = {
       }
     },
   },
+  'raydium-clmm': {
+    ladder: raydiumClmmLadder,
+    programId: raydiumClmm.programId,
+    fetch: (load, pool) => raydiumClmm.fetchPoolConfig(load, pool),
+    applyDirection: (cfg, direction) => {
+      if (direction === undefined || direction === '0to1') return cfg;
+      if (direction === '1to0') return { ...(cfg as RaydiumClmmPoolConfig), direction: '1to0' };
+      throw new Error(`raydium-clmm direction must be '0to1' or '1to0', got '${direction}'`);
+    },
+    gate: (cfg) => {
+      // Like whirlpool: no shipped boundaries + no edge for the direction means
+      // nothing to walk in-VM (the live-tick array is missing or non-CLMM).
+      const c = cfg as RaydiumClmmPoolConfig;
+      if (raydiumClmmWindowFor(c).readable === 0) {
+        throw new Error(
+          `raydium-clmm pool ${c.pool} has no initialized tick array covering the live tick for ${c.direction}`,
+        );
+      }
+    },
+  },
+  'meteora-dlmm': {
+    ladder: meteoraDlmmLadder,
+    programId: meteoraDlmm.programId,
+    fetch: (load, pool) => meteoraDlmm.fetchPoolConfig(load, pool),
+    applyDirection: (cfg, direction) => {
+      if (direction === undefined || direction === 'xToY') return cfg;
+      if (direction === 'yToX') return { ...(cfg as MeteoraDlmmPoolConfig), direction: 'yToX' };
+      throw new Error(`meteora-dlmm direction must be 'xToY' or 'yToX', got '${direction}'`);
+    },
+    gate: (cfg) => {
+      const c = cfg as MeteoraDlmmPoolConfig;
+      if (meteoraDlmmWindowFor(c).bins.length === 0) {
+        throw new Error(`meteora-dlmm pair ${c.pool} has no shippable liquid bins for ${c.direction}`);
+      }
+    },
+  },
   manifest: {
     ladder: manifestLadder,
     programId: manifest.programId,
@@ -255,7 +304,7 @@ export interface EcoSwapSvmPoolSpec {
    * exactIn side, per family: raydium-cp-swap '0to1' (default) | '1to0';
    * raydium-amm-v4 'coinToPc' (default) | 'pcToCoin'; pumpswap 'quoteToBase'
    * (default) | 'baseToQuote'; meteora-damm-v2 and orca-whirlpool 'aToB'
-   * (default) | 'bToA'; manifest 'baseIn' (default, sell base) | 'quoteIn'
+   * (default) | 'bToA'; raydium-clmm '0to1' (default) | '1to0'; meteora-dlmm 'xToY' (default, swap_for_y) | 'yToX'; manifest 'baseIn' (default, sell base) | 'quoteIn'
    * (buy base); saber-stableswap and meteora-damm-v1-stable only 'AtoB'.
    */
   direction?: string;
@@ -588,11 +637,142 @@ export async function stageEcoSwapSvm(
 }
 
 /**
+ * A prepared address lookup table for one EcoSwapSVM universe (shape + pool
+ * set + user). Returned by prepareAltForUniverse and handed to
+ * executeEcoSwapSvm's `alt` option; reusable across every trade on that
+ * universe, like the staged blob.
+ */
+export type EcoSwapSvmAlt = EnsuredLookupTable;
+
+/** The 'auto' compute-unit-limit prepend the execute path adds beyond RequestHeapFrame — ~8 wire bytes. */
+const AUTO_CU_PREPEND_BYTES = 8;
+
+/**
+ * The lookup-table address set for a staged trade: the buffer plus every
+ * NON-SIGNER account in the resolved plan (venue pools/vaults/programs + the
+ * user's token accounts), deduped. Signers (the owner / fee payer) MUST stay
+ * static message accounts — they cannot be looked up. These keys are stable
+ * across trades on a given (shape, pool set, user), so the ALT built over them
+ * is reusable per universe like the staged blob.
+ */
+export function selectEcoSwapSvmAltAddresses(
+  output: Pick<EcoSwapSvmOutput, 'accountPlan'>,
+  staged: StagedBuffer | Address,
+  resolution: AccountResolution,
+  payerAddress: Address,
+): Address[] {
+  const buffer = typeof staged === 'string' ? staged : staged.address;
+  const metas = resolveAccounts(output.accountPlan, resolution, payerAddress);
+  return [...new Set<Address>([buffer, ...selectAltAddresses(metas)])];
+}
+
+export interface EcoSwapSvmPacketOptions {
+  /**
+   * Resolution + payer to ALSO model the ALT-compressed estimate (the plan's
+   * non-signer metas move to the table). Without them only `raw` is returned.
+   */
+  resolution?: AccountResolution;
+  payerAddress?: Address;
+  /** Prepend bytes beyond RequestHeapFrame (the 'auto' CU-limit prepend ≈ 8). Default 8. */
+  prependBytes?: number;
+}
+
+export interface EcoSwapSvmPacketBudget {
+  /** Raw (no-ALT) staged v0 packet estimate — check `raw.overflowBytes > 0`. */
+  raw: PacketBudget;
+  /** ALT-compressed estimate (only when resolution + payerAddress are given). */
+  withAlt?: PacketBudget;
+}
+
+/**
+ * Models the staged execute_from_account v0 packet for a compiled shape (the
+ * compiler's estimatePacket over the shape's argsLayout byte length). With a
+ * resolution + payer it also models the ALT-compressed packet, moving the
+ * non-signer metas to one lookup table. This estimate counts plan METAS (not
+ * deduped addresses), so it is CONSERVATIVE — the real message dedups repeated
+ * addresses (shared token/venue programs, mints), so a shape it flags near the
+ * limit may still fit raw; building an ALT is always safe. The account-LOCK
+ * count is invariant to the ALT (locks = static keys + resolved addresses):
+ * the table shrinks BYTES, never the 64-lock cap.
+ */
+export function ecoSwapSvmPacketBudget(
+  output: Pick<EcoSwapSvmOutput, 'accountPlan' | 'bytecode' | 'argsLayout'>,
+  opts: EcoSwapSvmPacketOptions = {},
+): EcoSwapSvmPacketBudget {
+  const argsBytes = output.argsLayout.byteLength;
+  const prependBytes = opts.prependBytes ?? AUTO_CU_PREPEND_BYTES;
+  const raw = estimatePacket(output.accountPlan, output.bytecode.length, { mode: 'staged', argsBytes, prependBytes });
+  if (opts.resolution === undefined || opts.payerAddress === undefined) return { raw };
+
+  const metas = resolveAccounts(output.accountPlan, opts.resolution, opts.payerAddress);
+  const lookupAddresses = metas.filter((meta) => !isSignerRole(meta.role)).length;
+  const withAlt =
+    lookupAddresses === 0
+      ? raw
+      : estimatePacket(output.accountPlan, output.bytecode.length, {
+          mode: 'staged',
+          argsBytes,
+          prependBytes,
+          lookupTables: 1,
+          lookupAddresses,
+        });
+  return { raw, withAlt };
+}
+
+export interface PrepareAltOptions {
+  /**
+   * Reuse and EXTEND this table (idempotent) instead of creating a fresh one —
+   * only the addresses it does not already hold are appended. Pass the
+   * lookupTableAddress a previous prepareAltForUniverse returned to grow one
+   * table across universes that share a payer.
+   */
+  existingTable?: Address;
+  commitment?: Commitment;
+}
+
+/**
+ * Idempotent create-(or-extend)-and-warm-up of the lookup table for a staged
+ * EcoSwapSVM universe. Selects the buffer + non-signer plan accounts
+ * (selectEcoSwapSvmAltAddresses), builds/extends the table through the client
+ * (waiting for it to activate), and returns it in the shape executeEcoSwapSvm's
+ * `alt` option consumes. Call it ONCE per universe and reuse the result across
+ * every trade — the account set is as stable as the staged blob. Only worth
+ * doing when the raw packet would overflow (ecoSwapSvmPacketBudget); a
+ * within-budget shape needs no ALT.
+ */
+export async function prepareAltForUniverse(
+  client: SauceSvmClient,
+  staged: StagedBuffer | Address,
+  output: Pick<EcoSwapSvmOutput, 'accountPlan'>,
+  resolution: AccountResolution,
+  opts: PrepareAltOptions = {},
+): Promise<EcoSwapSvmAlt> {
+  const addresses = selectEcoSwapSvmAltAddresses(output, staged, resolution, client.payerAddress);
+  return client.ensureLookupTable(addresses, { existing: opts.existingTable, commitment: opts.commitment });
+}
+
+export interface ExecuteEcoSwapSvmOpts {
+  /**
+   * A prepared lookup table (prepareAltForUniverse) — the execute goes out as a
+   * v0 transaction compressed against it, shrinking the packet below the
+   * 1,232-byte limit for shapes whose account list would otherwise overflow.
+   * Absent = a plain v0 transaction (the account keys ride the message inline).
+   * The staged blob, hash pin and payload-args path are identical either way;
+   * only the transaction assembly changes.
+   */
+  alt?: EcoSwapSvmAlt;
+}
+
+/**
  * One trade = ONE execute_from_account instruction: the staged blob,
  * hash-pinned, with this trade's cfg bytes as payload args. `resolution`
  * binds the user refs (outAta/inAta/owner — plus, for pumpswap buy slots,
  * the caller-derived user volume accumulator PDA); adapter-resolved refs are
- * already stamped on the plan.
+ * already stamped on the plan. Pass `opts.alt` (from prepareAltForUniverse) to
+ * send the transaction compressed against an address lookup table when the raw
+ * account list would overflow the 1,232-byte packet — RequestHeapFrame stays
+ * add-once and signerless simulate is unaffected (the ALT only reshapes the
+ * account KEYS section, never the signer set or the 64-lock cap).
  */
 export async function executeEcoSwapSvm(
   client: SauceSvmClient,
@@ -600,11 +780,13 @@ export async function executeEcoSwapSvm(
   output: EcoSwapSvmOutput,
   resolution: AccountResolution,
   trade?: { amountIn: bigint; minOut: bigint },
+  opts: ExecuteEcoSwapSvmOpts = {},
 ): Promise<SendExecuteResult> {
   const values = trade === undefined ? output.argValues : output.encodeTrade(trade.amountIn, trade.minOut);
   return client.executeStaged(staged, output.accountPlan, resolution, {
     args: { layout: output.argsLayout, values },
     computeUnitLimit: 'auto',
+    ...(opts.alt !== undefined ? { lookupTables: opts.alt.lookupTables } : {}),
     ...(typeof staged === 'string' ? { expectedSha256: output.sha256 } : {}),
   });
 }

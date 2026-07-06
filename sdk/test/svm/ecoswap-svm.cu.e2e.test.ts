@@ -29,6 +29,10 @@ import type { Address } from '@solana/kit';
 import {
   fetchManifestConfig,
   fetchOrcaWhirlpoolConfig,
+  fetchRaydiumClmmConfig,
+  raydiumClmmLadder,
+  fetchMeteoraDlmmConfig,
+  meteoraDlmmLadder,
   manifestLadder,
   meteoraDammV1Stable,
   meteoraDammV1StableLadder,
@@ -70,6 +74,8 @@ const OUT_ATA_START = 5_000_000n;
 const VENUE_POOL: Record<string, Address> = {
   'raydium-cp-swap': address('7JuwJuNU88gurFnyWeiyGKbFmExMWcmRZntn9imEzdny'),
   'orca-whirlpool': address('Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE'),
+  'raydium-clmm': address('3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv'),
+  'meteora-dlmm': address('5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6'),
   manifest: address('ENhU8LsaR7vDD2G1CsWcsuSGNrih9Cv5WZEk7q9kPapQ'),
   'raydium-amm-v4': address('58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'),
   pumpswap: address('2uF4Xh61rDwxnG9woyxsVQP7zuA6kLFpb3NvnRQeoiSd'),
@@ -133,6 +139,12 @@ describeSvm('ecoswap-svm CU calibration: per-family coefficients on the real eng
       // 100 SOL = one boundary crossing on the ts=4 fixture — the pinned
       // calibration point (CU rises with crossing depth; see budget.ts).
       { slug: 'orca-whirlpool', adapter: orcaWhirlpoolLadder, amountIn: 100_000_000_000n, fetch: () => fetchOrcaWhirlpoolConfig(liveLoader, VENUE_POOL['orca-whirlpool']) },
+      // 50 SOL crosses real initialized ticks on the ts=1 fixture (its window
+      // caps ~50-100 SOL); calibrates the raydium-clmm walk at crossing depth.
+      { slug: 'raydium-clmm', adapter: raydiumClmmLadder, amountIn: 50_000_000_000n, fetch: () => fetchRaydiumClmmConfig(liveLoader, VENUE_POOL['raydium-clmm']) },
+      // 5 SOL walks several liquid bins on the bin_step=4 fixture (its window is
+      // deep); calibrates the DLMM bin walk + the dynamic-fee arithmetic.
+      { slug: 'meteora-dlmm', adapter: meteoraDlmmLadder, amountIn: 5_000_000_000n, fetch: () => fetchMeteoraDlmmConfig(liveLoader, VENUE_POOL['meteora-dlmm']) },
       // 5 SOL sells across several real bid levels of the SOL/USDC CLOB.
       { slug: 'manifest', adapter: manifestLadder, amountIn: 5_000_000_000n, fetch: () => fetchManifestConfig(liveLoader, VENUE_POOL.manifest) },
       { slug: 'meteora-damm-v2', adapter: meteoraDammV2Ladder, amountIn: 1_000_000_000n, fetch: () => meteoraDammV2.fetchPoolConfig(liveLoader, VENUE_POOL['meteora-damm-v2']) },

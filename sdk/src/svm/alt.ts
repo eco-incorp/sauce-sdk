@@ -28,6 +28,11 @@ import type { SignedExecuteTransaction } from './transaction.js';
 const MAX_ADDRESSES_PER_EXTEND = 30;
 const MAX_ADDRESSES_PER_EXTEND_DISTINCT_AUTHORITY = 27;
 
+/** Extend chunk size for a (payer, authority) pair — 30 same-key, 27 when a distinct authority costs a second signature. */
+function extendChunkSize(payer: Address, authority: Address): number {
+  return payer === authority ? MAX_ADDRESSES_PER_EXTEND : MAX_ADDRESSES_PER_EXTEND_DISTINCT_AUTHORITY;
+}
+
 /**
  * Picks the account addresses worth putting in a lookup table: non-signers
  * only (signers must be static message accounts — they cannot be looked up),
@@ -81,7 +86,7 @@ export async function createAltWithAddresses({
     findAddressLookupTablePda({ authority: authority.address, recentSlot }),
   ]);
 
-  const chunkSize = payer.address === authority.address ? MAX_ADDRESSES_PER_EXTEND : MAX_ADDRESSES_PER_EXTEND_DISTINCT_AUTHORITY;
+  const chunkSize = extendChunkSize(payer.address, authority.address);
   const batches: Instruction[][] = [[createInstruction]];
 
   for (let i = 0; i < addresses.length; i += chunkSize) {
@@ -106,6 +111,56 @@ export async function createAltWithAddresses({
   const lastExtendedSlot = await rpc.getSlot({ commitment }).send();
 
   return { lookupTableAddress, lastExtendedSlot };
+}
+
+export interface ExtendAltInput {
+  rpc: Rpc<GetLatestBlockhashApi & GetSlotApi>;
+  payer: TransactionSigner;
+  authority: TransactionSigner;
+  /** The existing table to extend (must already be created and owned by `authority`). */
+  lookupTableAddress: Address;
+  /** Addresses to append — the caller has already removed any the table holds. */
+  addresses: readonly Address[];
+  sendAndConfirm: SendAndConfirmTransaction;
+  commitment?: Commitment;
+}
+
+/**
+ * Appends `addresses` to an existing lookup table (one transaction per chunk of
+ * 30 — 27 with a distinct authority), returning a slot upper bound for the last
+ * extend. Feed it to `waitForAltActive` before compressing against the table.
+ * An empty `addresses` sends nothing and returns the current slot (the table is
+ * already sufficient) — this is the idempotent no-op the reuse path relies on.
+ */
+export async function extendAlt({
+  rpc,
+  payer,
+  authority,
+  lookupTableAddress,
+  addresses,
+  sendAndConfirm,
+  commitment = 'confirmed',
+}: ExtendAltInput): Promise<{ lastExtendedSlot: bigint }> {
+  const chunkSize = extendChunkSize(payer.address, authority.address);
+
+  for (let i = 0; i < addresses.length; i += chunkSize) {
+    const { value: latestBlockhash } = await rpc.getLatestBlockhash({ commitment }).send();
+    const transaction = await buildExecuteTransaction({
+      payer,
+      instructions: [
+        getExtendLookupTableInstruction({
+          address: lookupTableAddress,
+          authority,
+          payer,
+          addresses: addresses.slice(i, i + chunkSize),
+        }),
+      ],
+      latestBlockhash,
+    });
+    await sendAndConfirm(transaction, { commitment });
+  }
+
+  return { lastExtendedSlot: await rpc.getSlot({ commitment }).send() };
 }
 
 /**
