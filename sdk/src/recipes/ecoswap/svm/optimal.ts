@@ -3,7 +3,7 @@
  * equalization used ONLY to measure the quantized ladder's efficiency loss
  * (a report, never a gate; the exactness gate is solver-reference.ts).
  *
- * Every Phase 0 venue reduces to the fee-scaled constant-product form
+ * Every CP-class venue reduces to the fee-scaled constant-product form
  *   out(x) ≈ mu · (gamma·x · rOut) / (rIn + gamma·x)
  * (gamma = input-side fee retention, mu = output-side retention — the
  * adapters' continuousFees, ppm-scaled). Its post-fee marginal price is

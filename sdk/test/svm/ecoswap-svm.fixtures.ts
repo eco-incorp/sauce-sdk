@@ -14,7 +14,8 @@
  * flat fees from the checked-in FeeConfig fixture (25/5/0 bps). The
  * GlobalConfig/FeeConfig/mint accounts are the untouched mainnet dumps.
  */
-import { address, getAddressCodec } from '@solana/kit';
+import { createHash } from 'node:crypto';
+import { address, getAddressCodec, getAddressDecoder, getAddressEncoder, isOffCurveAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import type { AccountBytesMap, AccountLoader } from '../../src/svm/index.js';
 import type { AccountFixture } from './fixtures.js';
@@ -54,22 +55,30 @@ export interface SynthesizedPumpswapPool {
 }
 
 /**
- * A 243-byte pump-amm Pool account for base = WSOL, quote = USDC with the
- * given vault balances, plus its two vault token accounts. coin_creator is
- * Pubkey::default (zeros) — creator fee 0, no pool-v2 remaining account —
- * and the creator is random, so the pool is non-canonical (flat fees).
+ * A 243-byte pump-amm Pool account for base = WSOL, quote = USDC (override
+ * the mint pair through opts) with the given vault balances, plus its two
+ * vault token accounts. coin_creator is Pubkey::default (zeros) — creator
+ * fee 0, no pool-v2 remaining account — and the creator is random, so the
+ * pool is non-canonical (flat fees). Non-fixture mints need their own
+ * account image on the loader — see syntheticMintBytes.
  */
-export function synthesizePumpswapPool(baseAmount: bigint, quoteAmount: bigint): SynthesizedPumpswapPool {
+export function synthesizePumpswapPool(
+  baseAmount: bigint,
+  quoteAmount: bigint,
+  opts: { baseMint?: Address; quoteMint?: Address } = {},
+): SynthesizedPumpswapPool {
   const codec = getAddressCodec();
   const pool = randomAddr();
   const baseVault = randomAddr();
   const quoteVault = randomAddr();
+  const baseMint = opts.baseMint ?? WSOL_MINT;
+  const quoteMint = opts.quoteMint ?? USDC_MINT;
 
   const data = new Uint8Array(243);
   data.set(POOL_DISCRIMINATOR, 0);
   data.set(randomBytes32(), 11); // creator: random => non-canonical
-  data.set(new Uint8Array(codec.encode(WSOL_MINT)), 43);
-  data.set(new Uint8Array(codec.encode(USDC_MINT)), 75);
+  data.set(new Uint8Array(codec.encode(baseMint)), 43);
+  data.set(new Uint8Array(codec.encode(quoteMint)), 75);
   data.set(new Uint8Array(codec.encode(baseVault)), 139);
   data.set(new Uint8Array(codec.encode(quoteVault)), 171);
   new DataView(data.buffer).setBigUint64(203, 1_000_000_000n, true); // lp_supply (unread)
@@ -81,14 +90,103 @@ export function synthesizePumpswapPool(baseAmount: bigint, quoteAmount: bigint):
     quoteVault,
     accounts: [
       { address: pool, owner: PUMPSWAP_PROGRAM, data },
-      { address: baseVault, owner: TOKENKEG, data: splTokenAccountBytes(WSOL_MINT, pool, baseAmount) },
-      { address: quoteVault, owner: TOKENKEG, data: splTokenAccountBytes(USDC_MINT, pool, quoteAmount) },
+      { address: baseVault, owner: TOKENKEG, data: splTokenAccountBytes(baseMint, pool, baseAmount) },
+      { address: quoteVault, owner: TOKENKEG, data: splTokenAccountBytes(quoteMint, pool, quoteAmount) },
+    ],
+  };
+}
+
+/** 82-byte classic SPL mint image: supply u64 LE @36, decimals @44, initialized @45. */
+export function syntheticMintBytes(decimals: number, supply = 10n ** 15n): Uint8Array {
+  const data = new Uint8Array(82);
+  new DataView(data.buffer).setBigUint64(36, supply, true);
+  data[44] = decimals;
+  data[45] = 1;
+  return data;
+}
+
+export const SABER_PROGRAM = address('SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ');
+
+export interface SynthesizedSaberPool {
+  pool: Address;
+  vaultA: Address;
+  vaultB: Address;
+  /** Account images keyed by address — feed to a loader AND setAccount. */
+  accounts: { address: Address; owner: Address; data: Uint8Array }[];
+}
+
+/**
+ * A 395-byte saber SwapInfo on the given mint pair with the given vault
+ * balances: initialized, unpaused, flat amp (initial == target == amp, no
+ * ramp window), trade fee feeNum/feeDen, zero admin fees. The stored nonce
+ * walks down from 255 to the first OFF-curve swap authority — the same
+ * search initialize performs, so fetchPoolConfig's create_program_address
+ * derivation succeeds. Admin fee accounts are random (only the real-binary
+ * CPI lane ever touches them, and it fabricates token accounts there).
+ */
+export function synthesizeSaberPool(
+  mintA: Address,
+  mintB: Address,
+  reserveA: bigint,
+  reserveB: bigint,
+  opts: { amp?: bigint; feeNum?: bigint; feeDen?: bigint } = {},
+): SynthesizedSaberPool {
+  const codec = getAddressCodec();
+  const pool = randomAddr();
+  const vaultA = randomAddr();
+  const vaultB = randomAddr();
+  const amp = opts.amp ?? 100n;
+  const feeNum = opts.feeNum ?? 1n;
+  const feeDen = opts.feeDen ?? 10_000n;
+
+  // The stored bump: first nonce (255 downward) deriving off-curve.
+  const encoder = getAddressEncoder();
+  const decoder = getAddressDecoder();
+  let nonce = 255;
+  for (; nonce >= 0; nonce--) {
+    const digest = createHash('sha256')
+      .update(encoder.encode(pool) as Uint8Array)
+      .update(Uint8Array.of(nonce))
+      .update(encoder.encode(SABER_PROGRAM) as Uint8Array)
+      .update('ProgramDerivedAddress')
+      .digest();
+    if (isOffCurveAddress(decoder.decode(digest))) break;
+  }
+
+  const data = new Uint8Array(395);
+  const view = new DataView(data.buffer);
+  data[0] = 1; // is_initialized
+  data[1] = 0; // is_paused
+  data[2] = nonce;
+  view.setBigUint64(3, amp, true); // initial_amp_factor
+  view.setBigUint64(11, amp, true); // target_amp_factor
+  // start/stop ramp ts stay 0 — amp is flat
+  data.set(new Uint8Array(codec.encode(vaultA)), 107);
+  data.set(new Uint8Array(codec.encode(vaultB)), 139);
+  data.set(new Uint8Array(codec.encode(mintA)), 203);
+  data.set(new Uint8Array(codec.encode(mintB)), 235);
+  data.set(randomBytes32(), 267); // admin_fees_a
+  data.set(randomBytes32(), 299); // admin_fees_b
+  view.setBigUint64(363, feeNum, true);
+  view.setBigUint64(371, feeDen, true);
+
+  return {
+    pool,
+    vaultA,
+    vaultB,
+    accounts: [
+      { address: pool, owner: SABER_PROGRAM, data },
+      { address: vaultA, owner: TOKENKEG, data: splTokenAccountBytes(mintA, pool, reserveA) },
+      { address: vaultB, owner: TOKENKEG, data: splTokenAccountBytes(mintB, pool, reserveB) },
     ],
   };
 }
 
 /** Loader over mainnet fixtures overlaid with synthesized accounts (fresh copies per read). */
-export function overlayLoader(fixtures: AccountFixture[], synthesized: SynthesizedPumpswapPool[]): AccountLoader {
+export function overlayLoader(
+  fixtures: AccountFixture[],
+  synthesized: { accounts: { address: Address; owner: Address; data: Uint8Array }[] }[],
+): AccountLoader {
   const map: AccountBytesMap = fixtureBytesMap(fixtures);
   for (const synth of synthesized) {
     for (const account of synth.accounts) map[account.address] = account.data;
@@ -100,7 +198,10 @@ export function overlayLoader(fixtures: AccountFixture[], synthesized: Synthesiz
 }
 
 /** AccountBytesMap over the same overlay (for the reference oracles). */
-export function overlayBytesMap(fixtures: AccountFixture[], synthesized: SynthesizedPumpswapPool[]): AccountBytesMap {
+export function overlayBytesMap(
+  fixtures: AccountFixture[],
+  synthesized: { accounts: { address: Address; owner: Address; data: Uint8Array }[] }[],
+): AccountBytesMap {
   const map: AccountBytesMap = {};
   for (const fixture of fixtures) map[fixture.address] = fixtureData(fixture);
   for (const synth of synthesized) {

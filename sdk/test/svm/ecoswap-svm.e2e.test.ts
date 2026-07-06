@@ -366,10 +366,10 @@ describeSvm('ecoswap-svm e2e: 2-venue live split on the real engine', () => {
         `args ${output.cfgByteLength} bytes in one packed cfg slot`,
     );
     // Measured ~842k for the 2-venue trade (the interpreter's per-op cost
-    // dominates; 3 slots ≈ 1.31M, 4 slots exceed the cap — why the
-    // orchestrator admits at most ECO_SVM_MAX_SLOTS = 3). Pinned with ~19%
-    // headroom so a CU regression fails loudly here before it walls 3-slot
-    // trades on-cluster.
+    // dominates) — the CU budgeter's per-family coefficients live in
+    // budget.ts and are re-measured by ecoswap-svm.cu.e2e.test.ts. Pinned
+    // with ~19% headroom so a CU regression fails loudly here before it
+    // walls multi-slot trades on-cluster.
     expect(baselineCu).toBeGreaterThan(0n);
     expect(baselineCu).toBeLessThan(1_000_000n);
     expect(output.bytecode.length).toBeLessThan(65_535);

@@ -60,36 +60,42 @@ export const pumpswapLadder = {
     return `${SLUG}:${cfg.direction}${cfg.poolV2 !== undefined ? ':v2' : ''}`;
   },
 
-  helperName(base: PoolConfig): string {
-    return psConfig(base).direction === 'quoteToBase' ? 'qPumpBuy' : 'qPumpSell';
-  },
-
-  helperSource(base: PoolConfig): string {
+  helpers(base: PoolConfig): { name: string; source: string }[] {
     if (psConfig(base).direction === 'quoteToBase') {
       // buy_exact_quote_in: strip the fee share off the spendable budget
       // (each component ceil'd separately, over-budget corrected), then the
       // invariant swap runs on eff − 1. eff < 2 returns 0 — the venue-side
       // throw guard, kept out of the ladder so dust rungs just never win.
       return [
-        'function qPumpBuy(x, rb, rq, lp, prot, cr) {',
-        '  if (x === 0) { return 0 }',
-        '  let eff = (x * 10000) / (10000 + lp + prot + cr);',
-        '  const fees = (eff * lp + 9999) / 10000 + (eff * prot + 9999) / 10000 + (eff * cr + 9999) / 10000;',
-        '  if (eff + fees > x) { eff = eff - (eff + fees - x) }',
-        '  if (eff < 2) { return 0 }',
-        '  const ia = eff - 1;',
-        '  return Math.mulDiv(rb, ia, rq + ia);',
-        '}',
-      ].join('\n');
+        {
+          name: 'qPumpBuy',
+          source: [
+            'function qPumpBuy(x, rb, rq, lp, prot, cr) {',
+            '  if (x === 0) { return 0 }',
+            '  let eff = (x * 10000) / (10000 + lp + prot + cr);',
+            '  const fees = (eff * lp + 9999) / 10000 + (eff * prot + 9999) / 10000 + (eff * cr + 9999) / 10000;',
+            '  if (eff + fees > x) { eff = eff - (eff + fees - x) }',
+            '  if (eff < 2) { return 0 }',
+            '  const ia = eff - 1;',
+            '  return Math.mulDiv(rb, ia, rq + ia);',
+            '}',
+          ].join('\n'),
+        },
+      ];
     }
     // sell: fees are per-component ceilDiv on the OUTPUT.
     return [
-      'function qPumpSell(x, rb, rq, lp, prot, cr) {',
-      '  if (x === 0) { return 0 }',
-      '  const qo = Math.mulDiv(rq, x, rb + x);',
-      '  return qo - (qo * lp + 9999) / 10000 - (qo * prot + 9999) / 10000 - (qo * cr + 9999) / 10000;',
-      '}',
-    ].join('\n');
+      {
+        name: 'qPumpSell',
+        source: [
+          'function qPumpSell(x, rb, rq, lp, prot, cr) {',
+          '  if (x === 0) { return 0 }',
+          '  const qo = Math.mulDiv(rq, x, rb + x);',
+          '  return qo - (qo * lp + 9999) / 10000 - (qo * prot + 9999) / 10000 - (qo * cr + 9999) / 10000;',
+          '}',
+        ].join('\n'),
+      },
+    ];
   },
 
   /** Three params: lpFeeBps, protocolFeeBps, creatorFeeBps. */

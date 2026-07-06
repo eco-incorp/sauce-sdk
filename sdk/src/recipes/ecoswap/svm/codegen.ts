@@ -4,7 +4,8 @@
  * true }`.
  *
  * ONE compiled blob per SHAPE (the ordered list of family slots — venue,
- * direction, optional-account layout) serves any matching pool set:
+ * direction, RUNG COUNT, optional-account layout) serves any matching pool
+ * set:
  * - pool ACCOUNTS ride the transaction account list at fixed per-slot
  *   positions (slot-role refs `s<i>:*`, rebound per trade through the
  *   resolution map);
@@ -18,6 +19,15 @@
  *   patched at RUNTIME from the merge result (prefix ++ le8(amount) ++
  *   suffix, venue min_out = 1), and ONE terminal realized-delta check on the
  *   user's outAta enforces minOut across all slots at once.
+ *
+ * DETERMINISM RULE (the SVM place where the EVM analog does not transfer):
+ * per-slot ladder DEPTH is fixed at CODEGEN time by the CU budgeter
+ * (budget.ts) — a pure function of the shape — never adapted from GasLeft at
+ * runtime. The solver-reference mirror cannot read GasLeft, so any
+ * CU-dependent branching would break the lamport-exact gate. GasLeft (0x62)
+ * appears exactly once, as a HARD SAFETY THROW (`"cu"`) before any work when
+ * the transaction's compute budget cannot cover the shape's modeled cost —
+ * an all-or-nothing abort that can never change a landed split.
  *
  * The generated merge is transcribed 1:1 by solver-reference.ts — change
  * them together or the lamport-exact gate breaks.
@@ -33,11 +43,17 @@ import type {
   SwapUser,
   VenueAccount,
 } from '../../../svm/venues/types.js';
-import { QL_S } from './solver-reference.js';
+import { MAX_RUNGS, MIN_RUNGS, QL_S } from './solver-reference.js';
 
 export interface EcoSwapSvmSlot {
   adapter: SvmVenueLadderV2;
   cfg: PoolConfig;
+  /**
+   * Ladder rungs for this slot (default: the adapter's defaultRungs, else
+   * QL_S). Fixed into the SHAPE — the budgeter picks it, the mirror
+   * replicates it from the prepared slots, never from runtime CU.
+   */
+  rungs?: number;
   /**
    * Test/integration hook: replaces the venue swap CPI while the quote stays
    * live (e.g. an SPL-transfer stand-in paying the predicted output when no
@@ -49,6 +65,13 @@ export interface EcoSwapSvmSlot {
 export interface GenerateEcoSwapSvmInput {
   slots: EcoSwapSvmSlot[];
   user: SwapUser;
+  /**
+   * The GasLeft safety floor (CU): when set, the program throws `"cu"`
+   * before any work if the remaining compute budget is below it. A pure
+   * function of the shape (the budgeter's modeled cost) — see the
+   * determinism rule above.
+   */
+  cuFloor?: number;
 }
 
 export interface GeneratedEcoSwapSvm {
@@ -60,6 +83,8 @@ export interface GeneratedEcoSwapSvm {
   accountPlan: AccountPlan;
   /** Shape discriminant: pool sets sharing it reuse the identical blob. */
   shapeKey: string;
+  /** Resolved per-slot ladder rungs (slot order) — feed solver-reference. */
+  rungs: number[];
   /** Byte length of the packed cfg arg (encodeEcoSwapSvmTrade must match). */
   cfgByteLength: number;
   warnings: string[];
@@ -99,6 +124,15 @@ function bindAddress(addressByRef: Map<string, string>, ref: string, address: Ad
   addressByRef.set(ref, address);
 }
 
+/** Resolves a slot's ladder depth: explicit > adapter default > QL_S; bounds-checked. */
+export function resolveSlotRungs(slot: Pick<EcoSwapSvmSlot, 'adapter' | 'rungs'>): number {
+  const rungs = slot.rungs ?? slot.adapter.defaultRungs ?? QL_S;
+  if (!Number.isInteger(rungs) || rungs < MIN_RUNGS || rungs > MAX_RUNGS) {
+    throw new Error(`ecoSwapSvm slot rungs must be an integer in ${MIN_RUNGS}..${MAX_RUNGS}, got ${rungs}`);
+  }
+  return rungs;
+}
+
 /**
  * Encodes the per-trade cfg bytes for a shape: u64 LE words
  * [amountIn][minOut] then per slot [enable][...params]. Slot order and
@@ -124,20 +158,52 @@ export function encodeEcoSwapSvmTrade(
   return `0x${Buffer.from(bytes).toString('hex')}`;
 }
 
-function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgByteLength: number } {
-  const { slots, user } = input;
+/** Collects and dedupes the slots' helper functions; one name = one source. */
+function collectHelpers(slots: readonly EcoSwapSvmSlot[]): string[] {
+  const byName = new Map<string, string>();
+  for (const { adapter, cfg } of slots) {
+    for (const helper of adapter.helpers(cfg)) {
+      const known = byName.get(helper.name);
+      if (known !== undefined && known !== helper.source) {
+        throw new Error(`ecoSwapSvm helper '${helper.name}' is declared with two different sources`);
+      }
+      byName.set(helper.name, helper.source);
+    }
+  }
+  return [...byName.values()];
+}
+
+function quoteMode(adapter: SvmVenueLadderV2): 'expression' | 'statements' {
+  if (adapter.emitQuoteCall !== undefined) return 'expression';
+  if (adapter.emitLadderQuote !== undefined && adapter.emitFinalQuote !== undefined) return 'statements';
+  throw new Error(
+    `ecoSwapSvm adapter '${adapter.slug}' must implement emitQuoteCall or (emitLadderQuote + emitFinalQuote)`,
+  );
+}
+
+function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgByteLength: number; rungs: number[] } {
+  const { slots, user, cuFloor } = input;
   const k = slots.length;
   const codec = getAddressCodec();
 
-  // ── helpers: le8 + one quote helper per family/direction (deduped) ──
-  const helpers = new Map<string, string>();
-  for (const { adapter, cfg } of slots) {
-    const name = adapter.helperName(cfg);
-    if (!helpers.has(name)) helpers.set(name, adapter.helperSource(cfg));
+  const rungs = slots.map(resolveSlotRungs);
+  const rungBase: number[] = [];
+  let totalRungs = 0;
+  for (const r of rungs) {
+    rungBase.push(totalRungs);
+    totalRungs += r;
   }
 
-  const lines: string[] = [LE8_HELPER, ...helpers.values()];
+  const lines: string[] = [LE8_HELPER, ...collectHelpers(slots)];
   lines.push('function main(cfg) {');
+
+  // ── the GasLeft hard safety throw (never a split input — see header) ──
+  if (cuFloor !== undefined) {
+    if (!Number.isInteger(cuFloor) || cuFloor <= 0) {
+      throw new Error(`ecoSwapSvm cuFloor must be a positive integer, got ${cuFloor}`);
+    }
+    lines.push(`  if (gasLeft() < ${cuFloor}) { throw "cu" }`);
+  }
 
   // ── cfg words: [amountIn][minOut] then per slot [enable][...params] ──
   let word = 0;
@@ -151,8 +217,11 @@ function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgBy
   const enables: string[] = [];
   const slotParams: string[][] = [];
   slots.forEach(({ adapter }, i) => {
-    lines.push(`  const s${i}on = ${slice()};`);
-    enables.push(`s${i}on`);
+    // `s<i>en` — the enable flag; the name is part of the adapter contract's
+    // reserved-local surface (adapters must not declare it; orca's owner-fee
+    // numerator local made `s<i>on` unavailable).
+    lines.push(`  const s${i}en = ${slice()};`);
+    enables.push(`s${i}en`);
     const params: string[] = [];
     for (let p = 0; p < adapter.paramCount; p++) {
       lines.push(`  const s${i}p${p} = ${slice()};`);
@@ -163,30 +232,42 @@ function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgBy
   const cfgByteLength = word * 8;
 
   // ── setup: LIVE reserve/fee reads into slot locals (unconditional — a
-  //    disabled slot still needs readable accounts attached; see README) ──
-  slots.forEach(({ adapter, cfg }, i) => lines.push(adapter.emitSetup(cfg, i, slotParams[i])));
+  //    disabled slot still needs readable accounts attached; adapters gate
+  //    EXPENSIVE setup work, e.g. a stable slot's Newton D, on the enable
+  //    var themselves) ──
+  slots.forEach(({ adapter, cfg }, i) => lines.push(adapter.emitSetup(cfg, i, slotParams[i], enables[i])));
 
   // Zero-length reads intern each slot's CPI target program account: the
   // engine resolves a CALL target by scanning the attached user accounts for
   // the program's pubkey, so it must ride along.
   for (let i = 0; i < k; i++) lines.push(`  accountData(${JSON.stringify(progRef(i))}, 0, 0);`);
 
-  // ── ladders: QL_S rungs per enabled slot on the geometric grid
-  //    G_j = amountIn >> (QL_S − j); a disabled slot is born exhausted ──
+  // ── ladders: rungs[i] rungs per enabled slot on the geometric grid
+  //    G_j = amountIn >> (rungs[i] − j); a disabled slot is born exhausted.
+  //    Per-slot rung counts/bases ride the rl/rb runtime arrays so the merge
+  //    scan stays a flat loop (mirrored 1:1 by solver-reference). ──
   lines.push(
-    `  const din = new Array(${k * QL_S});`,
-    `  const dout = new Array(${k * QL_S});`,
+    `  const din = new Array(${totalRungs});`,
+    `  const dout = new Array(${totalRungs});`,
+    `  const rl = new Array(${k});`,
+    `  const rb = new Array(${k});`,
     `  const ptr = new Array(${k});`,
     `  const fill = new Array(${k});`,
   );
+  slots.forEach((_, i) => lines.push(`  rl[${i}] = ${rungs[i]}; rb[${i}] = ${rungBase[i]};`));
   slots.forEach(({ adapter, cfg }, i) => {
-    const call = (x: string) => adapter.emitQuoteCall(cfg, i, x);
+    const mode = quoteMode(adapter);
+    const r = rungs[i];
     lines.push(`  if (${enables[i]} !== 0) {`);
-    for (let j = 1; j <= QL_S; j++) {
-      const rung = i * QL_S + (j - 1);
-      const g = j === QL_S ? 'amountIn' : `s${i}g${j}`;
-      if (j < QL_S) lines.push(`    const ${g} = amountIn >> ${QL_S - j};`);
-      lines.push(`    const s${i}o${j} = ${call(g)};`);
+    for (let j = 1; j <= r; j++) {
+      const rung = rungBase[i] + (j - 1);
+      const g = j === r ? 'amountIn' : `s${i}g${j}`;
+      if (j < r) lines.push(`    const ${g} = amountIn >> ${r - j};`);
+      if (mode === 'expression') {
+        lines.push(`    const s${i}o${j} = ${adapter.emitQuoteCall!(cfg, i, g)};`);
+      } else {
+        lines.push(adapter.emitLadderQuote!(cfg, i, j - 1, g, `s${i}o${j}`));
+      }
       if (j === 1) {
         lines.push(`    din[${rung}] = ${g}; dout[${rung}] = s${i}o${j};`);
       } else {
@@ -194,7 +275,7 @@ function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgBy
       }
     }
     lines.push('  }');
-    lines.push(`  if (${enables[i]} === 0) { ptr[${i}] = ${QL_S} }`);
+    lines.push(`  if (${enables[i]} === 0) { ptr[${i}] = ${r} }`);
   });
 
   // ── merge: greedy cheapest-rung-first, ONE pointer advance per step;
@@ -202,20 +283,20 @@ function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgBy
   //    ties. Mirrored 1:1 by solver-reference.ts — change together. ──
   lines.push(
     '  let remaining = amountIn;',
-    `  for (let it = 0; it < ${k * QL_S} && remaining > 0; it++) {`,
+    `  for (let it = 0; it < ${totalRungs} && remaining > 0; it++) {`,
     `    let best = ${k};`,
     `    for (let s = 0; s < ${k}; s++) {`,
-    `      if (ptr[s] < ${QL_S}) {`,
+    '      if (ptr[s] < rl[s]) {',
     `        if (best === ${k}) { best = s }`,
     '        if (best !== s) {',
-    `          const c = s * ${QL_S} + ptr[s];`,
-    `          const b = best * ${QL_S} + ptr[best];`,
+    '          const c = rb[s] + ptr[s];',
+    '          const b = rb[best] + ptr[best];',
     '          if (dout[c] * din[b] > dout[b] * din[c]) { best = s }',
     '        }',
     '      }',
     '    }',
     `    if (best === ${k}) { throw "fill" }`,
-    `    const r = best * ${QL_S} + ptr[best];`,
+    '    const r = rb[best] + ptr[best];',
     '    let take = din[r];',
     '    if (take > remaining) { take = remaining }',
     '    fill[best] += take;',
@@ -226,9 +307,14 @@ function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgBy
   );
 
   // ── predicted outputs + the pre-CPI bound (compute BEFORE the first CPI:
-  //    once invoke() launches, a callee failure aborts the transaction) ──
+  //    once invoke() launches, a callee failure aborts the transaction).
+  //    ALWAYS the COLD quote — venue-exact at the elected slice. ──
   slots.forEach(({ adapter, cfg }, i) => {
-    lines.push(`  const p${i} = ${adapter.emitQuoteCall(cfg, i, `fill[${i}]`)};`);
+    if (quoteMode(adapter) === 'expression') {
+      lines.push(`  const p${i} = ${adapter.emitQuoteCall!(cfg, i, `fill[${i}]`)};`);
+    } else {
+      lines.push(adapter.emitFinalQuote!(cfg, i, `fill[${i}]`, `p${i}`));
+    }
   });
   lines.push(`  const predicted = ${slots.map((_, i) => `p${i}`).join(' + ')};`);
   lines.push('  if (predicted < minOut) { throw "minOut" }');
@@ -265,14 +351,20 @@ function generateSource(input: GenerateEcoSwapSvmInput): { source: string; cfgBy
   const returns = [...slots.map((_, i) => `fill[${i}]`), ...slots.map((_, i) => `p${i}`), 'realized'];
   lines.push(`  return abi.encode(${returns.join(', ')});`, '}');
 
-  return { source: lines.join('\n'), cfgByteLength };
+  return { source: lines.join('\n'), cfgByteLength, rungs };
 }
 
-/** Shape discriminant for blob reuse: family slots + any swap overrides. */
+/**
+ * Shape discriminant for blob reuse: family slots (rung-count-suffixed when
+ * off the Phase-0 default QL_S) + any swap overrides.
+ */
 export function ecoSwapSvmShapeKey(slots: readonly EcoSwapSvmSlot[]): string {
   return slots
-    .map(({ adapter, cfg, swapOverride }) => {
-      const base = adapter.shapeKey(cfg);
+    .map((slot) => {
+      const { adapter, cfg, swapOverride } = slot;
+      const rungs = resolveSlotRungs(slot);
+      let base = adapter.shapeKey(cfg);
+      if (rungs !== QL_S) base += `~r${rungs}`;
       if (swapOverride === undefined) return base;
       return `${base}#ov:${swapOverride.patch}:${swapOverride.programId}:${swapOverride.accounts.length}`;
     })
@@ -289,7 +381,7 @@ export function generateEcoSwapSvm(input: GenerateEcoSwapSvmInput): GeneratedEco
     if (user[key].length === 0) throw new Error(`ecoSwapSvm user.${key} ref must not be empty`);
   }
 
-  const { source, cfgByteLength } = generateSource(input);
+  const { source, cfgByteLength, rungs } = generateSource(input);
   const { bytecode, warnings, accountPlan, argsLayout } = compile(source, {
     target: 'svm',
     staged: true,
@@ -319,6 +411,7 @@ export function generateEcoSwapSvm(input: GenerateEcoSwapSvmInput): GeneratedEco
     argsLayout,
     accountPlan: { ...accountPlan, metas },
     shapeKey: ecoSwapSvmShapeKey(slots),
+    rungs,
     cfgByteLength,
     warnings,
   };

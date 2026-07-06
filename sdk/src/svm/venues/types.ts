@@ -103,23 +103,40 @@ export interface LadderSwapTemplate {
  * cfg. One compiled blob per SHAPE (ordered family slots, see shapeKey)
  * serves any matching pool set — pool accounts rebind per trade through the
  * resolution map, per-trade values ride the payload args.
+ *
+ * STABLE-STYLE families (Newton-iteration quotes) additionally implement the
+ * statement-emitting ladder surface: `emitLadderQuote` threads warm-start
+ * state between rungs (the invariant D is computed ONCE per trade in
+ * emitSetup, each rung's Newton-y starts from the previous rung's y), and
+ * `referenceLadderQuotes` mirrors that exact chain off-chain. The FINAL
+ * per-slot quote (the predicted output the minOut check and the real-binary
+ * quadrilateral see) always stays COLD — identical to the venue program's own
+ * from-scratch iteration — via emitQuoteCall/referenceQuote.
  */
 export interface SvmVenueLadderV2 {
   slug: string;
+  /**
+   * Default quote-ladder rungs for a slot of this family (the codegen input;
+   * the CU budgeter may override per slot). Absent = 4 (the CP default);
+   * stable families declare 2 — a Newton quote costs ~2 orders of magnitude
+   * more CU than a CP quote, see recipes/ecoswap/svm/budget.ts.
+   */
+  defaultRungs?: number;
   /**
    * Shape discriminant: pools sharing a shapeKey compile to byte-identical
    * slot fragments (direction and optional-account layout are part of it).
    */
   shapeKey(cfg: PoolConfig): string;
-  /** Quote-helper function name (helpers are deduped by name across slots). */
-  helperName(cfg: PoolConfig): string;
   /**
-   * The family quote helper `function <name>(x, ...) { ... }`: a pure scalar
-   * function of the gross input x and passed-in live state/params (helpers
-   * cannot call helpers or read accounts/args themselves). Returns 0 for
-   * x == 0 and for inputs the venue would reject (dust).
+   * Helper functions the family's fragments call — `function <name>(...) {}`
+   * sources, pure scalar functions of their arguments (helpers cannot call
+   * helpers or read accounts/args themselves). Deduped by NAME across slots
+   * AND families (two families claiming one name must ship byte-identical
+   * source — the codegen asserts it; that is how saber and meteora-damm-v1
+   * share stableD/stableYW). A quote helper returns 0 for x == 0 and for
+   * inputs the venue would reject (dust).
    */
-  helperSource(cfg: PoolConfig): string;
+  helpers(cfg: PoolConfig): { name: string; source: string }[];
   /** Per-slot scalar params the fragment consumes (beyond the shared enable flag). */
   paramCount: number;
   /** Per-trade values for those params, in emitSetup order. */
@@ -129,25 +146,68 @@ export interface SvmVenueLadderV2 {
   /**
    * Main-body lines binding the slot locals (`s<i>rin` etc.) from LIVE
    * accountUint reads plus the param locals (`params[k]` is the SauceScript
-   * expression of per-slot param k).
+   * expression of per-slot param k). `enableVar` is the slot's enable-flag
+   * local — adapters with EXPENSIVE setup (a stable slot's Newton D) gate
+   * that work on it (`let` the local, assign inside `if (enableVar !== 0)`)
+   * so a disabled slot costs only its unconditional account reads.
    */
-  emitSetup(cfg: PoolConfig, slot: number, params: readonly string[]): string;
-  /** Quote-call expression for the gross-input expression `x` over the slot locals. */
-  emitQuoteCall(cfg: PoolConfig, slot: number, x: string): string;
+  emitSetup(cfg: PoolConfig, slot: number, params: readonly string[], enableVar?: string): string;
+  /**
+   * Quote-call EXPRESSION for the gross-input expression `x` over the slot
+   * locals — the CP form, used for ladder rungs and the final predicted
+   * output alike. Absent for statement-form (stable) families, which provide
+   * emitLadderQuote + emitFinalQuote instead.
+   */
+  emitQuoteCall?(cfg: PoolConfig, slot: number, x: string): string;
+  /**
+   * STABLE-STYLE ladders: statement lines that define `const <outVar>` = the
+   * chain quote at cumulative grid point `x` for rung index `rung` (0-based),
+   * threading warm-start locals between rungs by slot-scoped naming
+   * (`s<slot>wy`). Rung 0 must seed the chain from the setup locals. Emitted
+   * INSIDE the slot's enable-gated ladder block. When absent the codegen uses
+   * `emitQuoteCall` per rung (CP families — pointwise == chain).
+   */
+  emitLadderQuote?(cfg: PoolConfig, slot: number, rung: number, x: string, outVar: string): string;
+  /**
+   * Statement lines that define `let <outVar>` = the COLD (venue-exact,
+   * from-scratch) quote at expression `x` — the final predicted output.
+   * Required alongside emitLadderQuote; must guard x == 0 (and disabled-slot
+   * zeroed setup locals) to 0 without running the expensive path.
+   */
+  emitFinalQuote?(cfg: PoolConfig, slot: number, x: string, outVar: string): string;
   /** The venue swap CPI as a runtime-patchable template (patch: 'in'). */
   buildSwapV2(cfg: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
   /**
    * TS mirror of the emitted quote: an exact integer closure over the SAME
    * live account bytes and params the fragment reads — the solver-reference
    * (and quoteEcoSwapSvm) evaluates it lamport-identically to the engine.
+   * `now` (unix seconds) feeds time-dependent families (locked-profit decay,
+   * amp ramps) — it must equal the cluster clock the fragment's
+   * block.timestamp reads for the lamport-exact gate to hold.
    */
-  referenceQuote(cfg: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint;
-  /** Effective (reserveIn, reserveOut) from state — relative-depth filter + continuous-oracle input. */
-  depthReserves(cfg: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint };
+  referenceQuote(cfg: PoolConfig, state: AccountBytesMap, params: readonly bigint[], now?: bigint): (x: bigint) => bigint;
+  /**
+   * Mirror of emitLadderQuote's warm-start chain: quotes the ORDERED
+   * cumulative grid points with the same state threading, same integer ops,
+   * same iteration counts. Absent = pointwise referenceQuote (CP families).
+   */
+  referenceLadderQuotes?(
+    cfg: PoolConfig,
+    state: AccountBytesMap,
+    params: readonly bigint[],
+    now?: bigint,
+  ): (grid: readonly bigint[]) => bigint[];
+  /**
+   * Effective (reserveIn, reserveOut) from state — relative-depth filter +
+   * continuous-oracle input. `now` as in referenceQuote.
+   */
+  depthReserves(cfg: PoolConfig, state: AccountBytesMap, now?: bigint): { reserveIn: bigint; reserveOut: bigint };
   /**
    * Continuous-oracle fee model (ppm-scaled): out(x) ~= mu * (gamma*x*rOut) /
    * (rIn + gamma*x) with gamma = gammaPpm/1e6, mu = muPpm/1e6. Measurement
-   * only (the optimal.ts efficiency oracle) — never a gate.
+   * only (the optimal.ts efficiency oracle) — never a gate. For stable
+   * curves the CP form badly understates depth; their values are honest fee
+   * retentions but the oracle stays meaningful only for CP-class venues.
    */
   continuousFees(cfg: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): { gammaPpm: bigint; muPpm: bigint };
 }

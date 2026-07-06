@@ -12,7 +12,7 @@ import { existsSync } from 'fs';
 import { resolve } from 'path';
 import { getAddressCodec, generateKeyPairSigner, lamports } from '@solana/kit';
 import type { Address, AddressesByLookupTableAddress, Instruction, KeyPairSigner } from '@solana/kit';
-import { Clock, FailedTransactionMetadata, LiteSVM } from 'litesvm';
+import { Clock, FailedTransactionMetadata, FeatureSet, LiteSVM } from 'litesvm';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 import {
   buildComputeBudgetPrepend,
@@ -55,7 +55,16 @@ export const randomAddress = (): Address => getAddressCodec().decode(crypto.getR
  * frame, requested by the RequestHeapFrame prepend on every execute.
  */
 export const startEngine = async (unixTimestamp: bigint): Promise<EngineHarness> => {
-  const svm = new LiteSVM();
+  // The default constructor's program runtime misses the
+  // sol_remaining_compute_units syscall (the engine's GasLeft, 0x62 — the
+  // EcoSwapSVM CU-floor guard); rebuilding the runtime with every feature
+  // enabled registers it, matching mainnet where the feature is long active.
+  const svm = new LiteSVM()
+    .withFeatureSet(FeatureSet.allEnabled())
+    .withBuiltins()
+    .withPrecompiles()
+    .withSysvars()
+    .withDefaultPrograms();
   const programId = (await generateKeyPairSigner()).address;
   svm.addProgramFromFile(programId, ENGINE_SO);
 
@@ -84,13 +93,14 @@ export const tokenAccountData = (mint: Address, owner: Address, amount: bigint):
   return data;
 };
 
-/** Places a Tokenkeg-owned token account at `address` and returns the address. */
+/** Places a token account at `address` (Tokenkeg-owned unless `tokenProgram` says otherwise) and returns the address. */
 export const setTokenAccount = (
   harness: EngineHarness,
   address: Address,
   mint: Address,
   owner: Address,
   amount: bigint,
+  tokenProgram: Address = TOKEN_PROGRAM,
 ): Address => {
   const data = tokenAccountData(mint, owner, amount);
   harness.svm.setAccount({
@@ -98,7 +108,7 @@ export const setTokenAccount = (
     data,
     executable: false,
     lamports: lamports(harness.svm.minimumBalanceForRentExemption(BigInt(data.length))),
-    programAddress: TOKEN_PROGRAM,
+    programAddress: tokenProgram,
     space: BigInt(data.length),
   });
   return address;

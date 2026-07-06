@@ -69,23 +69,24 @@ export const raydiumCpSwapLadder = {
     return `${SLUG}:${cfg.inputIsToken0 ? '0to1' : '1to0'}`;
   },
 
-  helperName(): string {
-    return 'qRayCp';
-  },
-
   // Unified over the three creator-fee modes: trin carries the input-side
   // rate sum, crout the output-side creator rate; zero rates are no-ops.
   // Rounding mirrors the program: ceil on every fee, floor on the curve.
-  helperSource(): string {
+  helpers(): { name: string; source: string }[] {
     return [
-      'function qRayCp(x, rin, rout, trin, crout) {',
-      '  if (x === 0) { return 0 }',
-      `  const fee = (x * trin + ${FEE_RATE_DENOMINATOR - 1n}) / ${FEE_RATE_DENOMINATOR};`,
-      '  const net = x - fee;',
-      '  const os = Math.mulDiv(net, rout, rin + net);',
-      `  return os - (os * crout + ${FEE_RATE_DENOMINATOR - 1n}) / ${FEE_RATE_DENOMINATOR};`,
-      '}',
-    ].join('\n');
+      {
+        name: 'qRayCp',
+        source: [
+          'function qRayCp(x, rin, rout, trin, crout) {',
+          '  if (x === 0) { return 0 }',
+          `  const fee = (x * trin + ${FEE_RATE_DENOMINATOR - 1n}) / ${FEE_RATE_DENOMINATOR};`,
+          '  const net = x - fee;',
+          '  const os = Math.mulDiv(net, rout, rin + net);',
+          `  return os - (os * crout + ${FEE_RATE_DENOMINATOR - 1n}) / ${FEE_RATE_DENOMINATOR};`,
+          '}',
+        ].join('\n'),
+      },
+    ];
   },
 
   /** One param: crMode (0 = none, 1 = creator fee on input, 2 = on output). */

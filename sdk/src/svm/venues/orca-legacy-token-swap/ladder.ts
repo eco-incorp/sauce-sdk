@@ -41,31 +41,32 @@ export const orcaLegacyTokenSwapLadder = {
     return `${SLUG}:AtoB`;
   },
 
-  helperName(): string {
-    return 'qOrca';
-  },
-
   // fees.rs calculate_fee (floor, min 1 when rate and amount are nonzero) on
   // both fee legs, then the ceiling-divided constant-product curve rounding
   // against the trader. Venue-rejected inputs (fees swallow x, zero
   // quotient, zero output) return 0 instead of throwing.
-  helperSource(): string {
+  helpers(): { name: string; source: string }[] {
     return [
-      'function qOrca(x, rin, rout, tn, td, on, od) {',
-      '  if (x === 0) { return 0 }',
-      '  let tf = 0;',
-      '  if (tn > 0) { tf = x * tn / td; if (tf === 0) { tf = 1 } }',
-      '  let of = 0;',
-      '  if (on > 0) { of = x * on / od; if (of === 0) { of = 1 } }',
-      '  if (tf + of >= x) { return 0 }',
-      '  const net = x - tf - of;',
-      '  const ni = rin + net;',
-      '  if (rin * rout / ni === 0) { return 0 }',
-      '  const no = (rin * rout + ni - 1) / ni;',
-      '  if (no >= rout) { return 0 }',
-      '  return rout - no;',
-      '}',
-    ].join('\n');
+      {
+        name: 'qOrca',
+        source: [
+          'function qOrca(x, rin, rout, tn, td, on, od) {',
+          '  if (x === 0) { return 0 }',
+          '  let tf = 0;',
+          '  if (tn > 0) { tf = x * tn / td; if (tf === 0) { tf = 1 } }',
+          '  let of = 0;',
+          '  if (on > 0) { of = x * on / od; if (of === 0) { of = 1 } }',
+          '  if (tf + of >= x) { return 0 }',
+          '  const net = x - tf - of;',
+          '  const ni = rin + net;',
+          '  if (rin * rout / ni === 0) { return 0 }',
+          '  const no = (rin * rout + ni - 1) / ni;',
+          '  if (no >= rout) { return 0 }',
+          '  return rout - no;',
+          '}',
+        ].join('\n'),
+      },
+    ];
   },
 
   /** Four params: trade fee numerator/denominator, owner fee numerator/denominator. */
