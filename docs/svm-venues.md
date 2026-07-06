@@ -1,19 +1,24 @@
 # SVM venue facts
 
-Normative reference for the venue adapters in `sdk/src/svm/venues/` — seven v1 (solswap)
-adapters plus the ladder-only orca-whirlpool CLMM and manifest CLOB families. Every byte offset, quote formula,
-rounding rule, gate and pinned constant that the adapters and their test suites cite lives
-here. The adapters were written against the venues' published sources and deployed mainnet
-binaries; this document is regenerated from that code and its fixtures and is the companion
-the adapter doc comments point at.
+Normative reference for the **12 venue adapters** in `sdk/src/svm/venues/` — **seven v1 (solswap)
+adapters** (raydium-cp-swap, raydium-amm-v4, pumpswap, orca-legacy-token-swap, meteora-damm-v2,
+saber-stableswap, meteora-damm-v1-stable) plus **five ladder-only EcoSwapSVM v2 families**: the
+tick-walk CLMMs orca-whirlpool and raydium-clmm, the bin-walk meteora-dlmm, the CLOB manifest, and
+the oracle-anchored prop-AMM obric-v2. Every byte offset, quote formula, rounding rule, gate and
+pinned constant that the adapters and their test suites cite lives here. The adapters were written
+against the venues' published sources and deployed mainnet binaries; this document is regenerated
+from that code and its fixtures and is the companion the adapter doc comments point at. The
+EcoSwapSVM recipe that composes these adapters into one atomic multi-venue split is documented in
+`sdk/src/recipes/ecoswap/svm/README.md`.
 
 ## How quoting works
 
-Solana has no view functions, so the solswap recipe quotes **inside the VM**: each venue's pool
+Solana has no view functions, so the recipe quotes **inside the VM**: each venue's pool
 state accounts are attached to the execute instruction **read-only**, and the adapter's
-`emitQuote` fragment reads live fields with `accountUint(ref, offset, width)` — a little-endian
-unsigned read, mirrored off-chain by `readUintLE` in `sdk/src/svm/venues/math.ts`. All seven
-venues are pure little-endian; big-endian never occurs. Anything that is a compile-time constant
+`emitQuote` fragment (v1) / `emitQuoteCall` + `emitLadderQuote` (the ladder-only v2 families) reads
+live fields with `accountUint(ref, offset, width)` — a little-endian unsigned read, mirrored
+off-chain by `readUintLE` in `sdk/src/svm/venues/math.ts`. All venues are pure little-endian;
+big-endian never occurs. Anything that is a compile-time constant
 for a fixed `amountIn` (immutable fee rates, multipliers, direction branches) is folded off-chain
 at generation time; anything trade- or admin-mutable (reserves, live fee rates, pause bytes) stays
 a live in-VM read. The quote and the swap execute in the same instruction against the same account
@@ -1405,6 +1410,30 @@ concentrated in one USDC/USDT pool `BWBHrYqfcjAh…` ≈ $489k; the SOL/USDC poo
 pointing at the **Instructions sysvar** (an introspecting newer pool — tier P-C); a **non-Pyth-v2
 feed** (Doves/Minimox magic — tier P-B, layout not pinned); token-2022 mints. A drained pool also
 drops out of the relative-depth filter (vault-balance depth = 0).
+
+### Pinned worked example
+
+Mainnet 27G8/USDC pool `AJ5HfGY32igLgUbDtfNRdrkjTSYkCVKdhmnFFfcZMJ1E`
+(`sdk/test/svm/ecoswap-svm.fixtures.ts` `OBRIC_FIXTURES`, real dump) — decoded layout: `bigK`
+6_725_685_088_743_750_000_000_000_000, `targetX` 0, `feeMillionth` 150 (1.5 bps), classified P-A
+(12-account swap, no Instructions sysvar). The oracle scaling reproduces from the real feeds: both
+mints are 6-decimal at expo −8, so `getPrice` scales to expo −3 (`÷1e5`, decimalMult 1) → the USDC
+feed's `1e10` gives **multY = 100000**, EXACTLY the pool's stored multY (the live-derived 27G8 mult
+is 330596). Because Obric bakes the shape and reads the mid live, the quote is a closed-form
+re-anchor; on symmetric reserves `reserveX = reserveY = 1e12` (the `referenceQuote` cell in
+`ecoswap-svm.obric.oracles.test.ts`, matching the independently-transcribed `sdkQuoteXToY`):
+
+- `targetXK = isqrt(bigK · 100000 / 330596)` = 45_104_457_861_101; `currentXK = targetXK + reserveX`
+  = 46_104_457_861_101.
+- xToY 1_000_000 (27G8 in) → **3_163_629** USDC raw; 1_000_000_000 → **3_163_560_330**;
+  5_000_000_000 → **15_816_429_454** (each `out − floor(out · 150 / 1e6)`, monotone).
+
+The real on-chain AJ5 vaults are **empty**, so against un-doctored mainnet bytes the
+Insufficient-active guard quotes **0** (self-deactivation) — Obric's real depth lives in the one
+USDC/USDT pool `BWBHrYqfcjAh…`. A live mid drift of ~5% (still inside the 25% band) re-anchors the
+curve center and moves the quote, staying bit-exact vs the SDK mirror (the `LIVE mid re-anchors`
+cell). The full realized-binary quadrilateral is the deferred `.so` follow-up (see the caveat
+below).
 
 ### Honest venue-exactness caveat
 

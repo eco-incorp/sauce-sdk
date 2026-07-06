@@ -1,4 +1,4 @@
-# EcoSwapSVM (Phase 1)
+# EcoSwapSVM
 
 The Solana sibling of EcoSwap: split ONE swap across multiple venues so the **post-fee marginal
 execution prices equalize**, with the whole solve computed **LIVE in one atomic engine
@@ -9,31 +9,72 @@ reads pull the reserves inside the VM, and the quote, the split and the swaps al
 the same account state in the same instruction. No off-chain quote can be stale, because there is
 no off-chain quote.
 
-Phase 1 extends the Phase 0 skeleton with the **stable-curve class** (Newton iterations in-VM,
-warm-started), two more families, the **CU budgeter** (measured per-family coefficients decide
-ladder depth and slot count deterministically), the **batched account loader**, and the
-**real-binary CPI lane** (the full quadrilateral against venue programs dumped from mainnet).
+What landed: **12 venue adapters across five liquidity models** — CP (constant-product),
+stable (in-VM Newton), CLMM (tick-walk window), BIN (Meteora Liquidity Book), CLOB (Manifest
+order book) — plus the **oracle-anchored prop-AMM class** (Obric V2, tier P-A). On top of the
+single-hop merge: **2-hop routes** (the compute-exec-read-realized-compute-exec composite venue),
+an **address-lookup-table** path for account lists that outgrow the 1,232-byte packet, a **CU
+budgeter** (measured per-family coefficients fix ladder depth and slot count deterministically at
+codegen time), a **batched account loader**, the **lamport-exact gate** against a bit-for-bit TS
+mirror (which is also the user-facing quote), the **prop-AMM P-A/P-B/P-C ledger** (the
+Instructions-sysvar CPI-acceptance discriminant), and the env-gated **real-binary CPI lane** (the
+full quadrilateral against five venue programs dumped from mainnet). Everything is
+single-instruction, atomic and lamport-exact.
+
+## Navigation
+
+Families + measured CU · CLMM/CLOB/BIN windows · quantized water-fill · stable-slot Newton
+economics · CU budgeter · shape-blob model · exactness gate + oracles · batched loading · usage ·
+ALT · real-binary lane · prop-AMM (Obric) + the P-A/B/C ledger · 2-hop routes · honest limits.
 
 ## Families (adapter contract v2, `sdk/src/svm/venues/*/ladder.ts`)
 
-| family | class | default rungs | live reads |
-| --- | --- | --- | --- |
-| raydium-cp-swap | CP | 4 | vaults − fee accumulators, AmmConfig fee rates; creator-fee side as a per-trade param |
-| raydium-amm-v4 | CP | 4 | vaults − need_take_pnl, swap fee fraction (status 6/7 gate at prepare; Tokenkeg-only) |
-| pumpswap | CP | 4 | raw vault balances; fee bps ride as per-trade params; buy and sell directions |
-| orca-legacy-token-swap | CP | 4 | raw vault balances; SwapV1 fee fractions as params; floor-min-1 fees, ceiling curve |
-| meteora-damm-v2 | sqrt-price | 4 | liquidity, sqrt_price, base+dynamic fee, version cap, band bounds, collect_fee_mode — zero params |
-| saber-stableswap | STABLE | 2 | pause byte, vault balances, the four amp-ramp fields, trade fee — zero params |
-| meteora-damm-v1-stable | STABLE | 2 | vault share math with locked-profit decay, fees (min-1), amp, multipliers, idle float — zero params |
-| orca-whirlpool | CLMM | 2 | sqrt_price, tick, liquidity, fee_rate, per-boundary initialized flags + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, with their pure-function sqrt prices) rides the params |
-| raydium-clmm | CLMM | 2 | sqrt_price_x64, tick_current, liquidity from the pool + trade_fee_rate from the AmmConfig; per-boundary liquidity_gross (initialized) + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, standard Uniswap-V3 tick math) rides the params; classic fee-on-input path only (dynamic-fee/`fee_on` pools gated) |
-| meteora-dlmm | BIN | 2 | active_id + the volatility v_parameters from the LbPair; per shipped bin amount_x/amount_y from its bin array; the WINDOW (up to 8 liquid bins as biased id + array cell + Q64.64 price) rides the params; VARIABLE FEE computed live per bin (base + volatility, update_references over the live clock); fee-on-input (collect_fee_mode 0) + no-limit-order pools only |
-| manifest | CLOB | 2 | the whole order book in one market account; per shipped level a live sequence_number (identity) + price (u128) + num_base_atoms; the top-of-book WINDOW (up to 16 best-first levels as DataIndex+seq) rides the params; zero fee |
-| obric-v2 | oracle-CP (prop-AMM, P-A) | 4 | reserveX/reserveY vault balances + the LIVE oracle MID from a separate Pyth-v2-relay feed account (re-anchors targetXK every execution); bigK hi/lo, targetX, fee, the oracle scaling + feed offsets ride the params; sanity-band self-deactivation vs the stored mult |
+The venue byte layouts, quote formulas, gates and pinned worked examples live in
+`docs/svm-venues.md` — one section per family. **Model / rungs / measured CU / real-binary
+verified** at a glance (the per-family CU is a single-slot trade on the real engine; see
+**Measured** below for the split figures):
+
+| family | model | default rungs | @2 rungs | @4 rungs | real-binary |
+| --- | --- | --- | --- | --- | --- |
+| raydium-cp-swap | CP | 4 | 270,098 | 400,206 | **yes** |
+| raydium-amm-v4 | CP | 4 | 244,475 | 368,773 | no (SDK == program) |
+| pumpswap | CP | 4 | 273,510 | 414,269 | **yes** (+ `pump-fee.so`) |
+| orca-legacy-token-swap | CP | 4 | 327,829 | 503,191 | no (SDK == program) |
+| meteora-damm-v2 | CP (sqrt-price) | 4 | 306,903 | 471,714 | no (SDK == program) |
+| saber-stableswap | STABLE | 2 | 778,562 | 1,097,079 | **yes** |
+| meteora-damm-v1-stable | STABLE | 2 | 940,490 | 1,353,318 | no (SDK == program) |
+| orca-whirlpool | CLMM | 2 | 771,309 | 1,142,759 | **yes** (real tick cross) |
+| raydium-clmm | CLMM | 2 | 818,705 | 1,227,431 | no (env-gated quad) |
+| meteora-dlmm | BIN | 2 | 816,315 | 1,183,105 | no (mirror-gated) |
+| manifest | CLOB | 2 | 791,441 | 961,890 | **yes** (real CLOB match) |
+| obric-v2 | CP (oracle-anchored, P-A) | 4 | 379,674 | 506,621 | no (SDK == program) |
+
+**Real-binary** = the full quadrilateral (docs == `referenceQuote` == in-VM predicted == the real
+mainnet binary's realized output) runs in `test/svm/ecoswap-svm.realcpi.e2e.test.ts` under
+`SAUCE_VENUE_PROGRAMS`; the other seven rest on **SDK == program** (an independent direct port of
+the venue's own math, cross-checked in-VM by the unconditional lamport-exact gate) plus the
+conservative under-quote and the terminal `minOut` — see **Honest limits**.
+
+The live-read fields per family:
+
+| family | live reads |
+| --- | --- |
+| raydium-cp-swap | vaults − fee accumulators, AmmConfig fee rates; creator-fee side as a per-trade param |
+| raydium-amm-v4 | vaults − need_take_pnl, swap fee fraction (status 6/7 gate at prepare; Tokenkeg-only) |
+| pumpswap | raw vault balances; fee bps ride as per-trade params; buy and sell directions |
+| orca-legacy-token-swap | raw vault balances; SwapV1 fee fractions as params; floor-min-1 fees, ceiling curve |
+| meteora-damm-v2 | liquidity, sqrt_price, base+dynamic fee, version cap, band bounds, collect_fee_mode — zero params |
+| saber-stableswap | pause byte, vault balances, the four amp-ramp fields, trade fee — zero params |
+| meteora-damm-v1-stable | vault share math with locked-profit decay, fees (min-1), amp, multipliers, idle float — zero params |
+| orca-whirlpool | sqrt_price, tick, liquidity, fee_rate, per-boundary initialized flags + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, with their pure-function sqrt prices) rides the params |
+| raydium-clmm | sqrt_price_x64, tick_current, liquidity from the pool + trade_fee_rate from the AmmConfig; per-boundary liquidity_gross (initialized) + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, standard Uniswap-V3 tick math) rides the params; classic fee-on-input path only (dynamic-fee/`fee_on` pools gated) |
+| meteora-dlmm | active_id + the volatility v_parameters from the LbPair; per shipped bin amount_x/amount_y from its bin array; the WINDOW (up to 8 liquid bins as biased id + array cell + Q64.64 price) rides the params; VARIABLE FEE computed live per bin (base + volatility, update_references over the live clock); fee-on-input (collect_fee_mode 0) + no-limit-order pools only |
+| manifest | the whole order book in one market account; per shipped level a live sequence_number (identity) + price (u128) + num_base_atoms; the top-of-book WINDOW (up to 16 best-first levels as DataIndex+seq) rides the params; zero fee |
+| obric-v2 | reserveX/reserveY vault balances + the LIVE oracle MID from a separate Pyth-v2-relay feed account (re-anchors targetXK every execution); bigK hi/lo, targetX, fee, the oracle scaling + feed offsets ride the params; sanity-band self-deactivation vs the stored mult |
 
 A v2 fragment reads the trade amount and the live state at RUNTIME — nothing about the trade is
-baked. Direction stays part of the shape (and rung count joined it in Phase 1: `~r<n>` in the
-shape key when off the 4-rung default).
+baked. Direction stays part of the shape, as does the rung count (`~r<n>` in the shape key when
+off the family default).
 
 **The CLMM window (orca-whirlpool, the first Phase 2 family).** A tick walk needs boundary
 STRUCTURE that is unaffordable to discover in-VM (measured: ~8k CU per scanned tick slot, ~54k
@@ -239,22 +280,9 @@ shape executing lamport-exact + byte-identical through an ALT, reused across tra
 
 ## Measured (LiteSVM `FeatureSet.allEnabled`, real engine.so, 2026-07-06)
 
-Per-family single-slot trades (stand-in CPI), the calibration suite's raw numbers:
-
-| family | @2 rungs | @4 rungs |
-| --- | --- | --- |
-| raydium-cp-swap | 270,098 CU | 400,206 CU |
-| raydium-amm-v4 | 244,475 CU | 368,773 CU |
-| pumpswap | 273,510 CU | 414,269 CU |
-| orca-legacy-token-swap | 327,829 CU | 503,191 CU |
-| meteora-damm-v2 | 306,903 CU | 471,714 CU |
-| saber-stableswap | 778,562 CU | 1,097,079 CU |
-| meteora-damm-v1-stable | 940,490 CU | 1,353,318 CU |
-| orca-whirlpool | 771,309 CU | 1,142,759 CU |
-| raydium-clmm | 818,705 CU | 1,227,431 CU |
-| meteora-dlmm | 816,315 CU | 1,183,105 CU |
-| manifest | 791,441 CU | 961,890 CU |
-| obric-v2 | 373,150 CU | 500,097 CU |
+The per-family single-slot figures (stand-in CPI, the calibration suite's raw numbers) are in the
+**Families** table above; `test/svm/ecoswap-svm.cu.e2e.test.ts` re-measures and alarms past ±25%,
+and `ECO_SVM_CU_PRINT=1` prints a fresh table. The split + real-binary figures:
 
 | metric | value |
 | --- | --- |
@@ -405,7 +433,7 @@ top-level merge, the EVM shape) is the documented **Phase 3c** follow-up.
 `prepareAltForUniverse` / `selectEcoSwapSvmAltAddresses` / `ecoSwapSvmPacketBudget` work on the route
 output unchanged.
 
-## Honest limits (Phase 1 + the Phase 2 CLMM/BIN/CLOB families + Phase 3b routes)
+## Honest limits
 
 - **2-hop routes landed** (see above); N>2 hops, and direct+route mixing in one instruction (Phase 3c),
   are follow-ups. Phoenix / OpenBook remain future families on the manifest CLOB pattern.
@@ -472,18 +500,22 @@ output unchanged.
   ladders and merge run the production path against live account bytes on the real engine, and
   the real venue templates are exercised by the env-gated quadrilateral lane above.
 
-## Phase 2 notes
+## What landed vs deferred
 
-Whirlpools + Manifest LANDED (prepare-declared windows + live-value walks; see the CLMM/CLOB window
-notes above — the whirlpool ships tick boundaries, the CLOB ships top-of-book order levels, both
-read all value-bearing state live). **2-hop routes LANDED** (Phase 3b, `route.ts` +
-`routeEcoSwapSvm`/`quoteRouteEcoSwapSvm` — the compute-exec-compute-exec composite venue; see the
-"2-hop routes" section above). Remaining: Raydium CLMM / Meteora DLMM on the whirlpool pattern
-and Phoenix / OpenBook on the CLOB pattern, N>2 hops and direct+route mixing (route as a
-composite venue in the top-level merge — the EVM QL-legs shape — is the Phase 3c follow-up), an
-ALT path for shapes whose account lists outgrow the 1,232-byte packet (a
-two-whirlpool shape already needs it: 16 cfg words per CLMM slot plus ~6 accounts; a manifest slot's
-cfg is ~33 words but only one account), per-level (rather than geometric-grid) rungs for the CLOB
-side to remove the residual split quantization (needs per-family grid support in codegen +
-solver-reference), and per-slot `swapOverride`-style external quotes once a router-integration
-consumer shows up.
+**Landed.** All four window/curve families beyond the CP+stable base — Orca Whirlpool + Raydium
+CLMM (tick-walk CLMM), Meteora DLMM (bin walk), Manifest (CLOB order-window) — plus Obric V2
+(oracle-anchored prop-AMM), the **ALT path** (`prepareAltForUniverse` — the two-whirlpool packet
+is proven under 1,232 bytes with it), and **2-hop routes** (`route.ts` +
+`routeEcoSwapSvm`/`quoteRouteEcoSwapSvm` — the compute-exec-read-realized-compute-exec composite
+venue; see "2-hop routes" above). All read every value-bearing field live in-VM; prepare ships
+only drift-invariant window structure.
+
+**Deferred (documented).** N>2 hops and **direct+route mixing** in one instruction (route as a
+composite venue in the top-level merge — the EVM QL-legs shape); Phoenix / OpenBook on the Manifest
+CLOB pattern; per-level (rather than geometric-grid) rungs for the CLOB side to remove the residual
+split quantization (needs per-family grid support in codegen + solver-reference); **P-B prop-AMM
+builds** (Aquifer, HumidiFi, BisonFi — CPI-open, the work is locating the internal/relay mid
+field); Raydium dynamic-fee/`fee_on` and DLMM OnlyY-fee/limit-order pool classes; per-slot
+`swapOverride`-style external quotes once a router-integration consumer shows up; and engine
+`sauce#204` (a U256 fast path that lifts the slot counts under a heavy shape). See **Honest
+limits** for the CU ceilings and exactness caveats that bound today's shapes.

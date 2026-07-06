@@ -212,6 +212,45 @@ survivorCount, totalL, liqFloor]`, and `prepare.ts` consumes them with **no re-f
 `MIN_LIQUIDITY` floor was **dropped** — relative-depth `minRelBps` (plus a `>0` aliveness gate) is now the
 sole liquidity filter.
 
+### EcoSwapSVM (Solana)
+
+The Solana sibling of EcoSwap lives at **`sdk/src/recipes/ecoswap/svm/`** (`index.ts` orchestrator +
+`quoteEcoSwapSvm`, `codegen.ts`, `route.ts`, `budget.ts`, `solver-reference.ts`, `optimal.ts`);
+the 12 venue adapters are in **`sdk/src/svm/venues/*/`** (`ladder.ts` fragment + `index.ts` fetch/
+gates), byte-layouts documented in **`docs/svm-venues.md`** and the recipe in that dir's `README.md`.
+Exposed via the **`/svm`** SDK subpath and re-exported from `/recipes`.
+
+**One-instruction model.** Solana has no view functions, so the quote, the split and every venue
+swap compute **LIVE in ONE atomic `execute_from_account` instruction** against read-only pool
+accounts (`accountUint` reads inside the VM) — no off-chain quote to go stale. It is **stage-once /
+trade-many**: `codegen` compiles ONE blob per **shape** (`{target:'svm', staged:true}`) — the
+ordered `(family, direction, rungs)` slots — staged through the buffer protocol
+(`stageEcoSwapSvm`); each trade is one `executeEcoSwapSvm` with the pool accounts riding the tx
+account list and the per-trade values packed as a `cfg` bytes arg. A **quantized water-fill** merge
+(geometric quote ladders, cheapest-rung-first) equalizes post-fee marginals; a **CU budgeter**
+(`budget.ts`, measured per-family coefficients, admission ≈ 1.19M = the 1.4M tx cap − 15%) fixes
+rung/slot counts deterministically at codegen time; `solver-reference.ts` is the bit-for-bit TS
+mirror that is BOTH the **lamport-exact gate** (e2e asserts engine returndata == mirror) and the
+user-facing quote. Account lists over the 1,232-byte packet use an **ALT** (`prepareAltForUniverse`,
+byte-not-lock relief). **2-hop routes** (`routeEcoSwapSvm`) are the compute-exec-read-realized-
+compute-exec composite venue (landed 1+1/2+1/2+2).
+
+Families (5 liquidity models + oracle-anchored prop): **CP** — raydium-cp-swap, raydium-amm-v4,
+pumpswap, orca-legacy-token-swap, meteora-damm-v2; **STABLE** (in-VM Newton) — saber-stableswap,
+meteora-damm-v1-stable; **CLMM** (tick-walk window) — orca-whirlpool, raydium-clmm; **BIN** —
+meteora-dlmm; **CLOB** — manifest; **PROP** (P-A) — obric-v2. Five (raydium-cp, pumpswap, saber,
+orca-whirlpool, manifest) are verified against **genuine mainnet binaries**; the rest rest on
+SDK==program + the unconditional lamport gate + minOut.
+
+**Tests** run via **jest** (`sdk/test/svm/*.test.ts`, LiteSVM): `pnpm --filter './sdk' test`, single
+suite `pnpm --filter './sdk' test -- ecoswap-svm.e2e`. **`SAUCE_ENGINE_SO`** points at the Solana
+`engine.so` (default `../sauce/svm/target/deploy/engine.so`; suites **skip cleanly when absent**, CI
+builds it). **`SAUCE_VENUE_PROGRAMS`** points at a dir of `solana program dump`ed `<slug>.so`
+binaries and enables the real-binary CPI quadrilateral lane (`ecoswap-svm.realcpi.e2e.test.ts`);
+`ECO_SVM_CU_PRINT=1` reprints the CU table. **Deferred (documented):** N>2 hops, direct+route mixing
+in one instruction, P-B prop-AMM builds (Aquifer/HumidiFi/BisonFi), Phoenix/OpenBook CLOBs, and
+engine `sauce#204` (U256 fast path to lift slot counts).
+
 ### Running recipes against a fork / RPC (in `dev-tools/`)
 
 ```sh

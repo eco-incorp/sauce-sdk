@@ -119,7 +119,7 @@ export const CU_FAMILIES: Record<string, FamilyCuCoefficients> = {
   // for the isqrt + the two extra oracle reads. Measured 2026-07-06 on a
   // synthesized centered pool (@2 373,150 CU, @4 500,097 CU); re-pin with
   // ECO_SVM_CU_PRINT=1 (test/svm/ecoswap-svm.cu.e2e.test.ts).
-  'obric-v2': { kind: 'cp', slot: 289_401, rung: 63_473 },
+  'obric-v2': { kind: 'cp', slot: 295_925, rung: 63_473 },
   'saber-stableswap': { kind: 'stable', slot: 503_243, rung: 159_258 },
   'meteora-damm-v1-stable': { kind: 'stable', slot: 570_859, rung: 206_414 },
 };
