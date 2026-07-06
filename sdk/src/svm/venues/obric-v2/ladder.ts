@@ -67,6 +67,9 @@ const SLUG = 'obric-v2';
 const AMOUNT_OFF = 64;
 const U64_MAX = (1n << 64n) - 1n;
 const FEE_DEN = 1_000_000n;
+/** Pyth-v2 relay: agg.status (u32 LE, 1 == Trading) sits 16 bytes past agg.price. */
+const FEED_STATUS_GAP = 16;
+const FEED_STATUS_TRADING = 1n;
 
 /** cfg words per slot (paramsFor order). */
 const PARAM_COUNT = 11;
@@ -137,7 +140,12 @@ function liveCurve(cfg: ObricV2PoolConfig, state: AccountBytesMap, params: reado
   const k = (bkHi << 64n) | bkLo;
 
   const off: LiveCurve = { cIn: 0n, cOut: 0n, kq: 0n, rOut: 0n, fee };
-  let ok = mx !== 0n && my !== 0n;
+  // Both admitted feeds are the Pyth-v2 relay (non-relay layouts are rejected P-B
+  // at fetch), so agg.status sits 16 bytes past the price word; a feed that is not
+  // Trading (1) deactivates the slot rather than quoting a halted mid.
+  const sx = readUintLE(fx, Number(offX) + FEED_STATUS_GAP, 4);
+  const sy = readUintLE(fy, Number(offY) + FEED_STATUS_GAP, 4);
+  let ok = mx !== 0n && my !== 0n && sx === FEED_STATUS_TRADING && sy === FEED_STATUS_TRADING;
   if (band !== 0n && ok) {
     const zx = readUintLE(pool, OFF_MULT_X, 8);
     const zy = readUintLE(pool, OFF_MULT_Y, 8);
@@ -223,6 +231,10 @@ export const obricV2Ladder = {
       `  const ${p}ay = accountUint(${fy}, ${offY}, 8);`,
       `  const ${p}mx = (${p}ax / ${divX}) * ${mulX};`,
       `  const ${p}my = (${p}ay / ${divY}) * ${mulY};`,
+      // agg.status (Pyth-v2 relay: 16 bytes past the price word) — a non-Trading
+      // feed deactivates the slot rather than quoting a halted mid.
+      `  const ${p}sx = accountUint(${fx}, ${Number(c.priceOffX) + FEED_STATUS_GAP}, 4);`,
+      `  const ${p}sy = accountUint(${fy}, ${Number(c.priceOffY) + FEED_STATUS_GAP}, 4);`,
       `  const ${p}bk = (${bkHi} << 64) | ${bkLo};`,
       `  const ${p}fe = ${fee};`,
       // Curve anchor + sanity band (EXPENSIVE — isqrt/products gated on enable).
@@ -234,6 +246,8 @@ export const obricV2Ladder = {
       `    let ${p}ok = 1;`,
       `    if (${p}mx === 0) { ${p}ok = 0 }`,
       `    if (${p}my === 0) { ${p}ok = 0 }`,
+      `    if (${p}sx !== ${FEED_STATUS_TRADING}) { ${p}ok = 0 }`,
+      `    if (${p}sy !== ${FEED_STATUS_TRADING}) { ${p}ok = 0 }`,
       `    if (${band} !== 0 && ${p}ok !== 0) {`,
       `      const ${p}zx = accountUint(${pool}, ${OFF_MULT_X}, 8);`,
       `      const ${p}zy = accountUint(${pool}, ${OFF_MULT_Y}, 8);`,

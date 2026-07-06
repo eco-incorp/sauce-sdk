@@ -210,6 +210,26 @@ describe('obric-v2: referenceQuote — the lamport-exact target (bake shape / re
     expect(obricV2Ladder.referenceQuote(cfg, state, params)(1_000_000_000n)).toBe(0n);
   });
 
+  it('a non-Trading feed status self-deactivates even at a valid in-band price', async () => {
+    const cfg = await obricV2.fetchPoolConfig(fixtureLoader(aj5Fixtures), AJ5_POOL);
+    const params = obricV2Ladder.paramsFor(cfg);
+    const state = fixtureBytesMap(aj5Fixtures);
+    state[String(cfg.reserveXVault)] = vaultBytes(String(cfg.mintX), String(cfg.pool), 10n ** 12n);
+    state[String(cfg.reserveYVault)] = vaultBytes(String(cfg.mintY), String(cfg.pool), 10n ** 12n);
+    // The real decoded X feed price ($330.596 @ expo −8) — perfectly in-band vs the
+    // pool's stored multX; only the status byte changes across the three sub-cases.
+    const realX = 33_059_603_329n;
+    // status 1 (Trading): a normal, non-zero quote.
+    state[String(cfg.feedX)] = pythV2FeedBytes(realX, -8, 1);
+    expect(obricV2Ladder.referenceQuote(cfg, state, params)(1_000_000_000n)).toBeGreaterThan(0n);
+    // status 0 (Halted) at the identical price: the slot deactivates.
+    state[String(cfg.feedX)] = pythV2FeedBytes(realX, -8, 0);
+    expect(obricV2Ladder.referenceQuote(cfg, state, params)(1_000_000_000n)).toBe(0n);
+    // status 3 (Auction) likewise — only 1 quotes.
+    state[String(cfg.feedX)] = pythV2FeedBytes(realX, -8, 3);
+    expect(obricV2Ladder.referenceQuote(cfg, state, params)(1_000_000_000n)).toBe(0n);
+  });
+
   it('a synthesized pool quotes both directions and drops to 0 past its inventory', () => {
     const synth = synthesizeObricPool({
       bigK: 10n ** 24n,
