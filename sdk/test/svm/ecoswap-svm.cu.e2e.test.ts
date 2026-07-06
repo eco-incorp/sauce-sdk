@@ -24,9 +24,11 @@
  */
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { address } from '@solana/kit';
+import { address, lamports } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import {
+  obricV2,
+  obricV2Ladder,
   fetchManifestConfig,
   fetchOrcaWhirlpoolConfig,
   fetchRaydiumClmmConfig,
@@ -63,6 +65,7 @@ import type { EcoSwapSvmOutput } from '../../src/recipes/ecoswap/svm/index.js';
 import { describeSvm, loadFixtureAccounts, randomAddress, setTokenAccount, startEngine, tokenAmount } from './engine-harness.js';
 import type { EngineHarness } from './engine-harness.js';
 import { loadFixtures } from './fixtures.js';
+import { synthesizeObricPool, syntheticMintBytes, TOKENKEG, USDC_MINT } from './ecoswap-svm.fixtures.js';
 import { decodeEcoTrade, execEcoTrade, stageEcoBlob } from './ecoswap-svm.harness.js';
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -86,7 +89,7 @@ const VENUE_POOL: Record<string, Address> = {
 };
 
 interface FamilyCell {
-  slug: keyof typeof VENUE_POOL;
+  slug: string;
   adapter: SvmVenueLadderV2;
   amountIn: bigint;
   fetch: () => Promise<PoolConfig>;
@@ -123,6 +126,17 @@ describeSvm('ecoswap-svm CU calibration: per-family coefficients on the real eng
       return account.exists ? new Uint8Array(account.data) : null;
     };
 
+    // Obric's real mainnet pool has drained vaults (thin prop-AMM inventory) —
+    // calibrate on a synthesized centered pool with reserves (equal-decimal
+    // mints so the oracle decimalMult is 1). Both directions cost the same.
+    const setAccount = (a: Address, owner: Address, data: Uint8Array): void =>
+      harness.svm.setAccount({ address: a, data, executable: false, lamports: lamports(harness.svm.minimumBalanceForRentExemption(BigInt(data.length))), programAddress: owner, space: BigInt(data.length) });
+    const aaaMint = address('AAA1111111111111111111111111111111111111111');
+    setAccount(aaaMint, TOKENKEG, syntheticMintBytes(6));
+    setAccount(USDC_MINT, TOKENKEG, syntheticMintBytes(6));
+    const obric = synthesizeObricPool({ bigK: 10n ** 24n, reserveX: 5_000_000_000n, reserveY: 5_000_000_000n, priceX: 100_000_000n, priceY: 100_000_000n, mintX: aaaMint, mintY: USDC_MINT });
+    for (const a of obric.accounts) setAccount(a.address, a.owner, a.data);
+
     cells = [
       { slug: 'raydium-cp-swap', adapter: raydiumCpSwapLadder, amountIn: 400_000_000n, fetch: () => raydiumCpSwap.fetchPoolConfig(liveLoader, VENUE_POOL['raydium-cp-swap']) },
       { slug: 'raydium-amm-v4', adapter: raydiumAmmV4Ladder, amountIn: 1_000_000_000n, fetch: () => raydiumAmmV4.fetchPoolConfig(liveLoader, VENUE_POOL['raydium-amm-v4']) },
@@ -150,6 +164,7 @@ describeSvm('ecoswap-svm CU calibration: per-family coefficients on the real eng
       { slug: 'meteora-damm-v2', adapter: meteoraDammV2Ladder, amountIn: 1_000_000_000n, fetch: () => meteoraDammV2.fetchPoolConfig(liveLoader, VENUE_POOL['meteora-damm-v2']) },
       { slug: 'saber-stableswap', adapter: saberStableswapLadder, amountIn: 1_000_000_000n, fetch: () => saberStableswap.fetchPoolConfig(liveLoader, VENUE_POOL['saber-stableswap']) },
       { slug: 'meteora-damm-v1-stable', adapter: meteoraDammV1StableLadder, amountIn: 1_000_000_000n, fetch: () => meteoraDammV1Stable.fetchPoolConfig(liveLoader, VENUE_POOL['meteora-damm-v1-stable']) },
+      { slug: 'obric-v2', adapter: obricV2Ladder, amountIn: 500_000_000n, fetch: () => obricV2.fetchPoolConfig(liveLoader, obric.pool) },
     ];
   });
 

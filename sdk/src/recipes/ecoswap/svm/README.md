@@ -29,6 +29,7 @@ ladder depth and slot count deterministically), the **batched account loader**, 
 | raydium-clmm | CLMM | 2 | sqrt_price_x64, tick_current, liquidity from the pool + trade_fee_rate from the AmmConfig; per-boundary liquidity_gross (initialized) + liquidity_net i128 — the WINDOW (up to 4 initialized-tick boundaries + the sequence edge, standard Uniswap-V3 tick math) rides the params; classic fee-on-input path only (dynamic-fee/`fee_on` pools gated) |
 | meteora-dlmm | BIN | 2 | active_id + the volatility v_parameters from the LbPair; per shipped bin amount_x/amount_y from its bin array; the WINDOW (up to 8 liquid bins as biased id + array cell + Q64.64 price) rides the params; VARIABLE FEE computed live per bin (base + volatility, update_references over the live clock); fee-on-input (collect_fee_mode 0) + no-limit-order pools only |
 | manifest | CLOB | 2 | the whole order book in one market account; per shipped level a live sequence_number (identity) + price (u128) + num_base_atoms; the top-of-book WINDOW (up to 16 best-first levels as DataIndex+seq) rides the params; zero fee |
+| obric-v2 | oracle-CP (prop-AMM, P-A) | 4 | reserveX/reserveY vault balances + the LIVE oracle MID from a separate Pyth-v2-relay feed account (re-anchors targetXK every execution); bigK hi/lo, targetX, fee, the oracle scaling + feed offsets ride the params; sanity-band self-deactivation vs the stored mult |
 
 A v2 fragment reads the trade amount and the live state at RUNTIME — nothing about the trade is
 baked. Direction stays part of the shape (and rung count joined it in Phase 1: `~r<n>` in the
@@ -253,6 +254,7 @@ Per-family single-slot trades (stand-in CPI), the calibration suite's raw number
 | raydium-clmm | 818,705 CU | 1,227,431 CU |
 | meteora-dlmm | 816,315 CU | 1,183,105 CU |
 | manifest | 791,441 CU | 961,890 CU |
+| obric-v2 | 373,150 CU | 500,097 CU |
 
 | metric | value |
 | --- | --- |
@@ -303,6 +305,35 @@ decay) + per-bin `update_volatility_accumulator` (vacc grows with |index_referen
 `compute_variable_fee` over the LIVE volatility state and clock — so the merge sees the real dynamic
 fee. Only fee-on-input (collect_fee_mode 0) + no-limit-order pools are walked (the limit-order fill
 layers and the OnlyY fee mode are gated).
+
+## The prop-AMM oracle-anchored family (obric-v2) — bake the shape, read the level
+
+Obric V2 is the first PROP-AMM family and the first venue whose price LEVEL is NOT in the pool/vault
+state: it lives in a **separate oracle account** the swap already passes (a Pyth-v2-format relay).
+The fragment **bakes the drift-invariant SHAPE** (the bigK virtual-reserve curve, targetX, fee, the
+oracle scaling — cfg params) and **reads the fast-moving MID live** from the feed every execution,
+re-anchoring `targetXK = isqrt(bigK · multY/multX)` in-VM — the SVM analog of the EVM net-cache
+(cache the spread, read the mid live). It is a closed-form shifted-constant-product quote (CP-class,
+4 rungs), statement-form so the ladder reports the last-good value past capacity (monotone, merge-
+safe) while the cold final quote clamps to 0 past capacity (the venue's "Insufficient active" — skip
+the CPI). A **sanity band** vs the pool's stored mult self-deactivates a grossly out-of-band / halted
+oracle (clamp to 0, the merge redistributes in-instruction). See `docs/svm-venues.md#obric-v2` for
+the layout, the oracle scaling, and the honest venue-exactness caveat (the closed-source oracle→mult
+derivation is transcribed from the official SDK + cross-checked vs the stored mult; the lamport-exact
+gate is unconditional, venue-exactness rests on that + the conservative-fee under-quote + minOut).
+
+**Tiers + the CPI-acceptance probe (`sdk/src/svm/cpi-probe.ts`).** Prop-AMMs are not uniformly
+integrable — the barrier is layout / CPI-acceptance, not reading. A prepare-time probe sorts a venue
+**P-A** (public readable oracle, permissionless swap — build now: Obric), **P-B** (proprietary
+internal-oracle mid, locatable but undocumented/mutable — document + build if stable), **P-C**
+(introspecting swap — carries the Instructions sysvar — external-quote-lane or drop). The static
+screen flags the Instructions sysvar / non-user signers; the definitive test simulates an
+unrecognized-caller swap (`sigVerify:false`) and classifies ACCEPT / REJECT / DEGRADE by the out-ATA
+delta. Obric's `fetchPoolConfig` applies the static discriminant directly: a pool whose feed is the
+Instructions sysvar (the newer introspecting pools) is gated P-C; a non-Pyth-relay feed
+(Doves/Minimox — unpinned layout) is gated P-B. The ranked, on-chain-verified ledger (Obric,
+Aquifer, HumidiFi, BisonFi, SolFi, Tessera, ZeroFi, GoonFi, AlphaQ, …) with per-venue evidence lives
+in `docs/svm-venues.md`.
 
 ## 2-hop routes (A → X → B) — the SVM composite venue
 

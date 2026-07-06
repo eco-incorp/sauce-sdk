@@ -67,6 +67,9 @@ import type { RaydiumCpSwapPoolConfig } from '../../../svm/venues/raydium-cp-swa
 import { raydiumCpSwapLadder } from '../../../svm/venues/raydium-cp-swap/ladder.js';
 import { saberStableswap } from '../../../svm/venues/saber-stableswap/index.js';
 import { saberStableswapLadder } from '../../../svm/venues/saber-stableswap/ladder.js';
+import { obricV2 } from '../../../svm/venues/obric-v2/index.js';
+import type { ObricV2PoolConfig } from '../../../svm/venues/obric-v2/index.js';
+import { obricV2Ladder } from '../../../svm/venues/obric-v2/ladder.js';
 import type {
   AccountBytesMap,
   AccountLoader,
@@ -134,7 +137,8 @@ type LadderVenueSlug =
   | 'manifest'
   | 'meteora-damm-v2'
   | 'saber-stableswap'
-  | 'meteora-damm-v1-stable';
+  | 'meteora-damm-v1-stable'
+  | 'obric-v2';
 
 interface FamilyEntry {
   ladder: SvmVenueLadderV2;
@@ -309,6 +313,20 @@ const FAMILIES: Record<LadderVenueSlug, FamilyEntry> = {
       }
     },
   },
+  'obric-v2': {
+    ladder: obricV2Ladder,
+    programId: obricV2.programId,
+    fetch: (load, pool) => obricV2.fetchPoolConfig(load, pool),
+    applyDirection: (cfg, direction) => {
+      if (direction === undefined || direction === 'xToY') return cfg;
+      if (direction === 'yToX') return { ...(cfg as ObricV2PoolConfig), direction: 'yToX' };
+      throw new Error(`obric-v2 direction must be 'xToY' or 'yToX', got '${direction}'`);
+    },
+    // The CPI-acceptance gate (introspection / non-Pyth feed / drained bigK)
+    // lives in fetchPoolConfig; the fragment reads the oracle + reserves live,
+    // so no extra prepare gate is needed. A pool with empty inventory drops
+    // out of the relative-depth filter (depth == 0).
+  },
 };
 
 export interface EcoSwapSvmPoolSpec {
@@ -319,7 +337,8 @@ export interface EcoSwapSvmPoolSpec {
    * raydium-amm-v4 'coinToPc' (default) | 'pcToCoin'; pumpswap 'quoteToBase'
    * (default) | 'baseToQuote'; meteora-damm-v2 and orca-whirlpool 'aToB'
    * (default) | 'bToA'; raydium-clmm '0to1' (default) | '1to0'; meteora-dlmm 'xToY' (default, swap_for_y) | 'yToX'; manifest 'baseIn' (default, sell base) | 'quoteIn'
-   * (buy base); saber-stableswap and meteora-damm-v1-stable only 'AtoB'.
+   * (buy base); saber-stableswap and meteora-damm-v1-stable only 'AtoB';
+   * obric-v2 'xToY' (default, mintX in) | 'yToX'.
    */
   direction?: string;
   /** Test/integration hook: replace the venue swap CPI (the quote stays live). */

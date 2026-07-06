@@ -111,6 +111,15 @@ export const CU_FAMILIES: Record<string, FamilyCuCoefficients> = {
   // (test/svm/ecoswap-svm.cu.e2e.test.ts).
   manifest: { kind: 'stable', slot: 664_190, rung: 85_224 },
   'meteora-damm-v2': { kind: 'cp', slot: 185_290, rung: 82_405 },
+  // Obric V2 (prop-AMM oracle-anchored, tier P-A): a closed-form shifted-CP
+  // quote — CP kind (4-rung default). The slot term folds the setup (4 live
+  // reads: two vaults + two oracle feeds, the oracle→mult scaling, the isqrt
+  // re-anchor + the sanity band) and the cold final quote; the rung term folds
+  // one last-good ladder step (a division + fee). Heavier than meteora-damm-v2
+  // for the isqrt + the two extra oracle reads. Measured 2026-07-06 on a
+  // synthesized centered pool (@2 373,150 CU, @4 500,097 CU); re-pin with
+  // ECO_SVM_CU_PRINT=1 (test/svm/ecoswap-svm.cu.e2e.test.ts).
+  'obric-v2': { kind: 'cp', slot: 289_401, rung: 63_473 },
   'saber-stableswap': { kind: 'stable', slot: 503_243, rung: 159_258 },
   'meteora-damm-v1-stable': { kind: 'stable', slot: 570_859, rung: 206_414 },
 };

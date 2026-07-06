@@ -44,10 +44,16 @@ under `sdk/test/svm/fixtures/<slug>/` as `{ address, owner, base64Data }`.
   data-dependent and unfit for the v1 shape. **Manifest is covered as a LADDER-ONLY family**
   (adapter contract v2 — see its section below); other CLOBs (Phoenix, OpenBook) are future
   candidates on the same order-window pattern.
-- **Proprietary AMMs** (SolFi, Obric v2, ZeroFi, HumidiFi, ...): over 92% of aggregator flow, but
-  closed-source — no published math, often no published layouts, nothing for an in-VM quote to
-  read. Covered exclusively through the external-quote path (`quoteViaSimulation` + the recipe's
-  post-swap delta check).
+- **Proprietary AMMs** (SolFi, HumidiFi, BisonFi, ZeroFi, Tessera, AlphaQ, GoonFi, Aquifer, ...):
+  ~50% of SOL–stable volume, mostly closed-source. Their integrability is NOT uniform — the barrier
+  is layout/CPI-acceptance, not READING (reads are permissionless). A prepare-time CPI-acceptance
+  probe (`sdk/src/svm/cpi-probe.ts`) sorts them into tiers **P-A / P-B / P-C** — see the ranked
+  ledger in the `obric-v2` section below. **Obric v2 is BUILT as tier P-A** (the oracle-anchored
+  ladder family — separate readable Pyth-v2-relay feed, permissionless 12-account swap, known SDK
+  math); the rest are documented (P-B: internal-oracle prop-AMMs whose mid field is locatable but
+  the layout is undocumented/mutable; P-C: introspecting swaps that carry the Instructions sysvar —
+  external-quote-lane or drop). The external-quote path (`quoteViaSimulation` + the recipe's
+  post-swap delta check) remains the fallback for P-C and any un-probed venue.
 - **Lifinity** (v2): prices from a live oracle with proactive inventory shifts, so a baked in-VM
   quote is stale by construction; the protocol wound down its DEX liquidity in 2025-12. No
   adapter.
@@ -1311,3 +1317,149 @@ Mainnet USDC/USDT pool `32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG`
 - `t < last_report` cannot happen on-chain (the vault crank stamps last_report from the same
   clock); if it ever wrapped, the ratio would exceed 1e12 and the fragment falls back to
   `total_amount`. `referenceQuote` throws on it instead.
+
+## obric-v2 (prop-AMM oracle-anchored, tier P-A)
+
+Obric V2 is the FIRST prop-AMM family: an oracle-priced shifted-constant-product AMM whose
+fast-moving price LEVEL lives in a **separate, live-readable oracle account** (a Pyth-v2-format
+relay) the swap already passes in, while the drift-invariant SHAPE (the bigK curve, reserves, fee)
+is baked. This is the SVM analog of the EVM net-cache: **bake the shape, read the level** — the
+fragment reads the oracle mid live in-VM every execution and re-anchors the virtual-reserve curve
+to it. Program `obriQD1zbpyLz95G5n7nJe6a4DPjpFwa5XYPoNm113y`; verified against the obric-solana
+IDL + a real mainnet dump of pool `AJ5HfGY32igLgUbDtfNRdrkjTSYkCVKdhmnFFfcZMJ1E` (27G8/USDC).
+
+### SSTradingPair account (666 bytes, Anchor)
+
+Discriminator `3bde0fec62665ae0` (`sha256("account:SSTradingPair")[..8]`), then (offsets absolute,
+LE):
+
+| field | offset | type | role |
+|---|---|---|---|
+| isInitialized | 8 | u8 | gate |
+| xPriceFeedId | 9 | pubkey | oracle account for X (read live) |
+| yPriceFeedId | 41 | pubkey | oracle account for Y |
+| reserveX (vault) | 73 | pubkey | SPL token acct; `amount`@64 read live |
+| reserveY (vault) | 105 | pubkey | " |
+| protocolFeeX / protocolFeeY | 137 / 169 | pubkey | output-side fee vault = swap acct #7 |
+| mintX / mintY | 202 / 234 | pubkey | classic Tokenkeg only |
+| bigK | 274 | u128 | virtual-reserve product (curve depth) — baked hi/lo |
+| targetX | 290 | u64 | oracle-target inventory — baked |
+| multX / multY | 306 / 314 | u64 | STORED oracle-scaled prices (last swap) — the sanity-band anchor |
+| feeMillionth | 322 | u64 | fee, parts per 1e6 (e.g. 150 = 1.5 bps) — baked |
+| rebatePercentage | 330 | u64 | rebalancing-trade fee rebate (OMITTED — conservative) |
+| protocolFeeShareThousandth | 338 | u64 | fee split (irrelevant to the swap OUTPUT) |
+| version | 474 | u8 | |
+| mintSslpX / mintSslpY | 482 / 514 | pubkey | (present → confirms the whole layout, ends at 666) |
+
+### Oracle feed (the LEVEL, read live)
+
+Each pool names its own feed accounts and the swap passes them, so the fragment reads whatever the
+pool points at. Obric migrated off canonical Pyth onto **per-pair relay programs** (verified on real
+pools): a **Pyth-v2-format relay** (owner `Feed29Bg…`, 3312 B, magic `0xa1b2c3d4`: expo i32 @20,
+agg.price i64 @208, agg.status u32 @224 — the documented, live-readable layout the adapter admits),
+plus **Doves** (`DoVEsk76…`, 283 B) and **Minimox** (`Minimox7…`, 240 B) with proprietary layouts
+(NOT pinned → gated as P-B). The mult scaling reproduces the SDK's `getPrice` (scale to expo −3) ×
+`decimalMult`: `mult = floor(rawPrice / divX) * mulX`, cross-checked on the real pool — the USDC
+feed reports `1e10` @ expo −8 → `÷1e5 = 100000`, EXACTLY the pool's stored multY. Prepare bakes
+`(divX, mulX, divY, mulY, priceOffX, priceOffY)` per pool.
+
+### Quote (exactIn, both directions — SDK V2Pool.quoteXToY, rebate omitted)
+
+```
+multX = floor(rawPriceX / divX) * mulX          # read live from the feed
+multY = floor(rawPriceY / divY) * mulY
+targetXK  = isqrt(bigK * multY / multX)          # the LIVE re-anchor (Math.sqrt in-VM)
+currentXK = targetXK − targetX + reserveX        # reserveX read live from the vault
+currentYK = bigK / currentXK
+xToY:  out = currentYK − bigK / (currentXK + x)  # Y from the curve
+yToX:  out = currentXK − bigK / (currentYK + x)  # X from the curve
+out −= floor(out * feeMillionth / 1e6)           # fee on OUTPUT
+clamp: out > reserveOut ⇒ the venue reverts "Insufficient active"
+```
+
+Both directions collapse to one form via `(cIn, cOut, reserveOut)`: xToY = `(currentXK, currentYK,
+reserveY)`, yToX = `(currentYK, currentXK, reserveX)`. **Capacity handling** (like the CLMM
+window): the LADDER rung reports the last-good value once the walk passes capacity (`out >
+reserveOut`) — monotone, dOut 0 there, so the merge never over-fills obric — while the COLD final
+quote clamps to 0 past capacity (skips the CPI). **SANITY BAND** (self-deactivation): the live
+oracle-derived mult ratio is compared vs the pool's stored multX/multY (the program's own last-swap
+values); out of band by more than `bandBps` (default 25% — a wide gross-corruption guard for the
+documented feed), or a zero/halted mid, ⇒ the slot quotes 0 and the merge redistributes
+in-instruction. **Conservative fee**: the rebalancing REBATE is omitted (full feeMillionth
+charged), so predicted ≤ realized — one-sided safe for the terminal minOut; `rebatePercentage=0`
+pools are exact.
+
+### Swap instruction: `swap` (unified, 12 accounts, Tokenkeg)
+
+`swap` — discriminator `f8c69e91e17587c8` (`sha256("global:swap")`); args `isXToY: bool, inputAmt:
+u64, minOutputAmt: u64`. Accounts: `0 tradingPair(w) · 1 mintX · 2 mintY · 3 reserveX(w) · 4
+reserveY(w) · 5 userTokenAccountX(w) · 6 userTokenAccountY(w) · 7 protocolFee(w = output side) · 8
+xPriceFeed · 9 yPriceFeed · 10 user(signer) · 11 tokenProgram`. **No Instructions sysvar, no oracle-
+writer signer, no maker seat** → structurally permissionless CPI. The ladder template is `patch:'in'`
+(`prefix = disc ++ isXToY`, `suffix = minOut(=1) LE`).
+
+### Gates (fetch time)
+
+Wrong size/disc; uninitialized; **bigK=0** (drained/never-seeded — Obric's real inventory is thin,
+concentrated in one USDC/USDT pool `BWBHrYqfcjAh…` ≈ $489k; the SOL/USDC pools are empty); a feed
+pointing at the **Instructions sysvar** (an introspecting newer pool — tier P-C); a **non-Pyth-v2
+feed** (Doves/Minimox magic — tier P-B, layout not pinned); token-2022 mints. A drained pool also
+drops out of the relative-depth filter (vault-balance depth = 0).
+
+### Honest venue-exactness caveat
+
+The lamport-exact gate (fragment == referenceQuote) is UNCONDITIONAL. Venue-exactness (predicted ==
+the real program's realized output) additionally rests on (a) the SDK==program oracle-derivation
+assumption — the program is closed-source; the stored-mult cross-check and the terminal minOut
+backstop it — and (b) the conservative-fee under-quote. Closing the derivation (dumping the `.so` +
+a live-simulation quadrilateral) would upgrade Obric to a full deterministic quote (meteora-damm-v2
+class). Real-world caveat: **thin current on-chain inventory** — deep only in one stable pool.
+
+## The CPI-acceptance probe + the ranked prop-AMM ledger
+
+`sdk/src/svm/cpi-probe.ts` classifies a venue P-A / P-B / P-C BEFORE any adapter effort — the SVM
+analog of the EVM Metric/Tessera probing discipline; it never lands a swap.
+
+1. **Static screen** (free, from the swap's account list): the **Instructions sysvar**
+   (`Sysvar1nstructions…`) ⇒ the program introspects the enclosing transaction (router / anti-
+   sandwich / caller gating) ⇒ hard **P-C**. A non-user signer (maker seat / oracle writer) ⇒ P-C
+   candidate. `absent` is necessary-but-not-sufficient — the simulation confirms.
+2. **Unrecognized-caller simulation** (definitive): build the swap from an address the venue has
+   never seen (a non-router caller), tiny input, `minOut=1`, and `simulateTransaction`
+   (`sigVerify:false`, `replaceRecentBlockhash`). Classify by the out-ATA delta: **ACCEPT** (delta >
+   0 ⇒ P-A/P-B), **REJECT** (custom error / caller/owner/missing-acct ⇒ P-C), **DEGRADE** (succeeds
+   but materially below the venue's own quote ⇒ P-C-with-penalty, external-lane only).
+3. **CU probe** (feeds the budgeter) + **oracle-freshness probe** (derives the sanity-band staleness
+   bound). The terminal realized-delta minOut backstops ALL tiers.
+
+**Ranked ledger (on-chain-verified, mid-2026 — RE-PULL DefiLlama at commit time; rankings churn
+quarterly).** The decisive discriminant is the Instructions sysvar in a captured swap:
+
+| venue | program | pool size (accts) | swap accts | instr-sysvar | oracle model | tier |
+|---|---|---|---|---|---|---|
+| **Obric V2** | `obriQD1z…` | 666 B (37) | **12, no introspection** | **absent** | separate readable feed (Doves / Pyth-v2 relay / Minimox per pair) | **P-A (BUILT)** |
+| Aquifer | `AQU1FRd7…` | 1056 B (41) | 5, no introspection | absent | separate relay feed (`fastC7g…`, 128 B) | P-A/P-B |
+| HumidiFi | `9H6tua7j…` | 1728 B (92) | 3, no introspection | absent | internal mid pushed into the pool acct | P-B |
+| BisonFi | `BiSoNHVp…` | 2048 B (23) | 3, no introspection | absent | internal push-oracle mid (NOT an on-chain book) | P-B |
+| SolFi (v1) | `SoLFiHG9…` | 2800 B (40) | 3, no introspection | absent | internal mid in the pool acct | P-B |
+| Tessera V | `TessVdML…` | 1264 B (24) | 2, no introspection | absent | internal (Wintermute), opaque | P-B (hard) |
+| ZeroFi | `ZERor4xh…` | 1072 B+38 KB | 14 | **PRESENT** | internal + introspection gate | P-C |
+| GoonFi V2 | `goonuddt…` | 2048 B+719 KB | 14 | **PRESENT** | internal + introspection gate | P-C |
+| AlphaQ | `ALPHAQme…` | 336/672 B (41) | 14 | **PRESENT** | internal + introspection gate | P-C |
+| SolFi V2 | `SV2EYYJy…` | 1728 B+1 MB | 13 | **PRESENT** | internal + introspection gate | P-C |
+| Lifinity | `2wT8Y…` | — | — | — | oracle + proactive inventory; DEX wound down 2025-12 | P-C / drop |
+
+- **P-A built now: Obric V2** — all three barriers fall (readable feed, permissionless swap, known
+  math), CPI-integrated by third-party routers. The one gap (the closed-source oracle→mult scaling)
+  is sidestepped by bake-shape/read-level + minOut.
+- **P-B (build if the mid field is locatable + stable): Aquifer, then HumidiFi + BisonFi.** All
+  CPI-open (no introspection); the work is empirically locating the internal/relay mid + slot field
+  (diff the account bytes across consecutive oracle-update txs), reading it live with the sanity
+  band, baking the spread shape. HumidiFi/BisonFi are the highest-volume prizes but the layout is
+  undocumented and mutable — real ongoing maintenance risk, so documented-not-built here.
+  (Correction to the working hypothesis: **BisonFi is NOT an on-chain 10-level order book** — its
+  10-level book is an off-chain pricing construct pushed to the chain as a compact oracle payload;
+  on-chain it is a 3-account push-oracle swap like HumidiFi/SolFi.)
+- **P-C (external best-scan or drop): SolFi V2, ZeroFi, GoonFi V2, AlphaQ** carry the Instructions
+  sysvar (introspecting); **Tessera V** is P-B but maximally opaque; **Lifinity** wound down. Reach
+  them only through `quoteViaSimulation` if the probe returns ACCEPT.

@@ -12,5 +12,6 @@ export * from './transaction.js';
 export * from './send.js';
 export * from './client.js';
 export * from './quoteSim.js';
+export * from './cpi-probe.js';
 export * from './loader.js';
 export * from './venues/index.js';

@@ -251,6 +251,127 @@ export function synthesizeSaberPool(
   };
 }
 
+export const OBRIC_V2_PROGRAM = address('obriQD1zbpyLz95G5n7nJe6a4DPjpFwa5XYPoNm113y');
+const OBRIC_POOL_DISCRIMINATOR = [0x3b, 0xde, 0x0f, 0xec, 0x62, 0x66, 0x5a, 0xe0];
+const PYTH_V2_RELAY_OWNER = address('Feed29BgSBmKrK5jQsLR4VcwJpJr1eHfg5sX4TQbLGrV');
+
+/**
+ * A synthetic Pyth-v2-format relay feed (3312 bytes): magic 0xa1b2c3d4 @0,
+ * version 2 @4, expo i32 @20, agg.price i64 @208, agg.status u32 @224 (1 =
+ * Trading). Owned by the relay program so the adapter's feed classifier
+ * accepts it — the oracle MID the Obric fragment reads live.
+ */
+export function pythV2FeedBytes(price: bigint, expo: number, status = 1): Uint8Array {
+  const data = new Uint8Array(3312);
+  const view = new DataView(data.buffer);
+  view.setUint32(0, 0xa1b2c3d4, true); // magic
+  view.setUint32(4, 2, true); // version
+  view.setInt32(20, expo, true);
+  view.setBigInt64(208, price, true); // agg.price
+  view.setUint32(224, status, true); // agg.status
+  return data;
+}
+
+export interface SynthesizedObricPool {
+  pool: Address;
+  feedX: Address;
+  feedY: Address;
+  vaultX: Address;
+  vaultY: Address;
+  protocolFeeY: Address;
+  protocolFeeX: Address;
+  /** Account images keyed by address — feed to a loader AND setAccount. */
+  accounts: { address: Address; owner: Address; data: Uint8Array }[];
+}
+
+/**
+ * A 666-byte Obric SSTradingPair + its two Pyth-v2-relay feeds, two reserve
+ * vaults, and two protocol-fee vaults, for the oracle-anchored (P-A) family.
+ * Curve shape (bigK/targetX/fee) and reserves are caller-chosen; the feeds
+ * carry `priceX`/`priceY` at `expo` so tests can drift the mid and trip the
+ * sanity band. `storedMultX`/`storedMultY` default to the live oracle-derived
+ * mults (in band); pass them to simulate stale on-chain values.
+ */
+export function synthesizeObricPool(opts: {
+  bigK: bigint;
+  reserveX: bigint;
+  reserveY: bigint;
+  priceX: bigint;
+  priceY: bigint;
+  expo?: number;
+  feeMillionth?: bigint;
+  targetX?: bigint;
+  mintX?: Address;
+  mintY?: Address;
+  storedMultX?: bigint;
+  storedMultY?: bigint;
+}): SynthesizedObricPool {
+  const codec = getAddressCodec();
+  const enc = (a: Address): Uint8Array => new Uint8Array(codec.encode(a));
+  const pool = randomAddr();
+  const feedX = randomAddr();
+  const feedY = randomAddr();
+  const vaultX = randomAddr();
+  const vaultY = randomAddr();
+  const protocolFeeX = randomAddr();
+  const protocolFeeY = randomAddr();
+  const mintX = opts.mintX ?? WSOL_MINT;
+  const mintY = opts.mintY ?? USDC_MINT;
+  const expo = opts.expo ?? -8;
+  // getPrice → expo −3, decimalMult 1 for equal-decimal fixtures.
+  const scale = expo < -3 ? 10n ** BigInt(-3 - expo) : 1n;
+  const mul = expo < -3 ? 1n : 10n ** BigInt(expo + 3);
+  const multX = (opts.priceX / scale) * mul;
+  const multY = (opts.priceY / scale) * mul;
+
+  const d = new Uint8Array(666);
+  d.set(OBRIC_POOL_DISCRIMINATOR, 0);
+  d[8] = 1; // isInitialized
+  d.set(enc(feedX), 9);
+  d.set(enc(feedY), 41);
+  d.set(enc(vaultX), 73);
+  d.set(enc(vaultY), 105);
+  d.set(enc(protocolFeeX), 137);
+  d.set(enc(protocolFeeY), 169);
+  d[201] = 254; // bump
+  d.set(enc(mintX), 202);
+  d.set(enc(mintY), 234);
+  const view = new DataView(d.buffer);
+  view.setBigUint64(266, 1n, true); // concentration (unread)
+  // bigK is u128 @274
+  view.setBigUint64(274, opts.bigK & ((1n << 64n) - 1n), true);
+  view.setBigUint64(282, opts.bigK >> 64n, true);
+  // targetX defaults to reserveX so currentXK == targetXK — the pool sits
+  // CENTERED on the oracle mid (marginal price == the oracle ratio), a healthy
+  // "at-target" state. Override for off-target curves.
+  view.setBigUint64(290, opts.targetX ?? opts.reserveX, true); // targetX
+  view.setBigUint64(306, opts.storedMultX ?? multX, true); // multX (sanity anchor)
+  view.setBigUint64(314, opts.storedMultY ?? multY, true); // multY
+  view.setBigUint64(322, opts.feeMillionth ?? 150n, true); // feeMillionth
+  view.setBigUint64(330, 0n, true); // rebatePercentage
+  view.setBigUint64(338, 5n, true); // protocolFeeShareThousandth
+  d[474] = 100; // version
+
+  return {
+    pool,
+    feedX,
+    feedY,
+    vaultX,
+    vaultY,
+    protocolFeeX,
+    protocolFeeY,
+    accounts: [
+      { address: pool, owner: OBRIC_V2_PROGRAM, data: d },
+      { address: feedX, owner: PYTH_V2_RELAY_OWNER, data: pythV2FeedBytes(opts.priceX, expo) },
+      { address: feedY, owner: PYTH_V2_RELAY_OWNER, data: pythV2FeedBytes(opts.priceY, expo) },
+      { address: vaultX, owner: TOKENKEG, data: splTokenAccountBytes(mintX, pool, opts.reserveX) },
+      { address: vaultY, owner: TOKENKEG, data: splTokenAccountBytes(mintY, pool, opts.reserveY) },
+      { address: protocolFeeX, owner: TOKENKEG, data: splTokenAccountBytes(mintX, pool, 0n) },
+      { address: protocolFeeY, owner: TOKENKEG, data: splTokenAccountBytes(mintY, pool, 0n) },
+    ],
+  };
+}
+
 /** Loader over mainnet fixtures overlaid with synthesized accounts (fresh copies per read). */
 export function overlayLoader(
   fixtures: AccountFixture[],

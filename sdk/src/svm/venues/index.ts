@@ -53,3 +53,5 @@ export * from './saber-stableswap/index.js';
 export * from './saber-stableswap/ladder.js';
 export * from './meteora-damm-v1-stable/index.js';
 export * from './meteora-damm-v1-stable/ladder.js';
+export * from './obric-v2/index.js';
+export * from './obric-v2/ladder.js';
