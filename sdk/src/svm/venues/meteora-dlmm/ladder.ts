@@ -251,7 +251,10 @@ function emitBinWalk(p: string, swapForY: boolean, x: string, v: WalkVars, loopV
     `        ${p}fi = (${v.rm} * ${p}tf + ${FEE_PRECISION} - 1) / ${FEE_PRECISION};`,
     `        ${p}ex2 = ${v.rm} - ${p}fi;`,
     `        ${p}mi = ${maxIn};`,
-    `        if (${p}ex2 >= ${p}mi) {`,
+    // A bin whose max input can't be represented in u64 (>= 2^65) is deactivated,
+    // matching the mirror's null-return so fragment and reference agree at pathological deep bins.
+    `        if (${p}mi >= ${SENT}) { ${v.ex} = 1 }`,
+    `        else if (${p}ex2 >= ${p}mi) {`,
     `          ${p}f2 = (${p}mi * ${p}tf + ${FEE_PRECISION} - ${p}tf - 1) / (${FEE_PRECISION} - ${p}tf);`,
     `          ${p}cs = ${p}mi + ${p}f2;`,
     `          if (${p}cs > ${v.rm}) { ${v.ex} = 1 }`,
