@@ -178,3 +178,46 @@ export function solveReference(slots: readonly SolverSlotInput[], amountIn: bigi
     totalPredicted: predictedOuts.reduce((sum, out) => sum + out, 0n),
   };
 }
+
+/**
+ * The lamport-exact mirror of a 2-hop ROUTE (A → X → B), composing
+ * solveReference twice — no new merge logic. leg-0 splits `amountIn` across
+ * its pool set (each slot's predicted out is bit-exact to its venue binary by
+ * the single-hop quadrilateral gate); the sum of those predicted outs is the
+ * intermediate X, which the on-chain instruction MEASURES as the realized
+ * outAta delta after leg-0's CPIs — so `intermediate` here equals the chain's
+ * `realizedX`. leg-1 then splits that SAME intermediate across its own pool
+ * set. Because predicted == realized at every leg-0 intermediate, the two
+ * leg-1 grids (this one built on predicted X, the chain's built on realized X)
+ * coincide, and the composed result is bit-for-bit reproducible from the same
+ * account bytes (absent genuine price drift; drift is caught by minOut).
+ *
+ * This is the exactness gate for routes AND the user-facing route quote
+ * (quoteRouteEcoSwapSvm runs it over fetched account bytes — zero simulation).
+ */
+export interface RouteReferenceResult {
+  /** leg-0 solve on amountIn: slices/predictedOuts/totalPredicted for the leg-0 pool set. */
+  leg0: SolverReferenceResult;
+  /** leg-1 solve on the realized intermediate. */
+  leg1: SolverReferenceResult;
+  /** Σ leg-0 predicted outs == the on-chain realizedX (the exactness keystone). */
+  intermediate: bigint;
+  /** leg-1 totalPredicted == the on-chain realizedB (absent drift). */
+  totalOut: bigint;
+}
+
+export function routeReference(
+  leg0: readonly SolverSlotInput[],
+  leg1: readonly SolverSlotInput[],
+  amountIn: bigint,
+): RouteReferenceResult {
+  if (leg0.length === 0) throw new Error('routeReference needs at least one leg-0 slot');
+  if (leg1.length === 0) throw new Error('routeReference needs at least one leg-1 slot');
+  const r0 = solveReference(leg0, amountIn);
+  const intermediate = r0.totalPredicted; // = Σ leg-0 predicted outs = the on-chain realizedX
+  if (intermediate <= 0n) {
+    throw new Error('routeReference: leg-0 produced no intermediate (mirrors the on-chain "x" revert)');
+  }
+  const r1 = solveReference(leg1, intermediate); // leg-1 grid on the realized X — identical to the chain's
+  return { leg0: r0, leg1: r1, intermediate, totalOut: r1.totalPredicted };
+}

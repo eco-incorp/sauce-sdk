@@ -92,20 +92,20 @@ export interface GeneratedEcoSwapSvm {
 
 const U64_MAX = (1n << 64n) - 1n;
 
-const hexLiteral = (bytes: Uint8Array): string =>
+export const hexLiteral = (bytes: Uint8Array): string =>
   '0x' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 
-const progRef = (slot: number): string => `s${slot}:prog`;
+export const progRef = (slot: number): string => `s${slot}:prog`;
 
 /** 64-bit byte swap: the LE image of a u64 amount, MSTORE'd big-endian by abi.encode. */
-const LE8_HELPER = [
+export const LE8_HELPER = [
   'function le8(x) {',
   '  return ((x & 255) << 56) | ((x & 65280) << 40) | ((x & 16711680) << 24) | ((x & 4278190080) << 8)' +
     ' | ((x >> 8) & 4278190080) | ((x >> 24) & 16711680) | ((x >> 40) & 65280) | (x >> 56);',
   '}',
 ].join('\n');
 
-function accountEntry(account: VenueAccount): string {
+export function accountEntry(account: VenueAccount): string {
   const flags = [
     ...(account.writable ? ['writable: true'] : []),
     ...(account.signer ? ['signer: true'] : []),
@@ -115,7 +115,7 @@ function accountEntry(account: VenueAccount): string {
 }
 
 /** Records ref → address; a ref claiming two different addresses is a config error. */
-function bindAddress(addressByRef: Map<string, string>, ref: string, address: Address | undefined): void {
+export function bindAddress(addressByRef: Map<string, string>, ref: string, address: Address | undefined): void {
   if (address === undefined) return;
   const bound = addressByRef.get(ref);
   if (bound !== undefined && bound !== address) {
@@ -159,7 +159,7 @@ export function encodeEcoSwapSvmTrade(
 }
 
 /** Collects and dedupes the slots' helper functions; one name = one source. */
-function collectHelpers(slots: readonly EcoSwapSvmSlot[]): string[] {
+export function collectHelpers(slots: readonly EcoSwapSvmSlot[]): string[] {
   const byName = new Map<string, string>();
   for (const { adapter, cfg } of slots) {
     for (const helper of adapter.helpers(cfg)) {
@@ -173,7 +173,7 @@ function collectHelpers(slots: readonly EcoSwapSvmSlot[]): string[] {
   return [...byName.values()];
 }
 
-function quoteMode(adapter: SvmVenueLadderV2): 'expression' | 'statements' {
+export function quoteMode(adapter: SvmVenueLadderV2): 'expression' | 'statements' {
   if (adapter.emitQuoteCall !== undefined) return 'expression';
   if (adapter.emitLadderQuote !== undefined && adapter.emitFinalQuote !== undefined) return 'statements';
   throw new Error(

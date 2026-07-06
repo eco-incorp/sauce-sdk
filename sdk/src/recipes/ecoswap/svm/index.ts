@@ -25,7 +25,7 @@
  */
 import { createHash } from 'node:crypto';
 import { isSignerRole } from '@solana/kit';
-import type { Address, Commitment } from '@solana/kit';
+import type { Address, Commitment, Instruction, TransactionSigner } from '@solana/kit';
 import { estimatePacket } from '@eco-incorp/sauce-compiler';
 import type { PacketBudget } from '@eco-incorp/sauce-compiler';
 import type { EnsuredLookupTable, SauceSvmClient, StagedBuffer } from '../../../svm/client.js';
@@ -35,6 +35,7 @@ import type { AccountResolution } from '../../../svm/resolve.js';
 import { selectAltAddresses } from '../../../svm/alt.js';
 import { coalescingAccountLoader } from '../../../svm/loader.js';
 import type { BatchAccountLoader } from '../../../svm/loader.js';
+import { buildAtaPrepend } from '../../../svm/prepends.js';
 import { meteoraDammV1Stable } from '../../../svm/venues/meteora-damm-v1-stable/index.js';
 import type { MeteoraDammV1StablePoolConfig } from '../../../svm/venues/meteora-damm-v1-stable/index.js';
 import { meteoraDammV1StableLadder } from '../../../svm/venues/meteora-damm-v1-stable/ladder.js';
@@ -74,17 +75,27 @@ import type {
   SvmVenueLadderV2,
   SwapUser,
 } from '../../../svm/venues/types.js';
-import { planLadders } from './budget.js';
-import type { LadderPlan } from './budget.js';
+import { planLadders, planRouteLadders } from './budget.js';
+import type { LadderPlan, RouteLadderPlan } from './budget.js';
 import { encodeEcoSwapSvmTrade, generateEcoSwapSvm } from './codegen.js';
 import type { EcoSwapSvmSlot, GeneratedEcoSwapSvm } from './codegen.js';
-import { solveReference } from './solver-reference.js';
-import type { SolverReferenceResult, SolverSlotInput } from './solver-reference.js';
+import { DEFAULT_INTER_REF, generateEcoSwapSvmRoute } from './route.js';
+import type { GeneratedEcoSwapSvmRoute } from './route.js';
+import { routeReference, solveReference } from './solver-reference.js';
+import type { RouteReferenceResult, SolverReferenceResult, SolverSlotInput } from './solver-reference.js';
 
 export { encodeEcoSwapSvmTrade, ecoSwapSvmShapeKey, generateEcoSwapSvm, resolveSlotRungs } from './codegen.js';
 export type { EcoSwapSvmSlot, GenerateEcoSwapSvmInput, GeneratedEcoSwapSvm } from './codegen.js';
-export { buildLadder, ladderGrid, solveReference, MAX_RUNGS, MIN_RUNGS, QL_S } from './solver-reference.js';
-export type { LadderRung, SolverReferenceResult, SolverSlotInput } from './solver-reference.js';
+export {
+  DEFAULT_INTER_REF,
+  ecoSwapSvmRouteShapeKey,
+  generateEcoSwapSvmRoute,
+  MAX_LEG_SLOTS,
+  MAX_ROUTE_SLOTS,
+} from './route.js';
+export type { GenerateEcoSwapSvmRouteInput, GeneratedEcoSwapSvmRoute } from './route.js';
+export { buildLadder, ladderGrid, routeReference, solveReference, MAX_RUNGS, MIN_RUNGS, QL_S } from './solver-reference.js';
+export type { LadderRung, RouteReferenceResult, SolverReferenceResult, SolverSlotInput } from './solver-reference.js';
 export { efficiencyLoss, solveOptimal } from './optimal.js';
 export type { ContinuousVenue, OptimalSplitResult } from './optimal.js';
 export {
@@ -92,12 +103,15 @@ export {
   CU_BASE,
   CU_FAMILIES,
   CU_TRANSACTION_CAP,
+  CU_TWO_HOP,
   defaultRungsFor,
+  estimateRouteCu,
   estimateShapeCu,
   familyCuCoefficients,
   planLadders,
+  planRouteLadders,
 } from './budget.js';
-export type { BudgetSlotInput, FamilyCuCoefficients, LadderPlan } from './budget.js';
+export type { BudgetSlotInput, FamilyCuCoefficients, LadderPlan, RouteLadderPlan } from './budget.js';
 
 /** Default relative-depth floor: drop pools below 1% of the summed depth. */
 export const ECO_SVM_MIN_REL_BPS = 100;
@@ -426,7 +440,11 @@ interface ResolvedCandidate {
 }
 
 /** The effective loader: `load` as given, or a coalescing wrapper over `loadMany` with pool-owner checks. */
-function effectiveLoader(config: QuoteEcoSwapSvmConfig): AccountLoader {
+function effectiveLoader(config: {
+  load?: AccountLoader;
+  loadMany?: BatchAccountLoader;
+  pools: readonly EcoSwapSvmPoolSpec[];
+}): AccountLoader {
   if (config.load !== undefined && config.loadMany !== undefined) {
     throw new Error('ecoSwapSvm takes load OR loadMany, not both');
   }
@@ -450,20 +468,30 @@ function effectiveLoader(config: QuoteEcoSwapSvmConfig): AccountLoader {
   });
 }
 
+const droppedAs = (c: ResolvedCandidate, reason: EcoSwapSvmDroppedPool['reason']): EcoSwapSvmDroppedPool => ({
+  pool: c.spec.pool,
+  venue: c.spec.venue,
+  depth: c.depth,
+  reason,
+});
+
 /**
  * Fetch + gate every candidate (the v1 adapters' fetchPoolConfig — status
  * bits, transfer-fee mints, curve types — plus the family prepare gates),
- * snapshot the quote accounts, apply the relative-depth filter over
- * L = isqrt(rIn·rOut), the structural slot cap, and the CU budgeter.
+ * snapshot the quote accounts, and apply the relative-depth filter over
+ * L = isqrt(rIn·rOut) plus the structural slot cap. The CU budgeter runs
+ * AFTER this (single-hop: resolveCandidates; route: planRouteLadders over both
+ * legs' survivors) — so a route can reuse this per directed edge and share ONE
+ * combined budget.
  */
-async function resolveCandidates(
-  config: QuoteEcoSwapSvmConfig,
-): Promise<{ survivors: ResolvedCandidate[]; dropped: EcoSwapSvmDroppedPool[]; plan: LadderPlan }> {
-  const { pools, amountIn } = config;
-  requireU64('amountIn', amountIn, true);
+async function filterCandidates(
+  load: AccountLoader,
+  pools: readonly EcoSwapSvmPoolSpec[],
+  now: bigint,
+  minRelBpsOpt: number | undefined,
+  maxSlots: number = ECO_SVM_MAX_SLOTS,
+): Promise<{ survivors: ResolvedCandidate[]; dropped: EcoSwapSvmDroppedPool[] }> {
   if (pools.length === 0) throw new Error('ecoSwapSvm needs at least one candidate pool');
-  const load = effectiveLoader(config);
-  const now = config.now ?? BigInt(Math.floor(Date.now() / 1000));
 
   // Parallel fetch: with a coalescing loader every dependency LEVEL becomes
   // one getMultipleAccounts sweep across all candidates.
@@ -512,24 +540,16 @@ async function resolveCandidates(
     }),
   );
 
-  const droppedAs = (c: ResolvedCandidate, reason: EcoSwapSvmDroppedPool['reason']): EcoSwapSvmDroppedPool => ({
-    pool: c.spec.pool,
-    venue: c.spec.venue,
-    depth: c.depth,
-    reason,
-  });
-
   // Relative-depth filter (aliveness + minRelBps of ΣL), then the structural
-  // cap — keep the deepest ECO_SVM_MAX_SLOTS, preserving caller preference
-  // order — then the CU budgeter fixes rungs and may drop tail slots.
-  const minRelBps = BigInt(config.minRelBps ?? ECO_SVM_MIN_REL_BPS);
+  // cap — keep the deepest `maxSlots`, preserving caller preference order.
+  const minRelBps = BigInt(minRelBpsOpt ?? ECO_SVM_MIN_REL_BPS);
   const totalDepth = candidates.reduce((sum, c) => sum + c.depth, 0n);
   let survivors = candidates.filter((c) => c.depth > 0n && c.depth * 10_000n >= minRelBps * totalDepth);
   const dropped = candidates.filter((c) => !survivors.includes(c)).map((c) => droppedAs(c, 'depth'));
-  if (survivors.length > ECO_SVM_MAX_SLOTS) {
+  if (survivors.length > maxSlots) {
     const deepest = [...survivors]
       .sort((a, b) => (b.depth > a.depth ? 1 : b.depth < a.depth ? -1 : 0))
-      .slice(0, ECO_SVM_MAX_SLOTS);
+      .slice(0, maxSlots);
     dropped.push(...survivors.filter((c) => !deepest.includes(c)).map((c) => droppedAs(c, 'slots')));
     survivors = survivors.filter((c) => deepest.includes(c));
   }
@@ -537,14 +557,25 @@ async function resolveCandidates(
     throw new Error('ecoSwapSvm: no pool survived the relative-depth filter (pass minRelBps: 0 to disable)');
   }
 
+  return { survivors, dropped };
+}
+
+/** filterCandidates + the single-hop CU budgeter (rung fit + tail-slot drops). */
+async function resolveCandidates(
+  config: QuoteEcoSwapSvmConfig,
+): Promise<{ survivors: ResolvedCandidate[]; dropped: EcoSwapSvmDroppedPool[]; plan: LadderPlan }> {
+  requireU64('amountIn', config.amountIn, true);
+  const load = effectiveLoader(config);
+  const now = config.now ?? BigInt(Math.floor(Date.now() / 1000));
+  const { survivors: filtered, dropped } = await filterCandidates(load, config.pools, now, config.minRelBps);
+
   const plan = planLadders(
-    survivors.map((c) => ({ slug: c.spec.venue })),
+    filtered.map((c) => ({ slug: c.spec.venue })),
     config.cuBudget,
   );
-  dropped.push(...survivors.slice(plan.admitted).map((c) => droppedAs(c, 'budget')));
-  survivors = survivors.slice(0, plan.admitted);
+  dropped.push(...filtered.slice(plan.admitted).map((c) => droppedAs(c, 'budget')));
 
-  return { survivors, dropped, plan };
+  return { survivors: filtered.slice(0, plan.admitted), dropped, plan };
 }
 
 const preparedSlot = (c: ResolvedCandidate, rungs: number): EcoSwapSvmPreparedSlot => ({
@@ -555,12 +586,15 @@ const preparedSlot = (c: ResolvedCandidate, rungs: number): EcoSwapSvmPreparedSl
   rungs,
 });
 
-const solverInputs = (survivors: readonly ResolvedCandidate[], plan: LadderPlan): SolverSlotInput[] =>
+const solverInputsRungs = (survivors: readonly ResolvedCandidate[], rungs: readonly number[]): SolverSlotInput[] =>
   survivors.map((c, i) => ({
     quote: c.quote,
     ...(c.ladderQuotes !== undefined ? { ladderQuotes: c.ladderQuotes } : {}),
-    rungs: plan.rungs[i],
+    rungs: rungs[i],
   }));
+
+const solverInputs = (survivors: readonly ResolvedCandidate[], plan: LadderPlan): SolverSlotInput[] =>
+  solverInputsRungs(survivors, plan.rungs);
 
 /**
  * The user-facing quote: fetch the candidates' account bytes once through
@@ -786,6 +820,259 @@ export async function executeEcoSwapSvm(
   return client.executeStaged(staged, output.accountPlan, resolution, {
     args: { layout: output.argsLayout, values },
     computeUnitLimit: 'auto',
+    ...(opts.alt !== undefined ? { lookupTables: opts.alt.lookupTables } : {}),
+    ...(typeof staged === 'string' ? { expectedSha256: output.sha256 } : {}),
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2-hop routes (A → X → B): a composite venue solved as its own instruction.
+// A route is EITHER the direct-venue merge above OR one 2-hop route — not both
+// in one instruction (Phase 3b: standalone-route-first; direct+route mixing is
+// the documented Phase 3c follow-up, deferred on CU + merge-integration
+// grounds). To pick the better of the two off-chain, quote BOTH quoteEcoSwapSvm
+// and quoteRouteEcoSwapSvm and stage whichever `totalOut`/`totalPredicted`
+// wins — a pure off-chain selection, one shape staged.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface QuoteRouteEcoSwapSvmConfig {
+  amountIn: bigint;
+  /** leg-0 candidate pools (A → X), preference order — 1..MAX_LEG_SLOTS after filtering. */
+  leg0Pools: EcoSwapSvmPoolSpec[];
+  /** leg-1 candidate pools (X → B), preference order. */
+  leg1Pools: EcoSwapSvmPoolSpec[];
+  /** Single-account source (fixtures / custom RPC binding). One of load/loadMany is required. */
+  load?: AccountLoader;
+  /** Batched source (e.g. kitBatchAccountLoader(rpc)) — the prepare coalesces into getMultipleAccounts sweeps. */
+  loadMany?: BatchAccountLoader;
+  /** Relative-depth floor in bps of ΣL, applied PER LEG (default 100 = 1%; 0 disables). */
+  minRelBps?: number;
+  /** Combined-route CU admission budget (default CU_ADMISSION_BUDGET); raising it forces heavier routes. */
+  cuBudget?: number;
+  /** Unix seconds the time-dependent reference quotes evaluate at (default wall clock). */
+  now?: bigint;
+  /** Intermediate-token (X) ATA ref, resolved by the caller (default 'user:inter'). */
+  interRef?: string;
+}
+
+export interface RouteEcoSwapSvmConfig extends QuoteRouteEcoSwapSvmConfig {
+  /** Minimum realized outAta (B) delta, inclusive — enforced pre-CPI on the leg-1 prediction and post-CPI on the delta. */
+  minOut: bigint;
+  /** User-side account refs (inAta = token A, outAta = token B, owner). */
+  user: SwapUser;
+}
+
+export interface EcoSwapSvmRouteQuote extends RouteReferenceResult {
+  /** Post-filter leg-0 slot assignment (slots back leg0.slices in order). */
+  leg0Slots: EcoSwapSvmPreparedSlot[];
+  /** Post-filter leg-1 slot assignment. */
+  leg1Slots: EcoSwapSvmPreparedSlot[];
+  /** Pools dropped by the per-leg depth filter / slot cap / route CU budget. */
+  dropped: EcoSwapSvmDroppedPool[];
+  /** Modeled route CU of the admitted shape (the codegen GasLeft floor). */
+  estimatedCu: number;
+  /** Budgeter degradations/drops, packet-budgeter style. */
+  warnings: string[];
+}
+
+export interface EcoSwapSvmRouteOutput extends GeneratedEcoSwapSvmRoute {
+  /** sha256 of the staged blob — the execute pin. */
+  sha256: Uint8Array;
+  /** The intermediate-token ATA ref this blob's leg-0 out / leg-1 in resolve to. */
+  interRef: string;
+  /** Post-filter leg-0 prepared slots, in blob order. */
+  leg0Slots: EcoSwapSvmPreparedSlot[];
+  /** Post-filter leg-1 prepared slots. */
+  leg1Slots: EcoSwapSvmPreparedSlot[];
+  /** Flat prepared slots (leg-0, then leg-1) — the cfg / returndata order. */
+  slots: EcoSwapSvmPreparedSlot[];
+  /** Encoded cfg arg for THIS trade; re-encode via encodeTrade for others. */
+  argValues: [`0x${string}`];
+  /** Composed route reference over the fetch-time bytes (the user-facing quote). */
+  quote: EcoSwapSvmRouteQuote;
+  /** Re-encodes the cfg arg for a new trade on the SAME staged route blob. */
+  encodeTrade: (amountIn: bigint, minOut: bigint) => [`0x${string}`];
+}
+
+/**
+ * Per-leg filter (fetch + gate + relative-depth + slot cap) under ONE combined
+ * loader, then the leg-aware route budgeter (planRouteLadders: degrade rungs
+ * across both legs, drop only tail slots, never empty a leg). Discovers each
+ * leg's pool SET for the directed edge the caller supplies — leg-0 pools trade
+ * A → X, leg-1 pools trade X → B.
+ */
+async function resolveRouteCandidates(config: QuoteRouteEcoSwapSvmConfig): Promise<{
+  leg0: ResolvedCandidate[];
+  leg1: ResolvedCandidate[];
+  dropped: EcoSwapSvmDroppedPool[];
+  plan: RouteLadderPlan;
+}> {
+  requireU64('amountIn', config.amountIn, true);
+  if (config.leg0Pools.length === 0 || config.leg1Pools.length === 0) {
+    throw new Error('ecoSwapSvm route needs at least one candidate pool per leg');
+  }
+  const load = effectiveLoader({
+    load: config.load,
+    loadMany: config.loadMany,
+    pools: [...config.leg0Pools, ...config.leg1Pools],
+  });
+  const now = config.now ?? BigInt(Math.floor(Date.now() / 1000));
+
+  // MAX_LEG_SLOTS is the per-leg structural cap (route.ts); the combined route
+  // budgeter (planRouteLadders) then fixes rungs and may drop tail slots.
+  const f0 = await filterCandidates(load, config.leg0Pools, now, config.minRelBps, 3);
+  const f1 = await filterCandidates(load, config.leg1Pools, now, config.minRelBps, 3);
+
+  const plan = planRouteLadders(
+    f0.survivors.map((c) => ({ slug: c.spec.venue })),
+    f1.survivors.map((c) => ({ slug: c.spec.venue })),
+    config.cuBudget,
+  );
+  const leg0 = f0.survivors.slice(0, plan.leg0Admitted);
+  const leg1 = f1.survivors.slice(0, plan.leg1Admitted);
+  const dropped = [
+    ...f0.dropped,
+    ...f0.survivors.slice(plan.leg0Admitted).map((c) => droppedAs(c, 'budget')),
+    ...f1.dropped,
+    ...f1.survivors.slice(plan.leg1Admitted).map((c) => droppedAs(c, 'budget')),
+  ];
+  return { leg0, leg1, dropped, plan };
+}
+
+/**
+ * The user-facing ROUTE quote: fetch both legs' candidate bytes once through
+ * the loader, run the composed lamport-exact mirror (routeReference) — zero
+ * simulation. `intermediate` == the on-chain realizedX, `totalOut` == realizedB
+ * (absent drift). Lamport-identical to what the staged route blob computes on
+ * the same bytes.
+ */
+export async function quoteRouteEcoSwapSvm(config: QuoteRouteEcoSwapSvmConfig): Promise<EcoSwapSvmRouteQuote> {
+  const { leg0, leg1, dropped, plan } = await resolveRouteCandidates(config);
+  const ref = routeReference(
+    solverInputsRungs(leg0, plan.leg0Rungs),
+    solverInputsRungs(leg1, plan.leg1Rungs),
+    config.amountIn,
+  );
+  return {
+    ...ref,
+    leg0Slots: leg0.map((c, i) => preparedSlot(c, plan.leg0Rungs[i])),
+    leg1Slots: leg1.map((c, i) => preparedSlot(c, plan.leg1Rungs[i])),
+    dropped,
+    estimatedCu: plan.estimatedCu,
+    warnings: plan.warnings,
+  };
+}
+
+/**
+ * Prepare + compile a 2-hop route: per-leg candidate gates → per-leg depth
+ * filter → route CU budgeter → leg slot assignment → route codegen (the
+ * compute-exec-compute-exec solver) → staged compile. The blob serves ANY pool
+ * set matching its route shapeKey; per-trade values ride the payload args, pool
+ * accounts (both legs) + the intermediate ATA rebind through the resolution map.
+ */
+export async function routeEcoSwapSvm(config: RouteEcoSwapSvmConfig): Promise<EcoSwapSvmRouteOutput> {
+  requireU64('minOut', config.minOut, false);
+  const interRef = config.interRef ?? DEFAULT_INTER_REF;
+  const { leg0, leg1, dropped, plan } = await resolveRouteCandidates(config);
+
+  const asSlots = (survivors: ResolvedCandidate[], rungs: number[]): EcoSwapSvmSlot[] =>
+    survivors.map((c, i) => ({ adapter: c.entry.ladder, cfg: c.cfg, rungs: rungs[i], swapOverride: c.spec.swapOverride }));
+  const generated = generateEcoSwapSvmRoute({
+    leg0: asSlots(leg0, plan.leg0Rungs),
+    leg1: asSlots(leg1, plan.leg1Rungs),
+    user: config.user,
+    interRef,
+    cuFloor: plan.estimatedCu,
+  });
+
+  const tradeSlots = [...leg0, ...leg1].map((c) => ({ params: c.params }));
+  const encodeTrade = (amountIn: bigint, minOut: bigint): [`0x${string}`] => {
+    requireU64('amountIn', amountIn, true);
+    requireU64('minOut', minOut, false);
+    return [encodeEcoSwapSvmTrade(tradeSlots, amountIn, minOut)];
+  };
+
+  const ref = routeReference(
+    solverInputsRungs(leg0, plan.leg0Rungs),
+    solverInputsRungs(leg1, plan.leg1Rungs),
+    config.amountIn,
+  );
+  const preparedLeg0 = leg0.map((c, i) => preparedSlot(c, plan.leg0Rungs[i]));
+  const preparedLeg1 = leg1.map((c, i) => preparedSlot(c, plan.leg1Rungs[i]));
+
+  return {
+    ...generated,
+    warnings: [...generated.warnings, ...plan.warnings],
+    sha256: new Uint8Array(createHash('sha256').update(generated.bytecode).digest()),
+    interRef,
+    leg0Slots: preparedLeg0,
+    leg1Slots: preparedLeg1,
+    slots: [...preparedLeg0, ...preparedLeg1],
+    argValues: encodeTrade(config.amountIn, config.minOut),
+    quote: {
+      ...ref,
+      leg0Slots: preparedLeg0,
+      leg1Slots: preparedLeg1,
+      dropped,
+      estimatedCu: plan.estimatedCu,
+      warnings: plan.warnings,
+    },
+    encodeTrade,
+  };
+}
+
+/** Stage a route blob once (init → chunked writes → sha256-gated finalize). */
+export async function stageRouteEcoSwapSvm(
+  client: SauceSvmClient,
+  index: number,
+  output: Pick<EcoSwapSvmRouteOutput, 'bytecode'>,
+): Promise<StagedBuffer> {
+  return client.stageBuffer(index, output.bytecode);
+}
+
+/**
+ * Idempotent create of the intermediate-token (X) ATA for `owner` — the sole
+ * intermediate custody (the engine never signs). Prepend it beside the
+ * heap-frame + CU-limit prepends on the route execute, exactly like the
+ * wSOL-wrap prepend, and resolve the blob's `interRef` to the returned `ata`.
+ */
+export async function buildRouteInterAtaPrepend(input: {
+  payer: TransactionSigner;
+  owner: Address;
+  mint: Address;
+  tokenProgram?: Address;
+}): Promise<{ ata: Address; instruction: Instruction }> {
+  return buildAtaPrepend(input);
+}
+
+export interface ExecuteRouteEcoSwapSvmOpts extends ExecuteEcoSwapSvmOpts {
+  /**
+   * Extra prepends (add-once, beside the client's heap-frame + CU-limit) — the
+   * idempotent intermediate-ATA create belongs here (buildRouteInterAtaPrepend).
+   */
+  prepends?: readonly Instruction[];
+}
+
+/**
+ * One route trade = ONE execute_from_account instruction: the staged route
+ * blob, hash-pinned, with this trade's cfg bytes as payload args. `resolution`
+ * binds the user refs (inAta = A, outAta = B, owner, and the interRef = the
+ * intermediate ATA). Pass `opts.alt` (routes ~double the account list — an ALT
+ * is effectively mandatory) and `opts.prepends` (the intermediate-ATA create).
+ */
+export async function executeRouteEcoSwapSvm(
+  client: SauceSvmClient,
+  staged: StagedBuffer | Address,
+  output: EcoSwapSvmRouteOutput,
+  resolution: AccountResolution,
+  trade?: { amountIn: bigint; minOut: bigint },
+  opts: ExecuteRouteEcoSwapSvmOpts = {},
+): Promise<SendExecuteResult> {
+  const values = trade === undefined ? output.argValues : output.encodeTrade(trade.amountIn, trade.minOut);
+  return client.executeStaged(staged, output.accountPlan, resolution, {
+    args: { layout: output.argsLayout, values },
+    computeUnitLimit: 'auto',
+    ...(opts.prepends !== undefined ? { prepends: opts.prepends } : {}),
     ...(opts.alt !== undefined ? { lookupTables: opts.alt.lookupTables } : {}),
     ...(typeof staged === 'string' ? { expectedSha256: output.sha256 } : {}),
   });

@@ -115,6 +115,27 @@ export const CU_FAMILIES: Record<string, FamilyCuCoefficients> = {
   'meteora-damm-v1-stable': { kind: 'stable', slot: 570_859, rung: 206_414 },
 };
 
+/**
+ * The 2-hop ROUTE intercept, added ONCE to a route's combined-slot estimate:
+ * the second inlined merge's base + the intermediate `accountUint` before/after
+ * reads + the leg-boundary `realizedX` handling. Everything else (both legs'
+ * setup, cold quotes, merge shares and venue CPIs) is already counted per slot
+ * by estimateShapeCu over the combined leg-0 ++ leg-1 slot list — a route just
+ * runs two single-hop-style legs back to back, so the family coefficients
+ * (calibrated WITH a real-binary CPI per slot) already fold both legs' CPIs.
+ *
+ * Measured (test/svm/ecoswap-svm.multihop.e2e.test.ts, 2026-07-06): a 1+1
+ * raydium-cp route with SPL-transfer stand-ins runs 775,675 CU, ~68k UNDER the
+ * combined-model 843,609 — but the stand-in CPIs are ~76 CU each vs a real
+ * raydium-cp swap's ~50k, so stand-ins hide ~100k of real-CPI cost the model
+ * assumes; the true structural route overhead over two independent legs is a
+ * modest POSITIVE ~30-40k. Pinned conservatively at 40k (a floor that is only
+ * a safety throw, not the consumed amount — gasLeft at entry is the full
+ * budget). Re-pin against a REAL-binary route lane when one lands, same ±25%
+ * alarm discipline as the family coefficients.
+ */
+export const CU_TWO_HOP = 40_000;
+
 export interface BudgetSlotInput {
   /** Family slug (a CU_FAMILIES key). */
   slug: string;
@@ -202,4 +223,122 @@ export function planLadders(slots: readonly BudgetSlotInput[], cuBudget: number 
   }
 
   return { rungs, admitted, estimatedCu: estimate(), warnings };
+}
+
+/** Modeled CU for a 2-hop route — the combined leg-0 ++ leg-1 shape plus the CU_TWO_HOP intercept. */
+export function estimateRouteCu(leg0: readonly BudgetSlotInput[], leg1: readonly BudgetSlotInput[]): number {
+  return estimateShapeCu([...leg0, ...leg1]) + CU_TWO_HOP;
+}
+
+export interface RouteLadderPlan {
+  /** leg-0 admitted rungs (a prefix of the leg-0 input order). */
+  leg0Rungs: number[];
+  /** leg-1 admitted rungs. */
+  leg1Rungs: number[];
+  /** Flat rung array: leg-0 admitted, then leg-1 admitted (the codegen/reference order). */
+  rungs: number[];
+  /** Admitted counts (prefixes of each leg's input). */
+  leg0Admitted: number;
+  leg1Admitted: number;
+  /** Modeled route CU of the admitted shape — also the codegen GasLeft floor. */
+  estimatedCu: number;
+  /** Budgeter notes: degradations and drops, packet-budgeter style. */
+  warnings: string[];
+}
+
+/**
+ * Fits a 2-hop route's per-slot rung counts (and, when degradation is not
+ * enough, the per-leg slot counts) to `cuBudget`, deterministically in its
+ * inputs alone. Degradation is the single-hop order over the COMBINED slot list
+ * (stable slots shed rungs toward MIN_RUNGS first, then CP; within a kind the
+ * most rungs first, later flat index on ties). When nothing is left to
+ * degrade, the TAIL slot drops — but NEVER a leg's last surviving slot (a route
+ * needs >= 1 enabled slot per leg or it is not a route), so drops come from the
+ * higher-flat-index leg's tail first (leg-1, then leg-0) and only while that leg
+ * has more than one admitted slot. A 1-slot-per-leg route still over budget at
+ * MIN_RUNGS throws infeasible (naming the estimate) — the caller falls back to
+ * direct-only or a different route, or relaxes with `cuBudget`.
+ */
+export function planRouteLadders(
+  leg0: readonly BudgetSlotInput[],
+  leg1: readonly BudgetSlotInput[],
+  cuBudget: number = CU_ADMISSION_BUDGET,
+): RouteLadderPlan {
+  if (leg0.length === 0 || leg1.length === 0) throw new Error('planRouteLadders needs at least one slot per leg');
+  const warnings: string[] = [];
+  let leg0Admitted = leg0.length;
+  let leg1Admitted = leg1.length;
+  const leg0Rungs = leg0.map((slot) => slot.rungs ?? defaultRungsFor(slot.slug));
+  const leg1Rungs = leg1.map((slot) => slot.rungs ?? defaultRungsFor(slot.slug));
+
+  const estimate = (): number =>
+    estimateRouteCu(
+      leg0.slice(0, leg0Admitted).map((slot, i) => ({ slug: slot.slug, rungs: leg0Rungs[i] })),
+      leg1.slice(0, leg1Admitted).map((slot, i) => ({ slug: slot.slug, rungs: leg1Rungs[i] })),
+    );
+
+  // Degrade one slot of the given kind: most rungs first, later flat index on
+  // ties (leg-1 slots are higher flat than leg-0), so identical pools keep
+  // balanced ladders and the merge's earliest-slot tie preference survives.
+  const degrade = (kind: 'stable' | 'cp'): boolean => {
+    let pickRungs: number[] | undefined;
+    let pickIndex = -1;
+    let pickCurrent = -1;
+    const consider = (rungsArr: number[], slots: readonly BudgetSlotInput[], admitted: number): void => {
+      for (let i = 0; i < admitted; i++) {
+        if (familyCuCoefficients(slots[i].slug).kind !== kind || rungsArr[i] <= MIN_RUNGS) continue;
+        if (pickRungs === undefined || rungsArr[i] >= pickCurrent) {
+          pickRungs = rungsArr;
+          pickIndex = i;
+          pickCurrent = rungsArr[i];
+        }
+      }
+    };
+    consider(leg0Rungs, leg0, leg0Admitted);
+    consider(leg1Rungs, leg1, leg1Admitted);
+    if (pickRungs === undefined) return false;
+    pickRungs[pickIndex] -= 1;
+    const leg = pickRungs === leg0Rungs ? 0 : 1;
+    warnings.push(
+      `ecoSwapSvm route CU budget: degraded leg-${leg} slot ${pickIndex} to ${pickRungs[pickIndex]} rungs (modeled ${estimate()} CU, budget ${cuBudget})`,
+    );
+    return true;
+  };
+
+  // Drop the tail slot, never emptying a leg (leg-1 tail first, then leg-0).
+  const drop = (): boolean => {
+    if (leg1Admitted > 1) {
+      leg1Admitted -= 1;
+      warnings.push(`ecoSwapSvm route CU budget: dropped leg-1 slot ${leg1Admitted} — modeled cost exceeds the ${cuBudget} CU budget`);
+      return true;
+    }
+    if (leg0Admitted > 1) {
+      leg0Admitted -= 1;
+      warnings.push(`ecoSwapSvm route CU budget: dropped leg-0 slot ${leg0Admitted} — modeled cost exceeds the ${cuBudget} CU budget`);
+      return true;
+    }
+    return false;
+  };
+
+  for (;;) {
+    if (estimate() <= cuBudget) break;
+    if (degrade('stable') || degrade('cp')) continue;
+    if (drop()) continue;
+    throw new Error(
+      `ecoSwapSvm route CU budget: a minimal 1-slot-per-leg route (${leg0[0].slug} >> ${leg1[0].slug}) at ${MIN_RUNGS} rungs models ${estimate()} CU,` +
+        ` over the ${cuBudget} CU budget (transaction cap ${CU_TRANSACTION_CAP}); pass a higher cuBudget to force it`,
+    );
+  }
+
+  const admittedLeg0 = leg0Rungs.slice(0, leg0Admitted);
+  const admittedLeg1 = leg1Rungs.slice(0, leg1Admitted);
+  return {
+    leg0Rungs: admittedLeg0,
+    leg1Rungs: admittedLeg1,
+    rungs: [...admittedLeg0, ...admittedLeg1],
+    leg0Admitted,
+    leg1Admitted,
+    estimatedCu: estimate(),
+    warnings,
+  };
 }

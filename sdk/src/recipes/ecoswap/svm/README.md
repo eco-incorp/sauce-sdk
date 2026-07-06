@@ -304,10 +304,89 @@ decay) + per-bin `update_volatility_accumulator` (vacc grows with |index_referen
 fee. Only fee-on-input (collect_fee_mode 0) + no-limit-order pools are walked (the limit-order fill
 layers and the OnlyY fee mode are gated).
 
-## Honest limits (Phase 1 + the Phase 2 CLMM/BIN/CLOB families)
+## 2-hop routes (A → X → B) — the SVM composite venue
 
-- **No multihop routes yet**; Phoenix / OpenBook remain future families on the manifest CLOB pattern.
+A route splits ONE swap across two sequential single-hop-style splits, chained through the user's
+intermediate-token ATA and computed + executed in ONE atomic `execute_from_account` instruction. It is
+a *recomposition* of the single-hop machinery — **no new SauceScript intrinsic, no new adapter contract,
+no engine change**. Every leg pool is a slot of an existing family reusing its `ladder.ts` fragment
+BYTE-FOR-BYTE (`route.ts`'s `emitLegBlock` calls `emitSetup`/`emitQuoteCall`/`emitLadderQuote`/
+`emitFinalQuote`/`buildSwapV2`/`referenceQuote` exactly as `codegen.ts` does); the only new codegen is a
+second inlined merge phase and an intermediate-delta read between the two.
+
+**The SVM atomicity advantage — why a route is lamport-EXACT, not fold-error bounded.** The EVM QL-legs
+shape must PREDICT every leg's output before any swap lands (one `cook()`, no mid-tx re-read), so it
+*folds* predicted heads through the legs. Solana lets an instruction **compute → exec → read realized
+state → compute → exec**, because after `invoke()` returns, `accountUint` reads the callee's committed
+writes (the mechanism the single-hop terminal delta check already uses). So a route runs, in one atomic
+instruction:
+
+1. read leg-0 pools live + solve the leg-0 split for `amountIn`;
+2. execute ALL leg-0 CPIs (they credit X into the user's intermediate ATA);
+3. read the **realized** intermediate delta on that ATA — `realizedX`;
+4. solve the leg-1 split on `realizedX` and the (leg-0-independent) live leg-1 pool state;
+5. execute ALL leg-1 CPIs (credit B into the user's out ATA);
+6. terminal: `realizedB ≥ minOut`.
+
+leg-1 solves on **genuine realized X**, not a predicted fold — so there is no fold-error to bound. The
+platform law is obeyed exactly as single-hop: each leg's *entire* split is computed before that leg's
+first CPI, and a failing CPI or a `throw` aborts the whole transaction — atomic, no partial fills.
+
+**The exactness keystone.** The single-hop lamport-exact gate already holds per family (`referenceQuote
+== in-VM predicted == the real venue binary's realized output`). So per leg-0 venue predicted ==
+realized, hence `Σ leg-0 predicted == realizedX`; the off-chain oracle (`routeReference`, composing
+`solveReference` twice) builds leg-1's grid on `Σ leg-0 predicted` and gets the IDENTICAL grid the chain
+builds on `realizedX`. The composed on-chain returndata equals the oracle **by construction** (absent
+genuine drift; drift is caught by `minOut`). This is why **intermediate mints are restricted to classic
+SPL (wSOL/USDC/USDT — no transfer fee)** and leg-0 to the exact-quadrilateral families: anything with
+`predicted != realized` desyncs the two leg-1 grids.
+
+**cfg / account / CU shape.** The route reuses the packed-`cfg` bytes arg unchanged: `[amountIn][minOut]`
+then per FLAT slot `[enable][…params]`, leg-0 slots first, then leg-1 slots — the leg boundary `k0` is
+STRUCTURAL (baked into the shape, recoverable from the `route:…>>…` shapeKey), never a cfg word, and
+there is **no `realizedX` word** (it is measured on-chain). A 1-CP-per-leg route is `2 + 2·2 = 6 words =
+48 B`. The plan is the union of both legs' account sets plus one shared intermediate ATA (`user:inter`,
+writable non-signer, leg-0's out ATA and leg-1's in ATA deduped); per-leg `SwapUser` threading is the
+only structural change (`buildSwapV2(cfg, i, legUser)` with leg-0 = {A → inter}, leg-1 = {inter → B}).
+The returndata is `[fills…][predicted…][realizedX][realizedB]` (`(2k+2)` 32-B words). CU: a route just
+runs two single-hop legs back to back, so the family coefficients (which already fold a CPI per slot)
+count both legs; `estimateRouteCu = estimateShapeCu(leg0 ++ leg1) + CU_TWO_HOP` adds the second merge
+base + the intermediate reads. **Measured (LiteSVM, stand-in CPIs):** a 1+1 raydium-cp route ≈ **776k
+CU**, a 2+1 ≈ **975k**, a 2+2 ≈ **946k** (all under the 1.4M cap). The leg-aware budgeter
+(`planRouteLadders`) degrades rungs across both legs, then drops only TAIL slots, **never a leg's last
+surviving slot** (a route needs ≥ 1 enabled slot per leg or it is not a route); a 1-per-leg route still
+over budget at `MIN_RUNGS` throws infeasible. Two heavy legs (CLMM/CLOB) exceed the cap, exactly as two
+heavy single-hop slots do.
+
+**Standalone-route-first (Phase 3b).** A swap is EITHER the direct-venue merge OR one 2-hop route — not
+both in one instruction (CU + merge-integration grounds; a route can't be a plain ladder slot without
+nested merges, which the no-helper-to-helper rule forbids inline). To get the best of both, prepare can
+quote BOTH `quoteEcoSwapSvm` and `quoteRouteEcoSwapSvm`, compare `totalOut`/`totalPredicted`, and stage
+the winner — a pure off-chain selection. Direct+route mixing (route as a composite venue in the
+top-level merge, the EVM shape) is the documented **Phase 3c** follow-up.
+
+**API:** `routeEcoSwapSvm({ amountIn, minOut, leg0Pools, leg1Pools, user, interRef?, … })` →
+`{ bytecode, argsLayout, accountPlan, quote, encodeTrade, sha256, leg0Count, leg1Count, … }` (mirrors
+`ecoSwapSvm`); `quoteRouteEcoSwapSvm` is the zero-chain composed quote; `stageRouteEcoSwapSvm` /
+`executeRouteEcoSwapSvm` are the stage-once/trade-many wrappers (the latter forwards `opts.alt` and
+`opts.prepends` — the idempotent intermediate-ATA create, `buildRouteInterAtaPrepend`, belongs in
+`prepends`). Routes ~double the account list, so an ALT is effectively mandatory; the single-hop
+`prepareAltForUniverse` / `selectEcoSwapSvmAltAddresses` / `ecoSwapSvmPacketBudget` work on the route
+output unchanged.
+
+## Honest limits (Phase 1 + the Phase 2 CLMM/BIN/CLOB families + Phase 3b routes)
+
+- **2-hop routes landed** (see above); N>2 hops, and direct+route mixing in one instruction (Phase 3c),
+  are follow-ups. Phoenix / OpenBook remain future families on the manifest CLOB pattern.
   (Whirlpools + Raydium CLMM + Meteora DLMM + Manifest landed — see the window notes above.)
+- **Route intermediate mints are classic-SPL only** (wSOL/USDC/USDT) and leg-0 venues must be
+  exact-quadrilateral families: a transfer-fee mint or a non-bit-exact leg-0 model breaks
+  `predicted == realized`, desyncing the composed oracle from the chain (the terminal `minOut` still
+  guards realized B under genuine drift, but the quote would no longer be bit-exact).
+- **Route CU wall:** only CP-family legs stack comfortably (a 1+1 or 2+1 CP route ≈ 0.8–1.0M CU); one
+  CLMM/stable leg + one CP leg is near the cap; two heavy legs are infeasible. A discovery result whose
+  BEST route needs a heavy leg is CU-infeasible — the leg-aware budgeter throws, and the off-chain
+  direct-vs-route selection falls back.
 - **The CLMM windows are 4 boundaries deep, the DLMM window 8 liquid bins deep, per direction**: a
   trade beyond the shipped depth self-caps and the merge reroutes the tail; a live tick/active_id
   drifting past the whole window deactivates the slot until re-prepare.
@@ -366,9 +445,12 @@ layers and the OnlyY fee mode are gated).
 
 Whirlpools + Manifest LANDED (prepare-declared windows + live-value walks; see the CLMM/CLOB window
 notes above — the whirlpool ships tick boundaries, the CLOB ships top-of-book order levels, both
-read all value-bearing state live). Remaining: Raydium CLMM / Meteora DLMM on the whirlpool pattern
-and Phoenix / OpenBook on the CLOB pattern, multihop route legs (each hop its own slot set, the EVM
-QL-legs shape), an ALT path for shapes whose account lists outgrow the 1,232-byte packet (a
+read all value-bearing state live). **2-hop routes LANDED** (Phase 3b, `route.ts` +
+`routeEcoSwapSvm`/`quoteRouteEcoSwapSvm` — the compute-exec-compute-exec composite venue; see the
+"2-hop routes" section above). Remaining: Raydium CLMM / Meteora DLMM on the whirlpool pattern
+and Phoenix / OpenBook on the CLOB pattern, N>2 hops and direct+route mixing (route as a
+composite venue in the top-level merge — the EVM QL-legs shape — is the Phase 3c follow-up), an
+ALT path for shapes whose account lists outgrow the 1,232-byte packet (a
 two-whirlpool shape already needs it: 16 cfg words per CLMM slot plus ~6 accounts; a manifest slot's
 cfg is ~33 words but only one account), per-level (rather than geometric-grid) rungs for the CLOB
 side to remove the residual split quantization (needs per-family grid support in codegen +
