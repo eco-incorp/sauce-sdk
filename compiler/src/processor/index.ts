@@ -124,6 +124,9 @@ function processFunctionV12(stmt: FunctionDeclaration, parentCtx: CompilerContex
   const ctx = parentCtx.forFunction();
   const name = stmt.id?.name ?? 'main';
   const isMain = name === 'main';
+  // Helpers self-terminate every `return` with FUNC_RETURN; main is inlined and
+  // just leaves its value (see CompilerContext.isMainFunction / V12Saucer.return).
+  ctx.isMainFunction = isMain;
   const argTypes = isMain ? parentCtx.mainArgTypes : undefined;
 
   // Params live on the EVM stack (isParam) in declaration order.

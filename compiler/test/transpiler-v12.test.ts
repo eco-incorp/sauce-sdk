@@ -251,21 +251,26 @@ const paramCases: ParamCase[] = [
 ];
 
 // Multi-function cases — captured hex (assembly validated by the integration suites).
+// A helper `return` now self-terminates with FUNC_RETURN (0xf3) so an EARLY return
+// inside a conditional exits instead of leaking its value and falling through; the
+// assembly's trailing per-helper FUNC_RETURN follows as (dead, unreachable) code.
+// (In the two-helper case the inc body's extra 0xf3 also shifts dbl's CALL_FUNCTION
+// jump offset 0x0011→0x0012.)
 const helperCases: { name: string; src: string; hex: string }[] = [
   {
     name: 'single-arg helper + call',
     src: 'function inc(n){ return n + 1n } function main(){ return inc(5n) }',
-    hex: '010599000801f200d1010121f3',
+    hex: '010599000801f200d1010121f3f3',
   },
   {
     name: 'two-arg helper + call',
     src: 'function add(a, b){ return a + b } function main(){ return add(3n, 7n) }',
-    hex: '0103010799000a02f200d2d221f3',
+    hex: '0103010799000a02f200d2d221f3f3',
   },
   {
     name: 'two helpers + nested call',
     src: 'function inc(n){ return n + 1n } function dbl(n){ return n * 2n } function main(){ return inc(dbl(5n)) }',
-    hex: '01059900110199000c01f200d1010121f3d1010223f3',
+    hex: '01059900120199000c01f200d1010121f3f3d1010223f3f3',
   },
 ];
 
@@ -305,6 +310,22 @@ describe("Transpiler — v12 target (compile(src, { target: 'v12' }))", () => {
         expect(compileV12(c.src)).toBe(c.hex);
       });
     }
+
+    it('early return inside a helper emits its own FUNC_RETURN (no stack leak)', () => {
+      // A helper with an EARLY return inside an `if` must terminate that path with
+      // FUNC_RETURN (0xf3) — otherwise the value is left on the stack and execution
+      // falls through into the rest of the body, leaking a stack item per call (a
+      // loop of such calls → EVM "out of stack" on the v12 runtime). Both the early
+      // and the tail return self-terminate, so the body carries TWO 0xf3 returns
+      // (plus the assembly's trailing dead one). main is INLINED — it must NOT emit a
+      // helper FUNC_RETURN, so its body has no 0xf3.
+      const src =
+        'function clamp(x){ if (x > 10n) { return 10n } return x } function main(){ return clamp(5n) }';
+      const bc = compileV12(src);
+      const funcReturns = (bc.match(/f3/g) ?? []).length;
+      // 2 in-body returns (early + tail) + 1 trailing assembly FUNC_RETURN = 3.
+      expect(funcReturns).toBeGreaterThanOrEqual(3);
+    });
   });
 
   describe('Array mutation (SET_INDEX / NEW_ARRAY)', () => {
