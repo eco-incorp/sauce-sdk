@@ -179,13 +179,11 @@ Flag and remove any unverified addresses.
 - [ ] CLI tool: `sauce-sdk list --category dex --chain base`
 - [ ] Auto-complete for protocol names and function signatures
 - [ ] Documentation generator from protocol info + functions
-- [ ] Recipe templates combining multiple protocols (e.g., "flash loan + swap + repay")
 
 ### Integration with Existing Codebase
 - [ ] Connect to `compiler-poc/` for real compilation testing
 - [ ] Connect to `dev-tools/` for on-chain execution
 - [ ] Align with existing `dev-tools/src/contracts.ts` address registry
-- [ ] Support the `dev-tools/recipes/` pattern for multi-protocol flows
 - [ ] Ensure Sauce functions match `dev-tools/sauce/ts/call.ts` import pattern
 
 ---

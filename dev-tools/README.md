@@ -114,7 +114,6 @@ dev-tools/
 ├── test/
 │   ├── examples.test.ts # Compilation tests for all examples
 │   └── e2e.test.ts      # End-to-end integration tests
-├── recipes/             # Multi-step Sauce recipes
 └── artifacts/           # Sauce engine contract artifact
 ```
 

@@ -5,9 +5,9 @@ Tooling for the Sauce protocol, published as a single npm package: `@eco-incorp/
 Includes:
 
 - A JS-like recipe **compiler** that emits Sauce bytecode.
-- A TypeScript **SDK** for building recipes against on-chain protocols (Uniswap, Curve, Balancer, …).
+- A TypeScript **SDK** for building against on-chain protocols (Uniswap, Curve, Balancer, …).
 - High-level **action primitives** (AMM swaps, multi-hop, split routing).
-- A local **dev environment** (hardhat fork, recipe runner, examples).
+- A local **dev environment** (hardhat fork, script runner, examples).
 
 ## Install
 
@@ -24,7 +24,6 @@ Everything ships under the single `@eco-incorp/sauce-sdk` package with subpath e
 ```ts
 import { compile } from '@eco-incorp/sauce-sdk/compiler'
 import { protocolInfo } from '@eco-incorp/sauce-sdk/protocols/uniswap-v3'
-import { megaSwap } from '@eco-incorp/sauce-sdk/recipes'
 import { Saucer } from '@eco-incorp/sauce-sdk/actions'
 // the bare specifier is the SDK entry
 import { /* ... */ } from '@eco-incorp/sauce-sdk'
@@ -37,9 +36,9 @@ Sources are organised as a pnpm workspace for development; everything ships unde
 | Path | What's in it | Subpath |
 | --- | --- | --- |
 | [`compiler/`](compiler/) | Recipe compiler (JS → Sauce bytecode) | `/compiler` |
-| [`sdk/`](sdk/) | Protocols, chains, skills, recipes | `/`, `/protocols/*`, `/chains`, `/skills`, `/recipes` |
+| [`sdk/`](sdk/) | Protocols, chains, skills | `/`, `/protocols/*`, `/chains`, `/skills` |
 | [`actions/`](actions/) | High-level action primitives | `/actions` |
-| [`dev-tools/`](dev-tools/) | Local fork environment, recipe runner, examples | bin: `sauce-dev-tools` |
+| [`dev-tools/`](dev-tools/) | Local fork environment, script runner, examples | bin: `sauce-dev-tools` |
 
 ## Development
 
