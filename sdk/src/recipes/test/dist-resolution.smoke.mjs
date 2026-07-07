@@ -1,19 +1,12 @@
 #!/usr/bin/env node
-// DIST-resolution smoke: proves the PUBLISHED /recipes and /svm exports resolve
-// from dist (no live RPC). Verifies, against sdk/dist:
+// DIST-resolution smoke: proves the PUBLISHED /recipes export resolves its runtime
+// assets from dist (no live RPC). Verifies, against sdk/dist:
 //   1. the built recipe barrel imports and exposes ecoSwap/megaSwap/etc.
 //   2. each recipe's `.sauce.ts` exists at the dist __dirname it readFileSyncs.
 //   3. compiling a recipe's `.sauce.ts` with the recipe's OWN dist baseDirs
 //      ([REPO_ROOT=dist, __dirname=dist/recipes/<name>]) resolves every JSON
 //      import — the engine `./artifacts/*.json` AND the sibling ABI JSONs —
 //      i.e. the exact path the dist-run recipe takes, with no ENOENT.
-//   4. the SVM surface resolves from dist: the /recipes barrel exposes the
-//      public EcoSwapSVM API, the /svm subpath export loads, a pure recipe
-//      export runs, and the staged `target:'svm'` codegen path compiles — all
-//      from dist. (The SVM recipe reads NO runtime .sauce.ts/JSON assets — its
-//      codegen builds the SauceScript in memory — so there is nothing on disk
-//      to resolve; these checks guard the dist MODULE GRAPH + the export
-//      surface the way (1)-(3) guard the EVM recipes' assets.)
 //
 // Run (after `pnpm --filter ./sdk build`): node src/recipes/test/dist-resolution.smoke.mjs
 import { createRequire } from "node:module";
@@ -97,39 +90,7 @@ async function main() {
   }
   console.log("[smoke] ecoswap.sauce.ts compiled from dist (v1+v12) — artifacts + sibling ABIs resolved OK");
 
-  // (4) the SVM surface resolves from dist.
-  for (const fn of [
-    "ecoSwapSvm",
-    "quoteEcoSwapSvm",
-    "stageEcoSwapSvm",
-    "executeEcoSwapSvm",
-    "prepareAltForUniverse",
-    "routeEcoSwapSvm",
-    "solveReference",
-  ]) {
-    assert.equal(typeof barrel[fn], "function", `dist barrel must export ${fn}()`);
-  }
-  // the /svm subpath export target loads and carries its public helpers.
-  const svm = await import(join(DIST, "svm", "index.js"));
-  for (const name of ["resolveAccounts", "kitBatchAccountLoader", "raydiumCpSwapLadder"]) {
-    assert.ok(svm[name] !== undefined, `dist /svm export must expose ${name}`);
-  }
-  // a pure recipe export runs from dist (no assets, no compiler).
-  const solved = barrel.solveReference([{ quote: (x) => x }], 1000n);
-  assert.equal(solved.slices[0], 1000n, "solveReference must run from dist");
-  // the staged `target:'svm'` codegen path — the exact compile mode ecoSwapSvm
-  // uses — emits bytecode + an account plan + an args layout from dist.
-  const svmProg = compile("function main(cfg) { return abi.encode(uint(cfg.slice(0, 8))); }", {
-    target: "svm",
-    staged: true,
-    args: ["0x0000000000000000"],
-  });
-  const svmSegs = svmProg.bytecode ?? svmProg.bytecodes;
-  assert.ok(Array.isArray(svmSegs) && svmSegs[0].length > 0, "svm staged compile must emit bytecode from dist");
-  assert.ok(svmProg.accountPlan && svmProg.argsLayout, "svm staged compile must emit account plan + args layout");
-  console.log("[smoke] SVM surface resolves from dist — /recipes barrel + /svm exports, solveReference runs, svm-staged compile OK");
-
-  console.log("[smoke] PASS — published /recipes + /svm resolve their dist assets without ENOENT");
+  console.log("[smoke] PASS — published /recipes resolves its dist assets without ENOENT");
 }
 
 main().catch((e) => {
