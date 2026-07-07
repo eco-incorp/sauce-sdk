@@ -125,51 +125,6 @@ BalancerV2=4, DODOV2=5, TraderJoeLB=6, MaverickV2=7, WOOFi=8`.
   contract's Solidity dispatcher, **not** the paused bytecode interpreter — so callbacks can only be
   serviced by the router's compiled code. These swaps **must** go through the router (`swapV3`/`swapV4`).
 
-## Recipes
-
-A recipe prepares pool data off-chain and executes it on-chain via one `cook()`. **Recipes exist in
-two drifted trees:**
-
-- `sdk/src/recipes/` — published library copy (`megaswap`, `alphaswap`), **untested**, behind dev-tools.
-- `dev-tools/recipes/` — source of truth (`megaswap`, `alphaswap`, `gigaswap`, `terraswap`), with the
-  CLI runner and fork tests. **Trust this tree.**
-
-Each recipe dir: `prepare.ts` (off-chain read-only RPC — discover/quote pools, compute slippage),
-`<name>.sauce.ts` (a **static** SauceScript template — not string-interpolated; read from disk, types
-stripped via `ts.transpileModule`, pool data passed as compiler **`args`**), `index.ts` (orchestrator:
-client → prepare → compile → `{ bytecodes, prepared, source }`), `shared/` (pool-discovery, quoting,
-constants, types). **The compiler must be built first** — sdk recipes import it by relative `dist`
-path, dev-tools recipes via the `@eco-incorp/sauce-compiler` workspace dep.
-
-### Running recipes against a fork / RPC (in `dev-tools/`)
-
-```sh
-pnpm sync-artifacts                                          # populate dev-tools/artifacts/ (once)
-npm run start:fork https://eth-mainnet.g.alchemy.com/v2/KEY  # boot fork + deploy, writes .deployment.json
-npm run recipe megaswap WETH USDC 1
-npm run stop
-npm run recipe megaswap WETH USDC 0.01 -- --network base     # live: hardcoded router + BASE_RPC_URL + PRIVATE_KEY
-```
-
-`scripts/recipe.ts` reads `.deployment.json`, auto-wraps ETH→WETH, auto-approves the router,
-prepares+compiles, `cook()`s, and parses `Transfer` logs. Tokens: `WETH/USDC/DAI/USDbC` or raw `0x`.
-
-### Artifacts
-
-`dev-tools/artifacts/*.json` (gitignored build output) are read by recipes (`quoting.ts`, the
-`.sauce.ts` JSON imports) and `deploy.ts` (`Router`/`SauceRouter` carry deploy bytecode). Populate
-them with **`pnpm sync-artifacts`**, which copies the `sauce` engine's Foundry build output (`forge
-build` runs in the compiler `postinstall`). This also runs automatically at **`prepack`** so the
-published package ships them.
-
-### Recipe tests (not wired into `npm test`)
-
-`dev-tools/recipes/test/{megaswap,alphaswap,gigaswap}.test.ts` are self-contained fork tests (plain
-`tsx` + hand-rolled asserts) — boot a fork pinned to a fixed block, deploy router, fund/approve,
-`prepare+compile+cook`, assert on balance deltas + events. Require `BASE_RPC_URL`, run manually
-(`BASE_RPC_URL=<url> npx tsx recipes/test/megaswap.test.ts`). dev-tools `npm test` only runs the
-`examples`/`runner` compile tests; sdk recipes have no tests; `terraswap` has no test.
-
 ## Publishing
 
 Tag-driven (`.github/workflows/publish.yml`): `git tag v1.2.3 && git push origin v1.2.3` (or manual
