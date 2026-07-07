@@ -219,6 +219,7 @@ export class CompilerContext {
     const scope = this.scopes.pop()!;
     for (const v of scope.variables.values()) {
       if (v.slot < 0) continue;
+
       if (v.kind === 'scalar') this.freeValueSlots.push(v.slot);
       else this.freeHeapSlots.push(v.slot);
     }
@@ -247,15 +248,19 @@ export class CompilerContext {
     // Memory-slot allocation reuses a slot freed by a popped sibling scope (lower
     // index → tighter packing → fewer total slots), else bumps the high-water mark.
     let slot: number;
+
     if (isParam) {
       slot = -1;
     } else if (kind === 'scalar') {
       slot = this.freeValueSlots.length > 0 ? this.freeValueSlots.pop()! : this.nextValueSlot++;
+
       if (slot + 1 > this.maxValueSlot) this.maxValueSlot = slot + 1;
     } else {
       slot = this.freeHeapSlots.length > 0 ? this.freeHeapSlots.pop()! : this.nextHeapSlot++;
+
       if (slot + 1 > this.maxHeapSlot) this.maxHeapSlot = slot + 1;
     }
+
     const variable: Variable = { name, slot, kind, elementType, structType, isParam };
     scope.variables.set(name, variable);
 

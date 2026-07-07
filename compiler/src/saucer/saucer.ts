@@ -552,6 +552,7 @@ export class Saucer implements SaucerLike {
           `slot >=256 would wrap and corrupt an earlier slot. Split the function or reuse locals.`,
       );
     }
+
     if (heapSlots > 0xff) {
       throw new Error(
         `too many heap (dynamic) locals: ${heapSlots} (max 255). Heap-slot indices are 1 byte; ` +

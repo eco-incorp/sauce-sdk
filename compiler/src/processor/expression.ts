@@ -265,13 +265,18 @@ function processAbiArg(arg: Expression, param: AbiParameter | undefined, ctx: Co
  */
 function isStaticAbiParam(param: AbiParameter): boolean {
   const t = param.type;
+
   if (t === 'tuple') return (param.components ?? []).every(isStaticAbiParam);
+
   if (t.endsWith('[]')) return false; // dynamic-length array
+
   const fixedArray = /^(.*)\[(\d+)\]$/.exec(t);
+
   if (fixedArray) {
     // T[k]: static iff element type T is static.
     return isStaticAbiParam({ ...param, type: fixedArray[1] });
   }
+
   return t !== 'bytes' && t !== 'string';
 }
 
@@ -305,14 +310,13 @@ function flattenStaticStructFields(
     // Flatten an all-static nested struct given as an object literal: splice its
     // (recursively flattened) fields into the parent instead of nesting a tuple.
     if (component.type === 'tuple' && value.type === 'ObjectExpression' && isStaticAbiParam(component)) {
-      out.push(
-        ...flattenStaticStructFields(value as ObjectExpression, component.components ?? [], ctx),
-      );
+      out.push(...flattenStaticStructFields(value as ObjectExpression, component.components ?? [], ctx));
       continue;
     }
 
     out.push(processAbiArg(value, component, ctx));
   }
+
   return out;
 }
 
