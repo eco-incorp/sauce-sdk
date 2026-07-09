@@ -16,6 +16,7 @@ import { isImmutablePackedArray } from '../saucer/index.js';
 import type { CompilerContext } from '../context.js';
 import { processExpression, processStatement } from './index.js';
 import { applyBinaryOp } from './expression.js';
+import { evalConstBool } from './const-eval.js';
 import {
   inferKindWithContext,
   inferElementTypeWithContext,
@@ -48,6 +49,25 @@ export function processVariableDeclaration(
 }
 
 export function processIfStatement(stmt: IfStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
+  // Conditional compilation: when folding is enabled and the test folds to a known
+  // boolean, emit ONLY the taken branch (and recurse into an `else if` chain). This
+  // mirrors collectCalls() EXACTLY (same evalConstBool prune, nothing else), so the
+  // CALL targets the emitter emits == the set treeshake walks — every emitted call
+  // therefore targets a registered function.
+  if (ctx.foldEnabled) {
+    const taken = evalConstBool(stmt.test, ctx);
+
+    if (taken === true) return saucer.join(processBlock(stmt.consequent, ctx));
+
+    if (taken === false) {
+      if (!stmt.alternate) return saucer;
+
+      return stmt.alternate.type === 'IfStatement'
+        ? processIfStatement(stmt.alternate as IfStatement, ctx, saucer)
+        : saucer.join(processBlock(stmt.alternate, ctx));
+    }
+  }
+
   const condition = processExpression(stmt.test, ctx);
   const thenBody = processBlock(stmt.consequent, ctx);
 
@@ -137,6 +157,15 @@ function processTernaryStore(
   ctx: CompilerContext,
   saucer: SaucerLike,
 ): SaucerLike {
+  // Conditional compilation (mirrors processIfStatement / collectCalls): a const-known
+  // test stores ONLY the taken side, so a guarded handler call in the untaken side is
+  // never emitted (and treeshake then drops it).
+  if (ctx.foldEnabled) {
+    const taken = evalConstBool(expr.test, ctx);
+
+    if (taken !== undefined) return storeExpression(name, taken ? expr.consequent : expr.alternate, ctx, saucer);
+  }
+
   const condition = processExpression(expr.test, ctx);
   const consequent = processExpression(expr.consequent, ctx);
   const alternate = processExpression(expr.alternate, ctx);
