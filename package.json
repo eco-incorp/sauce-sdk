@@ -38,6 +38,10 @@
     "./skills": {
       "types": "./sdk/dist/skills/loader.d.ts",
       "default": "./sdk/dist/skills/loader.js"
+    },
+    "./svm": {
+      "types": "./sdk/dist/svm/index.d.ts",
+      "default": "./sdk/dist/svm/index.js"
     }
   },
   "bin": {
