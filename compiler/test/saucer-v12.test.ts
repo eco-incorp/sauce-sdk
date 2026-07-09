@@ -28,6 +28,13 @@ describe('V12Saucer — postfix emission', () => {
     expect(hex(S().int(256n)._bytes)).toBe('020100');
   });
 
+  it('emits a negative constant postfix: literal first, NEG last', () => {
+    // encodeInt's v1 prefix form ([NEG][BYTE_N][…]) is reordered — the postfix
+    // engines pop NEG's operand off the stack. [BYTE_1,5][NEG=0x29].
+    expect(hex(S().int(-5n)._bytes)).toBe('010529');
+    expect(hex(S().int(-256n)._bytes)).toBe('02010029');
+  });
+
   it('context ops are nullary single opcodes', () => {
     expect(Array.from(S().msgSender()._bytes)).toEqual([OPS.MSG_SENDER]);
     expect(Array.from(S().blockTimestamp()._bytes)).toEqual([OPS.TIMESTAMP]);
@@ -338,7 +345,7 @@ describe('V12Saucer — signed/extended ops (v12-only)', () => {
   });
   it('cast/addMod/mulMod emit their opcodes', () => {
     const s = S();
-    expect(s.cast(s.bytes(new Uint8Array([1])))._bytes.at(-1)).toBe(OPS.CAST);
+    expect(s.castBe(s.bytes(new Uint8Array([1])))._bytes.at(-1)).toBe(OPS.CAST_BE);
     expect(s.addMod(s.int(1n), s.int(2n), s.int(3n))._bytes.at(-1)).toBe(OPS.ADD_MOD);
     expect(s.mulMod(s.int(1n), s.int(2n), s.int(3n))._bytes.at(-1)).toBe(OPS.MUL_MOD);
   });

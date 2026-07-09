@@ -190,7 +190,7 @@ const scenarios: Record<string, (c: CompilerContext) => Uint8Array> = {
   concat: (c) => S(c).concat([B(c, '1234'), B(c, '5678')])._bytes,
   concatScalar: (c) => S(c).concat([U(c, 5), U(c, 7)])._bytes,
   length: (c) => S(c).length(B(c, '123456'))._bytes,
-  cast: (c) => S(c).cast(B(c, '1234'))._bytes,
+  castBe: (c) => S(c).castBe(B(c, '1234'))._bytes,
 
   index: (c) => S(c).index(S(c).array([U(c, 0x10), U(c, 0x20), U(c, 0x30)]), U(c, 1))._bytes,
   tuple: (c) => S(c).tuple([B(c, '1234'), B(c, '5678')])._bytes,

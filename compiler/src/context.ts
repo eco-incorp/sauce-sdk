@@ -6,8 +6,10 @@ import { RESERVED_NAMES } from './globals.js';
 import { Saucer } from './saucer/saucer.js';
 import { V12Saucer } from './saucer/saucer-v12.js';
 import type { SaucerLike } from './saucer/saucer-like.js';
+import { AccountRegistry } from './planner/registry.js';
+import type { AccountPlan } from './planner/registry.js';
 
-export type CompileTarget = 'v1' | 'v12';
+export type CompileTarget = 'v1' | 'v12' | 'svm';
 
 export type VariableKind = 'scalar' | 'dynamic';
 
@@ -59,6 +61,8 @@ interface SharedModule {
   funcMeta: FunctionMeta[];
   /** Compile-time constants (name → known bigint) for conditional compilation. */
   defines: Map<string, bigint>;
+  /** svm: symbolic account refs → user-account indices, shared so helper functions share numbering. */
+  accounts: AccountRegistry;
 }
 
 export class CompilerContext {
@@ -150,15 +154,27 @@ export class CompilerContext {
     this.scopes.push({ variables: new Map() });
     this.baseDirs = baseDirs;
     this.target = target;
-    this.module = shared ?? { functions: [], contracts: new Map(), funcMeta: [], defines: new Map() };
+    this.module = shared ?? {
+      functions: [],
+      contracts: new Map(),
+      funcMeta: [],
+      defines: new Map(),
+      accounts: new AccountRegistry(),
+    };
 
     for (const [name, config] of Object.entries(contracts)) {
       this.registerContract(name, config.abi);
     }
   }
 
+  /** True for BOTH postfix v12 dialects — 'v12' (EVM Huff runtime) and 'svm' (Solana engine). */
   get isV12(): boolean {
-    return this.target === 'v12';
+    return this.target !== 'v1';
+  }
+
+  /** True only for the Solana target ('svm' is a v12 dialect with divergent call/storage lowering). */
+  get isSvm(): boolean {
+    return this.target === 'svm';
   }
 
   /** The function index table (shared across a v12 module's contexts). */
@@ -173,7 +189,24 @@ export class CompilerContext {
 
   /** Target-aware builder factory — the seam that keeps the processor agnostic. */
   newSaucer(): SaucerLike {
-    return this.target === 'v12' ? new V12Saucer(this) : new Saucer(this);
+    return this.target === 'v1' ? new Saucer(this) : new V12Saucer(this);
+  }
+
+  // ── svm account registry (module-shared, see planner/registry.ts) ──
+
+  /** svm: intern a symbolic account ref → stable user-account index (first-use order). */
+  internAccount(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
+    return this.module.accounts.intern(ref, flags);
+  }
+
+  /** svm: record that a raw numeric account index was used (locks out symbolic refs). */
+  useRawAccountIndex(): void {
+    this.module.accounts.useRawIndex();
+  }
+
+  /** svm: the ordered account plan assembled from the shared registry. */
+  buildAccountPlan(): AccountPlan {
+    return this.module.accounts.buildPlan();
   }
 
   /**

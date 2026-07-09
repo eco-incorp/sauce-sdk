@@ -334,6 +334,15 @@ function processContractCall(
   callTypeOverride?: 'static' | 'delegate',
   skipOutput?: boolean,
 ): SaucerLike {
+  // svm has no ABI-typed binding lowering yet (a binding would need per-method
+  // account lists); every typed-binding shape (inline chain, .view()/.lib(),
+  // variable-bound, standalone) funnels through here, so one guard covers them.
+  if (ctx.isSvm) {
+    throw new Error(
+      `contract bindings are not supported on target 'svm'; use contract.call(target, calldata, accounts)`,
+    );
+  }
+
   const method = contract.methods.get(methodName);
 
   if (!method) {
@@ -521,6 +530,10 @@ function resolveVariableBoundCatch(
 
 const RAW_CALL_METHODS = new Set(['call', 'static', 'delegate']);
 
+// Raw-call `.catch()` wrapping works on every target, including 'svm' — but there
+// the engine's CATCH intercepts only PRE-FLIGHT CPI failures (unresolvable target/
+// calldata/accounts operands); once invoke() launches, a failing callee aborts the
+// whole transaction. Same emission, narrower runtime semantics.
 function resolveRawCallCatch(
   innerCall: CallExpression,
   handlerBody: Statement,
