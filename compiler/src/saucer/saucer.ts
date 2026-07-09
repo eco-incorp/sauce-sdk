@@ -2,14 +2,12 @@ import { OPS } from './ops.js';
 import { encodeInt } from './integer.js';
 import { encodeReadByKind, encodeStoreByKind } from './memory.js';
 import { encodeBytes, encodeString } from './bytes.js';
-import { encodeArray, encodeIndex } from './array.js';
+import { encodeArray, encodeIndex, encodeSetIndex, encodeNewArray } from './array.js';
 import { encodeTuple } from './tuple.js';
 import type { CompilerContext, VariableKind, ElementType, StructType } from '../context.js';
+import type { SaucerLike, SaucerIfLike, SaucerThenLike, SaucerLoopLike, OutputSpec } from './saucer-like.js';
 
-export interface OutputSpec {
-  count: number;
-  typeSpecs: number[];
-}
+export type { OutputSpec };
 
 const MAX_BYTE_1 = 0xff;
 const MAX_BYTE_2 = 0xffff;
@@ -68,7 +66,7 @@ const mergeOffsets = (a: JumpOffsets, b: JumpOffsets): JumpOffsets => ({
   continues: [...a.continues, ...b.continues],
 });
 
-export class Saucer {
+export class Saucer implements SaucerLike {
   readonly _bytes: Uint8Array;
   readonly jumpOffsets: JumpOffsets;
 
@@ -235,6 +233,14 @@ export class Saucer {
 
   index(arr: Saucer, idx: Saucer): Saucer {
     return this.with(encodeIndex(idx, arr));
+  }
+
+  setIndex(arr: Saucer, idx: Saucer, value: Saucer): Saucer {
+    return this.with(encodeSetIndex(value, idx, arr));
+  }
+
+  newArray(count: Saucer): Saucer {
+    return this.with(encodeNewArray(count));
   }
 
   length(arr: Saucer): Saucer {
@@ -525,9 +531,34 @@ export class Saucer {
     return this.with([OPS.EVAL, ...bytecode._bytes]);
   }
 
+  // The prefix-tree interpreter discards a statement's result implicitly, so there
+  // is nothing to drop (see V12Saucer for the stack-based counterpart).
+  dropIfUnused(): Saucer {
+    return this;
+  }
+
   build(): Uint8Array {
     const valueSlots = this.ctx.valueSlotCount;
     const heapSlots = this.ctx.heapSlotCount;
+
+    // Value/heap slot indices are encoded as a SINGLE byte (READ_VALUE/WRITE_VALUE/
+    // ALLOCATE_VALUE and the HEAP equivalents — see saucer/memory.ts). A program with
+    // more than 256 scalar (or heap) locals would silently wrap slot index ≥256 to
+    // index mod 256, aliasing an earlier slot (e.g. a function parameter) and
+    // corrupting it at runtime. Fail loud at compile time instead of miscompiling.
+    if (valueSlots > 0xff) {
+      throw new Error(
+        `too many scalar locals: ${valueSlots} (max 255). Value-slot indices are 1 byte; ` +
+          `slot >=256 would wrap and corrupt an earlier slot. Split the function or reuse locals.`,
+      );
+    }
+
+    if (heapSlots > 0xff) {
+      throw new Error(
+        `too many heap (dynamic) locals: ${heapSlots} (max 255). Heap-slot indices are 1 byte; ` +
+          `slot >=256 would wrap and corrupt an earlier slot. Split the function or reuse locals.`,
+      );
+    }
 
     const prefix: number[] = [];
 
@@ -539,7 +570,7 @@ export class Saucer {
   }
 }
 
-class SaucerIf {
+class SaucerIf implements SaucerIfLike {
   constructor(
     private readonly parent: Saucer,
     private readonly condition: Saucer,
@@ -564,7 +595,7 @@ class SaucerIf {
   }
 }
 
-class SaucerThen extends Saucer {
+class SaucerThen extends Saucer implements SaucerThenLike {
   constructor(
     ctx: CompilerContext,
     bytes: Uint8Array,
@@ -600,7 +631,7 @@ class SaucerThen extends Saucer {
   }
 }
 
-class SaucerLoop {
+class SaucerLoop implements SaucerLoopLike {
   constructor(
     private readonly parent: Saucer,
     private readonly condition?: Saucer,

@@ -1,6 +1,10 @@
 import { OPS } from './ops.js';
 import { BYTE_OPS, BYTE_WIDTH } from './integer.js';
-import type { Saucer } from './saucer.js';
+
+// Structural view of a builder node — both v1 Saucer and v12 V12Saucer expose
+// `_bytes`, and array literals encode identically for either target. Named so it
+// doesn't shadow the real Saucer class.
+type BuilderNode = { _bytes: Uint8Array };
 
 const MAX_BYTE_1 = 0xff;
 const MAX_BYTE_2 = 0xffff;
@@ -16,11 +20,11 @@ const isRuntimeDynamic = (op: number): boolean =>
 
 const isDynamicType = (op: number): boolean => isDynamicLiteral(op) || isRuntimeDynamic(op);
 
-const allStatic = (elements: Saucer[]): boolean => elements.every((e) => isStaticType(e._bytes[0]));
+const allStatic = (elements: BuilderNode[]): boolean => elements.every((e) => isStaticType(e._bytes[0]));
 
-const allDynamic = (elements: Saucer[]): boolean => elements.every((e) => isDynamicType(e._bytes[0]));
+const allDynamic = (elements: BuilderNode[]): boolean => elements.every((e) => isDynamicType(e._bytes[0]));
 
-const maxByteWidth = (elements: Saucer[]): number => Math.max(...elements.map((e) => BYTE_WIDTH[e._bytes[0]]));
+const maxByteWidth = (elements: BuilderNode[]): number => Math.max(...elements.map((e) => BYTE_WIDTH[e._bytes[0]]));
 
 const padToWidth = (bytes: Uint8Array, width: number): number[] => {
   const valueBytes = bytes.slice(1); // Skip opcode
@@ -29,17 +33,17 @@ const padToWidth = (bytes: Uint8Array, width: number): number[] => {
   return [...Array<number>(padding).fill(0), ...valueBytes];
 };
 
-const packStaticElements = (elements: Saucer[], width: number): number[] =>
+const packStaticElements = (elements: BuilderNode[], width: number): number[] =>
   elements.flatMap((e) => padToWidth(e._bytes, width));
 
-const packDynamicElements = (elements: Saucer[]): number[] => elements.flatMap((e) => Array.from(e._bytes));
+const packDynamicElements = (elements: BuilderNode[]): number[] => elements.flatMap((e) => Array.from(e._bytes));
 
 const encodeLength = (length: number): { op: number; bytes: number[] } =>
   length <= MAX_BYTE_1
     ? { op: OPS.ARRAY, bytes: [length] }
     : { op: OPS.ARRAY_2, bytes: [(length >> 8) & 0xff, length & 0xff] };
 
-export const encodeArray = (elements: Saucer[]): Uint8Array => {
+export const encodeArray = (elements: BuilderNode[]): Uint8Array => {
   if (elements.length === 0) return new Uint8Array([OPS.ARRAY, 0, OPS.BYTE_1]);
 
   if (elements.length > MAX_BYTE_2)
@@ -63,5 +67,29 @@ export const encodeArray = (elements: Saucer[]): Uint8Array => {
   return new Uint8Array([op, ...lengthBytes, elementType, ...packDynamicElements(elements)]);
 };
 
-export const encodeIndex = (index: Saucer, array: Saucer): Uint8Array =>
+export const encodeIndex = (index: BuilderNode, array: BuilderNode): Uint8Array =>
   new Uint8Array([OPS.INDEX, ...index._bytes, ...array._bytes]);
+
+// In-place element assignment `arr[i] = value`. v1 prefix order:
+// [SET_INDEX][value][index][array] — value first, array last.
+export const encodeSetIndex = (value: BuilderNode, index: BuilderNode, array: BuilderNode): Uint8Array =>
+  new Uint8Array([OPS.SET_INDEX, ...value._bytes, ...index._bytes, ...array._bytes]);
+
+// `new Array(n)` → zero-initialized TUPLE of n slots. v1 prefix: [NEW_ARRAY][count].
+export const encodeNewArray = (count: BuilderNode): Uint8Array => new Uint8Array([OPS.NEW_ARRAY, ...count._bytes]);
+
+// Whether a value's encoded bytes are a STATIC PACKED array literal — element-
+// width-packed (element-type byte 0x01..0x20) and therefore immutable: the engine
+// reverts SET_INDEX on it (only TUPLE and dynamic arrays, element-type byte > 0x20,
+// are in-place mutable). Mirrors the engine's `do_set_idx_array` subtype check so
+// the compiler rejects exactly the targets the runtime would reject — no false
+// positives. TUPLE / NEW_ARRAY / dynamic-element arrays / scalars all return false.
+export const isImmutablePackedArray = (bytes: Uint8Array): boolean => {
+  const op = bytes[0];
+
+  if (op !== OPS.ARRAY && op !== OPS.ARRAY_2) return false;
+
+  const elementType = bytes[op === OPS.ARRAY ? 2 : 3];
+
+  return elementType >= 0x01 && elementType <= 0x20;
+};
