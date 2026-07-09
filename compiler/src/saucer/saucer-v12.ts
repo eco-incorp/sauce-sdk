@@ -262,6 +262,16 @@ export class V12Saucer implements SaucerLike {
     return this.withBytes([OPS.CALL_VALUE], this.stackEffect + 1, false);
   }
   msgData(): V12Saucer {
+    // Staged svm user code must never emit its own CALLDATA: every CALLDATA
+    // materializes the WHOLE `program ++ args` composite into the 65,535-byte
+    // heap (25% of it at 16 KB), and the staged arg prologue already owns the
+    // single sanctioned one — per-execution values arrive as payload args.
+    if (this.ctx.isSvm && this.ctx.staged) {
+      throw new Error(
+        'msg.data is not supported in staged svm mode (CALLDATA copies the whole staged program to the heap); pass per-execution values as payload args instead',
+      );
+    }
+
     return this.withBytes([OPS.CALLDATA], this.stackEffect + 1, true);
   }
   blockNumber(): V12Saucer {

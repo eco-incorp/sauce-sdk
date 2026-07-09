@@ -1,29 +1,28 @@
 /**
  * Shared LiteSVM engine harness for the engine-gated (`SAUCE_ENGINE_SO`)
- * solswap suites: boots the real SVM engine with pre-provisioned PDAs, pins
- * the cluster clock (the venue fragments read Clock via block.timestamp),
- * loads venue fixtures, fabricates SPL token accounts / address lookup tables,
- * and executes compiled programs through the sdk's own pure builders
- * (resolveAccounts + buildExecuteInstruction + buildExecuteTransaction).
+ * solswap suites: boots the real SVM engine, pins the cluster clock (the venue
+ * fragments read Clock via block.timestamp), loads venue fixtures, fabricates
+ * SPL token accounts / address lookup tables, and executes compiled programs
+ * through the sdk's own pure builders (resolveAccounts +
+ * buildExecuteInstruction + buildExecuteTransaction). Interpreter memory is
+ * the transaction's 256 KiB heap frame — no memory accounts, no provisioning;
+ * every execute transaction carries the RequestHeapFrame prepend.
  */
 import { existsSync } from 'fs';
 import { resolve } from 'path';
 import { getAddressCodec, generateKeyPairSigner, lamports } from '@solana/kit';
 import type { Address, AddressesByLookupTableAddress, Instruction, KeyPairSigner } from '@solana/kit';
-import { Clock, FailedTransactionMetadata, LiteSVM } from 'litesvm';
+import { Clock, FailedTransactionMetadata, FeatureSet, LiteSVM } from 'litesvm';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 import {
   buildComputeBudgetPrepend,
   buildExecuteInstruction,
   buildExecuteTransaction,
-  deriveEnginePdas,
+  buildHeapFramePrepend,
   getTransactionSize,
-  PDA_FRAMES_BYTES,
-  PDA_HEAP_BYTES,
-  PDA_STACK_BYTES,
   resolveAccounts,
 } from '../../src/svm/index.js';
-import type { AccountResolution, EnginePda, EnginePdas, SignedExecuteTransaction } from '../../src/svm/index.js';
+import type { AccountResolution, SignedExecuteTransaction } from '../../src/svm/index.js';
 import { fixtureAccounts } from './fixtures.js';
 import type { AccountFixture } from './fixtures.js';
 
@@ -44,19 +43,28 @@ export interface EngineHarness {
   svm: LiteSVM;
   programId: Address;
   payer: KeyPairSigner;
-  pdas: EnginePdas;
 }
 
 export const randomAddress = (): Address => getAddressCodec().decode(crypto.getRandomValues(new Uint8Array(32)));
 
 /**
- * Boots LiteSVM with the engine program, a funded payer, full-size PDAs
- * (zeroed data + canonical bump, what the on-chain init loop builds), and the
- * cluster clock pinned to `unixTimestamp` — the venue quote fragments read
+ * Boots LiteSVM with the engine program, a funded payer, and the cluster
+ * clock pinned to `unixTimestamp` — the venue quote fragments read
  * block.timestamp, so engine-side quotes evaluate at exactly this instant.
+ * No memory setup exists: interpreter memory is the per-transaction heap
+ * frame, requested by the RequestHeapFrame prepend on every execute.
  */
 export const startEngine = async (unixTimestamp: bigint): Promise<EngineHarness> => {
-  const svm = new LiteSVM();
+  // The default constructor's program runtime misses the
+  // sol_remaining_compute_units syscall (the engine's GasLeft, 0x62 — the
+  // EcoSwapSVM CU-floor guard); rebuilding the runtime with every feature
+  // enabled registers it, matching mainnet where the feature is long active.
+  const svm = new LiteSVM()
+    .withFeatureSet(FeatureSet.allEnabled())
+    .withBuiltins()
+    .withPrecompiles()
+    .withSysvars()
+    .withDefaultPrograms();
   const programId = (await generateKeyPairSigner()).address;
   svm.addProgramFromFile(programId, ENGINE_SO);
 
@@ -66,26 +74,7 @@ export const startEngine = async (unixTimestamp: bigint): Promise<EngineHarness>
   const payer = await generateKeyPairSigner();
   svm.airdrop(payer.address, lamports(1_000_000_000_000n));
 
-  const pdas = await deriveEnginePdas(programId);
-  const specs: [EnginePda, number][] = [
-    [pdas.stack, PDA_STACK_BYTES],
-    [pdas.heap, PDA_HEAP_BYTES],
-    [pdas.frames, PDA_FRAMES_BYTES],
-  ];
-  for (const [pda, size] of specs) {
-    const data = new Uint8Array(size);
-    data[0] = pda.bump;
-    svm.setAccount({
-      address: pda.address,
-      data,
-      executable: false,
-      lamports: lamports(svm.minimumBalanceForRentExemption(BigInt(size))),
-      programAddress: programId,
-      space: BigInt(size),
-    });
-  }
-
-  return { svm, programId, payer, pdas };
+  return { svm, programId, payer };
 };
 
 /** Loads mainnet fixture dumps into the bank (rent-exempt, original owners). */
@@ -104,13 +93,14 @@ export const tokenAccountData = (mint: Address, owner: Address, amount: bigint):
   return data;
 };
 
-/** Places a Tokenkeg-owned token account at `address` and returns the address. */
+/** Places a token account at `address` (Tokenkeg-owned unless `tokenProgram` says otherwise) and returns the address. */
 export const setTokenAccount = (
   harness: EngineHarness,
   address: Address,
   mint: Address,
   owner: Address,
   amount: bigint,
+  tokenProgram: Address = TOKEN_PROGRAM,
 ): Address => {
   const data = tokenAccountData(mint, owner, amount);
   harness.svm.setAccount({
@@ -118,7 +108,7 @@ export const setTokenAccount = (
     data,
     executable: false,
     lamports: lamports(harness.svm.minimumBalanceForRentExemption(BigInt(data.length))),
-    programAddress: TOKEN_PROGRAM,
+    programAddress: tokenProgram,
     space: BigInt(data.length),
   });
   return address;
@@ -188,7 +178,8 @@ export interface ExecuteOptions {
 
 /**
  * Signs (but does not send) the execute transaction for a compiled output: CU
- * prepend + engine execute instruction, v0, optionally ALT-compressed.
+ * prepend + the mandatory heap-frame request + engine execute instruction,
+ * v0, optionally ALT-compressed.
  */
 export const signExecuteTransaction = async (
   harness: EngineHarness,
@@ -199,9 +190,9 @@ export const signExecuteTransaction = async (
   const accounts = resolveAccounts(output.accountPlan, resolution, harness.payer.address);
   const instructions: Instruction[] = [
     ...buildComputeBudgetPrepend({ unitLimit: computeUnits }),
+    buildHeapFramePrepend(),
     buildExecuteInstruction({
       programId: harness.programId,
-      pdas: harness.pdas,
       bytecode: output.bytecode,
       accounts,
     }),
@@ -218,6 +209,32 @@ export const signExecuteTransaction = async (
     lookupTables,
   });
 };
+
+/**
+ * Signs (but does not send) arbitrary instructions as one payer-fee-paid v0
+ * transaction on a fresh blockhash — the staging-protocol building block
+ * (init/write/finalize/close txs and hand-assembled execute_from_account
+ * transactions are all built through it). Callers assembling an EXECUTE
+ * transaction must include buildHeapFramePrepend() themselves.
+ */
+export const buildExecuteTransactionForHarness = async (
+  harness: EngineHarness,
+  instructions: readonly Instruction[],
+): Promise<SignedExecuteTransaction> => {
+  // A fresh blockhash per send keeps signatures unique — LiteSVM's history
+  // rejects a byte-identical resend.
+  harness.svm.expireBlockhash();
+
+  return buildExecuteTransaction({
+    payer: harness.payer,
+    instructions,
+    latestBlockhash: { blockhash: harness.svm.latestBlockhash(), lastValidBlockHeight: 1_000_000n },
+  });
+};
+
+/** Builds, signs, and sends one transaction of `instructions`; returns the run result. */
+export const sendInstructions = async (harness: EngineHarness, instructions: readonly Instruction[]): Promise<RunResult> =>
+  sendSigned(harness, await buildExecuteTransactionForHarness(harness, instructions));
 
 export const sendSigned = (harness: EngineHarness, transaction: SignedExecuteTransaction): RunResult => {
   const result = harness.svm.sendTransaction(transaction);

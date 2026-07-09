@@ -23,6 +23,9 @@ export interface AccountMeta {
   signer: boolean;
 }
 
+/** Reserved ref: the SDK's resolveAccounts binds it to the fee payer (signer). */
+export const PAYER_REF = 'payer';
+
 /** Ordered account plan: metas[i] is user-account index i (after the 3 engine PDAs). */
 export interface AccountPlan {
   metas: AccountMeta[];
@@ -50,6 +53,10 @@ export class AccountRegistry {
   intern(ref: string, flags: { writable?: boolean; signer?: boolean } = {}): number {
     this.setMode('refs');
 
+    return this.place(ref, flags);
+  }
+
+  private place(ref: string, flags: { writable?: boolean; signer?: boolean }): number {
     let entry = this.entries.get(ref);
 
     if (!entry) {

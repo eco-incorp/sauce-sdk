@@ -4,7 +4,7 @@ import {
   buildComputeBudgetPrepend,
   buildExecuteInstruction,
   buildExecuteTransaction,
-  deriveEnginePdas,
+  buildHeapFramePrepend,
   getTransactionSize,
   resolveAccounts,
 } from '../../src/svm/index.js';
@@ -24,10 +24,10 @@ beforeAll(async () => {
 
 describe('buildExecuteTransaction', () => {
   it('signs a version-0 transaction with the fee payer and all instructions', async () => {
-    const pdas = await deriveEnginePdas(PROGRAM_ID);
     const instructions = [
       ...buildComputeBudgetPrepend({ unitLimit: 200_000 }),
-      buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts: [] }),
+      buildHeapFramePrepend(),
+      buildExecuteInstruction({ programId: PROGRAM_ID, bytecode: new Uint8Array([0x00]), accounts: [] }),
     ];
 
     const transaction = await buildExecuteTransaction({ payer, instructions, latestBlockhash: BLOCKHASH });
@@ -35,7 +35,7 @@ describe('buildExecuteTransaction', () => {
     const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
     expect(compiled.version).toBe(0);
     if (compiled.version !== 0) throw new Error('expected a v0 compiled message');
-    expect(compiled.instructions).toHaveLength(2);
+    expect(compiled.instructions).toHaveLength(3);
     // fee payer is the first static account
     expect(compiled.staticAccounts[0]).toBe(payer.address);
 
@@ -53,11 +53,11 @@ describe('buildExecuteTransaction', () => {
 
   it('signs for a non-payer plan signer attached to the execute metas via resolveAccounts', async () => {
     const delegate = await generateKeyPairSigner();
-    const pdas = await deriveEnginePdas(PROGRAM_ID);
     const plan = { metas: [{ ref: 'delegate', writable: false, signer: true }] };
     const accounts = resolveAccounts(plan, { delegate: { address: delegate.address, signer: delegate } }, payer.address);
     const instructions = [
-      buildExecuteInstruction({ programId: PROGRAM_ID, pdas, bytecode: new Uint8Array([0x00]), accounts }),
+      buildHeapFramePrepend(),
+      buildExecuteInstruction({ programId: PROGRAM_ID, bytecode: new Uint8Array([0x00]), accounts }),
     ];
 
     const transaction = await buildExecuteTransaction({ payer, instructions, latestBlockhash: BLOCKHASH });

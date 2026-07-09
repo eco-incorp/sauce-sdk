@@ -1,29 +1,30 @@
-import { getProgramDerivedAddress } from '@solana/kit';
+import { getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import { FRAMES_SEED, HEAP_SEED, STACK_SEED } from './engine.js';
+import { BUFFER_SEED } from './engine.js';
 
 export interface EnginePda {
   address: Address;
   bump: number;
 }
 
-export interface EnginePdas {
-  stack: EnginePda;
-  heap: EnginePda;
-  frames: EnginePda;
+function assertByteSeed(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xff) {
+    throw new Error(`${name} must be a u8 (0-255), got ${value}`);
+  }
 }
 
-/** Derives the three engine PDAs (single-seed, canonical bump) for a deployed engine program. */
-export async function deriveEnginePdas(programId: Address): Promise<EnginePdas> {
-  const [stack, heap, frames] = await Promise.all(
-    [STACK_SEED, HEAP_SEED, FRAMES_SEED].map(seed =>
-      getProgramDerivedAddress({ programAddress: programId, seeds: [seed] }),
-    ),
-  );
+/**
+ * Derives a bytecode buffer PDA: ["buffer", authority, [index]]. The index (not
+ * a content hash) keeps the address stable across recompiles — cross-lifecycle
+ * integrity is the execute hash pin, never the address alone.
+ */
+export async function deriveBufferPda(programId: Address, authority: Address, index: number): Promise<EnginePda> {
+  assertByteSeed(index, 'buffer index');
 
-  return {
-    stack: { address: stack[0], bump: stack[1] },
-    heap: { address: heap[0], bump: heap[1] },
-    frames: { address: frames[0], bump: frames[1] },
-  };
+  const [address, bump] = await getProgramDerivedAddress({
+    programAddress: programId,
+    seeds: [BUFFER_SEED, getAddressEncoder().encode(authority), new Uint8Array([index])],
+  });
+
+  return { address, bump };
 }

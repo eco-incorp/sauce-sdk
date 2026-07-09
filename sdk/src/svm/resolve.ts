@@ -1,4 +1,4 @@
-import { AccountRole } from '@solana/kit';
+import { AccountRole, isSignerRole } from '@solana/kit';
 import type { Address, TransactionSigner } from '@solana/kit';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 
@@ -20,6 +20,20 @@ export interface AccountResolution {
  */
 export const PAYER_REF = 'payer';
 
+export interface ResolveAccountsOptions {
+  /**
+   * Append the fee payer as a readonly signer at the END of the tail (plan
+   * indices stay stable) when no resolved meta already signs. The engine's
+   * NoSigner is LAZY — raised only when the program executes
+   * MSG_SENDER/TX_ORIGIN — so a signerless list is valid for programs that
+   * never read the sender (and lets simulations run sigVerify: false with no
+   * signer at all). Set this for MSG_SENDER-reading programs whose plan
+   * carries no signer meta; prefer the reserved 'payer' ref when the payer
+   * should occupy a plan slot instead.
+   */
+  appendPayerSigner?: boolean;
+}
+
 export interface ResolvedAccountMeta {
   address: Address;
   role: AccountRole;
@@ -33,14 +47,24 @@ export interface ResolvedAccountMeta {
 
 /**
  * Resolves an AccountPlan into ordered account metas: metas[i] is user-account
- * index i of the execute instruction (i.e. instruction account index i + 3).
- * writable comes from the plan; signer is upgraded by the plan flag, the
- * resolution entry's signer flag or TransactionSigner, or the reserved
- * PAYER_REF. An attached TransactionSigner rides on the meta so the
- * transaction builder signs with it. Duplicate addresses across refs are
- * fine — Solana dedupes at message compile.
+ * index i of the execute instruction (inline: instruction account i; staged:
+ * i + 1, after the buffer). writable comes from the plan; signer is upgraded
+ * by the plan flag, the resolution entry's signer flag or TransactionSigner,
+ * or the reserved PAYER_REF. An attached TransactionSigner rides on the meta
+ * so the transaction builder signs with it. Duplicate addresses across refs
+ * are fine — Solana dedupes at message compile.
+ *
+ * MSG_SENDER/TX_ORIGIN is the first in-list signer, resolved LAZILY by the
+ * engine (NoSigner only when the program actually reads the sender) — so no
+ * signer is auto-appended; a MSG_SENDER-reading program whose plan carries no
+ * signer meta passes `appendPayerSigner: true`.
  */
-export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution, payer: Address): ResolvedAccountMeta[] {
+export function resolveAccounts(
+  plan: AccountPlan,
+  resolution: AccountResolution,
+  payer: Address,
+  { appendPayerSigner = false }: ResolveAccountsOptions = {},
+): ResolvedAccountMeta[] {
   if (plan.usesRawIndices) {
     throw new Error('account plan uses raw indices: the caller owns the account ordering, build metas manually');
   }
@@ -101,6 +125,10 @@ export function resolveAccounts(plan: AccountPlan, resolution: AccountResolution
 
   if (unresolved.length > 0) {
     throw new Error(`unresolved account refs: ${unresolved.join(', ')} (provide addresses in the resolution map)`);
+  }
+
+  if (appendPayerSigner && !metas.some(meta => isSignerRole(meta.role))) {
+    metas.push({ address: payer, role: AccountRole.READONLY_SIGNER });
   }
 
   return metas;
