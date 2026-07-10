@@ -22,6 +22,9 @@ export {
   arrayStartIndex as raydiumClmmArrayStartIndex,
   windowStartTicks as raydiumClmmWindowStartTicks,
   windowFor as raydiumClmmWindowFor,
+  POOL_DISCRIMINATOR as RAYDIUM_CLMM_POOL_DISCRIMINATOR,
+  TICK_ARRAY_DISCRIMINATOR as RAYDIUM_CLMM_TICK_ARRAY_DISCRIMINATOR,
+  AMM_CONFIG_DISCRIMINATOR as RAYDIUM_CLMM_AMM_CONFIG_DISCRIMINATOR,
 } from './raydium-clmm/index.js';
 export type { RaydiumClmmPoolConfig, RaydiumClmmWindow, RaydiumClmmBoundary } from './raydium-clmm/index.js';
 export {
@@ -39,12 +42,20 @@ export {
   fetchMeteoraDlmmConfig,
   METEORA_DLMM_PROGRAM_ID,
   METEORA_DLMM_MAX_BINS,
+  LB_PAIR_DISCRIMINATOR,
+  BIN_ARRAY_DISCRIMINATOR,
   windowArrayIndexes as meteoraDlmmWindowArrayIndexes,
   windowFor as meteoraDlmmWindowFor,
 } from './meteora-dlmm/index.js';
 export type { MeteoraDlmmPoolConfig, DlmmWindow, DlmmBin } from './meteora-dlmm/index.js';
 export { meteoraDlmmLadder } from './meteora-dlmm/ladder.js';
-export { priceFromId as dlmmPriceFromId, pow as dlmmPow, amountOut as dlmmAmountOut, amountIn as dlmmAmountIn } from './meteora-dlmm/bin-math.js';
+export {
+  priceFromId as dlmmPriceFromId,
+  pow as dlmmPow,
+  amountOut as dlmmAmountOut,
+  amountIn as dlmmAmountIn,
+  binArrayIndex as dlmmBinArrayIndex,
+} from './meteora-dlmm/bin-math.js';
 export * from './manifest/index.js';
 export * from './manifest/ladder.js';
 export * from './meteora-damm-v2/index.js';
