@@ -245,7 +245,10 @@ export function resolveContractCallTarget(expr: Expression, ctx: CompilerContext
   if (chain) {
     const contract = ctx.lookupContract(chain.contractName);
 
-    if (!contract) return; // not a known contract — let the normal call path report it
+    // The .at()/.view()/.lib() chain shape is unambiguous — an unknown name is a
+    // genuine error, and the normal call path reports it with this exact message
+    // (so a probe caller surfaces nothing the emission wouldn't).
+    if (!contract) throw new Error(`Unknown contract: ${chain.contractName}`);
 
     const method = contract.methods.get(chain.methodName);
 

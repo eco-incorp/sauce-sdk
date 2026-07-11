@@ -82,6 +82,15 @@ function processDestructuringDeclaration(
   ctx: CompilerContext,
   saucer: SaucerLike,
 ): SaucerLike {
+  // Fail with a destructuring-specific message on svm: the generic binding
+  // error suggests contract.call(...), which cannot be destructured either.
+  if (ctx.isSvm) {
+    throw new Error(
+      `array destructuring is not supported on target 'svm' — contract bindings are not available there; ` +
+        `read fields from the contract.call(...) returndata with slice()/uint()`,
+    );
+  }
+
   if (init.type === 'CallExpression' && resolveCatchChain(init as CallExpression)) {
     throw new Error(
       'cannot destructure a .catch() chain — a catch handler cannot capture call outputs; destructure the bare call instead',
@@ -159,6 +168,23 @@ function processDestructuringDeclaration(
 
   for (const { name, index } of bindings) {
     const output = outputs[index];
+
+    // The compiler has no block scope for if-bodies, so a destructured name
+    // that already exists resolves to the EXISTING variable — and store() uses
+    // ITS kind, silently discarding the component's. For a dynamic component
+    // landing in a scalar slot that drops the heap descriptor (the exact fault
+    // class this lowering exists to avoid), so reject the mismatch instead of
+    // miscompiling. A matching kind reassigns, like a plain const would.
+    const existing = ctx.getVar(name);
+    const kind = abiOutputKind(output);
+
+    if (existing && !existing.isParam && existing.kind !== kind) {
+      throw new Error(
+        `cannot destructure output ${index}${output.name ? ` ('${output.name}')` : ''} of ${label} into ` +
+          `existing ${existing.kind} variable '${name}' (needs a ${kind} slot) — use a fresh name`,
+      );
+    }
+
     const width = fastPath ? elementaryStaticWidth(output) : undefined;
 
     // v12, elementary-static component: zero-copy word extraction. SLICE on the
@@ -184,7 +210,13 @@ function processDestructuringDeclaration(
             ctx.newSaucer().int(BigInt(index)),
           );
 
-    result = result.store(name, value, abiOutputKind(output), destructuredElementType(output));
+    result = result.store(name, value, kind, destructuredElementType(output));
+
+    // A destructured element is a single decoded component, never a raw
+    // multi-output word — clear any stale tag on a reused name.
+    const bound = ctx.getVar(name);
+
+    if (bound) bound.multiOutputCall = undefined;
   }
 
   return result;
@@ -320,20 +352,23 @@ export function storeExpression(name: string, expr: Expression, ctx: CompilerCon
       if (variable) {
         variable.immutablePacked = isImmutablePackedArray(value._bytes);
         // Metadata only (bytes above are untouched): on v1, remember that the
-        // variable was assigned a multi-output call result — a later indexed
-        // read of it would fault INDEX at runtime, so it is rejected at compile
-        // time (processIndexAccess) with a pointer at destructuring. Cleared on
-        // any other assignment so a reassigned variable indexes normally again.
-        variable.multiOutputCall = undefined;
-
-        if (!ctx.isV12 && expr.type === 'CallExpression' && !resolveCatchChain(expr as CallExpression)) {
-          // Pure probe — resolveContractCallTarget emits nothing (addr is lazy).
-          const target = resolveContractCallTarget(expr, ctx);
-
-          if (target && (target.method.outputs?.length ?? 0) > 1) {
-            variable.multiOutputCall = target.method.outputs;
-          }
-        }
+        // variable was assigned a multi-output call result INTO A SCALAR SLOT —
+        // a later indexed read of it would fault INDEX at runtime, so it is
+        // rejected at compile time (processIndexAccess) with a pointer at
+        // destructuring. A DYNAMIC-kind destination is exempt: the heap
+        // round-trip preserves the decoded tuple on v1 (same mechanism as the
+        // new-Array dynamic-kind fix — runtime-verified), so `let s = [0, 0];
+        // s = pool.slot0(); s[1]` keeps working. Cleared on any other
+        // assignment so a reassigned variable indexes normally again; an
+        // Identifier initializer PROPAGATES the source tag (`const t = s`
+        // copies the descriptor-less word, so `t[k]` faults exactly like
+        // `s[k]`). Known over-approximation: the tag is flow-insensitive — a
+        // store inside an if-branch taints reads on the untaken path (the
+        // sibling clear on the other branch restores it in the else-form).
+        // Known holes (pre-existing fault class, still compile): a
+        // single-multi-output-branch ternary, and passing the tagged word into
+        // a helper function.
+        variable.multiOutputCall = multiOutputCallOutputs(expr, ctx, variable);
       }
 
       ctx.consumePendingContractBinding(name);
@@ -341,6 +376,28 @@ export function storeExpression(name: string, expr: Expression, ctx: CompilerCon
       return result;
     }
   }
+}
+
+// The ABI outputs to tag `variable` with after storing `expr` into it, or
+// undefined (clear). Only a SCALAR destination is ever tagged — see the comment
+// at the call site in storeExpression.
+function multiOutputCallOutputs(
+  expr: Expression,
+  ctx: CompilerContext,
+  variable: { kind: string },
+): AbiParameter[] | undefined {
+  if (ctx.isV12 || variable.kind !== 'scalar') return undefined;
+
+  if (expr.type === 'Identifier') {
+    return ctx.getVar((expr as { name: string }).name)?.multiOutputCall;
+  }
+
+  if (expr.type !== 'CallExpression' || resolveCatchChain(expr as CallExpression)) return undefined;
+
+  // Pure probe — resolveContractCallTarget emits nothing (addr is lazy).
+  const target = resolveContractCallTarget(expr, ctx);
+
+  return target && (target.method.outputs?.length ?? 0) > 1 ? target.method.outputs : undefined;
 }
 
 function processTernaryStore(
@@ -371,6 +428,17 @@ function processTernaryStore(
 
   if (variable) {
     variable.immutablePacked = isImmutablePackedArray(consequent._bytes) || isImmutablePackedArray(alternate._bytes);
+    // Same recompute for the multi-output tag: a ternary reassignment must not
+    // leave a stale tag from an earlier `s = pool.slot0()` (that rejected
+    // previously-working programs). Tag only when BOTH branches are multi-output
+    // calls into a scalar slot — then the indexed read faults on every path
+    // (the guard's contract). A single multi-output branch stays untagged: the
+    // other path may be perfectly indexable, and rejecting it would break
+    // working code (documented hole — that branch still faults at runtime).
+    const thenOutputs = multiOutputCallOutputs(expr.consequent, ctx, variable);
+    const elseOutputs = multiOutputCallOutputs(expr.alternate, ctx, variable);
+
+    variable.multiOutputCall = thenOutputs && elseOutputs ? thenOutputs : undefined;
   }
 
   return saucer.if(condition).then(thenStore).else(elseStore);
@@ -394,10 +462,15 @@ function processUpdateStore(
   const result = expr.prefix ? assign(update(saucer)) : update(assign(saucer));
 
   // An increment result is always a scalar, never a packed literal — clear any
-  // stale flag from a prior array-literal assignment to `name`.
+  // stale flag from a prior array-literal assignment to `name`, and the
+  // multi-output tag with it (the variable no longer holds a call result; a
+  // later `name[k]` is the generic index-a-number fault, not this guard's).
   const variable = ctx.getVar(name);
 
-  if (variable) variable.immutablePacked = false;
+  if (variable) {
+    variable.immutablePacked = false;
+    variable.multiOutputCall = undefined;
+  }
 
   return result;
 }
