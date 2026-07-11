@@ -297,6 +297,17 @@ const transpilerVectors: { name: string; src: string; expected: number; kind: 'u
     expected: 7,
     kind: 'uint',
   },
+  {
+    // The destructuring fast path's building block, executed on the real runtime:
+    // CAST_BE(SLICE(bytes, k*32 + (32-N), N)) must equal the canonical
+    // low-N-bytes form ABI_DECODE's ad_scalar mask produces. Two head words —
+    // word 0 a uint160-shaped value (0x42, slice(12, 32) → 20 bytes), word 1 a
+    // SIGN-EXTENDED negative int24 (-100 = NOT(0x63); slice(61, 64) → 0xffff9c).
+    name: 'slice_cast_be_word_extract',
+    src: `function main(){ const w = Uint8Array.from([${[...Array(31).fill(0), 0x42, ...Array(31).fill(0xff), 0x9c].join(',')}]); return uint(w.slice(12, 32)) * 16777216 + uint(w.slice(61, 64)) }`,
+    expected: 0x42 * 16777216 + 0xffff9c,
+    kind: 'uint',
+  },
 ];
 
 function buildVectors(): Vector[] {
@@ -356,6 +367,7 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(forgeOutput).toMatch(/ok array_compound_assign 14/); // transpiler compound +=
     expect(forgeOutput).toMatch(/ok object_field_set 42/); // object-literal (TUPLE) field set
     expect(forgeOutput).toMatch(/ok unused_call_dropped 7/); // bare call result SDROP'd, stack balanced
+    expect(forgeOutput).toMatch(/ok slice_cast_be_word_extract 1124073372/); // destructuring fast-path word extraction (incl. signed intN)
     expect(forgeOutput).not.toMatch(/\[FAIL/);
   });
 });

@@ -39,6 +39,14 @@ const META_CODE =
 const LIST_ADDR = '0x0000000000000000000000000000000000007004';
 const LIST_CODE = '0x60095f5260406020526002604052600b606052601660805260a05ff3';
 
+// Returns (uint160 0x42, int24 -100 [sign-extended: NOT(0x63)], bool true,
+// address 0xabcd) — pins decode semantics for SIGNED components: the engine's
+// canonical intN form is the low N bytes (zero-extended), so tick must read as
+// 0xffff9c = 16777116, the exact value the v12 SLICE+CAST_BE fast path produces
+// geometrically.
+const PROBE_ADDR = '0x0000000000000000000000000000000000007005';
+const PROBE_CODE = '0x60425f52606319602052600160405261abcd60605260805ff3';
+
 const uint256 = (name: string) => ({ name, type: 'uint256' });
 
 const mockAbis: Record<string, unknown[]> = {
@@ -78,6 +86,20 @@ const mockAbis: Record<string, unknown[]> = {
       stateMutability: 'view',
     },
   ],
+  Probe: [
+    {
+      type: 'function',
+      name: 'probe',
+      inputs: [],
+      outputs: [
+        { name: 'big', type: 'uint160' },
+        { name: 'tick', type: 'int24' },
+        { name: 'flag', type: 'bool' },
+        { name: 'who', type: 'address' },
+      ],
+      stateMutability: 'view',
+    },
+  ],
 };
 
 let tmpDir: string;
@@ -88,6 +110,7 @@ beforeAll(() => {
   etch(COUNTER_ADDR, COUNTER_CODE);
   etch(META_ADDR, META_CODE);
   etch(LIST_ADDR, LIST_CODE);
+  etch(PROBE_ADDR, PROBE_CODE);
 
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sauce-destructuring-int-'));
   for (const [name, abi] of Object.entries(mockAbis)) {
@@ -172,6 +195,22 @@ describe('integration: array destructuring (v1 engine)', () => {
 
   it('array component behind a hole', () => {
     expect(run(`const [, xs] = List.at(${BigInt(LIST_ADDR)}n).list(); return xs[1];`, ['List'])).toBe(22n);
+  });
+
+  it('negative signed intN component decodes to the canonical low-N-bytes form', () => {
+    // int24 -100: sign-extended word 0xff…ff9c → canonical 0xffff9c. This is the
+    // exact value the v12 SLICE+CAST_BE fast path extracts geometrically — the
+    // v1 run pins the reference semantics the fast path must match.
+    expect(run(`const [, tick] = Probe.at(${BigInt(PROBE_ADDR)}n).probe(); return tick;`, ['Probe'])).toBe(0xffff9cn);
+  });
+
+  it('mixed-width statics (uint160, bool, address) bind correctly around the signed component', () => {
+    expect(
+      run(
+        `const [big, tick, flag, who] = Probe.at(${BigInt(PROBE_ADDR)}n).probe(); return (big + flag) * 100000 + who;`,
+        ['Probe'],
+      ),
+    ).toBe(BigInt(0x42 + 1) * 100000n + 0xabcdn);
   });
 });
 

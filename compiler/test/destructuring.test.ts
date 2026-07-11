@@ -129,6 +129,18 @@ const IMPORT = 'import { Pool } from "./Pool.json";';
 
 const count = (bytecode: Uint8Array, op: number): number => bytecode.filter((b) => b === op).length;
 
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+
+    return i;
+  }
+
+  return -1;
+}
+
 // Opcode-count DIFFERENTIALS between equivalent programs are robust against a
 // selector byte colliding with an opcode value: both programs embed the same
 // selectors, so collisions cancel.
@@ -266,7 +278,7 @@ describe('array destructuring — happy paths (v1)', () => {
     ).not.toThrow();
   });
 
-  it('compiles for v12 with the same one-call shape', () => {
+  it('compiles for v12 with the same one-call shape (zero-decode fast path)', () => {
     const destructured = compile(
       `${IMPORT}
        function main() {
@@ -284,7 +296,10 @@ describe('array destructuring — happy paths (v1)', () => {
     ).bytecode[0];
 
     expect(count(doubleCall, OPS.STATIC) - count(destructured, OPS.STATIC)).toBe(1);
-    expect(count(destructured, OPS.ABI_DECODE)).toBe(2);
+    // elementary-static components skip the decode entirely on v12
+    expect(count(destructured, OPS.ABI_DECODE)).toBe(0);
+    expect(count(destructured, OPS.SLICE)).toBe(2);
+    expect(count(destructured, OPS.CAST_BE)).toBe(2);
   });
 
   it('keeps a helper reachable when treeshaking (init args are walked)', () => {
@@ -382,6 +397,72 @@ describe('array destructuring — rejected shapes', () => {
     expect(() => compileMain('const [a, b] = Pool.at(1).getPair(); return a;', 'svm')).toThrow(
       /contract bindings are not supported on target 'svm'/,
     );
+  });
+});
+
+// v12 zero-decode fast path: elementary-static components are extracted from the
+// raw returndata with CAST_BE(SLICE(temp, k*32 + (32-N), N)) — pointer-arithmetic
+// slice + right-aligned cast, bit-identical to the engine's ABI_DECODE ad_scalar
+// mask (including negative signed intN) with zero per-element re-decode. Dynamic
+// components and any statement whose output tuple contains a nested 'tuple'
+// (inlined static tuples occupy multiple head words → k*32 would be wrong) keep
+// the portable decode lowering, as do v1 and svm entirely.
+describe('v12 zero-decode fast path (SLICE + CAST_BE)', () => {
+  const compileTarget = (body: string, target: 'v1' | 'v12') =>
+    compile(`${IMPORT} function main() { ${body} }`, { baseDirs, target }).bytecode[0];
+
+  it('extracts mixed-width statics (uint160, uint8, bool) with correct offsets', () => {
+    const bc = compileTarget('const [a, , , , , f, g] = Pool.at(1).slot0(); return a + f + g;', 'v12');
+
+    expect(count(bc, OPS.ABI_DECODE)).toBe(0);
+    expect(count(bc, OPS.SLICE)).toBe(3);
+    expect(count(bc, OPS.CAST_BE)).toBe(3);
+    // offset operands: uint160@0 → 12, uint8@5 → 191, bool@6 → 223
+    for (const offset of [12, 191, 223]) {
+      expect(indexOfBytes(bc, new Uint8Array([OPS.BYTE_1, offset]))).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('pins the int24 offset/width math (head word 1, low 3 bytes)', () => {
+    const bc = compileTarget('const [, tick] = Pool.at(1).slot0(); return tick;', 'v12');
+
+    expect(count(bc, OPS.ABI_DECODE)).toBe(0);
+    expect(count(bc, OPS.SLICE)).toBe(1);
+    // offset = 1*32 + (32-3) = 61, width = 3
+    expect(indexOfBytes(bc, new Uint8Array([OPS.BYTE_1, 61]))).toBeGreaterThanOrEqual(0);
+    expect(indexOfBytes(bc, new Uint8Array([OPS.BYTE_1, 3]))).toBeGreaterThanOrEqual(0);
+  });
+
+  it('mixes fast statics with decoded dynamic components', () => {
+    const bc = compileTarget('const [n, data] = Pool.at(1).meta(); return n + data.length;', 'v12');
+
+    expect(count(bc, OPS.ABI_DECODE)).toBe(1); // bytes component still decodes
+    expect(count(bc, OPS.SLICE)).toBe(1); // uint256 component sliced
+    expect(count(bc, OPS.CAST_BE)).toBe(1);
+  });
+
+  it('keeps the decode lowering for array components', () => {
+    const bc = compileTarget('const [n, xs] = Pool.at(1).list(); return n + xs[0];', 'v12');
+
+    expect(count(bc, OPS.ABI_DECODE)).toBe(1);
+    expect(count(bc, OPS.SLICE)).toBe(1);
+  });
+
+  it('disables the fast path entirely when any output is a nested tuple (hole over it)', () => {
+    const bc = compileTarget('const [nonce] = Pool.at(1).wrap(); return nonce;', 'v12');
+
+    // an inlined static tuple would shift head words — every binding falls back
+    expect(count(bc, OPS.ABI_DECODE)).toBe(1);
+    expect(count(bc, OPS.SLICE)).toBe(0);
+    expect(count(bc, OPS.CAST_BE)).toBe(0);
+  });
+
+  it('leaves the v1 lowering untouched (per-element decode, no slice/cast)', () => {
+    const bc = compileTarget('const [price, tick] = Pool.at(1).slot0(); return price + tick;', 'v1');
+
+    expect(count(bc, OPS.ABI_DECODE)).toBe(2);
+    expect(count(bc, OPS.SLICE)).toBe(0);
+    expect(count(bc, OPS.CAST_BE)).toBe(0);
   });
 });
 
