@@ -89,7 +89,13 @@ TUPLE descriptor survives a variable round-trip — scalar/bytes32 storage dropp
 after a static call. (c) v12 assembly emits a **no-param ARG-PROLOGUE entry** that pushes the
 compile-time args then falls through into `main` (the v12 analogue of v1's appended `CALL_FUNCTION` arg
 segment) — so **parameterized programs run on the Huff runtime**. (`main` is inlined, not a table fn →
-it can't recurse, same as v1.)
+it can't recurse, same as v1.) (d) **Array destructuring of multi-output call returns**:
+`const [price, tick] = pool.slot0()` compiles on v1+v12 and makes ONE external call — raw returndata
+lands in a hidden heap temp, each bound element is re-derived via `INDEX(ABI_DECODE(READ(temp)))`, so
+the decoded tuple is never stored and the v1 descriptor round-trip fault can't happen. Shape B
+(`const s = pool.slot0()` then `s[k]`) keeps its store byte-identical (arrakis/pendle `return result`
+bare reads still compile), but the indexed reads/writes that were guaranteed v1 runtime faults
+(`SauceInvalidOperationArgs(INDEX)`) are now compile errors pointing at destructuring; v12 untouched.
 
 **Known v12 limit (follow-up):** the Huff runtime's dynamic-value descriptor packs the data pointer in
 16 bits (region `0x5000`→`0xFFFF`, ≈45 KB), so a program whose total dynamic data exceeds that gets a

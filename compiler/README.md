@@ -461,12 +461,25 @@ function main() {
   // State-changing calls (CALL)
   ERC20.at(token).transfer(recipient, amount);
 
-  // Multiple return values
-  const result = Contract.at(addr).getMultiple();
-  const first = result[0];
-  const second = result[1];
+  // Multiple return values — destructure them (ONE external call)
+  const [first, second] = Contract.at(addr).getMultiple();
+
+  // Holes skip outputs you don't need
+  const [, tick] = Pool.at(pool).slot0();
+
+  // Inline chained indexing also works (each chain is its own call)
+  const third = Contract.at(addr).getMultiple()[2];
 }
 ```
+
+**Multi-output results and variables (v1):** a multi-output call result stored in
+a variable (`const s = pool.slot0()`) loses its tuple on the deployed v1 engine,
+so indexing it (`s[0]`) is a compile error — use destructuring instead, which
+never stores the decoded tuple (the raw returndata lands in a hidden temp and
+each bound element is re-decoded at its store site). Destructuring supports
+holes, partial bindings, and `bytes`/`string`/array components; nested-tuple
+components can't be bound to a variable — leave a hole and read their fields via
+chained indexing (`…wrap()[1][0]`). Rest elements (`...rest`) are not supported.
 
 ### Binding Methods
 
