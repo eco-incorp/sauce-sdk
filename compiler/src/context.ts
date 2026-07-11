@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Abi, ContractInfo, ContractsConfig } from './contracts.js';
+import type { Abi, AbiParameter, ContractInfo, ContractsConfig } from './contracts.js';
 import { parseAbiMethods } from './contracts.js';
 import { RESERVED_NAMES } from './globals.js';
 import { Saucer } from './saucer/saucer.js';
@@ -39,6 +39,16 @@ export interface Variable {
    * both TUPLE), so the lowering rejects assignment to a flagged variable.
    */
   immutablePacked?: boolean;
+  /**
+   * v1 only, metadata (never changes emitted bytes): the variable was assigned a
+   * multi-output contract call result (`const s = pool.slot0()`). The decoded
+   * tuple's descriptor does not survive the v1 variable round-trip, so an indexed
+   * read `s[k]` is GUARANTEED to fault SauceInvalidOperationArgs(INDEX) at
+   * runtime — the lowering rejects it at compile time and points at destructuring
+   * (`const [a, b] = pool.slot0()`), which never stores the descriptor. Bare
+   * reads (`return s` — shipping protocol functions do this) stay untouched.
+   */
+  multiOutputCall?: AbiParameter[];
 }
 
 export interface Scope {

@@ -10,12 +10,21 @@ import type {
   UpdateExpression,
   AssignmentExpression,
   MemberExpression,
+  ArrayPattern,
+  CallExpression,
 } from 'acorn';
 import type { SaucerLike } from '../saucer/index.js';
 import { isImmutablePackedArray } from '../saucer/index.js';
-import type { CompilerContext } from '../context.js';
+import type { CompilerContext, ElementType } from '../context.js';
+import type { AbiParameter } from '../contracts.js';
 import { processExpression, processStatement } from './index.js';
-import { applyBinaryOp } from './expression.js';
+import {
+  applyBinaryOp,
+  resolveContractCallTarget,
+  emitRawContractCall,
+  resolveCatchChain,
+  abiDecodeTypeSpecs,
+} from './expression.js';
 import { evalConstBool } from './const-eval.js';
 import {
   inferKindWithContext,
@@ -24,6 +33,7 @@ import {
   getPropertyName,
   lookupStructType,
   getFieldIndex,
+  abiOutputKind,
 } from './inference.js';
 
 export function processVariableDeclaration(
@@ -36,16 +46,128 @@ export function processVariableDeclaration(
   }
 
   return decl.declarations.reduce((acc, declarator) => {
-    if (declarator.id.type !== 'Identifier') {
-      throw new Error(`not implemented: ${declarator.id.type}`);
-    }
-
     if (!declarator.init) {
       throw new Error('const declarations must be initialized');
     }
 
+    if (declarator.id.type === 'ArrayPattern') {
+      return processDestructuringDeclaration(declarator.id as ArrayPattern, declarator.init, ctx, acc);
+    }
+
+    if (declarator.id.type !== 'Identifier') {
+      throw new Error(`not implemented: ${declarator.id.type}`);
+    }
+
     return storeExpression(declarator.id.name, declarator.init, ctx, acc);
   }, saucer);
+}
+
+/**
+ * `const [price, tick] = pool.slot0()` — ONE external call whose RAW returndata
+ * lands in a hidden heap temp, then per bound element
+ * `STORE(name, INDEX(ABI_DECODE(count, READ(temp), specs), i))`.
+ *
+ * The tuple descriptor is freshly derived by ABI_DECODE at every use and never
+ * stored: a decoded tuple does not survive a variable round-trip on the deployed
+ * (immutable) v1 engines — INDEX then faults with SauceInvalidOperationArgs —
+ * while raw heap bytes round-trip fine (the same shape the catch parameter uses).
+ * The identical lowering works on v12; the in-engine re-decode per element is
+ * negligible next to the ~2.6K-gas staticcall it replaces.
+ */
+function processDestructuringDeclaration(
+  pattern: ArrayPattern,
+  init: Expression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike {
+  if (init.type === 'CallExpression' && resolveCatchChain(init as CallExpression)) {
+    throw new Error(
+      'cannot destructure a .catch() chain — a catch handler cannot capture call outputs; destructure the bare call instead',
+    );
+  }
+
+  const target = resolveContractCallTarget(init, ctx);
+
+  if (!target) {
+    throw new Error(
+      'array destructuring requires a contract method call initializer, e.g. const [a, b] = Pool.at(addr).slot0()',
+    );
+  }
+
+  const label = `${target.contract.name}.${target.methodName}()`;
+  const outputs = target.method.outputs ?? [];
+
+  if (outputs.length === 0) {
+    throw new Error(`cannot destructure ${label}: it returns no outputs`);
+  }
+
+  if (pattern.elements.length > outputs.length) {
+    throw new Error(
+      `cannot destructure ${outputs.length} output(s) of ${label} into ${pattern.elements.length} element(s)`,
+    );
+  }
+
+  const bindings: { name: string; index: number }[] = [];
+
+  pattern.elements.forEach((element, index) => {
+    if (!element) return; // hole (`const [, tick] = …`) — skip this output
+
+    if (element.type === 'RestElement') {
+      throw new Error('not implemented: rest element in array destructuring');
+    }
+
+    if (element.type !== 'Identifier') {
+      throw new Error(`not implemented: ${element.type} in array destructuring`);
+    }
+
+    const output = outputs[index];
+
+    if (output.type === 'tuple') {
+      throw new Error(
+        `cannot destructure output ${index}${output.name ? ` ('${output.name}')` : ''} of ${label}: ` +
+          `a nested tuple cannot be stored in a variable — leave a hole and read its fields via chained ` +
+          `indexing (…${target.methodName}(…)[${index}][j])`,
+      );
+    }
+
+    bindings.push({ name: element.name, index });
+  });
+
+  // Derived once for the whole tuple (throws on unsupported ABI output types
+  // exactly like a normally-decoded call would).
+  const typeSpecs = abiDecodeTypeSpecs(outputs);
+
+  // The one external call. Emitted even when every element is a hole — the call
+  // may have side effects. `#tmpN` cannot collide with a parsed identifier.
+  const temp = ctx.freshTemp('dynamic');
+  let result = saucer.store(temp, emitRawContractCall(target, ctx), 'dynamic');
+
+  for (const { name, index } of bindings) {
+    const output = outputs[index];
+    const decoded = ctx.newSaucer().abiDecode(outputs.length, ctx.newSaucer().read(temp), typeSpecs);
+    const value = ctx.newSaucer().index(decoded, ctx.newSaucer().int(BigInt(index)));
+
+    result = result.store(name, value, abiOutputKind(output), destructuredElementType(output));
+  }
+
+  return result;
+}
+
+/**
+ * Element type for a destructured array component, so later `name[i]` reads infer
+ * the right kind. Only the top level is resolved; deeper nesting stays dynamic
+ * (safe — heap values round-trip).
+ */
+function destructuredElementType(output: AbiParameter): ElementType | undefined {
+  if (!output.type.endsWith('[]')) return undefined;
+
+  const inner = output.type.slice(0, -2);
+
+  if (inner.endsWith(']') || inner === 'tuple' || inner === 'bytes' || inner === 'string') {
+    return { kind: 'dynamic' };
+  }
+
+  return { kind: 'scalar' };
 }
 
 export function processIfStatement(stmt: IfStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
@@ -142,7 +264,24 @@ export function storeExpression(name: string, expr: Expression, ctx: CompilerCon
       // a later `name[i] = x` can be rejected before it reverts on the engine.
       const variable = ctx.getVar(name);
 
-      if (variable) variable.immutablePacked = isImmutablePackedArray(value._bytes);
+      if (variable) {
+        variable.immutablePacked = isImmutablePackedArray(value._bytes);
+        // Metadata only (bytes above are untouched): on v1, remember that the
+        // variable was assigned a multi-output call result — a later indexed
+        // read of it would fault INDEX at runtime, so it is rejected at compile
+        // time (processIndexAccess) with a pointer at destructuring. Cleared on
+        // any other assignment so a reassigned variable indexes normally again.
+        variable.multiOutputCall = undefined;
+
+        if (!ctx.isV12 && expr.type === 'CallExpression' && !resolveCatchChain(expr as CallExpression)) {
+          // Pure probe — resolveContractCallTarget emits nothing (addr is lazy).
+          const target = resolveContractCallTarget(expr, ctx);
+
+          if (target && (target.method.outputs?.length ?? 0) > 1) {
+            variable.multiOutputCall = target.method.outputs;
+          }
+        }
+      }
 
       ctx.consumePendingContractBinding(name);
 
@@ -275,6 +414,15 @@ function processMemberAssignment(
   const target = ctx.getVar(name);
 
   if (!target) throw new Error(`undefined variable: ${name}`);
+
+  // Same hazard as the indexed read (processIndexAccess): the stored value lost
+  // its tuple descriptor on v1, so SET_INDEX faults at runtime — reject early.
+  if (target.multiOutputCall) {
+    throw new Error(
+      `cannot assign to a component of '${name}': a multi-output call result stored in a variable loses its ` +
+        `tuple on the v1 engine — destructure the call instead: const [a, b] = …`,
+    );
+  }
 
   // A static packed array literal is immutable — the engine reverts SET_INDEX on
   // it. Reject element assignment at compile time and point at the mutable path.
