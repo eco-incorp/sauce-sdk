@@ -14,7 +14,7 @@ import type {
   CallExpression,
 } from 'acorn';
 import type { SaucerLike } from '../saucer/index.js';
-import { isImmutablePackedArray } from '../saucer/index.js';
+import { isImmutablePackedArray, OPS, V12Saucer } from '../saucer/index.js';
 import type { CompilerContext, ElementType } from '../context.js';
 import type { AbiParameter } from '../contracts.js';
 import { processExpression, processStatement } from './index.js';
@@ -71,8 +71,10 @@ export function processVariableDeclaration(
  * stored: a decoded tuple does not survive a variable round-trip on the deployed
  * (immutable) v1 engines — INDEX then faults with SauceInvalidOperationArgs —
  * while raw heap bytes round-trip fine (the same shape the catch parameter uses).
- * The identical lowering works on v12; the in-engine re-decode per element is
- * negligible next to the ~2.6K-gas staticcall it replaces.
+ * The in-engine re-decode per element is negligible next to the ~2.6K-gas
+ * staticcall it replaces; on the v12 EVM target, elementary-static components
+ * skip even that via a zero-copy `CAST_BE(SLICE(temp, k*32 + (32-N), N))` word
+ * extraction (see the fast-path notes below).
  */
 function processDestructuringDeclaration(
   pattern: ArrayPattern,
@@ -134,8 +136,21 @@ function processDestructuringDeclaration(
   });
 
   // Derived once for the whole tuple (throws on unsupported ABI output types
-  // exactly like a normally-decoded call would).
+  // exactly like a normally-decoded call would), regardless of which lowering
+  // each binding takes — so unsupported outputs are rejected identically.
   const typeSpecs = abiDecodeTypeSpecs(outputs);
+
+  // v12 EVM fast path precondition: every component must occupy exactly ONE
+  // 32-byte head word for `index * 32` to address word k. Elementary statics and
+  // dynamic components (bytes/string/T[]/tuple[] — one offset word) all do; an
+  // ALL-STATIC nested tuple is INLINED in the head (multiple words) and shifts
+  // everything after it, so any 'tuple' output (bindable ones are already
+  // rejected above — this guards holes over them) disables the fast path for
+  // the whole statement. Gate is target === 'v12' exactly: 'svm' is also a v12
+  // dialect (ctx.isV12) but its SLICE/CAST_BE handlers are unvalidated ports —
+  // it keeps the portable decode lowering.
+  const headWordsKnown = outputs.every((output) => output.type !== 'tuple');
+  const fastPath = ctx.target === 'v12' && headWordsKnown;
 
   // The one external call. Emitted even when every element is a hole — the call
   // may have side effects. `#tmpN` cannot collide with a parsed identifier.
@@ -144,13 +159,51 @@ function processDestructuringDeclaration(
 
   for (const { name, index } of bindings) {
     const output = outputs[index];
-    const decoded = ctx.newSaucer().abiDecode(outputs.length, ctx.newSaucer().read(temp), typeSpecs);
-    const value = ctx.newSaucer().index(decoded, ctx.newSaucer().int(BigInt(index)));
+    const width = fastPath ? elementaryStaticWidth(output) : undefined;
+
+    // v12, elementary-static component: zero-copy word extraction. SLICE on the
+    // raw-returndata descriptor is pointer arithmetic (no copy) and CAST_BE
+    // right-aligns the low N bytes of head word k — bit-identical to what the
+    // engine's ABI_DECODE ad_scalar mask produces (including negative signed
+    // intN: the byte-precise slice performs the masking geometrically), without
+    // re-materializing the whole decoded tuple per element.
+    const value = width
+      ? (ctx.newSaucer() as V12Saucer).castBe(
+          ctx
+            .newSaucer()
+            .slice(
+              ctx.newSaucer().read(temp),
+              ctx.newSaucer().int(BigInt(index * 32 + (32 - width))),
+              ctx.newSaucer().int(BigInt(width)),
+            ),
+        )
+      : ctx
+          .newSaucer()
+          .index(
+            ctx.newSaucer().abiDecode(outputs.length, ctx.newSaucer().read(temp), typeSpecs),
+            ctx.newSaucer().int(BigInt(index)),
+          );
 
     result = result.store(name, value, abiOutputKind(output), destructuredElementType(output));
   }
 
   return result;
+}
+
+/**
+ * Byte width of an elementary static ABI component (uintN/intN/address/bool), or
+ * undefined for anything else. Uses the decode spec map as the source of truth:
+ * elementary statics resolve to a single BYTE_1..BYTE_32 spec whose offset from
+ * BYTE_1 is the width; bytes/string/arrays resolve to other/longer specs.
+ * (bytesN and fixed-size arrays never reach this — abiDecodeTypeSpecs already
+ * rejects them for the whole statement.)
+ */
+function elementaryStaticWidth(output: AbiParameter): number | undefined {
+  const spec = abiDecodeTypeSpecs([output]);
+
+  if (spec.length !== 1 || spec[0] < OPS.BYTE_1 || spec[0] > OPS.BYTE_32) return undefined;
+
+  return spec[0] - OPS.BYTE_1 + 1;
 }
 
 /**
