@@ -223,8 +223,15 @@ describe('integration: shape B — stored multi-output result is a compile-time 
 
   it('bare reads of the stored result still compile and run (protocol `return result` shape)', () => {
     // The engine returns the stored word for a bare read — unchanged legacy
-    // semantics; the point here is that compilation and execution both succeed.
-    expect(() => run(`const s = Seven.at(${BigInt(SEVEN_ADDR)}n).vals(); return 1;`, ['Seven'])).not.toThrow();
+    // semantics (its value is engine-internal, so it is not pinned); the point
+    // is that compilation and execution of the actual bare READ both succeed.
+    expect(() => run(`const s = Seven.at(${BigInt(SEVEN_ADDR)}n).vals(); return s;`, ['Seven'])).not.toThrow();
+  });
+
+  it('a multi-output call stored into a DYNAMIC variable round-trips and indexes correctly', () => {
+    // the heap store preserves the decoded tuple on v1 (the reason the guard is
+    // storage-kind-aware): s was declared as an array literal → heap slot
+    expect(run(`let s = [0, 0]; s = Seven.at(${BigInt(SEVEN_ADDR)}n).vals(); return s[1];`, ['Seven'])).toBe(7n);
   });
 
   it('shape A (inline chained indexing) still works unchanged', () => {

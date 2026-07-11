@@ -141,9 +141,11 @@ function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
   return -1;
 }
 
-// Opcode-count DIFFERENTIALS between equivalent programs are robust against a
-// selector byte colliding with an opcode value: both programs embed the same
-// selectors, so collisions cancel.
+// Opcode-count assertions use raw byte counts, so a selector/operand byte equal
+// to a counted opcode would skew them (the differential pairs embed the selector
+// a DIFFERENT number of times, so collisions don't fully cancel). The ABIs here
+// are chosen so no selector or operand byte collides with STATIC/CALL/ABI_DECODE/
+// SLICE/CAST_BE, and the exact-emission hex pins below don't rely on counting.
 describe('array destructuring — happy paths (v1)', () => {
   it('binds 2 of 7 outputs with a single external call', () => {
     const destructured = compile(
@@ -393,10 +395,30 @@ describe('array destructuring — rejected shapes', () => {
     );
   });
 
-  it('errors cleanly on target svm (no typed bindings there)', () => {
+  it('errors cleanly on target svm (destructuring-specific message)', () => {
     expect(() => compileMain('const [a, b] = Pool.at(1).getPair(); return a;', 'svm')).toThrow(
-      /contract bindings are not supported on target 'svm'/,
+      /array destructuring is not supported on target 'svm'/,
     );
+  });
+
+  it('reports an unknown contract by name', () => {
+    expect(() => compileMain('const [a] = Nope.at(1).thing(); return a;')).toThrow(/Unknown contract: Nope/);
+  });
+
+  it('rejects rebinding an existing variable of a mismatched kind', () => {
+    // no block scope for if-bodies: the inner name resolves to the outer scalar
+    // variable, whose slot would strip the bytes component's heap descriptor
+    expect(() =>
+      compileMain(
+        'let data = 0; if (msg.value > 0) { const [n, data] = Pool.at(1).meta(); return n + data.length; } return data;',
+      ),
+    ).toThrow(/cannot destructure output 1 \('data'\).*existing scalar variable 'data'/);
+  });
+
+  it('allows rebinding an existing variable of the matching kind (plain-const semantics)', () => {
+    expect(() =>
+      compileMain('let f = 0; if (msg.value > 0) { const [f] = Pool.at(1).fee(); return f; } return f;'),
+    ).not.toThrow();
   });
 });
 
@@ -431,6 +453,29 @@ describe('v12 zero-decode fast path (SLICE + CAST_BE)', () => {
     // offset = 1*32 + (32-3) = 61, width = 3
     expect(indexOfBytes(bc, new Uint8Array([OPS.BYTE_1, 61]))).toBeGreaterThanOrEqual(0);
     expect(indexOfBytes(bc, new Uint8Array([OPS.BYTE_1, 3]))).toBeGreaterThanOrEqual(0);
+  });
+
+  // Presence-only probes and opcode counts are order-insensitive — a mutant that
+  // swaps the SLICE offset/length operands passes them (mutation-verified in
+  // review). These full-program pins fix the exact emission, operand ORDER
+  // included: per binding READ_HEAP temp · BYTE_1 offset · BYTE_1 width · SLICE
+  // · CAST_BE · WRITE_VALUE slot.
+  it('pins the exact fast-path emission bytes (hole + int24)', () => {
+    const bc = compileTarget('const [, tick] = Pool.at(1).slot0(); return tick;', 'v12');
+
+    // ALLOCATE_VALUE 1 · ALLOCATE_HEAP 1 · [int(1) selector(3850c7bd) STATIC] →
+    // WRITE_HEAP 0 · READ_HEAP 0 · offset 61 · width 3 · SLICE · CAST_BE →
+    // WRITE_VALUE 0 · READ_VALUE 0 · return
+    expect(Buffer.from(bc).toString('hex')).toBe('c001c201010190043850c7bda3c3009800013d01039554c1005000f2');
+  });
+
+  it('pins the exact fast-path emission bytes (uint160 + int24)', () => {
+    const bc = compileTarget('const [big, tick] = Pool.at(1).slot0(); return tick;', 'v12');
+
+    // as above, two bindings: offset 12/width 20 (uint160), offset 61/width 3
+    expect(Buffer.from(bc).toString('hex')).toBe(
+      'c002c201010190043850c7bda3c3009800010c01149554c1009800013d01039554c1015001f2',
+    );
   });
 
   it('mixes fast statics with decoded dynamic components', () => {
@@ -514,8 +559,54 @@ describe('shape B — multi-output call result stored in a variable (v1 guard)',
     expect(() => compileMain('let s = Pool.at(1).slot0(); s = [1, 2, 3]; return s[0];')).not.toThrow();
   });
 
-  it('re-tags on reassignment with another multi-output call', () => {
-    expect(() => compileMain('let s = [1, 2]; s = Pool.at(1).slot0(); return s[0];')).toThrow(/cannot index 's'/);
+  it('does NOT tag a dynamic-kind destination (heap round-trip preserves the tuple on v1)', () => {
+    // `s` was declared with an array literal → dynamic/heap slot; the
+    // reassignment stores the decoded tuple via WRITE_HEAP, which the v1 engine
+    // round-trips intact (runtime-verified — same mechanism as new Array(n)).
+    expect(() => compileMain('let s = [0, 0]; s = Pool.at(1).slot0(); return s[1];')).not.toThrow();
+    expect(() => compileMain('let s = new Array(2); s = Pool.at(1).slot0(); return s[1];')).not.toThrow();
+  });
+
+  it('re-tags on reassignment of a SCALAR variable with a multi-output call', () => {
+    expect(() => compileMain('let s = 0; s = Pool.at(1).slot0(); return s[0];')).toThrow(/cannot index 's'/);
+  });
+
+  it('ternary reassignment clears a stale tag (previously-working program keeps compiling)', () => {
+    expect(() =>
+      compileMain('let s = Pool.at(1).slot0(); s = msg.value > 0 ? [1, 2] : [3, 4]; return s[0];'),
+    ).not.toThrow();
+  });
+
+  it('update-expression reassignment clears a stale tag', () => {
+    expect(() => compileMain('let i = 1; let s = Pool.at(1).slot0(); s = i++; return s + i;')).not.toThrow();
+  });
+
+  it('tags a ternary whose BOTH branches are multi-output calls (guaranteed fault)', () => {
+    expect(() =>
+      compileMain('const s = msg.value > 0 ? Pool.at(1).slot0() : Pool.at(2).slot0(); return s[0];'),
+    ).toThrow(/cannot index 's'/);
+  });
+
+  it('leaves a single-multi-output-branch ternary untagged (documented hole — other path may be valid)', () => {
+    expect(() => compileMain('const s = msg.value > 0 ? Pool.at(1).slot0() : [1, 2]; return s[0];')).not.toThrow();
+  });
+
+  it('propagates the tag through aliasing (const t = s)', () => {
+    expect(() => compileMain('const s = Pool.at(1).slot0(); const t = s; return t[1];')).toThrow(/cannot index 't'/);
+  });
+
+  it('compiles a v12 stack param read AFTER a destructuring statement (stack neutrality)', () => {
+    // a stack-effect leak in the destructuring statement would corrupt the
+    // param's SDUP depth patch and throw at assembly
+    expect(() =>
+      compile(
+        `${IMPORT} function helper(p) { const [a, b] = Pool.at(1).getPair(); return p + a + b; } function main() { return helper(7); }`,
+        {
+          baseDirs,
+          target: 'v12',
+        },
+      ),
+    ).not.toThrow();
   });
 
   it('leaves single-output call stores untouched (indexing stays legal)', () => {
