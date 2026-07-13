@@ -1,0 +1,13 @@
+import { deployments } from "./addresses.js";
+export const protocolInfo = {
+    name: "Gains Network",
+    slug: "gains-network",
+    description: "Decentralized leveraged trading platform (gTrade) supporting crypto, forex, and stocks with synthetic leverage up to 1000x on forex.",
+    website: "https://gains.trade",
+    github: "https://github.com/GainsNetwork",
+    category: "perpetuals",
+    chains: deployments,
+    audited: true,
+    tvl: "$50M+",
+};
+//# sourceMappingURL=info.js.map

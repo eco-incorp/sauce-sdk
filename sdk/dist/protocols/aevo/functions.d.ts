@@ -1,0 +1,2 @@
+export declare const depositERC20 = "\nimport { DepositContractABI as IDeposit } from \"./abis\";\n\nfunction main(depositAddress: Address, token: Address, amount: Uint256): Uint256 {\n  const deposit = IDeposit.at(depositAddress);\n  deposit.depositERC20(token, amount);\n  return 1;\n}\n";
+//# sourceMappingURL=functions.d.ts.map

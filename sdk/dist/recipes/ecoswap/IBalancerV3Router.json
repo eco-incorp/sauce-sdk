@@ -1,0 +1,35 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "querySwapSingleTokenExactIn",
+      "_note": "eth_call-ONLY (off-chain discovery/prepare samples it via viem). It is NOT called on-chain inside the cook: it is declared `nonpayable` (reverts NotStaticCall() 0x67f84ab2 under a plain CALL — it demands a static context) yet INTERNALLY unlock()s the Vault, a state write (reverts StateChangeDuringStaticCall under a STATICCALL) — both guards fire, so it is unusable as an on-chain minAmountOut source. The recipe executes the off-chain-priced share as a straight exactIn swap with minAmountOut=0 (see ecoswap.sauce.ts). Kept `nonpayable` (its true on-chain mutability) so viem's readContract drives the off-chain sampling.",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        { "name": "pool", "type": "address" },
+        { "name": "tokenIn", "type": "address" },
+        { "name": "tokenOut", "type": "address" },
+        { "name": "exactAmountIn", "type": "uint256" },
+        { "name": "sender", "type": "address" },
+        { "name": "userData", "type": "bytes" }
+      ],
+      "outputs": [{ "name": "amountOut", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "swapSingleTokenExactIn",
+      "stateMutability": "payable",
+      "inputs": [
+        { "name": "pool", "type": "address" },
+        { "name": "tokenIn", "type": "address" },
+        { "name": "tokenOut", "type": "address" },
+        { "name": "exactAmountIn", "type": "uint256" },
+        { "name": "minAmountOut", "type": "uint256" },
+        { "name": "deadline", "type": "uint256" },
+        { "name": "wethIsEth", "type": "bool" },
+        { "name": "userData", "type": "bytes" }
+      ],
+      "outputs": [{ "name": "amountOut", "type": "uint256" }]
+    }
+  ]
+}

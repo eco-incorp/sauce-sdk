@@ -1,0 +1,18 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "getSwapOut",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "amountIn", "type": "uint128" },
+        { "name": "swapForY", "type": "bool" }
+      ],
+      "outputs": [
+        { "name": "amountInLeft", "type": "uint128" },
+        { "name": "amountOut", "type": "uint128" },
+        { "name": "fee", "type": "uint128" }
+      ]
+    }
+  ]
+}

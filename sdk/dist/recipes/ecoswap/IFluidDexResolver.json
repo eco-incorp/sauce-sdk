@@ -1,0 +1,26 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "getDexTokens",
+      "stateMutability": "view",
+      "inputs": [{ "name": "dex", "type": "address" }],
+      "outputs": [
+        { "name": "token0", "type": "address" },
+        { "name": "token1", "type": "address" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "estimateSwapIn",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        { "name": "dex", "type": "address" },
+        { "name": "swap0to1", "type": "bool" },
+        { "name": "amountIn", "type": "uint256" },
+        { "name": "amountOutMin", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "amountOut", "type": "uint256" }]
+    }
+  ]
+}

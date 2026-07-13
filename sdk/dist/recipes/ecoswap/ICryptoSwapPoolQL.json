@@ -1,0 +1,15 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "get_dy",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "i", "type": "uint256" },
+        { "name": "j", "type": "uint256" },
+        { "name": "dx", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    }
+  ]
+}

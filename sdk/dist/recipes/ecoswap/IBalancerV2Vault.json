@@ -1,0 +1,45 @@
+{
+  "_note": "Balancer V2 ComposableStable LIVE-state reads the on-chain solver replays into a StableMath quote ladder (segKind 6). getPoolTokenInfo(bytes32,address) targets the canonical Vault singleton (cfg[11]) and returns FOUR SCALARS (cash, managed, lastChangeBlock, assetManager) — the pool balance is cash+managed; this is the v12-safe scalar path (Vault.getPoolTokens nests the balances dyn array in a tuple and decodes to garbage on v12). getScalingFactors targets the POOL and is a BARE uint256[] aligned with the FULL registered token list (incl. the BPT) — it must be INLINE-INDEXED ([regPos], variable index proven on both engines) and NEVER stored in a var. getAmplificationParameter (=A*AMP_PRECISION) and getSwapFeePercentage target the POOL. The poolId is passed to getPoolTokenInfo as a Uint256 (encoded verbatim to 32 bytes = the bytes32); the ABI input MUST be typed bytes32 so the compiler computes the getPoolTokenInfo(bytes32,address) selector. One combined ABI so a single import can .at() the Vault and the pool.",
+  "abi": [
+    {
+      "type": "function",
+      "name": "getPoolTokenInfo",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "poolId", "type": "bytes32" },
+        { "name": "token", "type": "address" }
+      ],
+      "outputs": [
+        { "name": "cash", "type": "uint256" },
+        { "name": "managed", "type": "uint256" },
+        { "name": "lastChangeBlock", "type": "uint256" },
+        { "name": "assetManager", "type": "address" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getScalingFactors",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "uint256[]" }]
+    },
+    {
+      "type": "function",
+      "name": "getAmplificationParameter",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        { "name": "value", "type": "uint256" },
+        { "name": "isUpdating", "type": "bool" },
+        { "name": "precision", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getSwapFeePercentage",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    }
+  ]
+}

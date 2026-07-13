@@ -1,0 +1,36 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "getTradeInfo",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        { "name": "_reserve0", "type": "uint256" },
+        { "name": "_reserve1", "type": "uint256" },
+        { "name": "_vReserve0", "type": "uint256" },
+        { "name": "_vReserve1", "type": "uint256" },
+        { "name": "feeInPrecision", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "token0",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "address" }]
+    },
+    {
+      "type": "function",
+      "name": "swap",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        { "name": "amount0Out", "type": "uint256" },
+        { "name": "amount1Out", "type": "uint256" },
+        { "name": "to", "type": "address" },
+        { "name": "callbackData", "type": "bytes" }
+      ],
+      "outputs": []
+    }
+  ]
+}

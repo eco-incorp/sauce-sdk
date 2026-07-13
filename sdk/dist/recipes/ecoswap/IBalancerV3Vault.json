@@ -1,0 +1,37 @@
+{
+  "_note": "Balancer V3 LIVE-state reads the on-chain solver replays into a StableMath quote ladder (segKind 14). getCurrentLiveBalances / getStaticSwapFeePercentage target the CREATE2 Vault singleton (cfg[10]); getAmplificationParameter targets the POOL; getRate targets each token's rate provider (a plain uint256 SCALAR — v12-safe, unlike getPoolTokenRates which nests a dyn array in a tuple and decodes to garbage on v12). getCurrentLiveBalances is a BARE dyn array — it must be INLINE-INDEXED ([k]) and NEVER stored in a var (storing reverts on v1). One combined ABI so a single import can .at() the Vault, the pool, and either rate provider.",
+  "abi": [
+    {
+      "type": "function",
+      "name": "getCurrentLiveBalances",
+      "stateMutability": "view",
+      "inputs": [{ "name": "pool", "type": "address" }],
+      "outputs": [{ "name": "", "type": "uint256[]" }]
+    },
+    {
+      "type": "function",
+      "name": "getStaticSwapFeePercentage",
+      "stateMutability": "view",
+      "inputs": [{ "name": "pool", "type": "address" }],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    },
+    {
+      "type": "function",
+      "name": "getAmplificationParameter",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        { "name": "value", "type": "uint256" },
+        { "name": "isUpdating", "type": "bool" },
+        { "name": "precision", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "getRate",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [{ "name": "", "type": "uint256" }]
+    }
+  ]
+}
