@@ -65,13 +65,17 @@ Actions and dev-tools use the **node test runner**, not jest → `pnpm --filter 
 - **`SAUCE_ENGINE_SO`** — path to the Solana engine binary (`engine.so`, built with
   `cargo build-sbf` in the sauce repo's `svm/`). The SVM integration suites
   (`compiler/integration-test/svm-*.test.ts`, `sdk/test/svm/*.test.ts`) run compiled
-  `target: 'svm'` bytecode on it via LiteSVM; default is the sibling-checkout path
-  `../sauce/svm/target/deploy/engine.so`, and the suites **skip cleanly** when the binary is
-  absent. CI does NOT skip them: it builds `engine.so` from the pinned `sauce` dep
-  (`compiler/node_modules/sauce/svm`, Anza toolchain, binary cached by the locked dep commit)
-  and fails loudly if the binary is missing. The `'svm'` compile target, its account-plan
-  output, and the `/svm` SDK subpath are documented in
-  `docs/plans/2026-07-03-solana-svm-support.md`.
+  `target: 'svm'` bytecode on it via LiteSVM. The binary is **vendored** at
+  `artifacts/svm/engine.so` (committed, force-added — `.so` is gitignored — same
+  convention as the committed `compiler/dist`/`sdk/dist`) and that's the default both
+  locally and in CI, so these suites run **offline by default**, same as the EVM ones; the
+  suites **skip cleanly** only if that binary is somehow missing. Set `SAUCE_ENGINE_SO` to
+  override — e.g. to test a freshly built engine before repinning the `sauce` dep. **Refresh
+  the vendored binary whenever the `sauce` dep is repinned**: `cargo build-sbf` in the pinned
+  commit's `svm/` checkout, copy `target/deploy/engine.so` over `artifacts/svm/engine.so`,
+  force-commit — nothing re-derives this automatically, so a repin without a refresh silently
+  tests against a stale engine again. The `'svm'` compile target, its account-plan output,
+  and the `/svm` SDK subpath are documented in `docs/plans/2026-07-03-solana-svm-support.md`.
 
 ## Architecture
 

@@ -6,9 +6,9 @@
  * compute is unit-tested (svm-target.test.ts); this closes the loop at the
  * result level across engines.
  *
- * Runs only when the engine .so exists (canRunSvm) — the anvil/cast harness is
- * always up in a jest run (global-setup). CI has no engine.so, so the suite
- * skips there, same as the v12 suites.
+ * Runs against the vendored engine .so (canRunSvm; see svm-utils.ts) by
+ * default, alongside the anvil/cast harness which is always up in a jest run
+ * (global-setup) — both engines run in every CI job now.
  */
 import { cook } from './utils.js';
 import { canRunSvm, startSvm, svmCook, svmUint } from './svm-utils.js';

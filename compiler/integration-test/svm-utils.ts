@@ -22,9 +22,13 @@
  *   provided accounts) so plan indices — and raw positional indices — stay
  *   faithful while MSG_SENDER-reading programs keep working.
  *
- * The engine binary comes from `make build` (cargo build-sbf) in the sauce
- * repo. CI has no engine.so, so suites guard with `describeSvm` and skip there
- * (same pattern as the v12 suites).
+ * The engine binary is vendored at ../artifacts/svm/engine.so (committed,
+ * force-added — built from the exact commit the `sauce` git dep is pinned
+ * to) so these suites run offline, same as the EVM ones. SAUCE_ENGINE_SO
+ * overrides the default, e.g. to test against a freshly built engine before
+ * repinning. Refresh the vendored binary whenever the pin moves: rebuild with
+ * `cargo build-sbf` in the pinned commit's svm/ checkout, copy over
+ * artifacts/svm/engine.so, and force-commit.
  */
 import { existsSync } from 'fs';
 import { resolve } from 'path';
@@ -61,10 +65,9 @@ const requestHeapFrame = (bytes: number): Instruction => {
   return { programAddress: COMPUTE_BUDGET_PROGRAM, accounts: [], data };
 };
 
-// cwd is compiler/ under jest (the pnpm script runs there), mirroring how
-// utils.ts resolves its cwd-relative paths.
-export const ENGINE_SO =
-  process.env.SAUCE_ENGINE_SO ?? resolve(process.cwd(), '../../sauce/svm/target/deploy/engine.so');
+// cwd is compiler/ under jest (the pnpm script runs there); the vendored
+// binary lives at the repo-root artifacts/svm/, one level up from compiler/.
+export const ENGINE_SO = process.env.SAUCE_ENGINE_SO ?? resolve(process.cwd(), '../artifacts/svm/engine.so');
 
 export const canRunSvm = (): boolean => existsSync(ENGINE_SO);
 

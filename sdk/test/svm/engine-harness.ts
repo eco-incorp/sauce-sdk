@@ -1,12 +1,13 @@
 /**
- * Shared LiteSVM engine harness for the engine-gated (`SAUCE_ENGINE_SO`)
- * solswap suites: boots the real SVM engine, pins the cluster clock (the venue
- * fragments read Clock via block.timestamp), loads venue fixtures, fabricates
- * SPL token accounts / address lookup tables, and executes compiled programs
- * through the sdk's own pure builders (resolveAccounts +
- * buildExecuteInstruction + buildExecuteTransaction). Interpreter memory is
- * the transaction's 256 KiB heap frame — no memory accounts, no provisioning;
- * every execute transaction carries the RequestHeapFrame prepend.
+ * Shared LiteSVM engine harness for the solswap suites (gated on the vendored
+ * engine .so existing — see ENGINE_SO below): boots the real SVM engine, pins
+ * the cluster clock (the venue fragments read Clock via block.timestamp),
+ * loads venue fixtures, fabricates SPL token accounts / address lookup
+ * tables, and executes compiled programs through the sdk's own pure builders
+ * (resolveAccounts + buildExecuteInstruction + buildExecuteTransaction).
+ * Interpreter memory is the transaction's 256 KiB heap frame — no memory
+ * accounts, no provisioning; every execute transaction carries the
+ * RequestHeapFrame prepend.
  */
 import { existsSync } from 'fs';
 import { resolve } from 'path';
@@ -26,9 +27,11 @@ import type { AccountResolution, SignedExecuteTransaction } from '../../src/svm/
 import { fixtureAccounts } from './fixtures.js';
 import type { AccountFixture } from './fixtures.js';
 
-// sdk jest cwd is sdk/, so the default points at the sibling sauce checkout's
-// engine build (same resolution rule as the compiler's LiteSVM harness).
-export const ENGINE_SO = process.env.SAUCE_ENGINE_SO ?? resolve(process.cwd(), '../../sauce/svm/target/deploy/engine.so');
+// sdk jest cwd is sdk/; the vendored binary lives at the repo-root
+// artifacts/svm/, one level up (same resolution rule as the compiler's
+// LiteSVM harness). SAUCE_ENGINE_SO overrides it, e.g. to test against a
+// freshly built engine before repinning the sauce dep.
+export const ENGINE_SO = process.env.SAUCE_ENGINE_SO ?? resolve(process.cwd(), '../artifacts/svm/engine.so');
 
 /** describe when the engine binary exists, describe.skip otherwise (CI). */
 export const describeSvm = existsSync(ENGINE_SO) ? describe : describe.skip;

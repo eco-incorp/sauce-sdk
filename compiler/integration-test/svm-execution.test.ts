@@ -6,9 +6,9 @@
  * pre-flight catch) and the chain context divergences (MSG_SENDER = payer,
  * synthetic CHAIN_ID).
  *
- * Requires the engine .so built by cargo build-sbf (SAUCE_ENGINE_SO or the
- * sauce checkout's svm/target/deploy/engine.so). CI has no engine.so, so the
- * whole suite skips there — same pattern as the v12 suites.
+ * Runs against the vendored engine .so (artifacts/svm/engine.so, committed —
+ * see svm-utils.ts) by default; SAUCE_ENGINE_SO overrides it. Skips only if
+ * that binary is somehow missing.
  */
 import { getAddressCodec } from '@solana/kit';
 import { compile } from '../src/index.js';
