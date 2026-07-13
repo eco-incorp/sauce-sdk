@@ -223,6 +223,46 @@ function coldWalk(kept: readonly KeptBin[], fee: FeeParams, live: DlmmLive, swap
   return remaining > 0n ? null : out;
 }
 
+/**
+ * Capacity-clamped cold bin walk: the same loop, never null — reports the
+ * PRODUCTIVE gross input consumed (`cap = x − remaining`) and the output at
+ * that point. cap === x when x is fully absorbed; cap < x once the walk runs
+ * out of shipped bins (or hits a deactivating bin). The lamport twin of the
+ * emitted rung's `lx`/`lo` capped booking.
+ */
+function coldWalkClamped(
+  kept: readonly KeptBin[],
+  fee: FeeParams,
+  live: DlmmLive,
+  swapForY: boolean,
+  x: bigint,
+): { out: bigint; cap: bigint } {
+  if (x <= 0n || kept.length === 0) return { out: 0n, cap: 0n };
+  let remaining = x;
+  let out = 0n;
+  for (let k = 0; k < kept.length && remaining > 0n; k++) {
+    const { bid, price, amount } = kept[k];
+    const tfee = totalFeeForBin(fee, live, bid);
+    const feeIn = (remaining * tfee + FEE_PRECISION - 1n) / FEE_PRECISION;
+    const excluded = remaining - feeIn;
+    const maxIn = binAmountIn(amount, price, swapForY, 'up');
+    if (maxIn >= SENT) break;
+    if (excluded >= maxIn) {
+      const fee2 = (maxIn * tfee + (FEE_PRECISION - tfee) - 1n) / (FEE_PRECISION - tfee);
+      const consumed = maxIn + fee2;
+      if (consumed > remaining) break;
+      remaining -= consumed;
+      out += amount;
+    } else {
+      const o = binAmountOut(excluded, price, swapForY, 'down');
+      if (o >= SENT) break;
+      out += o;
+      remaining = 0n;
+    }
+  }
+  return { out, cap: x - remaining };
+}
+
 // ---------------------------------------------------------------------------
 // Fragment emission (the fragment twin of the walk above).
 // ---------------------------------------------------------------------------
@@ -412,11 +452,20 @@ export const meteoraDlmmLadder = {
     return [
       `    if (${p}vld !== 0 && ${p}wcx === 0 && ${x} > 0) {`,
       ...emitBinWalk(p, swapForY, x, v, `${p}w${rung}`),
+      // Capacity-aware booking: a fully-absorbed rung records (grid point,
+      // output); an exhausted rung records the PRODUCTIVE input consumed
+      // (x − remaining, the window cap) and the output at the cap, then
+      // latches wcx so higher rungs reuse the cap (their dIn folds to 0). lx
+      // holds the cumulative productive input the codegen books dIn from.
       `      if (${p}wex === 0 && ${p}wrm === 0) { ${p}lo = ${p}wout; ${p}lx = ${x} }`,
-      `      else { ${p}wcx = 1 }`,
+      `      else { ${p}lo = ${p}wout; ${p}lx = ${x} - ${p}wrm; ${p}wcx = 1 }`,
       `    }`,
       `    const ${outVar} = ${p}lo;`,
     ].join('\n');
+  },
+
+  capacityInputVar(slot: number): string {
+    return `s${slot}lx`;
   },
 
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
@@ -498,11 +547,36 @@ export const meteoraDlmmLadder = {
       let capped = false;
       return grid.map((g) => {
         if (!capped && g > 0n) {
-          const out = coldWalk(kept, fee, live, swapForY, g);
-          if (out === null) capped = true;
-          else lo = out;
+          const { out, cap } = coldWalkClamped(kept, fee, live, swapForY, g);
+          lo = out; // fully absorbed: q(g); exhausted: q(cap) at the last shipped bin
+          if (cap < g) capped = true;
         }
         return lo;
+      });
+    };
+  },
+
+  referenceCapacities(
+    base: PoolConfig,
+    state: AccountBytesMap,
+    params: readonly bigint[],
+    now?: bigint,
+  ): (grid: readonly bigint[]) => bigint[] {
+    const cfg = dlmmConfig(base);
+    const swapForY = cfg.direction === 'xToY';
+    const fee = feeParamsFromCfg(cfg, params);
+    const live = liveFromState(cfg, state, fee, now ?? BigInt(Math.floor(Date.now() / 1000)));
+    const kept = effectiveBins(cfg, state, live, params);
+    return (grid: readonly bigint[]): bigint[] => {
+      let cap = 0n;
+      let capped = false;
+      return grid.map((g) => {
+        if (!capped && g > 0n) {
+          const clamped = coldWalkClamped(kept, fee, live, swapForY, g);
+          cap = clamped.cap; // grid point when absorbed; productive input at the window edge
+          if (clamped.cap < g) capped = true;
+        }
+        return cap;
       });
     };
   },
