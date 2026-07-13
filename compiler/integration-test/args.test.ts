@@ -78,4 +78,98 @@ describe('integration: args', () => {
       ),
     ).toBe(30n);
   });
+
+  it('passes an object (struct) arg and reads a field by name', () => {
+    // Declaration order {b,a} but sorted [a,b]; a=1 is field index 0.
+    expect(
+      BigInt(
+        cook('function main(cfg) { return cfg.a; }', {
+          args: [{ b: 2n, a: 1n }],
+        }),
+      ),
+    ).toBe(1n);
+  });
+
+  it('reads a nested struct field via chained field access', () => {
+    expect(
+      BigInt(
+        cook('function main(cfg) { return cfg.chain.vault + cfg.amountIn; }', {
+          args: [{ amountIn: 5n, chain: { router: 7n, vault: 9n } }],
+        }),
+      ),
+    ).toBe(14n);
+  });
+
+  it('reads a top-level scalar field that sorts AFTER a nested-tuple field', () => {
+    // fields sorted: [amountIn, caller, chain, directCount, minOut, priceLimit, tokenIn, tokenOut]
+    // chain (a nested tuple) is at index 2; minOut is at index 4 — reading it must skip the
+    // nested tuple as ONE element, not flatten chain's fields into the parent.
+    expect(
+      BigInt(
+        cook('function main(cfg) { return cfg.minOut; }', {
+          args: [
+            {
+              amountIn: 1n,
+              caller: 2n,
+              chain: { a: 91n, b: 92n, c: 93n, d: 94n, e: 95n, f: 96n },
+              directCount: 3n,
+              minOut: 0n,
+              priceLimit: 4n,
+              tokenIn: 5n,
+              tokenOut: 6n,
+            },
+          ],
+        }),
+      ),
+    ).toBe(0n);
+  });
+
+  it('interleaves nested-tuple reads with a top-level scalar read (solver cfg pattern)', () => {
+    const src =
+      'function main(cfg) {' +
+      ' let a = cfg.chain.fluidResolver;' +
+      ' let b = cfg.chain.mentoBroker;' +
+      ' let c = cfg.chain.balancerV3Router;' +
+      ' let m = cfg.minOut;' +
+      ' let d = cfg.chain.balancerV3Vault;' +
+      ' let e = cfg.chain.balancerV2Vault;' +
+      ' return m + a + b + c + d + e;' +
+      ' }';
+    expect(
+      BigInt(
+        cook(src, {
+          args: [
+            {
+              amountIn: 1n,
+              caller: 2n,
+              chain: {
+                balancerV2Vault: 0n,
+                balancerV3Router: 0n,
+                balancerV3Vault: 0n,
+                fluidResolver: 0n,
+                infinityVault: 0n,
+                mentoBroker: 0n,
+              },
+              directCount: 3n,
+              directQlvCount: 0n,
+              minOut: 0n,
+              priceLimit: 4n,
+              tokenIn: 5n,
+              tokenOut: 6n,
+            },
+          ],
+        }),
+      ),
+    ).toBe(0n);
+  });
+
+  it('mixes a struct arg with scalar and array args', () => {
+    expect(
+      BigInt(
+        cook('function main(cfg, n, pools) { return cfg.a + n + pools[0]; }', {
+          args: [{ b: 2n, a: 1n }, 100n, [7n]],
+        }),
+      ),
+    ).toBe(108n);
+  });
 });

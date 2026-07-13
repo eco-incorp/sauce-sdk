@@ -331,6 +331,12 @@ const v = first.val;
 // Note: fields are sorted alphabetically for ABI encoding
 ```
 
+An object can also be passed as a `main()` argument (`compile(src, { args: [{ … }] })`).
+It is encoded as a TUPLE with fields sorted alphabetically — byte-identical to an
+in-script object literal — so `main(cfg)` reads its fields with `cfg.field` (and nested
+`cfg.child.field`) via the same field-index lowering. Works on both the v1 and v12
+targets. Not supported for staged SVM args (ABI-encode into a bytes arg instead).
+
 ### Increment/Decrement
 
 ```javascript

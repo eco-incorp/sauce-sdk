@@ -4,6 +4,7 @@ import {
   CompilerContext,
   type ElementType,
   type VariableKind,
+  type StructType,
   type CompileTarget,
   type FunctionMeta,
 } from './context.js';
@@ -38,7 +39,45 @@ export type {
   ContractInfo,
 } from './contracts.js';
 
-export type ArgValue = bigint | string | ArgValue[];
+export type ArgValue = bigint | string | ArgValue[] | ArgObject;
+
+/**
+ * A struct arg at the main() boundary. Passed as a plain object, it is encoded as a
+ * TUPLE with fields sorted ALPHABETICALLY — byte-identical to an in-script object
+ * literal (see `extractStructType`/`processObjectExpression`) — so main() reads its
+ * fields with `param.field` (and nested `param.child.field`) via the same INDEX
+ * lowering as any in-script struct. Nested objects recurse; array/scalar/bytes field
+ * values encode as their normal ArgValue forms.
+ */
+export interface ArgObject {
+  [key: string]: ArgValue;
+}
+
+/** A plain struct object (excludes bigint, string, and arrays — all also `object`-ish). */
+function isArgObject(v: ArgValue): v is ArgObject {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Sorted (alphabetical, localeCompare — matching `extractSortedProperties`) field names
+ * of a struct arg, so the encoded tuple order and the compiled `getFieldIndex` order agree.
+ */
+function sortedArgObjectKeys(obj: ArgObject): string[] {
+  return Object.keys(obj).sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The StructType (field names + nested field struct types) for a struct arg, mirroring
+ * `extractStructType` on an in-script object literal so member access on the main() param
+ * resolves the same field indices.
+ */
+function structTypeFromArg(obj: ArgObject): StructType {
+  const fields = sortedArgObjectKeys(obj);
+  const fieldStructTypes = fields.map((k) => (isArgObject(obj[k]) ? structTypeFromArg(obj[k] as ArgObject) : undefined));
+  const hasNestedStruct = fieldStructTypes.some((t) => t !== undefined);
+
+  return hasNestedStruct ? { fields, fieldStructTypes } : { fields };
+}
 
 // ── staged svm arg ABI (payload args over CALLDATA) ──
 //
@@ -147,10 +186,12 @@ export interface CompileResult {
   argsLayout?: ArgsLayout;
 }
 
-function inferArgType(v: ArgValue): { kind: VariableKind; elementType?: ElementType } {
+function inferArgType(v: ArgValue): { kind: VariableKind; elementType?: ElementType; structType?: StructType } {
   if (typeof v === 'bigint') return { kind: 'scalar' };
 
   if (typeof v === 'string') return { kind: 'dynamic' }; // hex bytes
+
+  if (isArgObject(v)) return { kind: 'dynamic', structType: structTypeFromArg(v) }; // struct (TUPLE)
 
   if (Array.isArray(v)) {
     // Infer element type from first element
@@ -309,9 +350,9 @@ function buildArgsLayout(args: ArgValue[]): ArgsLayout {
   let offset = 0;
 
   args.forEach((value, arg) => {
-    if (Array.isArray(value)) {
+    if (Array.isArray(value) || isArgObject(value)) {
       throw new Error(
-        `staged svm args do not support array values (arg ${arg}); ABI-encode the collection into a bytes arg and abi.decode it on-chain`,
+        `staged svm args do not support ${Array.isArray(value) ? 'array' : 'struct'} values (arg ${arg}); ABI-encode the collection into a bytes arg and abi.decode it on-chain`,
       );
     }
 
@@ -538,6 +579,12 @@ function encodeArgValueV12(ctx: CompilerContext, v: ArgValue): V12Saucer {
     return new V12Saucer(ctx).tuple(v.map((el) => encodeArgValueV12(ctx, el)));
   }
 
+  // Struct: a TUPLE of the field values in alphabetical order (matches the in-script
+  // object literal so main() reads its fields by the same INDEX).
+  if (isArgObject(v)) {
+    return new V12Saucer(ctx).tuple(sortedArgObjectKeys(v).map((k) => encodeArgValueV12(ctx, v[k])));
+  }
+
   if (typeof v === 'string') return new V12Saucer(ctx).bytes(hexToBytes(v));
 
   return new V12Saucer(ctx).int(typeof v === 'bigint' ? v : BigInt(v));
@@ -546,6 +593,16 @@ function encodeArgValueV12(ctx: CompilerContext, v: ArgValue): V12Saucer {
 function encodeArgValue(v: ArgValue): Uint8Array {
   if (Array.isArray(v)) {
     const elements = v.map((el) => encodeArgValue(el));
+    const flat = elements.reduce((acc, bytes) => new Uint8Array([...acc, ...bytes]), new Uint8Array());
+
+    return new Uint8Array([OPS.TUPLE, elements.length, ...flat]);
+  }
+
+  // Struct: a TUPLE of the alphabetically-ordered field values (same order as an
+  // in-script object literal, so `getFieldIndex` and this encoding agree).
+  if (isArgObject(v)) {
+    const keys = sortedArgObjectKeys(v);
+    const elements = keys.map((k) => encodeArgValue(v[k]));
     const flat = elements.reduce((acc, bytes) => new Uint8Array([...acc, ...bytes]), new Uint8Array());
 
     return new Uint8Array([OPS.TUPLE, elements.length, ...flat]);

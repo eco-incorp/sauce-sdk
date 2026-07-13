@@ -127,7 +127,7 @@ export class CompilerContext {
   isMainFunction = true;
 
   /** Type info for main() function parameters, inferred from args option */
-  mainArgTypes?: { kind: VariableKind; elementType?: ElementType }[];
+  mainArgTypes?: { kind: VariableKind; elementType?: ElementType; structType?: StructType }[];
 
   /**
    * Optional hook to transform an imported SOURCE module's text before it is parsed —
