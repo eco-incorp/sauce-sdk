@@ -42,8 +42,8 @@
  *
  * Gates (named errors): account size / discriminator; a non-Enabled status;
  * `collect_fee_mode != 0` (only InputOnly is walked — fee always on input);
- * `is_support_limit_order` pairs (LimitOrder function_type, or Undetermined
- * with NO reward mint set — the limit-order fill layers are unsupported); non-classic
+ * explicit LimitOrder-function_type pairs (the limit-order fill layers are unmodeled;
+ * Undetermined/LiquidityMining are admitted — unmodeled orders only add output); non-classic
  * -SPL mints; a slot-typed activation with a nonzero point (no in-VM slot read);
  * a direction with no shippable liquid bins (gated by the orchestrator).
  */
@@ -92,8 +92,6 @@ const OFF_TOKEN_X_MINT = 88;
 const OFF_TOKEN_Y_MINT = 120;
 const OFF_RESERVE_X = 152;
 const OFF_RESERVE_Y = 184;
-const OFF_REWARD0_MINT = 264;
-const OFF_REWARD1_MINT = 408;
 const OFF_ORACLE = 552;
 export const OFF_ACTIVATION_POINT = 816;
 const OFF_TOKEN_X_PROGRAM_FLAG = 880;
@@ -132,31 +130,23 @@ export function windowArrayIndexes(activeId, swapForY) {
     const base = binArrayIndex(activeId);
     return swapForY ? [base, base - 1, base - 2] : [base, base + 1, base + 2];
 }
-const isZeroMint = (data, offset) => {
-    for (let i = 0; i < 32; i++)
-        if (data[offset + i] !== 0)
-            return false;
-    return true;
-};
 /**
- * is_support_limit_order (dlmm-sdk commons/src/extensions/lb_pair.rs @ 4eaaeaa6;
- * FunctionType @ commons/src/conversions/function_type.rs). The enum is
- * 0=Undetermined, 1=LiquidityMining, 2=LimitOrder. Upstream returns true — the
- * pool supports limit orders, whose fill layers the ladder does NOT model, so
- * it is gated — for LimitOrder; false for LiquidityMining; and for Undetermined
- * true iff EVERY reward mint is default/unset (reward_infos.iter().all(|r| r.mint
- * == Pubkey::default())). A byte that is none of 0/1/2 fails FunctionType::try_from
- * upstream and yields false (admitted).
+ * Whether this pair is an explicit LimitOrder pool (FunctionType, dlmm-sdk
+ * commons/src/conversions/function_type.rs @ 4eaaeaa6: 0=Undetermined,
+ * 1=LiquidityMining, 2=LimitOrder). The ladder models only bin (liquidity)
+ * crossings, not limit-order fill layers, so a LimitOrder pool is GATED.
+ *
+ * NOTE: we intentionally do NOT mirror upstream's is_support_limit_order, which
+ * ALSO returns true for an Undetermined pool with no reward mint. That predicate
+ * is a routing-consideration flag ("this pool MIGHT carry limit-order liquidity"),
+ * NOT a drop signal — and Undetermined-with-no-reward is the DEFAULT state of an
+ * ordinary new pool (e.g. the SOL/USDC mainnet fixture), so gating on it would
+ * drop a large fraction of normal DLMM pools. Admitting them is conservative-safe:
+ * any unmodeled limit-order liquidity only ADDS output (realized out >= modeled),
+ * exactly the Raydium-CLMM treatment. Gate only the explicit LimitOrder(2) type.
  */
 function isSupportLimitOrder(data) {
-    const functionType = data[OFF_FUNCTION_TYPE];
-    if (functionType === 2)
-        return true; // LimitOrder
-    if (functionType === 0) {
-        // Undetermined: supported (gated) iff no reward mint is configured.
-        return isZeroMint(data, OFF_REWARD0_MINT) && isZeroMint(data, OFF_REWARD1_MINT);
-    }
-    return false; // LiquidityMining (1) or an unrecognized function_type
+    return data[OFF_FUNCTION_TYPE] === 2; // LimitOrder — admit Undetermined(0) and LiquidityMining(1)
 }
 /**
  * Scan the readable window for liquid bins in walk order: from active_id
