@@ -205,10 +205,12 @@ export const pumpswapAdapter = {
         if (!hasDiscriminator(globalConfigData, GLOBAL_CONFIG_DISCRIMINATOR)) {
             throw new Error(`pumpswap global config ${GLOBAL_CONFIG} discriminator mismatch`);
         }
+        // disable_flags (bit3 buy, bit4 sell) gate only the direction they disable.
+        // fetchPoolConfig always returns direction 'quoteToBase' (the caller flips
+        // it to 'baseToQuote' for sells), so gating a disabled buy HERE would drop
+        // a pool that is still a perfectly valid sell venue. The check is deferred
+        // to buildSwap, where the resolved direction is known.
         const disableFlags = globalConfigData[56];
-        if ((disableFlags & (1 << 3)) !== 0) {
-            throw new Error(`pumpswap gate: buys are disabled (global config disable_flags ${disableFlags})`);
-        }
         if (!hasDiscriminator(feeConfigData, FEE_CONFIG_DISCRIMINATOR)) {
             throw new Error(`pumpswap fee config ${FEE_CONFIG} discriminator mismatch`);
         }
@@ -321,8 +323,10 @@ export const pumpswapAdapter = {
         const c = asPumpswapConfig(cfg);
         checkAmountIn(amountIn);
         const sell = c.direction === 'baseToQuote';
-        if (sell && (c.disableFlags & (1 << 4)) !== 0) {
-            throw new Error(`pumpswap gate: sells are disabled (global config disable_flags ${c.disableFlags})`);
+        // Gate only the resolved direction: bit3 disables buys, bit4 disables sells.
+        const disabled = sell ? c.disableFlags & (1 << 4) : c.disableFlags & (1 << 3);
+        if (disabled !== 0) {
+            throw new Error(`pumpswap gate: ${sell ? 'sells' : 'buys'} are disabled (global config disable_flags ${c.disableFlags})`);
         }
         // buy_exact_quote_in: disc + spendable_quote_in u64 + min_base_amount_out
         // u64 + track_volume OptionBool (1 byte, 0x00 = false) = 25 bytes.

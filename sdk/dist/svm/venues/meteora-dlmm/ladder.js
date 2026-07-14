@@ -236,7 +236,12 @@ export const meteoraDlmmLadder = {
     /** 2 rungs by default: a rung is a full cold bin walk (degrade-first class, like the CLMMs). */
     defaultRungs: 2,
     shapeKey(base) {
-        return `${SLUG}:${dlmmConfig(base).direction}`;
+        const cfg = dlmmConfig(base);
+        // The swap ix ships only the bin arrays that EXIST on-chain (the readable
+        // prefix), so the CPI account layout — hence the compiled bytecode — varies
+        // with that count; it MUST be part of the shape discriminant (the contract:
+        // one shapeKey => byte-identical slot fragments).
+        return `${SLUG}:${cfg.direction}:ba${windowFor(cfg).readable}`;
     },
     helpers() {
         return [];
@@ -382,7 +387,11 @@ export const meteoraDlmmLadder = {
             patch: 'in',
             accounts: [
                 roled('pair', cfg.pool, true),
-                roled('bmx', cfg.bitmapExtension), // bin_array_bitmap_extension (optional)
+                // bin_array_bitmap_extension is an Option<AccountLoader>: pass the real
+                // account only when it exists on-chain, else the DLMM program-id None
+                // sentinel (mirrors host_fee_in below). A derived-but-uninitialized PDA
+                // makes Anchor try Some(deserialize) and revert every real swap.
+                roled('bmx', cfg.bitmapExtensionExists ? cfg.bitmapExtension : METEORA_DLMM_PROGRAM_ID),
                 roled('rx', cfg.reserveX, true),
                 roled('ry', cfg.reserveY, true),
                 { ref: swapForY ? user.inAta : user.outAta, writable: true }, // user_token_in (x-side)
@@ -396,10 +405,11 @@ export const meteoraDlmmLadder = {
                 roled('tpy', TOKEN_PROGRAM),
                 roled('evt', EVENT_AUTHORITY),
                 roled('prog', METEORA_DLMM_PROGRAM_ID),
-                // remaining accounts: the walk bin arrays.
-                roled('ba0', window.binArrays[0], true),
-                roled('ba1', window.binArrays[1], true),
-                roled('ba2', window.binArrays[2], true),
+                // remaining accounts: only the bin arrays that ACTUALLY EXIST on-chain
+                // (the contiguous readable prefix — every shipped liquid bin lives in
+                // it). Shipping a derived-but-uninitialized bin-array PDA reverts the
+                // swap, and the capacity clamp already keeps the walk inside this set.
+                ...window.binArrays.slice(0, window.readable).map((addr, i) => roled(`ba${i}`, addr, true)),
             ],
         };
     },

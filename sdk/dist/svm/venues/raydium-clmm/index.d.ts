@@ -43,6 +43,8 @@ export declare const OFF_TA_TICKS = 44;
 export declare const TICK_LEN = 168;
 export declare const OFF_TICK_LIQ_NET = 4;
 export declare const OFF_TICK_LIQ_GROSS = 20;
+export declare const OFF_TICK_ORDERS_AMOUNT = 124;
+export declare const OFF_TICK_PART_FILLED_ORDERS = 132;
 export interface RaydiumClmmBoundary {
     /** Index into the window's tickArrays (0..2). */
     arrayIndex: number;

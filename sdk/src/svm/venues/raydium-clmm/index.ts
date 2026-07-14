@@ -18,8 +18,17 @@
  * da f4 21 68 cb cb 2b 6f; TickArrayState = 10240 bytes, discriminator
  * c0 9b 55 cd 31 f9 81 2a. All integers little-endian; liquidity_net is i128
  * LE two's-complement and tick indices are i32 LE (read unsigned + biased by
- * 2^31 in-VM). A tick is INITIALIZED iff its liquidity_gross (u128) is nonzero
- * — Raydium has no per-tick `initialized` byte (unlike whirlpool).
+ * 2^31 in-VM). Raydium has no per-tick `initialized` byte (unlike whirlpool):
+ * upstream's TickState::is_initialized() is has_liquidity() (liquidity_gross
+ * != 0) OR has_limit_orders() (orders_amount != 0 || part_filled_orders_
+ * remaining != 0), and the swap matches a boundary tick's limit orders
+ * UNCONDITIONALLY (before any liquidity crossing). The ladder models ONLY the
+ * liquidity crossing, so it uses liquidity_gross != 0 as its boundary condition
+ * and GATES any pool whose scanned window carries active limit orders (see
+ * tickHasLimitOrders) — a conservative drop, never mis-modeled order math. On
+ * the classic order-free CLMM build those two order u64s lie inside the
+ * never-written padding[13] region and read as zero, so the gate is a no-op
+ * there; the fields are populated only by the limit-order build.
  *
  * THE WINDOW (identical thesis to whirlpool): prepare walks the tick arrays
  * OFF-CHAIN and ships up to RAYDIUM_CLMM_MAX_BOUNDARIES initialized-tick
@@ -41,6 +50,10 @@
  *   bounded steps with a per-step volatility fee the fragment does not model
  *   (the SwapState path where `get_dynamic_fee_info()` is Some); classic pools
  *   (all-zero dynamic_fee_info) jump straight to the next initialized tick;
+ * - active limit orders on any scanned window tick (orders_amount /
+ *   part_filled_orders_remaining nonzero) — upstream matches them at the
+ *   boundary UNCONDITIONALLY and the ladder does not model order matching
+ *   (conservative drop; a no-op on the classic order-free build);
  * - the swap-disabled status bit;
  * - non-classic-SPL mints (the quote reads vault-independent tick liquidity,
  *   but a transfer-fee mint would break the realized-delta bound);
@@ -107,6 +120,12 @@ export const OFF_TA_TICKS = 44;
 export const TICK_LEN = 168;
 export const OFF_TICK_LIQ_NET = 4;
 export const OFF_TICK_LIQ_GROSS = 20;
+// Limit-order fields (cell-relative). orders_amount u64 @124, part_filled_orders_remaining
+// u64 @132 — after reward_growths_outside_x64[3] (ends @116) and order_phase u64 (@116).
+// On the classic order-free build these two u64s fall inside the never-written padding[13]
+// region (also @116..168) and read as zero, so the limit-order gate is a no-op there.
+export const OFF_TICK_ORDERS_AMOUNT = 124;
+export const OFF_TICK_PART_FILLED_ORDERS = 132;
 
 /** Swap-disabled status bit (PoolStatusBitIndex::Swap = 4). */
 const STATUS_SWAP_BIT = 4;
@@ -216,6 +235,22 @@ function tickInitialized(array: Uint8Array, offset: number): boolean {
 }
 
 /**
+ * Whether a tick cell carries ACTIVE limit orders — upstream's
+ * TickState::has_limit_orders() = orders_amount > 0 || part_filled_orders_remaining > 0.
+ * Upstream treats such a tick as initialized and matches its orders UNCONDITIONALLY when
+ * the swap reaches the boundary (even with liquidity_gross == 0, so this is checked
+ * independently of tickInitialized). The ladder models only liquidity crossings, so a
+ * window tick with live orders is gated. No-op on the classic order-free build (padding).
+ */
+function tickHasLimitOrders(array: Uint8Array, offset: number): boolean {
+  const base = OFF_TA_TICKS + offset * TICK_LEN;
+  return (
+    readUintLE(array, base + OFF_TICK_ORDERS_AMOUNT, 8) !== 0n ||
+    readUintLE(array, base + OFF_TICK_PART_FILLED_ORDERS, 8) !== 0n
+  );
+}
+
+/**
  * Scan the readable window for initialized-tick boundaries in walk order —
  * next_initialized_tick semantics: zero_for_one searches DOWN from the live
  * tick's offset INCLUSIVE, one_for_zero searches UP exclusive; later arrays
@@ -264,6 +299,16 @@ async function resolveWindow(
     }
     if (!zeroForOne && offset < 0) offset = 0;
     while (offset >= 0 && offset < TICK_ARRAY_SIZE) {
+      if (tickHasLimitOrders(data, offset)) {
+        // Upstream matches this boundary tick's limit orders unconditionally; the ladder
+        // does not model order matching, so drop the pool (conservative — real out would
+        // only exceed the modeled out). Rejection routes through the orchestrator's
+        // per-venue self-drop, exactly like the other named gates.
+        throw new Error(
+          `${SLUG}: pool ${pool} has active limit orders at tick ${start + offset * tickSpacing} ` +
+            '— the ladder does not model limit-order matching',
+        );
+      }
       if (tickInitialized(data, offset)) {
         const tick = start + offset * tickSpacing;
         boundaries.push({ arrayIndex: a, offset, tick, sqrtPrice: raydiumSqrtPriceAtTick(tick) });

@@ -66,7 +66,13 @@ export const pumpswapLadder = {
                 },
             ];
         }
-        // sell: fees are per-component ceilDiv on the OUTPUT.
+        // sell: fees are per-component ceilDiv on the OUTPUT. Because each of the
+        // three components is ceil-rounded independently, on a dust output their
+        // sum can exceed the gross qo — a plain qo - a - b - c would underflow and
+        // WRAP in the engine's unsigned math, presenting a huge bogus quote that
+        // wins ranking then reverts on-chain. Clamp the net at 0 so a dust rung
+        // just yields nothing and self-drops. Byte-identical to the old expression
+        // whenever fee <= qo (the only regime a real trade lands in).
         return [
             {
                 name: 'qPumpSell',
@@ -74,7 +80,9 @@ export const pumpswapLadder = {
                     'function qPumpSell(x, rb, rq, lp, prot, cr) {',
                     '  if (x === 0) { return 0 }',
                     '  const qo = Math.mulDiv(rq, x, rb + x);',
-                    '  return qo - (qo * lp + 9999) / 10000 - (qo * prot + 9999) / 10000 - (qo * cr + 9999) / 10000;',
+                    '  const fee = (qo * lp + 9999) / 10000 + (qo * prot + 9999) / 10000 + (qo * cr + 9999) / 10000;',
+                    '  if (fee > qo) { return 0 }',
+                    '  return qo - fee;',
                     '}',
                 ].join('\n'),
             },
@@ -109,8 +117,12 @@ export const pumpswapLadder = {
     buildSwapV2(base, slot, user) {
         const cfg = psConfig(base);
         const sell = cfg.direction === 'baseToQuote';
-        if (sell && (cfg.disableFlags & (1 << 4)) !== 0) {
-            throw new Error(`${SLUG} gate: sells are disabled (global config disable_flags ${cfg.disableFlags})`);
+        // disable_flags gate ONLY the direction they actually disable (bit3 buy,
+        // bit4 sell). A buy-disabled pool is still a valid sell venue and vice
+        // versa, so never let one direction's flag drop the other.
+        const disabled = sell ? cfg.disableFlags & (1 << 4) : cfg.disableFlags & (1 << 3);
+        if (disabled !== 0) {
+            throw new Error(`${SLUG} gate: ${sell ? 'sells' : 'buys'} are disabled (global config disable_flags ${cfg.disableFlags})`);
         }
         // buy_exact_quote_in: disc ++ spendable_quote_in u64 (patched) ++
         // min_base_amount_out u64 = 1 ++ track_volume OptionBool 0x00.
@@ -180,7 +192,10 @@ export const pumpswapLadder = {
             if (x === 0n)
                 return 0n;
             const qo = (rq * x) / (rb + x);
-            return qo - (qo * lp + 9999n) / BPS - (qo * prot + 9999n) / BPS - (qo * cr + 9999n) / BPS;
+            // Mirror the on-chain clamp: the per-component ceil'd fee sum can exceed
+            // the gross output on a dust trade; never let the net go negative.
+            const fee = (qo * lp + 9999n) / BPS + (qo * prot + 9999n) / BPS + (qo * cr + 9999n) / BPS;
+            return fee > qo ? 0n : qo - fee;
         };
     },
     depthReserves(base, state) {

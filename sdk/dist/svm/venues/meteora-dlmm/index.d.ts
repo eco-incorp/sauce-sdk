@@ -74,6 +74,13 @@ export interface MeteoraDlmmPoolConfig extends PoolConfig {
     oracle: Address;
     /** ['bitmap', lb_pair] — required by the swap when the walk leaves the default bitmap. */
     bitmapExtension: Address;
+    /**
+     * Whether the ['bitmap', lb_pair] extension account EXISTS on-chain. The swap
+     * ix takes it as an Option<AccountLoader>; when it is absent the swap must pass
+     * the DLMM program id as the Anchor None sentinel (NOT the derived-but-
+     * uninitialized PDA, which makes Anchor deserialize Some(...) and revert).
+     */
+    bitmapExtensionExists: boolean;
     binStep: number;
     activeId: number;
     /** Immutable fee params (StaticParameters) — shipped as cfg words. */

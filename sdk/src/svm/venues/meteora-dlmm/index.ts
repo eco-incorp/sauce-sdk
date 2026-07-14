@@ -43,7 +43,7 @@
  * Gates (named errors): account size / discriminator; a non-Enabled status;
  * `collect_fee_mode != 0` (only InputOnly is walked — fee always on input);
  * `is_support_limit_order` pairs (LimitOrder function_type, or Undetermined
- * with a reward mint — the limit-order fill layers are unsupported); non-classic
+ * with NO reward mint set — the limit-order fill layers are unsupported); non-classic
  * -SPL mints; a slot-typed activation with a nonzero point (no in-VM slot read);
  * a direction with no shippable liquid bins (gated by the orchestrator).
  */
@@ -147,6 +147,13 @@ export interface MeteoraDlmmPoolConfig extends PoolConfig {
   oracle: Address;
   /** ['bitmap', lb_pair] — required by the swap when the walk leaves the default bitmap. */
   bitmapExtension: Address;
+  /**
+   * Whether the ['bitmap', lb_pair] extension account EXISTS on-chain. The swap
+   * ix takes it as an Option<AccountLoader>; when it is absent the swap must pass
+   * the DLMM program id as the Anchor None sentinel (NOT the derived-but-
+   * uninitialized PDA, which makes Anchor deserialize Some(...) and revert).
+   */
+  bitmapExtensionExists: boolean;
   binStep: number;
   activeId: number;
   /** Immutable fee params (StaticParameters) — shipped as cfg words. */
@@ -202,14 +209,23 @@ const isZeroMint = (data: Uint8Array, offset: number): boolean => {
 };
 
 /**
- * is_support_limit_order (lb_pair.rs): LimitOrder(1) => true; LiquidityMining(0)
- * => false; Undetermined(2) => true iff any reward mint is set (non-default).
+ * is_support_limit_order (dlmm-sdk commons/src/extensions/lb_pair.rs @ 4eaaeaa6;
+ * FunctionType @ commons/src/conversions/function_type.rs). The enum is
+ * 0=Undetermined, 1=LiquidityMining, 2=LimitOrder. Upstream returns true — the
+ * pool supports limit orders, whose fill layers the ladder does NOT model, so
+ * it is gated — for LimitOrder; false for LiquidityMining; and for Undetermined
+ * true iff EVERY reward mint is default/unset (reward_infos.iter().all(|r| r.mint
+ * == Pubkey::default())). A byte that is none of 0/1/2 fails FunctionType::try_from
+ * upstream and yields false (admitted).
  */
 function isSupportLimitOrder(data: Uint8Array): boolean {
   const functionType = data[OFF_FUNCTION_TYPE];
-  if (functionType === 1) return true;
-  if (functionType === 0) return false;
-  return !(isZeroMint(data, OFF_REWARD0_MINT) && isZeroMint(data, OFF_REWARD1_MINT));
+  if (functionType === 2) return true; // LimitOrder
+  if (functionType === 0) {
+    // Undetermined: supported (gated) iff no reward mint is configured.
+    return isZeroMint(data, OFF_REWARD0_MINT) && isZeroMint(data, OFF_REWARD1_MINT);
+  }
+  return false; // LiquidityMining (1) or an unrecognized function_type
 }
 
 /**
@@ -323,6 +339,10 @@ export async function fetchMeteoraDlmmConfig(load: AccountLoader, pair: Address)
       seeds: [new TextEncoder().encode('bitmap'), getAddressEncoded(pair)],
     }).then(([pda]) => pda),
   ]);
+  // The bitmap extension exists only for pairs whose liquidity leaves the
+  // default bitmap; probe it so the swap can pass the program-id None sentinel
+  // when it is absent (the common case) instead of an uninitialized PDA.
+  const bitmapExtensionExists = (await load(bitmapExtension)) !== null;
 
   return {
     venue: SLUG,
@@ -334,6 +354,7 @@ export async function fetchMeteoraDlmmConfig(load: AccountLoader, pair: Address)
     reserveY: codec.decode(data.subarray(OFF_RESERVE_Y, OFF_RESERVE_Y + 32)),
     oracle: codec.decode(data.subarray(OFF_ORACLE, OFF_ORACLE + 32)),
     bitmapExtension,
+    bitmapExtensionExists,
     binStep,
     activeId,
     baseFactor: Number(readUintLE(data, OFF_BASE_FACTOR, 2)),
