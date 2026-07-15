@@ -3,19 +3,24 @@
  * engine inside an in-process LiteSVM bank (no validator, no RPC).
  *
  * Self-contained on purpose: the compiler package must not depend on sdk/, so
- * the engine interface (discriminator, PDA seeds/sizes, account laws) is
- * mirrored here from the engine crate (sauce repo, svm/programs/engine) and
- * the execute instruction is assembled by hand.
+ * the engine interface (discriminator, account laws, the ComputeBudget
+ * prepends) is mirrored here from the engine crate (sauce repo,
+ * svm/programs/engine) and the execute instruction is assembled by hand.
+ *
+ * Interpreter memory is the transaction's 256 KiB BPF heap frame — no memory
+ * accounts exist, so every execute transaction carries a
+ * RequestHeapFrame(262144) instruction (add-once beside any other
+ * ComputeBudget instruction; without it the engine aborts before any opcode).
  *
  * Two laws bind the execute account list:
  * - the AccountPlan's meta order IS the engine's user-account index space:
- *   plan meta i must be instruction account 3+i (after the stack/heap/frames
- *   PDAs), exactly;
- * - MSG_SENDER = the first is_signer in the FULL instruction account list, so
- *   the payer must be an instruction account: when the plan interns the
- *   reserved 'payer' ref it is mapped in place, otherwise it is appended AFTER
- *   the plan-mapped metas (and any extra provided accounts) so plan indices —
- *   and raw positional indices — stay faithful.
+ *   plan meta i must be instruction account i, exactly (no fixed prefix);
+ * - MSG_SENDER = the first is_signer in the instruction account list, resolved
+ *   LAZILY (NoSigner only when the program reads the sender): when the plan
+ *   interns the reserved 'payer' ref it is mapped in place, otherwise the
+ *   harness appends the payer AFTER the plan-mapped metas (and any extra
+ *   provided accounts) so plan indices — and raw positional indices — stay
+ *   faithful while MSG_SENDER-reading programs keep working.
  *
  * The engine binary comes from `make build` (cargo build-sbf) in the sauce
  * repo. CI has no engine.so, so suites guard with `describeSvm` and skip there
@@ -29,7 +34,6 @@ import {
   createTransactionMessage,
   generateKeyPairSigner,
   getAddressCodec,
-  getProgramDerivedAddress,
   lamports,
   pipe,
   setTransactionMessageFeePayerSigner,
@@ -40,12 +44,22 @@ import { FailedTransactionMetadata, LiteSVM } from 'litesvm';
 import { compile } from '../src/index.js';
 import type { CompileOptions } from '../src/index.js';
 
-// Mirrored from the engine crate: sha256("global:execute")[..8] and the full
-// PDA sizes (1 bump byte + payload).
+// Mirrored from the engine crate: sha256("global:execute")[..8] and the
+// heap-frame size every execute transaction must request.
 const EXECUTE_DISCRIMINATOR = new Uint8Array([0x82, 0xdd, 0xf2, 0x9a, 0x0d, 0xc1, 0xbd, 0x1d]);
-const PDA_SIZES = { stack: 33793, heap: 65536, frames: 67585 } as const;
+const HEAP_FRAME_BYTES = 262_144;
 
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111' as Address;
+const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111' as Address;
+
+/** ComputeBudgetInstruction::RequestHeapFrame — u8 discriminant 1 + u32 LE bytes. */
+const requestHeapFrame = (bytes: number): Instruction => {
+  const data = new Uint8Array(5);
+  data[0] = 1;
+  new DataView(data.buffer).setUint32(1, bytes, true);
+
+  return { programAddress: COMPUTE_BUDGET_PROGRAM, accounts: [], data };
+};
 
 // cwd is compiler/ under jest (the pnpm script runs there), mirroring how
 // utils.ts resolves its cwd-relative paths.
@@ -58,7 +72,6 @@ export interface SvmHarness {
   svm: LiteSVM;
   programId: Address;
   payer: KeyPairSigner;
-  pdas: { stack: Address; heap: Address; frames: Address };
 }
 
 /**
@@ -91,33 +104,9 @@ export const startSvm = async (): Promise<SvmHarness> => {
   const payer = await generateKeyPairSigner();
   svm.airdrop(payer.address, lamports(1_000_000_000_000n));
 
-  const [stack, heap, frames] = await Promise.all(
-    (['stack', 'heap', 'frames'] as const).map((seed) => provisionPda(svm, programId, seed)),
-  );
-
-  return { svm, programId, payer, pdas: { stack, heap, frames } };
-};
-
-// Fast-path PDA provisioning: setAccount with full-size zeroed data and the
-// canonical bump at data[0] — exactly what the on-chain init_* growth loop
-// builds, minus the transactions (the sdk bootstrap path is covered by sdk
-// tests). The PDA seed is the single literal word; owner must be the engine.
-const provisionPda = async (svm: LiteSVM, programId: Address, seed: keyof typeof PDA_SIZES): Promise<Address> => {
-  const [address, bump] = await getProgramDerivedAddress({ programAddress: programId, seeds: [seed] });
-  const size = PDA_SIZES[seed];
-  const data = new Uint8Array(size);
-  data[0] = bump;
-
-  svm.setAccount({
-    address,
-    data,
-    executable: false,
-    lamports: lamports(svm.minimumBalanceForRentExemption(BigInt(size))),
-    programAddress: programId,
-    space: BigInt(size),
-  });
-
-  return address;
+  // No memory setup: interpreter memory is the per-transaction heap frame,
+  // requested by the RequestHeapFrame instruction svmCook prepends.
+  return { svm, programId, payer };
 };
 
 interface ResolvedTestAccount {
@@ -152,8 +141,11 @@ const materializeAccount = async (harness: SvmHarness, spec: SvmTestAccount): Pr
       data,
       executable: false,
       lamports: lamports(spec.lamports ?? harness.svm.minimumBalanceForRentExemption(BigInt(data.length))),
-      // Default owner is the engine so writeAccountData can mutate the data
-      // (the runtime rejects writes to accounts the program does not own).
+      // Default owner is the engine. Note SSTORE has NO effectively-writable
+      // target class on SVM: every engine-owned target is ProtectedAccount
+      // (finalized buffers stay unscribblable) and the runtime independently
+      // rejects engine data-writes to foreign-owned accounts — the SSTORE
+      // fail-path tests below pin both walls.
       programAddress: spec.owner ?? harness.programId,
       space: BigInt(data.length),
     });
@@ -214,7 +206,7 @@ export const svmCook = async (
   }
 
   // Plan-mapped metas first (plan index i = user index i = instruction account
-  // 3+i). In raw-index mode the plan is empty and the provided accounts map
+  // i). In raw-index mode the plan is empty and the provided accounts map
   // positionally to user indices 0..n-1. Unplanned extras follow, the payer
   // last (unless the plan interned the reserved 'payer' ref).
   const metas: (AccountMeta | AccountSignerMeta)[] = [];
@@ -251,12 +243,7 @@ export const svmCook = async (
 
   const instruction: Instruction = {
     programAddress: harness.programId,
-    accounts: [
-      { address: harness.pdas.stack, role: AccountRole.WRITABLE },
-      { address: harness.pdas.heap, role: AccountRole.WRITABLE },
-      { address: harness.pdas.frames, role: AccountRole.WRITABLE },
-      ...metas,
-    ],
+    accounts: metas,
     data,
   };
 
@@ -267,7 +254,7 @@ export const svmCook = async (
   const message = pipe(
     createTransactionMessage({ version: 0 }),
     (m) => setTransactionMessageFeePayerSigner(harness.payer, m),
-    (m) => appendTransactionMessageInstructions([instruction], m),
+    (m) => appendTransactionMessageInstructions([requestHeapFrame(HEAP_FRAME_BYTES), instruction], m),
     (m) => harness.svm.setTransactionMessageLifetimeUsingLatestBlockhash(m),
   );
   const transaction = await signTransactionMessageWithSigners(message);

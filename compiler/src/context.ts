@@ -63,6 +63,15 @@ interface SharedModule {
   defines: Map<string, bigint>;
   /** svm: symbolic account refs → user-account indices, shared so helper functions share numbering. */
   accounts: AccountRegistry;
+  /**
+   * svm: compiling for staged execution (execute_from_account). Compile-time
+   * args are NOT baked into the blob — the prologue SLICEs them out of the
+   * CALLDATA composite (`program ++ payload args`) — and user-level msg.data
+   * is rejected (the prologue owns the single CALLDATA; a second one copies
+   * the whole staged program to the heap again). Module-shared so every
+   * function context sees the gate.
+   */
+  staged: boolean;
 }
 
 export class CompilerContext {
@@ -160,6 +169,7 @@ export class CompilerContext {
       funcMeta: [],
       defines: new Map(),
       accounts: new AccountRegistry(),
+      staged: false,
     };
 
     for (const [name, config] of Object.entries(contracts)) {
@@ -175,6 +185,16 @@ export class CompilerContext {
   /** True only for the Solana target ('svm' is a v12 dialect with divergent call/storage lowering). */
   get isSvm(): boolean {
     return this.target === 'svm';
+  }
+
+  /** svm: compiling for staged execution — args read from the payload via CALLDATA; msg.data rejected. */
+  get staged(): boolean {
+    return this.module.staged;
+  }
+
+  /** svm: mark the module staged (set once by compile() before processing). */
+  setStaged(staged: boolean): void {
+    this.module.staged = staged;
   }
 
   /** The function index table (shared across a v12 module's contexts). */

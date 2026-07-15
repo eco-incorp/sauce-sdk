@@ -81,8 +81,8 @@ importers:
         specifier: ^3.8.1
         version: 3.8.3
       sauce:
-        specifier: github:eco-incorp/sauce#feat/engine-infinity-swaps
-        version: git+https://git@github.com:eco-incorp/sauce.git#3b1157775c5b514f32eea623f65b2874155240b4
+        specifier: github:eco-incorp/sauce#feat/svm-exec-from-account
+        version: git+https://git@github.com:eco-incorp/sauce.git#c099cdee9dedc64f9563fb94e009216649337206
       ts-jest:
         specifier: ^29.4.6
         version: 29.4.11(@babel/core@7.29.7)(@jest/transform@30.4.1)(@jest/types@30.4.1)(babel-jest@30.4.1(@babel/core@7.29.7))(jest-util@30.4.1)(jest@30.4.2(@types/node@25.9.1))(typescript@5.9.3)
@@ -3078,8 +3078,8 @@ packages:
   safer-buffer@2.1.2:
     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
 
-  sauce@git+https://git@github.com:eco-incorp/sauce.git#3b1157775c5b514f32eea623f65b2874155240b4:
-    resolution: {commit: 3b1157775c5b514f32eea623f65b2874155240b4, repo: git@github.com:eco-incorp/sauce.git, type: git}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#c099cdee9dedc64f9563fb94e009216649337206:
+    resolution: {commit: c099cdee9dedc64f9563fb94e009216649337206, repo: git@github.com:eco-incorp/sauce.git, type: git}
     version: 0.0.0
 
   semver@5.7.2:
@@ -7122,7 +7122,7 @@ snapshots:
 
   safer-buffer@2.1.2: {}
 
-  sauce@git+https://git@github.com:eco-incorp/sauce.git#3b1157775c5b514f32eea623f65b2874155240b4: {}
+  sauce@git+https://git@github.com:eco-incorp/sauce.git#c099cdee9dedc64f9563fb94e009216649337206: {}
 
   semver@5.7.2: {}
 

@@ -1,6 +1,6 @@
 import { AccountRole, address, generateKeyPairSigner, getAddressDecoder, getCompiledTransactionMessageDecoder } from '@solana/kit';
 import type { Blockhash, TransactionSigner } from '@solana/kit';
-import { createAltWithAddresses, getTransactionSize, selectAltAddresses, waitForAltActive } from '../../src/svm/index.js';
+import { createAltWithAddresses, extendAlt, getTransactionSize, selectAltAddresses, waitForAltActive } from '../../src/svm/index.js';
 import type { SignedExecuteTransaction } from '../../src/svm/index.js';
 
 const A = address('So11111111111111111111111111111111111111112');
@@ -109,6 +109,75 @@ describe('createAltWithAddresses', () => {
     expect(extendedCount(sent[1])).toBe(27);
     expect(extendedCount(sent[2])).toBe(3);
     for (const transaction of sent) expect(getTransactionSize(transaction)).toBeLessThanOrEqual(1232);
+  });
+});
+
+describe('extendAlt', () => {
+  const TABLE = address('11111111111111111111111111111112');
+  const addresses = Array.from({ length: 30 }, (_, i) => getAddressDecoder().decode(new Uint8Array(32).fill(i + 1)));
+
+  function altRpcStub(): Parameters<typeof extendAlt>[0]['rpc'] {
+    const rpc = {
+      getSlot: () => ({ send: async () => 200n }),
+      getLatestBlockhash: () => ({ send: async () => ({ context: { slot: 200n }, value: BLOCKHASH }) }),
+    };
+
+    return rpc as unknown as Parameters<typeof extendAlt>[0]['rpc'];
+  }
+
+  function extendedCount(transaction: SignedExecuteTransaction): number {
+    const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+    if (compiled.version !== 0) throw new Error('expected a v0 compiled message');
+
+    return (compiled.instructions[0].data!.length - 12) / 32;
+  }
+
+  async function runExtend(payer: TransactionSigner, authority: TransactionSigner, toAdd: typeof addresses): Promise<{ sent: SignedExecuteTransaction[]; slot: bigint }> {
+    const sent: SignedExecuteTransaction[] = [];
+    const { lastExtendedSlot } = await extendAlt({
+      rpc: altRpcStub(),
+      payer,
+      authority,
+      lookupTableAddress: TABLE,
+      addresses: toAdd,
+      sendAndConfirm: async transaction => {
+        sent.push(transaction);
+      },
+    });
+
+    return { sent, slot: lastExtendedSlot };
+  }
+
+  it('appends 30 addresses in one extend tx (no create) when payer === authority, inside the packet', async () => {
+    const payer = await generateKeyPairSigner();
+
+    const { sent, slot } = await runExtend(payer, payer, addresses);
+
+    expect(sent).toHaveLength(1);
+    expect(extendedCount(sent[0])).toBe(30);
+    expect(getTransactionSize(sent[0])).toBeLessThanOrEqual(1232);
+    expect(slot).toBe(200n);
+  });
+
+  it('chunks at 27 with a distinct authority, all inside the packet', async () => {
+    const payer = await generateKeyPairSigner();
+    const authority = await generateKeyPairSigner();
+
+    const { sent } = await runExtend(payer, authority, addresses);
+
+    expect(sent).toHaveLength(2);
+    expect(extendedCount(sent[0])).toBe(27);
+    expect(extendedCount(sent[1])).toBe(3);
+    for (const transaction of sent) expect(getTransactionSize(transaction)).toBeLessThanOrEqual(1232);
+  });
+
+  it('sends nothing for an empty address set (the idempotent reuse no-op)', async () => {
+    const payer = await generateKeyPairSigner();
+
+    const { sent, slot } = await runExtend(payer, payer, []);
+
+    expect(sent).toHaveLength(0);
+    expect(slot).toBe(200n);
   });
 });
 
