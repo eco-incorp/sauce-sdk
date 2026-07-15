@@ -1,20 +1,27 @@
 import { resolve } from 'node:path';
-import { compile, createCompileCache, compileCacheKey } from '../src/index.js';
+import {
+  compile,
+  createCompileCache,
+  compileCacheKey,
+  getDefaultCompileCache,
+  clearDefaultCompileCache,
+} from '../src/index.js';
 import type { CompileResult } from '../src/index.js';
 
 // A hit must be byte-identical to a fresh compile, and the cache must be
 // invisible to output (only speed changes). The correctness risks are (1) a
 // wrong hit across differing inputs and (2) shared mutable state between a
-// cached entry and a returned result — both pinned below.
+// cached entry and a returned result — both pinned below. `{ cache: false }` is
+// the guaranteed-fresh baseline now that caching is ON by default.
 
 const hex = (r: CompileResult) => r.bytecode.map((b) => Buffer.from(b).toString('hex')).join('|');
 
 describe('compile cache', () => {
-  it('a cached hit is byte-identical to a fresh compile', () => {
+  it('a cached hit is byte-identical to a fresh (uncached) compile', () => {
     const src = 'function main() { const x = 2n + 3n; return x; }';
     const cache = createCompileCache();
 
-    const fresh = compile(src); // no cache
+    const fresh = compile(src, { cache: false }); // guaranteed no cache
     const miss = compile(src, { cache });
     const hitResult = compile(src, { cache });
 
@@ -23,9 +30,35 @@ describe('compile cache', () => {
     expect(cache.stats).toEqual({ hits: 1, misses: 1, size: 1 });
   });
 
-  it('does nothing observable when no cache is passed', () => {
+  it('caching is ON by default (a repeat bare compile hits the process-global cache)', () => {
+    clearDefaultCompileCache();
     const src = 'function main() { return 42n; }';
-    expect(hex(compile(src))).toBe(hex(compile(src)));
+
+    const first = compile(src); // miss → default cache
+    const second = compile(src); // hit → default cache
+
+    expect(hex(second)).toBe(hex(first));
+    expect(getDefaultCompileCache().stats.hits).toBeGreaterThanOrEqual(1);
+  });
+
+  it('cache: false bypasses the default cache entirely', () => {
+    clearDefaultCompileCache();
+    const src = 'function main() { return 43n; }';
+
+    const a = compile(src, { cache: false });
+    const b = compile(src, { cache: false });
+
+    expect(hex(a)).toBe(hex(b)); // still deterministic, just never cached
+    expect(getDefaultCompileCache().stats).toEqual({ hits: 0, misses: 0, size: 0 });
+  });
+
+  it('cache: true is the same as the default (process-global) cache', () => {
+    clearDefaultCompileCache();
+    const src = 'function main() { return 44n; }';
+
+    compile(src, { cache: true }); // miss
+    compile(src); // hit — same global store as cache:true
+    expect(getDefaultCompileCache().stats.hits).toBeGreaterThanOrEqual(1);
   });
 
   it('mutating a returned result does not corrupt the cache', () => {
