@@ -215,14 +215,16 @@ describe('fetchPoolConfig gates', () => {
     );
   });
 
-  it('throws when buys are disabled in GlobalConfig (disable_flags bit 3)', async () => {
+  it('does not throw when buys are disabled in GlobalConfig — gate is deferred to buildSwap (disable_flags bit 3)', async () => {
+    // fetchPoolConfig always returns direction 'quoteToBase' before the caller has resolved
+    // a real direction, so gating a disabled buy here would drop a pool that's still a valid
+    // sell venue — the check happens in buildSwap instead (see the 'rejects ... disabled sells'
+    // buildSwap test for the mirrored sell-side gate).
     const doctored = withFixture(GLOBAL_CONFIG, (data) => {
       data[56] = 1 << 3;
       return data;
     });
-    await expect(fetchConfig(POOL, doctored)).rejects.toThrow(
-      'pumpswap gate: buys are disabled (global config disable_flags 8)',
-    );
+    await expect(fetchConfig(POOL, doctored)).resolves.toMatchObject({ disableFlags: 1 << 3 });
   });
 
   it('throws on a foreign GlobalConfig discriminator', async () => {
@@ -448,6 +450,19 @@ describe('buildSwap', () => {
     const sellCfg: PumpswapPoolConfig = { ...(await fetchConfig(POOL, doctored)), direction: 'baseToQuote' };
     expect(() => pumpswapAdapter.buildSwap(sellCfg, user, 1_000_000_000n)).toThrow(
       'pumpswap gate: sells are disabled (global config disable_flags 16)',
+    );
+  });
+
+  it('rejects disabled buys once the direction is resolved', async () => {
+    // disable_flags bit 3 blocks buys; the resolved-direction gate lives in buildSwap
+    // (fetchPoolConfig's default direction is 'quoteToBase' = a buy, so no flip needed here).
+    const doctored = withFixture(GLOBAL_CONFIG, (data) => {
+      data[56] = 1 << 3;
+      return data;
+    });
+    const cfg = await fetchConfig(POOL, doctored);
+    expect(() => pumpswapAdapter.buildSwap(cfg, user, 1_000_000_000n)).toThrow(
+      'pumpswap gate: buys are disabled (global config disable_flags 8)',
     );
   });
 });
