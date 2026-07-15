@@ -86,6 +86,17 @@ inference); `src/saucer/` emits bytecode (`Saucer` builder, `ops.ts` opcode tabl
 `src/context.ts` tracks functions/var kinds/ABIs; `src/contracts.ts` loads contract ABIs from artifact
 JSON for `import { X } from "./X.json"` + `.at()/.view()/.lib()` binding.
 
+**Compile cache (`src/cache.ts`)** — `compile()` is a pure function of (source, options, on-disk
+import contents), so an OPT-IN memo makes recurring compiles cheap: `compile(src, { cache })` where
+`cache` is a `Map` or a `createCompileCache(maxEntries)` (LRU + hit/miss stats). Omit `cache` and
+behavior is unchanged. The key (`compileCacheKey`) covers every output-affecting option with
+`compile()`'s own defaults, so a difference can only MISS, never mis-hit; `baseDirs` are resolved to
+absolute so a relative dir keys by the file it actually reads (cwd-dependent). The two inputs the key
+can't see — `transformModule` behavior and imported-file bytes — are the caller's environment
+contract, or pin them explicitly with `cacheKeyExtra` (a fingerprint string mixed into the key).
+Meant for long-lived processes that recompile recurring programs (recipe solver, dev server); ~9×
+on a recurring-program workload. Results are cloned in and out, so a caller can never corrupt the cache.
+
 **Compiler fixes (this branch):** (a) `new Array(n)` now **infers as DYNAMIC (heap) storage** so the
 TUPLE descriptor survives a variable round-trip — scalar/bytes32 storage dropped the descriptor, so
 `arr[i]` read/write reverted after `let a = new Array(n)`. (b) v12 `staticCall`/`delegateCall`
