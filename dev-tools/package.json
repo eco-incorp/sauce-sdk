@@ -34,6 +34,7 @@
     "start:fork": "./scripts/start-fork.sh",
     "stop": "./scripts/stop-local.sh",
     "sync-price": "npx tsx scripts/sync-price.ts",
+    "sync-artifacts": "node scripts/sync-artifacts.js",
     "test": "npx tsx test/examples.test.ts && npx tsx test/runner.test.ts",
     "test:e2e": "npx tsx test/e2e.test.ts",
     "format": "npx prettier --write sauce scripts test",
@@ -46,6 +47,7 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@eco-incorp/sauce-compiler": "workspace:*",
     "@uniswap/v3-core": "^1.0.1",
     "dotenv": "^17.3.1",
     "viem": "^2.45.1"
