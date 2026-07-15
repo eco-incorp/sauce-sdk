@@ -15,7 +15,8 @@ import type {
   ArrayExpression,
   Property,
 } from 'acorn';
-import { Saucer, OPS } from '../saucer/index.js';
+import { OPS } from '../saucer/index.js';
+import type { SaucerLike } from '../saucer/index.js';
 import type { AbiParameter, ContractInfo } from '../contracts.js';
 import { hexToBytes } from '../contracts.js';
 import type { CompilerContext, VariableKind } from '../context.js';
@@ -34,7 +35,7 @@ import { processUint8Array } from './collection.js';
 import { GLOBALS, GLOBAL_FUNCTIONS } from '../globals.js';
 import { compile } from '../index.js';
 
-export function processLiteral(literal: Literal, saucer: Saucer): Saucer {
+export function processLiteral(literal: Literal, saucer: SaucerLike): SaucerLike {
   switch (typeof literal.value) {
     case 'number':
       if (!Number.isInteger(literal.value)) {
@@ -78,7 +79,7 @@ export function isLiteralZero(expr: Expression): boolean {
   return lit.value === 0 || lit.value === 0n;
 }
 
-export function processUnaryExpression(expr: UnaryExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processUnaryExpression(expr: UnaryExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   switch (expr.operator) {
     case '!':
       return saucer.not(processExpression(expr.argument as Expression, ctx));
@@ -94,7 +95,7 @@ export function processUnaryExpression(expr: UnaryExpression, ctx: CompilerConte
   }
 }
 
-export function applyBinaryOp(saucer: Saucer, op: string, left: Saucer, right: Saucer): Saucer {
+export function applyBinaryOp(saucer: SaucerLike, op: string, left: SaucerLike, right: SaucerLike): SaucerLike {
   switch (op) {
     case '+':
       return saucer.add(left, right);
@@ -123,7 +124,7 @@ export function applyBinaryOp(saucer: Saucer, op: string, left: Saucer, right: S
   }
 }
 
-export function processBinaryExpression(expr: BinaryExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processBinaryExpression(expr: BinaryExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   const left = processExpression(expr.left as Expression, ctx);
   const right = processExpression(expr.right as Expression, ctx);
 
@@ -155,14 +156,14 @@ const processStaticMethod = (
   method: [string, string],
   expr: CallExpression,
   ctx: CompilerContext,
-  saucer: Saucer,
-): Saucer => {
+  saucer: SaucerLike,
+): SaucerLike => {
   const [object, property] = method;
   const entry = GLOBALS[object]?.[property];
 
   if (!entry || entry.compile.length === 1) throw new Error(`not implemented: ${object}.${property}`);
 
-  return (entry.compile as (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => Saucer)(
+  return (entry.compile as (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => SaucerLike)(
     saucer,
     expr.arguments as Expression[],
     (e: Expression) => processExpression(e, ctx),
@@ -225,7 +226,7 @@ function resolveInlineChain(expr: CallExpression): InlineChainInfo | undefined {
 // (recursively, including nested tuples and tuple[]), rather than emitting the
 // internal alphabetical tuple. Non-object args (scalars, arrays, variables) fall
 // through to normal processing.
-function processAbiArg(arg: Expression, param: AbiParameter | undefined, ctx: CompilerContext): Saucer {
+function processAbiArg(arg: Expression, param: AbiParameter | undefined, ctx: CompilerContext): SaucerLike {
   if (param?.type === 'tuple' && arg.type === 'ObjectExpression') {
     return orderedStructTuple(arg as ObjectExpression, param.components ?? [], ctx);
   }
@@ -238,13 +239,57 @@ function processAbiArg(arg: Expression, param: AbiParameter | undefined, ctx: Co
       return processAbiArg(el as Expression, elementParam, ctx);
     });
 
-    return new Saucer(ctx).array(elements);
+    return ctx.newSaucer().array(elements);
   }
 
   return processExpression(arg, ctx);
 }
 
-function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], ctx: CompilerContext): Saucer {
+/**
+ * True iff an ABI parameter is fully STATIC — an elementary static type (uintN /
+ * intN / address / bool / bytesN), a fixed-size array of statics, or a tuple all of
+ * whose components are (recursively) static. Dynamic: bytes/string, any T[] (or
+ * unsized), a fixed array of dynamics, or a tuple with any dynamic component.
+ *
+ * Used to decide whether a nested struct component can be FLATTENED into its parent
+ * tuple at the ABI-encode boundary (see flattenStaticStructFields). For a fully
+ * static struct the flat and nested ABI encodings are byte-identical (no offsets
+ * either way), so flattening is transparent on the v1 engine — and it sidesteps a
+ * v12 Huff ABI_ENCODE bug whose static-tuple inliner only scans ONE level deep: it
+ * sees a nested TUPLE element (a static struct field, e.g. SwapParams.poolKey) as
+ * "dynamic" and prepends a spurious head offset, shifting every field by one word
+ * and corrupting the call (the v1 runtime recurses correctly). Emitting the static
+ * fields flat keeps the descriptor a flat tuple of scalars, which both engines
+ * encode identically and correctly. (Dynamic nested tuples are left nested — they
+ * genuinely need offset encoding, which both engines handle.)
+ */
+function isStaticAbiParam(param: AbiParameter): boolean {
+  const t = param.type;
+
+  if (t === 'tuple') return (param.components ?? []).every(isStaticAbiParam);
+
+  if (t.endsWith('[]')) return false; // dynamic-length array
+
+  const fixedArray = /^(.*)\[(\d+)\]$/.exec(t);
+
+  if (fixedArray) {
+    // T[k]: static iff element type T is static.
+    return isStaticAbiParam({ ...param, type: fixedArray[1] });
+  }
+
+  return t !== 'bytes' && t !== 'string';
+}
+
+/**
+ * Build the ordered SaucerLike elements for a struct, flattening any fully-static
+ * nested-tuple component into the parent (recursively) so the emitted descriptor is
+ * a flat tuple of scalar leaves. See isStaticAbiParam for why.
+ */
+function flattenStaticStructFields(
+  obj: ObjectExpression,
+  components: AbiParameter[],
+  ctx: CompilerContext,
+): SaucerLike[] {
   const byName = new Map<string, Expression>();
   for (const prop of obj.properties) {
     if (prop.type !== 'Property') throw new Error('spread properties are not supported');
@@ -254,17 +299,29 @@ function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], c
     byName.set(key, p.shorthand ? ({ type: 'Identifier', name: key } as Expression) : (p.value as Expression));
   }
 
-  const elements = components.map((component) => {
+  const out: SaucerLike[] = [];
+  for (const component of components) {
     if (!component.name) throw new Error('ABI tuple components must be named to encode an object literal');
 
     const value = byName.get(component.name);
 
     if (!value) throw new Error(`missing struct field '${component.name}' in object literal`);
 
-    return processAbiArg(value, component, ctx);
-  });
+    // Flatten an all-static nested struct given as an object literal: splice its
+    // (recursively flattened) fields into the parent instead of nesting a tuple.
+    if (component.type === 'tuple' && value.type === 'ObjectExpression' && isStaticAbiParam(component)) {
+      out.push(...flattenStaticStructFields(value as ObjectExpression, component.components ?? [], ctx));
+      continue;
+    }
 
-  return new Saucer(ctx).tuple(elements);
+    out.push(processAbiArg(value, component, ctx));
+  }
+
+  return out;
+}
+
+function orderedStructTuple(obj: ObjectExpression, components: AbiParameter[], ctx: CompilerContext): SaucerLike {
+  return ctx.newSaucer().tuple(flattenStaticStructFields(obj, components, ctx));
 }
 
 function processContractCall(
@@ -272,11 +329,11 @@ function processContractCall(
   methodName: string,
   args: Expression[],
   ctx: CompilerContext,
-  saucer: Saucer,
-  addrSaucer: Saucer,
+  saucer: SaucerLike,
+  addrSaucer: SaucerLike,
   callTypeOverride?: 'static' | 'delegate',
   skipOutput?: boolean,
-): Saucer {
+): SaucerLike {
   const method = contract.methods.get(methodName);
 
   if (!method) {
@@ -287,7 +344,7 @@ function processContractCall(
     throw new Error(`${contract.name}.${methodName}() expects ${method.inputs.length} argument(s), got ${args.length}`);
   }
 
-  const s = new Saucer(ctx);
+  const s = ctx.newSaucer();
   const selectorBytes = hexToBytes(method.selector);
 
   const processedArgs = args.map((arg, i) => processAbiArg(arg, method.inputs[i], ctx));
@@ -366,15 +423,15 @@ function declareCatchParam(paramName: string | undefined, ctx: CompilerContext):
 }
 
 function buildCatchSaucer(
-  callOnly: Saucer,
-  handler: Saucer,
+  callOnly: SaucerLike,
+  handler: SaucerLike,
   paramName: string | undefined,
   ctx: CompilerContext,
-  saucer: Saucer,
-): Saucer {
+  saucer: SaucerLike,
+): SaucerLike {
   if (!paramName) {
     // No parameter — emit call directly with catch
-    return new Saucer(ctx, new Uint8Array([...saucer._bytes, ...callOnly._bytes])).catch(handler);
+    return saucer.join(callOnly).catch(handler);
   }
 
   // Wrap call with store: [prefix] WRITE_HEAP <e_slot> [CALL bytes] CATCH <skip> <handler>
@@ -382,7 +439,7 @@ function buildCatchSaucer(
   return saucer.store(paramName, callOnly, 'dynamic').catch(handler);
 }
 
-function processCatchCall(info: CatchChainInfo, ctx: CompilerContext, saucer: Saucer): Saucer {
+function processCatchCall(info: CatchChainInfo, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
   const { innerCall, handlerBody, paramName } = info;
 
   // Declare catch parameter early so handler body can reference it
@@ -404,7 +461,7 @@ function processCatchCall(info: CatchChainInfo, ctx: CompilerContext, saucer: Sa
       methodName,
       chainArgs,
       ctx,
-      new Saucer(ctx),
+      ctx.newSaucer(),
       addrSaucer,
       BINDING_METHODS[bindMethod],
       true,
@@ -432,8 +489,8 @@ function resolveVariableBoundCatch(
   handlerBody: Statement,
   paramName: string | undefined,
   ctx: CompilerContext,
-  saucer: Saucer,
-): Saucer | undefined {
+  saucer: SaucerLike,
+): SaucerLike | undefined {
   if (innerCall.callee.type !== 'MemberExpression') return;
 
   const member = innerCall.callee as MemberExpression;
@@ -446,13 +503,13 @@ function resolveVariableBoundCatch(
 
   if (!bound) return;
 
-  const addrSaucer = new Saucer(ctx).read(objectName);
+  const addrSaucer = ctx.newSaucer().read(objectName);
   const callOnly = processContractCall(
     bound.contract,
     propertyName,
     innerCall.arguments as Expression[],
     ctx,
-    new Saucer(ctx),
+    ctx.newSaucer(),
     addrSaucer,
     bound.callTypeOverride,
     true,
@@ -469,8 +526,8 @@ function resolveRawCallCatch(
   handlerBody: Statement,
   paramName: string | undefined,
   ctx: CompilerContext,
-  saucer: Saucer,
-): Saucer | undefined {
+  saucer: SaucerLike,
+): SaucerLike | undefined {
   if (innerCall.callee.type !== 'MemberExpression') return;
 
   const member = innerCall.callee as MemberExpression;
@@ -486,8 +543,8 @@ function resolveRawCallCatch(
 
   if (!entry) return;
 
-  const callOnly = (entry.compile as (s: Saucer, a: Expression[], p: (e: Expression) => Saucer) => Saucer)(
-    new Saucer(ctx),
+  const callOnly = (entry.compile as (s: SaucerLike, a: Expression[], p: (e: Expression) => SaucerLike) => SaucerLike)(
+    ctx.newSaucer(),
     innerCall.arguments as Expression[],
     (e: Expression) => processExpression(e, ctx),
   );
@@ -496,7 +553,11 @@ function resolveRawCallCatch(
   return buildCatchSaucer(callOnly, handler, paramName, ctx, saucer);
 }
 
-function resolveVariableBoundCall(expr: CallExpression, ctx: CompilerContext, saucer: Saucer): Saucer | undefined {
+function resolveVariableBoundCall(
+  expr: CallExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike | undefined {
   if (expr.callee.type !== 'MemberExpression') return;
 
   const member = expr.callee as MemberExpression;
@@ -509,7 +570,7 @@ function resolveVariableBoundCall(expr: CallExpression, ctx: CompilerContext, sa
 
   if (!bound) return;
 
-  const addrSaucer = new Saucer(ctx).read(objectName);
+  const addrSaucer = ctx.newSaucer().read(objectName);
 
   return processContractCall(
     bound.contract,
@@ -522,7 +583,7 @@ function resolveVariableBoundCall(expr: CallExpression, ctx: CompilerContext, sa
   );
 }
 
-function resolveStandaloneBinding(expr: CallExpression, ctx: CompilerContext): Saucer | undefined {
+function resolveStandaloneBinding(expr: CallExpression, ctx: CompilerContext): SaucerLike | undefined {
   if (expr.callee.type !== 'MemberExpression') return;
 
   const member = expr.callee as MemberExpression;
@@ -545,7 +606,7 @@ function resolveStandaloneBinding(expr: CallExpression, ctx: CompilerContext): S
   return processExpression(expr.arguments[0] as Expression, ctx);
 }
 
-export const processCallExpression = (expr: CallExpression, ctx: CompilerContext, saucer: Saucer): Saucer => {
+export const processCallExpression = (expr: CallExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike => {
   // Pattern: .catch(handler) — ERC20.at(addr).transfer(to, amount).catch(() => { ... })
   const catchInfo = resolveCatchChain(expr);
 
@@ -592,7 +653,7 @@ export const processCallExpression = (expr: CallExpression, ctx: CompilerContext
   const ctxFn = GLOBAL_FUNCTIONS[expr.callee.name];
 
   if (ctxFn) {
-    return (ctxFn.compile as (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => Saucer)(
+    return (ctxFn.compile as (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => SaucerLike)(
       saucer,
       expr.arguments as Expression[],
       (e: Expression) => processExpression(e, ctx),
@@ -604,7 +665,11 @@ export const processCallExpression = (expr: CallExpression, ctx: CompilerContext
   return saucer.callFunction(expr.callee.name, args);
 };
 
-export function processLogicalExpression(expr: LogicalExpression, ctx: CompilerContext, saucer: Saucer): Saucer {
+export function processLogicalExpression(
+  expr: LogicalExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike {
   const left = processExpression(expr.left, ctx);
   const right = processExpression(expr.right, ctx);
 
@@ -622,27 +687,36 @@ export function processLogicalExpression(expr: LogicalExpression, ctx: CompilerC
 // The INDEX result is dynamic data that must live on the heap, but we're in the
 // middle of compiling an expression — we can't emit a WRITE_HEAP side-effect inline.
 // So we defer a store to a temp variable and return a READ_HEAP of that temp.
-const processFieldAccess = (expr: MemberExpression, field: string, ctx: CompilerContext, saucer: Saucer): Saucer => {
+const processFieldAccess = (
+  expr: MemberExpression,
+  field: string,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike => {
   const structType = lookupStructType(expr, ctx);
 
   if (!structType) throw new Error(`property '${field}' access not supported, use array indexing arr[i]`);
 
   return saucer.index(
     processExpression(expr.object as Expression, ctx),
-    new Saucer(ctx).int(BigInt(getFieldIndex(structType, field))),
+    ctx.newSaucer().int(BigInt(getFieldIndex(structType, field))),
   );
 };
 
-const processIndexAccess = (expr: MemberExpression, ctx: CompilerContext, saucer: Saucer): Saucer =>
+const processIndexAccess = (expr: MemberExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike =>
   saucer.index(processExpression(expr.object as Expression, ctx), processExpression(expr.property as Expression, ctx));
 
-export const processMemberExpression = (expr: MemberExpression, ctx: CompilerContext, saucer: Saucer): Saucer => {
+export const processMemberExpression = (
+  expr: MemberExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+): SaucerLike => {
   const property = getPropertyName(expr);
 
   if (property && expr.object.type === 'Identifier') {
     const entry = GLOBALS[(expr.object as { name: string }).name]?.[property];
 
-    if (entry?.compile.length === 1) return (entry.compile as (s: Saucer) => Saucer)(saucer);
+    if (entry?.compile.length === 1) return (entry.compile as (s: SaucerLike) => SaucerLike)(saucer);
   }
 
   if (property === 'length') return saucer.length(processExpression(expr.object as Expression, ctx));
@@ -652,10 +726,16 @@ export const processMemberExpression = (expr: MemberExpression, ctx: CompilerCon
   return processIndexAccess(expr, ctx, saucer);
 };
 
-export const processNewExpression = (expr: NewExpression, ctx: CompilerContext, saucer: Saucer): Saucer => {
+export const processNewExpression = (expr: NewExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike => {
   if (expr.callee.type !== 'Identifier') throw new Error(`not implemented: new ${expr.callee.type}`);
 
   const name = (expr.callee as { name: string }).name;
+
+  if (name === 'Array') {
+    if (expr.arguments.length !== 1) throw new Error('new Array expects exactly 1 argument (length)');
+
+    return saucer.newArray(processExpression(expr.arguments[0] as Expression, ctx));
+  }
 
   if (name !== 'Uint8Array') throw new Error(`not implemented: new ${name}`);
 
@@ -666,8 +746,8 @@ const processInstanceMethod = (
   instance: { method: string; object: Expression },
   expr: CallExpression,
   ctx: CompilerContext,
-  saucer: Saucer,
-): Saucer => {
+  saucer: SaucerLike,
+): SaucerLike => {
   const receiver = processExpression(instance.object, ctx);
 
   switch (instance.method) {
@@ -682,7 +762,7 @@ const processInstanceMethod = (
       const start = processExpression(expr.arguments[0] as Expression, ctx);
       const end = processExpression(expr.arguments[1] as Expression, ctx);
 
-      return saucer.slice(receiver, start, new Saucer(ctx).sub(end, start));
+      return saucer.slice(receiver, start, ctx.newSaucer().sub(end, start));
     }
     default:
       throw new Error(`not implemented: .${instance.method}()`);
@@ -813,30 +893,32 @@ function splitBySentinels(bytecodes: Uint8Array, kinds: VariableKind[]): Uint8Ar
   return segments;
 }
 
-function encodeScalarAsBytecode(expr: Saucer, ctx: CompilerContext): Saucer {
+function encodeScalarAsBytecode(expr: SaucerLike, ctx: CompilerContext): SaucerLike {
   // Produces [BYTE_32][32 bytes of value] at runtime via:
   // CONCAT(BYTES([0x20]), ABI_ENCODE(TUPLE(1, expr)))
-  return new Saucer(ctx).concat([
-    new Saucer(ctx).bytes(new Uint8Array([OPS.BYTE_32])),
-    new Saucer(ctx).abiEncode(new Saucer(ctx).tuple([expr])),
-  ]);
+  return ctx
+    .newSaucer()
+    .concat([
+      ctx.newSaucer().bytes(new Uint8Array([OPS.BYTE_32])),
+      ctx.newSaucer().abiEncode(ctx.newSaucer().tuple([expr])),
+    ]);
 }
 
-function encodeDynamicAsBytecode(expr: Saucer, ctx: CompilerContext): Saucer {
+function encodeDynamicAsBytecode(expr: SaucerLike, ctx: CompilerContext): SaucerLike {
   // Produces [BYTES_2][len_hi][len_lo][data...] at runtime via:
   // CONCAT(BYTES([0x91]), SLICE(ABI_ENCODE(TUPLE(1, LENGTH(expr))), 30, 2), expr)
-  const lengthSaucer = new Saucer(ctx).length(expr);
-  const lengthEncoded = new Saucer(ctx).abiEncode(new Saucer(ctx).tuple([lengthSaucer]));
-  const length2Bytes = new Saucer(ctx).slice(lengthEncoded, new Saucer(ctx).int(30n), new Saucer(ctx).int(2n));
+  const lengthSaucer = ctx.newSaucer().length(expr);
+  const lengthEncoded = ctx.newSaucer().abiEncode(ctx.newSaucer().tuple([lengthSaucer]));
+  const length2Bytes = ctx.newSaucer().slice(lengthEncoded, ctx.newSaucer().int(30n), ctx.newSaucer().int(2n));
 
-  return new Saucer(ctx).concat([new Saucer(ctx).bytes(new Uint8Array([OPS.BYTES_2])), length2Bytes, expr]);
+  return ctx.newSaucer().concat([ctx.newSaucer().bytes(new Uint8Array([OPS.BYTES_2])), length2Bytes, expr]);
 }
 
 export function processTaggedTemplateExpression(
   expr: TaggedTemplateExpression,
   ctx: CompilerContext,
-  saucer: Saucer,
-): Saucer {
+  saucer: SaucerLike,
+): SaucerLike {
   // Verify tag is $
   if (expr.tag.type !== 'Identifier' || (expr.tag as { name: string }).name !== '$') {
     throw new Error('tagged template expressions must use $`...`');
@@ -854,7 +936,7 @@ export function processTaggedTemplateExpression(
       contracts: ctx.contractsConfig,
     });
 
-    return new Saucer(ctx, new Uint8Array([...saucer._bytes, ...new Saucer(ctx).bytes(bytecode[0])._bytes]));
+    return saucer.join(ctx.newSaucer().bytes(bytecode[0]));
   }
 
   // Determine kind of each interpolation expression
@@ -887,10 +969,10 @@ export function processTaggedTemplateExpression(
   const outerExprs = expressions.map((e) => processExpression(e, ctx));
 
   // Build CONCAT: interleave static segments with encoded outer expressions
-  const concatParts: Saucer[] = [];
+  const concatParts: SaucerLike[] = [];
   for (let i = 0; i < segments.length; i++) {
     if (segments[i].length > 0) {
-      concatParts.push(new Saucer(ctx).bytes(segments[i]));
+      concatParts.push(ctx.newSaucer().bytes(segments[i]));
     }
 
     if (i < outerExprs.length) {
@@ -904,7 +986,7 @@ export function processTaggedTemplateExpression(
 
   // Single segment, no CONCAT needed
   if (concatParts.length === 1) {
-    return new Saucer(ctx, new Uint8Array([...saucer._bytes, ...concatParts[0]._bytes]));
+    return saucer.join(concatParts[0]);
   }
 
   return saucer.concat(concatParts);

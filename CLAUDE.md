@@ -72,6 +72,20 @@ inference); `src/saucer/` emits bytecode (`Saucer` builder, `ops.ts` opcode tabl
 `src/context.ts` tracks functions/var kinds/ABIs; `src/contracts.ts` loads contract ABIs from artifact
 JSON for `import { X } from "./X.json"` + `.at()/.view()/.lib()` binding.
 
+**Compiler fixes (this branch):** (a) `new Array(n)` now **infers as DYNAMIC (heap) storage** so the
+TUPLE descriptor survives a variable round-trip — scalar/bytes32 storage dropped the descriptor, so
+`arr[i]` read/write reverted after `let a = new Array(n)`. (b) v12 `staticCall`/`delegateCall`
+`stackEffect` is **-1** (they push a result), not -2 — fixes corrupt SDUP positions when a param is read
+after a static call. (c) v12 assembly emits a **no-param ARG-PROLOGUE entry** that pushes the
+compile-time args then falls through into `main` (the v12 analogue of v1's appended `CALL_FUNCTION` arg
+segment) — so **parameterized programs run on the Huff runtime**. (`main` is inlined, not a table fn →
+it can't recurse, same as v1.)
+
+**Known v12 limit (follow-up):** the Huff runtime's dynamic-value descriptor packs the data pointer in
+16 bits (region `0x5000`→`0xFFFF`, ≈45 KB), so a program whose total dynamic data exceeds that gets a
+truncated pointer → garbage read → revert. The fix needs a runtime-wide Huff pointer widening — out of
+scope here.
+
 **`sdk/`** — a data registry, no runtime logic. `src/protocols/<slug>/` per protocol (`info`,
 `addresses`, `abis` as-const, `functions` SauceScript templates); `src/protocols/index.ts` is the
 query registry. `src/skills/*.md` are AI-ready per-protocol docs (loaded by `loader.ts`, shipped in
