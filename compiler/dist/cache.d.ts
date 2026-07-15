@@ -35,12 +35,13 @@ export interface BoundedCompileCache extends CompileCache {
     readonly stats: CompileCacheStats;
     clear(): void;
 }
+/** The lazily-created process-global default cache (see `defaultCache`). */
+export declare function getDefaultCompileCache(): BoundedCompileCache;
 /**
- * A bounded, in-process compile cache. `maxEntries` (default 1024) caps memory:
- * on overflow the least-recently-used entry is evicted (a hit refreshes
- * recency). Pass one to `compile(src, { cache })` from a long-lived process that
- * recompiles recurring programs — a recipe solver, a dev server, a batch job.
- * A fresh process starts empty; the cache never persists to disk.
+ * Empty the process-global default cache (and reset its stats). Call after a
+ * change to an input the key cannot see — an edited imported file or a swapped
+ * `transformModule` — so subsequent default-cached compiles recompile fresh.
  */
+export declare function clearDefaultCompileCache(): void;
 export declare function createCompileCache(maxEntries?: number): BoundedCompileCache;
 //# sourceMappingURL=cache.d.ts.map

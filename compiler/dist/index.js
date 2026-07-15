@@ -7,8 +7,8 @@ import { encodeInt } from './saucer/integer.js';
 import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import { estimatePacket } from './planner/index.js';
-import { compileCacheKey, cloneCompileResult } from './cache.js';
-export { createCompileCache, compileCacheKey, cloneCompileResult } from './cache.js';
+import { compileCacheKey, cloneCompileResult, getDefaultCompileCache } from './cache.js';
+export { createCompileCache, compileCacheKey, cloneCompileResult, getDefaultCompileCache, clearDefaultCompileCache, } from './cache.js';
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
 export { CompilerContext } from './context.js';
@@ -58,7 +58,10 @@ function inferArgType(v) {
     return { kind: 'scalar' };
 }
 export function compile(source, options = {}) {
-    const cache = options.cache;
+    // Cache is ON by default: undefined/true → the process-global store, false →
+    // bypass, an instance → that store.
+    const opt = options.cache;
+    const cache = opt === false ? undefined : opt === undefined || opt === true ? getDefaultCompileCache() : opt;
     if (!cache)
         return compileFresh(source, options);
     const key = compileCacheKey(source, options);

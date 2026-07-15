@@ -2,7 +2,7 @@ import { type CompileTarget } from './context.js';
 import type { ContractsConfig } from './contracts.js';
 import type { AccountPlan } from './planner/index.js';
 import type { CompileCache } from './cache.js';
-export { createCompileCache, compileCacheKey, cloneCompileResult } from './cache.js';
+export { createCompileCache, compileCacheKey, cloneCompileResult, getDefaultCompileCache, clearDefaultCompileCache, } from './cache.js';
 export type { CompileCache, BoundedCompileCache, CompileCacheStats } from './cache.js';
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
@@ -101,16 +101,21 @@ export interface CompileOptions {
      */
     defines?: Record<string, bigint | boolean | number>;
     /**
-     * Optional memo store. When provided, `compile()` returns a cached result for
-     * a previously-seen (source + options) instead of recompiling, and stores each
-     * fresh result. Omit it and compilation is unchanged (no caching). The cache is
-     * keyed on every serializable input, so a difference can only ever miss, never
-     * mis-hit; the two inputs it cannot capture — `transformModule`'s behavior and
-     * the on-disk contents of `baseDirs` imports — are the caller's contract to keep
-     * stable for the cache's lifetime (see cache.ts). Use `createCompileCache()` for
-     * a bounded store with stats.
+     * Compile cache — ON BY DEFAULT. `compile()` returns a cached result for a
+     * repeat (source + options) instead of recompiling, and stores each fresh
+     * result. Values:
+     *   - omitted / `true` → the process-global default cache (getDefaultCompileCache)
+     *   - `false`          → no caching; always recompile (a guaranteed-fresh compile)
+     *   - a `CompileCache` → use that store (a Map, or createCompileCache() for
+     *                        bounded size + hit/miss stats)
+     * The key covers every serializable input, so a difference can only ever miss,
+     * never mis-hit. The two inputs it cannot capture — `transformModule`'s behavior
+     * and the on-disk contents of `baseDirs` imports — are an environment contract:
+     * keep them stable for the process, or pin them with `cacheKeyExtra`, or pass
+     * `cache: false` when you need to bypass a possibly-stale entry (e.g. after
+     * editing an imported file — see also clearDefaultCompileCache()).
      */
-    cache?: CompileCache;
+    cache?: CompileCache | boolean;
     /**
      * Opaque string mixed verbatim into the cache key — only consulted when `cache`
      * is set. Use it to pin the inputs the key cannot capture on its own: the

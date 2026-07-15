@@ -141,6 +141,35 @@ export interface BoundedCompileCache extends CompileCache {
  * recompiles recurring programs — a recipe solver, a dev server, a batch job.
  * A fresh process starts empty; the cache never persists to disk.
  */
+/**
+ * The process-global cache `compile()` uses BY DEFAULT (when `options.cache` is
+ * omitted or `true`). Lazily created, bounded (LRU). Because it is on by
+ * default, the two inputs the key cannot see — `transformModule` behavior and
+ * the on-disk bytes of `baseDirs` imports — become a default environment
+ * contract: within one process the transform must be stable and imported files
+ * must not change mid-run, else a recompile of the SAME source returns stale
+ * bytecode. A caller that violates this (a file-watching dev server that edits
+ * an imported ABI and recompiles) must pass `cache: false` for a guaranteed
+ * fresh compile, `cacheKeyExtra` to pin the changed input, or its own instance.
+ */
+let defaultCache: BoundedCompileCache | undefined;
+
+/** The lazily-created process-global default cache (see `defaultCache`). */
+export function getDefaultCompileCache(): BoundedCompileCache {
+  if (!defaultCache) defaultCache = createCompileCache(4096);
+
+  return defaultCache;
+}
+
+/**
+ * Empty the process-global default cache (and reset its stats). Call after a
+ * change to an input the key cannot see — an edited imported file or a swapped
+ * `transformModule` — so subsequent default-cached compiles recompile fresh.
+ */
+export function clearDefaultCompileCache(): void {
+  defaultCache?.clear();
+}
+
 export function createCompileCache(maxEntries = 1024): BoundedCompileCache {
   if (!Number.isInteger(maxEntries) || maxEntries < 1) {
     throw new Error(`createCompileCache: maxEntries must be a positive integer, got ${maxEntries}`);
