@@ -90,7 +90,27 @@ describe('imports', () => {
     expect(() => compile(source)).toThrow('Cannot resolve import');
   });
 
-  it('throws on duplicate contract name', () => {
+  it('dedups re-importing an IDENTICAL contract ABI under the same name', () => {
+    // Registering ERC20 with the SAME abi via the contracts option AND a `.json` import
+    // is idempotent — a no-op, not a throw — so a shared ABI pulled through multiple
+    // import paths (e.g. two source modules both importing it) does not collide.
+    const source = `
+      import { ERC20 } from "./ERC20.json";
+      function main() { return 1; }
+    `;
+
+    const result = compile(source, {
+      baseDirs: [tmpDir],
+      contracts: { ERC20: { abi: erc20Abi } },
+    });
+
+    expect(result.bytecode).toEqual([returnOne]);
+  });
+
+  it('throws on CONFLICTING ABIs for the same local name', () => {
+    // A DIFFERENT abi under an already-registered local name is a real collision, not a
+    // dedup: silently keeping the first would compile later calls against the wrong
+    // selector. The import (full erc20Abi) conflicts with the minimal contracts-option abi.
     const source = `
       import { ERC20 } from "./ERC20.json";
       function main() { return 1; }
@@ -105,7 +125,7 @@ describe('imports', () => {
           },
         },
       }),
-    ).toThrow('already registered');
+    ).toThrow('Conflicting ABIs');
   });
 
   it('import and function declarations coexist', () => {

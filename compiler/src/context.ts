@@ -57,6 +57,8 @@ interface SharedModule {
   functions: string[];
   contracts: Map<string, ContractInfo>;
   funcMeta: FunctionMeta[];
+  /** Compile-time constants (name → known bigint) for conditional compilation. */
+  defines: Map<string, bigint>;
 }
 
 export class CompilerContext {
@@ -104,6 +106,41 @@ export class CompilerContext {
   /** Type info for main() function parameters, inferred from args option */
   mainArgTypes?: { kind: VariableKind; elementType?: ElementType }[];
 
+  /**
+   * Optional hook to transform an imported SOURCE module's text before it is parsed —
+   * e.g. strip TypeScript types. Receives (code, absoluteFilePath); returns plain JS the
+   * acorn parser accepts. Set from CompileOptions.transformModule. Consulted ONLY for
+   * source-file imports (a `.json` contract ABI is never passed through it). Kept off the
+   * compiler's own dependency graph so it carries no typescript dep — callers that import
+   * `.ts`/`.sauce.ts` modules supply the stripper (the recipes pass ts.transpileModule).
+   */
+  transformModule?: (code: string, filePath: string) => string;
+
+  /** Drop functions unreachable from main() after constant folding (CompileOptions.treeshake). */
+  treeshake = false;
+
+  /**
+   * Compile-time constant environment for conditional compilation: names (from
+   * CompileOptions.defines and top-level `const X = <literal>`) → their known bigint value.
+   * Shared across a v12 module's per-function child contexts so a folded `if (HAS_CURVE)` in
+   * any function sees the same defines. Booleans are normalized to 1n/0n.
+   */
+  private get defines(): Map<string, bigint> {
+    return this.module.defines;
+  }
+
+  /**
+   * Whether compile-time constant folding is active. Gated so a LEGACY caller (no
+   * `treeshake`, no `defines`) gets byte-identical output — e.g. `if (1 === 1)` is
+   * NOT folded for them, it still emits a runtime branch. Folding turns on the moment
+   * either knob is set: treeshake needs it for constant-aware reachability, and any
+   * define implies the caller wants conditional compilation. A top-level `const X = …`
+   * also populates `defines`, so a program that declares one folds its own conditions.
+   */
+  get foldEnabled(): boolean {
+    return this.treeshake || this.defines.size > 0;
+  }
+
   constructor(
     baseDirs: string[] = [],
     contracts: ContractsConfig = {},
@@ -113,7 +150,7 @@ export class CompilerContext {
     this.scopes.push({ variables: new Map() });
     this.baseDirs = baseDirs;
     this.target = target;
-    this.module = shared ?? { functions: [], contracts: new Map(), funcMeta: [] };
+    this.module = shared ?? { functions: [], contracts: new Map(), funcMeta: [], defines: new Map() };
 
     for (const [name, config] of Object.entries(contracts)) {
       this.registerContract(name, config.abi);
@@ -305,6 +342,27 @@ export class CompilerContext {
     this.functions.push(functionName);
   }
 
+  /** Seed the compile-time constant environment from CompileOptions.defines. */
+  setDefines(defines: Record<string, bigint | boolean | number>): void {
+    for (const [name, value] of Object.entries(defines)) {
+      this.defines.set(name, defineToBigint(value));
+    }
+  }
+
+  /**
+   * Register a top-level `const X = <literal>` as a compile-time constant (so it can fold
+   * branch conditions). A define of the same name already set via CompileOptions wins (an
+   * explicit override), so a const never clobbers a caller-provided flag.
+   */
+  registerConstant(name: string, value: bigint): void {
+    if (!this.defines.has(name)) this.defines.set(name, value);
+  }
+
+  /** Compile-time value of a name (define or folded top-level const), or undefined if unknown. */
+  getConstant(name: string): bigint | undefined {
+    return this.defines.get(name);
+  }
+
   getFunc(functionName: string): number {
     const index = this.functions.findIndex((name) => name === functionName);
 
@@ -346,6 +404,39 @@ export class CompilerContext {
     throw new Error(`Cannot resolve import "${source}". File not found in any of the provided baseDirs.`);
   }
 
+  /**
+   * Resolve a SOURCE-FILE import (a SauceScript module that exports functions) — distinct
+   * from `resolveImport`, which loads a `.json` contract ABI. Returns the module's raw text
+   * + absolute path, or undefined if no source file resolves (the caller then treats the
+   * import as a `.json` contract). Tries the literal path, then the common SauceScript source
+   * extensions, across every baseDir. A `.json` source is never a module (returns undefined).
+   */
+  resolveModuleSource(source: string): { code: string; filePath: string } | undefined {
+    if (source.endsWith('.json')) return undefined; // a .json import is a contract ABI, not a module
+
+    const candidates = [
+      source,
+      `${source}.ts`,
+      `${source}.sauce.ts`,
+      `${source}.js`,
+      `${source}.sauce`,
+      `${source}.mjs`,
+    ];
+    for (const baseDir of this.baseDirs) {
+      for (const cand of candidates) {
+        const filePath = path.resolve(baseDir, cand);
+
+        try {
+          return { code: fs.readFileSync(filePath, 'utf-8'), filePath };
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
   registerContract(name: string, abi: Abi): void {
     if (this.module.contracts.has(name)) {
       throw new Error(`Contract "${name}" is already registered.`);
@@ -382,4 +473,11 @@ export class CompilerContext {
   ): { contract: ContractInfo; callTypeOverride?: 'static' | 'delegate' } | undefined {
     return this.boundContracts.get(variableName);
   }
+}
+
+/** Normalize a `defines` value to a compile-time bigint (booleans → 1n/0n). */
+function defineToBigint(value: bigint | boolean | number): bigint {
+  if (typeof value === 'boolean') return value ? 1n : 0n;
+
+  return BigInt(value);
 }
