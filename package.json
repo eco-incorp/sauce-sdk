@@ -38,10 +38,6 @@
     "./skills": {
       "types": "./sdk/dist/skills/loader.d.ts",
       "default": "./sdk/dist/skills/loader.js"
-    },
-    "./recipes": {
-      "types": "./sdk/dist/recipes/index.d.ts",
-      "default": "./sdk/dist/recipes/index.js"
     }
   },
   "bin": {
@@ -52,7 +48,6 @@
     "sdk/dist",
     "sdk/src/skills",
     "sdk/src/protocols",
-    "sdk/src/recipes",
     "actions/dist",
     "dev-tools/scripts",
     "dev-tools/src",

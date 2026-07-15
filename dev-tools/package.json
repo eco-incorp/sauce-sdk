@@ -30,7 +30,6 @@
   "scripts": {
     "prepublishOnly": "cp ../compiler/README.md COMPILER.md",
     "sauce": "npx tsx scripts/run.ts",
-    "recipe": "npx tsx scripts/recipe.ts",
     "start:local": "./scripts/start-local.sh",
     "start:fork": "./scripts/start-fork.sh",
     "stop": "./scripts/stop-local.sh",
