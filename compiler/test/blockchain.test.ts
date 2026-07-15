@@ -184,11 +184,16 @@ describe('blockchain context', () => {
   });
 
   it('throws on function named tx', () => {
-    expect(() => compile('function tx() { return 1; }\nfunction main() {}')).toThrow("'tx' is a reserved name");
+    // Called from main — treeshake defaults to true, so an unreferenced function is
+    // dropped (never compiled, never validated); this must stay reachable to fire.
+    expect(() => compile('function tx() { return 1; }\nfunction main() { return tx(); }')).toThrow(
+      "'tx' is a reserved name",
+    );
   });
 
   it('throws on function parameter named address', () => {
-    expect(() => compile('function foo(address) { return address; }\nfunction main() {}')).toThrow(
+    // Called from main — see the 'tx' comment above.
+    expect(() => compile('function foo(address) { return address; }\nfunction main() { return foo(1); }')).toThrow(
       "'address' is a reserved name",
     );
   });

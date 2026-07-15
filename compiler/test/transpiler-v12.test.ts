@@ -193,11 +193,13 @@ const cases: Record<string, Case[]> = {
 
   ControlFlow: [
     {
+      // block.chainId > 0 (not a literal) so the condition isn't const-foldable — this
+      // case pins generic if/else codegen shape, not folding.
       name: 'if/else statement',
-      src: 'function main(){ if (1 > 0) { storage.write(0, 1) } else { storage.write(0, 2) } }',
+      src: 'function main(){ if (block.chainId > 0) { storage.write(0, 1) } else { storage.write(0, 2) } }',
       ref: (c) =>
         mk(c)
-          .if(mk(c).gt(mk(c).int(1n), mk(c).int(0n)))
+          .if(mk(c).gt(mk(c).blockChainId(), mk(c).int(0n)))
           .then(mk(c).sstore(mk(c).int(0n), mk(c).int(1n)))
           .else(mk(c).sstore(mk(c).int(0n), mk(c).int(2n))) as V12Saucer,
     },

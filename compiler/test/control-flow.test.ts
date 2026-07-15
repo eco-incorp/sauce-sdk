@@ -3,7 +3,9 @@ import { OPS } from '../src/saucer/index.js';
 
 describe('control-flow', () => {
   it('compiles if statement', () => {
-    const result = compile('function main() { if (1 === 1) { const x = 5; } }');
+    // fold: false — the literal condition is const-foldable by default now; this pins
+    // the pre-folding runtime-branch shape (see source-import.test.ts for the fold-on case).
+    const result = compile('function main() { if (1 === 1) { const x = 5; } }', { fold: false });
     // thenBody = [WRITE_VALUE, 0, BYTE_1, 5] = 4 bytes
     expect(result.bytecode[0]).toEqual(
       new Uint8Array([
@@ -25,7 +27,10 @@ describe('control-flow', () => {
   });
 
   it('compiles if-else statement', () => {
-    const result = compile('function main() { if (1 === 2) { const x = 5; } else { const y = 10; } }');
+    // fold: false — see the 'compiles if statement' comment above.
+    const result = compile('function main() { if (1 === 2) { const x = 5; } else { const y = 10; } }', {
+      fold: false,
+    });
     // thenBody = [WRITE_VALUE, 0, BYTE_1, 5] = 4 bytes
     // elseBody = [WRITE_VALUE, 1, BYTE_1, 10] = 4 bytes
     // IF skip = thenBody(4) + JUMP(1) + jumpOperand(1) = 6
@@ -139,7 +144,8 @@ describe('control-flow', () => {
   });
 
   it('compiles ternary expression', () => {
-    const result = compile('function main() { const x = 1 === 1 ? 5 : 10; }');
+    // fold: false — see the 'compiles if statement' comment above.
+    const result = compile('function main() { const x = 1 === 1 ? 5 : 10; }', { fold: false });
     // IF skip=6 COND [WRITE_VALUE 0 5] JUMP 4 [WRITE_VALUE 0 10]
     expect(result.bytecode[0]).toEqual(
       new Uint8Array([
@@ -213,7 +219,8 @@ describe('control-flow', () => {
   });
 
   it('compiles throw in conditional', () => {
-    const result = compile('function main() { if (1 === 0) { throw "fail"; } }');
+    // fold: false — see the 'compiles if statement' comment above.
+    const result = compile('function main() { if (1 === 0) { throw "fail"; } }', { fold: false });
     // 1 === 0 optimized to BOOL_ZERO check on 1
     // thenBody = [REVERT, BYTES, 4, "fail"] = 7 bytes
     expect(result.bytecode[0]).toEqual(

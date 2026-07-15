@@ -73,7 +73,9 @@ function sortedArgObjectKeys(obj: ArgObject): string[] {
  */
 function structTypeFromArg(obj: ArgObject): StructType {
   const fields = sortedArgObjectKeys(obj);
-  const fieldStructTypes = fields.map((k) => (isArgObject(obj[k]) ? structTypeFromArg(obj[k] as ArgObject) : undefined));
+  const fieldStructTypes = fields.map((k) =>
+    isArgObject(obj[k]) ? structTypeFromArg(obj[k] as ArgObject) : undefined,
+  );
   const hasNestedStruct = fieldStructTypes.some((t) => t !== undefined);
 
   return hasNestedStruct ? { fields, fieldStructTypes } : { fields };
@@ -164,9 +166,20 @@ export interface CompileOptions {
   /**
    * Drop every function NOT reachable from main() (after compile-time constant folding) so an
    * imported-but-unreferenced function — or a handler behind a statically-false branch — is not
-   * emitted. Default false (every declared/imported function is emitted, the legacy behaviour).
+   * emitted. Default true — minimal bytecode by default. Set `false` for the legacy shape where
+   * every declared/imported function is emitted regardless of use (e.g. a test pinning an exact
+   * v1 function-table layout, where dropping a function would shift every later index).
    */
   treeshake?: boolean;
+  /**
+   * Whether an if/ternary/`&&`/`||` whose condition is a compile-time constant (a literal, a
+   * `defines` name, or a top-level `const X = <literal>`) emits only its taken branch. Default
+   * true — this can only ever act on an ACTUALLY-constant condition (anything runtime-derived
+   * evaluates to `undefined` and compiles as a normal branch, unchanged), so it's always safe.
+   * Set `false` to get the pre-folding literal output, e.g. a test pinning the exact unfolded
+   * bytecode of `if (1 === 1)`.
+   */
+  fold?: boolean;
   /**
    * Compile-time constants (name → value) used for conditional compilation: an `if`/ternary/
    * `&&`/`||` whose condition folds to a known value emits only the taken branch, so a guarded
@@ -223,7 +236,8 @@ export function compile(source: string, options: CompileOptions = {}): CompileRe
 
   const ctx = new CompilerContext(options.baseDirs, options.contracts, target);
   ctx.transformModule = options.transformModule;
-  ctx.treeshake = options.treeshake ?? false;
+  ctx.treeshake = options.treeshake ?? true;
+  ctx.fold = options.fold ?? true;
   ctx.setStaged(staged);
 
   if (options.defines) ctx.setDefines(options.defines);
