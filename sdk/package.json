@@ -28,17 +28,12 @@
     "./skills": {
       "types": "./dist/skills/loader.d.ts",
       "default": "./dist/skills/loader.js"
-    },
-    "./recipes": {
-      "types": "./dist/recipes/index.d.ts",
-      "default": "./dist/recipes/index.js"
     }
   },
   "files": [
     "dist",
     "src/skills",
-    "src/protocols",
-    "src/recipes"
+    "src/protocols"
   ],
   "publishConfig": {
     "access": "public"

@@ -210,21 +210,6 @@ Each protocol module exports: `protocolInfo`, `deployments`, `abis`, and SauceSc
 | `sablier` | Sablier | createWithDurations (token streaming, vesting) |
 | `superfluid` | Superfluid | createFlow (real-time per-second payments) |
 
-### Recipes (2 recipes)
-
-Pre-built Sauce recipes that combine off-chain preparation with on-chain SauceScript execution.
-
-| Slug | Name | Description |
-|------|------|-------------|
-| `alphaswap` | AlphaSwap | Liquidity-weighted swap splitting. Off-chain: pool discovery only. On-chain: read liquidity, proportional split via MUL_DIV, multi-hop routing through base tokens |
-| `megaswap` | MegaSwap | Adaptive price-stepping swap. Off-chain: pool discovery + quoting + slippage calculation. On-chain: iterative price-limit loop with fee-adjusted thresholds |
-
-```typescript
-// Recipe imports
-import { alphaSwap, prepareAlphaSwap } from "@eco-incorp/sauce-sdk/recipes";
-import { megaSwap, prepareMegaSwap } from "@eco-incorp/sauce-sdk/recipes";
-```
-
 ---
 
 ## Quick Reference by Operation
@@ -232,9 +217,8 @@ import { megaSwap, prepareMegaSwap } from "@eco-incorp/sauce-sdk/recipes";
 ### "I need to swap tokens"
 1. **Single DEX**: Use the chain's dominant DEX (Uniswap V3 on ETH, Aerodrome on BASE, Velodrome on OP, Camelot on ARB)
 2. **Best price**: Use an aggregator (`oneinch`, `paraswap`, `cowswap`, `zerox`)
-3. **On-chain optimized**: Use Sauce recipes -- `alphaswap` (liquidity-weighted split) or `megaswap` (adaptive price-stepping)
-4. **Stablecoin swap**: Use `curve` for lowest slippage between pegged assets
-5. **Cross-chain swap**: Use `lifi`, `squid`, or `socket` for bridge+swap in one tx
+3. **Stablecoin swap**: Use `curve` for lowest slippage between pegged assets
+4. **Cross-chain swap**: Use `lifi`, `squid`, or `socket` for bridge+swap in one tx
 
 ### "I need to lend/borrow"
 1. **Multi-chain**: `aave-v3` (most chains), `compound-v3` (major chains)
