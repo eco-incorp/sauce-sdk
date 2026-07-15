@@ -315,6 +315,10 @@ export class Saucer {
     return this.unary(OPS.SQRT, operand);
   }
 
+  mulDiv(a: Saucer, b: Saucer, c: Saucer): Saucer {
+    return this.ternary(OPS.MUL_DIV, a, b, c);
+  }
+
   keccak256(data: Saucer): Saucer {
     return this.unary(OPS.KECCAK256, data);
   }

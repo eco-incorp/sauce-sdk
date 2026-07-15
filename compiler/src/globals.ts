@@ -159,6 +159,13 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
   // Math.sqrt(x) — integer square root
   //   Math.sqrt(16)  => 4
   //   Math.sqrt(10)  => 3
+  //
+  // Math.mulDiv(a, b, denominator) — full-precision a*b/denominator (floored)
+  //   computes floor(a * b / denominator) in 512-bit precision (no intermediate overflow)
+  //   Math.mulDiv(100, 50, 25)  => 200
+  //
+  // Math.neg(x) — two's-complement negation (wrapping), i.e. the int256 value -x
+  //   for signed params like Uniswap amountSpecified (negative = exact input)
   Math: {
     sqrt: {
       kind: 'scalar',
@@ -166,6 +173,22 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
         expectArity('Math.sqrt', 1, args);
 
         return s.sqrt(process(args[0]));
+      },
+    },
+    mulDiv: {
+      kind: 'scalar',
+      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+        expectArity('Math.mulDiv', 3, args);
+
+        return s.mulDiv(process(args[0]), process(args[1]), process(args[2]));
+      },
+    },
+    neg: {
+      kind: 'scalar',
+      compile: (s: Saucer, args: Expression[], process: (e: Expression) => Saucer) => {
+        expectArity('Math.neg', 1, args);
+
+        return s.neg(process(args[0]));
       },
     },
   },

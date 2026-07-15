@@ -85,6 +85,46 @@ wraps, stakes) to bytecode. Actions **chain**: output feeds the next implicitly 
 **`dev-tools/`** — harness: `start:local`/`start:fork` boot a hardhat net + deploy the engine;
 `npm run sauce <file.js> [args]` compiles+runs a SauceScript; `npm run recipe …` runs recipes.
 
+## The swap Router (`../sauce/engine/src/Router.sol`)
+
+Lives in the **private engine repo**, not here, but recipes target it (its `Router`/`SauceRouter`
+artifacts are what `cook()` runs against). `SauceRouter` is a thin delegatecall proxy → `Router`
+(`~1218` lines). Recipes import the minimal `ISauceRouter` ABI from `dev-tools/artifacts/`.
+
+**Entry points** (all the `swap*` ones are `onlySelf` — callable only via `cook()` from the same
+contract, so a recipe calls them as `ISauceRouter.at(address.self).swapX(...)`):
+- `swap(SwapParams)` — unified swap; dispatches on `params.poolType` to `_swapV2/_swapV3/_swapV4/
+  _swapCurve/_swapBalancerV2/_swapDODOV2/_swapTraderJoeLB/_swapMaverickV2/_swapWOOFi`.
+  `SwapParams` embeds a `PoolKey` struct (`currency0,currency1,fee,tickSpacing,hooks`) used **only by
+  V4** (ignored for V2/V3). Calling this from SauceScript **now works**: the compiler orders
+  object-literal struct fields by the ABI's declared component order at the call boundary (recursively
+  for nested tuples) — see `compiler/src/processor/expression.ts` `processAbiArg`/`orderedStructTuple`,
+  unit-pinned by `compiler/test/struct-arg-order.test.ts`. (Previously it sorted fields alphabetically,
+  scrambling the nested `PoolKey` → empty revert.) The flat methods below remain valid alternatives.
+- `swapV3(pool, tokenIn, tokenOut, amountSpecified, sqrtPriceLimitX96, payer, recipient)` and
+  `swapV4(...)` — **flat** legacy methods (no nested struct), verified working from SauceScript.
+- `quote(QuoteParams)` — off-chain simulation; performs the swap and reverts with `QuoteRevert(amountIn,
+  amountOut, sqrtPriceAfter, gas)` (caught by `shared/quoting.ts`). Never lands a swap.
+
+**`amountSpecified` sign is inconsistent by path** (this bit us): the flat `swapV3` passes through to
+Uniswap, where **positive = exact input** (verified on fork). The unified `swap()`/V4 path and the
+`SwapParams`/`QuoteParams` doc say **negative = exact input** (Uniswap-V4/quote convention). For
+recipes using flat `swapV3`, pass a **positive** amount.
+
+**`SwapPoolType` enum** (must match recipe constants): `UniV2=0, UniV3=1, UniV4=2, Curve=3,
+BalancerV2=4, DODOV2=5, TraderJoeLB=6, MaverickV2=7, WOOFi=8`.
+
+**Callbacks vs callback-free** — the key architectural split for "where does swap logic live":
+- **V2/Solidly/Curve/DODO** are *callback-free*: `_swapV2` reads reserves, computes out (V2 fee
+  hardcoded 0.3% via `_getAmountOut`'s `*997/1000`), transfers tokenIn to the pool, calls
+  `pair.swap(...)`. A recipe can replicate this **entirely in SauceScript** (transfer + `pool.swap`),
+  bypassing the router — so new callback-free sources need only new SauceScript, no engine change.
+- **V3/V4 (and Maverick)** use *callbacks*: the pool re-enters the contract mid-swap
+  (`uniswapV3SwapCallback`/`pancakeV3SwapCallback`/`unlockCallback`/`maverickV2SwapCallback`) to pull
+  input, reading transient-storage context set by `_swapV3`. A reentrant call during `cook()` hits the
+  contract's Solidity dispatcher, **not** the paused bytecode interpreter — so callbacks can only be
+  serviced by the router's compiled code. These swaps **must** go through the router (`swapV3`/`swapV4`).
+
 ## Publishing
 
 Tag-driven (`.github/workflows/publish.yml`): `git tag v1.2.3 && git push origin v1.2.3` (or manual
