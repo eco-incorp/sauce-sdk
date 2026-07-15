@@ -54,8 +54,12 @@ export class CompilerContext {
      * `.ts`/`.sauce.ts` modules supply the stripper (the recipes pass ts.transpileModule).
      */
     transformModule;
-    /** Drop functions unreachable from main() after constant folding (CompileOptions.treeshake). */
-    treeshake = false;
+    /**
+     * Drop functions unreachable from main() after constant folding (CompileOptions.treeshake,
+     * default true — set false for the legacy "every declared/imported function is emitted"
+     * shape).
+     */
+    treeshake = true;
     /**
      * Compile-time constant environment for conditional compilation: names (from
      * CompileOptions.defines and top-level `const X = <literal>`) → their known bigint value.
@@ -66,15 +70,25 @@ export class CompilerContext {
         return this.module.defines;
     }
     /**
-     * Whether compile-time constant folding is active. Gated so a LEGACY caller (no
-     * `treeshake`, no `defines`) gets byte-identical output — e.g. `if (1 === 1)` is
-     * NOT folded for them, it still emits a runtime branch. Folding turns on the moment
-     * either knob is set: treeshake needs it for constant-aware reachability, and any
-     * define implies the caller wants conditional compilation. A top-level `const X = …`
-     * also populates `defines`, so a program that declares one folds its own conditions.
+     * Whether compile-time constant folding of if/ternary is active (CompileOptions.fold,
+     * default true). Independent of `treeshake`: folding a dead branch out of a function
+     * body is always safe on its own (evalConst only ever resolves an ACTUAL compile-time
+     * constant — a literal, or a name in `defines`/top-level `const`; anything runtime-derived
+     * yields `undefined` and falls through to normal codegen unchanged), whereas dropping a
+     * whole unreferenced function (treeshake) is a bigger, still-opt-in structural change.
+     * Set `fold: false` to get the pre-folding literal output (e.g. a test pinning the exact
+     * unfolded bytecode of `if (1 === 1)`). Module-shared (like `defines`) so a helper compiled
+     * in its own child context (forFunction) sees the same setting main() was compiled with.
      */
+    get fold() {
+        return this.module.fold;
+    }
+    set fold(value) {
+        this.module.fold = value;
+    }
+    /** Whether compile-time constant folding is active — see `fold`. */
     get foldEnabled() {
-        return this.treeshake || this.defines.size > 0;
+        return this.fold;
     }
     constructor(baseDirs = [], contracts = {}, target = 'v1', shared) {
         this.scopes.push({ variables: new Map() });
@@ -85,6 +99,7 @@ export class CompilerContext {
             contracts: new Map(),
             funcMeta: [],
             defines: new Map(),
+            fold: true,
             accounts: new AccountRegistry(),
             staged: false,
         };

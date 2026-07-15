@@ -7,6 +7,8 @@ import { encodeInt } from './saucer/integer.js';
 import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import { estimatePacket } from './planner/index.js';
+import { compileCacheKey, cloneCompileResult } from './cache.js';
+export { createCompileCache, compileCacheKey, cloneCompileResult } from './cache.js';
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
 export { CompilerContext } from './context.js';
@@ -32,7 +34,7 @@ function sortedArgObjectKeys(obj) {
  */
 function structTypeFromArg(obj) {
     const fields = sortedArgObjectKeys(obj);
-    const fieldStructTypes = fields.map((k) => (isArgObject(obj[k]) ? structTypeFromArg(obj[k]) : undefined));
+    const fieldStructTypes = fields.map((k) => isArgObject(obj[k]) ? structTypeFromArg(obj[k]) : undefined);
     const hasNestedStruct = fieldStructTypes.some((t) => t !== undefined);
     return hasNestedStruct ? { fields, fieldStructTypes } : { fields };
 }
@@ -56,6 +58,20 @@ function inferArgType(v) {
     return { kind: 'scalar' };
 }
 export function compile(source, options = {}) {
+    const cache = options.cache;
+    if (!cache)
+        return compileFresh(source, options);
+    const key = compileCacheKey(source, options);
+    const hit = cache.get(key);
+    if (hit)
+        return cloneCompileResult(hit);
+    const result = compileFresh(source, options);
+    // Store a clone so a caller mutating the returned result can't corrupt the
+    // cache; return a clone so a later compile can't corrupt this caller's result.
+    cache.set(key, cloneCompileResult(result));
+    return result;
+}
+function compileFresh(source, options = {}) {
     const target = options.target ?? 'v1';
     const staged = options.staged ?? false;
     if (staged && target !== 'svm') {
@@ -68,7 +84,8 @@ export function compile(source, options = {}) {
     });
     const ctx = new CompilerContext(options.baseDirs, options.contracts, target);
     ctx.transformModule = options.transformModule;
-    ctx.treeshake = options.treeshake ?? false;
+    ctx.treeshake = options.treeshake ?? true;
+    ctx.fold = options.fold ?? true;
     ctx.setStaged(staged);
     if (options.defines)
         ctx.setDefines(options.defines);

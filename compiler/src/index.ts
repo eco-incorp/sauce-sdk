@@ -17,6 +17,11 @@ import type { RefPlaceholder, CallPlaceholder } from './saucer/saucer-v12.js';
 import type { ContractsConfig } from './contracts.js';
 import { estimatePacket } from './planner/index.js';
 import type { AccountPlan } from './planner/index.js';
+import { compileCacheKey, cloneCompileResult } from './cache.js';
+import type { CompileCache } from './cache.js';
+
+export { createCompileCache, compileCacheKey, cloneCompileResult } from './cache.js';
+export type { CompileCache, BoundedCompileCache, CompileCacheStats } from './cache.js';
 
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
@@ -188,6 +193,28 @@ export interface CompileOptions {
    * 1n/0n. Top-level `const X = <literal>` in the program are folded the same way.
    */
   defines?: Record<string, bigint | boolean | number>;
+  /**
+   * Optional memo store. When provided, `compile()` returns a cached result for
+   * a previously-seen (source + options) instead of recompiling, and stores each
+   * fresh result. Omit it and compilation is unchanged (no caching). The cache is
+   * keyed on every serializable input, so a difference can only ever miss, never
+   * mis-hit; the two inputs it cannot capture — `transformModule`'s behavior and
+   * the on-disk contents of `baseDirs` imports — are the caller's contract to keep
+   * stable for the cache's lifetime (see cache.ts). Use `createCompileCache()` for
+   * a bounded store with stats.
+   */
+  cache?: CompileCache;
+  /**
+   * Opaque string mixed verbatim into the cache key — only consulted when `cache`
+   * is set. Use it to pin the inputs the key cannot capture on its own: the
+   * behavior of `transformModule` and the on-disk contents of `baseDirs` imports.
+   * A caller whose imported files can change mid-process (a watch/dev server), or
+   * that swaps `transformModule` against a shared cache, should pass a fingerprint
+   * (e.g. a hash of the transform config plus the imported files' mtime/size) so a
+   * changed input yields a distinct key instead of a stale hit. Omit it and those
+   * inputs remain the caller's documented environment contract (see cache.ts).
+   */
+  cacheKeyExtra?: string;
 }
 
 export interface CompileResult {
@@ -221,6 +248,24 @@ function inferArgType(v: ArgValue): { kind: VariableKind; elementType?: ElementT
 }
 
 export function compile(source: string, options: CompileOptions = {}): CompileResult {
+  const cache = options.cache;
+
+  if (!cache) return compileFresh(source, options);
+
+  const key = compileCacheKey(source, options);
+  const hit = cache.get(key);
+
+  if (hit) return cloneCompileResult(hit);
+
+  const result = compileFresh(source, options);
+  // Store a clone so a caller mutating the returned result can't corrupt the
+  // cache; return a clone so a later compile can't corrupt this caller's result.
+  cache.set(key, cloneCompileResult(result));
+
+  return result;
+}
+
+function compileFresh(source: string, options: CompileOptions = {}): CompileResult {
   const target: CompileTarget = options.target ?? 'v1';
   const staged = options.staged ?? false;
 

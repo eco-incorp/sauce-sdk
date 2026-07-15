@@ -1,6 +1,9 @@
 import { type CompileTarget } from './context.js';
 import type { ContractsConfig } from './contracts.js';
 import type { AccountPlan } from './planner/index.js';
+import type { CompileCache } from './cache.js';
+export { createCompileCache, compileCacheKey, cloneCompileResult } from './cache.js';
+export type { CompileCache, BoundedCompileCache, CompileCacheStats } from './cache.js';
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
 export type { SaucerLike, OutputSpec } from './saucer/saucer-like.js';
@@ -75,9 +78,20 @@ export interface CompileOptions {
     /**
      * Drop every function NOT reachable from main() (after compile-time constant folding) so an
      * imported-but-unreferenced function — or a handler behind a statically-false branch — is not
-     * emitted. Default false (every declared/imported function is emitted, the legacy behaviour).
+     * emitted. Default true — minimal bytecode by default. Set `false` for the legacy shape where
+     * every declared/imported function is emitted regardless of use (e.g. a test pinning an exact
+     * v1 function-table layout, where dropping a function would shift every later index).
      */
     treeshake?: boolean;
+    /**
+     * Whether an if/ternary/`&&`/`||` whose condition is a compile-time constant (a literal, a
+     * `defines` name, or a top-level `const X = <literal>`) emits only its taken branch. Default
+     * true — this can only ever act on an ACTUALLY-constant condition (anything runtime-derived
+     * evaluates to `undefined` and compiles as a normal branch, unchanged), so it's always safe.
+     * Set `false` to get the pre-folding literal output, e.g. a test pinning the exact unfolded
+     * bytecode of `if (1 === 1)`.
+     */
+    fold?: boolean;
     /**
      * Compile-time constants (name → value) used for conditional compilation: an `if`/ternary/
      * `&&`/`||` whose condition folds to a known value emits only the taken branch, so a guarded
@@ -86,6 +100,28 @@ export interface CompileOptions {
      * 1n/0n. Top-level `const X = <literal>` in the program are folded the same way.
      */
     defines?: Record<string, bigint | boolean | number>;
+    /**
+     * Optional memo store. When provided, `compile()` returns a cached result for
+     * a previously-seen (source + options) instead of recompiling, and stores each
+     * fresh result. Omit it and compilation is unchanged (no caching). The cache is
+     * keyed on every serializable input, so a difference can only ever miss, never
+     * mis-hit; the two inputs it cannot capture — `transformModule`'s behavior and
+     * the on-disk contents of `baseDirs` imports — are the caller's contract to keep
+     * stable for the cache's lifetime (see cache.ts). Use `createCompileCache()` for
+     * a bounded store with stats.
+     */
+    cache?: CompileCache;
+    /**
+     * Opaque string mixed verbatim into the cache key — only consulted when `cache`
+     * is set. Use it to pin the inputs the key cannot capture on its own: the
+     * behavior of `transformModule` and the on-disk contents of `baseDirs` imports.
+     * A caller whose imported files can change mid-process (a watch/dev server), or
+     * that swaps `transformModule` against a shared cache, should pass a fingerprint
+     * (e.g. a hash of the transform config plus the imported files' mtime/size) so a
+     * changed input yields a distinct key instead of a stale hit. Omit it and those
+     * inputs remain the caller's documented environment contract (see cache.ts).
+     */
+    cacheKeyExtra?: string;
 }
 export interface CompileResult {
     bytecode: Uint8Array[];
