@@ -66,15 +66,15 @@ describe('source-file function imports', () => {
         if (target === 'v1') expect(result.bytecode.length).toBe(3);
       });
 
-      it('tree-shaking drops an imported-but-unreferenced function', () => {
+      it('tree-shaking drops an imported-but-unreferenced function (the default)', () => {
         writeMod('m_pair.js', `export function used() { return 1n; }\nexport function never() { return 999n; }`);
         const source = `
           import { used, never } from "./m_pair";
           function main() { return used(); }
         `;
 
-        const shaken = compile(source, { baseDirs: [tmpDir], target, treeshake: true });
-        const full = compile(source, { baseDirs: [tmpDir], target });
+        const shaken = compile(source, { baseDirs: [tmpDir], target }); // treeshake defaults true
+        const full = compile(source, { baseDirs: [tmpDir], target, treeshake: false });
 
         if (target === 'v1') {
           // used + main, NOT never.
@@ -86,14 +86,14 @@ describe('source-file function imports', () => {
         }
       });
 
-      it('without treeshake every imported function is emitted (legacy)', () => {
+      it('treeshake: false emits every imported function (legacy)', () => {
         writeMod('m_pair2.js', `export function used2() { return 1n; }\nexport function spare2() { return 2n; }`);
         const source = `
           import { used2, spare2 } from "./m_pair2";
           function main() { return used2(); }
         `;
 
-        const result = compile(source, { baseDirs: [tmpDir], target });
+        const result = compile(source, { baseDirs: [tmpDir], target, treeshake: false });
 
         if (target === 'v1') expect(result.bytecode.length).toBe(3); // used2 + spare2 + main
       });
@@ -249,10 +249,10 @@ describe('source-file function imports', () => {
     });
   }
 
-  it('backward-compat: legacy caller does NOT fold a const-true if (v1 bytecode unchanged)', () => {
-    // With NEITHER defines NOR treeshake, folding is OFF, so `if (1 === 1)` still emits
-    // a runtime branch — identical to a genuinely runtime condition. Assert the folded
-    // (defines/treeshake) form differs from the un-folded legacy form.
+  it('a const-true if is folded by default (no options needed)', () => {
+    // fold defaults to true: `if (1 === 1)` needs no treeshake/defines to fold — it's
+    // const-foldable on its own. Assert the default form differs from (is smaller than)
+    // the explicit `fold: false` legacy form, which still emits a runtime branch.
     const source = `
       function main() {
         let x = 0n;
@@ -261,12 +261,14 @@ describe('source-file function imports', () => {
       }
     `;
 
-    const legacy = compile(source);
-    const folded = compile(source, { treeshake: true });
+    const folded = compile(source);
+    const legacy = compile(source, { fold: false });
 
     // Folding removes the runtime IF/JUMP scaffolding → strictly fewer bytes.
     expect(totalSize(folded.bytecode)).toBeLessThan(totalSize(legacy.bytecode));
-    // And legacy output still contains the conditional-jump opcode (branch emitted).
+    // `fold: false` output still contains the conditional-jump opcode (branch emitted).
     expect(Array.from(legacy.bytecode[0])).toContain(OPS.IF);
+    // The default output does not — the dead branch scaffolding is gone entirely.
+    expect(Array.from(folded.bytecode[0])).not.toContain(OPS.IF);
   });
 });

@@ -241,6 +241,46 @@ function coldWalk(levels: readonly ManifestLevel[], baseIn: boolean, x: bigint):
   return out;
 }
 
+/**
+ * Capacity-tracking taker walk: coldWalk plus the PRODUCTIVE gross input
+ * actually matched (`consumed = x − remaining`). consumed === x while the
+ * shipped book absorbs x; consumed < x once the book is depleted (or a level
+ * quote overflows). The lamport twin of the emitted rung's `lx` booking — the
+ * codegen books dIn from its delta so the CLOB slot self-caps at book depth
+ * instead of losing every merge election past it.
+ */
+function coldWalkConsumed(levels: readonly ManifestLevel[], baseIn: boolean, x: bigint): { out: bigint; consumed: bigint } {
+  if (x <= 0n) return { out: 0n, consumed: 0n };
+  let remaining = x;
+  let out = 0n;
+  for (let k = 0; k < levels.length && remaining > 0n; k++) {
+    const level = levels[k];
+    if (baseIn) {
+      if (remaining >= level.size) {
+        if (level.aux >= SENT) break;
+        out += level.aux;
+        remaining -= level.size;
+      } else {
+        const pv = manifestQuoteForBase(level.price, remaining, false);
+        if (pv >= SENT) break;
+        out += pv;
+        remaining = 0n;
+      }
+    } else {
+      const bl = manifestBaseForQuote(level.price, remaining, false);
+      if (bl >= SENT) break;
+      if (bl >= level.size) {
+        out += level.size;
+        remaining -= level.aux;
+      } else {
+        out += bl;
+        remaining = 0n;
+      }
+    }
+  }
+  return { out, consumed: x - remaining };
+}
+
 // ---------------------------------------------------------------------------
 // Fragment emission. Slot-local names are s<i>-prefixed short codes; the
 // reserved codegen surface (s<i>en, s<i>p<k>, s<i>g<j>, s<i>o<j>, amountIn,
@@ -277,8 +317,12 @@ function emitWalk(p: string, baseIn: boolean, xExpr: string, outVar: string, tag
     ...step,
     `${indent}  }`,
     `${indent}  ${outVar} = ${p}out;`,
-    // Remember the last computed grid point so the cold final quote can reuse it.
-    `${indent}  ${p}lo = ${p}out; ${p}lx = ${xExpr};`,
+    // Remember the output and the PRODUCTIVE input consumed (xExpr − leftover):
+    // the codegen books dIn from lx's delta so a rung past book depth folds to
+    // 0 dIn instead of a dead full-span rung. lx == xExpr when the book absorbs
+    // the whole grid point, so the cold final quote's `lx === x` reuse still
+    // fires on a fully-matched slice.
+    `${indent}  ${p}lo = ${p}out; ${p}lx = ${xExpr} - ${p}rm;`,
     `${indent}}`,
   ];
 }
@@ -373,6 +417,10 @@ export const manifestLadder = {
     return emitWalk(`s${slot}`, baseIn, x, outVar, `${rung}`, '    ', 'const').join('\n');
   },
 
+  capacityInputVar(slot: number): string {
+    return `s${slot}lx`;
+  },
+
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
     const p = `s${slot}`;
     const baseIn = manifestConfig(base).direction === 'baseIn';
@@ -441,6 +489,19 @@ export const manifestLadder = {
   // No referenceLadderQuotes: the ladder is pointwise (each rung is an
   // independent cold walk, no warm-start), so buildLadder's default
   // grid.map(quote) mirrors the fragment exactly.
+
+  /**
+   * Pointwise mirror of the emitted `lx` booking: the productive gross input
+   * matched at each grid point (== the point while the book absorbs it, the
+   * book depth beyond). No capped carry — each rung walks independently, so
+   * the emit recomputes lx per rung and this maps each grid point on its own.
+   */
+  referenceCapacities(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (grid: readonly bigint[]) => bigint[] {
+    const cfg = manifestConfig(base);
+    const baseIn = cfg.direction === 'baseIn';
+    const levels = effectiveLevels(cfg, state, params);
+    return (grid: readonly bigint[]): bigint[] => grid.map((g) => (g <= 0n ? 0n : coldWalkConsumed(levels, baseIn, g).consumed));
+  },
 
   /**
    * Depth for the relative filter: the shipped top-of-book aggregate. reserveIn

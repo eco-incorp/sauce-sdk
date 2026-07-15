@@ -333,6 +333,21 @@ function coldWalk(win: EffectiveWindow, live: RaydiumLive, zeroForOne: boolean, 
   return cursor.exhausted || rm > 0n ? null : cursor.out;
 }
 
+/**
+ * Capacity-clamped cold walk: the same loop, never null — reports the
+ * PRODUCTIVE gross input consumed (`cap = x − remaining`) and the output at
+ * that point. cap === x when x is fully absorbed; cap < x once the walk
+ * exhausts the shipped window. The lamport twin of the emitted rung's
+ * `lx`/`lo` capped booking.
+ */
+function coldWalkClamped(win: EffectiveWindow, live: RaydiumLive, zeroForOne: boolean, x: bigint): { out: bigint; cap: bigint } {
+  if (!win.valid || x <= 0n) return { out: 0n, cap: 0n };
+  const cursor: WalkCursor = { sp: live.sp, l: live.l, k: 0, exhausted: false, out: 0n };
+  let rm = x;
+  for (let it = 0; it < WALK_BOUND && rm > 0n && !cursor.exhausted; it++) rm = walkStep(cursor, win, live, zeroForOne, rm);
+  return { out: cursor.out, cap: x - rm };
+}
+
 // ---------------------------------------------------------------------------
 // Fragment emission (the fragment twin of the walk above).
 // ---------------------------------------------------------------------------
@@ -573,11 +588,20 @@ export const raydiumClmmLadder = {
       `      for (let ${p}w${rung} = 0; ${p}w${rung} < ${WALK_BOUND} && ${p}rm > 0 && ${p}wex === 0; ${p}w${rung}++) {`,
       ...emitWalkStep(p, zeroForOne, v, '        '),
       `      }`,
+      // Capacity-aware booking: a fully-absorbed rung records (grid point,
+      // output); an exhausted rung records the PRODUCTIVE input consumed
+      // (x − remaining, the window cap) and the output at the cap, then
+      // latches wcx so higher rungs reuse the cap (their dIn folds to 0). lx
+      // holds the cumulative productive input the codegen books dIn from.
       `      if (${p}wex === 0 && ${p}rm === 0) { ${p}lo = ${p}wout; ${p}lx = ${x} }`,
-      `      else { ${p}wcx = 1 }`,
+      `      else { ${p}lo = ${p}wout; ${p}lx = ${x} - ${p}rm; ${p}wcx = 1 }`,
       `    }`,
       `    const ${outVar} = ${p}lo;`,
     ].join('\n');
+  },
+
+  capacityInputVar(slot: number): string {
+    return `s${slot}lx`;
   },
 
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
@@ -668,11 +692,34 @@ export const raydiumClmmLadder = {
       let capped = false;
       return grid.map((g) => {
         if (win.valid && !capped && g > 0n) {
-          const out = coldWalk(win, live, zeroForOne, g);
-          if (out === null) capped = true;
-          else lo = out;
+          const { out, cap } = coldWalkClamped(win, live, zeroForOne, g);
+          lo = out; // fully absorbed: q(g); exhausted: q(cap) at the window edge
+          if (cap < g) capped = true;
         }
         return lo;
+      });
+    };
+  },
+
+  referenceCapacities(
+    base: PoolConfig,
+    state: AccountBytesMap,
+    params: readonly bigint[],
+  ): (grid: readonly bigint[]) => bigint[] {
+    const cfg = rayConfig(base);
+    const zeroForOne = cfg.direction === '0to1';
+    const live = liveFromState(cfg, state);
+    const win = effectiveWindow(cfg, state, live, params);
+    return (grid: readonly bigint[]): bigint[] => {
+      let cap = 0n;
+      let capped = false;
+      return grid.map((g) => {
+        if (win.valid && !capped && g > 0n) {
+          const clamped = coldWalkClamped(win, live, zeroForOne, g);
+          cap = clamped.cap; // grid point when absorbed; productive input at the window edge
+          if (clamped.cap < g) capped = true;
+        }
+        return cap;
       });
     };
   },

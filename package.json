@@ -58,7 +58,8 @@
     "dev-tools/sauce",
     "dev-tools/artifacts",
     "dev-tools/hardhat.config.cjs",
-    "dev-tools/README.md"
+    "dev-tools/README.md",
+    "artifacts/svm/engine.so"
   ],
   "scripts": {
     "build": "pnpm --filter './compiler' build && pnpm -r --filter './sdk' --filter './actions' build",

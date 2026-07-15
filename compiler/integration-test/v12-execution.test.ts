@@ -27,6 +27,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { compile, V12Saucer } from '../src/index.js';
 import { CompilerContext } from '../src/context.js';
+import type { ContractsConfig } from '../src/contracts.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ENGINE_V12 = process.env.SAUCE_ENGINE_V12 ?? join(__dirname, '../node_modules/sauce/engine-v12');
@@ -205,7 +206,14 @@ const builderVectors: {
 ];
 
 // Programs produced by the transpiler — the path with no Solidity twin.
-const transpilerVectors: { name: string; src: string; expected: number; kind: 'uint' | 'revert' }[] = [
+const transpilerVectors: {
+  name: string;
+  src: string;
+  expected: number;
+  kind: 'uint' | 'revert';
+  /** Pre-registered contract ABIs (CompileOptions.contracts) for call-based vectors. */
+  contracts?: ContractsConfig;
+}[] = [
   {
     name: 'func_call_params',
     src: 'function add(a, b){ return a + b } function main(){ return add(10, 20) }',
@@ -297,6 +305,52 @@ const transpilerVectors: { name: string; src: string; expected: number; kind: 'u
     expected: 7,
     kind: 'uint',
   },
+  {
+    // The destructuring fast path's building block, executed on the real runtime:
+    // CAST_BE(SLICE(bytes, k*32 + (32-N), N)) must equal the canonical
+    // low-N-bytes form ABI_DECODE's ad_scalar mask produces. Two head words —
+    // word 0 a uint160-shaped value (0x42, slice(12, 32) → 20 bytes), word 1 a
+    // SIGN-EXTENDED negative int24 (-100 = NOT(0x63); slice(61, 64) → 0xffff9c).
+    name: 'slice_cast_be_word_extract',
+    src: `function main(){ const w = Uint8Array.from([${[...Array(31).fill(0), 0x42, ...Array(31).fill(0xff), 0x9c].join(',')}]); return uint(w.slice(12, 32)) * 16777216 + uint(w.slice(61, 64)) }`,
+    expected: 0x42 * 16777216 + 0xffff9c,
+    kind: 'uint',
+  },
+  {
+    // END-TO-END destructuring fast path on the real runtime, through the actual
+    // processDestructuringDeclaration emission (not the .slice()/uint() sugar the
+    // vector above uses): STATIC to the identity precompile (0x04) echoes the
+    // calldata, so the "returndata" is fully deterministic — bytes 0..3 selector,
+    // 4..35 x, 36..67 y, 68..99 z. Binding c (uint32, k=1) slices bytes 60..63 =
+    // y[24..27] = 0x51525354; binding f (bool, k=2) slices byte 95 = z[27] = 1.
+    // Value-sensitive to the SLICE operand ORDER and the offset/width math: a
+    // swapped-operand mutant produces a len-60 slice → CAST_BE reverts.
+    name: 'destructure_fastpath_echo',
+    src: 'function main(){ const [, c, f] = Echo.at(4).id(1, 0x5152535400000000n, 0x100000000n); return c * 2 + f }',
+    expected: 0x51525354 * 2 + 1,
+    kind: 'uint',
+    contracts: {
+      Echo: {
+        abi: [
+          {
+            type: 'function',
+            name: 'id',
+            inputs: [
+              { name: 'x', type: 'uint256' },
+              { name: 'y', type: 'uint256' },
+              { name: 'z', type: 'uint256' },
+            ],
+            outputs: [
+              { name: 'a', type: 'uint256' },
+              { name: 'c', type: 'uint32' },
+              { name: 'f', type: 'bool' },
+            ],
+            stateMutability: 'view',
+          },
+        ],
+      },
+    },
+  },
 ];
 
 function buildVectors(): Vector[] {
@@ -305,7 +359,7 @@ function buildVectors(): Vector[] {
     out.push({ name: v.name, bytecodeHex: hex(v.make(ctx())), expectedKind: v.kind, expectedUint: v.expected });
   }
   for (const v of transpilerVectors) {
-    const bc = compile(v.src, { target: 'v12' }).bytecode[0];
+    const bc = compile(v.src, { target: 'v12', contracts: v.contracts }).bytecode[0];
     out.push({ name: v.name, bytecodeHex: hex(bc), expectedKind: v.kind, expectedUint: v.expected });
   }
 
@@ -356,6 +410,8 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(forgeOutput).toMatch(/ok array_compound_assign 14/); // transpiler compound +=
     expect(forgeOutput).toMatch(/ok object_field_set 42/); // object-literal (TUPLE) field set
     expect(forgeOutput).toMatch(/ok unused_call_dropped 7/); // bare call result SDROP'd, stack balanced
+    expect(forgeOutput).toMatch(/ok slice_cast_be_word_extract 1124073372/); // destructuring fast-path word extraction (incl. signed intN)
+    expect(forgeOutput).toMatch(/ok destructure_fastpath_echo 2728699561/); // = 0x51525354*2+1 — end-to-end fast path via identity precompile (operand-order-sensitive)
     expect(forgeOutput).not.toMatch(/\[FAIL/);
   });
 });

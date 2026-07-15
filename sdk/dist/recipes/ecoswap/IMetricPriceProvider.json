@@ -1,0 +1,14 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "getBidAndAskPrice",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        { "name": "bid", "type": "uint128" },
+        { "name": "ask", "type": "uint128" }
+      ]
+    }
+  ]
+}

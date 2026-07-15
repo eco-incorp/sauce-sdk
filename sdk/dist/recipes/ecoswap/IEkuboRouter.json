@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "EKUBO V3 MEVCaptureRouter (EkuboProtocol/evm-contracts v3.1.1 Router.sol; ETH mainnet",
+    "0xd26f20001a72a18C002b00e6710000d68700ce00) — the E0-frozen recipe surface. Signatures",
+    "line-verified against the pinned v3.1.1 sources AND selector-checked against the DEPLOYED",
+    "runtime 2026-07-04: quote((address,address,bytes32),bool,int128,uint96,uint256) = 0x3bc52842",
+    "(re-probed live: +1000e18 USDe -> delta0 +1000e18 / delta1 -998.69e6);",
+    "swap((address,address,bytes32),bool,int128,uint96,uint256,int256,address) = 0xf196187f",
+    "(fork-EXECUTED: pulled exactly the consumed input via transferFrom, paid the recipient the",
+    "quoted out to the wei, allowance residue 0, threshold == quote did not trip);",
+    "swapAllowPartialFill((address,address,bytes32),bool,int128,uint96,uint256,address) =",
+    "0x4adbe0cc (present, UNUSED — E0 pinned exec Option A: the partial-fill overloads hardcode",
+    "type(int256).min and DISABLE the slippage check). Underlying value types: SqrtRatio = uint96,",
+    "PoolConfig = bytes32, PoolBalanceUpdate = PoolState = bytes32 (declared uint256 below —",
+    "same raw word, and uint256 keeps the engine's return decode from intN-masking the packed",
+    "int128 lanes). quote is DECLARED NONPAYABLE so the compiler emits a PLAIN CALL: the lock",
+    "protocol TSTOREs, so a STATICCALL context breaks it (the Fluid/Metric quoter class); the",
+    "inner lock unwinds via the internal QuoteReturnValue revert, so the CALL is state-neutral",
+    "and probe-then-decode (two sequential CALLs) is safe. Revert classes (E0): uninitialized",
+    "pool -> PoolNotInitialized() 0x486aa307; oversize exact-in -> GRACEFUL partial fill (the",
+    "consumed in-delta < specified); full-fill swap -> PartialSwapsDisallowed() when consumed !=",
+    "amount, SlippageCheckFailed(int256,int256) below threshold; sqrtRatioLimit 0 -> the router",
+    "substitutes the direction-correct MIN/MAX bound (never SqrtRatioLimitWrongDirection)."
+  ],
+  "abi": [
+    {
+      "type": "function",
+      "name": "quote",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "name": "poolKey",
+          "type": "tuple",
+          "components": [
+            { "name": "token0", "type": "address" },
+            { "name": "token1", "type": "address" },
+            { "name": "config", "type": "bytes32" }
+          ]
+        },
+        { "name": "isToken1", "type": "bool" },
+        { "name": "amount", "type": "int128" },
+        { "name": "sqrtRatioLimit", "type": "uint96" },
+        { "name": "skipAhead", "type": "uint256" }
+      ],
+      "outputs": [
+        { "name": "balanceUpdate", "type": "uint256" },
+        { "name": "stateAfter", "type": "uint256" }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "swap",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "name": "poolKey",
+          "type": "tuple",
+          "components": [
+            { "name": "token0", "type": "address" },
+            { "name": "token1", "type": "address" },
+            { "name": "config", "type": "bytes32" }
+          ]
+        },
+        { "name": "isToken1", "type": "bool" },
+        { "name": "amount", "type": "int128" },
+        { "name": "sqrtRatioLimit", "type": "uint96" },
+        { "name": "skipAhead", "type": "uint256" },
+        { "name": "calculatedAmountThreshold", "type": "int256" },
+        { "name": "recipient", "type": "address" }
+      ],
+      "outputs": [{ "name": "balanceUpdate", "type": "uint256" }]
+    }
+  ]
+}

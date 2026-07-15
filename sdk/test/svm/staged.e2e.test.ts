@@ -6,8 +6,9 @@
  * anchor, the lazy-NoSigner contract, and the whole point of staging — a
  * program too large for the 1232-byte packet running from a buffer.
  *
- * Requires the engine .so (SAUCE_ENGINE_SO or the sibling sauce checkout);
- * skips cleanly when absent (same gate as the other engine-bound suites).
+ * Runs against the vendored engine .so by default (SAUCE_ENGINE_SO
+ * overrides); skips cleanly if that binary is somehow missing (same gate as
+ * the other engine-bound suites).
  */
 import { createHash } from 'node:crypto';
 import type { Address, Instruction } from '@solana/kit';

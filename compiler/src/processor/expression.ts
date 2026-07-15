@@ -17,7 +17,7 @@ import type {
 } from 'acorn';
 import { OPS } from '../saucer/index.js';
 import type { SaucerLike } from '../saucer/index.js';
-import type { AbiParameter, ContractInfo } from '../contracts.js';
+import type { AbiParameter, ContractInfo, MethodInfo } from '../contracts.js';
 import { hexToBytes } from '../contracts.js';
 import type { CompilerContext, VariableKind } from '../context.js';
 import { processExpression } from './index.js';
@@ -219,6 +219,91 @@ function resolveInlineChain(expr: CallExpression): InlineChainInfo | undefined {
   };
 }
 
+/**
+ * A contract-method call resolved WITHOUT emitting anything — the two typed
+ * shapes (inline `X.at(a).m(...)` chain, variable-bound `pool.m(...)`) plus the
+ * method's ABI, with the address emission deferred behind `addr()`. Lets the
+ * multi-output lowerings (array destructuring, raw shape-B stores) inspect
+ * `method.outputs` cheaply and only emit the call when they take the statement.
+ */
+export interface ContractCallTarget {
+  contract: ContractInfo;
+  methodName: string;
+  method: MethodInfo;
+  callTypeOverride?: 'static' | 'delegate';
+  addr: () => SaucerLike;
+  args: Expression[];
+}
+
+export function resolveContractCallTarget(expr: Expression, ctx: CompilerContext): ContractCallTarget | undefined {
+  if (expr.type !== 'CallExpression') return;
+
+  const call = expr as CallExpression;
+
+  const chain = resolveInlineChain(call);
+
+  if (chain) {
+    const contract = ctx.lookupContract(chain.contractName);
+
+    // The .at()/.view()/.lib() chain shape is unambiguous — an unknown name is a
+    // genuine error, and the normal call path reports it with this exact message
+    // (so a probe caller surfaces nothing the emission wouldn't).
+    if (!contract) throw new Error(`Unknown contract: ${chain.contractName}`);
+
+    const method = contract.methods.get(chain.methodName);
+
+    if (!method) throw new Error(`Unknown method "${chain.methodName}" on contract "${contract.name}"`);
+
+    return {
+      contract,
+      methodName: chain.methodName,
+      method,
+      callTypeOverride: BINDING_METHODS[chain.bindMethod],
+      addr: () => processExpression(chain.addressExpr, ctx),
+      args: chain.args,
+    };
+  }
+
+  if (call.callee.type !== 'MemberExpression') return;
+
+  const member = call.callee as MemberExpression;
+
+  if (member.object.type !== 'Identifier' || member.property.type !== 'Identifier') return;
+
+  const objectName = (member.object as { name: string }).name;
+  const bound = ctx.lookupBoundContract(objectName);
+
+  if (!bound) return;
+
+  const methodName = (member.property as { name: string }).name;
+  const method = bound.contract.methods.get(methodName);
+
+  if (!method) throw new Error(`Unknown method "${methodName}" on contract "${bound.contract.name}"`);
+
+  return {
+    contract: bound.contract,
+    methodName,
+    method,
+    callTypeOverride: bound.callTypeOverride,
+    addr: () => ctx.newSaucer().read(objectName),
+    args: call.arguments as Expression[],
+  };
+}
+
+/** Emit a resolved contract call WITHOUT output decoding — the raw returndata value. */
+export function emitRawContractCall(target: ContractCallTarget, ctx: CompilerContext): SaucerLike {
+  return processContractCall(
+    target.contract,
+    target.methodName,
+    target.args,
+    ctx,
+    ctx.newSaucer(),
+    target.addr(),
+    target.callTypeOverride,
+    true,
+  );
+}
+
 // Object literals are stored internally with fields in alphabetical order (the
 // canonical order used for `obj.field` reads). But a struct passed to a contract
 // method must be ABI-encoded in the ABI's DECLARATION order. So at the call
@@ -385,7 +470,7 @@ interface CatchChainInfo {
   paramName?: string;
 }
 
-function resolveCatchChain(expr: CallExpression): CatchChainInfo | undefined {
+export function resolveCatchChain(expr: CallExpression): CatchChainInfo | undefined {
   if (expr.callee.type !== 'MemberExpression') return;
 
   const member = expr.callee as MemberExpression;
@@ -716,8 +801,33 @@ const processFieldAccess = (
   );
 };
 
-const processIndexAccess = (expr: MemberExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike =>
-  saucer.index(processExpression(expr.object as Expression, ctx), processExpression(expr.property as Expression, ctx));
+// Compile-time rejection of `s[k]` where `s` was assigned a multi-output call
+// result on v1 (Variable.multiOutputCall): the stored value lost its tuple
+// descriptor in the round-trip, so the engine's INDEX is GUARANTEED to fault
+// SauceInvalidOperationArgs at runtime. Destructuring never stores the
+// descriptor and is the working replacement. (The store itself, and bare reads
+// of the variable, stay exactly as they always compiled — see storeExpression.)
+const assertIndexableVariable = (expr: MemberExpression, ctx: CompilerContext): void => {
+  if (expr.object.type !== 'Identifier') return;
+
+  const name = (expr.object as { name: string }).name;
+
+  if (!ctx.getVar(name)?.multiOutputCall) return;
+
+  throw new Error(
+    `cannot index '${name}': a multi-output call result stored in a variable loses its tuple on the v1 engine ` +
+      `(INDEX faults at runtime) — destructure the call instead: const [a, b] = …`,
+  );
+};
+
+const processIndexAccess = (expr: MemberExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike => {
+  assertIndexableVariable(expr, ctx);
+
+  return saucer.index(
+    processExpression(expr.object as Expression, ctx),
+    processExpression(expr.property as Expression, ctx),
+  );
+};
 
 export const processMemberExpression = (
   expr: MemberExpression,

@@ -8,6 +8,7 @@ import type {
   Property,
 } from 'acorn';
 import type { CompilerContext, VariableKind, ElementType, StructType } from '../context.js';
+import type { AbiParameter } from '../contracts.js';
 import { GLOBALS } from '../globals.js';
 
 const DYNAMIC_METHODS = ['concat', 'slice'];
@@ -175,6 +176,17 @@ const isNestedStructFieldAccess = (expr: MemberExpression, ctx: CompilerContext)
 
   return parentStructType.fieldStructTypes?.[fieldIndex] !== undefined;
 };
+
+/**
+ * Storage kind of one ABI output component once it is INDEXed out of a decoded
+ * tuple: an elementary static (uintN/intN/address/bool/bytesN) is a scalar word;
+ * bytes/string/arrays/tuples are heap values. Used by the multi-output-call
+ * lowerings (destructuring, raw shape-B reads) to pick the store kind per element.
+ */
+export const abiOutputKind = (param: AbiParameter): VariableKind =>
+  param.type === 'bytes' || param.type === 'string' || param.type === 'tuple' || param.type.endsWith(']')
+    ? 'dynamic'
+    : 'scalar';
 
 export const inferKindWithContext = (expr: Expression, ctx: CompilerContext): VariableKind => {
   if (expr.type !== 'MemberExpression') return inferKind(expr);

@@ -65,13 +65,17 @@ Actions and dev-tools use the **node test runner**, not jest → `pnpm --filter 
 - **`SAUCE_ENGINE_SO`** — path to the Solana engine binary (`engine.so`, built with
   `cargo build-sbf` in the sauce repo's `svm/`). The SVM integration suites
   (`compiler/integration-test/svm-*.test.ts`, `sdk/test/svm/*.test.ts`) run compiled
-  `target: 'svm'` bytecode on it via LiteSVM; default is the sibling-checkout path
-  `../sauce/svm/target/deploy/engine.so`, and the suites **skip cleanly** when the binary is
-  absent. CI does NOT skip them: it builds `engine.so` from the pinned `sauce` dep
-  (`compiler/node_modules/sauce/svm`, Anza toolchain, binary cached by the locked dep commit)
-  and fails loudly if the binary is missing. The `'svm'` compile target, its account-plan
-  output, and the `/svm` SDK subpath are documented in
-  `docs/plans/2026-07-03-solana-svm-support.md`.
+  `target: 'svm'` bytecode on it via LiteSVM. The binary is **vendored** at
+  `artifacts/svm/engine.so` (committed, force-added — `.so` is gitignored — same
+  convention as the committed `compiler/dist`/`sdk/dist`) and that's the default both
+  locally and in CI, so these suites run **offline by default**, same as the EVM ones; the
+  suites **skip cleanly** only if that binary is somehow missing. Set `SAUCE_ENGINE_SO` to
+  override — e.g. to test a freshly built engine before repinning the `sauce` dep. **Refresh
+  the vendored binary whenever the `sauce` dep is repinned**: `cargo build-sbf` in the pinned
+  commit's `svm/` checkout, copy `target/deploy/engine.so` over `artifacts/svm/engine.so`,
+  force-commit — nothing re-derives this automatically, so a repin without a refresh silently
+  tests against a stale engine again. The `'svm'` compile target, its account-plan output,
+  and the `/svm` SDK subpath are documented in `docs/plans/2026-07-03-solana-svm-support.md`.
 
 ## Architecture
 
@@ -89,7 +93,13 @@ TUPLE descriptor survives a variable round-trip — scalar/bytes32 storage dropp
 after a static call. (c) v12 assembly emits a **no-param ARG-PROLOGUE entry** that pushes the
 compile-time args then falls through into `main` (the v12 analogue of v1's appended `CALL_FUNCTION` arg
 segment) — so **parameterized programs run on the Huff runtime**. (`main` is inlined, not a table fn →
-it can't recurse, same as v1.)
+it can't recurse, same as v1.) (d) **Array destructuring of multi-output call returns**:
+`const [price, tick] = pool.slot0()` compiles on v1+v12 and makes ONE external call — raw returndata
+lands in a hidden heap temp, each bound element is re-derived via `INDEX(ABI_DECODE(READ(temp)))`, so
+the decoded tuple is never stored and the v1 descriptor round-trip fault can't happen. Shape B
+(`const s = pool.slot0()` then `s[k]`) keeps its store byte-identical (arrakis/pendle `return result`
+bare reads still compile), but the indexed reads/writes that were guaranteed v1 runtime faults
+(`SauceInvalidOperationArgs(INDEX)`) are now compile errors pointing at destructuring; v12 untouched.
 
 **Known v12 limit (follow-up):** the Huff runtime's dynamic-value descriptor packs the data pointer in
 16 bits (region `0x5000`→`0xFFFF`, ≈45 KB), so a program whose total dynamic data exceeds that gets a

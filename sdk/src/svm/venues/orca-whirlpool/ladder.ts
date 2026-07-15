@@ -379,6 +379,21 @@ function coldWalk(win: EffectiveWindow, live: WhirlpoolLive, aToB: boolean, x: b
   return cursor.exhausted || rm > 0n ? null : cursor.out;
 }
 
+/**
+ * Capacity-clamped cold walk: the same loop, but never null — it reports the
+ * PRODUCTIVE gross input actually consumed (`cap = x − remaining`) and the
+ * output at that point. cap === x for a fully-absorbed x; cap < x once the
+ * walk exhausts the shipped window (the venue's real depth for this trade).
+ * The lamport twin of the emitted rung's `lx`/`lo` capped booking.
+ */
+function coldWalkClamped(win: EffectiveWindow, live: WhirlpoolLive, aToB: boolean, x: bigint): { out: bigint; cap: bigint } {
+  if (!win.valid || x <= 0n) return { out: 0n, cap: 0n };
+  const cursor: WalkCursor = { sp: live.sp, l: live.l, k: 0, exhausted: false, out: 0n };
+  let rm = x;
+  for (let it = 0; it < WALK_BOUND && rm > 0n && !cursor.exhausted; it++) rm = walkStep(cursor, win, live, aToB, rm);
+  return { out: cursor.out, cap: x - rm };
+}
+
 // ---------------------------------------------------------------------------
 // Fragment emission. Slot-local names are s<i>-prefixed short codes; the
 // reserved codegen surface (s<i>en, s<i>p<k>, s<i>g<j>, s<i>o<j>, amountIn,
@@ -650,12 +665,22 @@ export const orcaWhirlpoolLadder = {
       `      for (let ${p}w${rung} = 0; ${p}w${rung} < ${WALK_BOUND} && ${p}rm > 0 && ${p}wex === 0; ${p}w${rung}++) {`,
       ...emitWalkStep(p, aToB, v, '        '),
       `      }`,
+      // Capacity-aware booking: a fully-absorbed rung records (grid point,
+      // output); an exhausted rung records the PRODUCTIVE input consumed
+      // (x − remaining, the window cap) and the output at the cap, then
+      // latches wcx so higher rungs reuse the cap (their dIn folds to 0). lx
+      // therefore always holds the cumulative productive input — the codegen
+      // books dIn from its delta so the venue self-caps at real depth.
       `      if (${p}wex === 0 && ${p}rm === 0) { ${p}lo = ${p}wout; ${p}lx = ${x} }`,
-      `      else { ${p}wcx = 1 }`,
+      `      else { ${p}lo = ${p}wout; ${p}lx = ${x} - ${p}rm; ${p}wcx = 1 }`,
       `    }`,
       `    const ${outVar} = ${p}lo;`,
     );
     return lines.join('\n');
+  },
+
+  capacityInputVar(slot: number): string {
+    return `s${slot}lx`;
   },
 
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
@@ -748,11 +773,34 @@ export const orcaWhirlpoolLadder = {
       let capped = false;
       return grid.map((g) => {
         if (win.valid && !capped && g > 0n) {
-          const out = coldWalk(win, live, aToB, g);
-          if (out === null) capped = true;
-          else lo = out;
+          const { out, cap } = coldWalkClamped(win, live, aToB, g);
+          lo = out; // fully absorbed: q(g); exhausted: q(cap) at the window edge
+          if (cap < g) capped = true;
         }
         return lo;
+      });
+    };
+  },
+
+  referenceCapacities(
+    base: PoolConfig,
+    state: AccountBytesMap,
+    params: readonly bigint[],
+  ): (grid: readonly bigint[]) => bigint[] {
+    const cfg = whirlConfig(base);
+    const aToB = cfg.direction === 'aToB';
+    const live = liveFromState(cfg, state);
+    const win = effectiveWindow(cfg, state, live, params);
+    return (grid: readonly bigint[]): bigint[] => {
+      let cap = 0n;
+      let capped = false;
+      return grid.map((g) => {
+        if (win.valid && !capped && g > 0n) {
+          const clamped = coldWalkClamped(win, live, aToB, g);
+          cap = clamped.cap; // grid point when absorbed; productive input at the window edge
+          if (clamped.cap < g) capped = true;
+        }
+        return cap;
       });
     };
   },

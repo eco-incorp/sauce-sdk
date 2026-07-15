@@ -42,8 +42,8 @@
  *
  * Gates (named errors): account size / discriminator; a non-Enabled status;
  * `collect_fee_mode != 0` (only InputOnly is walked — fee always on input);
- * `is_support_limit_order` pairs (LimitOrder function_type, or Undetermined
- * with a reward mint — the limit-order fill layers are unsupported); non-classic
+ * explicit LimitOrder-function_type pairs (the limit-order fill layers are unmodeled;
+ * Undetermined/LiquidityMining are admitted — unmodeled orders only add output); non-classic
  * -SPL mints; a slot-typed activation with a nonzero point (no in-VM slot read);
  * a direction with no shippable liquid bins (gated by the orchestrator).
  */
@@ -100,8 +100,6 @@ const OFF_TOKEN_X_MINT = 88;
 const OFF_TOKEN_Y_MINT = 120;
 const OFF_RESERVE_X = 152;
 const OFF_RESERVE_Y = 184;
-const OFF_REWARD0_MINT = 264;
-const OFF_REWARD1_MINT = 408;
 const OFF_ORACLE = 552;
 export const OFF_ACTIVATION_POINT = 816;
 const OFF_TOKEN_X_PROGRAM_FLAG = 880;
@@ -147,6 +145,13 @@ export interface MeteoraDlmmPoolConfig extends PoolConfig {
   oracle: Address;
   /** ['bitmap', lb_pair] — required by the swap when the walk leaves the default bitmap. */
   bitmapExtension: Address;
+  /**
+   * Whether the ['bitmap', lb_pair] extension account EXISTS on-chain. The swap
+   * ix takes it as an Option<AccountLoader>; when it is absent the swap must pass
+   * the DLMM program id as the Anchor None sentinel (NOT the derived-but-
+   * uninitialized PDA, which makes Anchor deserialize Some(...) and revert).
+   */
+  bitmapExtensionExists: boolean;
   binStep: number;
   activeId: number;
   /** Immutable fee params (StaticParameters) — shipped as cfg words. */
@@ -196,20 +201,23 @@ export function windowArrayIndexes(activeId: number, swapForY: boolean): [number
   return swapForY ? [base, base - 1, base - 2] : [base, base + 1, base + 2];
 }
 
-const isZeroMint = (data: Uint8Array, offset: number): boolean => {
-  for (let i = 0; i < 32; i++) if (data[offset + i] !== 0) return false;
-  return true;
-};
-
 /**
- * is_support_limit_order (lb_pair.rs): LimitOrder(1) => true; LiquidityMining(0)
- * => false; Undetermined(2) => true iff any reward mint is set (non-default).
+ * Whether this pair is an explicit LimitOrder pool (FunctionType, dlmm-sdk
+ * commons/src/conversions/function_type.rs @ 4eaaeaa6: 0=Undetermined,
+ * 1=LiquidityMining, 2=LimitOrder). The ladder models only bin (liquidity)
+ * crossings, not limit-order fill layers, so a LimitOrder pool is GATED.
+ *
+ * NOTE: we intentionally do NOT mirror upstream's is_support_limit_order, which
+ * ALSO returns true for an Undetermined pool with no reward mint. That predicate
+ * is a routing-consideration flag ("this pool MIGHT carry limit-order liquidity"),
+ * NOT a drop signal — and Undetermined-with-no-reward is the DEFAULT state of an
+ * ordinary new pool (e.g. the SOL/USDC mainnet fixture), so gating on it would
+ * drop a large fraction of normal DLMM pools. Admitting them is conservative-safe:
+ * any unmodeled limit-order liquidity only ADDS output (realized out >= modeled),
+ * exactly the Raydium-CLMM treatment. Gate only the explicit LimitOrder(2) type.
  */
 function isSupportLimitOrder(data: Uint8Array): boolean {
-  const functionType = data[OFF_FUNCTION_TYPE];
-  if (functionType === 1) return true;
-  if (functionType === 0) return false;
-  return !(isZeroMint(data, OFF_REWARD0_MINT) && isZeroMint(data, OFF_REWARD1_MINT));
+  return data[OFF_FUNCTION_TYPE] === 2; // LimitOrder — admit Undetermined(0) and LiquidityMining(1)
 }
 
 /**
@@ -323,6 +331,10 @@ export async function fetchMeteoraDlmmConfig(load: AccountLoader, pair: Address)
       seeds: [new TextEncoder().encode('bitmap'), getAddressEncoded(pair)],
     }).then(([pda]) => pda),
   ]);
+  // The bitmap extension exists only for pairs whose liquidity leaves the
+  // default bitmap; probe it so the swap can pass the program-id None sentinel
+  // when it is absent (the common case) instead of an uninitialized PDA.
+  const bitmapExtensionExists = (await load(bitmapExtension)) !== null;
 
   return {
     venue: SLUG,
@@ -334,6 +346,7 @@ export async function fetchMeteoraDlmmConfig(load: AccountLoader, pair: Address)
     reserveY: codec.decode(data.subarray(OFF_RESERVE_Y, OFF_RESERVE_Y + 32)),
     oracle: codec.decode(data.subarray(OFF_ORACLE, OFF_ORACLE + 32)),
     bitmapExtension,
+    bitmapExtensionExists,
     binStep,
     activeId,
     baseFactor: Number(readUintLE(data, OFF_BASE_FACTOR, 2)),

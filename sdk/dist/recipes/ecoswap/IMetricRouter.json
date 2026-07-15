@@ -1,0 +1,81 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "quoteSwap",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "name": "pool",
+          "type": "address"
+        },
+        {
+          "name": "xToY",
+          "type": "bool"
+        },
+        {
+          "name": "amountSpecified",
+          "type": "int128"
+        },
+        {
+          "name": "priceLimit",
+          "type": "uint128"
+        },
+        {
+          "name": "bid",
+          "type": "uint128"
+        },
+        {
+          "name": "ask",
+          "type": "uint128"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "amount0Delta",
+          "type": "int256"
+        },
+        {
+          "name": "amount1Delta",
+          "type": "int256"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "swapExactInput",
+      "stateMutability": "nonpayable",
+      "inputs": [
+        {
+          "name": "pool",
+          "type": "address"
+        },
+        {
+          "name": "recipient",
+          "type": "address"
+        },
+        {
+          "name": "xToY",
+          "type": "bool"
+        },
+        {
+          "name": "amountIn",
+          "type": "uint128"
+        },
+        {
+          "name": "priceLimit",
+          "type": "uint128"
+        },
+        {
+          "name": "minAmountOut",
+          "type": "uint256"
+        },
+        {
+          "name": "deadline",
+          "type": "uint256"
+        }
+      ],
+      "outputs": []
+    }
+  ]
+}

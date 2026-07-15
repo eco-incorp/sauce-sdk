@@ -1,0 +1,2 @@
+export declare const exerciseOption = "\nimport { HegicABI as IHegic } from \"./abis\";\n\nfunction main(hegicAddress: Address, optionId: Uint256): Uint256 {\n  const hegic = IHegic.at(hegicAddress);\n  hegic.exercise(optionId);\n  return 1;\n}\n";
+//# sourceMappingURL=functions.d.ts.map

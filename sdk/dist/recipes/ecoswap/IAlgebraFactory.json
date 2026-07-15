@@ -1,0 +1,14 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "poolByPair",
+      "stateMutability": "view",
+      "inputs": [
+        { "name": "tokenA", "type": "address" },
+        { "name": "tokenB", "type": "address" }
+      ],
+      "outputs": [{ "name": "pool", "type": "address" }]
+    }
+  ]
+}

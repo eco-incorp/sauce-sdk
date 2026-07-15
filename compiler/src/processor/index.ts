@@ -425,7 +425,7 @@ function processFunctionV12(stmt: FunctionDeclaration, parentCtx: CompilerContex
     if (param.type !== 'Identifier') throw new Error(`Unsupported function variable type: ${param.type}`);
 
     const argType = argTypes?.[i];
-    ctx.setVar(param.name, argType?.kind ?? 'scalar', argType?.elementType, undefined, true);
+    ctx.setVar(param.name, argType?.kind ?? 'scalar', argType?.elementType, argType?.structType, true);
     ctx.pushStack(param.name);
   });
 
@@ -443,7 +443,7 @@ function processFunction(stmt: FunctionDeclaration, ctx: CompilerContext = new C
     if (param.type !== 'Identifier') throw new Error(`Unsupported function variable type: ${param.type}`);
 
     const argType = argTypes?.[i];
-    ctx.setVar(param.name, argType?.kind ?? 'scalar', argType?.elementType);
+    ctx.setVar(param.name, argType?.kind ?? 'scalar', argType?.elementType, argType?.structType);
   });
 
   return stmt.body.body.reduce<SaucerLike>((saucer, st) => processStatement(st, ctx, saucer), ctx.newSaucer());

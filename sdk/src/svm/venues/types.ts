@@ -206,6 +206,35 @@ export interface SvmVenueLadderV2 {
     now?: bigint,
   ): (grid: readonly bigint[]) => bigint[];
   /**
+   * CAPACITY-AWARE (window-walking) families only — orca-whirlpool,
+   * raydium-clmm, meteora-dlmm, manifest. Names the slot-local that, after
+   * every emitLadderQuote call, holds the CUMULATIVE PRODUCTIVE gross input of
+   * the most recent rung: the grid point itself while the walk stays inside
+   * the shipped-window capacity, or the productive input consumed when the
+   * walk exhausts at c < grid point (the window/book cap). The codegen books
+   * each rung's dIn from the DELTA of this local instead of the raw geometric
+   * grid span, so a rung that exceeds capacity contributes only its productive
+   * input (not the full span with a dead dOut) — the venue self-caps at its
+   * real depth instead of losing every merge election past capacity. Absent =
+   * dIn is the raw grid span (CP/stable families, no capacity limit —
+   * byte-identical to the pre-capacity codegen).
+   */
+  capacityInputVar?(slot: number): string;
+  /**
+   * Off-chain mirror of capacityInputVar: the cumulative productive gross
+   * input per ORDERED grid point, computed over the SAME walk referenceQuote
+   * runs. Must equal the on-chain `capacityInputVar` local after each rung
+   * lamport-for-lamport (both derive from the same exhaustion point) — that is
+   * what keeps the capacity-clamped split reproducible. Present iff
+   * capacityInputVar is.
+   */
+  referenceCapacities?(
+    cfg: PoolConfig,
+    state: AccountBytesMap,
+    params: readonly bigint[],
+    now?: bigint,
+  ): (grid: readonly bigint[]) => bigint[];
+  /**
    * Effective (reserveIn, reserveOut) from state — relative-depth filter +
    * continuous-oracle input. `now` as in referenceQuote.
    */

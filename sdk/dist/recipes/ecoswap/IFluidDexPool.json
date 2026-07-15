@@ -1,0 +1,16 @@
+{
+  "abi": [
+    {
+      "type": "function",
+      "name": "swapIn",
+      "stateMutability": "payable",
+      "inputs": [
+        { "name": "swap0to1", "type": "bool" },
+        { "name": "amountIn", "type": "uint256" },
+        { "name": "amountOutMin", "type": "uint256" },
+        { "name": "to", "type": "address" }
+      ],
+      "outputs": [{ "name": "amountOut", "type": "uint256" }]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Abi, ContractInfo, ContractsConfig } from './contracts.js';
+import type { Abi, AbiParameter, ContractInfo, ContractsConfig } from './contracts.js';
 import { parseAbiMethods } from './contracts.js';
 import { RESERVED_NAMES } from './globals.js';
 import { Saucer } from './saucer/saucer.js';
@@ -39,6 +39,16 @@ export interface Variable {
    * both TUPLE), so the lowering rejects assignment to a flagged variable.
    */
   immutablePacked?: boolean;
+  /**
+   * v1 only, metadata (never changes emitted bytes): the variable was assigned a
+   * multi-output contract call result (`const s = pool.slot0()`). The decoded
+   * tuple's descriptor does not survive the v1 variable round-trip, so an indexed
+   * read `s[k]` is GUARANTEED to fault SauceInvalidOperationArgs(INDEX) at
+   * runtime — the lowering rejects it at compile time and points at destructuring
+   * (`const [a, b] = pool.slot0()`), which never stores the descriptor. Bare
+   * reads (`return s` — shipping protocol functions do this) stay untouched.
+   */
+  multiOutputCall?: AbiParameter[];
 }
 
 export interface Scope {
@@ -61,6 +71,12 @@ interface SharedModule {
   funcMeta: FunctionMeta[];
   /** Compile-time constants (name → known bigint) for conditional compilation. */
   defines: Map<string, bigint>;
+  /**
+   * Whether if/ternary constant folding is active (CompileOptions.fold, default true) —
+   * module-shared, like `defines`, so a helper compiled in its own child context (forFunction)
+   * sees the same setting main() was compiled with.
+   */
+  fold: boolean;
   /** svm: symbolic account refs → user-account indices, shared so helper functions share numbering. */
   accounts: AccountRegistry;
   /**
@@ -117,7 +133,7 @@ export class CompilerContext {
   isMainFunction = true;
 
   /** Type info for main() function parameters, inferred from args option */
-  mainArgTypes?: { kind: VariableKind; elementType?: ElementType }[];
+  mainArgTypes?: { kind: VariableKind; elementType?: ElementType; structType?: StructType }[];
 
   /**
    * Optional hook to transform an imported SOURCE module's text before it is parsed —
@@ -129,8 +145,12 @@ export class CompilerContext {
    */
   transformModule?: (code: string, filePath: string) => string;
 
-  /** Drop functions unreachable from main() after constant folding (CompileOptions.treeshake). */
-  treeshake = false;
+  /**
+   * Drop functions unreachable from main() after constant folding (CompileOptions.treeshake,
+   * default true — set false for the legacy "every declared/imported function is emitted"
+   * shape).
+   */
+  treeshake = true;
 
   /**
    * Compile-time constant environment for conditional compilation: names (from
@@ -143,15 +163,27 @@ export class CompilerContext {
   }
 
   /**
-   * Whether compile-time constant folding is active. Gated so a LEGACY caller (no
-   * `treeshake`, no `defines`) gets byte-identical output — e.g. `if (1 === 1)` is
-   * NOT folded for them, it still emits a runtime branch. Folding turns on the moment
-   * either knob is set: treeshake needs it for constant-aware reachability, and any
-   * define implies the caller wants conditional compilation. A top-level `const X = …`
-   * also populates `defines`, so a program that declares one folds its own conditions.
+   * Whether compile-time constant folding of if/ternary is active (CompileOptions.fold,
+   * default true). Independent of `treeshake`: folding a dead branch out of a function
+   * body is always safe on its own (evalConst only ever resolves an ACTUAL compile-time
+   * constant — a literal, or a name in `defines`/top-level `const`; anything runtime-derived
+   * yields `undefined` and falls through to normal codegen unchanged), whereas dropping a
+   * whole unreferenced function (treeshake) is a bigger, still-opt-in structural change.
+   * Set `fold: false` to get the pre-folding literal output (e.g. a test pinning the exact
+   * unfolded bytecode of `if (1 === 1)`). Module-shared (like `defines`) so a helper compiled
+   * in its own child context (forFunction) sees the same setting main() was compiled with.
    */
+  get fold(): boolean {
+    return this.module.fold;
+  }
+
+  set fold(value: boolean) {
+    this.module.fold = value;
+  }
+
+  /** Whether compile-time constant folding is active — see `fold`. */
   get foldEnabled(): boolean {
-    return this.treeshake || this.defines.size > 0;
+    return this.fold;
   }
 
   constructor(
@@ -168,6 +200,7 @@ export class CompilerContext {
       contracts: new Map(),
       funcMeta: [],
       defines: new Map(),
+      fold: true,
       accounts: new AccountRegistry(),
       staged: false,
     };
