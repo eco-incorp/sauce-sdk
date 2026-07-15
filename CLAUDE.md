@@ -86,6 +86,20 @@ inference); `src/saucer/` emits bytecode (`Saucer` builder, `ops.ts` opcode tabl
 `src/context.ts` tracks functions/var kinds/ABIs; `src/contracts.ts` loads contract ABIs from artifact
 JSON for `import { X } from "./X.json"` + `.at()/.view()/.lib()` binding.
 
+**Compile cache (`src/cache.ts`) — ON BY DEFAULT** — `compile()` is a pure function of (source,
+options, on-disk import contents), so it memoizes: a repeat `(source, options)` returns a cached
+`CompileResult` instead of recompiling (~9× on recurring compiles). `options.cache`: omitted/`true`
+→ the process-global default store (`getDefaultCompileCache`, bounded LRU); `false` → bypass
+(guaranteed-fresh compile); a `Map`/`createCompileCache(maxEntries)` → that store (with hit/miss
+stats). The key (`compileCacheKey`) covers every output-affecting option with `compile()`'s own
+defaults, so a difference can only MISS, never mis-hit; `baseDirs` resolve to absolute so a relative
+dir keys by the file it actually reads (cwd-dependent). **The two inputs the key can't see —
+`transformModule` behavior and imported-file bytes — are now a DEFAULT environment contract**: keep
+them stable within a process, else a recompile of the same source returns stale bytecode. Escape
+hatches: `cache: false` (bypass), `clearDefaultCompileCache()` (after editing an imported file), or
+`cacheKeyExtra` (a fingerprint string mixed into the key). Results are cloned in and out, so a
+caller can never corrupt the cache and every call returns a fresh mutable result.
+
 **Compiler fixes (this branch):** (a) `new Array(n)` now **infers as DYNAMIC (heap) storage** so the
 TUPLE descriptor survives a variable round-trip — scalar/bytes32 storage dropped the descriptor, so
 `arr[i]` read/write reverted after `let a = new Array(n)`. (b) v12 `staticCall`/`delegateCall`
