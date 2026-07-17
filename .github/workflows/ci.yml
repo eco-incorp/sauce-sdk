@@ -65,6 +65,21 @@ jobs:
         run: test -s artifacts/svm/engine.so || { echo "::error::artifacts/svm/engine.so missing or empty"; exit 1; }
       # -----------------------------------------------------------------------
 
+      # The committed EVM engine artifacts (sdk/dist/artifacts — Router,
+      # SauceRouter, V12*, interfaces) ship to downstream SDK consumers for their
+      # local tests/deploys, so they must track the pinned `sauce` engine. They
+      # are not build output, so a repin would otherwise leave them stale
+      # silently. Re-sync from the freshly-installed engine build (foundry v1.5.1
+      # + solc 0.8.27 → byte-reproducible) and fail if the committed copies drift.
+      - name: Verify engine artifacts are in sync with the pinned engine
+        run: |
+          pnpm --filter './sdk' sync-engine-artifacts
+          git diff --exit-status -- sdk/dist/artifacts || {
+            echo "::error::sdk/dist/artifacts is stale vs the pinned sauce engine. Run 'pnpm --filter ./sdk sync-engine-artifacts' and commit the result.";
+            exit 1;
+          }
+      # -----------------------------------------------------------------------
+
       - name: Build compiler
         run: pnpm --filter './compiler' build
 
