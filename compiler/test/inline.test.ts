@@ -8,7 +8,9 @@ function bytesToHex(b: Uint8Array): string {
 /** True if `needle` appears as a contiguous subsequence of `haystack`. */
 function containsSubsequence(haystack: Uint8Array, needle: Uint8Array): boolean {
   if (needle.length === 0) return true;
+
   if (needle.length > haystack.length) return false;
+
   return bytesToHex(haystack).includes(bytesToHex(needle));
 }
 
