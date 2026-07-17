@@ -715,6 +715,7 @@ export function processTaggedTemplateExpression(expr, ctx, saucer) {
         const { bytecode } = compile(wrappedSource, {
             baseDirs: ctx.resolvedBaseDirs,
             contracts: ctx.contractsConfig,
+            target: ctx.target,
         });
         return saucer.join(ctx.newSaucer().bytes(bytecode[0]));
     }
@@ -730,10 +731,13 @@ export function processTaggedTemplateExpression(expr, ctx, saucer) {
     }
     // Wrap in function main() if needed
     const wrappedSource = /function\s+main\s*\(/.test(innerSource) ? innerSource : `function main() { ${innerSource} }`;
-    // Compile inner source — contracts from outer scope are available
+    // Compile inner source — contracts from outer scope are available.
+    // Thread the enclosing target so the inner $-fragment matches the outer
+    // program's bytecode format (defaults to v1 otherwise, which breaks v12).
     const { bytecode } = compile(wrappedSource, {
         baseDirs: ctx.resolvedBaseDirs,
         contracts: ctx.contractsConfig,
+        target: ctx.target,
     });
     const innerBytes = bytecode[0];
     // Split bytecodes at sentinel positions

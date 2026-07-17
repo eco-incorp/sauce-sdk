@@ -44,7 +44,7 @@
     "jest": "^30.2.0",
     "litesvm": "^1.2.1",
     "prettier": "^3.8.1",
-    "sauce": "github:eco-incorp/sauce#feat/svm-exec-from-account",
+    "sauce": "github:eco-incorp/sauce#feat/router-flash-callback",
     "ts-jest": "^29.4.6",
     "typescript": "^5.7.0"
   },

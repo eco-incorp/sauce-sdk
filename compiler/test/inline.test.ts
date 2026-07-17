@@ -1,6 +1,19 @@
 import { compile } from '../src/index.js';
 import { OPS } from '../src/saucer/index.js';
 
+function bytesToHex(b: Uint8Array): string {
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/** True if `needle` appears as a contiguous subsequence of `haystack`. */
+function containsSubsequence(haystack: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.length === 0) return true;
+
+  if (needle.length > haystack.length) return false;
+
+  return bytesToHex(haystack).includes(bytesToHex(needle));
+}
+
 describe('$ inline', () => {
   it('compiles static template (no interpolations)', () => {
     const source = `
@@ -121,6 +134,34 @@ describe('$ inline', () => {
 
     // inner stored on heap
     expect(bytes).toContain(OPS.WRITE_HEAP);
+  });
+
+  it('threads the enclosing target into the inner $-fragment compile (v12, not v1)', () => {
+    // The inner fragment must be compiled for the SAME target as the enclosing
+    // program. Otherwise a v12 program embeds a v1-format fragment, which reverts
+    // when delegatecalled into the v12 runtime. Regression test for the inner
+    // compile() defaulting to v1 regardless of ctx.target.
+    const innerSrc = 'return 42;';
+    const wrappedInner = `function main() { ${innerSrc} }`;
+
+    // Standalone reference compiles of the inner fragment at each target.
+    const innerV12 = compile(wrappedInner, { target: 'v12' }).bytecode[0];
+    const innerV1 = compile(wrappedInner, { target: 'v1' }).bytecode[0];
+
+    // Sanity: the two target formats genuinely differ, so the assertions below
+    // actually distinguish them.
+    expect(bytesToHex(innerV12)).not.toEqual(bytesToHex(innerV1));
+
+    // Enclosing program at target v12 with a no-interpolation $-fragment. The
+    // inner bytes are embedded verbatim as a BYTES literal.
+    const outer = compile(`function main() { const inner = $\`${innerSrc}\`; }`, {
+      target: 'v12',
+    }).bytecode[0];
+
+    // The outer v12 program must embed the v12-compiled inner fragment ...
+    expect(containsSubsequence(outer, innerV12)).toBe(true);
+    // ... and must NOT embed the v1-compiled fragment.
+    expect(containsSubsequence(outer, innerV1)).toBe(false);
   });
 
   it('multiple interpolations produce correct CONCAT structure', () => {
