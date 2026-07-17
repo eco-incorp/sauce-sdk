@@ -45,6 +45,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "sync-engine-artifacts": "node scripts/sync-engine-artifacts.mjs",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.config.cjs"
   },
   "dependencies": {
