@@ -74,10 +74,11 @@ jobs:
       - name: Verify engine artifacts are in sync with the pinned engine
         run: |
           pnpm --filter './sdk' sync-engine-artifacts
-          git diff --exit-status -- sdk/dist/artifacts || {
+          if [ -n "$(git status --porcelain -- sdk/dist/artifacts)" ]; then
             echo "::error::sdk/dist/artifacts is stale vs the pinned sauce engine. Run 'pnpm --filter ./sdk sync-engine-artifacts' and commit the result.";
+            git --no-pager diff --stat -- sdk/dist/artifacts;
             exit 1;
-          }
+          fi
       # -----------------------------------------------------------------------
 
       - name: Build compiler
