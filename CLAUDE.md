@@ -76,6 +76,16 @@ Actions and dev-tools use the **node test runner**, not jest → `pnpm --filter 
   force-commit — nothing re-derives this automatically, so a repin without a refresh silently
   tests against a stale engine again. The `'svm'` compile target, its account-plan output,
   and the `/svm` SDK subpath are documented in `docs/plans/2026-07-03-solana-svm-support.md`.
+- **Committed EVM engine artifacts** (`sdk/dist/artifacts/` — `Router`, `SauceRouter`,
+  `ISauceRouter`, `V12Pot`, `V12Kitchen`, `V12RuntimeBytecode`, `IERC20`, `IUniswapV3Pool`,
+  `IStateView`) ship to downstream SDK consumers, which read them for local tests/deploys, so
+  they must track the pinned `sauce` engine. Unlike `compiler/dist`, they are **not** build
+  output — `tsc` never emits them — so a `sauce` repin would silently leave them stale. **After
+  any repin run `pnpm --filter './sdk' sync-engine-artifacts`** (copies the 8 forge artifacts
+  from the pinned dep's `engine/out/` + the `V12RuntimeBytecode` snapshot from
+  `engine-v12/snapshots/`) **and commit the result**. CI enforces this: it re-syncs from the
+  freshly-installed engine (foundry v1.5.1 + solc 0.8.27 → byte-reproducible) and fails on any
+  drift, so a forgotten re-sync can't merge.
 
 ## Architecture
 
