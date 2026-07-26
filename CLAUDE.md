@@ -160,19 +160,66 @@ recurses into any nested reads (a computed member-access key, a destructuring de
 leaves the bound identifier(s) themselves untouched, mirroring `foldExpression`'s
 `ASSIGNMENT_OPERATOR_TOKENS` guard one level down — the same "never fold/substitute an lvalue"
 invariant, enforced by a second, independent guard for this second pass. Only the SAME same-file
-top-level `consts` map the fold pass already trusts is ever
-consulted — a `let`/`var`/mutable-reassignment chain (e.g. `a = 1; b = a + 3; console.log(b);`) is
-untouched by construction, not by a special-cased guard: `collectTopLevelConsts` only ever records
-`NodeFlags.Const` declarations, so such a name is simply never a key in `consts`, and a bare
-Identifier that doesn't resolve in `consts` is always left exactly as found. Dead-declaration
-elimination is deliberately a simple, NOT scope-aware, whole-file textual `Identifier` reference
-count taken AFTER substitution (`countIdentifierRefs`) — a top-level const that happens to share
-its name with an unrelated nested shadowing declaration elsewhere in the file may be kept around
-(harmlessly inert, its value already fully propagated to every real reader) rather than removed,
-but this can never cause an INCORRECT substitution, only an occasionally-missed cleanup. Tracking
-itself is not extended by any of this: only the pre-existing top-level `consts` map is ever
-consulted or mutated-by-removal; a nested/function-local `const` is never added to it and stays out
-of scope, exactly as before.
+top-level `consts` map the fold pass already trusts is ever consulted (as of the effectively-const
+`let`/`var` feature below, `consts` is no longer real-`const`-only — see there for what else now
+feeds it). Dead-declaration elimination is deliberately a simple, NOT scope-aware, whole-file
+textual `Identifier` reference count taken AFTER substitution (`countIdentifierRefs`) — a top-level
+const that happens to share its name with an unrelated nested shadowing declaration elsewhere in
+the file may be kept around (harmlessly inert, its value already fully propagated to every real
+reader) rather than removed, but this can never cause an INCORRECT substitution, only an
+occasionally-missed cleanup. Tracking itself is not extended by any of this: only the pre-existing
+top-level `consts` map is ever consulted or mutated-by-removal; a nested/function-local `const` is
+never added to it and stays out of scope, exactly as before.
+
+**Effectively-const `let`/`var` detection** (`analyzeTopLevelConsts` — the function
+`collectTopLevelConsts` grew into once it started tracking more than real `const`s; still ONE
+top-to-bottom pass, still emitting the SAME `consts` map the paragraph above describes, so
+`foldTransformer`/`constPropagationTransformer` need no changes at all): a top-level `let`/`var`
+written EXACTLY ONCE across its entire (shadow-respecting) visible scope is semantically
+indistinguishable from a `const` — nothing downstream can ever observe a second value, so it's
+folded into `consts` exactly like a real top-level `const` (the standard "effectively final"
+analysis — the same rule Java applies to lambda capture). Two shapes, both scoped to TOP-LEVEL
+declarations only (the identical scope boundary real `const` tracking already used, unchanged — a
+function-local/nested-scope `let` stays out of scope):
+1. **PRIMARY** — `let x = <init>;` (or `var`) where `x` is never written again anywhere in the
+   file — e.g. `let a = 1; let b = a + 3; let c = b + 4; console.log(c);` now collapses to
+   `console.log(8n);`, same as the real-`const` version.
+2. **STRETCH (landed)** — the two-statement idiom `let x; x = <init>;`: a bare predeclaration (no
+   initializer) plus its ONE later assignment, both direct, unconditional statements of the SAME
+   top-level statement list (never nested inside an `if`/`for`/`while`/function/block) — including
+   the multi-declarator predeclaration form `let a, b, c;` followed by three separate later
+   top-level assignments, each resolved independently. This is literally the user-motivating shape
+   `let a, b, c;\na = 1;\nb = a + 3;\nc = b + 4;\nconsole.log(c);`, which now ALSO fully collapses
+   to `console.log(8n);`.
+
+"Written again"/"written exactly once" is a flat SYNTACTIC count of every assignment/compound-
+assignment/update-expression/destructuring-assignment target anywhere in the file that resolves
+(respecting the SAME lexical-shadowing rules `substituteConstReads` already applies) to that
+top-level binding (`collectWriteCounts`, reusing `substituteConstReads`'s own scope-threading
+shape) — deliberately NOT a reachability analysis: a second write inside an `if`/loop/function that
+might never execute at runtime still counts and still disqualifies the name, the conservative,
+sound rule this feature requires. STRETCH's statement-pair matching only ever looks at
+`sourceFile.statements` directly — never recursing into a nested block — so a predeclaration whose
+sole assignment lives inside a conditional is correctly never even considered, regardless of the
+write-count check. Interaction with the existing while-loop-unroll pairing
+(`foldStatementList`/`tryUnrollCountingWhile`, which ALSO recognizes an adjacent
+`[counter decl, while]` statement pair): a genuine loop counter is, by construction, written again
+inside the loop body (its own increment), so PRIMARY's "zero further writes" check always
+disqualifies it before it can reach `consts` — and STRETCH only ever matches a NO-initializer
+predeclaration, a shape `tryUnrollCountingWhile`'s own `prev` check never accepts anyway (it
+requires `decl.initializer`); since `consts` is fully precomputed once, before `foldTransformer`
+(and therefore the while-unroll pass) ever runs, there's no ordering race between the two
+mechanisms either. One implementation subtlety worth calling out: `analyzeTopLevelConsts` runs
+against its OWN separate `ts.createSourceFile` parse, a different tree instance from the one
+`ts.transpileModule` parses internally for the actual transformers — so it (like the paragraph
+above) returns NAMES only, never node references; `deadConstEliminationTransformer` RE-DERIVES which
+specific statements a STRETCH pair name maps to structurally, fresh, from whichever tree it is
+actually handed (`findPairStatements`), since `foldTransformer`/`constPropagationTransformer` ahead
+of it may already have rebuilt the assignment statement (e.g. once its RHS itself folds to a
+literal) — a node reference captured any earlier would already be stale. DCE-of-a-STRETCH-pair is a
+genuinely new kind of elimination (removing a statement PAIR, not a single declarator): once a name
+becomes fully dead, BOTH its predeclaration's declarator and its one assignment statement are
+removed together, in the same pass — never leaving an orphaned `let x;` behind.
 
 **Folds a call to a same-file, side-effect-free, single-`return`-expression function** (`tsEvalCall`,
 another case on `tsEvalConst` itself, alongside Literal/Identifier/Unary/Binary): `function
