@@ -174,11 +174,62 @@ itself is not extended by any of this: only the pre-existing top-level `consts` 
 consulted or mutated-by-removal; a nested/function-local `const` is never added to it and stays out
 of scope, exactly as before.
 
-**Known limitation (not fixed)**: this only folds/propagates compile-time-known COUNTERS/BOUNDS and
-same-file top-level `const` VALUES, not real array/object DATA processing (`arr[i]`, `.push()`,
-`for...of` iterating actual data) — ts-evaluator's no-checker mode can't resolve property/array
-access or function calls at all, and a full `ts.Program`/TypeChecker is a much bigger lift, out of
-scope here.
+**Folds a call to a same-file, side-effect-free, single-`return`-expression function** (`tsEvalCall`,
+another case on `tsEvalConst` itself, alongside Literal/Identifier/Unary/Binary): `function
+double(x) { return x * 2n; } const y = double(21n);` folds `double(21n)` to `42n` at the call
+site, which then composes for free with the const-propagation/DCE passes above — `const y`
+becomes `const y = 42n;` (an ordinary resolved top-level const as far as those two passes are
+concerned), so a later `console.log(y)` collapses all the way to `console.log(42n);` and `y`'s
+own now-dead declaration is removed, with zero special-casing needed in either pass. **Three hard
+boundaries, deliberately not relaxed in this first cut:** (1) the callee's body must have ZERO
+`CallExpression`/`NewExpression` anywhere — not just no *recursive* call, no call to ANYTHING,
+even another otherwise-foldable function — which is what makes recursion analysis unnecessary (a
+body that never calls out trivially can't recurse) and is the entire soundness argument for
+folding the call away at all; (2) same-file only, exactly like every other lookup this evaluator
+does (`consts`, now `functions` too) — an imported callee is never resolved this way, regardless
+of the separate cross-file function-import mechanism; (3) the callee's own `FunctionDeclaration`
+is NEVER touched or eliminated — only the call SITE becomes a literal — since it may still be
+called elsewhere with non-constant arguments, or itself be pulled across a file boundary by that
+same import mechanism; and (4) the callee must be neither a generator nor `async` — calling either
+never yields its `return`ed value directly (a generator yields an Iterator, `async` a Promise), so
+`foldableReturnExpr` rejects both up front. Parameters bind as a temporary overlay on top of
+`consts` (never mutating it), so a body reading a module-level `const` alongside its own
+parameter(s) resolves correctly; an omitted argument for a parameter with a default initializer
+evaluates that default too (left-to-right, so a later default may see an earlier bound parameter)
+— a deliberate choice, not a rejection, since the zero-nested-call check already covers default
+initializers as well. Every one of the callee's OWN parameter names is excluded from the overlay's
+initial seed (before any are individually bound) so an EARLIER default can never silently fall
+back to an outer const sharing a LATER (not-yet-bound) parameter's name — real JS/TS parameter-list
+TDZ semantics mean that would actually throw at runtime, so the fold correctly declines instead of
+computing the wrong value. Because a zero-argument call is vacuously "every argument constant,"
+this also folds calls like `used()` in `ts-frontend.test.ts`'s existing dead-branch-folding
+fixture — which is why that fixture's expected `bytecode.length` dropped from 3 to 2 once this
+landed (`used`'s own call is inlined away too, so treeshaking drops it exactly like the
+already-dead `unused`). `isFoldableValueExpression` now includes `CallExpression` (it's likewise
+never an lvalue), and `foldExpression` deliberately never hands a `CallExpression` to the
+`ts-evaluator` fallback — call-folding is governed entirely by `tsEvalCall`'s own rules above, not
+by whatever ts-evaluator's no-checker `evaluate()` happens to do with a same-file call today
+(confirmed to fail closed on every call shape) or in some future version.
+
+**Shadow-safe by construction, not just for calls.** `tsEvalConst`'s Identifier case and
+`tsEvalCall`'s callee lookup both consult a `shadowed: ReadonlySet<string>` that `foldTransformer`
+grows on the way down through every scope-introducing node it visits (function/method/getter/
+setter bodies, blocks, catch clauses, for/for-in/for-of loops) — mirroring
+`constPropagationTransformer`'s own shadow tracking one section below. A name reserved by ANYTHING
+between the current node and the top level (a parameter, a nested function/let/const/var/
+catch-binding of the same name, …) is never resolved against the top-level `consts`/`functions`
+maps: a nested `function calc(x) { … }` shadowing an outer top-level `calc`, a parameter named the
+same as an outer top-level function (the classic higher-order-function pattern, e.g. `function
+callIt(greet) { return greet(1n); }`), a block-scoped `let` of the same name, or simply a
+function's own parameter sharing a name with an unrelated top-level `const` (`function f(x) {
+return x * 2n; }` beside a top-level `const x`) — all correctly decline to fold rather than
+silently resolving against the wrong (top-level) binding.
+
+**Known limitation (not fixed)**: this only folds/propagates compile-time-known COUNTERS/BOUNDS,
+same-file top-level `const` VALUES, and the narrow same-file/single-return/constant-args CALL
+shape above, not real array/object DATA processing (`arr[i]`, `.push()`, `for...of` iterating
+actual data) — ts-evaluator's no-checker mode can't resolve property/array access at all, and a
+full `ts.Program`/TypeChecker is a much bigger lift, out of scope here.
 
 **Assignment expressions are never folded.** The TS AST represents `=`/`+=`/etc. as a
 `BinaryExpression`, and `ts-evaluator`'s `evaluate()` "succeeds" on a bare assignment (e.g.
