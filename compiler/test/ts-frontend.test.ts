@@ -55,13 +55,16 @@ describe('tsPartialEval (direct unit tests)', () => {
 
   it('folds literal binary arithmetic to a single literal', () => {
     // `let`, not `const`: isFoldableValueExpression's literal-arithmetic fold doesn't care
-    // about declaration kind (it's a purely syntactic check on the initializer shape), and
-    // `let` keeps this test immune to the const-propagation-to-reads + dead-declaration-
-    // elimination pass below (which would otherwise remove this now-fully-unused `const`
-    // entirely, since nothing ever reads `y`) — that behavior has its own dedicated tests.
-    const out = tsPartialEval(`let y = 2 + 3;`, 'f.ts');
+    // about declaration kind (it's a purely syntactic check on the initializer shape). A bare
+    // `let y = 2 + 3;` alone would ALSO now be picked up by effectively-const `let`/`var`
+    // detection (see the dedicated describe block below) and fully eliminated once `y` has
+    // zero remaining reads — so this fixture adds one further reassignment purely to
+    // disqualify `y` from that (unrelated) feature and keep this test isolated to ONLY the
+    // literal-arithmetic fold it's meant to pin.
+    const out = tsPartialEval(`let y = 2 + 3;\ny = 10;`, 'f.ts');
 
     expect(out).toContain('let y = 5');
+    expect(out).toContain('y = 10;');
     expect(out).not.toContain('2 + 3');
   });
 
@@ -104,11 +107,17 @@ describe('tsPartialEval (direct unit tests)', () => {
     // Regression: `evaluate({node: <the "a = 1" BinaryExpression>})` returns success:true,
     // value:1 — the assignment's own left-hand mutation is invisible to that "value". Before
     // the fix, isFoldableValueExpression's fold path replaced `a = 1;` with bare `1;`,
-    // silently dropping the assignment to `a` entirely.
-    const code = `let a, b, c;\na = 1;\nb = a + 3;\nc = b + 4;\nconsole.log(c);`;
+    // silently dropping the assignment to `a` entirely. `a` is reassigned TWICE here (not
+    // once) so effectively-const `let`/`var` detection (see the dedicated describe block
+    // below) never touches this fixture at all — this test is isolated to ONLY the
+    // assignment-is-never-a-foldable-value guard it's meant to pin; the ORIGINAL
+    // single-assignment shape from this same code now has its own (very different, and now
+    // fully collapsing) coverage there.
+    const code = `let a;\na = 1;\na = 2;\nconsole.log(a);`;
     const out = tsPartialEval(code, 'f.ts');
 
     expect(out).toContain('a = 1;');
+    expect(out).toContain('a = 2;');
     expect(out).not.toMatch(/^\s*1;/m);
   });
 
@@ -322,6 +331,14 @@ describe('tsPartialEval (while-loop unrolling — the counting idiom, reusing th
 // correctly, and DCE is a simple whole-file textual reference count taken AFTER
 // substitution (so a coincidentally-same-named shadowing declaration elsewhere in the file
 // can keep an otherwise-dead top-level const around — harmless, never incorrect).
+//
+// UPDATE: `consts` is no longer real-`const`-only — top-level `let`/`var` effectively-const
+// detection (see the dedicated describe block further below) now ALSO feeds this same map, so
+// the plain-mutable-variable chain this describe block used to pin as permanently untouched
+// (the user's exact original motivating example) now collapses too, once every write to a
+// name is accounted for. The genuinely-mutated (written more than once, or written
+// conditionally) cases remain untouched — that's what the new describe block's own regression
+// tests are for.
 describe('tsPartialEval (constant propagation to reads + dead-declaration elimination)', () => {
   it('propagates a resolved const chain all the way to a bare-identifier read, eliminating every intermediate declaration', () => {
     const out = tsPartialEval(`const a = 1; const b = a + 3; const c = b + 4; console.log(c);`, 'f.ts');
@@ -332,22 +349,21 @@ describe('tsPartialEval (constant propagation to reads + dead-declaration elimin
     expect(out.trim()).toBe('console.log(8n);');
   });
 
-  it('the same chain shape with let + plain reassignment is left completely alone — never substitutes the bare read, never drops the declaration (regression guard)', () => {
-    // Deliberately the assignment-chain shape (matching the existing ASSIGNMENT_OPERATOR_TOKENS
-    // regression test above), NOT a `let a = 1;` declaration-with-initializer chain — TS-evaluator's
-    // own same-file identifier resolution already folds SOME `let` declaration-initializer
-    // arithmetic today (a pre-existing, unrelated quirk of the ts-evaluator fallback, not
-    // something this feature touches), but a bare-identifier READ (`console.log(c)`) and an
-    // ASSIGNMENT (`b = a + 3;`) are never in `consts` (only `NodeFlags.Const` declarations are),
-    // so neither this feature nor the fold pass ever substitutes or removes anything here.
+  it('the user\'s exact original motivating shape (plain "let a, b, c;" predeclare + one assignment each) NOW fully collapses too, via effectively-const let/var detection', () => {
+    // This is the user's exact original example, `let`/plain-assignment form — this describe
+    // block used to pin this AS permanently untouched (this exact `it` name used to say "is
+    // left completely alone"). Effectively-const `let`/`var` detection (the STRETCH
+    // "declare-then-assign-once" idiom — see the dedicated describe block below for the full
+    // story and its own much more thorough coverage) now recognizes `a`/`b`/`c` are each
+    // written EXACTLY once, unconditionally, at the top level — indistinguishable from the
+    // real-`const` chain in the test right above, so the result is byte-identical.
     const code = `let a, b, c;\na = 1;\nb = a + 3;\nc = b + 4;\nconsole.log(c);`;
     const out = tsPartialEval(code, 'f.ts');
 
-    expect(out).toContain('let a, b, c;');
-    expect(out).toContain('a = 1;');
-    expect(out).toContain('b = a + 3;');
-    expect(out).toContain('console.log(c);');
-    expect(out).not.toMatch(/console\.log\(8/);
+    expect(out).not.toContain('let a');
+    expect(out).not.toContain('a = 1');
+    expect(out).not.toContain('b = a');
+    expect(out.trim()).toBe('console.log(8n);');
   });
 
   it('a same-named const declared inside a function shadows the outer one: the inner read stays a bare identifier, the outer (post-function) read still substitutes', () => {
@@ -773,6 +789,294 @@ describe('tsPartialEval (constant propagation never substitutes an assignment/up
     expect(out).toContain('arr[0n] = 2n;');
     expect(out).toContain('return arr[0n];');
     expect(out).not.toContain('IDX');
+  });
+});
+
+// ── tsPartialEval (effectively-const let/var detection — top-level scope only) ──
+//
+// A top-level `let`/`var` written EXACTLY ONCE across its entire (shadow-respecting) file is
+// semantically indistinguishable from a `const` (the standard "effectively final" analysis) —
+// so it's folded into the SAME `consts`-driven const-propagation-to-reads + dead-declaration-
+// elimination machinery tested above, real `const`s and effectively-const `let`/`var`s treated
+// identically from that point on. Two shapes, both scoped to TOP-LEVEL declarations only
+// (never function-local/nested-scope — that stays out of scope, matching the const-tracking
+// boundary):
+//
+//   PRIMARY  — `let x = <init>;` where `x` is never written again anywhere in the file.
+//   STRETCH  — `let x; x = <init>;` (a bare predeclaration, no initializer, immediately or
+//              later followed by its ONE later top-level assignment in the SAME statement
+//              list) — including the multi-declarator `let a, b, c;` predeclaration form.
+//
+// Both landed. "Written again" is a flat SYNTACTIC count (assignment/compound-assignment/
+// update-expression/destructuring-assignment target), not a reachability analysis — a second
+// write inside an `if`/loop/function that might never execute at runtime still disqualifies
+// the name; this is the conservative, sound rule the feature requires.
+describe('tsPartialEval (effectively-const let/var detection)', () => {
+  describe('PRIMARY: let x = <init>; never written again', () => {
+    it("the user's exact original example, plain-assignment form, now fully collapses (STRETCH lands this — see the STRETCH describe block below for the dedicated coverage)", () => {
+      // Requirement 1 of the task: this is also covered as its own dedicated `it` in the
+      // "constant propagation" describe block above (updated in place, since it used to pin
+      // the OLD un-folded behavior) — repeated here, standalone, as the canonical pin for this
+      // exact motivating shape now that both PRIMARY and STRETCH are landed.
+      const code = `let a, b, c;\na = 1;\nb = a + 3;\nc = b + 4;\nconsole.log(c);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out.trim()).toBe('console.log(8n);');
+    });
+
+    it('the same chain with INLINE initializers collapses via PRIMARY alone (no predeclaration involved)', () => {
+      const out = tsPartialEval(`let a = 1; let b = a + 3; let c = b + 4; console.log(c);`, 'f.ts');
+
+      expect(out).not.toContain('let a');
+      expect(out).not.toContain('let b');
+      expect(out).not.toContain('let c');
+      expect(out.trim()).toBe('console.log(8n);');
+    });
+
+    it('var behaves the same way as let', () => {
+      const out = tsPartialEval(`var a = 1; var b = a + 3; console.log(b);`, 'f.ts');
+
+      expect(out).not.toContain('var a');
+      expect(out).not.toContain('var b');
+      expect(out.trim()).toBe('console.log(4n);');
+    });
+
+    it('reassigned exactly TWICE anywhere (even far apart) stays completely untouched (regression guard)', () => {
+      const code = `let x = 1n;\nconsole.log(x);\nx = 2n;\nconsole.log(x);\nx = 3n;\nconsole.log(x);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out.trim()).toBe(code);
+    });
+
+    it('reassigned exactly ONCE, but INSIDE an if/loop/function — stays completely untouched (a syntactic "any write anywhere" check, not reachability)', () => {
+      const ifCase = tsPartialEval(
+        `let x = 1n;\nfunction f(cond) {\n  if (cond) { x = 2n; }\n}\nf(true);\nconsole.log(x);`,
+        'f.ts',
+      );
+
+      expect(ifCase).toContain('let x = 1n;');
+      expect(ifCase).toContain('x = 2n;');
+      expect(ifCase).toContain('console.log(x);');
+      expect(ifCase).not.toMatch(/console\.log\(1n\)/);
+
+      const loopCase = tsPartialEval(
+        `let total = 1n;\nfor (let i = 0n; i < 3n; i++) {\n  total = total + i;\n}\nconsole.log(total);`,
+        'f.ts',
+      );
+
+      // The loop unrolls (an unrelated, pre-existing feature), but `total` is written 3 times
+      // by the unrolled body's own source shape (once per loop-body copy in the ORIGINAL,
+      // pre-unroll source) — never treated as effectively const, so its declaration survives.
+      expect(loopCase).toContain('let total = 1n;');
+
+      const functionCase = tsPartialEval(
+        `let a = 1n;\nfunction mut() {\n  a = 2n;\n}\nmut();\nconsole.log(a);`,
+        'f.ts',
+      );
+
+      expect(functionCase).toContain('let a = 1n;');
+      expect(functionCase).toContain('a = 2n;');
+      expect(functionCase).toContain('console.log(a);');
+    });
+
+    it("shadowing: an inner function's own same-named let, reassigned inside that inner scope, does not disqualify the OUTER effectively-const variable — and the inner reassignment is untouched", () => {
+      const code = `let a = 1n;\nfunction f() {\n  let a = 2n;\n  a = 3n;\n  return a;\n}\nconsole.log(a);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      // The inner (shadowed) declaration/reassignment/read are completely untouched.
+      expect(out).toContain('let a = 2n;');
+      expect(out).toContain('a = 3n;');
+      expect(out).toContain('return a;');
+      // The OUTER (unshadowed) read correctly resolves to the outer effectively-const value.
+      expect(out).toContain('console.log(1n);');
+    });
+
+    it('interaction with while-loop unrolling: a genuine "let i = <const>; while (...) { ...; i++; }" counter still unrolls exactly as before, untouched by this feature', () => {
+      const code = `let sum = 0n;\nlet i = 0n;\nwhile (i < 5n) { sum = sum + i; i = i + 1n; }`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).not.toContain('while (');
+      expect(out).not.toContain('let i');
+      for (const i of [0, 1, 2, 3, 4]) expect(out).toContain(`sum = sum + ${i}n;`);
+    });
+  });
+
+  describe('STRETCH: let x; x = <init>; (declare-then-assign-once)', () => {
+    it('a single predeclared name resolves and its declare+assign PAIR is eliminated together', () => {
+      const out = tsPartialEval(`let x;\nx = 5n;\nconsole.log(x);`, 'f.ts');
+
+      expect(out.trim()).toBe('console.log(5n);');
+    });
+
+    it('the multi-declarator predeclaration form (let a, b, c;) resolves each name independently, via its own later top-level assignment', () => {
+      const out = tsPartialEval(`let a, b, c;\na = 1n;\nb = a + 3n;\nc = b + 4n;\nconsole.log(c);`, 'f.ts');
+
+      expect(out.trim()).toBe('console.log(8n);');
+    });
+
+    it('the multi-declarator form with ONE name assigned inside a conditional disqualifies only that name, not the others', () => {
+      const code = [
+        'let a, b, c;',
+        'a = 1n;',
+        'function f(cond) {',
+        '  if (cond) { b = 2n; }',
+        '}',
+        'f(true);',
+        'c = a + 4n;',
+        'console.log(a);',
+        'console.log(b);',
+        'console.log(c);',
+      ].join('\n');
+      const out = tsPartialEval(code, 'f.ts');
+
+      // `a` and `c` fully resolve (their sole assignments are direct, unconditional top-level
+      // statements) — their declarations/assignments are gone, their reads substituted.
+      expect(out).not.toContain('a = 1n');
+      expect(out).not.toContain('c = a');
+      expect(out).toContain('console.log(1n);'); // a
+      expect(out).toContain('console.log(5n);'); // c = a + 4n = 5n
+
+      // `b`'s sole write is nested inside an `if` inside a function — never a direct,
+      // unconditional top-level statement — so `b` is never resolved, and its (still-live)
+      // predeclaration/assignment/read all survive untouched.
+      expect(out).toContain('let b;');
+      expect(out).toContain('b = 2n;');
+      expect(out).toContain('console.log(b);');
+    });
+
+    it('assigned twice total (even both at the top level) stays completely untouched — the "exactly one write" rule, not merely "one qualifying top-level assignment found"', () => {
+      const code = `let a;\na = 1n;\na = 2n;\nconsole.log(a);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out.trim()).toBe(code);
+    });
+
+    it('bails when the predeclaration and its assignment are NOT both direct, unconditional statements of the SAME top-level statement list', () => {
+      const nestedAssign = tsPartialEval(
+        `let x;\nfunction f(cond) {\n  if (cond) { x = 1n; }\n}\nf(true);\nconsole.log(x);`,
+        'f.ts',
+      );
+
+      expect(nestedAssign).toContain('let x;');
+      expect(nestedAssign).toContain('x = 1n;');
+      expect(nestedAssign).toContain('console.log(x);');
+    });
+
+    it('interaction with while-loop unrolling: a no-initializer predeclaration is never mistaken for the while-counter idiom (which requires an initializer on its own preceding declaration) — and a real counter with an initializer is unaffected either way', () => {
+      // `tryUnrollCountingWhile`'s own `prev` shape requires `decl.initializer` — a bare
+      // `let i;` predeclaration never matches it regardless of this feature. This pins that
+      // there's no accidental interference in either direction: the while still unrolls via
+      // the EXISTING mechanism, exactly as it does without any predeclaration involved.
+      const code = `let sum = 0n;\nlet i = 0n;\nwhile (i < 3n) { sum = sum + i; i++; }`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).not.toContain('while (');
+      expect(out).not.toContain('let i');
+      for (const i of [0, 1, 2]) expect(out).toContain(`sum = sum + ${i}n;`);
+    });
+
+    it('a read positioned BETWEEN a STRETCH predeclaration and its sole resolving assignment blocks folding (soundness regression guard)', () => {
+      // `let x;` genuinely makes `x` observable as `undefined` from that point on — a real,
+      // distinct value from whatever it's later assigned. Folding here would let
+      // constPropagationTransformer (order-blind, file-wide) replace the FIRST console.log's
+      // read with the value `x` only receives afterward.
+      const code = `let x;\nconsole.log(x);\nx = 5n;\nconsole.log(x);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out.trim()).toBe(code);
+    });
+
+    it('a read of one still-pending STRETCH name from inside an unrelated statement disqualifies just that name, not siblings resolved cleanly', () => {
+      const code = ['let x;', 'let y;', 'let z = x;', 'x = 1n;', 'y = 2n;', 'console.log(x, y, z);'].join('\n');
+      const out = tsPartialEval(code, 'f.ts');
+
+      // `x` is read (via `z`'s initializer) before its own resolving assignment — disqualified.
+      expect(out).toContain('let x;');
+      expect(out).toContain('x = 1n;');
+      // `y` has no intervening read anywhere and folds normally.
+      expect(out).not.toContain('let y;');
+      expect(out).not.toContain('y = 2n;');
+      expect(out).toContain('console.log(x, 2n, z);');
+    });
+
+    it('an intervening read inside a nested function body (called later, not between the two statements at runtime) still conservatively disqualifies folding', () => {
+      const code = ['let x;', 'function f() { return x; }', 'x = 5n;', 'console.log(f());'].join('\n');
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('let x;');
+      expect(out).toContain('x = 5n;');
+      expect(out).toContain('return x;');
+    });
+  });
+
+  describe('write-detection: reusing an EXISTING top-level let/var as a for-of/for-in loop target is a WRITE, not a read', () => {
+    // Regression guard: `collectWriteCounts`'s ForIn/ForOf branch must treat a REUSED (not
+    // freshly `let`/`const`/`var`-declared) loop head as a write to that binding on every
+    // iteration — otherwise it's reported as written zero times, gets folded into `consts`,
+    // and `constPropagationTransformer` then substitutes the loop head's own target with the
+    // stale pre-loop literal.
+    it('for (x of arr) — plain identifier reuse', () => {
+      const code = `let x = 1n;\nconsole.log(x);\nfor (x of [10n, 20n, 30n]) {\n  console.log(x);\n}\nconsole.log(x);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      // The declaration survives untouched (never folded into `consts`)...
+      expect(out).toContain('let x = 1n;');
+      // ...and every read — including the loop head's own binding — stays a live reference to
+      // `x`, never substituted with the stale pre-loop literal `1n`.
+      expect(out).toContain('for (x of [10n, 20n, 30n])');
+      expect(out.match(/console\.log\(x\)/g)).toHaveLength(3);
+      expect(out).not.toMatch(/console\.log\(1n\)/);
+    });
+
+    it('for (k in obj) — plain identifier reuse', () => {
+      const code = `let k = 1n;\nfor (k in [10n, 20n]) {\n  console.log(k);\n}\nconsole.log(k);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('let k = 1n;');
+      expect(out).toContain('for (k in [10n, 20n])');
+      expect(out.match(/console\.log\(k\)/g)).toHaveLength(2);
+      expect(out).not.toMatch(/console\.log\(1n\)/);
+    });
+
+    it('the STRETCH declare-then-assign-once idiom feeding a for-of target is also left untouched', () => {
+      const code = `let x;\nx = 1n;\nfor (x of [10n, 20n, 30n]) {\n  console.log(x);\n}\nconsole.log(x);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('let x;');
+      expect(out).toContain('x = 1n;');
+      expect(out).toContain('for (x of [10n, 20n, 30n])');
+      expect(out.match(/console\.log\(x\)/g)).toHaveLength(2);
+      expect(out).not.toMatch(/console\.log\(1n\)/);
+    });
+
+    it('array-destructuring reuse: for ([x, y] of pairs)', () => {
+      const code = `let x = 1n;\nlet y = 2n;\nfor ([x, y] of [[10n, 20n]]) {\n  console.log(x, y);\n}\nconsole.log(x, y);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('let x = 1n;');
+      expect(out).toContain('let y = 2n;');
+      expect(out).toContain('for ([x, y] of [[10n, 20n]])');
+      expect(out.match(/console\.log\(x, y\)/g)).toHaveLength(2);
+    });
+
+    it('object-destructuring reuse: for ({val: x} of arr)', () => {
+      const code = `let x = 1n;\nfor ({val: x} of [{val: 10n}]) {\n  console.log(x);\n}\nconsole.log(x);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('let x = 1n;');
+      expect(out.match(/console\.log\(x\)/g)).toHaveLength(2);
+      expect(out).not.toMatch(/console\.log\(1n\)/);
+    });
+
+    it('a FRESH declaration as the loop target (for (let x of arr)) is unaffected — only reuse of an existing binding is in scope here', () => {
+      const code = `let total = 0n;\nfor (let x of [1n, 2n]) {\n  total = total + x;\n}\nconsole.log(total);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      // `x` here is a fresh per-loop declaration, never a top-level candidate — untouched by
+      // this feature either way; `total` is written inside the loop body so it also survives.
+      expect(out).toContain('for (let x of');
+      expect(out).toContain('let total = 0n;');
+    });
   });
 });
 
