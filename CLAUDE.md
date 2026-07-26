@@ -154,7 +154,23 @@ rather than incrementally (matching real JS/TS semantics — a block-scoped name
 top of its scope regardless of TDZ) — the outer const is correctly left un-substituted inside that
 shadowed scope; `var` is additionally hoisted to its enclosing FUNCTION (not block) scope, via a
 separate pre-scan that doesn't cross nested function/class boundaries, matching real `var`
-semantics. Substitution never touches a WRITE position either — an assignment's left-hand side or an
+semantics. **Fix (this branch):** that shadow set now ALSO includes every name a `let`/`const`
+(or nested named `function`) declaration introduces anywhere reachable in the function's body
+WITHOUT crossing into a nested function-like scope or class — not just names declared directly
+in the function's own top-level statement list — via the same `collectLexicalNamesInScope` the
+local (per-function) pass below already needed. This matters because the REAL SauceScript
+compiler shares scope across `if`/`while`/bare-block bodies (`processor/statement.ts`'s
+`processIfStatement`/`processWhileStatement` never call `ctx.pushScope`; only
+`processForStatement` does), so a name FIRST `let`/`const`-declared inside such a branch is NOT
+block-scoped away once the branch ends — it is the SAME persisting variable for the rest of the
+function. Before this fix, `const FEE = 100n; function f(cond) { if (cond) { let FEE = 5n; }
+return FEE; }` wrongly substituted the final `return FEE;` with the OUTER `100n` (confirmed
+reachable on this exact shape) — the branch's own `let FEE` correctly shadowed reads INSIDE the
+`if`, but the function-level shadow set never saw a name declared only inside a nested branch,
+so a read AFTER it fell through to the top-level const instead of staying an (unsubstituted)
+real runtime read. Over-including a name this way costs at most a missed optimization (the real
+compiler's own `getVar`-then-`getConstant` resolution still handles an unresolved read
+correctly), never a wrong substitution. Substitution never touches a WRITE position either — an assignment's left-hand side or an
 update expression's (`++`/`--`) operand is walked by a dedicated `visitAssignmentTarget` that
 recurses into any nested reads (a computed member-access key, a destructuring default's value) but
 leaves the bound identifier(s) themselves untouched, mirroring `foldExpression`'s
@@ -272,6 +288,21 @@ function's own parameter sharing a name with an unrelated top-level `const` (`fu
 return x * 2n; }` beside a top-level `const x`) — all correctly decline to fold rather than
 silently resolving against the wrong (top-level) binding.
 
+**Fix (this branch): the `ts-evaluator` fallback wasn't shadow-safe.** `tsEvalConst` itself was
+always correctly shadow-aware (above), but `foldExpression`'s fallback to `tryEvaluate`
+(`ts-evaluator`'s own `evaluate()`) does its OWN, separate same-file identifier resolution —
+confirmed to ignore local (parameter/`let`/`const`) shadowing entirely, resolving straight
+through to an outer/top-level binding of the same name regardless. Reachable and confirmed on
+this exact shape: `const FLAG = true; function f(FLAG) { if (FLAG) { return 1; } return 2; }` —
+`tsEvalConst` correctly failed closed on the shadowed `FLAG` read, but `foldExpression` then fell
+through to `tryEvaluate`, which resolved `FLAG` against the OUTER `const FLAG = true` anyway,
+silently pruning the whole `if` down to `return 1;` and discarding the parameter (and the
+`return 2;` branch) entirely — a genuinely wrong compiled program, not just a missed
+optimization. Fixed by a new `containsShadowedIdentifier` guard: `foldExpression` now declines
+the `tryEvaluate` fallback outright whenever a shadowed name appears ANYWHERE in the candidate
+expression, exactly mirroring the `ASSIGNMENT_OPERATOR_TOKENS`/CallExpression guards it already
+applied to the same fallback for other reasons.
+
 **Array/object lookup-table folding.** A top-level `const NAME = [<foldable>, ...]` / `const NAME
 = { key: <foldable>, ... }` — a fee-tier table, a tick-spacing table, any table written purely for
 readable compile-time reference — where every element/property itself folds to a bigint (the SAME
@@ -348,12 +379,114 @@ declined `for...of` (e.g. a table with >256 elements) leaves a `ForOfStatement` 
 runtime-bytecode fallback at all, so `compile()` — even with `tsSource: true` — throws `not
 implemented: ForOfStatement` rather than compiling suboptimally.
 
+**Local (per-function) constant propagation** (`localConstPropagationTransformer`, a FIFTH
+`before` stage, appended LAST — after `foldTransformer`, `tableFoldTransformer`,
+`constPropagationTransformer`, and `deadConstEliminationTransformer`, consuming everything
+above's output): everything above tracks only same-file TOP-LEVEL `const`s (plus
+effectively-const `let`/`var`s and lookup tables — still all top-level). A `let`/`const`
+declared and reassigned INSIDE a function body got none of that benefit — this is a NEW,
+SEPARATE pass closing that gap: a control-flow-sensitive (but deliberately NOT a real fixpoint
+dataflow — see the loop rule below) sequential abstract interpreter, walked fresh and
+independently per function-like scope (`FunctionDeclaration`/`FunctionExpression`/
+`ArrowFunction`/`MethodDeclaration`/`GetAccessorDeclaration`/`SetAccessorDeclaration` with a
+`Block` body), tracking a `Map<name, bigint | NAC>` ("NAC" = not a compile-time constant) per
+variable per program point and substituting a read with its known value wherever provable. It
+only ever READS the same-file top-level `consts`/`functions` this file's other passes trust (as
+a fallback for a name this pass's own function never itself declares/assigns) — it never
+mutates them, and doesn't touch, duplicate, or depend on any other pass's own tracking.
+
+Every real `tsEvalConst`/`tsEvalUnary`/`tsEvalBinary` call this pass makes uses the file's ONE
+real 4-argument evaluator family (`node, consts, functions, shadowed`) — there is no second
+evaluator or lookup abstraction here, only a small per-call-site SNAPSHOT (`resolveLocalEnv`/
+`LocalResolution`) of what this pass's own evolving `env` currently resolves each name to,
+expressed in exactly those 3 extra arguments: a NAC-tracked name is excluded from the snapshot's
+`consts` map entirely (never merely left unresolved — a stale top-level entry of the same name
+must not leak through a plain map lookup) and included in `shadowed`; a known-bigint local
+overlays the top-level `consts`, correctly shadowing an outer const of the same name with the
+REAL current local value; anything else falls through to the top-level `consts`/`functions`
+unchanged. A useful, deliberate side effect of reusing the real evaluator family rather than a
+separate one: this pass can ALSO fold a call to an eligible same-file top-level function
+(`tsEvalCall`) when the call's argument only becomes constant through this pass's OWN local flow
+reasoning (e.g. `let x = 3n; let y = double(x);`) — something the top-level-only fold pass could
+never see. This is why `collectLexicalNamesInScope` (shared with the bug fix above) also records
+a NESTED named `function` declaration's own name, not just `let`/`const`: seeding it NAC keeps it
+in `shadowed`, so a call to it can never be wrongly resolved against an unrelated, same-named
+TOP-LEVEL function instead of the real (shadowing) nested one.
+
+**Straight-line code**: a declaration's initializer or an assignment/compound-assignment/update's
+new value is evaluated against the CURRENT env snapshot; resolving to a bigint updates the
+tracked value, otherwise the name becomes NAC. A destructuring ASSIGNMENT target (`[x] =
+call()`, `({ x } = call())` — distinct from a destructuring DECLARATION, which is handled
+separately) invalidates (marks NAC) every scalar name it writes, via the same
+`collectAssignmentTargetNames` helper the loop rule's write pre-scan already uses — not
+currently reachable through `compile()` (`processAssignmentMutation` throws "not implemented"
+for any assignment target that isn't a bare Identifier/MemberExpression today) but fixed
+defensively regardless, so a future compiler extension adding support doesn't silently
+resurrect a stale-value bug here. Recognizing an assignment/update expression at the statement
+level also unwraps a leading `ParenthesizedExpression` first — an object-destructuring
+assignment used as a statement MUST be parenthesized in real JS (`({ x } = obj);`, never a bare
+`{ x } = obj;`), so without unwrapping, the assignment inside is never routed through the
+env-invalidating path at all. **`if`/`else`** (only when the condition ISN'T already a resolved
+compile-time constant — `foldTransformer`, which runs strictly before this whole pass, has
+already pruned that case): visits `then` and `else` (or, if absent, an implicit copy that never
+touches anything) from independent COPIES of the current env, then merges — a name keeps its
+value only if both branches agree (an untouched branch counts as agreeing with the PRE-IF
+value); any disagreement, or either side NAC, becomes NAC. The merge only ever revisits names
+that are keys of `env` BEFORE the `if` — which is why the function's own env pre-seed covers not
+just its parameters but EVERY name `collectLexicalNamesInScope` finds anywhere in its body
+(crossing `if`/`while`/bare-block boundaries, only stopping at a nested function-like scope or
+class): the REAL SauceScript compiler shares scope across `if`/`while` bodies (see the bug fix
+above), so a `let`/`const` first declared inside a branch is NOT block-scoped away once the
+branch ends — it is the SAME persisting variable for the rest of the function, and without this
+whole-body pre-seed a read of it after the `if` would wrongly fall through to a same-named
+TOP-LEVEL const instead of staying an unsubstituted real runtime read (`const FEE = 100n;
+function f(cond) { if (cond) { let FEE = 5n; } return FEE; }` must stay `return FEE;`). A name a
+branch declares that DOESN'T collide with anything outside the `if` is unaffected either way
+(over-shadowing costs at most a missed optimization, never a wrong substitution). **Loops**
+(`for`/`while`/`do`/`while` the existing unroller did NOT fully unroll — still real runtime code,
+`JUMP_BACK`, by the time this pass sees it): NO fixpoint iteration (bigint is an unbounded
+lattice; a real fixpoint needs a widening operator and a termination proof, far more machinery
+than this warrants) — instead, every name written ANYWHERE in the loop (any assignment/update/
+declaration, at any depth, not crossing into a nested function-like scope) is forced to NAC BOTH
+within the loop and from loop-entry onward, even at the first textual reference before its own
+write — a later iteration's write could already have happened by then, so there's no
+textually-first-safe point to trust the pre-loop value. Untouched names simply keep flowing
+through unchanged; this intentionally MISSES a loop-invariant-but-reassigned-to-the-same-value
+case, a documented, deliberate tradeoff. **Bails the WHOLE containing function** (left completely
+untouched, not even partially analyzed, and not even descended into for nested opportunities) on:
+a `switch`/`try`/`catch`/`finally`/labeled `break`/`continue`, or a `for...of`/`for...in` — none
+of these 5 shapes has a case in `processStatement`'s switch (`compiler/src/processor/index.ts`/
+`statement.ts`) at all, so bailing costs nothing, a source containing one fails to compile
+regardless; and a nested function/arrow/method/accessor ANYWHERE within it (at any depth) that
+reads or writes a name belonging to the outer function's own parameter/lexical-local scope — a
+REAL, non-theoretical concern here, since `something.catch(handler)` (`resolveCatchChain`,
+compiler/src/processor/expression.ts) compiles the handler's body with `processBlock` against the
+SAME `CompilerContext` as its surrounding code, so a handler that mutates an enclosing local
+genuinely reaches through, not a harmless closure no-op; a nested function/arrow that only touches
+its OWN locals and/or the outer TOP-LEVEL scope does not trigger this. **Out of scope, on
+purpose**: real fixpoint dataflow (see the loop rule above); anything the closure-bail above
+already declines to reason about; dead-local-declaration elimination (the read-substitution is
+this feature's whole value; a still-live but now-fully-inlined `let x = 8n;` sitting unused is a
+nice-to-have cleanup this pass doesn't attempt); and algebraic-identity/dead-code-after-a-
+terminator peephole simplifications — skipped here to keep the surface area this change touches
+as small as the core requirement allows.
+
+**A function-local declaration that happens to share a name with a top-level const is now ALSO
+resolved (to its OWN value), not merely left inert.** Because this pass runs LAST, a shape like
+`const RATE = 10n; function f() { const RATE = 2n; return RATE + 1n; }` is no longer completely
+untouched end-to-end: the top-level passes above still correctly decline to fold `f`'s own `RATE`
+against the outer `10n` (shadow-tracking unregressed), but this pass then separately, correctly
+resolves the inner read against `f`'s OWN `RATE = 2n`, so the final output is `return 3n;` — a
+strict, sound improvement (the CORRECT own-scope value, never the wrong outer one), not a
+regression of the shadow-tracking the earlier passes are responsible for.
+
 **Known limitation (not fixed)**: this only folds/propagates compile-time-known COUNTERS/BOUNDS,
-same-file top-level `const` VALUES, the narrow same-file/single-return/constant-args CALL shape,
-and the narrow compile-time-only lookup-table case above — not general array/object DATA
-processing (`arr[i]`/`.push()`/`for...of` on non-table data, mutable arrays, arrays built at
-runtime) — ts-evaluator's no-checker mode can't resolve property/array access or function calls at
-all, and a full `ts.Program`/TypeChecker is a much bigger lift, out of scope here.
+same-file top-level `const` VALUES, function-LOCAL scalar values via the pass above, the narrow
+same-file/single-return/constant-args CALL shape, and the narrow compile-time-only lookup-table
+case above — not general array/object DATA processing (`arr[i]`/`.push()`/`for...of` on non-table
+data, mutable arrays, arrays built at runtime) — ts-evaluator's no-checker mode can't resolve
+property/array access or function calls at all, and a full `ts.Program`/TypeChecker is a much
+bigger lift, out of scope here.
 
 **Assignment expressions are never folded.** The TS AST represents `=`/`+=`/etc. as a
 `BinaryExpression`, and `ts-evaluator`'s `evaluate()` "succeeds" on a bare assignment (e.g.
