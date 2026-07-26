@@ -1123,6 +1123,491 @@ function countIdentifierRefs(root, name, exclude) {
     walk(root);
     return count;
 }
+/** Every array element must itself resolve via `tsEvalConst` — no spreads, no nested tables. */
+function foldArrayLiteralElements(lit, consts, functions) {
+    const out = [];
+    for (const el of lit.elements) {
+        if (ts.isSpreadElement(el) || ts.isArrayLiteralExpression(el) || ts.isObjectLiteralExpression(el))
+            return undefined;
+        const value = tsEvalConst(el, consts, functions, EMPTY_SHADOW);
+        if (value === undefined)
+            return undefined;
+        out.push(value);
+    }
+    return out;
+}
+/**
+ * Every property must be a plain (non-computed) `key: value` / `"key": value` assignment whose
+ * value itself resolves via `tsEvalConst` — no shorthand/spread/method/getter/setter, no computed
+ * keys, no nested tables.
+ */
+function foldObjectLiteralProps(lit, consts, functions) {
+    const out = new Map();
+    for (const prop of lit.properties) {
+        if (!ts.isPropertyAssignment(prop) || ts.isComputedPropertyName(prop.name))
+            return undefined;
+        if (ts.isArrayLiteralExpression(prop.initializer) || ts.isObjectLiteralExpression(prop.initializer))
+            return undefined;
+        const key = ts.isIdentifier(prop.name)
+            ? prop.name.text
+            : ts.isStringLiteral(prop.name) || ts.isNumericLiteral(prop.name)
+                ? prop.name.text
+                : undefined;
+        if (key === undefined)
+            return undefined;
+        const value = tsEvalConst(prop.initializer, consts, functions, EMPTY_SHADOW);
+        if (value === undefined)
+            return undefined;
+        out.set(key, value);
+    }
+    return out;
+}
+/**
+ * The OUTERMOST node representing the same logical value as `node` — `node` itself, or (if
+ * `node` sits directly inside one or more `(parens)`) the outermost of those wrapping
+ * `ParenthesizedExpression`s. Needed because an AST parent field (`BinaryExpression.left`,
+ * `CallExpression.expression`, a `PropertyAssignment.initializer`, ...) points at whatever its
+ * DIRECT child is — for `(ARR.foo)++`, the `PostfixUnaryExpression`'s `.operand` is the
+ * `ParenthesizedExpression`, NOT the inner `PropertyAccessExpression` — so comparing a field
+ * against `node` directly would silently miss a parenthesized write/call target. Every
+ * `isTableAccessUnsafeUsage` field-identity check below compares against THIS, not the raw node.
+ */
+function outermostParenWrapper(node) {
+    let current = node;
+    while (current.parent && ts.isParenthesizedExpression(current.parent))
+        current = current.parent;
+    return current;
+}
+/**
+ * True if `access` (a `NAME.prop`/`NAME[k]` access already known to have `NAME` as its base) sits
+ * anywhere a WRITE or a CALL could happen: a call/new callee, a `delete` operand, an update
+ * (`++`/`--`) operand, a plain/compound-assignment target, or — climbing up through the
+ * object/array-literal "pattern" node shapes TypeScript reuses for destructuring assignment —
+ * nested (however deeply) inside a pattern that is itself the target of `=` or a for-of/for-in
+ * loop's per-iteration binding. The climb is what catches `({ k: NAME.x } = obj)` / `[NAME.x] =
+ * arr`: a destructuring-assignment pattern parses with the exact same node kinds as an ordinary
+ * object/array-literal VALUE, so only the OUTERMOST wrapper (an assignment's left side, or a
+ * for-of/for-in binding) tells a target apart from a read — a single immediate-parent check
+ * would miss it. Every step re-wraps through `outermostParenWrapper` so an arbitrarily
+ * parenthesized target (`(ARR.foo)++`, `({ x: (ARR.y) } = obj)`, ...) is still caught.
+ */
+function isTableAccessUnsafeUsage(access) {
+    const wrapped = outermostParenWrapper(access);
+    const immediateParent = wrapped.parent;
+    if (immediateParent && ts.isCallExpression(immediateParent) && immediateParent.expression === wrapped)
+        return true;
+    if (immediateParent && ts.isNewExpression(immediateParent) && immediateParent.expression === wrapped)
+        return true;
+    if (immediateParent && ts.isDeleteExpression(immediateParent) && immediateParent.expression === wrapped)
+        return true;
+    if (immediateParent &&
+        (ts.isPrefixUnaryExpression(immediateParent) || ts.isPostfixUnaryExpression(immediateParent)) &&
+        (immediateParent.operator === ts.SyntaxKind.PlusPlusToken ||
+            immediateParent.operator === ts.SyntaxKind.MinusMinusToken) &&
+        immediateParent.operand === wrapped) {
+        return true;
+    }
+    let current = access;
+    for (;;) {
+        const w = outermostParenWrapper(current);
+        const parent = w.parent;
+        if (!parent)
+            return false;
+        if (ts.isBinaryExpression(parent) &&
+            parent.left === w &&
+            ASSIGNMENT_OPERATOR_TOKENS.has(parent.operatorToken.kind)) {
+            return true;
+        }
+        if ((ts.isForOfStatement(parent) || ts.isForInStatement(parent)) && parent.initializer === w)
+            return true;
+        if (ts.isPropertyAssignment(parent) && parent.initializer === w) {
+            current = parent;
+            continue;
+        }
+        if ((ts.isSpreadAssignment(parent) || ts.isSpreadElement(parent)) && parent.expression === w) {
+            current = parent;
+            continue;
+        }
+        if (ts.isArrayLiteralExpression(parent) || ts.isObjectLiteralExpression(parent)) {
+            current = parent;
+            continue;
+        }
+        return false;
+    }
+}
+/**
+ * True if the Identifier `id` (already known to be an unshadowed reference to a tracked table
+ * name) is used in the ONE safe shape this feature ever folds: immediately the base of a
+ * property/element access that is not itself a write/call target. Anything else — a bare
+ * argument, an alias, a return, a spread, the table's own name being reassigned/updated, a
+ * method call, an element/property WRITE — falls through to `false`. This is an ALLOWLIST (only
+ * the recognized-safe shape passes), not a blocklist, so an unrecognized shape fails closed.
+ */
+function isSafeTableRead(id) {
+    const parent = id.parent;
+    if (ts.isPropertyAccessExpression(parent) && parent.expression === id)
+        return !isTableAccessUnsafeUsage(parent);
+    if (ts.isElementAccessExpression(parent) && parent.expression === id)
+        return !isTableAccessUnsafeUsage(parent);
+    return false;
+}
+/**
+ * `id` is the (unshadowed) iterated-expression identifier of a `for (x of id) {...}` loop — a
+ * safe, read-only, non-aliasing use for an ARRAY table specifically (`kind` is checked by the
+ * caller): its elements are bigints, primitive values with no aliasing/mutation risk, so
+ * iterating them can never itself escape or mutate the array, regardless of whether the STRETCH
+ * for-of UNROLL below can actually unroll this particular loop shape — an unrollable-shape
+ * failure just leaves the loop as real runtime code, iterating the (still fully tracked, still
+ * correctly-folded-elsewhere) array unchanged. A `for await...of` is excluded out of caution
+ * (this narrow language surface has no async, but fail closed regardless).
+ */
+function isForOfIterableExpression(id) {
+    const parent = id.parent;
+    return ts.isForOfStatement(parent) && parent.expression === id && !parent.awaitModifier;
+}
+/**
+ * Whole-file, shadow-aware safety scan for the tracked table `name` (of table-kind `kind`):
+ * returns `false` the moment ANY occurrence of the (unshadowed) identifier isn't a safe read
+ * (`isSafeTableRead`) or — for an array table only — a safe for-of iteration
+ * (`isForOfIterableExpression`) — a single disqualifying use anywhere (reachable or not) rules
+ * out the whole table. `exclude` is the declaration's own name node (a binding, never itself a
+ * "use"). Shadowing is tracked with the EXACT same rules as `substituteConstReads` (reusing its
+ * own helper functions), so a same-named inner declaration's occurrences are skipped entirely —
+ * they refer to a different binding, not this table, and neither disqualify it nor participate
+ * in `checkTableSafety`'s scan.
+ *
+ * Deliberately does NOT reuse `isOutOfScopeForPropagation`'s blanket "class/enum/module → skip
+ * entirely, don't even descend" for THIS scan: that skip is sound for scalar constant
+ * propagation (a const's *value* can't be mutated from inside one of these without illegally
+ * reassigning the binding itself, already a hard error) but not for a tracked ARRAY/OBJECT
+ * table — a class method, or a namespace function, can legally call a mutating method on (or
+ * write through) an outer const table without ever reassigning the table's own binding, and
+ * that occurrence must not be invisible to this scan. These node kinds aren't part of the
+ * supported base language surface ("no closures/classes/async"), and a real class/namespace
+ * anywhere in a source is independently rejected before `compile()` ever reaches this feature's
+ * output — but `tsPartialEval` is itself a separately exported function, so this fails closed
+ * on its own rather than leaning on that upstream gate: encountering one of these node kinds
+ * disqualifies the table outright the moment the tracked name occurs ANYWHERE inside it (not a
+ * "safe read" recheck — this scanner doesn't attempt to precisely re-derive scoping/aliasing
+ * inside a node shape it otherwise never has to reason about, so it conservatively treats any
+ * textual occurrence as disqualifying rather than risk missing a real one).
+ */
+function checkTableSafety(node, name, kind, shadowed, exclude) {
+    if (node === exclude)
+        return true;
+    if (ts.isClassLike(node) || ts.isEnumDeclaration(node) || ts.isModuleDeclaration(node)) {
+        return !referencesIdentifier(node, name);
+    }
+    if (isOutOfScopeForPropagation(node))
+        return true;
+    if (ts.isIdentifier(node) && node.text === name) {
+        if (shadowed.has(name))
+            return true;
+        return isSafeTableRead(node) || (kind === 'array' && isForOfIterableExpression(node));
+    }
+    if (ts.isBlock(node)) {
+        const names = new Set(shadowed);
+        collectDirectlyDeclaredNames(node.statements, names);
+        return node.statements.every((s) => checkTableSafety(s, name, kind, names, exclude));
+    }
+    if (isPlainFunctionScope(node)) {
+        const names = new Set(shadowed);
+        for (const p of node.parameters)
+            collectBindingNames(p.name, names);
+        if (node.body)
+            collectVarNames(node.body, names);
+        if (node.name)
+            names.add(node.name.text);
+        let ok = true;
+        ts.forEachChild(node, (child) => {
+            if (child === node.name)
+                return;
+            if (!checkTableSafety(child, name, kind, names, exclude))
+                ok = false;
+        });
+        return ok;
+    }
+    if (isMethodLikeScope(node)) {
+        const names = new Set(shadowed);
+        for (const p of node.parameters)
+            collectBindingNames(p.name, names);
+        if (node.body)
+            collectVarNames(node.body, names);
+        let ok = true;
+        ts.forEachChild(node, (child) => {
+            if (child === node.name) {
+                if (ts.isComputedPropertyName(node.name) &&
+                    !checkTableSafety(node.name.expression, name, kind, shadowed, exclude)) {
+                    ok = false;
+                }
+                return;
+            }
+            if (!checkTableSafety(child, name, kind, names, exclude))
+                ok = false;
+        });
+        return ok;
+    }
+    if (ts.isForStatement(node)) {
+        const names = new Set(shadowed);
+        if (node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+            for (const decl of node.initializer.declarations)
+                collectBindingNames(decl.name, names);
+        }
+        let ok = true;
+        if (node.initializer && !checkTableSafety(node.initializer, name, kind, names, exclude))
+            ok = false;
+        if (node.condition && !checkTableSafety(node.condition, name, kind, names, exclude))
+            ok = false;
+        if (node.incrementor && !checkTableSafety(node.incrementor, name, kind, names, exclude))
+            ok = false;
+        if (!checkTableSafety(node.statement, name, kind, names, exclude))
+            ok = false;
+        return ok;
+    }
+    if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+        const names = new Set(shadowed);
+        if (ts.isVariableDeclarationList(node.initializer)) {
+            for (const decl of node.initializer.declarations)
+                collectBindingNames(decl.name, names);
+        }
+        let ok = checkTableSafety(node.expression, name, kind, shadowed, exclude); // the iterated expr: outer scope
+        if (!checkTableSafety(node.initializer, name, kind, names, exclude))
+            ok = false;
+        if (!checkTableSafety(node.statement, name, kind, names, exclude))
+            ok = false;
+        return ok;
+    }
+    if (ts.isCatchClause(node)) {
+        const names = new Set(shadowed);
+        if (node.variableDeclaration)
+            collectBindingNames(node.variableDeclaration.name, names);
+        return checkTableSafety(node.block, name, kind, names, exclude);
+    }
+    let ok = true;
+    ts.forEachChild(node, (child) => {
+        if (!checkTableSafety(child, name, kind, shadowed, exclude))
+            ok = false;
+    });
+    return ok;
+}
+/**
+ * Every same-file top-level `const NAME = [<foldable>, ...] / { key: <foldable>, ... }` that
+ * passes BOTH soundness gates: (1) every element/property folds to a bigint via `tsEvalConst`
+ * (so `consts` — the scalar top-level consts, collected first — may be referenced by a table's
+ * elements, but a table may never reference another table), and (2) the whole-file
+ * `checkTableSafety` scan finds zero disqualifying uses of the name. A literal failing either
+ * gate is simply never added here — `tableFoldTransformer` only ever touches names present in
+ * this map, so anything not tracked is left byte-for-byte untouched, same as before this
+ * feature existed.
+ */
+function collectTopLevelTables(sourceFile, consts, functions) {
+    const tables = new Map();
+    for (const stmt of sourceFile.statements) {
+        if (!ts.isVariableStatement(stmt))
+            continue;
+        if (!(stmt.declarationList.flags & ts.NodeFlags.Const))
+            continue;
+        for (const decl of stmt.declarationList.declarations) {
+            if (!ts.isIdentifier(decl.name) || !decl.initializer)
+                continue;
+            const name = decl.name.text;
+            const init = decl.initializer;
+            let entry;
+            if (ts.isArrayLiteralExpression(init)) {
+                const elements = foldArrayLiteralElements(init, consts, functions);
+                if (elements)
+                    entry = { kind: 'array', elements };
+            }
+            else if (ts.isObjectLiteralExpression(init)) {
+                const props = foldObjectLiteralProps(init, consts, functions);
+                if (props)
+                    entry = { kind: 'object', props };
+            }
+            if (!entry)
+                continue; // not a fully-foldable literal — never a candidate, left completely alone
+            if (checkTableSafety(sourceFile, name, entry.kind, new Set(), decl.name))
+                tables.set(name, entry);
+        }
+    }
+    return tables;
+}
+/** Resolve a single `NAME[k]` / `NAME.prop` / `NAME["prop"]` access to its literal element/property value, if provable. */
+function foldTableAccess(node, table, consts, functions, shadowed) {
+    if (ts.isPropertyAccessExpression(node)) {
+        if (table.kind !== 'object')
+            return undefined;
+        const value = table.props.get(node.name.text);
+        return value !== undefined ? toLiteralNode(value) : undefined;
+    }
+    if (table.kind === 'array') {
+        const index = tsEvalConst(node.argumentExpression, consts, functions, shadowed);
+        if (index === undefined || index < 0n || index >= BigInt(table.elements.length))
+            return undefined;
+        return toLiteralNode(table.elements[Number(index)]);
+    }
+    // Object table via a computed key — only a literal string (`TABLE["key"]`) is resolved; any
+    // other computed-key shape is left untouched (this table has no OTHER disqualifying uses, so
+    // this single unresolvable access simply stays as real runtime code, same as an out-of-bounds
+    // array index).
+    if (!ts.isStringLiteralLike(node.argumentExpression))
+        return undefined;
+    const value = table.props.get(node.argumentExpression.text);
+    return value !== undefined ? toLiteralNode(value) : undefined;
+}
+/**
+ * The table-folding transformer: shadow-aware (identical scope rules to
+ * `constPropagationTransformer`/`substituteConstReads`, reusing the same helpers), replaces every
+ * resolvable `NAME[k]`/`NAME.prop`/`NAME["prop"]` access — where `NAME` is an unshadowed
+ * reference to a tracked table — with its literal value. A resolvable access is always safe to
+ * fold outright (never a write/call target): `collectTopLevelTables`'s `checkTableSafety` gate
+ * already proved zero such uses exist anywhere for a tracked name, and `foldTableAccess` itself
+ * re-checks boundedness/constancy per access — this transformer additionally re-derives
+ * `isTableAccessUnsafeUsage` per access as a second, independent guard (the same "belt and
+ * suspenders" double-check this file already applies to the assignment-operator guard).
+ */
+/**
+ * `for (const x of ARR) { ... }` where `ARR` is a tracked ARRAY table unrolls into one copy of
+ * the body per element, the loop variable substituted by its literal value — the STRETCH-GOAL
+ * counterpart of `unrollCountingLoop` above, adapted to iterate over TABLE ELEMENTS instead of
+ * an arithmetic sequence, reusing the exact same safety infrastructure: `MAX_UNROLL_ITERATIONS`
+ * (capped by element count, no need to count up to it — the length is already known),
+ * `bodyBlocksUnrolling` (break/continue/return/counter-shadowing bail — "counter" here is the
+ * loop variable), and `substituteCounter`. Declines (returns `undefined`, leaving the loop as
+ * real runtime code) on: `for await...of`, a destructured loop variable (`for (const [a,b] of
+ * ARR)` — out of scope, only a single plain identifier is supported), a shadowed or non-array-
+ * table iterated expression, or a body that `bodyBlocksUnrolling` rejects. `reprocess` re-enters
+ * the SAME statement-list visiting (`visitStatementList`) on each unrolled copy so a nested
+ * `if`/loop/table-access keyed on the loop variable cascades to a fully-resolved literal per
+ * iteration, exactly like the numeric unroller's own `foldStatementList` re-entry.
+ */
+function tryUnrollForOfArrayTable(node, tables, shadowed, context, reprocess) {
+    if (node.awaitModifier)
+        return undefined; // for-await — out of scope
+    if (!ts.isIdentifier(node.expression) || shadowed.has(node.expression.text))
+        return undefined;
+    const table = tables.get(node.expression.text);
+    if (!table || table.kind !== 'array')
+        return undefined; // only an ARRAY table has an iteration order
+    if (!ts.isVariableDeclarationList(node.initializer) || node.initializer.declarations.length !== 1)
+        return undefined;
+    const decl = node.initializer.declarations[0];
+    if (!ts.isIdentifier(decl.name))
+        return undefined; // a destructured loop variable — out of scope, decline
+    const loopVar = decl.name.text;
+    if (table.elements.length > MAX_UNROLL_ITERATIONS)
+        return undefined;
+    if (bodyBlocksUnrolling(node.statement, loopVar))
+        return undefined;
+    const bodyStatements = ts.isBlock(node.statement) ? node.statement.statements : [node.statement];
+    return table.elements.flatMap((value) => {
+        const literal = toLiteralNode(value);
+        const substituted = bodyStatements.map((s) => substituteCounter(s, loopVar, literal, context));
+        return reprocess(substituted, shadowed);
+    });
+}
+/**
+ * Visits a statement list for `tableFoldTransformer`, recognizing an unrollable `for...of` over
+ * a tracked array table before falling back to the ordinary per-statement `visit` — the natural
+ * place for this (mirroring `foldStatementList` above) since eliding one `ForOfStatement` in
+ * favor of N unrolled copies replaces ONE list entry with MANY, which a single-node visitor
+ * (`ts.visitEachChild`'s single-slot callback contract) cannot express. Kept as a SEPARATE
+ * function from the single-node `visit` specifically so the unroll attempt only ever fires from
+ * a genuine statement-LIST position (`Block.statements` / `SourceFile.statements`) — a for-of
+ * loop sitting in a single-statement slot (e.g. the un-braced body of an outer `for`/`if`) is
+ * conservatively left un-unrolled (falls through to `visit`'s own, ordinary — shadow-aware,
+ * non-unrolling — `ForOfStatement` handling) rather than risk returning an array where exactly
+ * one `ts.Statement` is structurally required.
+ */
+function visitStatementList(statements, visit, shadowed, tables, context) {
+    const reprocess = (stmts, s) => visitStatementList(stmts, visit, s, tables, context);
+    return statements.flatMap((stmt) => {
+        if (ts.isForOfStatement(stmt)) {
+            const unrolled = tryUnrollForOfArrayTable(stmt, tables, shadowed, context, reprocess);
+            if (unrolled)
+                return unrolled;
+        }
+        return [visit(stmt, shadowed)];
+    });
+}
+function tableFoldTransformer(tables, consts, functions) {
+    return (context) => {
+        const visit = (node, shadowed) => {
+            if (isOutOfScopeForPropagation(node))
+                return node;
+            if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+                ts.isIdentifier(node.expression) &&
+                !shadowed.has(node.expression.text) &&
+                tables.has(node.expression.text) &&
+                !isTableAccessUnsafeUsage(node)) {
+                const table = tables.get(node.expression.text);
+                const literal = foldTableAccess(node, table, consts, functions, shadowed);
+                if (literal)
+                    return literal;
+            }
+            if (ts.isBlock(node)) {
+                const names = new Set(shadowed);
+                collectDirectlyDeclaredNames(node.statements, names);
+                return ts.factory.updateBlock(node, visitStatementList(node.statements, visit, names, tables, context));
+            }
+            if (isPlainFunctionScope(node)) {
+                const names = new Set(shadowed);
+                for (const p of node.parameters)
+                    collectBindingNames(p.name, names);
+                if (node.body)
+                    collectVarNames(node.body, names);
+                if (node.name)
+                    names.add(node.name.text);
+                const childVisitor = (child) => (child === node.name ? child : visit(child, names));
+                return ts.visitEachChild(node, childVisitor, context);
+            }
+            if (isMethodLikeScope(node)) {
+                const names = new Set(shadowed);
+                for (const p of node.parameters)
+                    collectBindingNames(p.name, names);
+                if (node.body)
+                    collectVarNames(node.body, names);
+                const childVisitor = (child) => {
+                    if (child === node.name) {
+                        return ts.isComputedPropertyName(node.name)
+                            ? ts.factory.updateComputedPropertyName(node.name, visit(node.name.expression, shadowed))
+                            : node.name;
+                    }
+                    return visit(child, names);
+                };
+                return ts.visitEachChild(node, childVisitor, context);
+            }
+            if (ts.isForStatement(node)) {
+                const names = new Set(shadowed);
+                if (node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+                    for (const decl of node.initializer.declarations)
+                        collectBindingNames(decl.name, names);
+                }
+                return ts.factory.updateForStatement(node, node.initializer ? visit(node.initializer, names) : undefined, node.condition ? visit(node.condition, names) : undefined, node.incrementor ? visit(node.incrementor, names) : undefined, visit(node.statement, names));
+            }
+            if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+                const names = new Set(shadowed);
+                if (ts.isVariableDeclarationList(node.initializer)) {
+                    for (const decl of node.initializer.declarations)
+                        collectBindingNames(decl.name, names);
+                }
+                const visitedInit = visit(node.initializer, names);
+                const visitedStmt = visit(node.statement, names);
+                const visitedExpr = visit(node.expression, shadowed); // outer scope
+                return ts.isForOfStatement(node)
+                    ? ts.factory.updateForOfStatement(node, node.awaitModifier, visitedInit, visitedExpr, visitedStmt)
+                    : ts.factory.updateForInStatement(node, visitedInit, visitedExpr, visitedStmt);
+            }
+            if (ts.isCatchClause(node)) {
+                const names = new Set(shadowed);
+                if (node.variableDeclaration)
+                    collectBindingNames(node.variableDeclaration.name, names);
+                return ts.factory.updateCatchClause(node, node.variableDeclaration, visit(node.block, names));
+            }
+            return ts.visitEachChild(node, (child) => visit(child, shadowed), context);
+        };
+        return (sourceFile) => ts.factory.updateSourceFile(sourceFile, visitStatementList(sourceFile.statements, visit, new Set(), tables, context));
+    };
+}
 /**
  * Removes any top-level `const` declaration whose name has zero remaining `Identifier`
  * occurrences anywhere in the (already-substituted) file. Deliberately a flat, whole-file
@@ -1131,9 +1616,12 @@ function countIdentifierRefs(root, name, exclude) {
  * point, any occurrence still in the tree is either a shadowing inner declaration of the
  * SAME name (a coincidental false-positive "still referenced" that simply keeps this
  * otherwise-dead declaration around, harmlessly) or a genuine remaining use this pass
- * correctly declines to touch.
+ * correctly declines to touch. Also covers the array/object lookup-table declarations
+ * tracked in `tables` (see the section below) the exact same way — a table whose every
+ * access was resolved by `tableFoldTransformer` has zero remaining references, same as a
+ * scalar const whose every read was inlined.
  */
-function deadConstEliminationTransformer(consts) {
+function deadConstEliminationTransformer(consts, tables) {
     return (_context) => {
         return (sourceFile) => {
             const declNameNodes = new Map();
@@ -1141,7 +1629,8 @@ function deadConstEliminationTransformer(consts) {
                 if (!ts.isVariableStatement(stmt) || !(stmt.declarationList.flags & ts.NodeFlags.Const))
                     continue;
                 for (const decl of stmt.declarationList.declarations) {
-                    if (ts.isIdentifier(decl.name) && consts.has(decl.name.text) && !declNameNodes.has(decl.name.text)) {
+                    const trackedName = ts.isIdentifier(decl.name) && (consts.has(decl.name.text) || tables.has(decl.name.text));
+                    if (trackedName && ts.isIdentifier(decl.name) && !declNameNodes.has(decl.name.text)) {
                         declNameNodes.set(decl.name.text, decl.name);
                     }
                 }
@@ -1178,14 +1667,22 @@ export function tsPartialEval(code, filePath) {
     const sourceFile = ts.createSourceFile(filePath, code, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
     const functions = collectTopLevelFunctions(sourceFile);
     const consts = collectTopLevelConsts(sourceFile, functions);
+    // Table candidacy + the whole-file soundness scan run on the ORIGINAL, pre-fold source: a
+    // disqualifying use must count even if it sits in a branch `foldTransformer` would otherwise
+    // prune away (see the "Array/object lookup-table folding" section above).
+    const tables = collectTopLevelTables(sourceFile, consts, functions);
     const result = ts.transpileModule(code, {
         fileName: filePath,
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
         transformers: {
             before: [
                 foldTransformer(consts, functions),
+                // Runs AFTER foldTransformer so an index/key that only becomes a literal once a loop
+                // unrolls (e.g. `TABLE[i]` inside a `for` that unrolls `i` to a literal per iteration)
+                // is still resolvable.
+                tableFoldTransformer(tables, consts, functions),
                 constPropagationTransformer(consts),
-                deadConstEliminationTransformer(consts),
+                deadConstEliminationTransformer(consts, tables),
             ],
         },
     });
