@@ -117,6 +117,33 @@ processing, only countable counters). A failed/unresolvable fold always leaves t
 (fails closed, never throws) — `tryEvaluate` wraps `evaluate()` in try/catch for whatever still
 reaches it with a bigint present (e.g. a template literal substitution).
 
+**Fix (this branch): a suffix-less numeric literal beyond `Number.MAX_SAFE_INTEGER` silently
+corrupted to the nearest float64 value.** Both `tsEvalConst`'s `ts.isNumericLiteral` branch and
+acorn-side `processor/const-eval.ts`'s `literalToBigint` used to fold a numeric literal by first
+parsing it into an ordinary JS `number` (`Number(node.text)` / acorn's own already-parsed
+`literal.value`) and only then converting to `BigInt` — silently rounding to the nearest
+representable double for any suffix-less literal (hex/decimal/octal/binary) whose true value
+exceeds `2^53 - 1`. Confirmed via real EVM execution: the real ecoswap `HIGH` bitmask
+(`0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000000`, `2^256 - 2^24`, legally
+in-range for uint256) rounded UP to exactly `2^256` under this bug, so any `tickArg`-shaped helper
+using it threw `value exceeds 32 bytes (uint256 max)` at compile time whenever compiled through the
+ts-frontend (`tsSource: true`) — even though the source is valid SauceScript; a smaller value (e.g.
+`2^200 + 12345`) instead silently compiled to the WRONG (rounded) constant with no error at all,
+reproducing identically on the plain acorn-only path too (`const-eval.ts` is consulted for every
+top-level `const` runtime read via `ctx.getConstant`, not just ts-frontend). Both are `.ts`/
+`ts-frontend`-independent from `processor/expression.ts`'s `processLiteral`/`literalToInt` (the
+RUNTIME-value emission path), which already avoided this exact hazard by parsing the literal's own
+raw source text (`literal.raw`) — the two COMPILE-TIME-constant evaluators just never got the same
+treatment. Fixed by parsing the literal's own raw source text directly into a `BigInt` in both
+places instead: `tsEvalConst` now uses `BigInt(node.getText().replace(/_/g, ''))` (`ts.NumericLiteral.
+text` is NOT raw source text — the TS scanner normalizes it through the SAME lossy float round-trip,
+so `getText()` — the literal exactly as written — is required, with numeric separators stripped
+since `BigInt()` itself rejects them); `const-eval.ts`'s `literalToBigint` now threads the acorn
+`Literal` node's own `.raw` through, mirroring `processLiteral`/`literalToInt`'s existing pattern
+exactly. A non-integer literal (float, exponential notation) still correctly declines to fold —
+`BigInt()` throws for both forms, matching (and generalizing) the previous `Number.isInteger` reject
+path, now via an exact parse instead of a lossy intermediate float.
+
 **Loop unrolling**: a `for` loop with a constant start/bound/step (`i++`/`i--`/`i +=
 step`/`i -= step`/`i = i +/- step`, compared against a same-file `const` or literal bound) unrolls
 into N copies of its body with the counter substituted by its per-iteration literal — capped at
@@ -157,6 +184,25 @@ inner declaration fully CONSUMED/ELIDED by a further nested cascade (e.g. the pa
 counting idiom eliding its own counter) is correctly judged safe — existing unroll-cascade tests
 are unaffected; only a body whose local declaration has nothing to consume it now declines instead
 of crashing.
+
+**Fix (this branch): the SAME splice-collision crash, in if-branch flattening.** `foldTransformer`'s
+if-statement handling replaces a taken `if (true) { ... }` / `if (false) { ... } else { ... }` with
+its branch's OWN statements spliced directly into the ENCLOSING statement list (the identical
+architecture as the loop unroller above, for the identical reason — the base SauceScript compiler's
+statement processor doesn't accept a bare `Block` as a standalone statement) — but had no
+`collidesWithSurroundingDeclarations` check of its own. A taken branch's OWN `let`/`const` sharing a
+name with something already declared in the enclosing scope (`let x = 1n; if (true) { let x = 2n;
+... }` — an entirely ordinary shape, and perfectly legal AS WRITTEN since the branch's own `Block`
+gives it a real nested scope) became, once flattened, two adjacent declarations of the same name in
+the SAME scope — invalid to emit, crashing with the identical `SyntaxError: Identifier 'x' has
+already been declared` at the next `acorn.parse` stage. Fixed by reusing
+`collidesWithSurroundingDeclarations` unchanged: the flattened result is checked against the
+ORIGINAL outer `shadowed` set before being returned; a collision declines to flatten (falls through
+to the generic `ts.visitEachChild` fallback, which visits the branch via the ordinary `ts.isBlock`
+case instead — a genuine nested scope, so no collision there) rather than handing back output the
+next stage can't parse. A non-`Block` taken branch (e.g. `if (true) return 5;`) can never trigger
+this — real JS/TS grammar rejects a lexical (`let`/`const`) declaration as a single-statement `if`
+body outright, so that shape can't reach here in the first place.
 
 **Constant propagation to reads + dead-declaration elimination** (`constPropagationTransformer` /
 `deadConstEliminationTransformer`, two more `before` transformer stages appended AFTER
