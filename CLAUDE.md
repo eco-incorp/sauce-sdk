@@ -135,6 +135,29 @@ on the counter cascades to a fully-resolved literal per iteration (e.g. a nested
 unrolled `for` fully resolves both loops to straight-line arithmetic, no loop opcodes emitted at
 all). Plain `.js`/`.sauce` sources never invoke any of this.
 
+**Fix (this branch): unrolling could emit a duplicate declaration.** Both `unrollCountingLoop` (the
+`for`/`while` unroller above) and the array-table `for...of` unroller further below splice N copies
+of the body's OWN statements directly into the ENCLOSING statement list — no per-iteration `Block`
+scope of their own (the base SauceScript compiler's own statement processor doesn't accept a bare
+`Block` as a standalone statement, so wrapping each copy in one isn't a valid alternative fix
+either). The existing shadowing guard only ever bailed on a body that redeclared the COUNTER's own
+name; a body declaring any OTHER local (`let doubled = i * 2n;` — an entirely ordinary shape) would
+unroll into N (or, colliding with an outer declaration of the same name, even just 1) adjacent
+`let`/`const` declarations of that name in the SAME scope — invalid JS/TS that `ts.transpileModule`
+happily prints as text, but that `acorn.parse` (the very next `compile()` stage) then rejected with
+`SyntaxError: Identifier 'x' has already been declared`, crashing the whole compile. Confirmed
+reachable via all three unroll entry points (numeric `for`, the `while` counting idiom, and the
+array-table `for...of` unroller). Fixed by `collidesWithSurroundingDeclarations`: after producing
+the (already fully expanded/cascaded) unrolled statement list, it's scanned for a direct `let`/
+`const`/nested-`function` name that either repeats within that list or collides with a name already
+reserved by an OUTER enclosing scope — either shape bails the WHOLE unroll (falls back to the
+well-tested "stays real runtime code" path) rather than handing back output the next stage can't
+parse. This inspects the ACTUAL final output, not the per-iteration body in isolation, so an
+inner declaration fully CONSUMED/ELIDED by a further nested cascade (e.g. the paired `while`-
+counting idiom eliding its own counter) is correctly judged safe — existing unroll-cascade tests
+are unaffected; only a body whose local declaration has nothing to consume it now declines instead
+of crashing.
+
 **Constant propagation to reads + dead-declaration elimination** (`constPropagationTransformer` /
 `deadConstEliminationTransformer`, two more `before` transformer stages appended AFTER
 `foldTransformer`, running on ITS output): a chain like `const a = 1; const b = a + 3; const c = b
@@ -170,7 +193,27 @@ reachable on this exact shape) — the branch's own `let FEE` correctly shadowed
 so a read AFTER it fell through to the top-level const instead of staying an (unsubstituted)
 real runtime read. Over-including a name this way costs at most a missed optimization (the real
 compiler's own `getVar`-then-`getConstant` resolution still handles an unresolved read
-correctly), never a wrong substitution. Substitution never touches a WRITE position either — an assignment's left-hand side or an
+correctly), never a wrong substitution. **Follow-up fix (this branch): the SAME gap, in every
+OTHER pass that computes its own function-scope shadow set.** The fix above landed only in
+`constPropagationTransformer`'s `substituteConstReads` — `foldTransformer` itself (which folds a
+`BinaryExpression`/`CallExpression`/`TemplateExpression` DIRECTLY, via `tsEvalConst`/`tsEvalCall`,
+strictly BEFORE `substituteConstReads` ever runs), the array/object lookup-table feature's
+`checkTableSafety` (the whole-file soundness scan) and `tableFoldTransformer` (the actual table
+substitution), and `collectWriteCounts` (the effectively-const `let`/`var` write-count scan) each
+had their OWN, separate, still-`collectVarNames`-only shadow computation, unfixed. Reachable and
+confirmed (including via real EVM execution — the ts-frontend-compiled bytecode returned the SAME
+answer for both branch outcomes of the shadowing condition, while the plain/acorn pipeline
+correctly returned two different, condition-dependent answers) on: `const RATE = 5n; function
+f(cond) { if (cond) { let RATE = 999n; } return RATE + 1n; }` (foldTransformer folding a
+BinaryExpression read after the branch straight to the OUTER `6n`) and the analogous shape with a
+top-level array/object table in place of a scalar const (`checkTableSafety`/`tableFoldTransformer`
+folding `TABLE[k]`/`OBJ.prop` after the branch against the OUTER table). All four now also call
+`collectLexicalNamesInScope` in their `isPlainFunctionScope`/`isMethodLikeScope` handling, exactly
+like `substituteConstReads` already did — `collectWriteCounts`'s own gap could only ever have made
+its write-count scan OVER-conservative (a shadowed write miscounted as a top-level one can only
+inflate a reported count, never deflate one), so it was never an unsound-fold risk the way the
+other three were, but is fixed too for consistency (every shadow computation in the file now
+agrees on the same rule). Substitution never touches a WRITE position either — an assignment's left-hand side or an
 update expression's (`++`/`--`) operand is walked by a dedicated `visitAssignmentTarget` that
 recurses into any nested reads (a computed member-access key, a destructuring default's value) but
 leaves the bound identifier(s) themselves untouched, mirroring `foldExpression`'s
@@ -339,7 +382,17 @@ each resolvable access with its literal element/property value; an access that I
 (a non-constant index, an out-of-bounds or negative array index, a non-string-literal computed key
 into an object table) is simply left untouched and does NOT disqualify other, provably-resolvable
 accesses of the same table elsewhere — each access is judged independently once the file-wide
-immutability proof holds. The now-fully-dead declaration is then removed by the SAME
+immutability proof holds. **Caveat: "left untouched" only avoids a WORSE fold — it does not, by
+itself, guarantee the file still compiles.** The base (non-`tsSource`) SauceScript compiler has no
+representation for an array/object literal at all inside a function body — `const TIERS = [500n,
+3000n]; function main(idx) { return TIERS[idx]; }` throws `undefined variable: TIERS` with
+`tsSource` OFF entirely, independent of this feature. So a table with even ONE access this pass
+can't resolve (e.g. an index only knowable via a DIFFERENT function's own local-per-function
+constant propagation, which this feature's top-level-only `TopLevelContext` has no visibility
+into) still fails the WHOLE compile once handed to `acorn`/the base processor — just with that
+same generic, table-fold-unrelated `undefined variable: TIERS` error, not a graceful real-array
+runtime-read fallback (there is no such fallback to fall back to) and not a clearer,
+table-fold-specific diagnostic either. The now-fully-dead declaration is then removed by the SAME
 `deadConstEliminationTransformer` dead-declaration-elimination pass already used for scalar consts
 (extended to also track table names). **Explicitly out of scope**, a literal simply never becoming
 a candidate (left completely untouched, same as any other non-fully-foldable initializer):
