@@ -135,15 +135,50 @@ on the counter cascades to a fully-resolved literal per iteration (e.g. a nested
 unrolled `for` fully resolves both loops to straight-line arithmetic, no loop opcodes emitted at
 all). Plain `.js`/`.sauce` sources never invoke any of this.
 
-**Known limitation (not fixed)**: this only folds compile-time-known COUNTERS/BOUNDS, not real
-array/object DATA processing (`arr[i]`, `.push()`, `for...of`) — ts-evaluator's no-checker mode
-can't resolve property/array access or function calls at all, and a full `ts.Program`/TypeChecker
-is a much bigger lift, out of scope here. Folding is also purely LOCAL: a chain of plain `let`/
-reassignment (`a = 1; b = a + 3; console.log(b)`) is untouched (`consts` only tracks same-file
-`const` declarations), and even a `const` chain (`const a = 1; const b = a + 3;`) only folds each
-initializer — it never substitutes a resolved const into a later bare-identifier READ (e.g.
-`console.log(b)` stays `console.log(b)`, not `console.log(4n)`) and never removes a now-unused
-intermediate declaration.
+**Constant propagation to reads + dead-declaration elimination** (`constPropagationTransformer` /
+`deadConstEliminationTransformer`, two more `before` transformer stages appended AFTER
+`foldTransformer`, running on ITS output): a chain like `const a = 1; const b = a + 3; const c = b
++ 4; console.log(c);` now fully collapses to `console.log(8n);`. The fold pass above already
+resolves every top-level `const`'s value into `consts` up front and folds it into a later
+FOLDABLE initializer expression (`const b = a + 3` → `const b = 4n`), but never touched a bare
+`Identifier` sitting in ordinary READ position — `constPropagationTransformer` closes that gap,
+substituting every unshadowed read of a top-level const name with its resolved literal;
+`deadConstEliminationTransformer` then deletes any top-level `const` left with ZERO remaining
+`Identifier` occurrences of its name anywhere in the file. Running after fold+unroll means a const
+used only as a now-fully-unrolled loop bound, or only inside a since-pruned dead `if`-branch, is
+correctly eliminated too — its only textual reference already disappeared with the unrolled-away
+loop condition or pruned branch, before either of these two passes ever looks for it. Scope-aware:
+descending into a function body, block, catch clause, for-loop declaration, or parameter that
+redeclares the SAME name shadows it for that whole (inner) scope, computed once up front per scope
+rather than incrementally (matching real JS/TS semantics — a block-scoped name is reserved from the
+top of its scope regardless of TDZ) — the outer const is correctly left un-substituted inside that
+shadowed scope; `var` is additionally hoisted to its enclosing FUNCTION (not block) scope, via a
+separate pre-scan that doesn't cross nested function/class boundaries, matching real `var`
+semantics. Substitution never touches a WRITE position either — an assignment's left-hand side or an
+update expression's (`++`/`--`) operand is walked by a dedicated `visitAssignmentTarget` that
+recurses into any nested reads (a computed member-access key, a destructuring default's value) but
+leaves the bound identifier(s) themselves untouched, mirroring `foldExpression`'s
+`ASSIGNMENT_OPERATOR_TOKENS` guard one level down — the same "never fold/substitute an lvalue"
+invariant, enforced by a second, independent guard for this second pass. Only the SAME same-file
+top-level `consts` map the fold pass already trusts is ever
+consulted — a `let`/`var`/mutable-reassignment chain (e.g. `a = 1; b = a + 3; console.log(b);`) is
+untouched by construction, not by a special-cased guard: `collectTopLevelConsts` only ever records
+`NodeFlags.Const` declarations, so such a name is simply never a key in `consts`, and a bare
+Identifier that doesn't resolve in `consts` is always left exactly as found. Dead-declaration
+elimination is deliberately a simple, NOT scope-aware, whole-file textual `Identifier` reference
+count taken AFTER substitution (`countIdentifierRefs`) — a top-level const that happens to share
+its name with an unrelated nested shadowing declaration elsewhere in the file may be kept around
+(harmlessly inert, its value already fully propagated to every real reader) rather than removed,
+but this can never cause an INCORRECT substitution, only an occasionally-missed cleanup. Tracking
+itself is not extended by any of this: only the pre-existing top-level `consts` map is ever
+consulted or mutated-by-removal; a nested/function-local `const` is never added to it and stays out
+of scope, exactly as before.
+
+**Known limitation (not fixed)**: this only folds/propagates compile-time-known COUNTERS/BOUNDS and
+same-file top-level `const` VALUES, not real array/object DATA processing (`arr[i]`, `.push()`,
+`for...of` iterating actual data) — ts-evaluator's no-checker mode can't resolve property/array
+access or function calls at all, and a full `ts.Program`/TypeChecker is a much bigger lift, out of
+scope here.
 
 **Assignment expressions are never folded.** The TS AST represents `=`/`+=`/etc. as a
 `BinaryExpression`, and `ts-evaluator`'s `evaluate()` "succeeds" on a bare assignment (e.g.
