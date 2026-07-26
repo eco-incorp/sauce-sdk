@@ -1287,6 +1287,201 @@ describe('tsPartialEval (LOCAL, per-function constant propagation)', () => {
     // (inner) call for the compiler to resolve against the nested declaration.
     expect(out).not.toContain('return 2n;');
   });
+
+  // ── Ternary (conditional-expression) folding ──
+  //
+  // `tsEvalConst` itself has no case for `ts.isConditionalExpression` anywhere (a ternary's
+  // mainstream path folds via `foldTransformer`'s own separate, MODULE-scope mechanism
+  // instead) — this LOCAL pass had no equivalent, so `x = localCond ? 5n : 6n;` fell through
+  // to NAC even when `localCond` was a plain local variable this pass's own reasoning already
+  // knew. `evalLocalConst`/`substituteLocalReads`'s own `ConditionalExpression` case close
+  // this gap: the condition is evaluated through this pass's own `LocalResolution`, and if it
+  // resolves, the WHOLE ternary is structurally replaced by whichever branch was selected,
+  // cascading into anything further foldable inside it.
+  describe('ternary (conditional-expression) folding', () => {
+    it('the motivating repro: a locally-known condition folds an assignment-RHS ternary all the way through to the final read', () => {
+      const out = tsPartialEval(`function f() { let x=1n; const A=true; x = A?5n:6n; return x; }`, 'f.ts');
+
+      expect(out).toContain('return 5n;');
+      expect(out).not.toContain('?');
+      expect(out).not.toContain('return x;');
+    });
+
+    it('a nested ternary in the TAKEN branch, itself keyed on a different, also locally-known condition, cascades to a single literal', () => {
+      const out = tsPartialEval(
+        `function f() {
+           let a = 1n;
+           let b = 2n;
+           let x = a > 0n ? (b > 0n ? 10n : 20n) : 30n;
+           return x;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('return 10n;');
+      expect(out).not.toContain('?');
+    });
+
+    it('a ternary NESTED inside another expression (not directly an assignment RHS) whose condition is locally known folds completely — the shape that would otherwise be an illegal ternary position downstream', () => {
+      const out = tsPartialEval(
+        `function f() {
+           let a = 1n;
+           let b = (a > 0n ? 2n : 3n) + 1n;
+           return b;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('return 3n;');
+      expect(out).not.toContain('?');
+    });
+
+    it('a genuinely unknown condition (a function parameter) declines to fold — the ternary stays intact, structurally untouched', () => {
+      const out = tsPartialEval(
+        `function f(n) {
+           let b = (n > 0n ? 2n : 3n) + 1n;
+           return b;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('n > 0n ? 2n : 3n');
+      expect(out).toContain('return b;');
+      expect(out).not.toContain('return 3n;');
+      expect(out).not.toContain('return 4n;');
+    });
+
+    it('sub-parts of an unresolvable ternary still get locally-known identifiers substituted, without collapsing the ternary itself', () => {
+      const out = tsPartialEval(
+        `function f(n) {
+           const SCALE = 2n;
+           let b = n > 0n ? SCALE : 3n;
+           return b;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('n > 0n ? 2n : 3n'); // the SCALE READ substituted, ternary itself untouched
+      // Dead-local-declaration elimination is out of scope for this pass (documented
+      // limitation) — `const SCALE = 2n;` itself is still emitted, just no longer READ.
+      expect(out).not.toContain('? SCALE :');
+      expect(out).toContain('return b;');
+    });
+
+    it('interaction with the if/else merge-at-join rule: a ternary condition resolved only via a PRIOR if/else merge in the same function uses the already-merged value', () => {
+      const out = tsPartialEval(
+        `function f(cond) {
+           let x = 1n;
+           if (cond) { x = 5n; } else { x = 5n; }
+           let y = x > 0n ? 10n : 20n;
+           return y;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('return 10n;');
+      expect(out).not.toContain('?');
+    });
+
+    it('interaction with the loop-NAC rule: a ternary depending on a variable written inside a real (non-unrolled) loop correctly declines to fold', () => {
+      const out = tsPartialEval(
+        `function f(n) {
+           let sum = 0n;
+           for (let i = 0n; i < n; i++) {
+             sum = sum + i;
+           }
+           let y = sum > 0n ? 1n : 2n;
+           return y;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('sum > 0n ? 1n : 2n');
+      expect(out).toContain('return y;');
+      expect(out).not.toContain('return 1n;');
+      expect(out).not.toContain('return 2n;');
+    });
+
+    it('a ternary inside a function this pass bails on (closure reassignment) is left untouched along with the rest of the containing function', () => {
+      const out = tsPartialEval(
+        `function outer() {
+           let x = 1n;
+           const inner = () => { x = 2n; };
+           let y = x ? 5n : 6n;
+           return y;
+         }`,
+        'f.ts',
+      );
+
+      // Were this pass NOT to bail the whole function, `x`'s own straight-line `let x = 1n;`
+      // would look constant in outer's OWN sequential walk (the nested closure is an opaque
+      // leaf to it) and the ternary would wrongly fold to `return 5n;`.
+      expect(out).toContain('x ? 5n : 6n');
+      expect(out).toContain('return y;');
+      expect(out).not.toContain('return 5n;');
+      expect(out).not.toContain('return 6n;');
+    });
+
+    it('a ternary passed AS A CALL ARGUMENT to an opaque (non-foldable) call resolves the argument in place, leaving the call itself untouched — the OTHER illegal-position shape the base grammar rejects', () => {
+      const out = tsPartialEval(
+        `function f() {
+           let a = 1n;
+           console.log(a > 0n ? 2n : 3n);
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('console.log(2n)');
+      expect(out).not.toContain('?');
+    });
+
+    it('a ternary passed as a call argument to an UNRESOLVABLE condition is left structurally intact', () => {
+      const out = tsPartialEval(
+        `function f(n) {
+           console.log(n > 0n ? 2n : 3n);
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('n > 0n ? 2n : 3n');
+    });
+
+    it('the RHS of a COMPOUND assignment (`+=`) is also routed through the ternary bridge — the tracked value updates, not just the printed text', () => {
+      // Before this fix, `evalCompoundAssignmentResult` called the bare `tsEvalConst` directly
+      // (never `evalLocalConst`), so a ternary RHS printed correctly (`substituteLocalReads`
+      // already collapsed it in the emitted code) but the TRACKED value stayed NAC — a
+      // subsequent read of `x` incorrectly stayed unfolded even though the emitted assignment
+      // was already a fully-resolved literal.
+      const out = tsPartialEval(
+        `function f() {
+           let x = 10n;
+           const cond = true;
+           x += cond ? 1n : 2n;
+           return x;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('x += 1n;');
+      expect(out).toContain('return 11n;');
+      expect(out).not.toContain('?');
+      expect(out).not.toContain('return x;');
+    });
+
+    it('a compound assignment with a genuinely UNRESOLVABLE ternary RHS correctly declines (NAC) — no false fold', () => {
+      const out = tsPartialEval(
+        `function f(cond) {
+           let x = 10n;
+           x += cond ? 1n : 2n;
+           return x;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('x += cond ? 1n : 2n;');
+      expect(out).toContain('return x;');
+    });
+  });
 });
 
 // ── tsPartialEval (effectively-const let/var detection — top-level scope only) ──
@@ -2330,5 +2525,84 @@ describe('ts-frontend compile() integration', () => {
 
     expect(result.bytecode.length).toBe(1);
     expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+  });
+
+  it('the LOCAL per-function pass folding a NESTED ternary (locally-known condition) is what makes an otherwise-illegal ternary position compile at all — the base SauceScript grammar only accepts a ternary directly in assignment/declaration position', () => {
+    // `(a > 0n ? 2n : 3n)` is NOT itself the whole assignment RHS here — it's nested inside
+    // a BinaryExpression (`... + 1n`) — a shape the base (acorn) processor's own
+    // `processExpression` rejects outright with "ternary must be used directly in an
+    // assignment" whenever a bare ConditionalExpression reaches it. `a > 0n` is resolvable
+    // through this pass's own local reasoning (`a` a plain local, not a top-level const), so
+    // `localConstPropagationTransformer` eliminates the ternary entirely before acorn ever
+    // sees it, and the program compiles.
+    const resolvable = `
+      function main() {
+        let a = 1n;
+        let b = (a > 0n ? 2n : 3n) + 1n;
+        return b;
+      }
+    `;
+
+    expect(() => compile(resolvable, { tsSource: true })).not.toThrow();
+
+    const result = compile(resolvable, { tsSource: true });
+
+    // Only `main` — no helper functions — proving the ternary was eliminated rather than,
+    // say, hoisted into some fallback runtime representation. (Not compared byte-for-byte to
+    // a bare `return 3n;` literal: dead-local-declaration elimination is explicitly out of
+    // scope for this pass — see its own "Out of scope, on purpose" note — so `let a = 1n;`
+    // is still emitted, just no longer READ; `tsPartialEval`'s own dedicated unit test above
+    // already pins the exact folded text, `let b = 3n; return 3n;`.)
+    expect(result.bytecode.length).toBe(1);
+
+    // The identical shape, except the condition depends on a genuine runtime parameter — this
+    // pass correctly declines to fold it (it can't be resolved), so the raw, still-nested
+    // ConditionalExpression reaches acorn unresolved and fails to compile with the SAME error
+    // a plain (non-tsSource) ternary-in-illegal-position source would.
+    const unresolvable = `
+      function main(n: bigint) {
+        let b = (n > 0n ? 2n : 3n) + 1n;
+        return b;
+      }
+    `;
+
+    expect(() => compile(unresolvable, { tsSource: true })).toThrow(/ternary must be used directly in an assignment/);
+  });
+
+  it('the LOCAL per-function pass folding a ternary passed AS A CALL ARGUMENT is the OTHER illegal-position shape the base grammar names — a ternary "passed as a call argument" is the second shape `processExpression` rejects outright, alongside the nested-BinaryExpression shape pinned above', () => {
+    const resolvable = `
+      function double(v) {
+        return v * 2n;
+      }
+      function main() {
+        let a = 1n;
+        let b = double(a > 0n ? 2n : 3n);
+        return b;
+      }
+    `;
+
+    expect(() => compile(resolvable, { tsSource: true })).not.toThrow();
+
+    const result = compile(resolvable, { tsSource: true });
+
+    // Only `main` — `double` is ALSO tsEvalCall-eligible (same-file, single-return,
+    // constant argument once the ternary resolves), so the whole chain collapses and no
+    // separate helper function survives to be called at runtime.
+    expect(result.bytecode.length).toBe(1);
+
+    // The identical shape, except the condition depends on a genuine runtime parameter — this
+    // pass correctly declines to fold it, so the raw ConditionalExpression-as-call-argument
+    // reaches acorn unresolved and fails with the SAME error the nested-BinaryExpression
+    // shape's unresolvable counterpart already throws above.
+    const unresolvable = `
+      function double(v) {
+        return v * 2n;
+      }
+      function main(n: bigint) {
+        return double(n > 0n ? 2n : 3n);
+      }
+    `;
+
+    expect(() => compile(unresolvable, { tsSource: true })).toThrow(/ternary must be used directly in an assignment/);
   });
 });
