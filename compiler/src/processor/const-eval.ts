@@ -1,4 +1,4 @@
-import type { Node, Expression } from 'acorn';
+import type { Node, Expression, Literal } from 'acorn';
 import type { CompilerContext } from '../context.js';
 
 // ── Compile-time constant evaluation (conditional compilation) ──
@@ -17,7 +17,7 @@ export function evalConst(node: Node | null | undefined, ctx: CompilerContext): 
 
   switch (node.type) {
     case 'Literal':
-      return literalToBigint((node as unknown as { value: unknown }).value);
+      return literalToBigint(node as unknown as Literal);
     case 'Identifier':
       return ctx.getConstant((node as unknown as { name: string }).name);
     case 'UnaryExpression':
@@ -38,13 +38,27 @@ export function evalConstBool(node: Node | null | undefined, ctx: CompilerContex
   return v === undefined ? undefined : v !== 0n;
 }
 
-function literalToBigint(value: unknown): bigint | undefined {
+function literalToBigint(literal: Literal): bigint | undefined {
+  const { value, raw } = literal;
+
   if (typeof value === 'bigint') return value;
 
   if (typeof value === 'boolean') return value ? 1n : 0n;
 
-  // Only integer numeric literals fold; a non-integer can't be a uint256 constant.
-  if (typeof value === 'number' && Number.isInteger(value)) return BigInt(value);
+  // Only integer numeric literals fold; a non-integer can't be a uint256 constant. Parse the
+  // literal's own SOURCE text (acorn's `raw`), never `value` — acorn itself already lossily
+  // rounds a suffix-less integer literal beyond Number.MAX_SAFE_INTEGER through a JS float at
+  // PARSE time (e.g. `0xffff...000000` in the real ecoswap `HIGH` mask), so `value` here can
+  // already be the WRONG number before this function ever runs. Mirrors
+  // `processor/expression.ts`'s `processLiteral`/`literalToInt`, which uses this exact
+  // `raw`-first pattern for the runtime-value emission path already.
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    try {
+      return BigInt(raw ?? value);
+    } catch {
+      return undefined;
+    }
+  }
 
   return undefined;
 }

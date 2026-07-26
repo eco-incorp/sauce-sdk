@@ -63,8 +63,22 @@ function tsEvalConst(node, consts, functions, shadowed) {
     if (ts.isBigIntLiteral(node))
         return BigInt(node.text.slice(0, -1)); // strip the "n" ts-evaluator's own BigInt() call rejects
     if (ts.isNumericLiteral(node)) {
-        const n = Number(node.text);
-        return Number.isInteger(n) ? BigInt(n) : undefined;
+        // `node.text` is NOT the literal's raw source text — the TS scanner normalizes a
+        // NumericLiteral's own `.text` through a lossy JS-`number` round-trip (confirmed: a
+        // suffix-less hex/decimal literal beyond Number.MAX_SAFE_INTEGER comes back as e.g.
+        // `"1.157920892373162e+77"`, already wrong before this function ever runs — reproduces
+        // even for a PLAIN decimal integer literal, not just hex). `getText()` returns the
+        // literal exactly as written (radix prefix intact, full digit string, no float
+        // round-trip), which `BigInt()` parses exactly; it throws for any non-integer form
+        // (float/exponential literal, or a numeric-separator underscore we strip first since a
+        // legal `1_000_000` must still fold) — a thrown/undefined result is the correct "can't
+        // fold this" outcome here, matching the old `Number.isInteger` reject path it replaces.
+        try {
+            return BigInt(node.getText().replace(/_/g, ''));
+        }
+        catch {
+            return undefined;
+        }
     }
     if (node.kind === ts.SyntaxKind.TrueKeyword)
         return 1n;
@@ -708,9 +722,25 @@ function foldTransformer(consts, functions) {
                     if (ts.isBlock(taken)) {
                         const names = new Set(shadowed);
                         collectDirectlyDeclaredNames(taken.statements, names);
-                        return foldStatementList(taken.statements, consts, functions, names, context, visit);
+                        const result = foldStatementList(taken.statements, consts, functions, names, context, visit);
+                        // A taken branch's OWN `let`/`const`/nested-`function` (an entirely ordinary
+                        // shape — `if (true) { let x = 2n; ... }`) would otherwise duplicate an
+                        // already-declared name once spliced directly into the SAME enclosing statement
+                        // list (e.g. an outer `let x = 1n;` before this `if`) — invalid to emit, the
+                        // identical root cause (splicing into an enclosing scope without checking for a
+                        // collision) as the loop-unroll crash `collidesWithSurroundingDeclarations` was
+                        // added for; reused here unchanged. Checked against the ORIGINAL outer `shadowed`
+                        // (not the branch-extended `names`, which would trivially "collide" with itself).
+                        // A collision bails to the well-tested "if stays real runtime code" path (falls
+                        // through to the generic `ts.visitEachChild` below, which visits the Block via
+                        // its own `ts.isBlock` case — a genuine nested scope, so no collision there)
+                        // rather than handing back output the next compile stage can't even parse.
+                        if (!collidesWithSurroundingDeclarations(result, shadowed))
+                            return result;
                     }
-                    return visit(taken, shadowed);
+                    else {
+                        return visit(taken, shadowed);
+                    }
                 }
             }
             else if (ts.isConditionalExpression(node)) {
