@@ -227,6 +227,34 @@ describe('tsPartialEval (loop unrolling)', () => {
 
     expect(out).toContain('for (');
   });
+
+  it('bails (leaves the loop as real runtime code) when the body declares its OWN per-iteration local — unrolling splices N copies of the body directly into the enclosing statement list, so duplicating a non-counter `let`/`const` would produce invalid JS the next compile stage cannot even parse', () => {
+    // Regression: before this fix, `unrollCountingLoop` spliced the substituted body straight
+    // into the surrounding list regardless of what else it declared, producing (for this
+    // example) THREE adjacent `let doubled = ...;` statements in the same scope —
+    // `ts.transpileModule`'s printer happily printed that text, but `acorn.parse` (the very
+    // next compile() stage) threw `SyntaxError: Identifier 'doubled' has already been declared`.
+    const out = tsPartialEval(
+      `let total = 0n;\nfor (let i = 0n; i < 3n; i++) { let doubled = i * 2n; total = total + doubled; }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('for (');
+    expect(out.match(/let doubled/g)?.length).toBe(1); // the ORIGINAL declaration, never duplicated
+  });
+
+  it('bails even for a SINGLE unrolled iteration when the body-declared local collides with an OUTER, already-declared name of the same text (an enclosing FUNCTION scope, where sibling declarations ARE tracked in `shadowed` — unlike the top-level source-file scope, which never reserves its own sibling names this way)', () => {
+    // A single iteration wouldn't duplicate anything WITHIN the unroll itself, but it would
+    // still redeclare a name already reserved by the enclosing (function) scope — equally
+    // invalid to emit, and equally guarded against via `collidesWithSurroundingDeclarations`'s
+    // `outerNames` parameter (here, the function body Block's own pre-computed `shadowed` set).
+    const out = tsPartialEval(
+      `function f() {\n  let doubled = 999n;\n  let total = 0n;\n  for (let i = 0n; i < 1n; i++) { let doubled = i * 2n; total = total + doubled; }\n  return total;\n}`,
+      'f.ts',
+    );
+
+    expect(out).toContain('for (');
+  });
 });
 
 describe('tsPartialEval (while-loop unrolling — the counting idiom, reusing the for-loop unroller)', () => {
@@ -282,6 +310,14 @@ describe('tsPartialEval (while-loop unrolling — the counting idiom, reusing th
     const out = tsPartialEval(code, 'f.ts');
 
     expect(out).toContain('while (');
+  });
+
+  it('bails (leaves the loop as real runtime code) when the body declares its OWN per-iteration local — same crash class as the numeric for-loop unroller, same fix (both share `unrollCountingLoop`)', () => {
+    const code = `let total = 0n;\nlet i = 0n;\nwhile (i < 3n) { let doubled = i * 2n; total = total + doubled; i++; }`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('while (');
+    expect(out.match(/let doubled/g)?.length).toBe(1);
   });
 
   it('cascades: a nested countdown while inside an unrolled for loop fully resolves', () => {
@@ -853,6 +889,39 @@ describe('tsPartialEval (foldTransformer never folds a shadowed identifier again
     // "no gratuitous rewrite" contract), never the wrong `3n`.
     expect(out).not.toContain('console.log(3n)');
     expect(out).toContain('console.log(9n + 1n);');
+  });
+
+  it('a same-named `let`/`const` FIRST introduced INSIDE an if-branch shadows a top-level const for a BINARY/CALL read AFTER the branch too — not just a bare identifier read', () => {
+    // Regression: `constPropagationTransformer`'s `substituteConstReads` already covers a bare
+    // identifier read after the branch (see the "constant propagation" describe block's own
+    // "shadows a top-level const for the REST of the function too" test), but `foldTransformer`
+    // itself — which folds a BinaryExpression/CallExpression DIRECTLY, before that later pass
+    // ever runs — had its OWN, separate shadow computation that only ever called
+    // `collectVarNames` (var-hoisted names only), never `collectLexicalNamesInScope`. So
+    // `RATE + 1n`, itself an `isFoldableValueExpression` foldTransformer resolves on its own,
+    // was wrongly folded straight to the OUTER `RATE = 5n`'s value (`return 6n;`) regardless of
+    // `cond`, even though `RATE` is locally shadowed by the branch's own `let RATE = 999n;` for
+    // the rest of the function (confirmed reachable, including via real EVM execution, before
+    // this fix).
+    const binaryOut = tsPartialEval(
+      `const RATE = 5n;\nfunction f(cond) {\n  if (cond) {\n    let RATE = 999n;\n  }\n  return RATE + 1n;\n}`,
+      'f.ts',
+    );
+
+    expect(binaryOut).toContain('return RATE + 1n;');
+    expect(binaryOut).not.toContain('return 6n;');
+
+    // Same root cause, reached via a CallExpression argument instead of a BinaryExpression:
+    // `tsEvalCall` evaluates each argument against the SAME `shadowed` set `foldTransformer`
+    // computed for the call site, so an under-shadowed set lets a shadowed argument resolve
+    // against the wrong (outer) const too.
+    const callOut = tsPartialEval(
+      `const RATE = 5n;\nfunction double(x) { return x * 2n; }\nfunction f(cond) {\n  if (cond) {\n    let RATE = 999n;\n  }\n  return double(RATE);\n}`,
+      'f.ts',
+    );
+
+    expect(callOut).toContain('return double(RATE);');
+    expect(callOut).not.toContain('return 10n;');
   });
 });
 
@@ -1682,6 +1751,26 @@ describe('tsPartialEval (array/object lookup-table folding)', () => {
     expect(out).toContain('const ARR = [1n, 2n];');
   });
 
+  it('a same-named `let` FIRST introduced INSIDE an if-branch shadows a top-level table for a read AFTER the branch too — mirrors the scalar-const fix, ported to table-fold', () => {
+    // Regression: `checkTableSafety`/`tableFoldTransformer`'s own shadow computation (like
+    // `foldTransformer`'s, above) only ever called `collectVarNames` (var-hoisted names only),
+    // never `collectLexicalNamesInScope` — so a table name FIRST `let`-declared inside a nested
+    // if/while branch was invisible to it once control passed the branch's closing brace. A
+    // table access in a SIBLING statement after the branch was then wrongly treated as an
+    // unshadowed read of the OUTER top-level table by BOTH the safety scan and the fold itself.
+    const arrayCode = `const TABLE = [10n, 20n, 30n];\nfunction f(cond) {\n  if (cond) {\n    let TABLE = [1n, 2n, 3n];\n  }\n  return TABLE[1n] + 0n;\n}`;
+    const arrayOut = tsPartialEval(arrayCode, 'f.ts');
+
+    expect(arrayOut).toContain('return TABLE[1n] + 0n;'); // NOT folded to `20n + 0n;`
+    expect(arrayOut).not.toContain('20n + 0n');
+
+    const objectCode = `const RATE = { a: 1n, b: 2n };\nfunction f(cond) {\n  if (cond) {\n    let RATE = { a: 99n, b: 99n };\n  }\n  return RATE.a;\n}`;
+    const objectOut = tsPartialEval(objectCode, 'f.ts');
+
+    expect(objectOut).toContain('return RATE.a;'); // NOT folded to `1n;`
+    expect(objectOut).not.toContain('return 1n;');
+  });
+
   it('a nested array/object literal ("a table of tables") is never a candidate — left completely untouched (explicitly out of scope)', () => {
     const code = `const TBL = [[1n, 2n], [3n, 4n]];\nconsole.log(TBL[0n]);`;
     const out = tsPartialEval(code, 'f.ts');
@@ -1786,6 +1875,17 @@ describe('tsPartialEval (array/object lookup-table folding)', () => {
 
       expect(out).toContain('for (const fee of FEES)');
       expect(out).toContain('const FEES');
+    });
+
+    it('bails (leaves the for-of as real runtime code) when the body declares its OWN per-iteration local — same crash class as the numeric for/while unroller (splicing N copies of the body directly into the enclosing list would otherwise duplicate a non-loop-variable `let`/`const`)', () => {
+      const out = tsPartialEval(
+        `const TABLE = [10n, 20n, 30n];\nlet total = 0n;\nfor (const x of TABLE) { let doubled = x * 2n; total = total + doubled; }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('for (const x of TABLE)');
+      expect(out).toContain('const TABLE');
+      expect(out.match(/let doubled/g)?.length).toBe(1);
     });
 
     it('a for-of iteration over a table does not disqualify its OTHER, independent index-access reads elsewhere', () => {
@@ -2023,6 +2123,34 @@ describe('ts-frontend compile() integration', () => {
 
     expect(Array.from(runtime.bytecode[0])).toContain(OPS.JUMP_BACK);
     expect(Array.from(unrolled.bytecode[0])).not.toContain(OPS.JUMP_BACK);
+  });
+
+  it('a countable loop whose body declares its OWN per-iteration local (not the counter) compiles fine — falls back to a real runtime loop rather than crashing acorn.parse on a duplicated declaration', () => {
+    // Regression: before the fix, unrolling spliced N copies of the body — including its own
+    // `let doubled = ...;` — directly into the enclosing statement list with no per-iteration
+    // Block scope, so `ts.transpileModule`'s printed text had 3 adjacent `let doubled` decls;
+    // the very next stage, `acorn.parse`, rejected that with `SyntaxError: Identifier 'doubled'
+    // has already been declared`. `unrollCountingLoop` now declines to unroll instead (falls
+    // back to the well-tested real-JUMP_BACK-loop path), so this compiles successfully — with
+    // its own per-iteration `let` scope intact, exactly like the plain (non-tsSource) pipeline.
+    const source = `
+      function main() {
+        let total = 0n;
+        for (let i = 0n; i < 3n; i++) {
+          let doubled = i * 2n;
+          total = total + doubled;
+        }
+        return total;
+      }
+    `;
+
+    expect(() => compile(source, { tsSource: true })).not.toThrow();
+
+    const unrolled = compile(source, { tsSource: true });
+    const runtime = compile(source); // plain acorn path — never touched by this bug either way
+
+    expect(Array.from(unrolled.bytecode[0])).toContain(OPS.JUMP_BACK); // declined to unroll
+    expect(Array.from(runtime.bytecode[0])).toContain(OPS.JUMP_BACK);
   });
 
   it('CompileOptions.tsSource unrolls a for-of over a lookup table — a construct plain acorn cannot even PARSE, not just a bytecode-shape difference', () => {
