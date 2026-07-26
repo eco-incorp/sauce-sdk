@@ -108,4 +108,28 @@ describe('integration: control-flow', () => {
   it('throw: no revert when condition false', () => {
     expect(BigInt(cook('function main() { if (1 === 2) { throw "fail"; } return 42; }'))).toBe(42n);
   });
+
+  it('a top-level const from a huge suffix-less numeric literal folds an if-condition using its EXACT value (regression: const-eval.ts used to round it via a lossy Number(...) round-trip)', () => {
+    // Regression: `processor/const-eval.ts`'s `literalToBigint` only ever received acorn's
+    // OWN parsed `.value` — already a lossy JS `number` for any suffix-less integer literal
+    // beyond Number.MAX_SAFE_INTEGER (acorn itself parses the literal's numeric text into a
+    // float at PARSE time) — so a top-level `const`'s registered compile-time value silently
+    // rounded to the nearest representable double, corrupting both the runtime read
+    // (`ctx.getConstant`, `processExpression`'s Identifier case) AND any if/ternary condition
+    // folded against it — on a PLAIN `.js`/`.sauce` source, no ts-frontend/`tsSource`
+    // involved at all. `2^200 + 12345` is deliberately NOT a round power of 2 so a lossy
+    // round-trip is observable (it rounds the `+ 12345` away entirely): before the fix, `X`
+    // registered as `2^200` exactly, so `X === (2^200 + 12345)n` was false at runtime and
+    // this test took the `return 222n;` branch instead.
+    const trueValue = 2n ** 200n + 12345n;
+    const source = `
+      const X = ${trueValue.toString()};
+      function main() {
+        if (X === ${trueValue.toString()}n) { return 111n; }
+        return 222n;
+      }
+    `;
+
+    expect(BigInt(cook(source))).toBe(111n);
+  });
 });

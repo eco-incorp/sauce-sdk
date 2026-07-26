@@ -67,4 +67,25 @@ describe('literal', () => {
       expect(bytecodeHex).toContain('20000000000000');
     });
   });
+
+  describe('compile-time constant evaluation (const-eval.ts) precision', () => {
+    // The tests above pin the RUNTIME-value emission path (processLiteral/literalToInt),
+    // which already parsed a literal's `.raw` source text correctly. `const-eval.ts`'s
+    // `literalToBigint` is a SEPARATE evaluator (registerTopLevelConsts -> ctx.getConstant,
+    // consulted for every top-level `const` read AND if/ternary branch folding) that used to
+    // receive only acorn's own already-lossy `.value` for a suffix-less huge numeric literal
+    // — reproduces on a PLAIN `.js`/`.sauce` source, no ts-frontend involved at all.
+    it('a top-level const from a huge suffix-less numeric literal preserves full precision when read as a runtime value', () => {
+      // 2^200 + 12345 is deliberately NOT a round power of 2 so a lossy Number round-trip is
+      // detectable (it would drop the `+ 12345` entirely, rounding to 2^200).
+      const trueValue = 2n ** 200n + 12345n;
+      const source = `
+        const X = ${trueValue.toString()};
+        function main() { return X; }
+      `;
+      const hex = Buffer.from(compile(source).bytecode[0]).toString('hex');
+
+      expect(hex).toContain(trueValue.toString(16));
+    });
+  });
 });

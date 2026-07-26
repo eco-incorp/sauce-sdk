@@ -64,6 +64,44 @@ describe('integration: inline functions — real execution', () => {
     expect(inlineResult).toBe(realFnResult);
   });
 
+  // Regression: the fixtures above append `n` to HIGH (`${HIGH}n`) rather than using the
+  // suffix-less literal form the real ecoswap recipe actually ships
+  // (`const HIGH: Uint256 = 0xffff...000000;` — no `n` suffix, only a `: Uint256` type
+  // annotation, which requires `tsSource: true`/a `.ts` source to even parse). Both
+  // ts-frontend's `tsEvalConst` (the ts.Node evaluator) and acorn's own `const-eval.ts`
+  // used to parse a suffix-less numeric literal beyond Number.MAX_SAFE_INTEGER through a
+  // LOSSY `Number(...)` round-trip: this exact mask (`2^256 - 2^24`) rounded UP to exactly
+  // `2^256` under that bug, so `tickArg` compiled via `tsSource: true` threw `value exceeds
+  // 32 bytes (uint256 max)` at compile time even though the source is valid SauceScript.
+  // Now fixed (both evaluators parse the literal's own raw source text via `BigInt(...)`
+  // instead), this must compile AND execute identically to the `n`-suffixed baseline above.
+  const tickArgTsSourceSrc = `
+    const tickArg = (shifted: bigint, OFFSET: bigint) => {
+      const HIGH: bigint = ${HIGH};
+      if (shifted >= OFFSET) {
+        const up = shifted - OFFSET;
+        if (up >= 8388608n) {
+          return up | HIGH;
+        }
+        return up;
+      }
+      return Math.neg(OFFSET - shifted) | HIGH;
+    };
+    function main(shifted: bigint, OFFSET: bigint) { return tickArg(shifted, OFFSET); }
+  `;
+
+  it.each(tickArgCases)(
+    'tickArg(%s, %s): suffix-less HIGH literal via tsSource compiles and matches the n-suffixed baseline (regression)',
+    (shifted, offset) => {
+      expect(() => cook(tickArgTsSourceSrc, { args: [shifted, offset], tsSource: true })).not.toThrow();
+
+      const tsSourceResult = cook(tickArgTsSourceSrc, { args: [shifted, offset], tsSource: true });
+      const realFnResult = cook(tickArgRealFnSrc, { args: [shifted, offset] });
+
+      expect(tsSourceResult).toBe(realFnResult);
+    },
+  );
+
   const kyberOutInlineSrc = `
     const kyberOut = (amt, kfee, kVin, kVout, PRECISION) => {
       const inWithFee = Math.mulDiv(amt, PRECISION - kfee, PRECISION);

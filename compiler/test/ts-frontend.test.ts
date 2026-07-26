@@ -135,6 +135,119 @@ describe('tsPartialEval (direct unit tests)', () => {
 
     expect(out).toContain('x += 5;');
   });
+
+  describe('numeric literal precision (tsEvalConst)', () => {
+    // Regression: `ts.NumericLiteral.text` is NOT the literal's raw source text — the TS
+    // scanner normalizes it through a lossy JS-`number` round-trip (confirmed: a suffix-less
+    // hex/decimal literal beyond Number.MAX_SAFE_INTEGER comes back from `.text` as e.g.
+    // "1.157920892373162e+77", already wrong). `tsEvalConst`'s `ts.isNumericLiteral` branch
+    // used to fold via `Number(node.text)`, silently corrupting any such literal used as a
+    // top-level const, an effectively-const let/var, a function-local constant-propagated
+    // value, or a loop bound. Now parses `node.getText()` (the literal exactly as written)
+    // through `BigInt(...)` instead.
+    it('folds a huge suffix-less HEX literal (beyond Number.MAX_SAFE_INTEGER) to its EXACT value', () => {
+      // The real ecoswap `HIGH` mask (sauce-recipes/ecoswap/ecoswap.sauce.ts ~line 267):
+      // 2^256 - 2^24, legally in-range for uint256. Under the lossy-Number bug this rounded
+      // UP to exactly 2^256 (one past uint256 max).
+      const trueValue = 2n ** 256n - 2n ** 24n;
+      const out = tsPartialEval(`const HIGH = ${'0x' + trueValue.toString(16)};\nconsole.log(HIGH);`, 'f.ts');
+
+      expect(out).toContain(`console.log(${trueValue.toString()}n)`);
+    });
+
+    it('folds a huge suffix-less DECIMAL literal (beyond Number.MAX_SAFE_INTEGER) to its EXACT value', () => {
+      // Deliberately NOT a round power of 2 so a lossy Number round-trip is observable (it
+      // would drop the `+ 12345` entirely).
+      const trueValue = 2n ** 200n + 12345n;
+      const out = tsPartialEval(`const X = ${trueValue.toString()};\nconsole.log(X);`, 'f.ts');
+
+      expect(out).toContain(`console.log(${trueValue.toString()}n)`);
+    });
+
+    it('still folds an ordinary small numeric literal (unaffected by the fix)', () => {
+      const out = tsPartialEval(`const X = 42;\nconsole.log(X);`, 'f.ts');
+
+      expect(out).toContain('console.log(42n)');
+    });
+
+    it('still folds a literal with numeric separators', () => {
+      const out = tsPartialEval(`const X = 1_000_000;\nconsole.log(X);`, 'f.ts');
+
+      expect(out).toContain('console.log(1000000n)');
+    });
+
+    it('still fails closed (does not fold, does not throw) on a non-integer literal — a floating-point value', () => {
+      // Not foldable, so `X` is never registered as a compile-time constant: neither the
+      // read (`console.log(X)`) nor the declaration itself is touched at all.
+      const code = `const X = 1.5;\nconsole.log(X);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const X = 1.5;');
+      expect(out).toContain('console.log(X);');
+    });
+
+    it('still fails closed (does not fold, does not throw) on a non-integer literal — exponential notation', () => {
+      // Number.isInteger(1e21) is true (it's a whole-number-VALUED float) but BigInt("1e21")
+      // throws — correctly declining to fold rather than silently computing a rounded value
+      // the way the old Number(node.text) + Number.isInteger check would have.
+      const code = `const X = 1e21;\nconsole.log(X);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const X = 1e21;');
+      expect(out).toContain('console.log(X);');
+    });
+  });
+});
+
+describe('tsPartialEval (if-branch flattening — collision with a surrounding declaration)', () => {
+  // Regression: `foldTransformer`'s if-statement branch-flattening splices a taken
+  // `if (true) { ... }` / `if (false) { ... } else { ... }` branch's OWN statements directly
+  // into the enclosing statement list (Block.statements/SourceFile.statements) — the
+  // identical root-cause shape (splicing into an enclosing scope without checking for a name
+  // collision) as the loop-unroll crash `collidesWithSurroundingDeclarations` was added for,
+  // but in this separate code path. Before this fix, a taken branch's OWN `let`/`const` of
+  // the SAME name as something already declared in the enclosing scope (an entirely ordinary
+  // shape) produced two adjacent declarations of that name in the SAME flattened scope —
+  // `ts.transpileModule`'s printer happily printed that text, but `acorn.parse` (the very
+  // next compile() stage) then threw `SyntaxError: Identifier 'x' has already been declared`.
+  it('bails (leaves the if as real runtime code) when the taken branch redeclares an OUTER already-declared name', () => {
+    // Wrapped in a function: a bare top-level (SourceFile-level) statement list never
+    // reserves its OWN sibling declarations into `shadowed` (a separate, pre-existing,
+    // deliberate asymmetry vs. a function/block's own body scan — see the loop-unroll
+    // collision tests above for the same requirement), so the collision guard needs an
+    // enclosing FUNCTION scope to see the outer `let x` as already-declared.
+    const code = `function f() {\n  let x = 1n;\n  if (true) {\n    let x = 2n;\n    x = x + 1n;\n  }\n  console.log(x);\n}`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('if ('); // NOT flattened — the collision guard declined
+  });
+
+  it('the same collision shape via the compile() pipeline compiles without throwing (real repro, end to end)', () => {
+    const source = `function main() {
+      let x = 1n;
+      if (true) {
+        let x = 2n;
+        x = x + 1n;
+      }
+      return x;
+    }`;
+
+    expect(() => compile(source, { tsSource: true })).not.toThrow();
+  });
+
+  it('the same collision shape gated on the ELSE branch also bails', () => {
+    const code = `function f() {\n  let x = 1n;\n  if (false) {\n    console.log(0n);\n  } else {\n    let x = 2n;\n    x = x + 1n;\n  }\n  console.log(x);\n}`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('if (');
+  });
+
+  it('a taken branch declaring its OWN local that does NOT collide with anything outer still flattens normally (no regression)', () => {
+    const out = tsPartialEval(`if (true) {\n  let y = 5n;\n  console.log(y);\n}`, 'f.ts');
+
+    expect(out).not.toContain('if (');
+    expect(out).toContain('let y = 5n;');
+  });
 });
 
 describe('tsPartialEval (loop unrolling)', () => {
