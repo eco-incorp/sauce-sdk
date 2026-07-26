@@ -96,6 +96,63 @@ inference); `src/saucer/` emits bytecode (`Saucer` builder, `ops.ts` opcode tabl
 `src/context.ts` tracks functions/var kinds/ABIs; `src/contracts.ts` loads contract ABIs from artifact
 JSON for `import { X } from "./X.json"` + `.at()/.view()/.lib()` binding.
 
+**TS front-end (`src/ts-frontend.ts`) — `.ts`/`.sauce.ts` sources/imports only.** The core pipeline
+is acorn-only; a `.ts`/`.sauce.ts` source opts into a front-end that runs strictly BEFORE acorn: it
+parses with the real `typescript` compiler, folds provably-constant `if`/ternary branches, literal
+expressions, and countable `for` loops, then strips types via `ts.transpileModule` — handing acorn
+plain JS text. Wired at both the import seam (`ctx.transformModule`, default for any resolved
+`.ts`-suffixed module — a caller-supplied `transformModule` always overrides it) and the top level
+(`CompileOptions.tsSource`).
+
+TWO evaluators, layered: `tsEvalConst` (a hand-rolled bigint evaluator mirroring
+`processor/const-eval.ts`, retargeted to `ts.Node`) is the PRIMARY one — because
+**`ts-evaluator@2.0.0` cannot reliably evaluate bigint arithmetic at all** (`BigInt(node.text)` on a
+bare BigInt literal like `"3n"` throws — the constructor rejects the literal's own `n` suffix — and
+bigint binary expressions just fail silently), and SauceScript is bigint-only, so `ts-evaluator`'s
+`evaluate()` (`tryEvaluate`) is only a fallback for shapes `tsEvalConst` doesn't cover (bare
+boolean/string identifiers, ternaries-as-values, templates — same-file identifiers only, no
+`ts.Program`/checker is built, so it can't see into array/object property access or function calls
+either — that scope boundary is why loop unrolling can't (yet) fold real array/object DATA
+processing, only countable counters). A failed/unresolvable fold always leaves the node untouched
+(fails closed, never throws) — `tryEvaluate` wraps `evaluate()` in try/catch for whatever still
+reaches it with a bigint present (e.g. a template literal substitution).
+
+**Loop unrolling**: a `for` loop with a constant start/bound/step (`i++`/`i--`/`i +=
+step`/`i -= step`/`i = i +/- step`, compared against a same-file `const` or literal bound) unrolls
+into N copies of its body with the counter substituted by its per-iteration literal — capped at
+`MAX_UNROLL_ITERATIONS` (256) so it can't blow up bytecode size; over the cap, or a
+non-canonical/non-constant shape, or a body containing `break`/`continue`/`return` or shadowing the
+counter name, leaves the loop as real runtime code (`JUMP_BACK`) untouched. The SAME counting-loop
+core (`unrollCountingLoop`) also recognizes the `while` spelling of the identical idiom — a `while`
+has no init/incrementor clauses of its own, so it's the pairing `let i = <const>; while (i <cmp>
+bound) { ...; i +/- step; }` (the increment as the body's own last statement) that's matched, at the
+statement-LIST level (`foldStatementList`, since eliding the pair replaces two adjacent statements
+with N — a single-node visitor can't express that). Unrolling a `while` this way ELIDES the counter
+declaration entirely, so it only fires when nothing after the loop still reads the counter (a
+"found index" pattern must keep the loop as-is) — checked by scanning the rest of the enclosing
+statement list. Each unrolled iteration re-enters the fold pass, so a nested `if`/inner loop keyed
+on the counter cascades to a fully-resolved literal per iteration (e.g. a nested `while` inside an
+unrolled `for` fully resolves both loops to straight-line arithmetic, no loop opcodes emitted at
+all). Plain `.js`/`.sauce` sources never invoke any of this.
+
+**Known limitation (not fixed)**: this only folds compile-time-known COUNTERS/BOUNDS, not real
+array/object DATA processing (`arr[i]`, `.push()`, `for...of`) — ts-evaluator's no-checker mode
+can't resolve property/array access or function calls at all, and a full `ts.Program`/TypeChecker
+is a much bigger lift, out of scope here. Folding is also purely LOCAL: a chain of plain `let`/
+reassignment (`a = 1; b = a + 3; console.log(b)`) is untouched (`consts` only tracks same-file
+`const` declarations), and even a `const` chain (`const a = 1; const b = a + 3;`) only folds each
+initializer — it never substitutes a resolved const into a later bare-identifier READ (e.g.
+`console.log(b)` stays `console.log(b)`, not `console.log(4n)`) and never removes a now-unused
+intermediate declaration.
+
+**Assignment expressions are never folded.** The TS AST represents `=`/`+=`/etc. as a
+`BinaryExpression`, and `ts-evaluator`'s `evaluate()` "succeeds" on a bare assignment (e.g.
+`evaluate(a = 1)` → `{success: true, value: 1}`), which would silently discard the assignment's
+side effect if treated as an ordinary foldable value expression (rewriting `a = 1;` to bare `1;`).
+`foldExpression` guards against this up front via an `ASSIGNMENT_OPERATOR_TOKENS` check — a
+`BinaryExpression` using any assignment-family operator token always fails closed before either
+evaluator runs, so `a = 1` (and `if (a = 1)`) are left untouched.
+
 **Compile cache (`src/cache.ts`) — ON BY DEFAULT** — `compile()` is a pure function of (source,
 options, on-disk import contents), so it memoizes: a repeat `(source, options)` returns a cached
 `CompileResult` instead of recompiling (~9× on recurring compiles). `options.cache`: omitted/`true`
