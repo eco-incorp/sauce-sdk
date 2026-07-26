@@ -162,6 +162,9 @@ function tsEvalBinary(node, consts, functions, shadowed) {
             return undefined;
     }
 }
+// `collectTopLevelConsts` (real `const` only) has grown into `analyzeTopLevelConsts`, defined
+// further down (after the shadow-tracking helpers it now shares with `substituteConstReads`) —
+// see the "effectively-const `let`/`var` detection" section below for the full story.
 /**
  * True if a CallExpression or NewExpression occurs anywhere in `node`, including `node`
  * itself. A same-file top-level function is only ever a call-folding candidate when its body
@@ -300,24 +303,6 @@ function collectTopLevelFunctions(sourceFile) {
             functions.set(stmt.name.text, stmt);
     }
     return functions;
-}
-/** Every same-file top-level `const NAME = <literal>`, resolved in declaration order. */
-function collectTopLevelConsts(sourceFile, functions) {
-    const consts = new Map();
-    for (const stmt of sourceFile.statements) {
-        if (!ts.isVariableStatement(stmt))
-            continue;
-        if (!(stmt.declarationList.flags & ts.NodeFlags.Const))
-            continue;
-        for (const decl of stmt.declarationList.declarations) {
-            if (!ts.isIdentifier(decl.name) || !decl.initializer)
-                continue;
-            const value = tsEvalConst(decl.initializer, consts, functions, EMPTY_SHADOW);
-            if (value !== undefined)
-                consts.set(decl.name.text, value);
-        }
-    }
-    return consts;
 }
 /**
  * Every JS/TS assignment-operator token — `=`, `+=`, `&&=`, etc. A BinaryExpression using
@@ -1060,11 +1045,21 @@ function substituteConstReads(node, shadowed, consts, context) {
     }
     if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
         const names = new Set(shadowed);
+        let visitedInit;
         if (ts.isVariableDeclarationList(node.initializer)) {
             for (const decl of node.initializer.declarations)
                 collectBindingNames(decl.name, names);
+            visitedInit = visit(node.initializer, names);
         }
-        const visitedInit = visit(node.initializer, names);
+        else {
+            // Reusing an EXISTING binding as the loop target (`for (x of arr)`, `for (x in obj)`, or a
+            // destructuring reuse `for ([x, y] of pairs)`/`for ({val: x} of arr)`) is a genuine WRITE
+            // on every iteration, never a read — route it through the same assignment-target visitor
+            // every other write shape in this file already uses, instead of treating it as an ordinary
+            // read position (which would let a tracked const/effectively-const name get substituted
+            // into the loop's own binding target).
+            visitedInit = visitAssignmentTarget(node.initializer, names, consts, context);
+        }
         const visitedStmt = visit(node.statement, names);
         // The iterated/enumerated expression is evaluated in the OUTER scope — it can never see
         // the loop's own declaration, regardless of TDZ (it runs once, before any iteration binds).
@@ -1078,6 +1073,347 @@ function substituteConstReads(node, shadowed, consts, context) {
     }
     return ts.visitEachChild(node, (child) => visit(child), context);
 }
+// ── Effectively-const `let`/`var` detection (top-level scope only) ──
+//
+// A top-level `let`/`var` that is WRITTEN EXACTLY ONCE across its entire (shadow-respecting)
+// visible scope is semantically indistinguishable from a `const` — nothing downstream can ever
+// observe a second value, so folding it into the exact same `consts` map real top-level
+// `const`s already use is just as sound (the standard "effectively final" analysis — the same
+// rule Java applies to lambda capture). Two shapes are recognized, both scoped to TOP-LEVEL
+// declarations only (the identical scope boundary real `const` tracking already uses — a
+// function-local/nested-scope `let` is out of scope here, same as before):
+//
+//  1. PRIMARY — `let x = <init>;` (or `var`) where `x` is never written again anywhere in the
+//     file. Handled by `analyzeTopLevelConsts` below in exactly the same pass, and exactly the
+//     same way, as a real top-level `const` — added to `consts`, later eliminated by
+//     `deadConstEliminationTransformer` once every read has been substituted away.
+//  2. STRETCH — the two-statement idiom `let x; x = <init>;` (a bare predeclaration —
+//     `NodeFlags.Let`/`Var`, no initializer — immediately... not necessarily ADJACENT, but
+//     both statements are direct, unconditional members of the SAME top-level statement list,
+//     e.g. the multi-declarator `let a, b, c;` followed by three separate later top-level
+//     assignments). Recognized ONLY when the declaration and its sole assignment are both
+//     direct `sourceFile.statements` entries (never nested inside an `if`/`for`/`while`/
+//     function/block) — a conditional or nested assignment is never even considered, let alone
+//     folded. This is a genuinely new kind of elimination: it removes a STATEMENT PAIR (the
+//     predeclaration's now-empty declarator + its one assignment statement), not a single
+//     declarator — handled by `deadConstEliminationTransformer` alongside (but structurally
+//     distinct from) the existing single-declaration removal.
+//
+// CRITICAL SOUNDNESS RULE: "written exactly once/never again" is a flat SYNTACTIC count of
+// every assignment/compound-assignment/update-expression/destructuring-assignment target
+// anywhere in the file that resolves (respecting lexical shadowing) to that top-level binding —
+// NOT a reachability analysis. A second write inside an `if`/loop/function that might never
+// execute at runtime still counts and still disqualifies the name; this is the conservative,
+// sound rule the task requires (a syntactic "does ANY write exist" check), mirroring how the
+// existing scope-shadowing analysis above is already computed once, up front, per scope.
+//
+// Interaction with the existing while-loop-unroll pairing (`foldStatementList` /
+// `tryUnrollCountingWhile`, which ALSO recognizes an adjacent `[counter decl, while] `
+// statement pair): a genuine loop counter is, by construction, written again inside the loop
+// body (its own increment) — so PRIMARY's "zero further writes" check always disqualifies it
+// before it can ever reach `consts`, regardless of whether the counter is declared with or
+// without an initializer. STRETCH only ever matches a NO-initializer predeclaration, which
+// `tryUnrollCountingWhile`'s `prev` shape never accepts anyway (it requires `decl.initializer`).
+// And since `consts` here is fully precomputed ONCE, before `foldTransformer` (and therefore the
+// while-unroll pass) ever runs, there is no ordering race between the two mechanisms — a name
+// can only ever be claimed by one of them, decided purely by whether it's ever written again.
+/**
+ * Every bare-Identifier WRITE TARGET reachable from a (possibly nested/destructuring)
+ * assignment-target expression — the same recursive shape `visitAssignmentTarget` above already
+ * walks (a destructuring-assignment pattern reuses ordinary object/array-literal node kinds), but
+ * this COLLECTS rather than substitutes: reports every leaf Identifier actually being written to.
+ * A `PropertyAccessExpression`/`ElementAccessExpression` target (`obj.x = …`) writes a PROPERTY
+ * of `obj`, never the variable `obj` itself — mirroring `visitAssignmentTarget`'s treatment of
+ * that position as a nested READ (irrelevant here: a read is never a write).
+ */
+function collectAssignmentTargetIdentifiers(node, report) {
+    if (ts.isParenthesizedExpression(node)) {
+        collectAssignmentTargetIdentifiers(node.expression, report);
+        return;
+    }
+    if (ts.isIdentifier(node)) {
+        report(node.text);
+        return;
+    }
+    if (ts.isOmittedExpression(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+        return; // a property write, or a hole in an array pattern — never a variable write
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+        for (const el of node.elements) {
+            collectAssignmentTargetIdentifiers(ts.isSpreadElement(el) ? el.expression : el, report);
+        }
+        return;
+    }
+    if (ts.isObjectLiteralExpression(node)) {
+        for (const prop of node.properties) {
+            if (ts.isShorthandPropertyAssignment(prop))
+                report(prop.name.text); // `{ a }` as a target writes `a`
+            else if (ts.isPropertyAssignment(prop))
+                collectAssignmentTargetIdentifiers(prop.initializer, report);
+            else if (ts.isSpreadAssignment(prop))
+                collectAssignmentTargetIdentifiers(prop.expression, report);
+        }
+        return;
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        // A destructuring default (`[a = 1] = arr`) — the LEFT is still the real target.
+        collectAssignmentTargetIdentifiers(node.left, report);
+    }
+}
+/**
+ * For every name in `candidateNames`, how many times it is WRITTEN to (assignment target,
+ * compound-assignment target, or `++`/`--` operand) anywhere in `root` — respecting the SAME
+ * lexical-shadowing rules `substituteConstReads` already applies (a nested re-declaration of the
+ * same name reserves it for that inner scope, so a write inside a shadowing scope doesn't count
+ * against the outer binding of the same spelling). This mirrors `substituteConstReads`'s own
+ * scope-threading shape (Block/CatchClause/ForStatement/ForIn/ForOf/plain-function/method-like)
+ * exactly, but COUNTS instead of substituting — see the module comment above for why a flat
+ * syntactic count (not reachability) is the correct, conservative rule here.
+ */
+function collectWriteCounts(root, candidateNames) {
+    const counts = new Map();
+    const bump = (name) => {
+        if (!candidateNames.has(name))
+            return;
+        counts.set(name, (counts.get(name) ?? 0) + 1);
+    };
+    const reportIfUnshadowed = (shadowed) => (name) => {
+        if (!shadowed.has(name))
+            bump(name);
+    };
+    const visit = (node, shadowed) => {
+        if (isOutOfScopeForPropagation(node))
+            return;
+        if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
+            collectAssignmentTargetIdentifiers(node.left, reportIfUnshadowed(shadowed));
+            visit(node.right, shadowed);
+            return;
+        }
+        if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+            (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) {
+            collectAssignmentTargetIdentifiers(node.operand, reportIfUnshadowed(shadowed));
+            return;
+        }
+        if (ts.isCatchClause(node)) {
+            const names = new Set(shadowed);
+            if (node.variableDeclaration)
+                collectBindingNames(node.variableDeclaration.name, names);
+            visit(node.block, names);
+            return;
+        }
+        if (ts.isBlock(node)) {
+            const names = new Set(shadowed);
+            collectDirectlyDeclaredNames(node.statements, names);
+            for (const s of node.statements)
+                visit(s, names);
+            return;
+        }
+        if (isPlainFunctionScope(node)) {
+            const names = new Set(shadowed);
+            for (const p of node.parameters)
+                collectBindingNames(p.name, names);
+            if (node.body)
+                collectVarNames(node.body, names);
+            if (node.name)
+                names.add(node.name.text);
+            ts.forEachChild(node, (child) => {
+                if (child !== node.name)
+                    visit(child, names);
+            });
+            return;
+        }
+        if (isMethodLikeScope(node)) {
+            const names = new Set(shadowed);
+            for (const p of node.parameters)
+                collectBindingNames(p.name, names);
+            if (node.body)
+                collectVarNames(node.body, names);
+            ts.forEachChild(node, (child) => visit(child, child === node.name ? shadowed : names));
+            return;
+        }
+        if (ts.isForStatement(node)) {
+            const names = new Set(shadowed);
+            if (node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+                for (const decl of node.initializer.declarations)
+                    collectBindingNames(decl.name, names);
+            }
+            if (node.initializer)
+                visit(node.initializer, names);
+            if (node.condition)
+                visit(node.condition, names);
+            if (node.incrementor)
+                visit(node.incrementor, names);
+            visit(node.statement, names);
+            return;
+        }
+        if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+            const names = new Set(shadowed);
+            if (ts.isVariableDeclarationList(node.initializer)) {
+                for (const decl of node.initializer.declarations)
+                    collectBindingNames(decl.name, names);
+            }
+            else {
+                // Reusing an EXISTING top-level `let`/`var` as the loop target (`for (x of arr)`,
+                // `for (x in obj)`, or a destructuring reuse `for ([x, y] of pairs)`/`for ({val: x} of
+                // arr)`) is a genuine WRITE on every iteration — route it through the same
+                // assignment-target collector every other write shape in this file already uses, so it
+                // counts as (at least) a second write and can never be folded as effectively-const.
+                collectAssignmentTargetIdentifiers(node.initializer, reportIfUnshadowed(shadowed));
+            }
+            visit(node.initializer, names);
+            visit(node.statement, names);
+            visit(node.expression, shadowed); // the iterated/enumerated expression runs in the OUTER scope
+            return;
+        }
+        ts.forEachChild(node, (child) => visit(child, shadowed));
+    };
+    visit(root, new Set());
+    return counts;
+}
+/** Every top-level `let`/`var` declared name (never `const`) — the candidate universe for
+ * effectively-const detection, matching the same top-level-only scope boundary real `const`
+ * tracking already uses. */
+function collectTopLevelMutableNames(sourceFile) {
+    const names = new Set();
+    for (const stmt of sourceFile.statements) {
+        if (!ts.isVariableStatement(stmt))
+            continue;
+        if (stmt.declarationList.flags & ts.NodeFlags.Const)
+            continue;
+        for (const decl of stmt.declarationList.declarations) {
+            if (ts.isIdentifier(decl.name))
+                names.add(decl.name.text);
+        }
+    }
+    return names;
+}
+/** If `stmt` is exactly a bare `name = <expr>;` ExpressionStatement, its target `name` —
+ * otherwise `undefined`. Used only to recognize a STRETCH pair's resolving assignment. */
+function simpleAssignmentTargetName(stmt) {
+    if (!ts.isExpressionStatement(stmt))
+        return undefined;
+    const expr = stmt.expression;
+    if (!ts.isBinaryExpression(expr) || expr.operatorToken.kind !== ts.SyntaxKind.EqualsToken)
+        return undefined;
+    return ts.isIdentifier(expr.left) ? expr.left.text : undefined;
+}
+function analyzeTopLevelConsts(sourceFile, functions) {
+    const consts = new Map();
+    const primaryNames = new Set();
+    const pairNames = new Set();
+    const mutableNames = collectTopLevelMutableNames(sourceFile);
+    const writeCounts = collectWriteCounts(sourceFile, mutableNames);
+    // Names predeclared (no initializer) by a top-level `let`/`var` not yet resolved, awaiting
+    // their sole later top-level assignment statement — the STRETCH idiom in progress. Tracked
+    // as a plain Set here (not a statement reference): once matched, all this local pass needs
+    // is "yes, a predeclaration for this name exists earlier in the file".
+    const pendingPredecl = new Set();
+    for (const stmt of sourceFile.statements) {
+        // STRETCH soundness: `let x;` genuinely makes `x` readable (as `undefined`) from that point
+        // forward — a real value, distinct from whatever `x` is later assigned. Any statement OTHER
+        // than a pending name's own resolving assignment that references it is therefore a read of
+        // that still-unassigned state; folding the name would let `constPropagationTransformer`
+        // (which substitutes every unshadowed read file-wide, with no notion of statement order)
+        // silently replace that read with the FUTURE value. Poison (permanently disqualify) any
+        // pending name referenced by any statement that isn't its own resolving assignment — this
+        // also covers a pending name read from inside another statement's initializer/expression
+        // (e.g. `let x; let y = x + 1; x = 5;`), which would otherwise let `foldTransformer` (using
+        // the final, order-blind `consts` map) fold `y`'s initializer using `x`'s eventual value.
+        const resolvingName = simpleAssignmentTargetName(stmt);
+        if (pendingPredecl.size > 0) {
+            for (const name of [...pendingPredecl]) {
+                if (name !== resolvingName && referencesIdentifier(stmt, name))
+                    pendingPredecl.delete(name);
+            }
+        }
+        if (ts.isVariableStatement(stmt)) {
+            const isConst = Boolean(stmt.declarationList.flags & ts.NodeFlags.Const);
+            for (const decl of stmt.declarationList.declarations) {
+                if (!ts.isIdentifier(decl.name))
+                    continue;
+                const name = decl.name.text;
+                if (isConst) {
+                    if (!decl.initializer)
+                        continue;
+                    const value = tsEvalConst(decl.initializer, consts, functions, EMPTY_SHADOW);
+                    if (value !== undefined)
+                        consts.set(name, value);
+                    continue;
+                }
+                if (decl.initializer) {
+                    if ((writeCounts.get(name) ?? 0) > 0)
+                        continue; // written again somewhere — not effectively const
+                    const value = tsEvalConst(decl.initializer, consts, functions, EMPTY_SHADOW);
+                    if (value === undefined)
+                        continue;
+                    consts.set(name, value);
+                    primaryNames.add(name);
+                }
+                else {
+                    pendingPredecl.add(name); // no initializer: only a STRETCH candidate
+                }
+            }
+            continue;
+        }
+        if (!ts.isExpressionStatement(stmt))
+            continue;
+        const expr = stmt.expression;
+        if (!ts.isBinaryExpression(expr) || expr.operatorToken.kind !== ts.SyntaxKind.EqualsToken)
+            continue;
+        if (!ts.isIdentifier(expr.left))
+            continue;
+        const name = expr.left.text;
+        if (!pendingPredecl.has(name))
+            continue;
+        pendingPredecl.delete(name); // this IS the name's one recognized write, resolvable or not
+        if (writeCounts.get(name) !== 1)
+            continue; // a write exists elsewhere too — not sound to fold
+        const value = tsEvalConst(expr.right, consts, functions, EMPTY_SHADOW);
+        if (value === undefined)
+            continue;
+        consts.set(name, value);
+        pairNames.add(name);
+    }
+    return { consts, primaryNames, pairNames };
+}
+/**
+ * Structurally RE-DERIVES, from whatever tree currently holds it, a STRETCH pair name's two
+ * statements (the no-initializer predeclaration + its sole top-level assignment) and their
+ * non-read name nodes — the same shape `analyzeTopLevelConsts` itself matched, just re-applied
+ * fresh. Never relies on a node reference carried in from elsewhere: by the time
+ * `deadConstEliminationTransformer` runs, `foldTransformer`/`constPropagationTransformer` have
+ * already rebuilt at least the assignment statement for any pair whose RHS was itself foldable
+ * (e.g. `b = a + 3` → `b = 4n`), so a node identity captured any earlier would already be stale.
+ */
+function findPairStatements(sourceFile, name) {
+    let declStatement;
+    let declName;
+    let assignStatement;
+    let assignTargetName;
+    for (const stmt of sourceFile.statements) {
+        if (ts.isVariableStatement(stmt) && !(stmt.declarationList.flags & ts.NodeFlags.Const)) {
+            for (const decl of stmt.declarationList.declarations) {
+                if (ts.isIdentifier(decl.name) && decl.name.text === name && !decl.initializer) {
+                    declStatement = stmt;
+                    declName = decl.name;
+                }
+            }
+        }
+        else if (ts.isExpressionStatement(stmt)) {
+            const expr = stmt.expression;
+            if (ts.isBinaryExpression(expr) &&
+                expr.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+                ts.isIdentifier(expr.left) &&
+                expr.left.text === name) {
+                assignStatement = stmt;
+                assignTargetName = expr.left;
+            }
+        }
+    }
+    if (!declStatement || !declName || !assignStatement || !assignTargetName)
+        return undefined;
+    return { declStatement, declName, assignStatement, assignTargetName };
+}
 function constPropagationTransformer(consts) {
     return (context) => {
         return (sourceFile) => {
@@ -1087,7 +1423,7 @@ function constPropagationTransformer(consts) {
     };
 }
 /**
- * How many `Identifier`s named `name` occur in `root`, ignoring the node at `exclude` — and
+ * How many `Identifier`s named `name` occur in `root`, ignoring any node in `exclude` — and
  * ignoring LABEL positions the same way `substituteConstReads` itself already does (a
  * non-computed `PropertyAssignment`/`ShorthandPropertyAssignment` key is never a variable
  * read), so a struct-literal shorthand read that pass already substituted away (`{ a }` →
@@ -1096,12 +1432,15 @@ function constPropagationTransformer(consts) {
  * (not-rewritten) `ShorthandPropertyAssignment` can never itself be a genuine unshadowed read
  * of a tracked top-level const either — if it were, `constPropagationTransformer` would
  * already have converted it — so its key is excluded too; only a destructuring default
- * (`objectAssignmentInitializer`) is still walked, since that IS a real read.
+ * (`objectAssignmentInitializer`) is still walked, since that IS a real read. `exclude` is a
+ * SET (not a single node) because the STRETCH two-statement idiom has TWO non-read occurrences
+ * to ignore — the predeclaration's own name AND the sole assignment's LHS target — where a
+ * real `const`/PRIMARY `let` only ever has the one declarator name.
  */
 function countIdentifierRefs(root, name, exclude) {
     let count = 0;
     const walk = (node) => {
-        if (node === exclude)
+        if (exclude.has(node))
             return;
         if (ts.isIdentifier(node) && node.text === name) {
             count++;
@@ -1609,43 +1948,88 @@ function tableFoldTransformer(tables, consts, functions) {
     };
 }
 /**
- * Removes any top-level `const` declaration whose name has zero remaining `Identifier`
- * occurrences anywhere in the (already-substituted) file. Deliberately a flat, whole-file
+ * Removes any top-level `const` (or effectively-const PRIMARY `let`/`var`, or array/object
+ * lookup-table declaration tracked in `tables`) whose name has zero remaining `Identifier`
+ * occurrences anywhere in the (already-substituted) file — and, for a STRETCH pair, removes
+ * its sole assignment statement too once the same holds. Deliberately a flat, whole-file
  * textual count — NOT scope-aware — matching `constPropagationTransformer`'s own guarantee
- * that it already replaced every reachable, unshadowed reference with a literal: by this
- * point, any occurrence still in the tree is either a shadowing inner declaration of the
+ * that it already replaced every reachable, unshadowed reference with a literal (and
+ * `tableFoldTransformer`'s equivalent guarantee for a table's every resolvable access): by
+ * this point, any occurrence still in the tree is either a shadowing inner declaration of the
  * SAME name (a coincidental false-positive "still referenced" that simply keeps this
  * otherwise-dead declaration around, harmlessly) or a genuine remaining use this pass
- * correctly declines to touch. Also covers the array/object lookup-table declarations
- * tracked in `tables` (see the section below) the exact same way — a table whose every
- * access was resolved by `tableFoldTransformer` has zero remaining references, same as a
- * scalar const whose every read was inlined.
+ * correctly declines to touch.
+ *
+ * DCE-of-a-PAIR design decision: once a STRETCH name becomes fully dead, BOTH its
+ * predeclaration's (now-empty) declarator and its one assignment statement are removed
+ * together, in this same pass — not left as an orphaned `let x;` (a declaration with no
+ * initializer and no further use is exactly as dead as the assignment that gave it its only
+ * value) and not deferred to a separate pass (nothing downstream should ever see a naked
+ * `let x;` this transformer chain itself introduced by only removing half the pair).
  */
-function deadConstEliminationTransformer(consts, tables) {
+function deadConstEliminationTransformer(consts, primaryNames, pairNames, tables) {
     return (_context) => {
         return (sourceFile) => {
+            // Real const + PRIMARY let/var: a single declarator, found directly (identity is safe
+            // here — these node references come from THIS SAME `sourceFile`, never carried in).
             const declNameNodes = new Map();
             for (const stmt of sourceFile.statements) {
-                if (!ts.isVariableStatement(stmt) || !(stmt.declarationList.flags & ts.NodeFlags.Const))
+                if (!ts.isVariableStatement(stmt))
                     continue;
+                const isConst = Boolean(stmt.declarationList.flags & ts.NodeFlags.Const);
                 for (const decl of stmt.declarationList.declarations) {
-                    const trackedName = ts.isIdentifier(decl.name) && (consts.has(decl.name.text) || tables.has(decl.name.text));
-                    if (trackedName && ts.isIdentifier(decl.name) && !declNameNodes.has(decl.name.text)) {
-                        declNameNodes.set(decl.name.text, decl.name);
-                    }
+                    if (!ts.isIdentifier(decl.name) || declNameNodes.has(decl.name.text))
+                        continue;
+                    const name = decl.name.text;
+                    const tracked = isConst ? consts.has(name) || tables.has(name) : primaryNames.has(name);
+                    if (tracked)
+                        declNameNodes.set(name, decl.name);
                 }
             }
+            // STRETCH pairs: re-derived structurally, fresh, from this same `sourceFile` — see
+            // `findPairStatements`'s own comment for why a carried-in node reference can't be used.
+            const pairInfo = new Map();
+            for (const name of pairNames) {
+                const found = findPairStatements(sourceFile, name);
+                if (found)
+                    pairInfo.set(name, found);
+            }
+            if (declNameNodes.size === 0 && pairInfo.size === 0)
+                return sourceFile;
             const eliminable = new Set();
             for (const [name, nameNode] of declNameNodes) {
-                if (countIdentifierRefs(sourceFile, name, nameNode) === 0)
+                if (countIdentifierRefs(sourceFile, name, new Set([nameNode])) === 0)
+                    eliminable.add(name);
+            }
+            for (const [name, info] of pairInfo) {
+                const exclude = new Set([info.declName, info.assignTargetName]);
+                if (countIdentifierRefs(sourceFile, name, exclude) === 0)
                     eliminable.add(name);
             }
             if (eliminable.size === 0)
                 return sourceFile;
             const statements = sourceFile.statements.flatMap((stmt) => {
-                if (!ts.isVariableStatement(stmt) || !(stmt.declarationList.flags & ts.NodeFlags.Const))
+                // A STRETCH pair's assignment statement is removed OUTRIGHT once its name is dead.
+                for (const [name, info] of pairInfo) {
+                    if (eliminable.has(name) && info.assignStatement === stmt)
+                        return [];
+                }
+                if (!ts.isVariableStatement(stmt))
                     return [stmt];
-                const kept = stmt.declarationList.declarations.filter((decl) => !(ts.isIdentifier(decl.name) && eliminable.has(decl.name.text)));
+                const isConst = Boolean(stmt.declarationList.flags & ts.NodeFlags.Const);
+                const kept = stmt.declarationList.declarations.filter((decl) => {
+                    if (!ts.isIdentifier(decl.name))
+                        return true;
+                    const name = decl.name.text;
+                    if (isConst)
+                        return !((consts.has(name) || tables.has(name)) && eliminable.has(name));
+                    if (primaryNames.has(name))
+                        return !eliminable.has(name);
+                    const pair = pairInfo.get(name);
+                    if (pair && pair.declStatement === stmt)
+                        return !eliminable.has(name);
+                    return true;
+                });
                 if (kept.length === stmt.declarationList.declarations.length)
                     return [stmt];
                 if (kept.length === 0)
@@ -1666,7 +2050,7 @@ function deadConstEliminationTransformer(consts, tables) {
 export function tsPartialEval(code, filePath) {
     const sourceFile = ts.createSourceFile(filePath, code, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
     const functions = collectTopLevelFunctions(sourceFile);
-    const consts = collectTopLevelConsts(sourceFile, functions);
+    const { consts, primaryNames, pairNames } = analyzeTopLevelConsts(sourceFile, functions);
     // Table candidacy + the whole-file soundness scan run on the ORIGINAL, pre-fold source: a
     // disqualifying use must count even if it sits in a branch `foldTransformer` would otherwise
     // prune away (see the "Array/object lookup-table folding" section above).
@@ -1682,7 +2066,7 @@ export function tsPartialEval(code, filePath) {
                 // is still resolvable.
                 tableFoldTransformer(tables, consts, functions),
                 constPropagationTransformer(consts),
-                deadConstEliminationTransformer(consts, tables),
+                deadConstEliminationTransformer(consts, primaryNames, pairNames, tables),
             ],
         },
     });
