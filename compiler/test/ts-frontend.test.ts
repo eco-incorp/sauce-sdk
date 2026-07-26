@@ -54,9 +54,14 @@ describe('tsPartialEval (direct unit tests)', () => {
   });
 
   it('folds literal binary arithmetic to a single literal', () => {
-    const out = tsPartialEval(`const y = 2 + 3;`, 'f.ts');
+    // `let`, not `const`: isFoldableValueExpression's literal-arithmetic fold doesn't care
+    // about declaration kind (it's a purely syntactic check on the initializer shape), and
+    // `let` keeps this test immune to the const-propagation-to-reads + dead-declaration-
+    // elimination pass below (which would otherwise remove this now-fully-unused `const`
+    // entirely, since nothing ever reads `y`) — that behavior has its own dedicated tests.
+    const out = tsPartialEval(`let y = 2 + 3;`, 'f.ts');
 
-    expect(out).toContain('const y = 5');
+    expect(out).toContain('let y = 5');
     expect(out).not.toContain('2 + 3');
   });
 
@@ -305,6 +310,246 @@ describe('tsPartialEval (while-loop unrolling — the counting idiom, reusing th
   });
 });
 
+// ── tsPartialEval (constant propagation to reads + dead-declaration elimination) ──
+//
+// The fold pass above already resolves a chained top-level `const` initializer
+// (`const b = a + 3` → `const b = 4n`) but, until now, never substituted the resolved value
+// into a later bare-identifier READ (`console.log(c)` stayed `console.log(c)`), and never
+// removed a declaration that became fully unused as a result. These two passes (run AFTER
+// fold+unroll, on ITS output) close that gap. Scope-aware: only the SAME same-file
+// top-level `const`s the fold pass already tracks are ever substituted; a nested
+// `let`/`const`/`var`/parameter/catch-binding/for-loop-declaration of the same name shadows
+// correctly, and DCE is a simple whole-file textual reference count taken AFTER
+// substitution (so a coincidentally-same-named shadowing declaration elsewhere in the file
+// can keep an otherwise-dead top-level const around — harmless, never incorrect).
+describe('tsPartialEval (constant propagation to reads + dead-declaration elimination)', () => {
+  it('propagates a resolved const chain all the way to a bare-identifier read, eliminating every intermediate declaration', () => {
+    const out = tsPartialEval(`const a = 1; const b = a + 3; const c = b + 4; console.log(c);`, 'f.ts');
+
+    expect(out).not.toContain('const a');
+    expect(out).not.toContain('const b');
+    expect(out).not.toContain('const c');
+    expect(out.trim()).toBe('console.log(8n);');
+  });
+
+  it('the same chain shape with let + plain reassignment is left completely alone — never substitutes the bare read, never drops the declaration (regression guard)', () => {
+    // Deliberately the assignment-chain shape (matching the existing ASSIGNMENT_OPERATOR_TOKENS
+    // regression test above), NOT a `let a = 1;` declaration-with-initializer chain — TS-evaluator's
+    // own same-file identifier resolution already folds SOME `let` declaration-initializer
+    // arithmetic today (a pre-existing, unrelated quirk of the ts-evaluator fallback, not
+    // something this feature touches), but a bare-identifier READ (`console.log(c)`) and an
+    // ASSIGNMENT (`b = a + 3;`) are never in `consts` (only `NodeFlags.Const` declarations are),
+    // so neither this feature nor the fold pass ever substitutes or removes anything here.
+    const code = `let a, b, c;\na = 1;\nb = a + 3;\nc = b + 4;\nconsole.log(c);`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('let a, b, c;');
+    expect(out).toContain('a = 1;');
+    expect(out).toContain('b = a + 3;');
+    expect(out).toContain('console.log(c);');
+    expect(out).not.toMatch(/console\.log\(8/);
+  });
+
+  it('a same-named const declared inside a function shadows the outer one: the inner read stays a bare identifier, the outer (post-function) read still substitutes', () => {
+    const code = `
+      const a = 1;
+      function f() {
+        const a = 2;
+        console.log(a);
+      }
+      console.log(a);
+    `;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('const a = 2;');
+    // Only the INNER (shadowed) read should still be a bare identifier reference.
+    expect(out.match(/console\.log\(a\);/g)?.length).toBe(1);
+    // The OUTER (top-level) read correctly resolves against the outer const.
+    expect(out).toContain('console.log(1n);');
+    // The outer declaration itself is conservatively KEPT: dead-const-elimination is a flat,
+    // whole-file textual Identifier count (not scope-aware), so the inner shadowing
+    // declaration/read of the same name "a" is enough to (harmlessly) keep `const a = 1;`
+    // around even though every real (unshadowed) read of it was already inlined above. This
+    // pins the documented behavior (ts-frontend.ts's own comment on
+    // deadConstEliminationTransformer) so a future change to the scope-tracking can't silently
+    // flip this either direction without a test noticing.
+    expect(out).toContain('const a = 1;');
+  });
+
+  it("object-literal method/getter/setter shorthand: the method/setter's OWN parameter shadows an outer const of the same name — the param read stays a bare identifier, not the outer const's literal", () => {
+    // Regression: MethodDeclaration/GetAccessorDeclaration/SetAccessorDeclaration are not
+    // FunctionDeclaration/FunctionExpression/ArrowFunction (isPlainFunctionScope's 3 shapes),
+    // so without dedicated handling their own parameter list never shadows the outer scope —
+    // a read of the parameter would be wrongly rewritten to the outer const's literal value.
+    const methodCode = `const a = 1;\nconst obj = {\n  method(a) { console.log(a); }\n};\nconsole.log(a);`;
+    const methodOut = tsPartialEval(methodCode, 'f.ts');
+
+    expect(methodOut).toContain('method(a) { console.log(a); }'); // the param read: untouched
+    expect(methodOut).toContain('console.log(1n);'); // the outer (unshadowed) read: substituted
+
+    const setterCode = `const a = 1;\nconst obj = { set prop(a) { console.log(a); } };\nconsole.log(a);`;
+    const setterOut = tsPartialEval(setterCode, 'f.ts');
+
+    expect(setterOut).toContain('set prop(a) { console.log(a); }');
+    expect(setterOut).toContain('console.log(1n);');
+
+    const getterCode = `const x = 1;\nconst obj = { get prop() { const x = 2; return x; } };\nconsole.log(x);`;
+    const getterOut = tsPartialEval(getterCode, 'f.ts');
+
+    expect(getterOut).toContain('const x = 2;');
+    expect(getterOut).toContain('return x;'); // shadowed by the getter body's own `const x`
+    expect(getterOut).toContain('console.log(1n);'); // the outer read still substitutes
+  });
+
+  it('object-literal method shorthand with a COMPUTED name: the computed key expression is still substituted (it is a genuine read, evaluated in the outer scope)', () => {
+    const code = `const KEY = 1;\nconst obj = {\n  [KEY](a) { return a; }\n};`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('[1n](a)');
+    expect(out).not.toContain('KEY');
+  });
+
+  it('a top-level const read only via object-literal SHORTHAND (`{ a }`) is substituted AND its now-dead declaration is eliminated — the shorthand rewrite reuses the original Identifier as the new property KEY, which must not count as a phantom remaining reference', () => {
+    // Regression: constPropagationTransformer's shorthand handling rewrites `{ a }` into
+    // `{ a: <literal> }` by reusing `node.name` as the synthesized PropertyAssignment's key —
+    // countIdentifierRefs must not mistake that label for a surviving read, or the const can
+    // never be eliminated despite every real read already being inlined. This is exactly the
+    // struct-literal idiom this codebase uses for router calls (PoolKey-style construction).
+    const code = `const fee = 3000n;\nconst tickSpacing = 60n;\nfunction build(currency0, currency1, hooks) {\n  return { currency0, currency1, fee, tickSpacing, hooks };\n}`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('fee: 3000n');
+    expect(out).toContain('tickSpacing: 60n');
+    expect(out).not.toContain('const fee');
+    expect(out).not.toContain('const tickSpacing');
+  });
+
+  it('a top-level const referenced only inside a helper function has its value baked into the body, and its own now-dead declaration is removed', () => {
+    const out = tsPartialEval(`const RATE = 3n;\nexport function scale(x) { return x * RATE; }`, 'f.ts');
+
+    expect(out).not.toContain('RATE');
+    expect(out).toContain('return x * 3n;');
+  });
+
+  it('a const used only as a fully-unrolled loop bound is eliminated once unrolling consumes its only reference', () => {
+    const out = tsPartialEval(`const N = 4n;\nlet sum = 0n;\nfor (let i = 0n; i < N; i++) { sum = sum + i; }`, 'f.ts');
+
+    expect(out).not.toContain('for (');
+    expect(out).not.toContain('const N');
+    for (const i of [0, 1, 2, 3]) expect(out).toContain(`sum = sum + ${i}n;`);
+  });
+
+  it('the same const ALSO used elsewhere (inside the unrolled body) is correctly substituted at every surviving site too', () => {
+    const out = tsPartialEval(
+      `const N = 4n;\nlet sum = 0n;\nfor (let i = 0n; i < N; i++) { sum = sum + N; }\nconsole.log(sum);`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('for (');
+    expect(out).not.toContain('const N');
+    expect(out.match(/sum = sum \+ 4n;/g)?.length).toBe(4); // all 4 unrolled copies got the literal
+    expect(out).toContain('console.log(sum);');
+  });
+
+  it('multiple reads of the same const across different statements are ALL substituted, and the declaration is eliminated only once every read is gone', () => {
+    const out = tsPartialEval(
+      `const K = 5n;\nconsole.log(K);\nconsole.log(K + 1n);\nfunction f() { return K; }`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('const K');
+    expect(out).toContain('console.log(5n);'); // the bare read — this feature's job
+    expect(out).toContain('console.log(6n);'); // K + 1n — already folded by the EXISTING pass
+    expect(out).toContain('return 5n;');
+  });
+
+  it('a const whose only use was inside a since-pruned dead if-branch is eliminated once branch-pruning removes that reference', () => {
+    const out = tsPartialEval(`const SOME_CONST = 7n;\nif (false) { console.log(SOME_CONST); }`, 'f.ts');
+
+    // The whole if-statement (the const's only use) was already pruned away by the EXISTING
+    // fold pass — leaving zero references, so this pass's DCE removes the now-dead const too.
+    expect(out.trim()).toBe('');
+  });
+
+  it('a const used only as a loop bound that DOES NOT unroll (past MAX_UNROLL_ITERATIONS) still gets its bound substituted into the surviving runtime loop, and is still eliminated', () => {
+    // A real 3-stage interaction: foldTransformer bails on unrolling (the loop stays a real
+    // `for`), constPropagationTransformer still walks INTO that surviving loop's condition and
+    // substitutes the literal there, and deadConstEliminationTransformer then correctly drops
+    // the now-fully-substituted `const N` declaration — leaving a genuine runtime loop with
+    // its bound inlined as a literal, not a dangling reference to a removed declaration.
+    const out = tsPartialEval(
+      `const N = 1000n;\nlet sum = 0n;\nfor (let i = 0n; i < N; i++) { sum = sum + i; }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('for ('); // unrolling bailed — past the cap
+    expect(out).toContain('i < 1000n'); // ...but the bound was still substituted
+    expect(out).not.toContain('const N'); // ...and the now-dead declaration was still removed
+  });
+
+  it('a const used only as a loop bound that DOES NOT unroll because the body has a break/continue behaves the same way', () => {
+    const out = tsPartialEval(
+      `const N = 5n;\nlet sum = 0n;\nfor (let i = 0n; i < N; i++) { if (i === 2n) { break; } sum = sum + i; }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('for (');
+    expect(out).toContain('i < 5n;');
+    expect(out).not.toContain('const N');
+  });
+});
+
+// ── tsPartialEval (constant propagation never touches an assignment/update TARGET) ──
+//
+// constPropagationTransformer's substitution visitor must never replace the left side of an
+// assignment (`=`/`+=`/etc.), a `++`/`--` operand, or any (possibly nested, destructuring)
+// write-target position with a top-level const's literal value — doing so would either
+// silently change the program's meaning or emit syntactically-invalid output (`1n = 2n;`,
+// `1n++;`). This mirrors the guard `foldTransformer`/`ASSIGNMENT_OPERATOR_TOKENS` already
+// applies to the (separate) folding pass, just for the propagate-to-reads pass.
+describe('tsPartialEval (constant propagation never substitutes an assignment/update target)', () => {
+  it('never substitutes the left side of a plain assignment, even reassigning a top-level const by name', () => {
+    const out = tsPartialEval(`const a = 1n;\na = 2n;\nconsole.log(a);`, 'f.ts');
+
+    expect(out).toContain('a = 2n;'); // NOT "1n = 2n;"
+  });
+
+  it('never substitutes the left side of a compound assignment (+=)', () => {
+    const out = tsPartialEval(`const a = 1n;\nfunction main() { a += 2n; return a; }`, 'f.ts');
+
+    expect(out).toContain('a += 2n;'); // NOT "1n += 2n;"
+  });
+
+  it('never substitutes the operand of a ++ / -- update expression (prefix or postfix)', () => {
+    const postfix = tsPartialEval(`const a = 1n;\nfunction main() { a++; return a; }`, 'f.ts');
+    const prefix = tsPartialEval(`const a = 1n;\nfunction main() { ++a; return a; }`, 'f.ts');
+
+    expect(postfix).toContain('a++;'); // NOT "1n++;"
+    expect(prefix).toContain('++a;'); // NOT "++1n;"
+  });
+
+  it("never substitutes a destructuring-assignment target (object or array), even reusing a top-level const's name as the shorthand target", () => {
+    const objectPattern = tsPartialEval(`const a = 1n;\nlet obj = { a: 5n };\n({ a } = obj);\nconsole.log(a);`, 'f.ts');
+    const arrayPattern = tsPartialEval(`const a = 1n;\nlet arr = [5n];\n[a] = arr;\nconsole.log(a);`, 'f.ts');
+
+    expect(objectPattern).toContain('({ a } = obj);'); // NOT "({ a: 1n } = obj);"
+    expect(arrayPattern).toContain('[a] = arr;'); // NOT "[1n] = arr;"
+  });
+
+  it("still substitutes genuine READS nested inside a write-target expression: a property/element-access target's object expression and computed key", () => {
+    const out = tsPartialEval(
+      `const IDX = 0n;\nfunction main(obj, arr) {\n  obj.x = 1n;\n  arr[IDX] = 2n;\n  return arr[IDX];\n}`,
+      'f.ts',
+    );
+
+    // `arr[IDX]`'s computed key IS a genuine read — substituted both as a write target's key
+    // and in the later plain read.
+    expect(out).toContain('arr[0n] = 2n;');
+    expect(out).toContain('return arr[0n];');
+    expect(out).not.toContain('IDX');
+  });
+});
+
 // ── compile() integration: the wiring (processor/index.ts import path + index.ts top-level) ──
 
 let tmpDir: string;
@@ -396,8 +641,54 @@ describe('ts-frontend compile() integration', () => {
 
         expect(() => compile(source, { baseDirs: [tmpDir], target })).not.toThrow();
       });
+
+      it('a top-level const referenced only inside an imported helper function is baked into its body before the import boundary is crossed — the plain (no ts-frontend) equivalent fails', () => {
+        // `collectImportedFunctions` (processor/index.ts) only ever pulls FUNCTION
+        // declarations across a source-file import boundary — a module's top-level
+        // `const`s are never carried over. So a `.sauce.ts` helper referencing a top-level
+        // const can ONLY compile once imported elsewhere if this feature has already baked
+        // the value into the function body (and dropped the now-dead declaration) BEFORE
+        // that boundary is crossed — this is what actually makes requirement 4 necessary,
+        // not just a cosmetic cleanup.
+        writeMod('m_rate.sauce.ts', `const RATE = 3n;\nexport function scale(x: bigint): bigint { return x * RATE; }`);
+        writeMod('m_rate_plain.sauce', `const RATE = 3n;\nexport function scale(x) { return x * RATE; }`);
+
+        const tsImportSource = `
+          import { scale } from "./m_rate";
+          function main() { return scale(2n); }
+        `;
+        const plainImportSource = `
+          import { scale } from "./m_rate_plain";
+          function main() { return scale(2n); }
+        `;
+
+        const result = compile(tsImportSource, { baseDirs: [tmpDir], target });
+
+        if (target === 'v1') {
+          expect(result.bytecode.length).toBe(2); // main + scale — RATE was never a function to begin with
+        }
+
+        // The plain `.sauce` sibling never runs through ts-frontend at all (no `.ts` suffix),
+        // so `scale`'s body still has a bare, now cross-file-unresolvable read of RATE.
+        expect(() => compile(plainImportSource, { baseDirs: [tmpDir], target })).toThrow(/undefined variable/);
+      });
     });
   }
+
+  it('CompileOptions.tsSource propagates a typed top-level const chain into a bare read, producing bytecode byte-identical to the fully-inlined literal', () => {
+    const source = `
+      const a: bigint = 1n;
+      const b: bigint = a + 3n;
+      const c: bigint = b + 4n;
+      function main() { return c; }
+    `;
+
+    const result = compile(source, { tsSource: true });
+    const literal = compile(`function main() { return 8n; }`);
+
+    expect(result.bytecode.length).toBe(1);
+    expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+  });
 
   it('CompileOptions.tsSource folds the same typed dead branch at the top level', () => {
     const source = typedGateSource().replace(/export /g, '') + `\nfunction main() { return gate(); }`;
