@@ -635,6 +635,592 @@ function foldTransformer(consts: ReadonlyMap<string, bigint>) {
   };
 }
 
+// ── Constant propagation to reads + dead-declaration elimination ──
+//
+// The fold pass above resolves every top-level `const`'s value into `consts` up front
+// (`collectTopLevelConsts`) and already folds FOLDABLE initializer expressions in place
+// (`const b = a + 3` becomes `const b = 4n`) — but it never touches a bare `Identifier`
+// sitting in ordinary read position (`console.log(c)` stays `console.log(c)`), because a
+// bare Identifier could just as easily be an lvalue, and `isFoldableValueExpression`
+// deliberately excludes it (only Binary/PrefixUnary/TemplateExpression — none of which can
+// ever be an assignment target — are folded wherever found). These two passes close that
+// gap, running strictly AFTER fold+unroll, on ITS OUTPUT: a loop bound consumed by
+// unrolling, or a condition consumed by branch-pruning, is already gone from the tree
+// before either pass below ever looks for a reference to it.
+//
+// 1. `constPropagationTransformer` walks the (already folded/unrolled) tree and replaces
+//    every unshadowed read of a top-level const name with its resolved literal.
+// 2. `deadConstEliminationTransformer` then deletes any top-level `const` declaration left
+//    with ZERO remaining `Identifier` occurrences of its name anywhere in the file.
+//
+// Both are scope-LOCAL to the SAME `consts` map the fold pass already trusts — same-file
+// top-level `const`s only. `let`/`var`/reassignment chains are untouched by construction,
+// not by a special guard: `collectTopLevelConsts` only ever records `NodeFlags.Const`
+// declarations, so a `let`/`var` name is simply never a key in `consts`, and a bare
+// Identifier that doesn't resolve in `consts` is always left exactly as found.
+//
+// Shadowing is tracked precisely enough to be safe without being a general dataflow engine:
+// a nested `let`/`const`/`var`/function/parameter/catch-binding/for-loop-declaration with the
+// SAME name reserves that name for its entire enclosing scope, matching real JS/TS semantics
+// (a block-scoped name is reserved from the top of its scope, TDZ notwithstanding —
+// referencing it before the declaration is a runtime error, never a silent fall-through to
+// an outer binding of the same name) — so the WHOLE scope is computed once, up front, rather
+// than incrementally per-statement. `var` is additionally hoisted to its enclosing FUNCTION
+// (not block) scope, matching real `var` semantics, by a separate pre-scan that doesn't cross
+// nested function/class boundaries. Only same-file top-level `const`s are ever tracked this
+// way — no attempt is made to extend `consts` itself to nested-scope bindings (that stays out
+// of scope, same as today).
+
+/** Every Identifier bound by a (possibly nested/destructuring) binding name. */
+function collectBindingNames(name: ts.BindingName, out: Set<string>): void {
+  if (ts.isIdentifier(name)) {
+    out.add(name.text);
+
+    return;
+  }
+
+  for (const element of name.elements) {
+    if (ts.isBindingElement(element)) collectBindingNames(element.name, out);
+  }
+}
+
+/** The 3 function-DECLARATION/EXPRESSION scope shapes this narrow language surface actually
+ * has — no classes, but object-literal method/getter/setter shorthand (see
+ * `isMethodLikeScope` below) is still ordinary TS/JS syntax a `.sauce.ts` source can contain
+ * (e.g. building a router struct argument), so it gets its own parallel scope check. */
+function isPlainFunctionScope(
+  node: ts.Node,
+): node is ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction {
+  return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node);
+}
+
+/**
+ * The node kinds TypeScript uses for object-literal (and class) method/getter/setter
+ * shorthand — a separate function-like-scope family from `isPlainFunctionScope`'s three
+ * shapes, since none of `ts.isFunctionDeclaration`/`isFunctionExpression`/`isArrowFunction`
+ * matches a `MethodDeclaration`/`GetAccessorDeclaration`/`SetAccessorDeclaration`. Classes are
+ * already fully out of scope for this feature (`isOutOfScopeForPropagation` skips
+ * `ts.isClassLike` outright, without descending), so in practice this only ever matters for
+ * object-literal shorthand — but the scoping rules are identical either way: the parameter
+ * list reserves each parameter's name for the whole method/getter/setter body, exactly like a
+ * plain function.
+ */
+function isMethodLikeScope(
+  node: ts.Node,
+): node is ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration {
+  return ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node);
+}
+
+/**
+ * Every `var`-declared name reachable from `node` WITHOUT crossing into a nested function/
+ * class boundary (those are separate `var` scopes of their own) — `var` is function-scoped,
+ * not block-scoped, so a `var` declared inside a nested `if`/`for`/block still reserves its
+ * name for the whole enclosing function, unlike `let`/`const`.
+ */
+function collectVarNames(node: ts.Node, out: Set<string>): void {
+  ts.forEachChild(node, (child) => {
+    if (isPlainFunctionScope(child) || isMethodLikeScope(child) || ts.isClassLike(child)) return; // a separate var-scope
+
+    if (ts.isVariableStatement(child) && !(child.declarationList.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let))) {
+      for (const decl of child.declarationList.declarations) collectBindingNames(decl.name, out);
+    }
+
+    collectVarNames(child, out);
+  });
+}
+
+/** Names a Block/statement-list declares DIRECTLY (not through a further-nested block/function). */
+function collectDirectlyDeclaredNames(statements: readonly ts.Statement[], out: Set<string>): void {
+  for (const stmt of statements) {
+    if (ts.isVariableStatement(stmt)) {
+      for (const decl of stmt.declarationList.declarations) collectBindingNames(decl.name, out);
+    } else if (ts.isFunctionDeclaration(stmt) && stmt.name) {
+      out.add(stmt.name.text);
+    } else if (ts.isClassDeclaration(stmt) && stmt.name) {
+      out.add(stmt.name.text);
+    }
+  }
+}
+
+/**
+ * Node kinds that are entirely out of scope for this feature — real object/array DATA
+ * processing, and TS-only declaration forms that hold no runtime value read anyway (types
+ * are stripped later regardless of what this pass does to them). Left completely untouched
+ * (not even recursed into): classes/enums/namespaces don't occur in this language surface
+ * ("no closures/classes/async" per the compiler's own scope), and import/export specifiers
+ * are pure name bindings, never a value read.
+ */
+function isOutOfScopeForPropagation(node: ts.Node): boolean {
+  return (
+    ts.isTypeNode(node) ||
+    ts.isTypeParameterDeclaration(node) ||
+    ts.isClassLike(node) ||
+    ts.isEnumDeclaration(node) ||
+    ts.isModuleDeclaration(node) ||
+    ts.isInterfaceDeclaration(node) ||
+    ts.isTypeAliasDeclaration(node) ||
+    ts.isImportDeclaration(node) ||
+    ts.isImportEqualsDeclaration(node) ||
+    ts.isExportDeclaration(node) ||
+    ts.isBreakStatement(node) ||
+    ts.isContinueStatement(node)
+  );
+}
+
+/** Recurse into a (possibly nested/destructuring) binding NAME position — never a read. */
+function substituteBindingName(
+  name: ts.BindingName,
+  shadowed: ReadonlySet<string>,
+  consts: ReadonlyMap<string, bigint>,
+  context: ts.TransformationContext,
+): ts.BindingName {
+  if (ts.isIdentifier(name)) return name; // a binding target, never itself a read
+
+  if (ts.isObjectBindingPattern(name)) {
+    return ts.factory.updateObjectBindingPattern(
+      name,
+      name.elements.map((el) => substituteConstReads(el, shadowed, consts, context) as ts.BindingElement),
+    );
+  }
+
+  return ts.factory.updateArrayBindingPattern(
+    name,
+    name.elements.map((el) =>
+      ts.isBindingElement(el) ? (substituteConstReads(el, shadowed, consts, context) as ts.ArrayBindingElement) : el,
+    ),
+  );
+}
+
+/**
+ * Recurse into an ASSIGNMENT TARGET — the left side of `=`/a compound-assignment operator, or
+ * a `++`/`--` operand — where TypeScript represents destructuring ASSIGNMENT (`({a} = obj)`,
+ * `[a, b] = arr`) with the SAME node kinds as an ordinary object/array literal VALUE (only the
+ * parse position, not the node kind, distinguishes a target from a value), so this can't reuse
+ * the plain read-position visitor. A bare `Identifier` (the binding actually being written to)
+ * is never substituted — that mirrors `substituteBindingName`'s "a binding target, never
+ * itself a read" rule for real destructuring DECLARATIONS, just for the assignment-expression
+ * shape instead. Everything nested inside that genuinely still a READ, evaluated in the outer
+ * (pre-assignment) scope, IS substituted: a `PropertyAccessExpression`/`ElementAccessExpression`
+ * target's object expression (and, for the latter, its computed key), a computed object-literal
+ * property key, and any destructuring DEFAULT value (`{ a = 1 } = obj`, `[a = 1] = arr`).
+ */
+function visitAssignmentTarget(
+  node: ts.Expression,
+  shadowed: ReadonlySet<string>,
+  consts: ReadonlyMap<string, bigint>,
+  context: ts.TransformationContext,
+): ts.Expression {
+  const read = (n: ts.Expression): ts.Expression => substituteConstReads(n, shadowed, consts, context) as ts.Expression;
+  const target = (n: ts.Expression): ts.Expression => visitAssignmentTarget(n, shadowed, consts, context);
+
+  if (ts.isParenthesizedExpression(node)) {
+    return ts.factory.updateParenthesizedExpression(node, target(node.expression));
+  }
+
+  if (ts.isIdentifier(node) || ts.isOmittedExpression(node)) return node; // the write target itself, never a read
+
+  if (ts.isPropertyAccessExpression(node)) {
+    return ts.factory.updatePropertyAccessExpression(node, read(node.expression), node.name);
+  }
+
+  if (ts.isElementAccessExpression(node)) {
+    return ts.factory.updateElementAccessExpression(node, read(node.expression), read(node.argumentExpression));
+  }
+
+  if (ts.isArrayLiteralExpression(node)) {
+    // A destructuring-assignment array pattern (`[a, ...rest] = arr`) — each element (or the
+    // rest target) recurses as a further assignment target, not a plain read.
+    return ts.factory.updateArrayLiteralExpression(
+      node,
+      node.elements.map((el) =>
+        ts.isSpreadElement(el) ? ts.factory.updateSpreadElement(el, target(el.expression)) : target(el),
+      ),
+    );
+  }
+
+  if (ts.isObjectLiteralExpression(node)) {
+    // A destructuring-assignment object pattern (`{ a, b: c, ...rest } = obj`).
+    return ts.factory.updateObjectLiteralExpression(
+      node,
+      node.properties.map((prop) => {
+        if (ts.isShorthandPropertyAssignment(prop)) {
+          // `{ a }` as a target binds `a` — never a read; `{ a = 1 }`'s default IS a read,
+          // evaluated in the outer (pre-assignment) scope.
+          return prop.objectAssignmentInitializer
+            ? ts.factory.updateShorthandPropertyAssignment(prop, prop.name, read(prop.objectAssignmentInitializer))
+            : prop;
+        }
+
+        if (ts.isPropertyAssignment(prop)) {
+          // `{ a: target }` — the key is a label (a COMPUTED key genuinely reads whatever's
+          // inside), the value recurses as a further assignment target, not a plain read.
+          const name = ts.isComputedPropertyName(prop.name)
+            ? ts.factory.updateComputedPropertyName(prop.name, read(prop.name.expression))
+            : prop.name;
+
+          return ts.factory.updatePropertyAssignment(prop, name, target(prop.initializer));
+        }
+
+        if (ts.isSpreadAssignment(prop)) return ts.factory.updateSpreadAssignment(prop, target(prop.expression));
+
+        return prop;
+      }),
+    );
+  }
+
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    // A default inside an ARRAY pattern (`[a = 1] = arr`) parses its element as a plain `=`
+    // BinaryExpression (unlike an object pattern's dedicated `objectAssignmentInitializer`
+    // slot) — the left is still the write target, the right is a genuine read.
+    return ts.factory.updateBinaryExpression(node, target(node.left), node.operatorToken, read(node.right));
+  }
+
+  // Any other shape here isn't a real assignment target — leave it untouched rather than guess.
+  return node;
+}
+
+/**
+ * The substitution visitor: replaces every unshadowed read of a top-level const name with
+ * its literal, threading a growing `shadowed` set down through every scope-introducing node.
+ * Falls back to generic `ts.visitEachChild` recursion (under the SAME `shadowed` set) for any
+ * node kind not specially handled — safe because the only slots that are ever NOT a value
+ * read (declaration/binding names, property-access member names, non-computed object-literal
+ * keys, and — see the assignment/update-operator cases below — an assignment's left-hand side
+ * or an update expression's operand) are exactly the ones special-cased below.
+ */
+function substituteConstReads(
+  node: ts.Node,
+  shadowed: ReadonlySet<string>,
+  consts: ReadonlyMap<string, bigint>,
+  context: ts.TransformationContext,
+): ts.Node {
+  const visit = (n: ts.Node, s: ReadonlySet<string> = shadowed): ts.Node => substituteConstReads(n, s, consts, context);
+
+  if (isOutOfScopeForPropagation(node)) return node;
+
+  if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
+    // `a = 1`, `a += 1`, `({a} = obj)`, `[a] = arr`, … — the left side (however deeply nested
+    // a destructuring-assignment pattern it is) is a WRITE target, never a read, regardless of
+    // which assignment operator is used (even `+=`/etc., which also reads the current value,
+    // still can't have its target replaced by a literal — you can't assign into `1n`). Only
+    // the right side is substituted as an ordinary read.
+    return ts.factory.updateBinaryExpression(
+      node,
+      visitAssignmentTarget(node.left, shadowed, consts, context),
+      node.operatorToken,
+      visit(node.right) as ts.Expression,
+    );
+  }
+
+  if (
+    (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+    (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)
+  ) {
+    // `a++`/`--a`/etc. — the operand is a write target (it's re-assigned), same rule as above.
+    const operand = visitAssignmentTarget(node.operand, shadowed, consts, context);
+
+    return ts.isPrefixUnaryExpression(node)
+      ? ts.factory.updatePrefixUnaryExpression(node, operand)
+      : ts.factory.updatePostfixUnaryExpression(node, operand);
+  }
+
+  if (ts.isIdentifier(node)) {
+    if (shadowed.has(node.text)) return node;
+
+    const value = consts.get(node.text);
+
+    if (value === undefined) return node;
+
+    return toLiteralNode(value) ?? node;
+  }
+
+  if (ts.isPropertyAccessExpression(node)) {
+    // `.name` (the member label after the dot) is never a variable reference.
+    return ts.factory.updatePropertyAccessExpression(node, visit(node.expression) as ts.Expression, node.name);
+  }
+
+  if (ts.isElementAccessExpression(node)) {
+    return ts.factory.updateElementAccessExpression(
+      node,
+      visit(node.expression) as ts.Expression,
+      visit(node.argumentExpression) as ts.Expression,
+    );
+  }
+
+  if (ts.isShorthandPropertyAssignment(node)) {
+    // `{ a }` — `a` is BOTH the object key and an implicit read of the variable `a`.
+    // `objectAssignmentInitializer` only ever appears when this shorthand is itself a
+    // DESTRUCTURING target (`({ a = 1 } = obj)`), not a value read — left alone (out of
+    // scope, same as any other binding-pattern default).
+    if (!node.objectAssignmentInitializer && !shadowed.has(node.name.text)) {
+      const value = consts.get(node.name.text);
+      const literal = value !== undefined ? toLiteralNode(value) : undefined;
+
+      if (literal) return ts.factory.createPropertyAssignment(node.name, literal);
+    }
+
+    return node;
+  }
+
+  if (ts.isPropertyAssignment(node)) {
+    // A non-computed key (`{ a: ... }`) is a label, not a read; a computed key
+    // (`{ [a]: ... }`) genuinely reads `a`.
+    const name = ts.isComputedPropertyName(node.name)
+      ? ts.factory.updateComputedPropertyName(node.name, visit(node.name.expression) as ts.Expression)
+      : node.name;
+
+    return ts.factory.updatePropertyAssignment(node, name, visit(node.initializer) as ts.Expression);
+  }
+
+  if (ts.isVariableDeclaration(node)) {
+    return ts.factory.updateVariableDeclaration(
+      node,
+      substituteBindingName(node.name, shadowed, consts, context),
+      node.exclamationToken,
+      node.type,
+      node.initializer ? (visit(node.initializer) as ts.Expression) : undefined,
+    );
+  }
+
+  if (ts.isBindingElement(node)) {
+    return ts.factory.updateBindingElement(
+      node,
+      node.dotDotDotToken,
+      node.propertyName,
+      substituteBindingName(node.name, shadowed, consts, context),
+      node.initializer ? (visit(node.initializer) as ts.Expression) : undefined,
+    );
+  }
+
+  if (ts.isParameter(node)) {
+    return ts.factory.updateParameterDeclaration(
+      node,
+      node.modifiers,
+      node.dotDotDotToken,
+      substituteBindingName(node.name, shadowed, consts, context),
+      node.questionToken,
+      node.type,
+      node.initializer ? (visit(node.initializer) as ts.Expression) : undefined,
+    );
+  }
+
+  if (ts.isCatchClause(node)) {
+    const names = new Set(shadowed);
+
+    if (node.variableDeclaration) collectBindingNames(node.variableDeclaration.name, names);
+
+    return ts.factory.updateCatchClause(node, node.variableDeclaration, visit(node.block, names) as ts.Block);
+  }
+
+  if (ts.isBlock(node)) {
+    const names = new Set(shadowed);
+
+    collectDirectlyDeclaredNames(node.statements, names);
+
+    return ts.factory.updateBlock(
+      node,
+      node.statements.map((s) => visit(s, names) as ts.Statement),
+    );
+  }
+
+  if (isPlainFunctionScope(node)) {
+    const names = new Set(shadowed);
+
+    for (const p of node.parameters) collectBindingNames(p.name, names);
+
+    if (node.body) collectVarNames(node.body, names);
+
+    // A named function (declaration, or named function EXPRESSION) can reference itself.
+    if (node.name) names.add(node.name.text);
+
+    const childVisitor: ts.Visitor = (child) => (child === node.name ? child : visit(child, names));
+
+    return ts.visitEachChild(node, childVisitor, context);
+  }
+
+  if (isMethodLikeScope(node)) {
+    const names = new Set(shadowed);
+
+    for (const p of node.parameters) collectBindingNames(p.name, names);
+
+    if (node.body) collectVarNames(node.body, names);
+
+    // A non-computed key (`method(...)` / `get x()` / `set x(...)`) is a label, not a read —
+    // unlike a named function EXPRESSION, a method/getter/setter can't reference its own key
+    // as a variable, so (unlike isPlainFunctionScope above) there's no self-reference name to
+    // add to `names`. A COMPUTED key (`[expr](...)`) genuinely reads whatever's inside, and
+    // that expression runs in the OUTER scope — before the method's own parameter scope
+    // exists — same as a computed object-literal property key (see isPropertyAssignment below).
+    const childVisitor: ts.Visitor = (child) => {
+      if (child === node.name) {
+        return ts.isComputedPropertyName(node.name)
+          ? ts.factory.updateComputedPropertyName(node.name, visit(node.name.expression, shadowed) as ts.Expression)
+          : node.name;
+      }
+
+      return visit(child, names);
+    };
+
+    return ts.visitEachChild(node, childVisitor, context);
+  }
+
+  if (ts.isForStatement(node)) {
+    const names = new Set(shadowed);
+
+    if (node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+      for (const decl of node.initializer.declarations) collectBindingNames(decl.name, names);
+    }
+
+    return ts.factory.updateForStatement(
+      node,
+      node.initializer ? (visit(node.initializer, names) as ts.ForInitializer) : undefined,
+      node.condition ? (visit(node.condition, names) as ts.Expression) : undefined,
+      node.incrementor ? (visit(node.incrementor, names) as ts.Expression) : undefined,
+      visit(node.statement, names) as ts.Statement,
+    );
+  }
+
+  if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+    const names = new Set(shadowed);
+
+    if (ts.isVariableDeclarationList(node.initializer)) {
+      for (const decl of node.initializer.declarations) collectBindingNames(decl.name, names);
+    }
+
+    const visitedInit = visit(node.initializer, names) as ts.ForInitializer;
+    const visitedStmt = visit(node.statement, names) as ts.Statement;
+    // The iterated/enumerated expression is evaluated in the OUTER scope — it can never see
+    // the loop's own declaration, regardless of TDZ (it runs once, before any iteration binds).
+    const visitedExpr = visit(node.expression, shadowed) as ts.Expression;
+
+    return ts.isForOfStatement(node)
+      ? ts.factory.updateForOfStatement(node, node.awaitModifier, visitedInit, visitedExpr, visitedStmt)
+      : ts.factory.updateForInStatement(node, visitedInit, visitedExpr, visitedStmt);
+  }
+
+  if (ts.isLabeledStatement(node)) {
+    return ts.factory.updateLabeledStatement(node, node.label, visit(node.statement) as ts.Statement);
+  }
+
+  return ts.visitEachChild(node, (child) => visit(child), context);
+}
+
+function constPropagationTransformer(consts: ReadonlyMap<string, bigint>) {
+  return (context: ts.TransformationContext): ts.Transformer<ts.SourceFile> => {
+    return (sourceFile) => {
+      const statements = sourceFile.statements.map(
+        (stmt) => substituteConstReads(stmt, new Set(), consts, context) as ts.Statement,
+      );
+
+      return ts.factory.updateSourceFile(sourceFile, statements);
+    };
+  };
+}
+
+/**
+ * How many `Identifier`s named `name` occur in `root`, ignoring the node at `exclude` — and
+ * ignoring LABEL positions the same way `substituteConstReads` itself already does (a
+ * non-computed `PropertyAssignment`/`ShorthandPropertyAssignment` key is never a variable
+ * read), so a struct-literal shorthand read that pass already substituted away (`{ a }` →
+ * `{ a: <literal> }`, reusing the original `a` Identifier as the new key) doesn't count as a
+ * phantom "still referenced" use of the const whose value was just inlined there. A surviving
+ * (not-rewritten) `ShorthandPropertyAssignment` can never itself be a genuine unshadowed read
+ * of a tracked top-level const either — if it were, `constPropagationTransformer` would
+ * already have converted it — so its key is excluded too; only a destructuring default
+ * (`objectAssignmentInitializer`) is still walked, since that IS a real read.
+ */
+function countIdentifierRefs(root: ts.Node, name: string, exclude: ts.Node): number {
+  let count = 0;
+
+  const walk = (node: ts.Node): void => {
+    if (node === exclude) return;
+
+    if (ts.isIdentifier(node) && node.text === name) {
+      count++;
+
+      return;
+    }
+
+    if (ts.isPropertyAssignment(node)) {
+      if (ts.isComputedPropertyName(node.name)) walk(node.name);
+
+      walk(node.initializer);
+
+      return;
+    }
+
+    if (ts.isShorthandPropertyAssignment(node)) {
+      if (node.objectAssignmentInitializer) walk(node.objectAssignmentInitializer);
+
+      return;
+    }
+
+    ts.forEachChild(node, walk);
+  };
+
+  walk(root);
+
+  return count;
+}
+
+/**
+ * Removes any top-level `const` declaration whose name has zero remaining `Identifier`
+ * occurrences anywhere in the (already-substituted) file. Deliberately a flat, whole-file
+ * textual count — NOT scope-aware — matching `constPropagationTransformer`'s own guarantee
+ * that it already replaced every reachable, unshadowed reference with a literal: by this
+ * point, any occurrence still in the tree is either a shadowing inner declaration of the
+ * SAME name (a coincidental false-positive "still referenced" that simply keeps this
+ * otherwise-dead declaration around, harmlessly) or a genuine remaining use this pass
+ * correctly declines to touch.
+ */
+function deadConstEliminationTransformer(consts: ReadonlyMap<string, bigint>) {
+  return (_context: ts.TransformationContext): ts.Transformer<ts.SourceFile> => {
+    return (sourceFile) => {
+      const declNameNodes = new Map<string, ts.Identifier>();
+
+      for (const stmt of sourceFile.statements) {
+        if (!ts.isVariableStatement(stmt) || !(stmt.declarationList.flags & ts.NodeFlags.Const)) continue;
+
+        for (const decl of stmt.declarationList.declarations) {
+          if (ts.isIdentifier(decl.name) && consts.has(decl.name.text) && !declNameNodes.has(decl.name.text)) {
+            declNameNodes.set(decl.name.text, decl.name);
+          }
+        }
+      }
+
+      const eliminable = new Set<string>();
+
+      for (const [name, nameNode] of declNameNodes) {
+        if (countIdentifierRefs(sourceFile, name, nameNode) === 0) eliminable.add(name);
+      }
+
+      if (eliminable.size === 0) return sourceFile;
+
+      const statements = sourceFile.statements.flatMap((stmt) => {
+        if (!ts.isVariableStatement(stmt) || !(stmt.declarationList.flags & ts.NodeFlags.Const)) return [stmt];
+
+        const kept = stmt.declarationList.declarations.filter(
+          (decl) => !(ts.isIdentifier(decl.name) && eliminable.has(decl.name.text)),
+        );
+
+        if (kept.length === stmt.declarationList.declarations.length) return [stmt];
+
+        if (kept.length === 0) return [];
+
+        return [
+          ts.factory.updateVariableStatement(
+            stmt,
+            stmt.modifiers,
+            ts.factory.updateVariableDeclarationList(stmt.declarationList, kept),
+          ),
+        ];
+      });
+
+      return ts.factory.updateSourceFile(sourceFile, statements);
+    };
+  };
+}
+
 /**
  * Fold provably-constant branches/expressions/loops in a `.ts`/`.sauce.ts` module and
  * strip types, returning plain JS text ready for `acorn.parse`. Pure function of its input
@@ -647,7 +1233,9 @@ export function tsPartialEval(code: string, filePath: string): string {
   const result = ts.transpileModule(code, {
     fileName: filePath,
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
-    transformers: { before: [foldTransformer(consts)] },
+    transformers: {
+      before: [foldTransformer(consts), constPropagationTransformer(consts), deadConstEliminationTransformer(consts)],
+    },
   });
 
   return result.outputText;
