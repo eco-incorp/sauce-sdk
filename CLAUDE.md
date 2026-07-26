@@ -110,12 +110,22 @@ TWO evaluators, layered: `tsEvalConst` (a hand-rolled bigint evaluator mirroring
 bare BigInt literal like `"3n"` throws — the constructor rejects the literal's own `n` suffix — and
 bigint binary expressions just fail silently), and SauceScript is bigint-only, so `ts-evaluator`'s
 `evaluate()` (`tryEvaluate`) is only a fallback for shapes `tsEvalConst` doesn't cover (bare
-boolean/string identifiers, ternaries-as-values, templates — same-file identifiers only, no
-`ts.Program`/checker is built, so it can't see into array/object property access or function calls
-either — that scope boundary is why loop unrolling can't (yet) fold real array/object DATA
-processing, only countable counters). A failed/unresolvable fold always leaves the node untouched
-(fails closed, never throws) — `tryEvaluate` wraps `evaluate()` in try/catch for whatever still
-reaches it with a bigint present (e.g. a template literal substitution).
+boolean/string identifiers, templates — same-file identifiers only, no `ts.Program`/checker is
+built, so it can't see into array/object property access or function calls either — that scope
+boundary is why loop unrolling can't (yet) fold real array/object DATA processing, only countable
+counters). **A ternary's MAINSTREAM path is neither evaluator directly**: `tsEvalConst`/
+`tsEvalUnary`/`tsEvalBinary` have NO case for `ts.isConditionalExpression` anywhere — instead,
+`foldTransformer` (the module-scope fold pass, described further below) handles a ternary via its
+OWN separate, dedicated `ts.isConditionalExpression` visitor branch: it evaluates ONLY `.condition`
+(via `foldExpression`, which tries `tsEvalConst` first, `tryEvaluate` only as THAT narrower
+fallback) and, if resolved, structurally replaces the WHOLE ternary with whichever branch was
+taken, recursing into it (so a nested ternary in the taken branch cascades too). `tryEvaluate` is
+only ever asked to resolve a WHOLE ternary node in the narrower case where `foldExpression` is
+reached from a calling context that doesn't go through that dedicated branch — e.g. an
+if-statement whose own test expression is itself a bare ternary. A failed/unresolvable fold always
+leaves the node untouched (fails closed, never throws) — `tryEvaluate` wraps `evaluate()` in
+try/catch for whatever still reaches it with a bigint present (e.g. a template literal
+substitution).
 
 **Fix (this branch): a suffix-less numeric literal beyond `Number.MAX_SAFE_INTEGER` silently
 corrupted to the nearest float64 value.** Both `tsEvalConst`'s `ts.isNumericLiteral` branch and
@@ -569,6 +579,59 @@ this feature's whole value; a still-live but now-fully-inlined `let x = 8n;` sit
 nice-to-have cleanup this pass doesn't attempt); and algebraic-identity/dead-code-after-a-
 terminator peephole simplifications — skipped here to keep the surface area this change touches
 as small as the core requirement allows.
+
+**Ternary (conditional-expression) folding, layered on top of every rule above.** `tsEvalConst`
+itself has no case for `ts.isConditionalExpression` anywhere (see the "TWO evaluators" note near
+the top of this file) — a ternary's mainstream path folds via `foldTransformer`'s own separate,
+MODULE-scope mechanism instead, which this LOCAL, per-function pass has no equivalent of by
+construction (it walks fresh per function, against its own evolving `env`/`LocalResolution`, never
+`foldTransformer`'s whole-file `consts`). Before this fix, a ternary whose CONDITION was only
+resolvable through this pass's own local reasoning (a plain local variable, not a same-file
+top-level const `foldTransformer` could ever have seen) fell through to NAC even on a plain
+assignment RHS (`x = localCond ? 5n : 6n;`), and the substitution side never restructured/collapsed
+a ternary node at all — only visited its children. `evalLocalConst` (used by `foldOrSubstitute`,
+the function that decides a declaration/assignment's newly-tracked value) closes the first half of
+this gap WITHOUT teaching the shared evaluator family a new node kind: it tries the ordinary
+`tsEvalConst` first (unchanged — the common, ternary-free case), and only if that fails, asks
+`substituteLocalReads` to structurally COLLAPSE any resolvable `ConditionalExpression` (its own new
+dedicated case, mirroring `foldTransformer`'s: evaluate just `.condition` through this pass's
+`LocalResolution`, and if it resolves, replace the WHOLE ternary with whichever branch was
+selected, itself recursively substituted — so a nested ternary in the taken branch, or any other
+locally-known identifier, also resolves, cascading) and re-attempts `tsEvalConst` on the collapsed
+result. Together these are what let the motivating shape (`x = localCond ? 5n : 6n;`) propagate
+`x`'s new value all the way to a later read, AND let a ternary NESTED inside a larger expression
+fold completely too (`let b = (cond ? 2n : 3n) + 1n;` — never itself the whole assignment RHS —
+`substituteLocalReads` collapses the ternary first, and the arithmetic around it then folds
+normally on the second attempt). **This matters beyond a missed-optimization win**: the base
+SauceScript grammar only accepts a ternary directly in assignment/declaration position — a ternary
+nested inside another expression, or passed as a call argument, is a hard compile error if it ever
+reaches that stage unresolved (`processor/index.ts`'s `processExpression`: `'ternary must be used
+directly in an assignment'`). Eliminating a locally-resolvable NESTED ternary here, before `acorn`
+ever sees it, is therefore what makes an otherwise genuinely-INVALID program compile at all, not
+merely a faster compile of an already-valid one. Composes with every existing rule in this pass
+rather than bypassing any of them, by construction — there is no separate lookup path for a
+ternary's condition, it is the exact same `tsEvalConst`-against-`LocalResolution` every other
+expression in this pass already uses: a ternary depending on a name this pass has forced NAC (the
+loop-write rule) correctly declines, since the condition's own lookup fails closed on the
+NAC-shadowed name, same as any other read; a ternary whose condition was resolved only via the
+if/else merge-at-join rule earlier in the same function correctly uses that ALREADY-MERGED value
+(again, the same `env`, no separate path); and a ternary inside a function this pass has already
+decided to bail on (the closure-bail rule) is never reached by any of this, since a bailed
+function is returned completely untouched before this pass ever walks its body. Whenever the
+condition genuinely can't be resolved, `substituteLocalReads`'s fallback rewrites `.condition`/
+`.whenTrue`/`.whenFalse` each independently instead of collapsing — so a locally-known identifier
+elsewhere inside the ternary still gets substituted, without touching the ternary's own (genuinely
+runtime-conditioned) branch structure — matching every other "can't prove it, don't guess" rule
+already in this pass. **This also covers a ternary on the RHS of a COMPOUND assignment
+(`+=`/`-=`/etc.)**: `evalCompoundAssignmentResult` (the function that decides a compound
+assignment's newly-tracked value, one level up from `foldOrSubstitute`) resolves its RHS through
+the SAME `evalLocalConst` bridge rather than a bare `tsEvalConst` call, so `x += cond ? 1n : 2n;`
+updates the tracked value exactly like the plain-assignment spelling `x = cond ? 1n : 2n;` does —
+before this, `substituteLocalReads` already collapsed the ternary in the EMITTED code (`x += 1n;`
+printed correctly), but the tracked value independently stayed NAC, so a later read of `x` stayed
+un-folded even though the assignment right above it was already a fully-resolved literal — sound
+(never a wrong value), just a needlessly missed fold, and now closed the same way every other
+asymmetry in this pass is: by routing through the one shared bridge rather than adding a second.
 
 **A function-local declaration that happens to share a name with a top-level const is now ALSO
 resolved (to its OWN value), not merely left inert.** Because this pass runs LAST, a shape like
