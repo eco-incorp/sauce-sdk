@@ -331,6 +331,33 @@ const ASSIGNMENT_OPERATOR_TOKENS = new Set([
     ts.SyntaxKind.AmpersandAmpersandEqualsToken,
     ts.SyntaxKind.QuestionQuestionEqualsToken,
 ]);
+/**
+ * Does `node` contain, anywhere (not crossing into a nested function-like scope — a separate
+ * scope `foldTransformer` visits independently, with its own narrowed `shadowed` set), a bare
+ * Identifier whose name is in `shadowed`? Gates the `tryEvaluate` (ts-evaluator) fallback in
+ * `foldExpression` below: `tsEvalConst` resolves an Identifier through the `shadowed`/`consts`
+ * pair passed to it (already correctly shadow-aware), but `tryEvaluate` delegates to
+ * `ts-evaluator`'s OWN same-file identifier resolution — a third-party black box this file
+ * does not control and cannot confirm respects LOCAL (parameter/`let`/`const`) shadowing at
+ * all. Confirmed empirically that it does NOT: `const FLAG = true; function f(FLAG) { if
+ * (FLAG) { ... } }` — `tsEvalConst` correctly fails closed on the shadowed `FLAG` read, but
+ * `ts-evaluator`'s `evaluate()` still resolves it against the OUTER `const FLAG = true`,
+ * silently pruning the `if` on the parameter's shadowing name instead of failing closed. So
+ * whenever a shadowed name could be in play anywhere in the expression, this must decline the
+ * ts-evaluator fallback entirely.
+ */
+function containsShadowedIdentifier(node, shadowed) {
+    if (shadowed.size === 0)
+        return false;
+    if (ts.isIdentifier(node))
+        return shadowed.has(node.text);
+    let found = false;
+    ts.forEachChild(node, (child) => {
+        if (!found && containsShadowedIdentifier(child, shadowed))
+            found = true;
+    });
+    return found;
+}
 /** Combines both evaluators: the reliable bigint path first, ts-evaluator as a fallback. */
 function foldExpression(node, consts, functions, shadowed) {
     if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
@@ -349,6 +376,13 @@ function foldExpression(node, consts, functions, shadowed) {
     // entirely. This mirrors the `ASSIGNMENT_OPERATOR_TOKENS` guard just above: fail closed by
     // construction, not by coincidence.
     if (ts.isCallExpression(node))
+        return { success: false };
+    // A shadowed name anywhere in the expression must decline this fallback outright — see
+    // `containsShadowedIdentifier`'s own comment: `ts-evaluator`'s same-file identifier
+    // resolution is confirmed to ignore local (parameter/`let`/`const`) shadowing entirely, so
+    // handing it an expression containing one risks silently resolving against the WRONG (outer,
+    // unrelated) top-level binding instead of failing closed like `tsEvalConst` already does.
+    if (containsShadowedIdentifier(node, shadowed))
         return { success: false };
     return tryEvaluate(node);
 }
@@ -789,6 +823,9 @@ function isPlainFunctionScope(node) {
 function isMethodLikeScope(node) {
     return ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node);
 }
+function isFunctionLikeScope(node) {
+    return isPlainFunctionScope(node) || isMethodLikeScope(node);
+}
 /**
  * Every `var`-declared name reachable from `node` WITHOUT crossing into a nested function/
  * class boundary (those are separate `var` scopes of their own) — `var` is function-scoped,
@@ -805,6 +842,49 @@ function collectVarNames(node, out) {
         }
         collectVarNames(child, out);
     });
+}
+/**
+ * Every name a (possibly nested) LEXICAL declaration — `let`/`const`, a nested named
+ * `function`, a `for`/`for-of`/`for-in` loop's own binding, a `catch` binding — introduces
+ * anywhere reachable from `node` WITHOUT crossing into a nested function-like scope or class
+ * (each of those is its own separate variable scope). Unlike `collectVarNames` (which only
+ * hoists a `var`), this DELIBERATELY includes a name first declared inside a nested `if`/
+ * `while`/bare-`{}` block: the real SauceScript compiler shares scope across those (only a
+ * `for` loop pushes a genuine new one — see `processor/statement.ts`'s `processIfStatement`/
+ * `processWhileStatement`, neither of which calls `ctx.pushScope`, versus
+ * `processForStatement`, which does), so a `let`/`const` first declared inside such a branch is
+ * NOT block-scoped away once the branch ends — it is the SAME persisting variable for the rest
+ * of the function. A nested named `function` declaration is included for the identical
+ * reason (and, separately, so a same-named top-level function is never wrongly resolved as the
+ * callee of a call to this nested one — see `tsEvalCall`'s own `shadowed` check, consulted by
+ * the local constant-propagation pass further down whenever it evaluates an expression via the
+ * real `tsEvalConst`/`tsEvalBinary`/`tsEvalUnary` family). Over-including a name here (treating
+ * it as reserved for the WHOLE function when a narrower, block-precise analysis might not have)
+ * costs at most a missed optimization — an unresolved read simply defers to the real compiler's
+ * own correct `getVar`-then-`getConstant`/function-lookup resolution — never a wrong fold.
+ */
+function collectLexicalNamesInScope(node, out) {
+    if (ts.isFunctionDeclaration(node) && node.name)
+        out.add(node.name.text); // record before treating as a nested scope below
+    if (isFunctionLikeScope(node) || ts.isClassLike(node))
+        return; // a separate scope — don't recurse into its own body
+    if (ts.isVariableStatement(node)) {
+        for (const decl of node.declarationList.declarations)
+            collectBindingNames(decl.name, out);
+    }
+    else if (ts.isForStatement(node) && node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+        for (const decl of node.initializer.declarations)
+            collectBindingNames(decl.name, out);
+    }
+    else if ((ts.isForOfStatement(node) || ts.isForInStatement(node)) &&
+        ts.isVariableDeclarationList(node.initializer)) {
+        for (const decl of node.initializer.declarations)
+            collectBindingNames(decl.name, out);
+    }
+    else if (ts.isCatchClause(node) && node.variableDeclaration) {
+        collectBindingNames(node.variableDeclaration.name, out);
+    }
+    ts.forEachChild(node, (child) => collectLexicalNamesInScope(child, out));
 }
 /** Names a Block/statement-list declares DIRECTLY (not through a further-nested block/function). */
 function collectDirectlyDeclaredNames(statements, out) {
@@ -1007,6 +1087,19 @@ function substituteConstReads(node, shadowed, consts, context) {
             collectBindingNames(p.name, names);
         if (node.body)
             collectVarNames(node.body, names);
+        // ALSO shadow every name `collectLexicalNamesInScope` finds anywhere in the body — not
+        // just this function's own DIRECT declarations — since the real SauceScript compiler
+        // shares scope across `if`/`while`/bare-block bodies (only a `for` loop pushes a genuine
+        // new one; see `processor/statement.ts`'s `processIfStatement`/`processWhileStatement`,
+        // neither of which calls `ctx.pushScope`, versus `processForStatement`, which does). A
+        // name FIRST `let`/`const`-declared inside such a branch is therefore NOT block-scoped
+        // away once the branch ends — it is the SAME persisting variable for the rest of the
+        // function — so without this, a read of it AFTER the branch would wrongly fall through to
+        // a same-named top-level const instead of staying an (unsubstituted) real runtime read:
+        // `const FEE = 100n; function f(cond) { if (cond) { let FEE = 5n; } return FEE; }` must
+        // stay `return FEE;`, never fold to `100n`.
+        if (node.body)
+            collectLexicalNamesInScope(node.body, names);
         // A named function (declaration, or named function EXPRESSION) can reference itself.
         if (node.name)
             names.add(node.name.text);
@@ -1019,6 +1112,8 @@ function substituteConstReads(node, shadowed, consts, context) {
             collectBindingNames(p.name, names);
         if (node.body)
             collectVarNames(node.body, names);
+        if (node.body)
+            collectLexicalNamesInScope(node.body, names); // see isPlainFunctionScope's note above
         // A non-computed key (`method(...)` / `get x()` / `set x(...)`) is a label, not a read —
         // unlike a named function EXPRESSION, a method/getter/setter can't reference its own key
         // as a variable, so (unlike isPlainFunctionScope above) there's no self-reference name to
@@ -2042,6 +2137,758 @@ function deadConstEliminationTransformer(consts, primaryNames, pairNames, tables
         };
     };
 }
+// ── Local (per-function) constant propagation ──
+//
+// Everything above this point tracks only same-file TOP-LEVEL `const`s (plus effectively-const
+// `let`/`var`s and array/object lookup tables — still all TOP-LEVEL). A `let`/`const` declared
+// and reassigned INSIDE a function body gets none of that benefit. This is a NEW, SEPARATE pass
+// closing that gap: a control-flow-sensitive (but deliberately NOT a real fixpoint dataflow —
+// see the loop rule below) sequential abstract interpreter, walked fresh and independently per
+// function-like scope (`FunctionDeclaration`/`FunctionExpression`/`ArrowFunction`/
+// `MethodDeclaration`/`GetAccessorDeclaration`/`SetAccessorDeclaration` with a `Block` body),
+// tracking a `Map<name, bigint | NAC>` ("NAC" = not a compile-time constant) per variable per
+// program point and substituting a read with its known value wherever provable. It does not
+// touch, duplicate, or depend on the mutable behavior of `constPropagationTransformer`/
+// `deadConstEliminationTransformer`/`tableFoldTransformer` above — it only ever READS the
+// same-file top-level `consts`/`functions` maps those trust, as a fallback for a name this
+// pass's own function never itself declares/assigns. It runs strictly AFTER every pass above
+// (last in `tsPartialEval`'s pipeline): a constant-condition `if`/a fully-unrolled loop is
+// already gone from the tree, and whatever the top-level passes already substituted/eliminated
+// stays exactly as they left it — this pass's own top-level fallback only ever matters for a
+// read this pass's OWN evaluation can resolve in the SAME expression as a genuine local (e.g.
+// `x + RATE`).
+//
+// Every real `tsEvalConst`/`tsEvalUnary`/`tsEvalBinary` call this pass makes uses the SAME
+// 4-argument signature (`node, consts, functions, shadowed`) every other pass in this file
+// uses — there is no second evaluator or lookup abstraction here, only a small per-call-site
+// SNAPSHOT (`resolveLocalEnv`/`LocalResolution`, further below) of what this pass's own
+// evolving `env` currently resolves each name to, expressed in exactly those 3 extra arguments.
+//
+// The lattice: known-bigint-value, or NAC, per variable name, per program point, tracked in a
+// plain `Map<name, bigint | NAC>` — walked fresh, independently, per function-like scope with a
+// Block body; a nested function-like scope encountered while walking is always an OPAQUE LEAF
+// here (left completely untouched by the walk in progress) because it gets its OWN independent
+// visit — a fresh environment, from scratch — from the top-level driver below. This is the
+// single biggest behavioral difference from `substituteConstReads` above (which INTENTIONALLY
+// recurses into a nested function body, since a top-level const's value is valid everywhere
+// unshadowed): a local's value from this pass's env is only ever meaningful within the ONE
+// function body currently being walked.
+const NAC = Symbol('not a compile-time constant');
+function resolveLocalEnv(env, top) {
+    const consts = new Map(top.consts);
+    const shadowed = new Set();
+    for (const [name, value] of env) {
+        if (value === NAC) {
+            shadowed.add(name);
+            // A NAC-shadowed name must never leak `top.consts`' own (stale, unrelated) value
+            // through a plain map lookup — `tsEvalConst`'s Identifier/call-callee resolution
+            // already checks `shadowed` before ever consulting `consts`, so this delete is
+            // redundant for THOSE call sites, but `substituteLocalReads`'s identifier
+            // substitution (and `evalCompoundAssignmentResult`/`walkUpdateExpr`'s "current value"
+            // reads) deliberately consult `consts` alone, with no separate `shadowed` check of
+            // their own — without deleting here, a same-named top-level const would otherwise
+            // still resolve through the leftover `top.consts` entry, wrongly substituting the
+            // OUTER value for a local this scope has already shadowed (the exact class of bug
+            // fix A closes for `constPropagationTransformer`, one layer up).
+            consts.delete(name);
+        }
+        else {
+            consts.set(name, value);
+        }
+    }
+    return { consts, functions: top.functions, shadowed };
+}
+/** Every name a (possibly nested/destructuring) binding introduces, marked NAC in `env` —
+ * used whenever a declaration's value isn't a bare Identifier bound to a single bigint (no
+ * initializer, or a destructuring pattern whose RHS this pass can't reason about anyway). */
+function markNamesNac(name, env) {
+    const names = new Set();
+    collectBindingNames(name, names);
+    for (const n of names)
+        env.set(n, NAC);
+}
+// ── Bail conditions: skip a WHOLE function-like scope entirely, leaving it completely
+// untouched (not even partially analyzed), when reasoning about it soundly would require
+// more than this pass attempts. ──
+/**
+ * `SwitchStatement`/`TryStatement`/`LabeledStatement` (any labeled break/continue is always
+ * paired with one)/`ForOfStatement`/`ForInStatement` ANYWHERE in `fn`'s own body — checked
+ * WITHOUT crossing into a nested function-like scope's own body, since that scope is vetted
+ * independently, on its own merits, when the top-level driver reaches it separately. None of
+ * these 5 node kinds has a case in `processStatement`'s switch (`compiler/src/processor/
+ * index.ts`/`statement.ts`) at all — every one throws "not implemented" downstream today —
+ * so bailing on them here costs nothing: a source containing one fails to compile regardless
+ * of whether this pass touches it.
+ */
+function containsDisallowedConstruct(node) {
+    if (isOutOfScopeForPropagation(node) || isFunctionLikeScope(node))
+        return false;
+    if (ts.isSwitchStatement(node) ||
+        ts.isTryStatement(node) ||
+        ts.isLabeledStatement(node) ||
+        ts.isForOfStatement(node) ||
+        ts.isForInStatement(node)) {
+        return true;
+    }
+    let found = false;
+    ts.forEachChild(node, (child) => {
+        if (!found && containsDisallowedConstruct(child))
+            found = true;
+    });
+    return found;
+}
+/**
+ * Every Identifier name referenced anywhere in `node`'s subtree that ISN'T bound by `node`'s
+ * own scope chain (its parameters/lexical locals, or those of any function-like scope nested
+ * inside it, tracked precisely via the SAME growing `bound` set the real JS/TS scoping rules
+ * use) — i.e. its free variable names. Used ONLY to decide whether a nested function/arrow
+ * closes over a name belonging to some OUTER function's local scope (the one bail condition
+ * that genuinely needs this): a supported, real construct here — SauceScript resolves
+ * `something.catch(handler)` (`resolveCatchChain`, compiler/src/processor/expression.ts) by
+ * compiling the handler's body with `processBlock` against the SAME `CompilerContext` as its
+ * surrounding code, so a handler that reads or writes an enclosing local is NOT a harmless
+ * no-op the way an ordinary JS closure's mutation would be if this construct were unsupported
+ * — it genuinely interacts with the outer scope at the bytecode level. Deliberately not fully
+ * precise beyond that (e.g. a property-access member label or object-literal key that happens
+ * to share a name with an outer local is counted as "free" too, even though it's not really a
+ * variable reference) — a false positive here only means bailing a function that could
+ * technically have been optimized; this pass never trades that safety margin for extra reach.
+ */
+function collectFreeIdentifierNames(node, bound, out) {
+    if (isOutOfScopeForPropagation(node))
+        return;
+    if (ts.isIdentifier(node)) {
+        if (!bound.has(node.text))
+            out.add(node.text);
+        return;
+    }
+    if (isFunctionLikeScope(node)) {
+        const inner = new Set(bound);
+        for (const p of node.parameters)
+            collectBindingNames(p.name, inner);
+        if (isPlainFunctionScope(node) && node.name)
+            inner.add(node.name.text); // a named function expression can reference itself
+        if (node.body && ts.isBlock(node.body))
+            collectLexicalNamesInScope(node.body, inner);
+        if (isMethodLikeScope(node) && ts.isComputedPropertyName(node.name)) {
+            collectFreeIdentifierNames(node.name.expression, bound, out); // a computed key runs in the OUTER scope
+        }
+        if (node.body)
+            collectFreeIdentifierNames(node.body, inner, out);
+        return;
+    }
+    ts.forEachChild(node, (child) => collectFreeIdentifierNames(child, bound, out));
+}
+/**
+ * Does ANY function-like scope reachable from `fn`'s body (at any nesting depth — a closure
+ * can capture `fn`'s locals transitively, through an intermediate non-capturing nested
+ * function) read or write a name belonging to `fn`'s OWN parameter/lexical-local scope? A
+ * nested function-like scope that only touches ITS OWN locals and/or the outer TOP-LEVEL
+ * scope is fine (not a local-closure concern) — only an overlap with `fn`'s specific local
+ * names bails `fn`.
+ */
+function bailsForOuterClosure(fn) {
+    if (!fn.body)
+        return false;
+    const localNames = new Set();
+    for (const p of fn.parameters)
+        collectBindingNames(p.name, localNames);
+    if (ts.isBlock(fn.body))
+        collectLexicalNamesInScope(fn.body, localNames);
+    if (localNames.size === 0)
+        return false;
+    let bails = false;
+    const scan = (node) => {
+        if (bails)
+            return;
+        if (isFunctionLikeScope(node)) {
+            const free = new Set();
+            collectFreeIdentifierNames(node, new Set(), free);
+            for (const name of free) {
+                if (localNames.has(name)) {
+                    bails = true;
+                    return;
+                }
+            }
+            return; // collectFreeIdentifierNames already recursed into any further-nested functions
+        }
+        ts.forEachChild(node, scan);
+    };
+    scan(fn.body);
+    return bails;
+}
+function functionBails(fn) {
+    if (!fn.body)
+        return false;
+    return containsDisallowedConstruct(fn.body) || bailsForOuterClosure(fn);
+}
+// ── Read/write-position-aware substitution, keyed to a `LocalResolution` snapshot instead of a
+// static whole-file map — the local-propagation analogue of `substituteConstReads`/
+// `visitAssignmentTarget` above. Reused for BOTH the sequential per-statement walk (called
+// fresh per statement, each time reflecting `env`'s current, still-evolving state) and the
+// "frozen" substitution over an entire non-unrolled loop's subtree (rule 3 below), where the
+// resolution is fixed for the whole call because every name the loop could possibly write is
+// already forced to NAC beforehand — in neither case does this substitution step itself ever
+// mutate anything; env mutation is entirely the sequential walker's/loop rule's job. ──
+/** Recurse into an ASSIGNMENT TARGET or update-expression OPERAND — mirrors
+ * `visitAssignmentTarget`'s exact node-kind dispatch (never substituting the bound
+ * identifier(s) themselves, but substituting any genuine READ nested inside: a computed
+ * member-access key, a destructuring default value), just reading through this pass's
+ * `LocalResolution` instead of the top-level pass's static `consts` map. */
+function visitLocalAssignmentTarget(node, resolution, context) {
+    const read = (n) => substituteLocalReads(n, resolution, context);
+    const target = (n) => visitLocalAssignmentTarget(n, resolution, context);
+    if (ts.isParenthesizedExpression(node)) {
+        return ts.factory.updateParenthesizedExpression(node, target(node.expression));
+    }
+    if (ts.isIdentifier(node) || ts.isOmittedExpression(node))
+        return node; // the write target itself, never a read
+    if (ts.isPropertyAccessExpression(node)) {
+        return ts.factory.updatePropertyAccessExpression(node, read(node.expression), node.name);
+    }
+    if (ts.isElementAccessExpression(node)) {
+        return ts.factory.updateElementAccessExpression(node, read(node.expression), read(node.argumentExpression));
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+        return ts.factory.updateArrayLiteralExpression(node, node.elements.map((el) => ts.isSpreadElement(el) ? ts.factory.updateSpreadElement(el, target(el.expression)) : target(el)));
+    }
+    if (ts.isObjectLiteralExpression(node)) {
+        return ts.factory.updateObjectLiteralExpression(node, node.properties.map((prop) => {
+            if (ts.isShorthandPropertyAssignment(prop)) {
+                return prop.objectAssignmentInitializer
+                    ? ts.factory.updateShorthandPropertyAssignment(prop, prop.name, read(prop.objectAssignmentInitializer))
+                    : prop;
+            }
+            if (ts.isPropertyAssignment(prop)) {
+                const name = ts.isComputedPropertyName(prop.name)
+                    ? ts.factory.updateComputedPropertyName(prop.name, read(prop.name.expression))
+                    : prop.name;
+                return ts.factory.updatePropertyAssignment(prop, name, target(prop.initializer));
+            }
+            if (ts.isSpreadAssignment(prop))
+                return ts.factory.updateSpreadAssignment(prop, target(prop.expression));
+            return prop;
+        }));
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        return ts.factory.updateBinaryExpression(node, target(node.left), node.operatorToken, read(node.right));
+    }
+    return node;
+}
+function substituteLocalReads(node, resolution, context) {
+    const visit = (n) => substituteLocalReads(n, resolution, context);
+    if (isOutOfScopeForPropagation(node))
+        return node;
+    // A nested function/arrow/method/accessor is always an OPAQUE LEAF here — see this
+    // section's own header comment above for why (it is independently visited elsewhere).
+    if (isFunctionLikeScope(node))
+        return node;
+    if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
+        return ts.factory.updateBinaryExpression(node, visitLocalAssignmentTarget(node.left, resolution, context), node.operatorToken, visit(node.right));
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) {
+        const operand = visitLocalAssignmentTarget(node.operand, resolution, context);
+        return ts.isPrefixUnaryExpression(node)
+            ? ts.factory.updatePrefixUnaryExpression(node, operand)
+            : ts.factory.updatePostfixUnaryExpression(node, operand);
+    }
+    if (ts.isIdentifier(node)) {
+        // `resolution.consts` already omits every name this scope tracks WITHOUT a known value
+        // (see `resolveLocalEnv`), so a plain map lookup alone is enough — no separate `shadowed`
+        // check needed here, unlike `tsEvalConst`'s Identifier case (which also has to gate a
+        // CALL-callee lookup through the same `shadowed` set; substitution never calls anything).
+        const value = resolution.consts.get(node.text);
+        return value === undefined ? node : (toLiteralNode(value) ?? node);
+    }
+    if (ts.isPropertyAccessExpression(node)) {
+        return ts.factory.updatePropertyAccessExpression(node, visit(node.expression), node.name);
+    }
+    if (ts.isElementAccessExpression(node)) {
+        return ts.factory.updateElementAccessExpression(node, visit(node.expression), visit(node.argumentExpression));
+    }
+    if (ts.isShorthandPropertyAssignment(node)) {
+        if (!node.objectAssignmentInitializer) {
+            const value = resolution.consts.get(node.name.text);
+            const literal = value !== undefined ? toLiteralNode(value) : undefined;
+            if (literal)
+                return ts.factory.createPropertyAssignment(node.name, literal);
+        }
+        return node;
+    }
+    if (ts.isPropertyAssignment(node)) {
+        const name = ts.isComputedPropertyName(node.name)
+            ? ts.factory.updateComputedPropertyName(node.name, visit(node.name.expression))
+            : node.name;
+        return ts.factory.updatePropertyAssignment(node, name, visit(node.initializer));
+    }
+    if (ts.isVariableDeclaration(node)) {
+        return ts.factory.updateVariableDeclaration(node, node.name, // a binding name is never a read
+        node.exclamationToken, node.type, node.initializer ? visit(node.initializer) : undefined);
+    }
+    if (ts.isBindingElement(node)) {
+        return ts.factory.updateBindingElement(node, node.dotDotDotToken, node.propertyName, node.name, node.initializer ? visit(node.initializer) : undefined);
+    }
+    if (ts.isParameter(node) || ts.isCatchClause(node))
+        return node; // defensive no-op; not a shape this pass reaches in practice
+    return ts.visitEachChild(node, visit, context);
+}
+/** Does `expr` contain any Identifier at all (not crossing into a nested function-like
+ * scope, which is opaque anyway)? Used by `foldOrSubstitute` to decide whether replacing the
+ * WHOLE expression with a freshly-built literal node is actually doing something (resolving
+ * a genuine variable read) versus merely reconstructing an already-fully-literal expression —
+ * `toLiteralNode` always emits a canonical BigInt literal for a bigint value, so blindly
+ * replacing e.g. a plain `2` (a NumericLiteral — SauceScript source may still write bare
+ * numbers pre-strip) with `2n` even when there was no read to fold would silently change a
+ * declaration's own literal kind for no reason every time this pass touches a function body,
+ * which is both gratuitous and, for a NumericLiteral specifically, an observably different
+ * node (a real regression risk this pass must not introduce just by existing in the pipeline).
+ */
+function containsIdentifier(node) {
+    if (ts.isIdentifier(node))
+        return true;
+    if (isOutOfScopeForPropagation(node) || isFunctionLikeScope(node))
+        return false;
+    let found = false;
+    ts.forEachChild(node, (child) => {
+        if (!found && containsIdentifier(child))
+            found = true;
+    });
+    return found;
+}
+/**
+ * Tries to fully resolve `expr` to a single compile-time bigint (via the real `tsEvalConst`,
+ * so a PARTIALLY-known expression like `x + f()` still correctly fails closed rather than
+ * half-folding — this also means a call to an eligible same-file top-level function
+ * (`tsEvalCall`) now folds here too when its arguments resolve through this scope's own
+ * locals, e.g. `let y = double(x);` once `x` is a known local — a natural, sound extension of
+ * reusing the SAME evaluator family, not a separate capability this pass builds itself); if it
+ * can't, falls back to substituting whatever individual reads WITHIN it are still resolvable
+ * (`x` alone, leaving the opaque `f()` call untouched) — this is rule 1's "a read of a bare
+ * identifier at any point substitutes... else left untouched", applied uniformly whether or
+ * not the ENCLOSING expression as a whole turns out to be foldable. An expression that
+ * resolves to a bigint WITHOUT containing any Identifier at all (already a bare literal, e.g.
+ * `1n` or a plain `2 + 3` — the latter already collapsed by `foldTransformer`, which runs
+ * before this pass, so in practice this is almost always just a bare literal by the time it
+ * gets here) is deliberately left completely untouched rather than "canonicalized" — see
+ * `containsIdentifier`'s own comment for why that specific rewrite is unsafe to do
+ * unconditionally.
+ */
+function foldOrSubstitute(expr, resolution, context) {
+    const value = tsEvalConst(expr, resolution.consts, resolution.functions, resolution.shadowed);
+    if (value !== undefined) {
+        if (!containsIdentifier(expr))
+            return { expr, value };
+        const literal = toLiteralNode(value);
+        if (literal)
+            return { expr: literal, value };
+    }
+    return { expr: substituteLocalReads(expr, resolution, context), value: undefined };
+}
+/** The resulting value of `expr.left` after a compound assignment (`+=`, `&=`, …) — mirrors
+ * `tsEvalBinary`'s operator switch one level up, since `tsEvalConst` itself has no case for
+ * any assignment-family token (by design — see `ASSIGNMENT_OPERATOR_TOKENS`). `&&=`/`||=`/
+ * `??=`/`>>>=` are not modeled (short-circuit-assignment semantics, and bigint has no `>>>`
+ * at all) — always NAC, which is always safe. */
+function evalCompoundAssignmentResult(expr, resolution) {
+    if (!ts.isIdentifier(expr.left))
+        return undefined;
+    const current = resolution.consts.get(expr.left.text);
+    if (current === undefined)
+        return undefined;
+    const rhs = tsEvalConst(expr.right, resolution.consts, resolution.functions, resolution.shadowed);
+    if (rhs === undefined)
+        return undefined;
+    switch (expr.operatorToken.kind) {
+        case ts.SyntaxKind.PlusEqualsToken:
+            return current + rhs;
+        case ts.SyntaxKind.MinusEqualsToken:
+            return current - rhs;
+        case ts.SyntaxKind.AsteriskEqualsToken:
+            return current * rhs;
+        case ts.SyntaxKind.SlashEqualsToken:
+            return rhs === 0n ? undefined : current / rhs;
+        case ts.SyntaxKind.PercentEqualsToken:
+            return rhs === 0n ? undefined : current % rhs;
+        case ts.SyntaxKind.AsteriskAsteriskEqualsToken:
+            return rhs < 0n ? undefined : current ** rhs;
+        case ts.SyntaxKind.AmpersandEqualsToken:
+            return current & rhs;
+        case ts.SyntaxKind.BarEqualsToken:
+            return current | rhs;
+        case ts.SyntaxKind.CaretEqualsToken:
+            return current ^ rhs;
+        case ts.SyntaxKind.LessThanLessThanEqualsToken:
+            return current << rhs;
+        case ts.SyntaxKind.GreaterThanGreaterThanEqualsToken:
+            return current >> rhs;
+        default:
+            return undefined;
+    }
+}
+// ── The sequential per-statement walk (rule 1) + if/else merge (rule 2) + loop rule (rule 3) ──
+function walkAssignmentExpr(expr, env, resolution, context) {
+    const isPlainAssign = expr.operatorToken.kind === ts.SyntaxKind.EqualsToken;
+    let newRight;
+    let value;
+    if (isPlainAssign) {
+        const folded = foldOrSubstitute(expr.right, resolution, context);
+        newRight = folded.expr;
+        value = folded.value;
+    }
+    else {
+        newRight = substituteLocalReads(expr.right, resolution, context);
+        value = evalCompoundAssignmentResult(expr, resolution);
+    }
+    if (ts.isIdentifier(expr.left)) {
+        env.set(expr.left.text, value ?? NAC);
+    }
+    else {
+        // A destructuring assignment target (`[x] = ...`, `({x} = ...)`) — not currently
+        // reachable through the real compiler (`processAssignmentMutation` throws "not
+        // implemented" for any target that isn't a bare Identifier/MemberExpression today), but
+        // fail closed here regardless rather than silently keep a stale tracked value: every
+        // scalar name the target writes becomes NAC, mirroring rule 3's loop-write pre-scan
+        // (`collectAssignmentTargetNames` is the same helper that feeds it).
+        const written = new Set();
+        collectAssignmentTargetNames(expr.left, written);
+        for (const name of written)
+            env.set(name, NAC);
+    }
+    const newLeft = visitLocalAssignmentTarget(expr.left, resolution, context);
+    return ts.factory.updateBinaryExpression(expr, newLeft, expr.operatorToken, newRight);
+}
+function walkUpdateExpr(expr, env, resolution, context) {
+    if (ts.isIdentifier(expr.operand)) {
+        const current = resolution.consts.get(expr.operand.text);
+        const next = current === undefined ? undefined : expr.operator === ts.SyntaxKind.PlusPlusToken ? current + 1n : current - 1n;
+        env.set(expr.operand.text, next ?? NAC);
+    }
+    const newOperand = visitLocalAssignmentTarget(expr.operand, resolution, context);
+    return ts.isPrefixUnaryExpression(expr)
+        ? ts.factory.updatePrefixUnaryExpression(expr, newOperand)
+        : ts.factory.updatePostfixUnaryExpression(expr, newOperand);
+}
+function walkExpressionStatementExpr(expr, env, top, context) {
+    // Unwrap a leading ParenthesizedExpression BEFORE checking for the assignment/update
+    // shapes below — an object-destructuring ASSIGNMENT used as a statement (`({ x } = obj);`)
+    // MUST be parenthesized in real JS (the parser would otherwise read a leading `{` as a
+    // block statement), so this is not a rare edge case: without unwrapping first, `expr` here
+    // is the ParenthesizedExpression, `ts.isBinaryExpression(expr)` is false, and the actual
+    // assignment inside is never routed through `walkAssignmentExpr` at all — its target
+    // never invalidates `env`, silently keeping a STALE tracked value alive past the
+    // reassignment. Recursing (rather than a single unwrap) also correctly handles the
+    // (rarer) doubly-parenthesized `((x) = 1);` shape, and rebuilds the exact same paren
+    // nesting depth in the output.
+    if (ts.isParenthesizedExpression(expr)) {
+        return ts.factory.updateParenthesizedExpression(expr, walkExpressionStatementExpr(expr.expression, env, top, context));
+    }
+    const resolution = resolveLocalEnv(env, top);
+    if (ts.isBinaryExpression(expr) && ASSIGNMENT_OPERATOR_TOKENS.has(expr.operatorToken.kind)) {
+        return walkAssignmentExpr(expr, env, resolution, context);
+    }
+    if ((ts.isPrefixUnaryExpression(expr) || ts.isPostfixUnaryExpression(expr)) &&
+        (expr.operator === ts.SyntaxKind.PlusPlusToken || expr.operator === ts.SyntaxKind.MinusMinusToken)) {
+        return walkUpdateExpr(expr, env, resolution, context);
+    }
+    return substituteLocalReads(expr, resolution, context);
+}
+function walkVariableDeclarator(decl, env, top, context) {
+    const resolution = resolveLocalEnv(env, top);
+    if (!decl.initializer) {
+        markNamesNac(decl.name, env); // e.g. `let x;` — not actually compilable downstream either way, but fails closed regardless
+        return decl;
+    }
+    if (!ts.isIdentifier(decl.name)) {
+        // Destructuring (only an ArrayBindingPattern is meaningfully supported downstream, via
+        // `const [a, b] = someCall()`) — the RHS is always a call this evaluator can't resolve to
+        // a bigint anyway, so every bound name is simply marked NAC; still substitute genuine
+        // reads inside the initializer itself (e.g. a computed index expression).
+        markNamesNac(decl.name, env);
+        return ts.factory.updateVariableDeclaration(decl, decl.name, decl.exclamationToken, decl.type, substituteLocalReads(decl.initializer, resolution, context));
+    }
+    const folded = foldOrSubstitute(decl.initializer, resolution, context);
+    env.set(decl.name.text, folded.value ?? NAC);
+    return ts.factory.updateVariableDeclaration(decl, decl.name, decl.exclamationToken, decl.type, folded.expr);
+}
+/** The "then"/"else" of an `if`, or a loop body when it IS a single (non-Block) statement —
+ * JS allows omitting braces for a single nested statement. */
+function walkNestedStatement(stmt, env, top, context) {
+    if (ts.isBlock(stmt)) {
+        return ts.factory.updateBlock(stmt, walkStatementList(stmt.statements, env, top, context));
+    }
+    return walkStatement(stmt, env, top, context);
+}
+/**
+ * Rule 2: visit `then` from a COPY of the current env, `else` (or, if absent, an UNTOUCHED
+ * second copy — the branch that never executes implicitly keeps the pre-if value, exactly
+ * like a branch that executes but never reassigns a given name) from ANOTHER COPY, then merge
+ * at the join point. The merge only ever considers names ALREADY tracked before the `if`
+ * (iterating `env`'s own pre-if keys) — a name a branch freshly declares (block-scoped to
+ * that branch alone, since `var` doesn't exist in this language) is correctly never carried
+ * past the `if`, without needing any extra bookkeeping: it simply isn't one of the keys this
+ * loop iterates. Nested/else-if `if`s and arbitrarily deep block nesting fall out of this
+ * function's own recursion via `walkNestedStatement` → `walkStatement` → `walkIfStatement`,
+ * with no separate handling needed. A condition that's ALREADY a resolved compile-time
+ * constant never reaches this function in the first place — `foldTransformer` (which runs
+ * strictly before this whole pass) has already pruned that `if` down to its taken branch; a
+ * condition this pass's OWN local tracking could newly resolve (e.g. depending on a local
+ * variable `foldTransformer` could never have seen) is deliberately NOT given the same
+ * branch-pruning treatment here — both branches are still walked and merged unconditionally,
+ * which is simply a MISSED optimization opportunity (never an unsound one), matching this
+ * pass's overall preference for under- over over-optimizing.
+ */
+function walkIfStatement(stmt, env, top, context) {
+    const resolution = resolveLocalEnv(env, top);
+    const newCondition = foldOrSubstitute(stmt.expression, resolution, context).expr;
+    const thenEnv = new Map(env);
+    const newThen = walkNestedStatement(stmt.thenStatement, thenEnv, top, context);
+    const elseEnv = new Map(env);
+    const newElse = stmt.elseStatement ? walkNestedStatement(stmt.elseStatement, elseEnv, top, context) : undefined;
+    for (const [name, preIfValue] of env) {
+        const thenValue = thenEnv.get(name) ?? preIfValue;
+        const elseValue = elseEnv.get(name) ?? preIfValue;
+        env.set(name, thenValue !== NAC && thenValue === elseValue ? thenValue : NAC);
+    }
+    return ts.factory.updateIfStatement(stmt, newCondition, newThen, newElse);
+}
+/** Every name written ANYWHERE within `node` (any assignment/compound-assignment/update/
+ * declaration), WITHOUT crossing into a nested function-like scope (a separate variable
+ * scope, already vetted independently by the closure-bail check before rule 3 ever runs) —
+ * the pre-scan rule 3 needs to force every such name to NAC before processing a real
+ * (non-unrolled) loop. A write through a property/element-access target (`arr[i] = x`,
+ * `obj.x = x`) is deliberately NOT collected here: it doesn't reassign the BINDING `arr`/
+ * `obj` itself (only whatever it points at), and — since this pass only ever tracks scalar
+ * bigint values — any array/heap-shaped local is already NAC from its own declaration
+ * onward regardless (`new Array(n)`/an array literal never resolves via `tsEvalConst`), so
+ * there is nothing this rule needs to additionally poison for that case. */
+function collectWrittenNames(node, out) {
+    if (isFunctionLikeScope(node))
+        return;
+    if (ts.isVariableDeclaration(node)) {
+        collectBindingNames(node.name, out);
+    }
+    else if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
+        collectAssignmentTargetNames(node.left, out);
+    }
+    else if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) {
+        collectAssignmentTargetNames(node.operand, out);
+    }
+    ts.forEachChild(node, (child) => collectWrittenNames(child, out));
+}
+/** The scalar binding name(s) an assignment/update TARGET reassigns — mirrors
+ * `visitAssignmentTarget`'s node-kind dispatch, collecting names instead of substituting. */
+function collectAssignmentTargetNames(node, out) {
+    if (ts.isParenthesizedExpression(node)) {
+        collectAssignmentTargetNames(node.expression, out);
+        return;
+    }
+    if (ts.isIdentifier(node)) {
+        out.add(node.text);
+        return;
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isOmittedExpression(node)) {
+        return; // reassigns whatever the target points at, not the binding itself — see collectWrittenNames' own note
+    }
+    if (ts.isArrayLiteralExpression(node)) {
+        for (const el of node.elements) {
+            collectAssignmentTargetNames(ts.isSpreadElement(el) ? el.expression : el, out);
+        }
+        return;
+    }
+    if (ts.isObjectLiteralExpression(node)) {
+        for (const prop of node.properties) {
+            if (ts.isShorthandPropertyAssignment(prop))
+                out.add(prop.name.text);
+            else if (ts.isPropertyAssignment(prop))
+                collectAssignmentTargetNames(prop.initializer, out);
+            else if (ts.isSpreadAssignment(prop))
+                collectAssignmentTargetNames(prop.expression, out);
+        }
+        return;
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        collectAssignmentTargetNames(node.left, out);
+    }
+}
+function walkForInitializer(init, resolution, context) {
+    if (ts.isVariableDeclarationList(init)) {
+        return ts.factory.updateVariableDeclarationList(init, init.declarations.map((d) => substituteLocalReads(d, resolution, context)));
+    }
+    return substituteLocalReads(init, resolution, context);
+}
+/**
+ * Rule 3: a `for`/`while`/`do-while` the existing loop-unroller did NOT fully unroll (still
+ * real runtime code, `JUMP_BACK`, by the time this pass sees it) gets NO fixpoint dataflow —
+ * bigint values are an unbounded lattice, and real fixpoint iteration needs a widening
+ * operator plus a termination proof, far more machinery than this warrants. Instead: force
+ * every name `collectWrittenNames` finds anywhere in the loop to NAC BEFORE looking at
+ * anything else, then substitute reads through the ENTIRE loop subtree (init/condition/
+ * incrementor/body, including any nested if/inner loop within it) using that single now-
+ * frozen resolution — no further env mutation happens while inside, and nothing needs a
+ * branch-merge the way `walkIfStatement` does, because every name that could possibly differ
+ * across iterations or branches inside the loop is already uniformly NAC. This is why a
+ * written name is NAC even at "the first reference before any write appears textually": a
+ * later iteration's write could have already happened by the time control reaches any given
+ * point inside the loop body, so there is no textually-first-safe point to trust the
+ * pre-loop value. Untouched names simply keep flowing through unchanged — this necessarily
+ * MISSES a loop-invariant-but-reassigned-to-the-same-value case (e.g. `for (...) { sum =
+ * 100n; }` where `sum` was already `100n`) — an intentional, documented tradeoff, not an
+ * oversight. The mutated `env` (written names now NAC) is also exactly what continues the
+ * walk for whatever comes AFTER the loop, in the same statement list.
+ */
+function walkLoopStatement(stmt, env, top, context) {
+    const written = new Set();
+    collectWrittenNames(stmt, written);
+    for (const name of written)
+        env.set(name, NAC);
+    const resolution = resolveLocalEnv(env, top);
+    if (ts.isForStatement(stmt)) {
+        const newInit = stmt.initializer ? walkForInitializer(stmt.initializer, resolution, context) : undefined;
+        const newCondition = stmt.condition
+            ? substituteLocalReads(stmt.condition, resolution, context)
+            : undefined;
+        const newIncrementor = stmt.incrementor
+            ? substituteLocalReads(stmt.incrementor, resolution, context)
+            : undefined;
+        const newBody = substituteLocalReads(stmt.statement, resolution, context);
+        return ts.factory.updateForStatement(stmt, newInit, newCondition, newIncrementor, newBody);
+    }
+    if (ts.isWhileStatement(stmt)) {
+        const newCondition = substituteLocalReads(stmt.expression, resolution, context);
+        const newBody = substituteLocalReads(stmt.statement, resolution, context);
+        return ts.factory.updateWhileStatement(stmt, newCondition, newBody);
+    }
+    const newBody = substituteLocalReads(stmt.statement, resolution, context);
+    const newCondition = substituteLocalReads(stmt.expression, resolution, context);
+    return ts.factory.updateDoStatement(stmt, newBody, newCondition);
+}
+function walkStatement(stmt, env, top, context) {
+    if (ts.isVariableStatement(stmt)) {
+        return ts.factory.updateVariableStatement(stmt, stmt.modifiers, ts.factory.updateVariableDeclarationList(stmt.declarationList, stmt.declarationList.declarations.map((decl) => walkVariableDeclarator(decl, env, top, context))));
+    }
+    if (ts.isExpressionStatement(stmt)) {
+        return ts.factory.updateExpressionStatement(stmt, walkExpressionStatementExpr(stmt.expression, env, top, context));
+    }
+    if (ts.isIfStatement(stmt))
+        return walkIfStatement(stmt, env, top, context);
+    if (ts.isForStatement(stmt) || ts.isWhileStatement(stmt) || ts.isDoStatement(stmt)) {
+        return walkLoopStatement(stmt, env, top, context);
+    }
+    if (ts.isReturnStatement(stmt)) {
+        if (!stmt.expression)
+            return stmt;
+        const resolution = resolveLocalEnv(env, top);
+        return ts.factory.updateReturnStatement(stmt, foldOrSubstitute(stmt.expression, resolution, context).expr);
+    }
+    if (ts.isThrowStatement(stmt)) {
+        const resolution = resolveLocalEnv(env, top);
+        return ts.factory.updateThrowStatement(stmt, foldOrSubstitute(stmt.expression, resolution, context).expr);
+    }
+    // BreakStatement/ContinueStatement/EmptyStatement (nothing to substitute), or any other
+    // statement shape this pass doesn't specifically model — left completely untouched rather
+    // than guess, matching this file's fail-closed philosophy throughout.
+    return stmt;
+}
+/**
+ * Reserves every name this (immediate — not a further-nested block's) statement list
+ * directly declares for the WHOLE list from the top, matching real `let`/`const` TDZ scoping:
+ * a read of such a name textually before its own declaration line must NOT fall through to
+ * an outer/top-level value of the same name (that would silently substitute the WRONG value
+ * for what real JS treats as a ReferenceError) — pre-seeding NAC here and letting each
+ * declaration's own statement overwrite it in place, in order, achieves exactly that without
+ * a separate "shadowed names" concept: `resolveLocalEnv` already refuses to fall back past an
+ * env key that's present, NAC or not.
+ */
+function walkStatementList(statements, env, top, context) {
+    const declaredHere = new Set();
+    collectDirectlyDeclaredNames(statements, declaredHere);
+    for (const name of declaredHere)
+        env.set(name, NAC);
+    return statements.map((stmt) => walkStatement(stmt, env, top, context));
+}
+function updateFunctionLikeBody(node, body) {
+    if (ts.isFunctionDeclaration(node)) {
+        return ts.factory.updateFunctionDeclaration(node, node.modifiers, node.asteriskToken, node.name, node.typeParameters, node.parameters, node.type, body);
+    }
+    if (ts.isFunctionExpression(node)) {
+        return ts.factory.updateFunctionExpression(node, node.modifiers, node.asteriskToken, node.name, node.typeParameters, node.parameters, node.type, body);
+    }
+    if (ts.isArrowFunction(node)) {
+        return ts.factory.updateArrowFunction(node, node.modifiers, node.typeParameters, node.parameters, node.type, node.equalsGreaterThanToken, body);
+    }
+    if (ts.isMethodDeclaration(node)) {
+        return ts.factory.updateMethodDeclaration(node, node.modifiers, node.asteriskToken, node.name, node.questionToken, node.typeParameters, node.parameters, node.type, body);
+    }
+    if (ts.isGetAccessorDeclaration(node)) {
+        return ts.factory.updateGetAccessorDeclaration(node, node.modifiers, node.name, node.parameters, node.type, body);
+    }
+    return ts.factory.updateSetAccessorDeclaration(node, node.modifiers, node.name, node.parameters, body);
+}
+/** ASSUMES the caller already confirmed `!functionBails(node)` — performs the actual walk,
+ * fresh `env` seeded with every parameter marked NAC (runtime-supplied, never a compile-time
+ * constant), and swaps in the substituted body. A concise (non-Block) arrow body has no
+ * statement list of its own for this pass to walk (nothing to do — it's still eligible to be
+ * independently found elsewhere in the file by the top-level driver's own recursion). */
+function transformFunctionLikeScopeBody(node, top, context) {
+    if (!node.body || !ts.isBlock(node.body))
+        return node;
+    const env = new Map();
+    for (const p of node.parameters)
+        markNamesNac(p.name, env);
+    // Pre-seed NAC for every name lexically (`let`/`const`/nested-function) declared ANYWHERE in
+    // this function's body — not just this statement list's own DIRECT declarations (which is
+    // all `walkStatementList`'s own per-list pre-seed below sees) — because the real SauceScript
+    // compiler shares scope across `if`/`while`/bare-block bodies (only a `for` loop pushes a
+    // genuine new one; see `processor/statement.ts`'s `processIfStatement`/
+    // `processWhileStatement`, neither of which calls `ctx.pushScope`, versus
+    // `processForStatement`, which does). A name FIRST `let`/`const`-declared inside an
+    // `if`/`while` branch therefore isn't block-scoped away once the branch ends — it's the
+    // SAME persisting variable for the rest of the function — so without this pre-seed,
+    // `walkIfStatement`'s merge (which only ever revisits names already keyed in `env` BEFORE
+    // the `if`) would never see such a name, and a later read of it would incorrectly fall
+    // through to a same-named top-level `const`'s value instead of staying an (unsubstituted)
+    // real runtime read. This over-includes a name declared only inside a real (non-unrolled)
+    // `for` loop's own body too (this pass doesn't need the finer distinction) — always safe:
+    // it can only cost a MISSED optimization (an unsubstituted read the real compiler still
+    // resolves correctly via its own `getVar`-then-`getConstant` lookup), never a wrong one.
+    const lexicalNames = new Set();
+    collectLexicalNamesInScope(node.body, lexicalNames);
+    for (const name of lexicalNames)
+        env.set(name, NAC);
+    const newStatements = walkStatementList(node.body.statements, env, top, context);
+    return updateFunctionLikeBody(node, ts.factory.updateBlock(node.body, newStatements));
+}
+/**
+ * The top-level driver: recursively finds every function-like scope in the file (top-level
+ * or nested — inside an object literal, another function, a `.catch()` handler, …) and
+ * transforms each one INDEPENDENTLY, with its own fresh environment, unless the WHOLE scope
+ * bails (in which case it — and, deliberately, anything nested inside it too, since bailing
+ * means "leave this subtree completely untouched" — is left exactly as found, and this driver
+ * does not descend into it looking for nested opportunities). Classes are skipped entirely
+ * (`isOutOfScopeForPropagation`, matching every other pass in this file) since this language
+ * surface has none ("no closures/classes/async" per the compiler's own scope).
+ */
+function localConstPropagationTransformer(top) {
+    return (context) => {
+        const visit = (node) => {
+            if (isOutOfScopeForPropagation(node))
+                return node;
+            if (isFunctionLikeScope(node)) {
+                if (functionBails(node))
+                    return node;
+                const transformed = transformFunctionLikeScopeBody(node, top, context);
+                return ts.visitEachChild(transformed, visit, context);
+            }
+            return ts.visitEachChild(node, visit, context);
+        };
+        return (sourceFile) => {
+            const statements = sourceFile.statements.map((stmt) => visit(stmt));
+            return ts.factory.updateSourceFile(sourceFile, statements);
+        };
+    };
+}
 /**
  * Fold provably-constant branches/expressions/loops in a `.ts`/`.sauce.ts` module and
  * strip types, returning plain JS text ready for `acorn.parse`. Pure function of its input
@@ -2055,6 +2902,7 @@ export function tsPartialEval(code, filePath) {
     // disqualifying use must count even if it sits in a branch `foldTransformer` would otherwise
     // prune away (see the "Array/object lookup-table folding" section above).
     const tables = collectTopLevelTables(sourceFile, consts, functions);
+    const topLevelContext = { consts, functions };
     const result = ts.transpileModule(code, {
         fileName: filePath,
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
@@ -2067,6 +2915,10 @@ export function tsPartialEval(code, filePath) {
                 tableFoldTransformer(tables, consts, functions),
                 constPropagationTransformer(consts),
                 deadConstEliminationTransformer(consts, primaryNames, pairNames, tables),
+                // Runs LAST, consuming everything above's output: a FOURTH kind of constant
+                // propagation, this one control-flow-sensitive and LOCAL (per-function) — see the
+                // "Local (per-function) constant propagation" section above for the full design.
+                localConstPropagationTransformer(topLevelContext),
             ],
         },
     });
