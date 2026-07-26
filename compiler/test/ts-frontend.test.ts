@@ -499,6 +499,232 @@ describe('tsPartialEval (constant propagation to reads + dead-declaration elimin
   });
 });
 
+// ── tsPartialEval (folding a CALL to a same-file, side-effect-free, single-return function) ──
+//
+// `tsEvalConst` also resolves a CallExpression when its callee is a same-file top-level
+// `FunctionDeclaration` whose ENTIRE body is exactly one `return <expr>;` statement, with
+// zero CallExpression/NewExpression anywhere in that return expression (or in any parameter's
+// default initializer) — a body that never calls anything trivially can't recurse, so no
+// separate recursion analysis is needed — and every argument itself resolves to a constant.
+// A folded call becomes an ordinary literal AST node at the CALL SITE ONLY: the callee's own
+// `FunctionDeclaration` is never touched (it might still be called elsewhere with runtime
+// args), so this composes for free with the existing const-propagation + dead-declaration-
+// elimination passes below (a folded call's result is just another resolved top-level const
+// value once bound to a `const NAME = <call>;` initializer) and with loop unrolling (a call
+// inside an unrolled body folds independently per substituted-counter copy, since unrolling
+// re-enters this same fold pass on each copy).
+describe('tsPartialEval (folds a call to a same-file, side-effect-free, single-return function)', () => {
+  it('folds the motivating example end to end: the call resolves to a literal, which then fully composes with const-propagation + dead-declaration elimination', () => {
+    const out = tsPartialEval(`function double(x) { return x * 2n; }\nconst y = double(21n);\nconsole.log(y);`, 'f.ts');
+
+    expect(out).toContain('function double(x)'); // the callee declaration is never eliminated
+    expect(out).not.toContain('const y'); // y's own declaration is now fully dead, and removed
+    expect(out).toContain('console.log(42n);'); // the call folded, then propagated all the way to the read
+  });
+
+  it('never folds a call whose body contains a NESTED call — even to another, itself-foldable function (soundness guard: no recursion analysis needed only because a zero-call body trivially cannot recurse)', () => {
+    const out = tsPartialEval(
+      `function inc(x) { return x + 1n; }
+       function addTwice(x) { return inc(x) + 1n; }
+       const z = addTwice(5n);
+       console.log(z);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('addTwice(5n)'); // the call site is left completely untouched
+    expect(out).toContain('console.log(z)'); // z never resolved, so its read stays a bare identifier
+  });
+
+  it('never folds a call whose body is more than one statement, or contains an if/loop, instead of exactly one `return <expr>;`', () => {
+    const multiStatement = tsPartialEval(
+      `function f(x) { let y = x; return y; }\nconst a = f(1n);\nconsole.log(a);`,
+      'f.ts',
+    );
+    const withIf = tsPartialEval(
+      `function g(x) { if (x > 0n) { return x; } return 0n; }\nconst b = g(1n);\nconsole.log(b);`,
+      'f.ts',
+    );
+
+    expect(multiStatement).toContain('f(1n)');
+    expect(multiStatement).toContain('console.log(a)');
+    expect(withIf).toContain('g(1n)');
+    expect(withIf).toContain('console.log(b)');
+  });
+
+  it('folds one call site with all-constant arguments while leaving another call site (a non-constant, parameter-derived argument) untouched — the callee declaration remains either way', () => {
+    const out = tsPartialEval(
+      `function double(x) { return x * 2n; }
+       const a = double(3n);
+       console.log(a);
+       function useDouble(n) { return double(n); }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('function double(x)'); // still genuinely called elsewhere with a runtime arg
+    expect(out).toContain('console.log(6n);'); // the constant call site: folded, propagated, decl eliminated
+    expect(out).not.toContain('const a');
+    expect(out).toContain('return double(n);'); // the non-constant call site: untouched, still a real call
+  });
+
+  it('folds a call whose body reads a module-level top-level const alongside its own parameter, using the already-resolved value as a lookup alongside the parameter overlay', () => {
+    const out = tsPartialEval(
+      `const RATE = 2n;
+       function scale(x) { return x * RATE; }
+       const y = scale(21n);
+       console.log(y);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('console.log(42n);');
+    expect(out).not.toContain('const y');
+    expect(out).not.toContain('RATE'); // baked into scale's own body by the SEPARATE propagation pass, then eliminated
+  });
+
+  it('inside an already-unrolled loop, each copy folds the call independently with its own per-iteration counter argument', () => {
+    const out = tsPartialEval(
+      `function double(x) { return x * 2n; }
+       for (let i = 0n; i < 3n; i++) { console.log(double(i)); }`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('for (');
+    expect(out).toContain('console.log(0n);');
+    expect(out).toContain('console.log(2n);');
+    expect(out).toContain('console.log(4n);');
+  });
+
+  it('a call omitting an argument for a parameter with a DEFAULT value evaluates that default too (a deliberate choice, not a rejection — see the ts-frontend.ts doc comment on tsEvalCall)', () => {
+    const out = tsPartialEval(
+      `function inc(x, step = 1n) { return x + step; }\nconst a = inc(5n);\nconsole.log(a);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('console.log(6n);');
+    expect(out).not.toContain('const a');
+  });
+
+  it('a later default may reference an EARLIER already-bound parameter (documented left-to-right default evaluation)', () => {
+    const out = tsPartialEval(
+      `function f(a, b = a + 1n) { return a + b; }\nconst z = f(10n);\nconsole.log(z);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('console.log(21n);');
+    expect(out).not.toContain('const z');
+  });
+
+  it('never folds a call to a callee reached through property access (`obj.method(...)`), only a same-file plain-identifier callee', () => {
+    const out = tsPartialEval(
+      `const obj = { double(x) { return x * 2n; } };\nconst a = obj.double(21n);\nconsole.log(a);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('obj.double(21n)');
+    expect(out).toContain('console.log(a)');
+  });
+
+  it('never folds a call whose callee is a GENERATOR function — calling it yields an Iterator, never its `return`ed value', () => {
+    const out = tsPartialEval(
+      `function* gen() { return 7n; }\nfunction useGen() { return gen(); }\nconsole.log(useGen());`,
+      'f.ts',
+    );
+
+    expect(out).toContain('gen()'); // the call site is left completely untouched
+  });
+
+  it('never folds a call whose callee is `async` — calling it yields a Promise, never its `return`ed value directly', () => {
+    const out = tsPartialEval(`async function foo() { return 5n; }\nconst y = foo();\nconsole.log(y);`, 'f.ts');
+
+    expect(out).toContain('foo()'); // the call site is left completely untouched
+    expect(out).toContain('console.log(y)'); // never resolved, so its read stays a bare identifier
+  });
+
+  it("a call omitting an argument never lets an EARLIER default silently fall back to an outer const sharing a LATER (not-yet-bound) parameter's name — real JS/TS TDZ semantics mean this would actually throw at runtime, so folding must decline rather than compute the wrong value", () => {
+    const out = tsPartialEval(
+      `const b = 999n;\nfunction foo(a = b, b = 5n) { return a + b; }\nconst y = foo();\nconsole.log(y);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('foo()'); // the call site is left completely untouched
+    expect(out).not.toContain('console.log(1004n)'); // NOT the outer const's value (999 + 5)
+  });
+
+  describe('soundness: a shadowed callee/identifier name is never resolved against an unrelated top-level binding', () => {
+    it('never folds a call whose callee name is shadowed by a NESTED function declaration of the same name', () => {
+      const out = tsPartialEval(
+        `function calc(x) { return x + 1n; }
+         function outer() {
+           function calc(x) { return x + 100n; }
+           return calc(5n);
+         }
+         console.log(outer());`,
+        'f.ts',
+      );
+
+      // The inner `calc` call must stay untouched — folding it against the OUTER `calc`
+      // would hardcode 6n (5+1) instead of leaving the real (inner) call for the compiler.
+      expect(out).toContain('calc(5n)');
+      expect(out).not.toContain('console.log(6n)');
+    });
+
+    it("never folds a call whose callee name is shadowed by the enclosing function's OWN parameter (the higher-order-function pattern)", () => {
+      const out = tsPartialEval(
+        `function greet(name) { return name + 100n; }
+         function farewell(name) { return name + 999n; }
+         function callIt(greet) { return greet(1n); }
+         const y = callIt(farewell);
+         console.log(y);`,
+        'f.ts',
+      );
+
+      // `greet` inside `callIt`'s body refers to whatever's PASSED as the `greet` parameter,
+      // never necessarily the top-level `greet` function — must not fold to a fixed literal.
+      expect(out).toContain('greet(1n)');
+    });
+
+    it('never folds a call whose callee name is shadowed by a block-scoped `let` inside an if-branch', () => {
+      const out = tsPartialEval(
+        `function calc(x) { return x + 1n; }
+         function outer(flag) {
+           if (flag) {
+             let calc = (n) => n + 999n;
+             return calc(1n);
+           }
+           return 0n;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('calc(1n)');
+    });
+
+    it('never folds a call shadowed by a block-scoped `let` even when the enclosing if-condition IS constant (so the branch is flattened directly into the enclosing statement list)', () => {
+      const out = tsPartialEval(
+        `function calc(x) { return x + 1n; }
+         function outer() {
+           if (true) {
+             let calc = (n) => n + 999n;
+             return calc(1n);
+           }
+           return 0n;
+         }`,
+        'f.ts',
+      );
+
+      expect(out).toContain('calc(1n)');
+    });
+
+    it("never folds a plain identifier/arithmetic expression whose name is shadowed by the enclosing function's OWN parameter, even when a top-level const of the exact same name exists", () => {
+      const out = tsPartialEval(`const x = 999n;\nfunction f(x) { return x * 2n; }`, 'f.ts');
+
+      // `x` inside `f`'s body is its own parameter, never the outer `const x` — the
+      // multiplication must stay real runtime arithmetic, not fold to 1998n.
+      expect(out).toContain('return x * 2n;');
+      expect(out).not.toContain('1998');
+    });
+  });
+});
+
 // ── tsPartialEval (constant propagation never touches an assignment/update TARGET) ──
 //
 // constPropagationTransformer's substitution visitor must never replace the left side of an
@@ -608,9 +834,13 @@ describe('ts-frontend compile() integration', () => {
         const result = compile(source, { baseDirs: [tmpDir], target }); // treeshake defaults true
 
         if (target === 'v1') {
-          // main + gate + used — NOT unused: the dead else-branch (and its call) was
-          // folded away before acorn ever parsed the module.
-          expect(result.bytecode.length).toBe(3);
+          // main + gate — NOT unused (the dead else-branch, and its call, folded away
+          // pre-acorn) — and NOT used either: `used()` is itself a zero-arg, single-`return`,
+          // no-nested-call function, so it's vacuously call-foldable ("every argument is a
+          // compile-time constant" holds trivially with zero arguments) — the call-folding
+          // pass above inlines `used()` directly into `gate`'s own body, so treeshaking drops
+          // `used` too, since nothing calls it anymore by the time acorn ever sees the module.
+          expect(result.bytecode.length).toBe(2);
         }
       });
 
@@ -695,7 +925,10 @@ describe('ts-frontend compile() integration', () => {
 
     const result = compile(source, { tsSource: true }); // treeshake defaults true; default target v1
 
-    expect(result.bytecode.length).toBe(3); // main + gate + used — unused folded away pre-acorn
+    // main + gate — `used()`'s call is ALSO folded away (a zero-arg, single-`return`,
+    // no-nested-call function is vacuously call-foldable), so treeshaking drops it too, same
+    // as `unused` — see the matching `.sauce.ts` import test above for the full explanation.
+    expect(result.bytecode.length).toBe(2);
   });
 
   it('without tsSource, the identical (untyped) source needs no stripping and folds via acorn itself', () => {
