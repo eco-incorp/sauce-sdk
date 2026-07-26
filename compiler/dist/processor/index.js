@@ -5,6 +5,7 @@ import { processVariableDeclaration, processIfStatement, processForStatement, pr
 import { processArrayExpression, processObjectExpression } from './collection.js';
 import { evalConst, evalConstBool } from './const-eval.js';
 import { tsPartialEval } from '../ts-frontend.js';
+import { extractInlineDeclarations, buildInlineMap, expandInlineFunctionsInDeclarations, } from './inline.js';
 export function processNode(node, ctx) {
     switch (node.type) {
         case 'Program':
@@ -74,7 +75,7 @@ function extractFunctionDeclarations(program) {
 // detection across modules); `visited` is the set of already-pulled module paths
 // (a shared module imported by two parents is pulled once). Imports recurse FIRST
 // so a transitively-imported function is registered before the importing module's.
-function collectImportedFunctions(program, ctx, seen, visited) {
+function collectImportedFunctions(program, ctx, seen, visited, inlineOut) {
     const out = [];
     for (const stmt of program.body) {
         if (stmt.type !== 'ImportDeclaration')
@@ -113,7 +114,7 @@ function collectImportedFunctions(program, ctx, seen, visited) {
         }
         // Recurse into the imported module's own imports FIRST so transitive functions
         // (and contracts) are registered before this module's.
-        out.push(...collectImportedFunctions(modAst, ctx, seen, visited));
+        out.push(...collectImportedFunctions(modAst, ctx, seen, visited, inlineOut));
         for (const fn of extractFunctionDeclarations(modAst)) {
             const name = fn.id?.name;
             if (!name)
@@ -131,6 +132,19 @@ function collectImportedFunctions(program, ctx, seen, visited) {
                 continue;
             seen.set(name, mod.filePath);
             out.push(fn);
+        }
+        // Same collision-detection namespace (`seen`) covers inline (arrow-const) function
+        // declarations too, so a real function in one module colliding with an inline
+        // function of the same name in another (or the same) module is rejected identically.
+        for (const [name, decl] of extractInlineDeclarations(modAst)) {
+            const prev = seen.get(name);
+            if (prev && prev !== mod.filePath) {
+                throw new Error(`duplicate imported function "${name}" (from "${prev}" and "${mod.filePath}")`);
+            }
+            if (prev)
+                continue;
+            seen.set(name, mod.filePath);
+            inlineOut.set(name, decl);
         }
     }
     return out;
@@ -211,7 +225,9 @@ function collectCalls(node, ctx, declMap, out = new Set()) {
 }
 // Walk every AST-node child of a node (node-valued props + arrays of nodes), skipping
 // acorn's bookkeeping fields. Generic so collectCalls needn't enumerate node shapes.
-function eachChild(node, visit) {
+// Exported for reuse by the inline-function expansion pass (processor/inline.ts) —
+// its own recursion-detection / bail-condition scans need the identical generic walk.
+export function eachChild(node, visit) {
     for (const [key, value] of Object.entries(node)) {
         if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range')
             continue;
@@ -267,7 +283,10 @@ function isAllowedTopLevel(stmt) {
 function processProgram(program, ctx) {
     // Pull imported source-module functions (and process .json contract imports) FIRST,
     // so they join the same function table as local functions. Recursive across modules.
-    const importedFns = collectImportedFunctions(program, ctx, new Map(), new Set());
+    // Inline (arrow-const) function declarations are collected alongside, into the same
+    // cross-module duplicate-name namespace (`seen`, threaded inside collectImportedFunctions).
+    const importedInlines = new Map();
+    const importedFns = collectImportedFunctions(program, ctx, new Map(), new Set(), importedInlines);
     // Register top-level consts (compile-time only) before validating / folding.
     registerTopLevelConsts(program, ctx);
     const nonAllowed = program.body.find((stmt) => !isAllowedTopLevel(stmt));
@@ -280,25 +299,38 @@ function processProgram(program, ctx) {
     if (!mainFunc) {
         throw new Error('missing main() function');
     }
+    // Inline (arrow-const) function expansion: a top-level `const NAME = (…) => …` call is
+    // spliced into ordinary statements at its call site, BEFORE treeshake/v1/v12 dispatch —
+    // both targets then compile the (already-expanded) plain SauceScript unmodified. A no-op
+    // when the program declares no inline functions (buildInlineMap/expand both fast-path on
+    // an empty map), so an unmodified program is unaffected byte-for-byte.
+    const inlineMap = buildInlineMap(program, importedInlines, declarations);
+    expandInlineFunctionsInDeclarations(declarations, inlineMap);
     // Drop functions unreachable from main() (constant-aware) so an imported-but-unused
-    // function — or a handler behind a statically-false branch — is never emitted.
+    // function — or a handler behind a statically-false branch — is never emitted. Runs
+    // AFTER inline expansion so a real function reachable only THROUGH an inline function's
+    // (now-spliced) body is correctly seen as reachable.
     if (ctx.treeshake)
         declarations = treeshake(declarations, ctx);
     if (ctx.isV12) {
         return processProgramV12(declarations, mainFunc, ctx);
     }
-    const functions = declarations
-        .filter((stmt) => stmt.id?.name !== 'main')
-        .map((stmt) => {
+    // Register EVERY helper name up front (mirroring processProgramV12 below) before
+    // compiling any body, so a helper may call an as-yet-uncompiled LATER-declared helper —
+    // matching v12, which already has no such ordering restriction (v1 used to interleave
+    // addFunc with compilation in one pass, so a forward reference threw "Function X is
+    // undefined."; this fixes that asymmetry).
+    const helpers = declarations.filter((stmt) => stmt.id?.name !== 'main');
+    for (const stmt of helpers)
         ctx.addFunc(stmt.id?.name);
-        // Compile each helper in a CHILD context (fresh slots/scopes, isolated like the
-        // legacy fresh-context behaviour) that SHARES the module's function index table
-        // and contracts — so an imported helper that calls a sibling imported function
-        // (or uses an imported contract ABI) resolves instead of failing late with
-        // "Function … is undefined".
-        return processFunction(stmt, ctx.forFunction());
-    });
     ctx.addFunc('main');
+    const functions = helpers.map((stmt) => 
+    // Compile each helper in a CHILD context (fresh slots/scopes, isolated like the
+    // legacy fresh-context behaviour) that SHARES the module's function index table
+    // and contracts — so an imported helper that calls a sibling imported function
+    // (or uses an imported contract ABI) resolves instead of failing late with
+    // "Function … is undefined".
+    processFunction(stmt, ctx.forFunction()));
     return [...functions, processFunction(mainFunc, ctx)];
 }
 /**
