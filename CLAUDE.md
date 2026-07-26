@@ -397,6 +397,75 @@ bare reads still compile), but the indexed reads/writes that were guaranteed v1 
 truncated pointer → garbage read → revert. The fix needs a runtime-wide Huff pointer widening — out of
 scope here.
 
+**v1 helper-declaration-order fix:** v1's `processProgram` used to `ctx.addFunc` each helper
+INTERLEAVED with compiling it, in file-declaration order — so a helper could only call an
+EARLIER-declared helper; a forward reference threw `Function X is undefined.` v12 never had this
+restriction (`processProgramV12` already registers every helper name in one pass BEFORE compiling
+any of them). v1 now mirrors that: two loops (register all names, then compile) instead of one, so a
+helper may call a helper declared later in the file, on both targets.
+
+**Inline (arrow-const) functions:** a top-level `const NAME = (params) => body;` (concise or block
+body) marks `NAME` INLINE — every call to it, anywhere (same file, or cross-file via the existing
+`import { fn } from "./mod"` source-import mechanism), is spliced into the call site's statement list
+at compile time instead of emitting a real `CALL_FUNCTION`/function-table entry. A plain
+`function NAME() {}` is completely unaffected — this is purely additive/opt-in. Real-world motivation:
+a large recipe file was hand-duplicating small pure-arithmetic guard-clause helpers inline because
+"the compiler forbids a helper calling another helper" (only true in the sense that helper→helper
+calls previously required the ordering above, and there was no lightweight always-inlined option) —
+`tickArg`/`kyberOut`-shaped functions (nested `if (cond) { return X; } ... return Y;`, no loops) are
+the concrete target shape.
+
+Implementation is a pure acorn-AST-to-acorn-AST rewrite (`src/processor/inline.ts`) that runs ONCE,
+right after `collectImportedFunctions`/`extractFunctionDeclarations` build the declaration list but
+BEFORE treeshake and the `ctx.isV12` fork — so v1 and v12 both compile the already-expanded, ordinary
+SauceScript AST unmodified; neither target needed any inline-specific codegen. Algorithm, per call
+site: (1) evaluate each argument once, bind it to a fresh `const` (matching normal call semantics —
+never re-evaluated even if the callee reads its parameter more than once); (2) alpha-rename every
+local the callee introduces (params + `const`/`let` declarations) with a globally-unique `#`-prefixed
+suffix — `#` can never appear in a user-typable SauceScript identifier (acorn rejects a bare `#name`
+outside a class body as a syntax error), the same collision-proof convention `CompilerContext.
+freshTemp()` already uses (`#tmp<N>`) — so repeated/simultaneous expansions of the same or different
+inline functions, and a user local that happens to share a base name, never collide; (3) run
+"return-elimination": walk the callee's (renamed) body, turning `return expr;` into
+`#inline_result_N = expr; #inline_done_N = 1;` and, for an `if`/`if-else` whose branch(es) contain a
+return, recursing into each branch and wrapping everything AFTER the `if` in
+`if (#inline_done_N === 0) { … }` (since a taken branch may already have produced the result) — this
+is what soundly handles guard clauses WITHOUT unconditionally hoisting a branch-only computation (an
+earlier, rejected approach: hoisting a callee's nested/guarded local out of its `if` can silently
+compute a wrapping/underflowing value on the branch that never actually runs). Fixpoint: an inline
+function calling another inline function expands correctly regardless of order, because a call graph
+covering both inline AND real functions is built and checked for cycles FIRST (direct or mutual
+recursion — including a cycle that routes through an intervening real function, e.g. inline A calls
+real B which calls back into A — is a clear compile error, not a hang; a cycle entirely among real
+functions is left alone, since that's ordinary supported runtime recursion bounded only by gas, not a
+hazard specific to inlining). A separate hard cap (`MAX_INLINE_EXPANSIONS`, 4096) bounds the total
+number of call-site expansions in one compile, so a non-cyclic but exponentially-fanning-out DAG of
+inline functions (a "diamond": each level calls a shared lower-level helper more than once) fails
+closed with a clear error instead of a multi-minute compile or a V8 argument-count crash.
+
+Bail conditions (fail closed — a compile error, never a silent fallback): a `for`/`while` loop, a
+switch, a `try`/`catch`, a labeled or bare-block statement, a destructuring parameter or declaration,
+or a nested function/arrow anywhere in an inline body; an inline call inside a `for`/`while`
+loop's own header (init/test/update — those are single-expression slots that can't host a
+multi-statement splice; an inline call as an ordinary statement INSIDE the loop body works fine); an
+inline call inside a ternary branch or the right-hand side of `&&`/`||` (conditionally evaluated —
+hoisting there unconditionally would be exactly the same unsoundness the guard-clause handling
+above exists to avoid); a callee whose body doesn't return on every path, UNLESS the call is a bare
+discarded statement (its value unused, so a validate-or-revert-only helper is fine); more than
+`MAX_INLINE_EXPANSIONS` (4096) total call-site expansions in one compile. Known limitation, matching
+the real-world need: **loop-free guard-clause functions only** for this version of the feature — a
+helper that genuinely needs a loop stays a real `function`.
+
+**Known gap (not fixed, documented):** `validateInlineable`/`detectInlineRecursion` run over EVERY
+declared inline function up front, before treeshake — so an inline function that's never actually
+reachable from `main()` (unlike an unreachable REAL function, which treeshake silently drops before
+it's ever compiled) still fails the whole compile if it violates a bail condition or participates in
+a recursive cycle. A fully correct fix needs the splicing pass itself to skip unreachable
+declarations too (not just gate validation), since eagerly splicing an unreachable-but-genuinely-
+recursive inline function without also skipping its recursion check would trade a clean compile error
+for a possible hang during splicing — deliberately left as-is (fail closed, just occasionally eager)
+rather than risk that regression.
+
 **`sdk/`** — a data registry, no runtime logic. `src/protocols/<slug>/` per protocol (`info`,
 `addresses`, `abis` as-const, `functions` SauceScript templates); `src/protocols/index.ts` is the
 query registry. `src/skills/*.md` are AI-ready per-protocol docs (loaded by `loader.ts`, shipped in
