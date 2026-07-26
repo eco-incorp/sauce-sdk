@@ -482,6 +482,40 @@ function bodyBlocksUnrolling(node, loopVar) {
     });
     return blocked;
 }
+/**
+ * True if `statements` — the ALREADY-EXPANDED, flattened result of splicing one or more copies
+ * of a loop body directly into the SAME enclosing statement list (unrolling doesn't give each
+ * iteration its own `Block` scope — it substitutes the counter and splices the body's own
+ * statements straight into the surrounding list, see `unrollCountingLoop`/
+ * `tryUnrollForOfArrayTable` below) — declares the SAME name more than once via a direct
+ * `let`/`const`/nested `function`, OR redeclares a name already reserved by an OUTER enclosing
+ * scope (`outerNames`, e.g. a sibling `let` declared before the loop in the same block). Either
+ * shape is invalid to actually emit: `ts.transpileModule`'s printer happily prints it as text,
+ * but the very next stage (`acorn.parse`, inside `compile()`) rejects a duplicate lexical
+ * declaration in one scope with a hard `SyntaxError: Identifier 'x' has already been declared`.
+ *
+ * This inspects the ACTUAL, already-expanded output — not the original per-iteration body in
+ * isolation — so a loop body whose own declaration is fully CONSUMED/ELIDED by a further nested
+ * unroll (e.g. the paired `while`-counting idiom, which elides its own counter declaration
+ * entirely once unrolled) is correctly judged safe: nothing of that name survives to collide.
+ * Only counting a name once it's ACTUALLY duplicated (or collides with something outside the
+ * loop entirely) is what lets ordinary, already-tested unroll-cascades keep working, while still
+ * catching the case that would otherwise crash: a body that declares its own per-iteration local
+ * (e.g. `let doubled = i * 2n;`) that has nothing to consume it.
+ */
+function collidesWithSurroundingDeclarations(statements, outerNames) {
+    const seen = new Set(outerNames);
+    for (const stmt of statements) {
+        const names = new Set();
+        collectDirectlyDeclaredNames([stmt], names);
+        for (const name of names) {
+            if (seen.has(name))
+                return true;
+            seen.add(name);
+        }
+    }
+    return false;
+}
 /** Replace every reference to `loopVar` in `node` with the literal `value`. */
 function substituteCounter(node, loopVar, value, context) {
     const sub = (n) => ts.isIdentifier(n) && n.text === loopVar ? value : ts.visitEachChild(n, sub, context);
@@ -538,11 +572,18 @@ function unrollCountingLoop(loopVar, start, cmp, bound, step, body, useBigInt, c
         values.push(v);
     }
     const bodyStatements = ts.isBlock(body) ? body.statements : [body];
-    return values.flatMap((v) => {
+    const result = values.flatMap((v) => {
         const literal = toLiteralNode(useBigInt ? v : Number(v));
         const substituted = bodyStatements.map((s) => substituteCounter(s, loopVar, literal, context));
         return foldStatementList(substituted, consts, functions, shadowed, context, visit);
     });
+    // A body that declares its OWN per-iteration local (e.g. `let doubled = i * 2n;`, an entirely
+    // ordinary shape) would otherwise duplicate that declaration once per unrolled iteration,
+    // directly in this SAME flattened list — invalid to emit (see
+    // `collidesWithSurroundingDeclarations`'s own comment). Bail to the well-tested "not unrolled,
+    // stays real runtime code" path rather than hand back output the next compile stage can't
+    // even parse.
+    return collidesWithSurroundingDeclarations(result, shadowed) ? undefined : result;
 }
 function tryUnrollForLoop(node, consts, functions, shadowed, context, visit) {
     const init = node.initializer;
@@ -723,6 +764,18 @@ function foldTransformer(consts, functions) {
                     collectBindingNames(p.name, names);
                 if (node.body)
                     collectVarNames(node.body, names);
+                // ALSO shadow every name `collectLexicalNamesInScope` finds anywhere in the body — not
+                // just this function's own DIRECT declarations — since the real SauceScript compiler
+                // shares scope across `if`/`while`/bare-block bodies (only a `for` loop pushes a genuine
+                // new one; see `processor/statement.ts`'s `processIfStatement`/`processWhileStatement`,
+                // neither of which calls `ctx.pushScope`, versus `processForStatement`, which does). A
+                // name FIRST `let`/`const`-declared inside such a branch is therefore NOT block-scoped
+                // away once the branch ends — without this, `tsEvalConst`/`foldExpression` could resolve
+                // a read of it AFTER the branch against a same-named top-level const/function instead of
+                // failing closed, exactly mirroring `constPropagationTransformer`'s own fix below (see
+                // its matching comment) — this pass must agree with that one on what counts as shadowed.
+                if (node.body)
+                    collectLexicalNamesInScope(node.body, names);
                 // A named function (declaration, or named function EXPRESSION) can reference itself.
                 if (node.name)
                     names.add(node.name.text);
@@ -734,6 +787,8 @@ function foldTransformer(consts, functions) {
                     collectBindingNames(p.name, names);
                 if (node.body)
                     collectVarNames(node.body, names);
+                if (node.body)
+                    collectLexicalNamesInScope(node.body, names); // see isPlainFunctionScope's note above
                 return ts.visitEachChild(node, (child) => {
                     if (child === node.name) {
                         // A COMPUTED key genuinely reads whatever's inside, in the OUTER scope — a
@@ -1309,6 +1364,15 @@ function collectWriteCounts(root, candidateNames) {
                 collectBindingNames(p.name, names);
             if (node.body)
                 collectVarNames(node.body, names);
+            // See foldTransformer's isPlainFunctionScope note: a name FIRST let/const-declared
+            // inside a nested if/while/bare-block shadows for the REST of the function too. This
+            // only ever REMOVES a false-positive write attribution here (a write to a locally-
+            // shadowing name of the same text was previously miscounted as a write to the top-level
+            // binding); it can only lower a reported write count, matching the REAL count of writes
+            // that actually reach the top-level variable, so this fix can only newly (and correctly)
+            // qualify a name as effectively-const, never disqualify one that genuinely is.
+            if (node.body)
+                collectLexicalNamesInScope(node.body, names);
             if (node.name)
                 names.add(node.name.text);
             ts.forEachChild(node, (child) => {
@@ -1323,6 +1387,8 @@ function collectWriteCounts(root, candidateNames) {
                 collectBindingNames(p.name, names);
             if (node.body)
                 collectVarNames(node.body, names);
+            if (node.body)
+                collectLexicalNamesInScope(node.body, names); // see isPlainFunctionScope's note above
             ts.forEachChild(node, (child) => visit(child, child === node.name ? shadowed : names));
             return;
         }
@@ -1750,6 +1816,13 @@ function checkTableSafety(node, name, kind, shadowed, exclude) {
             collectBindingNames(p.name, names);
         if (node.body)
             collectVarNames(node.body, names);
+        // See foldTransformer's isPlainFunctionScope note: a name FIRST let/const-declared inside
+        // a nested if/while/bare-block is NOT block-scoped away for the rest of the function (the
+        // real SauceScript compiler shares scope across if/while bodies), so it must shadow here
+        // too — otherwise a table access AFTER such a branch would be wrongly treated as an
+        // unshadowed read of the OUTER top-level table.
+        if (node.body)
+            collectLexicalNamesInScope(node.body, names);
         if (node.name)
             names.add(node.name.text);
         let ok = true;
@@ -1767,6 +1840,8 @@ function checkTableSafety(node, name, kind, shadowed, exclude) {
             collectBindingNames(p.name, names);
         if (node.body)
             collectVarNames(node.body, names);
+        if (node.body)
+            collectLexicalNamesInScope(node.body, names); // see isPlainFunctionScope's note above
         let ok = true;
         ts.forEachChild(node, (child) => {
             if (child === node.name) {
@@ -1933,11 +2008,15 @@ function tryUnrollForOfArrayTable(node, tables, shadowed, context, reprocess) {
     if (bodyBlocksUnrolling(node.statement, loopVar))
         return undefined;
     const bodyStatements = ts.isBlock(node.statement) ? node.statement.statements : [node.statement];
-    return table.elements.flatMap((value) => {
+    const result = table.elements.flatMap((value) => {
         const literal = toLiteralNode(value);
         const substituted = bodyStatements.map((s) => substituteCounter(s, loopVar, literal, context));
         return reprocess(substituted, shadowed);
     });
+    // See `unrollCountingLoop`'s matching guard / `collidesWithSurroundingDeclarations`'s own
+    // comment: a body declaring its own per-iteration local would otherwise duplicate that
+    // declaration once per table element, directly in this SAME flattened list.
+    return collidesWithSurroundingDeclarations(result, shadowed) ? undefined : result;
 }
 /**
  * Visits a statement list for `tableFoldTransformer`, recognizing an unrollable `for...of` over
@@ -1989,6 +2068,13 @@ function tableFoldTransformer(tables, consts, functions) {
                     collectBindingNames(p.name, names);
                 if (node.body)
                     collectVarNames(node.body, names);
+                // See foldTransformer's isPlainFunctionScope note (and checkTableSafety's matching
+                // copy above): a name FIRST let/const-declared inside a nested if/while/bare-block
+                // shadows for the REST of the function too, matching the real SauceScript compiler's
+                // shared if/while scope — without this, a table access after such a branch would be
+                // folded against the OUTER top-level table instead of staying an unresolved real read.
+                if (node.body)
+                    collectLexicalNamesInScope(node.body, names);
                 if (node.name)
                     names.add(node.name.text);
                 const childVisitor = (child) => (child === node.name ? child : visit(child, names));
@@ -2000,6 +2086,8 @@ function tableFoldTransformer(tables, consts, functions) {
                     collectBindingNames(p.name, names);
                 if (node.body)
                     collectVarNames(node.body, names);
+                if (node.body)
+                    collectLexicalNamesInScope(node.body, names); // see isPlainFunctionScope's note above
                 const childVisitor = (child) => {
                     if (child === node.name) {
                         return ts.isComputedPropertyName(node.name)
