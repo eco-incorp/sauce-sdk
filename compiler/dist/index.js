@@ -8,6 +8,7 @@ import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import { estimatePacket } from './planner/index.js';
 import { compileCacheKey, cloneCompileResult, getDefaultCompileCache } from './cache.js';
+import { tsPartialEval } from './ts-frontend.js';
 export { createCompileCache, compileCacheKey, cloneCompileResult, getDefaultCompileCache, clearDefaultCompileCache, } from './cache.js';
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
@@ -80,7 +81,8 @@ function compileFresh(source, options = {}) {
     if (staged && target !== 'svm') {
         throw new Error(`staged compilation requires target 'svm', got '${target}'`);
     }
-    const ast = acorn.parse(source, {
+    const sourceText = options.tsSource ? tsPartialEval(source, options.label ?? 'source.ts') : source;
+    const ast = acorn.parse(sourceText, {
         ecmaVersion: 'latest',
         sourceType: 'module',
         allowReturnOutsideFunction: true,

@@ -36,6 +36,7 @@ import {
 } from './statement.js';
 import { processArrayExpression, processObjectExpression } from './collection.js';
 import { evalConst, evalConstBool } from './const-eval.js';
+import { tsPartialEval } from '../ts-frontend.js';
 
 export function processNode(node: Node, ctx: CompilerContext): SaucerLike[] {
   switch (node.type) {
@@ -143,7 +144,14 @@ function collectImportedFunctions(
 
     visited.add(mod.filePath);
 
-    const code = ctx.transformModule ? ctx.transformModule(mod.code, mod.filePath) : mod.code;
+    // A caller-supplied transformModule always wins; absent one, a `.ts`/`.sauce.ts`
+    // module gets the built-in fold+strip front-end automatically — `.js`/`.sauce`/`.mjs`
+    // are untouched (no ts-evaluator/typescript invocation at all).
+    const code = ctx.transformModule
+      ? ctx.transformModule(mod.code, mod.filePath)
+      : mod.filePath.endsWith('.ts')
+        ? tsPartialEval(mod.code, mod.filePath)
+        : mod.code;
     let modAst: Program;
 
     try {
@@ -153,10 +161,11 @@ function collectImportedFunctions(
         allowReturnOutsideFunction: true,
       }) as unknown as Program;
     } catch (e) {
-      throw new Error(
-        `failed to parse imported module "${mod.filePath}": ${(e as Error).message}` +
-          ` (if it is TypeScript, pass options.transformModule to strip types before parsing)`,
-      );
+      const hint = mod.filePath.endsWith('.ts')
+        ? '' // .ts/.sauce.ts already ran through the built-in fold+strip front-end
+        : ' (if it is TypeScript, pass options.transformModule to strip types before parsing)';
+
+      throw new Error(`failed to parse imported module "${mod.filePath}": ${(e as Error).message}${hint}`);
     }
 
     // Recurse into the imported module's own imports FIRST so transitive functions

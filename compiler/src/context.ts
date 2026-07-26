@@ -139,9 +139,11 @@ export class CompilerContext {
    * Optional hook to transform an imported SOURCE module's text before it is parsed —
    * e.g. strip TypeScript types. Receives (code, absoluteFilePath); returns plain JS the
    * acorn parser accepts. Set from CompileOptions.transformModule. Consulted ONLY for
-   * source-file imports (a `.json` contract ABI is never passed through it). Kept off the
-   * compiler's own dependency graph so it carries no typescript dep — callers that import
-   * `.ts`/`.sauce.ts` modules supply the stripper (the recipes pass ts.transpileModule).
+   * source-file imports (a `.json` contract ABI is never passed through it), and ONLY
+   * overrides the built-in behavior: absent a caller-supplied hook, a `.ts`/`.sauce.ts`
+   * import already runs through the compiler's own `ts-frontend.ts` (fold via
+   * ts-evaluator, strip via ts.transpileModule) automatically — see processor/index.ts's
+   * `collectImportedFunctions`. `.js`/`.sauce`/`.mjs` imports never invoke either path.
    */
   transformModule?: (code: string, filePath: string) => string;
 

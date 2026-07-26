@@ -79,6 +79,7 @@ export function compileCacheKey(source: string, options: CompileOptions = {}): s
     source,
     target: options.target ?? 'v1',
     staged: options.staged ?? false,
+    tsSource: options.tsSource ?? false,
     treeshake: options.treeshake ?? true,
     fold: options.fold ?? true,
     defines: options.defines ?? null,

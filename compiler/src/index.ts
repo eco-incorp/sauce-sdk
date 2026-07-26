@@ -19,6 +19,7 @@ import { estimatePacket } from './planner/index.js';
 import type { AccountPlan } from './planner/index.js';
 import { compileCacheKey, cloneCompileResult, getDefaultCompileCache } from './cache.js';
 import type { CompileCache } from './cache.js';
+import { tsPartialEval } from './ts-frontend.js';
 
 export {
   createCompileCache,
@@ -169,11 +170,21 @@ export interface CompileOptions {
   /**
    * Transform an imported SOURCE module's text before parsing — e.g. strip TypeScript types.
    * Receives (code, absoluteFilePath); return plain JS. Only invoked for source-file function
-   * imports (`import { fn } from "./mod"`), never for `.json` contract ABIs. Callers importing
-   * `.ts`/`.sauce.ts` modules supply this (the recipes pass `ts.transpileModule`); plain `.js`
-   * /`.sauce` modules need no transform.
+   * imports (`import { fn } from "./mod"`), never for `.json` contract ABIs, and only OVERRIDES
+   * the built-in behavior: absent this, a `.ts`/`.sauce.ts` import already runs through the
+   * compiler's own ts-evaluator-powered fold+strip front-end automatically; plain `.js`/`.sauce`
+   * modules need no transform either way.
    */
   transformModule?: (code: string, filePath: string) => string;
+  /**
+   * Treat the top-level `source` string as TypeScript: runs it through the same built-in
+   * fold+strip front-end as a `.ts`/`.sauce.ts` import (constant-condition branches provably
+   * dead per `ts-evaluator` are dropped, then types are stripped) before `acorn.parse` ever
+   * sees it. Default false — a plain SauceScript/JS `source` needs no TS handling and this
+   * option is a no-op cost otherwise. `options.label`, if set, is used as the synthetic
+   * filename ts-evaluator/TypeScript diagnostics reference.
+   */
+  tsSource?: boolean;
   /**
    * Drop every function NOT reachable from main() (after compile-time constant folding) so an
    * imported-but-unreferenced function — or a handler behind a statically-false branch — is not
@@ -287,7 +298,9 @@ function compileFresh(source: string, options: CompileOptions = {}): CompileResu
     throw new Error(`staged compilation requires target 'svm', got '${target}'`);
   }
 
-  const ast = acorn.parse(source, {
+  const sourceText = options.tsSource ? tsPartialEval(source, options.label ?? 'source.ts') : source;
+
+  const ast = acorn.parse(sourceText, {
     ecmaVersion: 'latest',
     sourceType: 'module',
     allowReturnOutsideFunction: true,
