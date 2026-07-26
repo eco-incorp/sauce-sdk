@@ -3328,6 +3328,35 @@ function substituteLocalReads(node: ts.Node, resolution: LocalResolution, contex
       : ts.factory.updatePostfixUnaryExpression(node, operand);
   }
 
+  if (ts.isConditionalExpression(node)) {
+    // Mirrors `foldTransformer`'s own dedicated ternary-handling branch one layer up
+    // (module scope) — see its `ts.isConditionalExpression` case: evaluate ONLY
+    // `.condition`, through this pass's own `LocalResolution` (a local variable this
+    // pass tracks, not necessarily a same-file top-level const `foldTransformer` could
+    // ever have resolved), and if it resolves to a known bigint, structurally replace
+    // the WHOLE ternary with whichever branch was selected — recursed through this SAME
+    // substitution (`visit`), so a nested ternary in the taken branch (or any other
+    // locally-known identifier) also resolves, cascading. If the condition does NOT
+    // resolve (a genuine runtime unknown — a parameter — or a dependency this pass has
+    // already forced NAC, e.g. a name written inside a loop), fall through to rewriting
+    // `.condition`/`.whenTrue`/`.whenFalse` each independently: the ternary's own branch
+    // structure is never collapsed on a genuinely runtime-conditioned ternary, but any
+    // locally-known identifier still inside it is substituted, exactly matching every
+    // other "can't prove it, don't guess" rule already in this pass.
+    const condition = tsEvalConst(node.condition, resolution.consts, resolution.functions, resolution.shadowed);
+
+    if (condition !== undefined) return visit(condition !== 0n ? node.whenTrue : node.whenFalse);
+
+    return ts.factory.updateConditionalExpression(
+      node,
+      visit(node.condition) as ts.Expression,
+      node.questionToken,
+      visit(node.whenTrue) as ts.Expression,
+      node.colonToken,
+      visit(node.whenFalse) as ts.Expression,
+    );
+  }
+
   if (ts.isIdentifier(node)) {
     // `resolution.consts` already omits every name this scope tracks WITHOUT a known value
     // (see `resolveLocalEnv`), so a plain map lookup alone is enough — no separate `shadowed`
@@ -3420,29 +3449,63 @@ function containsIdentifier(node: ts.Node): boolean {
 }
 
 /**
- * Tries to fully resolve `expr` to a single compile-time bigint (via the real `tsEvalConst`,
- * so a PARTIALLY-known expression like `x + f()` still correctly fails closed rather than
+ * `tsEvalConst`, bridged to also resolve a `ConditionalExpression` this pass's OWN local
+ * reasoning can decide — needed because `tsEvalConst`/`tsEvalUnary`/`tsEvalBinary` have NO
+ * case for `ts.isConditionalExpression` anywhere (by design; see the "TWO evaluators" note
+ * near the top of this file — a ternary's mainstream path folds via `foldTransformer`'s own
+ * separate, MODULE-scope visitor branch instead, which this per-function pass has no
+ * equivalent of on its own). Rather than duplicating `tsEvalConst`'s entire dispatch a second
+ * time just to teach it one more node kind, this is a thin bridge: try the ordinary evaluator
+ * first (the common, ternary-free case — unchanged, just as cheap as before this existed),
+ * and only if THAT fails, hand `expr` to `substituteLocalReads` (which structurally COLLAPSES
+ * any resolvable `ConditionalExpression` it finds anywhere inside — see its own dedicated
+ * case, mirroring `foldTransformer`'s) and re-attempt the ordinary evaluator on the result.
+ * This is also what makes a ternary NESTED inside a larger expression resolve (`(cond ? 2n :
+ * 3n) + 1n`, never itself the whole expression) — `substituteLocalReads` collapses the
+ * ternary down to its selected branch first, and the arithmetic AROUND it then folds
+ * normally on this second attempt, exactly as if the source had spelled the taken branch
+ * directly.
+ */
+function evalLocalConst(
+  expr: ts.Expression,
+  resolution: LocalResolution,
+  context: ts.TransformationContext,
+): bigint | undefined {
+  const direct = tsEvalConst(expr, resolution.consts, resolution.functions, resolution.shadowed);
+
+  if (direct !== undefined) return direct;
+
+  const collapsed = substituteLocalReads(expr, resolution, context) as ts.Expression;
+
+  return tsEvalConst(collapsed, resolution.consts, resolution.functions, resolution.shadowed);
+}
+
+/**
+ * Tries to fully resolve `expr` to a single compile-time bigint (via `evalLocalConst`, so a
+ * PARTIALLY-known expression like `x + f()` still correctly fails closed rather than
  * half-folding — this also means a call to an eligible same-file top-level function
  * (`tsEvalCall`) now folds here too when its arguments resolve through this scope's own
  * locals, e.g. `let y = double(x);` once `x` is a known local — a natural, sound extension of
- * reusing the SAME evaluator family, not a separate capability this pass builds itself); if it
- * can't, falls back to substituting whatever individual reads WITHIN it are still resolvable
- * (`x` alone, leaving the opaque `f()` call untouched) — this is rule 1's "a read of a bare
- * identifier at any point substitutes... else left untouched", applied uniformly whether or
- * not the ENCLOSING expression as a whole turns out to be foldable. An expression that
- * resolves to a bigint WITHOUT containing any Identifier at all (already a bare literal, e.g.
- * `1n` or a plain `2 + 3` — the latter already collapsed by `foldTransformer`, which runs
- * before this pass, so in practice this is almost always just a bare literal by the time it
- * gets here) is deliberately left completely untouched rather than "canonicalized" — see
- * `containsIdentifier`'s own comment for why that specific rewrite is unsafe to do
- * unconditionally.
+ * reusing the SAME evaluator family, not a separate capability this pass builds itself; and,
+ * via `evalLocalConst`, a `ConditionalExpression` whose condition this pass's own local
+ * reasoning can resolve, cascading into a nested ternary in the taken branch); if it can't,
+ * falls back to substituting whatever individual reads WITHIN it are still resolvable (`x`
+ * alone, leaving the opaque `f()` call untouched, or a genuinely runtime-conditioned ternary's
+ * own sub-parts) — this is rule 1's "a read of a bare identifier at any point substitutes...
+ * else left untouched", applied uniformly whether or not the ENCLOSING expression as a whole
+ * turns out to be foldable. An expression that resolves to a bigint WITHOUT containing any
+ * Identifier at all (already a bare literal, e.g. `1n` or a plain `2 + 3` — the latter already
+ * collapsed by `foldTransformer`, which runs before this pass, so in practice this is almost
+ * always just a bare literal by the time it gets here) is deliberately left completely
+ * untouched rather than "canonicalized" — see `containsIdentifier`'s own comment for why that
+ * specific rewrite is unsafe to do unconditionally.
  */
 function foldOrSubstitute(
   expr: ts.Expression,
   resolution: LocalResolution,
   context: ts.TransformationContext,
 ): { expr: ts.Expression; value: bigint | undefined } {
-  const value = tsEvalConst(expr, resolution.consts, resolution.functions, resolution.shadowed);
+  const value = evalLocalConst(expr, resolution, context);
 
   if (value !== undefined) {
     if (!containsIdentifier(expr)) return { expr, value };
@@ -3459,15 +3522,26 @@ function foldOrSubstitute(
  * `tsEvalBinary`'s operator switch one level up, since `tsEvalConst` itself has no case for
  * any assignment-family token (by design — see `ASSIGNMENT_OPERATOR_TOKENS`). `&&=`/`||=`/
  * `??=`/`>>>=` are not modeled (short-circuit-assignment semantics, and bigint has no `>>>`
- * at all) — always NAC, which is always safe. */
-function evalCompoundAssignmentResult(expr: ts.BinaryExpression, resolution: LocalResolution): bigint | undefined {
+ * at all) — always NAC, which is always safe. The RHS is resolved via `evalLocalConst` (the
+ * SAME bridge `foldOrSubstitute` uses for a plain-assignment RHS), not a bare `tsEvalConst`
+ * call — so a ternary RHS whose condition this pass's own local reasoning can resolve (e.g.
+ * `x += cond ? 1n : 2n;`) also updates the TRACKED value here, matching what
+ * `substituteLocalReads` already collapses in the emitted code for the same RHS one level up
+ * in `walkAssignmentExpr`. Before this, the printed code and the tracked value could disagree
+ * (the emitted `x += 1n;` was correct, but a subsequent read of `x` stayed NAC) — sound (never
+ * a wrong VALUE), but a needlessly missed fold. */
+function evalCompoundAssignmentResult(
+  expr: ts.BinaryExpression,
+  resolution: LocalResolution,
+  context: ts.TransformationContext,
+): bigint | undefined {
   if (!ts.isIdentifier(expr.left)) return undefined;
 
   const current = resolution.consts.get(expr.left.text);
 
   if (current === undefined) return undefined;
 
-  const rhs = tsEvalConst(expr.right, resolution.consts, resolution.functions, resolution.shadowed);
+  const rhs = evalLocalConst(expr.right, resolution, context);
 
   if (rhs === undefined) return undefined;
 
@@ -3519,7 +3593,7 @@ function walkAssignmentExpr(
     value = folded.value;
   } else {
     newRight = substituteLocalReads(expr.right, resolution, context) as ts.Expression;
-    value = evalCompoundAssignmentResult(expr, resolution);
+    value = evalCompoundAssignmentResult(expr, resolution, context);
   }
 
   if (ts.isIdentifier(expr.left)) {
