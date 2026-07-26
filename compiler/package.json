@@ -45,11 +45,12 @@
     "litesvm": "^1.2.1",
     "prettier": "^3.8.1",
     "sauce": "github:eco-incorp/sauce#feat/router-flash-callback",
-    "ts-jest": "^29.4.6",
-    "typescript": "^5.7.0"
+    "ts-jest": "^29.4.6"
   },
   "dependencies": {
     "acorn": "^8.15.0",
+    "ts-evaluator": "^2.0.0",
+    "typescript": "^5.7.0",
     "viem": "^2.45.3"
   }
 }
