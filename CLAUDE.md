@@ -225,11 +225,88 @@ function's own parameter sharing a name with an unrelated top-level `const` (`fu
 return x * 2n; }` beside a top-level `const x`) — all correctly decline to fold rather than
 silently resolving against the wrong (top-level) binding.
 
+**Array/object lookup-table folding.** A top-level `const NAME = [<foldable>, ...]` / `const NAME
+= { key: <foldable>, ... }` — a fee-tier table, a tick-spacing table, any table written purely for
+readable compile-time reference — where every element/property itself folds to a bigint (the SAME
+`tsEvalConst`/`consts` machinery the scalar consts above already use — a table's elements may
+reference an earlier scalar top-level const, but never another table: no "tables of tables") is a
+candidate lookup table. A candidate is only ever actually tracked once a **whole-file, shadow-aware
+soundness scan** (`checkTableSafety`/`isSafeTableRead`, mirroring `constPropagationTransformer`'s
+own shadow-tracking) proves every remaining use of its name is a plain, constant-indexed read
+(`NAME[k]`/`NAME.prop`/`NAME["prop"]`) that is itself neither a write nor a call target. This is a
+strict **allowlist** (only the recognized-safe shape passes), not a blocklist of known-bad shapes,
+so an unrecognized escape shape fails closed by construction: the identifier being reassigned or
+`++`/`--`-updated; used as the base of ANY method call (`NAME.anything(...)`, regardless of method
+name — no whitelist of "safe" methods); an element/property access used as a write target
+(`NAME[i] = ...`, `NAME.x = ...`, including one nested — however deeply, climbing through the
+object/array-literal "pattern" node shapes TypeScript reuses for destructuring assignment —
+inside a destructuring-assignment target like `({ k: NAME.x } = obj)` / `[NAME.x] = arr`); or the
+bare identifier passed as a call argument, aliased to another variable, returned, or spread — ANY
+of these disqualifies the table from being tracked AT ALL, even if every other access to it would
+individually have been perfectly safe (no partial folding of an otherwise-safe table). A
+disqualifying use counts even inside unreachable code (`if (false) { ARR.push(1n); }` still
+disqualifies) — the scan is purely syntactic, not reachability-aware. `checkTableSafety`
+deliberately does NOT reuse the scalar-propagation passes' blanket "class/enum/namespace body →
+skip entirely, don't descend" (sound there only because a const scalar's *value* can't be mutated
+from inside one without illegally reassigning its binding, already a hard error): a class method
+or namespace function CAN mutate a tracked table without reassigning the table's own binding, so
+encountering one of these node kinds while scanning instead disqualifies the table outright the
+moment its name occurs anywhere inside (a coarser, fail-closed check, not a re-derived "was it
+actually a safe read" analysis) — these shapes don't occur in the supported base language surface
+and are independently rejected by `compile()` regardless, but `tsPartialEval` is a separately
+exported function so this scan fails closed on its own too. Once a table passes the
+scan, `tableFoldTransformer` (running right after `foldTransformer`, so a loop-unrolled literal
+index like `TABLE[i]` where `i` was just substituted by unrolling is still resolvable) replaces
+each resolvable access with its literal element/property value; an access that ISN'T resolvable
+(a non-constant index, an out-of-bounds or negative array index, a non-string-literal computed key
+into an object table) is simply left untouched and does NOT disqualify other, provably-resolvable
+accesses of the same table elsewhere — each access is judged independently once the file-wide
+immutability proof holds. The now-fully-dead declaration is then removed by the SAME
+`deadConstEliminationTransformer` dead-declaration-elimination pass already used for scalar consts
+(extended to also track table names). **Explicitly out of scope**, a literal simply never becoming
+a candidate (left completely untouched, same as any other non-fully-foldable initializer):
+`new Array(n)` (a wholly different, engine-level HEAP-allocated SauceScript concept, untouched by
+any of this); a spread element inside the literal itself (`[...x]`, `{...x}`); an object literal's
+shorthand/method/getter/setter property or a COMPUTED property name in the declaration itself
+(`{ [k]: v }` — only plain `key: value` / `"key": value` properties are supported); a nested
+array/object literal as an element/property value ("tables of tables" — deliberately rejected
+rather than supported, keeping the recursive-fold requirement to one flat level); and `for...in`
+(this feature only ever folds direct index/property reads, never enumerates).
+
+**Stretch: `for (const x of ARR) {...}` unrolling over a tracked ARRAY table.** Reuses the exact
+same safety infrastructure as the numeric `for`/`while` unroller above (`MAX_UNROLL_ITERATIONS`,
+`bodyBlocksUnrolling`'s break/continue/return/shadowing bail, `substituteCounter`) adapted to
+iterate over the table's ELEMENTS instead of an arithmetic sequence — one copy of the body per
+element, the loop variable substituted by its literal value each time, cascading into any nested
+`if`/loop/table-access keyed on it exactly like the numeric unroller. Iterating an array table via
+`for...of` is always a safe, read-only, non-aliasing use on its own (the elements are immutable
+bigints) — so it never disqualifies the table from tracking, independent of whether THIS
+particular loop shape can actually be unrolled. The unroll itself declines (leaves the loop as real
+runtime code, keeping the declaration referenced) on: `for await...of`; a destructured loop
+variable (`for (const [a] of ARR)` — only a single plain identifier loop variable is supported);
+a body `bodyBlocksUnrolling` rejects; or the table has **more elements than
+`MAX_UNROLL_ITERATIONS`** (256, the same cap the numeric unroller reuses). Because eliding one
+`ForOfStatement` in favor of N unrolled statements replaces one statement-list entry with many —
+which a single-node visitor cannot express — the attempt only ever fires from a genuine
+statement-LIST position (`Block.statements`/`SourceFile.statements`, via a dedicated
+`visitStatementList`, mirroring `foldStatementList`'s own role in the numeric/while unroller); a
+`for...of` sitting in a single-statement slot (e.g. the un-braced body of an outer `for`/`if`) is
+conservatively left un-unrolled. This isn't just a bytecode-shape optimization: plain acorn has
+**no** `ForOfStatement` handling at all (`compile()` without `tsSource`/a `.ts` import throws
+`not implemented: ForOfStatement` outright), so unrolling this away in the TS front-end is what
+makes a `for...of` over a lookup table compilable at all, not merely more efficient — which also
+means declining to unroll is a **harder failure here than for the numeric `for`/`while`
+unroller**: those gracefully fall back to real `JUMP_BACK` runtime bytecode past their cap, but a
+declined `for...of` (e.g. a table with >256 elements) leaves a `ForOfStatement` node with no
+runtime-bytecode fallback at all, so `compile()` — even with `tsSource: true` — throws `not
+implemented: ForOfStatement` rather than compiling suboptimally.
+
 **Known limitation (not fixed)**: this only folds/propagates compile-time-known COUNTERS/BOUNDS,
-same-file top-level `const` VALUES, and the narrow same-file/single-return/constant-args CALL
-shape above, not real array/object DATA processing (`arr[i]`, `.push()`, `for...of` iterating
-actual data) — ts-evaluator's no-checker mode can't resolve property/array access at all, and a
-full `ts.Program`/TypeChecker is a much bigger lift, out of scope here.
+same-file top-level `const` VALUES, the narrow same-file/single-return/constant-args CALL shape,
+and the narrow compile-time-only lookup-table case above — not general array/object DATA
+processing (`arr[i]`/`.push()`/`for...of` on non-table data, mutable arrays, arrays built at
+runtime) — ts-evaluator's no-checker mode can't resolve property/array access or function calls at
+all, and a full `ts.Program`/TypeChecker is a much bigger lift, out of scope here.
 
 **Assignment expressions are never folded.** The TS AST represents `=`/`+=`/etc. as a
 `BinaryExpression`, and `ts-evaluator`'s `evaluate()` "succeeds" on a bare assignment (e.g.
