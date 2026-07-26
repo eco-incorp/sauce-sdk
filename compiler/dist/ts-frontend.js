@@ -39,6 +39,11 @@ const POLICY = {
 };
 /** A countable `for` loop unrolls into at most this many copies of its body. */
 const MAX_UNROLL_ITERATIONS = 256;
+/** Shared empty shadow set — module (top-level) scope has nothing shadowing it, and a
+ * same-file top-level function's own body/defaults are evaluated fresh against this (see
+ * `tsEvalCall`): its free variables can only be OTHER top-level bindings, never whatever
+ * happens to be shadowed at whatever call site is being folded. */
+const EMPTY_SHADOW = new Set();
 function tryEvaluate(node) {
     try {
         const result = evaluate({ node, typescript: ts, environment: { preset: 'NONE' }, policy: POLICY });
@@ -52,10 +57,9 @@ function tryEvaluate(node) {
         return { success: false };
     }
 }
-// ── Hand-rolled bigint constant evaluator (ts.Node analogue of processor/const-eval.ts) ──
-function tsEvalConst(node, consts) {
+function tsEvalConst(node, consts, functions, shadowed) {
     if (ts.isParenthesizedExpression(node))
-        return tsEvalConst(node.expression, consts);
+        return tsEvalConst(node.expression, consts, functions, shadowed);
     if (ts.isBigIntLiteral(node))
         return BigInt(node.text.slice(0, -1)); // strip the "n" ts-evaluator's own BigInt() call rejects
     if (ts.isNumericLiteral(node)) {
@@ -66,16 +70,24 @@ function tsEvalConst(node, consts) {
         return 1n;
     if (node.kind === ts.SyntaxKind.FalseKeyword)
         return 0n;
+    // A name reserved by ANY enclosing scope between this node and the top level (a parameter,
+    // a nested function/let/const/var/catch-binding of the same name, …) can never be resolved
+    // against the top-level `consts` map — the identifier refers to THAT binding at runtime,
+    // never necessarily the same-named top-level const, so this must fail closed (undefined)
+    // rather than guess. See `foldTransformer`'s scope-introducing branches, which grow
+    // `shadowed` on the way down (mirroring `constPropagationTransformer`'s own shadow tracking).
     if (ts.isIdentifier(node))
-        return consts.get(node.text);
+        return shadowed.has(node.text) ? undefined : consts.get(node.text);
     if (ts.isPrefixUnaryExpression(node))
-        return tsEvalUnary(node, consts);
+        return tsEvalUnary(node, consts, functions, shadowed);
     if (ts.isBinaryExpression(node))
-        return tsEvalBinary(node, consts);
+        return tsEvalBinary(node, consts, functions, shadowed);
+    if (ts.isCallExpression(node))
+        return tsEvalCall(node, consts, functions, shadowed);
     return undefined;
 }
-function tsEvalUnary(node, consts) {
-    const v = tsEvalConst(node.operand, consts);
+function tsEvalUnary(node, consts, functions, shadowed) {
+    const v = tsEvalConst(node.operand, consts, functions, shadowed);
     if (v === undefined)
         return undefined;
     switch (node.operator) {
@@ -91,22 +103,22 @@ function tsEvalUnary(node, consts) {
             return undefined;
     }
 }
-function tsEvalBinary(node, consts) {
+function tsEvalBinary(node, consts, functions, shadowed) {
     const op = node.operatorToken.kind;
     // Short-circuit && / ||, matching const-eval.ts: a known-falsy left collapses `&&`, a
     // known-truthy left collapses `||`, even when the right side isn't itself constant.
     if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken) {
-        const left = tsEvalConst(node.left, consts);
+        const left = tsEvalConst(node.left, consts, functions, shadowed);
         const isAnd = op === ts.SyntaxKind.AmpersandAmpersandToken;
         if (left !== undefined && (isAnd ? left === 0n : left !== 0n))
             return isAnd ? 0n : 1n;
-        const right = tsEvalConst(node.right, consts);
+        const right = tsEvalConst(node.right, consts, functions, shadowed);
         if (left === undefined || right === undefined)
             return undefined;
         return (isAnd ? left !== 0n && right !== 0n : left !== 0n || right !== 0n) ? 1n : 0n;
     }
-    const a = tsEvalConst(node.left, consts);
-    const b = tsEvalConst(node.right, consts);
+    const a = tsEvalConst(node.left, consts, functions, shadowed);
+    const b = tsEvalConst(node.right, consts, functions, shadowed);
     if (a === undefined || b === undefined)
         return undefined;
     switch (op) {
@@ -150,8 +162,147 @@ function tsEvalBinary(node, consts) {
             return undefined;
     }
 }
+/**
+ * True if a CallExpression or NewExpression occurs anywhere in `node`, including `node`
+ * itself. A same-file top-level function is only ever a call-folding candidate when its body
+ * contains ZERO of these anywhere (see `foldableReturnExpr`) — a body that never calls
+ * anything trivially can't recurse (so no separate recursion analysis is needed) and can't
+ * reach a side effect through a nested call either, which is the entire soundness argument
+ * for folding the call away.
+ */
+function containsCallOrNew(node) {
+    if (ts.isCallExpression(node) || ts.isNewExpression(node))
+        return true;
+    let found = false;
+    ts.forEachChild(node, (child) => {
+        if (!found && containsCallOrNew(child))
+            found = true;
+    });
+    return found;
+}
+/**
+ * The narrow shape a same-file top-level function must have before a CALL to it can ever
+ * fold (see `tsEvalCall`): it is neither a generator nor `async` (calling either never
+ * yields its `return`ed value directly — a generator returns an Iterator, `async` returns a
+ * Promise — so folding straight to the resolved literal would be a genuine semantic
+ * divergence from what the source actually does when run), its ENTIRE body is exactly one
+ * `return <expr>;` statement (no other statements, no bare `return;`), every parameter is a
+ * plain identifier (no destructuring, no rest), and neither the return expression nor any
+ * parameter's default initializer contains a CallExpression/NewExpression anywhere. Returns
+ * the return expression when eligible, `undefined` otherwise — fails closed, same convention
+ * as every other check in this evaluator, so an ineligible function simply leaves every call
+ * to it untouched rather than throwing or guessing.
+ */
+function foldableReturnExpr(fn) {
+    if (fn.asteriskToken)
+        return undefined; // generator — calling it returns an Iterator, never its `return`ed value
+    if (ts.getModifiers(fn)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword))
+        return undefined; // async — returns a Promise
+    if (!fn.body || fn.body.statements.length !== 1)
+        return undefined;
+    const [stmt] = fn.body.statements;
+    if (!ts.isReturnStatement(stmt) || !stmt.expression)
+        return undefined;
+    if (containsCallOrNew(stmt.expression))
+        return undefined;
+    for (const param of fn.parameters) {
+        if (!ts.isIdentifier(param.name) || param.dotDotDotToken)
+            return undefined; // no destructuring/rest params
+        if (param.initializer && containsCallOrNew(param.initializer))
+            return undefined;
+    }
+    return stmt.expression;
+}
+/**
+ * Folds a CALL to a same-file, side-effect-free, single-`return`-expression top-level
+ * function (`foldableReturnExpr`) when every argument itself resolves to a compile-time
+ * constant. Parameters are bound as a temporary overlay ON TOP OF `consts` (a fresh `Map`
+ * copy — the caller's own `consts` is never mutated) and the return expression is evaluated
+ * through the SAME `tsEvalConst` machinery, so a body that reads a module-level `const`
+ * alongside its own parameter(s) resolves correctly (the overlay simply shadows a same-named
+ * outer const, exactly like a real parameter would at runtime). The callee's own body/
+ * defaults are evaluated against a FRESH (empty) shadow set, never the caller's `shadowed` —
+ * a top-level function's free variables can only be other same-file top-level bindings,
+ * never whatever happens to be shadowed at whatever call site is being folded.
+ *
+ * The callee identifier itself must resolve to the top-level function map entry UNSHADOWED:
+ * if anything between the call site and the top level (a parameter, a nested function/let/
+ * const of the same name, …) rebinds the same name, the call site's callee refers to THAT
+ * binding at runtime — never necessarily the top-level function of the same name — so this
+ * declines to fold rather than guess which one was meant (see `foldTransformer`'s
+ * scope-introducing branches, which grow `shadowed` on the way down).
+ *
+ * A call that omits an argument for a parameter with a default initializer evaluates that
+ * default instead — deliberately handled (not rejected): defaults are evaluated left to
+ * right, so a later default may reference an earlier already-bound parameter, matching real
+ * JS call semantics, and `foldableReturnExpr` already guarantees a default itself contains no
+ * nested call. Every one of the callee's OWN parameter names is excluded from the overlay's
+ * initial seed (before any are individually bound below) — real JS/TS parameter-list scoping
+ * puts every parameter name (including ones bound LATER in the same list) in its own TDZ for
+ * the whole parameter list, so an earlier default referencing a later (or its own,
+ * not-yet-bound) parameter name throws at runtime rather than silently reading an outer
+ * const of the same name; excluding those names up front reproduces that (the reference
+ * simply fails to resolve, declining the fold, instead of reading the wrong value). Any other
+ * mismatch — an unknown callee, a callee that isn't a plain identifier (e.g. `obj.method()`),
+ * a callee whose body isn't the exact eligible shape, too many arguments, or any argument (or
+ * used default) that doesn't itself resolve to a constant — returns `undefined`, leaving the
+ * call site completely untouched.
+ */
+function tsEvalCall(node, consts, functions, shadowed) {
+    if (!ts.isIdentifier(node.expression))
+        return undefined; // same-file plain calls only — no `obj.method()`
+    const calleeName = node.expression.text;
+    if (shadowed.has(calleeName))
+        return undefined; // the name is rebound between here and the top level
+    const fn = functions.get(calleeName);
+    if (!fn)
+        return undefined;
+    const returnExpr = foldableReturnExpr(fn);
+    if (!returnExpr)
+        return undefined;
+    if (node.arguments.length > fn.parameters.length)
+        return undefined; // too many args — never valid
+    const ownParamNames = new Set();
+    for (const param of fn.parameters) {
+        if (ts.isIdentifier(param.name))
+            ownParamNames.add(param.name.text);
+    }
+    // Seed the overlay from the outer `consts`, but WITHOUT any name that's also one of the
+    // callee's own parameters — that name is reserved for the whole parameter list (TDZ),
+    // never the outer const of the same name, even before it's individually bound below.
+    const overlay = new Map([...consts].filter(([name]) => !ownParamNames.has(name)));
+    for (let i = 0; i < fn.parameters.length; i++) {
+        const param = fn.parameters[i];
+        const arg = node.arguments[i];
+        // `arg` evaluates in the CALLER's scope (their own shadowing applies); an omitted arg's
+        // default evaluates in the CALLEE's own (fresh) scope, against the overlay built so far,
+        // so it can see earlier parameters already bound this call — but never an unbound later/
+        // own one, which correctly fails to resolve instead of reading the outer const.
+        let value;
+        if (arg)
+            value = tsEvalConst(arg, consts, functions, shadowed);
+        else if (param.initializer)
+            value = tsEvalConst(param.initializer, overlay, functions, EMPTY_SHADOW);
+        if (value === undefined)
+            return undefined;
+        overlay.set(param.name.text, value); // guaranteed Identifier by foldableReturnExpr
+    }
+    return tsEvalConst(returnExpr, overlay, functions, EMPTY_SHADOW);
+}
+/** Every same-file top-level NAMED `function` declaration, keyed by name — hoisting-order
+ * independent (unlike `consts`, which must be resolved in declaration order): a call or a
+ * `const` initializer may reference a function declared anywhere else in the file, matching
+ * real JS function-hoisting semantics. */
+function collectTopLevelFunctions(sourceFile) {
+    const functions = new Map();
+    for (const stmt of sourceFile.statements) {
+        if (ts.isFunctionDeclaration(stmt) && stmt.name)
+            functions.set(stmt.name.text, stmt);
+    }
+    return functions;
+}
 /** Every same-file top-level `const NAME = <literal>`, resolved in declaration order. */
-function collectTopLevelConsts(sourceFile) {
+function collectTopLevelConsts(sourceFile, functions) {
     const consts = new Map();
     for (const stmt of sourceFile.statements) {
         if (!ts.isVariableStatement(stmt))
@@ -161,7 +312,7 @@ function collectTopLevelConsts(sourceFile) {
         for (const decl of stmt.declarationList.declarations) {
             if (!ts.isIdentifier(decl.name) || !decl.initializer)
                 continue;
-            const value = tsEvalConst(decl.initializer, consts);
+            const value = tsEvalConst(decl.initializer, consts, functions, EMPTY_SHADOW);
             if (value !== undefined)
                 consts.set(decl.name.text, value);
         }
@@ -196,13 +347,24 @@ const ASSIGNMENT_OPERATOR_TOKENS = new Set([
     ts.SyntaxKind.QuestionQuestionEqualsToken,
 ]);
 /** Combines both evaluators: the reliable bigint path first, ts-evaluator as a fallback. */
-function foldExpression(node, consts) {
+function foldExpression(node, consts, functions, shadowed) {
     if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
         return { success: false };
     }
-    const hand = tsEvalConst(node, consts);
+    const hand = tsEvalConst(node, consts, functions, shadowed);
     if (hand !== undefined)
         return { success: true, value: hand };
+    // A CallExpression is deliberately NEVER handed to the ts-evaluator fallback: folding a
+    // call is governed entirely by `tsEvalCall`'s own hard-boundary eligibility rules above
+    // (same-file, single-return, zero nested calls, constant args), and ts-evaluator's
+    // no-checker `evaluate()` cannot resolve a function call at all today anyway (confirmed —
+    // it fails closed on every call shape, not just the ones this evaluator declines) — but
+    // relying on that behavior implicitly would silently change if a future ts-evaluator
+    // version learned to interpret same-file calls itself, bypassing our eligibility checks
+    // entirely. This mirrors the `ASSIGNMENT_OPERATOR_TOKENS` guard just above: fail closed by
+    // construction, not by coincidence.
+    if (ts.isCallExpression(node))
+        return { success: false };
     return tryEvaluate(node);
 }
 /** A JS primitive foldable into a literal AST node (object/array/function/symbol/null/undefined are not). */
@@ -226,15 +388,22 @@ function toLiteralNode(value) {
 /**
  * Node kinds safe to fold to a literal wherever they're found: none of these can ever be an
  * assignment target (an lvalue), so replacing one in place is always semantically safe —
- * unlike a bare Identifier, which might be the left side of an assignment or a declaration name.
+ * unlike a bare Identifier, which might be the left side of an assignment or a declaration
+ * name. A CallExpression is included here too — it's likewise never an lvalue — but actually
+ * folds only for the narrow same-file/single-return/constant-args shape `tsEvalCall` accepts;
+ * any other call (an unresolvable callee, `console.log(...)`, a multi-statement function,
+ * etc.) simply fails `foldExpression` and is left exactly as found, same as always.
  */
 function isFoldableValueExpression(node) {
-    return ts.isBinaryExpression(node) || ts.isPrefixUnaryExpression(node) || ts.isTemplateExpression(node);
+    return (ts.isBinaryExpression(node) ||
+        ts.isPrefixUnaryExpression(node) ||
+        ts.isTemplateExpression(node) ||
+        ts.isCallExpression(node));
 }
 // ── Loop unrolling: a "countable" `for` with a constant start/bound/step becomes N copies
 // of its body, the counter substituted by its literal value each time. ──
 /** `i++`/`i--`/`i += step`/`i -= step` on the counter → the signed per-iteration step. */
-function extractStep(incrementor, loopVar, consts) {
+function extractStep(incrementor, loopVar, consts, functions, shadowed) {
     if (!incrementor)
         return undefined;
     if (ts.isPostfixUnaryExpression(incrementor) || ts.isPrefixUnaryExpression(incrementor)) {
@@ -249,7 +418,7 @@ function extractStep(incrementor, loopVar, consts) {
     if (ts.isBinaryExpression(incrementor) && ts.isIdentifier(incrementor.left) && incrementor.left.text === loopVar) {
         const op = incrementor.operatorToken.kind;
         if (op === ts.SyntaxKind.PlusEqualsToken || op === ts.SyntaxKind.MinusEqualsToken) {
-            const rhs = tsEvalConst(incrementor.right, consts);
+            const rhs = tsEvalConst(incrementor.right, consts, functions, shadowed);
             if (rhs === undefined)
                 return undefined;
             return op === ts.SyntaxKind.PlusEqualsToken ? rhs : -rhs;
@@ -261,7 +430,7 @@ function extractStep(incrementor, loopVar, consts) {
             if ((rhsOp === ts.SyntaxKind.PlusToken || rhsOp === ts.SyntaxKind.MinusToken) &&
                 ts.isIdentifier(incrementor.right.left) &&
                 incrementor.right.left.text === loopVar) {
-                const step = tsEvalConst(incrementor.right.right, consts);
+                const step = tsEvalConst(incrementor.right.right, consts, functions, shadowed);
                 if (step === undefined)
                     return undefined;
                 return rhsOp === ts.SyntaxKind.PlusToken ? step : -step;
@@ -319,7 +488,7 @@ function referencesIdentifier(node, name) {
  * both `for` (bounds come from its own init/condition/incrementor) and the `while` counting
  * idiom (bounds come from a preceding decl + the condition + the body's own last statement).
  */
-function unrollCountingLoop(loopVar, start, cmp, bound, step, body, useBigInt, consts, context, visit) {
+function unrollCountingLoop(loopVar, start, cmp, bound, step, body, useBigInt, consts, functions, shadowed, context, visit) {
     const isLess = cmp === ts.SyntaxKind.LessThanToken || cmp === ts.SyntaxKind.LessThanEqualsToken;
     const isGreater = cmp === ts.SyntaxKind.GreaterThanToken || cmp === ts.SyntaxKind.GreaterThanEqualsToken;
     if (!isLess && !isGreater)
@@ -353,10 +522,10 @@ function unrollCountingLoop(loopVar, start, cmp, bound, step, body, useBigInt, c
     return values.flatMap((v) => {
         const literal = toLiteralNode(useBigInt ? v : Number(v));
         const substituted = bodyStatements.map((s) => substituteCounter(s, loopVar, literal, context));
-        return foldStatementList(substituted, consts, context, visit);
+        return foldStatementList(substituted, consts, functions, shadowed, context, visit);
     });
 }
-function tryUnrollForLoop(node, consts, context, visit) {
+function tryUnrollForLoop(node, consts, functions, shadowed, context, visit) {
     const init = node.initializer;
     if (!init || !ts.isVariableDeclarationList(init) || init.declarations.length !== 1)
         return undefined;
@@ -364,20 +533,20 @@ function tryUnrollForLoop(node, consts, context, visit) {
     if (!ts.isIdentifier(decl.name) || !decl.initializer)
         return undefined;
     const loopVar = decl.name.text;
-    const start = tsEvalConst(decl.initializer, consts);
+    const start = tsEvalConst(decl.initializer, consts, functions, shadowed);
     if (start === undefined)
         return undefined;
     const cond = node.condition;
     if (!cond || !ts.isBinaryExpression(cond) || !ts.isIdentifier(cond.left) || cond.left.text !== loopVar) {
         return undefined;
     }
-    const bound = tsEvalConst(cond.right, consts);
+    const bound = tsEvalConst(cond.right, consts, functions, shadowed);
     if (bound === undefined)
         return undefined;
-    const step = extractStep(node.incrementor, loopVar, consts);
+    const step = extractStep(node.incrementor, loopVar, consts, functions, shadowed);
     if (step === undefined || step === 0n)
         return undefined;
-    return unrollCountingLoop(loopVar, start, cond.operatorToken.kind, bound, step, node.statement, looksBigInt(decl.initializer), consts, context, visit);
+    return unrollCountingLoop(loopVar, start, cond.operatorToken.kind, bound, step, node.statement, looksBigInt(decl.initializer), consts, functions, shadowed, context, visit);
 }
 /**
  * A `while` loop has no init/incrementor clauses of its own, so the countable idiom must be
@@ -387,20 +556,20 @@ function tryUnrollForLoop(node, consts, context, visit) {
  * the enclosing scope entirely, this only fires when nothing after the loop still reads it
  * (a post-loop use of the counter, e.g. a "found index" pattern, must keep the loop as-is).
  */
-function tryUnrollCountingWhile(prev, whileStmt, rest, consts, context, visit) {
+function tryUnrollCountingWhile(prev, whileStmt, rest, consts, functions, shadowed, context, visit) {
     if (!ts.isVariableStatement(prev) || prev.declarationList.declarations.length !== 1)
         return undefined;
     const decl = prev.declarationList.declarations[0];
     if (!ts.isIdentifier(decl.name) || !decl.initializer)
         return undefined;
     const loopVar = decl.name.text;
-    const start = tsEvalConst(decl.initializer, consts);
+    const start = tsEvalConst(decl.initializer, consts, functions, shadowed);
     if (start === undefined)
         return undefined;
     const cond = whileStmt.expression;
     if (!ts.isBinaryExpression(cond) || !ts.isIdentifier(cond.left) || cond.left.text !== loopVar)
         return undefined;
-    const bound = tsEvalConst(cond.right, consts);
+    const bound = tsEvalConst(cond.right, consts, functions, shadowed);
     if (bound === undefined)
         return undefined;
     const bodyStatements = whileStmt.statement
@@ -411,33 +580,33 @@ function tryUnrollCountingWhile(prev, whileStmt, rest, consts, context, visit) {
     const last = bodyStatements[bodyStatements.length - 1];
     if (!last || !ts.isExpressionStatement(last))
         return undefined;
-    const step = extractStep(last.expression, loopVar, consts);
+    const step = extractStep(last.expression, loopVar, consts, functions, shadowed);
     if (step === undefined || step === 0n)
         return undefined;
     if (rest.some((s) => referencesIdentifier(s, loopVar)))
         return undefined;
     const innerBody = ts.factory.createBlock(bodyStatements.slice(0, -1), true); // exclude the consumed increment
-    return unrollCountingLoop(loopVar, start, cond.operatorToken.kind, bound, step, innerBody, looksBigInt(decl.initializer), consts, context, visit);
+    return unrollCountingLoop(loopVar, start, cond.operatorToken.kind, bound, step, innerBody, looksBigInt(decl.initializer), consts, functions, shadowed, context, visit);
 }
 /**
  * Visits a statement list, recognizing the `[counter decl, while (...) {...}]` pairing
  * before falling back to per-statement visiting — the natural place for this since eliding
  * the pair replaces TWO adjacent statements with N, which a single-node visitor can't express.
  */
-function foldStatementList(statements, consts, context, visit) {
+function foldStatementList(statements, consts, functions, shadowed, context, visit) {
     const out = [];
     for (let i = 0; i < statements.length; i++) {
         const stmt = statements[i];
         const next = statements[i + 1];
         if (next && ts.isWhileStatement(next)) {
-            const unrolled = tryUnrollCountingWhile(stmt, next, statements.slice(i + 2), consts, context, visit);
+            const unrolled = tryUnrollCountingWhile(stmt, next, statements.slice(i + 2), consts, functions, shadowed, context, visit);
             if (unrolled) {
                 out.push(...unrolled);
                 i++; // consumed `next` (the while) too
                 continue;
             }
         }
-        const visited = visit(stmt);
+        const visited = visit(stmt, shadowed);
         if (Array.isArray(visited))
             out.push(...visited);
         else if (visited)
@@ -445,11 +614,25 @@ function foldStatementList(statements, consts, context, visit) {
     }
     return out;
 }
-function foldTransformer(consts) {
+/**
+ * `foldTransformer`'s own scope tracking, mirroring `constPropagationTransformer`'s
+ * (`isPlainFunctionScope`/`isMethodLikeScope`/`collectVarNames`/`collectBindingNames`/
+ * `collectDirectlyDeclaredNames`, defined further below — reused as-is here; JS/TS function
+ * hoisting means the declaration order in this file doesn't matter). Every scope-introducing
+ * node grows a `shadowed` set of names reserved by SOMETHING between the current node and the
+ * top level (a parameter, a nested function/let/const/var/catch-binding/for-loop-declaration
+ * of the same name, …) — `tsEvalConst`'s Identifier case and `tsEvalCall`'s callee lookup
+ * both consult this set before ever touching the top-level `consts`/`functions` maps, so a
+ * shadowed name is never folded against the WRONG (top-level, unrelated) binding. Without
+ * this, a nested function/parameter/block-scoped `let` sharing a name with a top-level
+ * const or function would silently hijack every fold inside that scope to the outer
+ * binding's value instead of the real (shadowing) one.
+ */
+function foldTransformer(consts, functions) {
     return (context) => {
-        const visit = (node) => {
+        const visit = (node, shadowed) => {
             if (ts.isIfStatement(node)) {
-                const evaluated = foldExpression(node.expression, consts);
+                const evaluated = foldExpression(node.expression, consts, functions, shadowed);
                 if (evaluated.success) {
                     const taken = Boolean(evaluated.value) ? node.thenStatement : node.elseStatement;
                     if (!taken)
@@ -458,33 +641,100 @@ function foldTransformer(consts) {
                     // SourceFile.statements) — flatten its contents into that list (via foldStatementList,
                     // so a while-pairing inside the taken branch is still recognized) rather than nesting
                     // a bare Block, which the downstream SauceScript compiler's statement processor does
-                    // not accept as a standalone statement.
-                    return ts.isBlock(taken) ? foldStatementList(taken.statements, consts, context, visit) : visit(taken);
+                    // not accept as a standalone statement. Since the Block's own contents are being
+                    // flattened rather than visited via the `ts.isBlock` case below, its directly-declared
+                    // names are computed here too (same as that case) so a `let`/`const`/nested `function`
+                    // in the taken branch still shadows correctly once flattened.
+                    if (ts.isBlock(taken)) {
+                        const names = new Set(shadowed);
+                        collectDirectlyDeclaredNames(taken.statements, names);
+                        return foldStatementList(taken.statements, consts, functions, names, context, visit);
+                    }
+                    return visit(taken, shadowed);
                 }
             }
             else if (ts.isConditionalExpression(node)) {
-                const evaluated = foldExpression(node.condition, consts);
+                const evaluated = foldExpression(node.condition, consts, functions, shadowed);
                 if (evaluated.success) {
-                    return visit(Boolean(evaluated.value) ? node.whenTrue : node.whenFalse);
+                    return visit(Boolean(evaluated.value) ? node.whenTrue : node.whenFalse, shadowed);
                 }
             }
             else if (ts.isForStatement(node)) {
-                const unrolled = tryUnrollForLoop(node, consts, context, visit);
+                const unrolled = tryUnrollForLoop(node, consts, functions, shadowed, context, visit);
                 if (unrolled)
                     return unrolled;
+                // Not unrolled (a non-constant/non-canonical bound, say) — the loop stays real
+                // runtime code, but its own declared counter still shadows for the condition/
+                // incrementor/body, same as any other scope-introducing node.
+                const names = new Set(shadowed);
+                if (node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+                    for (const decl of node.initializer.declarations)
+                        collectBindingNames(decl.name, names);
+                }
+                return ts.factory.updateForStatement(node, node.initializer ? visit(node.initializer, names) : undefined, node.condition ? visit(node.condition, names) : undefined, node.incrementor ? visit(node.incrementor, names) : undefined, visit(node.statement, names));
+            }
+            else if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+                const names = new Set(shadowed);
+                if (ts.isVariableDeclarationList(node.initializer)) {
+                    for (const decl of node.initializer.declarations)
+                        collectBindingNames(decl.name, names);
+                }
+                const visitedInit = visit(node.initializer, names);
+                const visitedStmt = visit(node.statement, names);
+                // The iterated/enumerated expression runs in the OUTER scope, before any iteration binds.
+                const visitedExpr = visit(node.expression, shadowed);
+                return ts.isForOfStatement(node)
+                    ? ts.factory.updateForOfStatement(node, node.awaitModifier, visitedInit, visitedExpr, visitedStmt)
+                    : ts.factory.updateForInStatement(node, visitedInit, visitedExpr, visitedStmt);
             }
             else if (ts.isBlock(node)) {
-                return ts.factory.updateBlock(node, foldStatementList(node.statements, consts, context, visit));
+                const names = new Set(shadowed);
+                collectDirectlyDeclaredNames(node.statements, names);
+                return ts.factory.updateBlock(node, foldStatementList(node.statements, consts, functions, names, context, visit));
+            }
+            else if (ts.isCatchClause(node)) {
+                const names = new Set(shadowed);
+                if (node.variableDeclaration)
+                    collectBindingNames(node.variableDeclaration.name, names);
+                return ts.factory.updateCatchClause(node, node.variableDeclaration, visit(node.block, names));
+            }
+            else if (isPlainFunctionScope(node)) {
+                const names = new Set(shadowed);
+                for (const p of node.parameters)
+                    collectBindingNames(p.name, names);
+                if (node.body)
+                    collectVarNames(node.body, names);
+                // A named function (declaration, or named function EXPRESSION) can reference itself.
+                if (node.name)
+                    names.add(node.name.text);
+                return ts.visitEachChild(node, (child) => (child === node.name ? child : visit(child, names)), context);
+            }
+            else if (isMethodLikeScope(node)) {
+                const names = new Set(shadowed);
+                for (const p of node.parameters)
+                    collectBindingNames(p.name, names);
+                if (node.body)
+                    collectVarNames(node.body, names);
+                return ts.visitEachChild(node, (child) => {
+                    if (child === node.name) {
+                        // A COMPUTED key genuinely reads whatever's inside, in the OUTER scope — a
+                        // method/getter/setter can't reference its own (non-computed) key as a variable.
+                        return ts.isComputedPropertyName(node.name)
+                            ? ts.factory.updateComputedPropertyName(node.name, visit(node.name.expression, shadowed))
+                            : node.name;
+                    }
+                    return visit(child, names);
+                }, context);
             }
             else if (isFoldableValueExpression(node)) {
-                const evaluated = foldExpression(node, consts);
+                const evaluated = foldExpression(node, consts, functions, shadowed);
                 const literal = evaluated.success ? toLiteralNode(evaluated.value) : undefined;
                 if (literal)
                     return literal;
             }
-            return ts.visitEachChild(node, visit, context);
+            return ts.visitEachChild(node, (child) => visit(child, shadowed), context);
         };
-        return (sourceFile) => ts.factory.updateSourceFile(sourceFile, foldStatementList(sourceFile.statements, consts, context, visit));
+        return (sourceFile) => ts.factory.updateSourceFile(sourceFile, foldStatementList(sourceFile.statements, consts, functions, new Set(), context, visit));
     };
 }
 // ── Constant propagation to reads + dead-declaration elimination ──
@@ -926,12 +1176,17 @@ function deadConstEliminationTransformer(consts) {
  */
 export function tsPartialEval(code, filePath) {
     const sourceFile = ts.createSourceFile(filePath, code, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
-    const consts = collectTopLevelConsts(sourceFile);
+    const functions = collectTopLevelFunctions(sourceFile);
+    const consts = collectTopLevelConsts(sourceFile, functions);
     const result = ts.transpileModule(code, {
         fileName: filePath,
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
         transformers: {
-            before: [foldTransformer(consts), constPropagationTransformer(consts), deadConstEliminationTransformer(consts)],
+            before: [
+                foldTransformer(consts, functions),
+                constPropagationTransformer(consts),
+                deadConstEliminationTransformer(consts),
+            ],
         },
     });
     return result.outputText;
