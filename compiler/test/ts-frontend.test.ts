@@ -776,6 +776,448 @@ describe('tsPartialEval (constant propagation never substitutes an assignment/up
   });
 });
 
+// ── tsPartialEval (array/object lookup-table folding) ──
+//
+// A top-level `const NAME = [...]` / `const NAME = {...}` whose every element/property folds
+// to a bigint (the SAME `tsEvalConst`/`consts` machinery the scalar consts above already use)
+// AND whose every use anywhere in the file is a plain, unshadowed, non-write, non-call
+// constant-indexed read (`NAME[k]`/`NAME.prop`/`NAME["prop"]`) is folded the same way a scalar
+// const's read is — each resolvable access becomes its literal element/property value, and the
+// now-fully-dead declaration is removed by the SAME dead-declaration-elimination pass. A SINGLE
+// disqualifying use anywhere (reachable or not) rules out the WHOLE table — never partial
+// folding of an otherwise-safe access elsewhere in the same table.
+describe('tsPartialEval (array/object lookup-table folding)', () => {
+  it('a const array with a constant-index read folds to its literal element, and the now-dead declaration is removed', () => {
+    const out = tsPartialEval(`const FEES = [500n, 3000n, 10000n];\nconsole.log(FEES[1n]);`, 'f.ts');
+
+    expect(out).not.toContain('const FEES');
+    expect(out.trim()).toBe('console.log(3000n);');
+  });
+
+  it('a const object folds both a plain property read AND a computed-string-key read, declaration removed once dead', () => {
+    const out = tsPartialEval(
+      `const TIERS = { low: 10n, high: 200n };\nconsole.log(TIERS.low);\nconsole.log(TIERS["high"]);`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('const TIERS');
+    expect(out).toContain('console.log(10n);');
+    expect(out).toContain('console.log(200n);');
+  });
+
+  it('a non-constant (parameter-derived) index is left untouched, and does NOT disqualify other, provably-resolvable accesses of the same array', () => {
+    const out = tsPartialEval(
+      `const FEES = [1n, 2n, 3n];\nfunction f(i) { return FEES[i]; }\nconsole.log(FEES[0n]);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('FEES[i]'); // non-constant — left untouched
+    expect(out).toContain('console.log(1n);'); // the OTHER, resolvable access still folds
+    expect(out).toContain('const FEES'); // still referenced by the unresolvable access — kept
+  });
+
+  it('an out-of-bounds constant index is left untouched, and does NOT disqualify an in-bounds access elsewhere', () => {
+    const out = tsPartialEval(`const FEES = [1n, 2n];\nconsole.log(FEES[5n]);\nconsole.log(FEES[0n]);`, 'f.ts');
+
+    expect(out).toContain('FEES[5n]'); // out of bounds — left untouched
+    expect(out).toContain('console.log(1n);'); // the in-bounds access still folds
+  });
+
+  it('a negative constant index is left untouched (not a valid array index), and does not disqualify other accesses', () => {
+    const out = tsPartialEval(`const FEES = [1n, 2n];\nconsole.log(FEES[-1n]);\nconsole.log(FEES[0n]);`, 'f.ts');
+
+    expect(out).toContain('FEES[-1n]');
+    expect(out).toContain('console.log(1n);');
+  });
+
+  it('an unresolvable computed-key read on an object table (non-string-literal key) is left untouched, and does not disqualify a resolvable read elsewhere', () => {
+    const out = tsPartialEval(
+      `const TIERS = { low: 10n };\nfunction f(k) { return TIERS[k]; }\nconsole.log(TIERS.low);`,
+      'f.ts',
+    );
+
+    expect(out).toContain('TIERS[k]');
+    expect(out).toContain('console.log(10n);');
+  });
+
+  it('a table whose only disqualifying use sits in an unreachable if(false) branch is still disqualified — the safety scan runs on the PRE-fold source, not reachability-aware', () => {
+    const code = `const ARR = [1n, 2n];\nif (false) { ARR.push(1n); }\nconsole.log(ARR[0n]);`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('const ARR = [1n, 2n];'); // never tracked — declaration survives
+    expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    expect(out).not.toContain('ARR.push'); // the dead branch itself is still pruned by foldTransformer
+  });
+
+  describe('class/namespace/enum bodies are not silently skipped by the safety scan', () => {
+    // `isOutOfScopeForPropagation` treats a whole class/enum/namespace as "safe, don't even
+    // descend" — correct for the scalar-const propagation passes (you can't mutate a const
+    // scalar's VALUE without illegally reassigning its binding, already a hard error) but NOT
+    // for a tracked array/object table: a class method or namespace function can mutate the
+    // table without ever reassigning the table's own binding. `checkTableSafety` must not reuse
+    // that blanket skip. (These shapes are independently rejected by the real `compile()`
+    // pipeline regardless — see the `compile()` sibling test below — but `tsPartialEval` is a
+    // separately exported function, so the scan must fail closed on its own too.)
+    it('a class method mutating a tracked array via .push() disqualifies the whole table', () => {
+      const code = `
+        const ARR = [1n, 2n, 3n];
+        class Foo {
+          mutate() {
+            ARR.push(99n);
+          }
+        }
+        console.log(ARR[0n]);
+      `;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n, 3n];');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('a class method writing through an element access (NAME[k] = ...) disqualifies the whole table', () => {
+      const code = `
+        const ARR = [1n, 2n];
+        class Foo {
+          mutate() {
+            ARR[0n] = 99n;
+          }
+        }
+        console.log(ARR[0n]);
+      `;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n];');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('a namespace function mutating a tracked array disqualifies the whole table the same way', () => {
+      const code = `
+        const ARR = [1n, 2n];
+        namespace NS {
+          export function mutate() {
+            ARR[0n] = 99n;
+          }
+        }
+        console.log(ARR[0n]);
+      `;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n];');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('an enum member initializer referencing a tracked array disqualifies the whole table', () => {
+      const code = `
+        const ARR = [1n, 2n];
+        enum E {
+          A = ARR.length,
+        }
+        console.log(ARR[0n]);
+      `;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n];');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('sanity check: a class elsewhere in the file that never references the tracked name at all does not disqualify it — this is a name-scoped guard, not "any class anywhere"', () => {
+      const code = `
+        const ARR = [1n, 2n];
+        class Unrelated {
+          method() {
+            return 42n;
+          }
+        }
+        console.log(ARR[0n]);
+      `;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).not.toContain('const ARR');
+      expect(out).toContain('console.log(1n);');
+    });
+  });
+
+  describe('disqualification — any ONE use anywhere disqualifies the WHOLE table, even otherwise-safe accesses', () => {
+    it('reassignment of the identifier disqualifies every access', () => {
+      const code = `const ARR = [1n, 2n];\nARR = [3n];\nconsole.log(ARR[0n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n];');
+      expect(out).toContain('ARR = [3n];');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('a method call on the identifier disqualifies every access, regardless of method name (no whitelist)', () => {
+      const code = `const ARR = [1n, 2n];\nARR.push(3n);\nconsole.log(ARR[0n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n];');
+      expect(out).toContain('ARR.push(3n);');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('an element-access used as an assignment target disqualifies every access, including OTHER indices', () => {
+      const code = `const ARR = [1n, 2n];\nARR[0n] = 5n;\nconsole.log(ARR[1n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('const ARR = [1n, 2n];');
+      expect(out).toContain('ARR[0n] = 5n;');
+      expect(out).toContain('console.log(ARR[1n]);'); // NOT folded to 2n
+    });
+
+    it('passing the identifier as a bare call argument disqualifies every access', () => {
+      const code = `const ARR = [1n, 2n];\nconsole.log(ARR);\nconsole.log(ARR[0n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('console.log(ARR);');
+      expect(out).toContain('console.log(ARR[0n]);'); // NOT folded to 1n
+    });
+
+    it('aliasing the identifier to another variable disqualifies every access', () => {
+      const code = `const ARR = [1n, 2n];\nlet other = ARR;\nconsole.log(ARR[0n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('let other = ARR;');
+      expect(out).toContain('console.log(ARR[0n]);');
+    });
+
+    it('spreading the identifier disqualifies every access', () => {
+      const code = `const ARR = [1n, 2n];\nfunction f(...args) { return 1n; }\nf(...ARR);\nconsole.log(ARR[0n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('f(...ARR);');
+      expect(out).toContain('console.log(ARR[0n]);');
+    });
+
+    it('returning the identifier from a function disqualifies every access', () => {
+      const code = `const ARR = [1n, 2n];\nfunction f() { return ARR; }\nconsole.log(ARR[0n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('return ARR;');
+      expect(out).toContain('console.log(ARR[0n]);');
+    });
+
+    it('a property/element access reused as a destructuring-assignment target (nested inside the pattern) disqualifies every access', () => {
+      // `({ x: ARR[0n] } = obj)` — TypeScript parses a destructuring-assignment pattern with the
+      // SAME node kinds as an ordinary object-literal VALUE; only climbing up to the outermost
+      // `=` tells them apart. ARR[0n] here is a WRITE target (obj.x's value lands in ARR[0]).
+      const code = `const ARR = [1n, 2n];\nlet obj = { x: 5n };\n({ x: ARR[0n] } = obj);\nconsole.log(ARR[1n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('({ x: ARR[0n] } = obj);');
+      expect(out).toContain('console.log(ARR[1n]);'); // NOT folded to 2n
+    });
+
+    it('a PARENTHESIZED update-expression target still disqualifies (an AST parent field points at the wrapping ParenthesizedExpression, not the access itself)', () => {
+      const code = `const ARR = [1n, 2n];\n(ARR[0n])++;\nconsole.log(ARR[1n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('(ARR[0n])++;');
+      expect(out).toContain('console.log(ARR[1n]);'); // NOT folded to 2n
+    });
+
+    it('a PARENTHESIZED call callee still disqualifies', () => {
+      const code = `const ARR = [1n, 2n];\n(ARR[0n])();\nconsole.log(ARR[1n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('(ARR[0n])();');
+      expect(out).toContain('console.log(ARR[1n]);'); // NOT folded to 2n
+    });
+
+    it('a PARENTHESIZED destructuring-assignment target nested inside the pattern still disqualifies', () => {
+      const code = `const ARR = [1n, 2n];\nlet obj = { x: 5n };\n({ x: (ARR[0n]) } = obj);\nconsole.log(ARR[1n]);`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('({ x: (ARR[0n]) } = obj);');
+      expect(out).toContain('console.log(ARR[1n]);'); // NOT folded to 2n
+    });
+  });
+
+  it('a same-named local array in an inner function scope is a DIFFERENT binding — shadowing keeps it from being confused with the outer tracked table', () => {
+    const code = `
+      const ARR = [1n, 2n];
+      function f() {
+        const ARR = [9n, 8n];
+        ARR.push(1n); // disqualifies only the INNER (shadowed) ARR
+        return ARR[0n];
+      }
+      console.log(ARR[0n]);
+    `;
+    const out = tsPartialEval(code, 'f.ts');
+
+    // The inner, shadowed ARR (mutated via push) is left completely untouched.
+    expect(out).toContain('const ARR = [9n, 8n];');
+    expect(out).toContain('ARR.push(1n);');
+    expect(out).toContain('return ARR[0n];');
+    // The OUTER (unshadowed, never mutated) table's read still resolves...
+    expect(out).toContain('console.log(1n);');
+    // ...but its declaration is conservatively KEPT: dead-elimination is a flat, whole-file
+    // textual Identifier count (not scope-aware — same documented behavior as the scalar-const
+    // shadowing test above), and the inner shadowing declaration/uses of the same name "ARR"
+    // are enough to (harmlessly) keep the outer `const ARR = [1n, 2n];` around even though its
+    // one real (unshadowed) read was already inlined.
+    expect(out).toContain('const ARR = [1n, 2n];');
+  });
+
+  it('a nested array/object literal ("a table of tables") is never a candidate — left completely untouched (explicitly out of scope)', () => {
+    const code = `const TBL = [[1n, 2n], [3n, 4n]];\nconsole.log(TBL[0n]);`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('const TBL = [[1n, 2n], [3n, 4n]];');
+    expect(out).toContain('console.log(TBL[0n]);');
+  });
+
+  it('a spread element inside the literal itself is never a candidate — left completely untouched', () => {
+    const code = `const other = [9n];\nconst ARR = [...other, 1n];\nconsole.log(ARR[1n]);`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('const ARR = [...other, 1n];');
+    expect(out).toContain('console.log(ARR[1n]);');
+  });
+
+  it('an object literal with shorthand/spread/computed properties is never a candidate — left completely untouched', () => {
+    const code = `const k = 1n;\nconst OBJ = { k, ...{}, [1]: 2n };\nconsole.log(OBJ.k);`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('console.log(OBJ.k);'); // not folded — OBJ was never a candidate
+  });
+
+  it('`new Array(n)` — a completely different, heap-allocated SauceScript concept — is never treated as a lookup table', () => {
+    const code = `const arr = new Array(3n);\narr[0] = 1n;\nconsole.log(arr[0]);`;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('new Array(3n)');
+    expect(out).toContain('console.log(arr[0]);');
+  });
+
+  it('a resolved read used as an ordinary call argument (a derived SCALAR, not the array/object itself) is safe and still folds', () => {
+    const out = tsPartialEval(
+      `const FEES = [1n, 2n, 3n];\nfunction useFee(x) { return x; }\nconsole.log(useFee(FEES[0n]));`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('const FEES');
+    expect(out).toContain('console.log(useFee(1n));');
+  });
+
+  it('a table element/property may itself reference an earlier scalar top-level const', () => {
+    const out = tsPartialEval(`const BASE = 100n;\nconst FEES = [BASE, BASE + 1n];\nconsole.log(FEES[1n]);`, 'f.ts');
+
+    expect(out).not.toContain('const FEES');
+    expect(out).toContain('console.log(101n);');
+  });
+
+  it('interacts correctly with loop-unrolling: a table indexed by an unrolled loop counter folds every iteration', () => {
+    const out = tsPartialEval(
+      `const FEES = [10n, 20n, 30n];\nlet sum = 0n;\nfor (let i = 0n; i < 3n; i++) { sum = sum + FEES[i]; }\nconsole.log(sum);`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('for (');
+    expect(out).not.toContain('const FEES');
+    expect(out).toContain('sum = sum + 10n;');
+    expect(out).toContain('sum = sum + 20n;');
+    expect(out).toContain('sum = sum + 30n;');
+  });
+
+  // ── `for (const x of ARR) {...}` unrolling over a tracked ARRAY table (stretch goal) ──
+  //
+  // Reuses the exact same safety infrastructure as the numeric for/while unroller
+  // (MAX_UNROLL_ITERATIONS, bodyBlocksUnrolling's break/continue/return/shadowing bail,
+  // substituteCounter) adapted to iterate over the table's ELEMENTS instead of an arithmetic
+  // sequence. Iterating an array table is itself always a safe, read-only use (its elements are
+  // immutable bigints, no aliasing risk) — so `for...of` usage never disqualifies the table from
+  // its OTHER index/property folding, independent of whether this specific loop shape is one the
+  // unroller can actually expand.
+  describe('for-of unrolling over a tracked array table (stretch goal)', () => {
+    it('unrolls a basic for-of over a tracked array, substituting the loop variable with each literal element', () => {
+      const out = tsPartialEval(
+        `const FEES = [10n, 20n, 30n];\nlet sum = 0n;\nfor (const fee of FEES) { sum = sum + fee; }\nconsole.log(sum);`,
+        'f.ts',
+      );
+
+      expect(out).not.toContain('for (');
+      expect(out).not.toContain('const FEES');
+      expect(out).toContain('sum = sum + 10n;');
+      expect(out).toContain('sum = sum + 20n;');
+      expect(out).toContain('sum = sum + 30n;');
+    });
+
+    it('bails (leaves the for-of as real runtime code, keeps the declaration) when the body contains break/continue/return', () => {
+      for (const escape of ['break;', 'continue;', 'return sum;']) {
+        const out = tsPartialEval(
+          `function f() {\n  const FEES = [10n, 20n, 30n];\n  let sum = 0n;\n  for (const fee of FEES) { if (fee === 20n) { ${escape} } sum = sum + fee; }\n  return sum;\n}`,
+          'f.ts',
+        );
+
+        expect(out).toContain('for (const fee of FEES)');
+        expect(out).toContain('const FEES');
+      }
+    });
+
+    it('bails (leaves the for-of as real runtime code) when the body shadows the loop variable name', () => {
+      const out = tsPartialEval(
+        `const FEES = [10n, 20n];\nlet sum = 0n;\nfor (const fee of FEES) { let fee = 99n; sum = sum + fee; }\nconsole.log(sum);`,
+        'f.ts',
+      );
+
+      expect(out).toContain('for (const fee of FEES)');
+      expect(out).toContain('const FEES');
+    });
+
+    it('a for-of iteration over a table does not disqualify its OTHER, independent index-access reads elsewhere', () => {
+      const out = tsPartialEval(
+        `const FEES = [10n, 20n];\nlet sum = 0n;\nfor (const fee of FEES) { sum = sum + fee; }\nconsole.log(FEES[0n]);\nconsole.log(sum);`,
+        'f.ts',
+      );
+
+      expect(out).not.toContain('for (');
+      expect(out).not.toContain('const FEES');
+      expect(out).toContain('console.log(10n);'); // FEES[0n]
+      expect(out).toContain('sum = sum + 10n;');
+      expect(out).toContain('sum = sum + 20n;');
+    });
+
+    it('a destructured loop variable (`for (const [a] of ARR)`) is left un-unrolled — the table is still tracked (iteration alone is safe) but this loop shape is declined', () => {
+      const code = `const PAIRS = [1n, 2n];\nfor (const [a] of PAIRS) {\n  console.log(a);\n}`;
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('for (const [a] of PAIRS)');
+      expect(out).toContain('const PAIRS = [1n, 2n];');
+    });
+
+    it('declines to unroll a for-of whose table exceeds MAX_UNROLL_ITERATIONS (256), leaving the loop and declaration as real runtime code — the SAME cap the numeric for/while unroller reuses', () => {
+      const elements = Array.from({ length: 257 }, (_, i) => `${i}n`).join(', ');
+      const out = tsPartialEval(
+        `const FEES = [${elements}];\nlet sum = 0n;\nfor (const fee of FEES) { sum = sum + fee; }\nconsole.log(sum);`,
+        'f.ts',
+      );
+
+      expect(out).toContain('for (const fee of FEES)');
+      expect(out).toContain('const FEES');
+    });
+
+    it('cascades: a for-of unrolled inside an already-unrolled numeric for loop fully resolves both to straight-line arithmetic', () => {
+      const out = tsPartialEval(
+        `const FEES = [1n, 2n];\nlet sum = 0n;\nfor (let i = 0n; i < 2n; i++) {\n  for (const fee of FEES) { sum = sum + fee + i; }\n}\nconsole.log(sum);`,
+        'f.ts',
+      );
+
+      expect(out).not.toContain('for (');
+      expect(out).not.toContain('const FEES');
+      // i=0: fee=1,2 → "+ 1n + 0n", "+ 2n + 0n"; i=1: "+ 1n + 1n", "+ 2n + 1n"
+      for (const [fee, i] of [
+        [1, 0],
+        [2, 0],
+        [1, 1],
+        [2, 1],
+      ]) {
+        expect(out).toContain(`sum + ${fee}n + ${i}n`);
+      }
+    });
+  });
+});
+
 // ── compile() integration: the wiring (processor/index.ts import path + index.ts top-level) ──
 
 let tmpDir: string;
@@ -960,6 +1402,42 @@ describe('ts-frontend compile() integration', () => {
     expect(Array.from(unrolled.bytecode[0])).not.toContain(OPS.JUMP_BACK);
   });
 
+  it('CompileOptions.tsSource unrolls a for-of over a lookup table — a construct plain acorn cannot even PARSE, not just a bytecode-shape difference', () => {
+    const source = `
+      const FEES = [10n, 20n, 30n];
+      function main() {
+        let sum = 0n;
+        for (const fee of FEES) { sum = sum + fee; }
+        return sum;
+      }
+    `;
+
+    // Unlike the typed-branch/countable-loop cases above, plain acorn doesn't merely compile
+    // this LESS efficiently — it has no ForOfStatement handling at all, so it throws outright.
+    // The ts-frontend fully eliminates the for-of (and the array literal it iterated) before
+    // acorn ever sees this source, which is what makes it compilable at all.
+    expect(() => compile(source)).toThrow(/ForOfStatement/);
+
+    const result = compile(source, { tsSource: true });
+
+    expect(result.bytecode.length).toBe(1);
+    expect(Array.from(result.bytecode[0])).not.toContain(OPS.JUMP_BACK);
+  });
+
+  it('a for-of over a table exceeding MAX_UNROLL_ITERATIONS fails to compile even WITH tsSource — unlike the numeric for/while unroller (which falls back to real JUMP_BACK bytecode past its cap), a declined for-of has no runtime fallback at all: acorn cannot parse ForOfStatement, so this is a hard compile failure, not merely a less-optimal one', () => {
+    const elements = Array.from({ length: 257 }, (_, i) => `${i}n`).join(', ');
+    const source = `
+      const FEES = [${elements}];
+      function main() {
+        let sum = 0n;
+        for (const fee of FEES) { sum = sum + fee; }
+        return sum;
+      }
+    `;
+
+    expect(() => compile(source, { tsSource: true })).toThrow(/ForOfStatement/);
+  });
+
   it('a countable while loop with tsSource compiles to straight-line bytecode — no JUMP_BACK', () => {
     const source = `
       function main() {
@@ -975,5 +1453,18 @@ describe('ts-frontend compile() integration', () => {
 
     expect(Array.from(runtime.bytecode[0])).toContain(OPS.JUMP_BACK);
     expect(Array.from(unrolled.bytecode[0])).not.toContain(OPS.JUMP_BACK);
+  });
+
+  it('CompileOptions.tsSource folds a lookup-table read to bytecode byte-identical to the fully-inlined literal', () => {
+    const source = `
+      const FEES: bigint[] = [500n, 3000n, 10000n];
+      function main() { return FEES[1n]; }
+    `;
+
+    const result = compile(source, { tsSource: true });
+    const literal = compile(`function main() { return 3000n; }`);
+
+    expect(result.bytecode.length).toBe(1);
+    expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
   });
 });
