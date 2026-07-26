@@ -366,7 +366,7 @@ describe('tsPartialEval (constant propagation to reads + dead-declaration elimin
     expect(out.trim()).toBe('console.log(8n);');
   });
 
-  it('a same-named const declared inside a function shadows the outer one: the inner read stays a bare identifier, the outer (post-function) read still substitutes', () => {
+  it('a same-named const declared inside a function shadows the outer one: the inner read is never substituted against the OUTER value, and the outer (post-function) read still substitutes against the outer const', () => {
     const code = `
       const a = 1;
       function f() {
@@ -378,8 +378,12 @@ describe('tsPartialEval (constant propagation to reads + dead-declaration elimin
     const out = tsPartialEval(code, 'f.ts');
 
     expect(out).toContain('const a = 2;');
-    // Only the INNER (shadowed) read should still be a bare identifier reference.
-    expect(out.match(/console\.log\(a\);/g)?.length).toBe(1);
+    // The INNER (shadowed) read must never be substituted against the OUTER const's value —
+    // it resolves to `f`'s OWN local value (2n) instead, via the LATER, local (per-function)
+    // pass (see the "LOCAL, per-function constant propagation" describe block below for that
+    // dedicated coverage) — never the wrong, outer `1n`.
+    expect(out).toContain('console.log(2n);');
+    expect(out.match(/console\.log\(1n\);/g)?.length).toBe(1); // only the OUTER read is `1n`
     // The OUTER (top-level) read correctly resolves against the outer const.
     expect(out).toContain('console.log(1n);');
     // The outer declaration itself is conservatively KEPT: dead-const-elimination is a flat,
@@ -390,6 +394,22 @@ describe('tsPartialEval (constant propagation to reads + dead-declaration elimin
     // deadConstEliminationTransformer) so a future change to the scope-tracking can't silently
     // flip this either direction without a test noticing.
     expect(out).toContain('const a = 1;');
+  });
+
+  it('a same-named `let` FIRST introduced INSIDE an if-branch shadows a top-level const for the REST of the function too — the real SauceScript compiler shares scope across if/while bodies (only a `for` loop pushes a genuine new one), so a read after the branch must stay a genuine runtime reference, never fold to the outer value', () => {
+    // Regression: before this fix, `substituteConstReads`'s function-scope shadow computation
+    // only ever collected names declared DIRECTLY in the function's own top-level statement
+    // list (plus `var`-hoisted names) — a `let` first declared inside a nested `if`/`while`
+    // branch was invisible to it, so `return FEE;` (textually AFTER the branch, in the SAME
+    // function-level scope the branch's `let` persists into) was wrongly substituted with the
+    // OUTER top-level const's value instead of staying an unresolved real runtime read.
+    const out = tsPartialEval(
+      `const FEE = 100n;\nfunction f(cond) {\n  if (cond) {\n    let FEE = 5n;\n  }\n  return FEE;\n}`,
+      'f.ts',
+    );
+
+    expect(out).toContain('return FEE;');
+    expect(out).not.toContain('return 100n;');
   });
 
   it("object-literal method/getter/setter shorthand: the method/setter's OWN parameter shadows an outer const of the same name — the param read stays a bare identifier, not the outer const's literal", () => {
@@ -413,7 +433,12 @@ describe('tsPartialEval (constant propagation to reads + dead-declaration elimin
     const getterOut = tsPartialEval(getterCode, 'f.ts');
 
     expect(getterOut).toContain('const x = 2;');
-    expect(getterOut).toContain('return x;'); // shadowed by the getter body's own `const x`
+    // Shadowed by the getter body's own `const x` — this pass never substitutes it against
+    // the OUTER `1n`; the LATER, local (per-function) pass then separately resolves it
+    // against the getter's OWN value, `2n` (isMethodLikeScope's 3 shapes are function-like
+    // scopes for that pass too), so the final read is `return 2n;`, never `return 1n;`.
+    expect(getterOut).toContain('return 2n;');
+    expect(getterOut).not.toContain('return 1n;');
     expect(getterOut).toContain('console.log(1n);'); // the outer read still substitutes
   });
 
@@ -792,6 +817,296 @@ describe('tsPartialEval (constant propagation never substitutes an assignment/up
   });
 });
 
+describe('tsPartialEval (foldTransformer never folds a shadowed identifier against an outer/top-level const)', () => {
+  it('a function parameter sharing a top-level const name is never folded into ordinary arithmetic', () => {
+    const out = tsPartialEval(`const RATE = 10n;\nfunction f(RATE) {\n  return RATE + 1n;\n}`, 'f.ts');
+
+    expect(out).toContain('return RATE + 1n;'); // NOT `return 11n;`
+  });
+
+  it('a function parameter sharing a top-level const name never prunes an if/else branch — regression for the ts-evaluator fallback, which does its OWN identifier resolution unaware of local shadowing', () => {
+    const out = tsPartialEval(
+      `const FLAG = true;\nfunction f(FLAG) {\n  if (FLAG) { return 1; } else { return 2; }\n}`,
+      'f.ts',
+    );
+
+    // Before the fix: `tsEvalConst` correctly failed closed on the shadowed read, but
+    // `foldExpression` fell through to `tryEvaluate` (ts-evaluator's own `evaluate()`),
+    // which resolved `FLAG` against the OUTER `const FLAG = true` anyway — silently pruning
+    // the whole `if` down to `return 1;` and discarding the parameter entirely. Confirmed
+    // empirically reachable on real (unmodified) main before this fix.
+    expect(out).toContain('if (');
+    expect(out).toContain('return 1;');
+    expect(out).toContain('return 2;');
+  });
+
+  it('a same-named `let`/`const` declared inside an if/while branch shadows a top-level const for arithmetic INSIDE that branch too', () => {
+    const out = tsPartialEval(
+      `const SCALE = 2n;\nfunction f(cond) {\n  if (cond) {\n    let SCALE = 9n;\n    console.log(SCALE + 1n);\n  }\n}`,
+      'f.ts',
+    );
+
+    // `foldTransformer` itself must not fold `SCALE + 1n` against the OUTER `SCALE = 2n`
+    // (which would silently produce `3n`) — the later local (per-function) propagation pass
+    // then correctly substitutes the branch's OWN `SCALE = 9n` into the read, so the final
+    // pipeline output ends up `9n + 1n` (not further combined by that pass — see its own
+    // "no gratuitous rewrite" contract), never the wrong `3n`.
+    expect(out).not.toContain('console.log(3n)');
+    expect(out).toContain('console.log(9n + 1n);');
+  });
+});
+
+// ── tsPartialEval (LOCAL, per-function constant propagation) ──
+//
+// Everything above tracks only same-file TOP-LEVEL `const`s (plus effectively-const `let`/
+// `var`s, and array/object lookup tables — still all TOP-LEVEL). A `let`/`const` declared and
+// reassigned INSIDE a function body got none of that benefit until `localConstPropagationTransformer`
+// — a FIFTH `before` transformer stage, appended LAST (after fold/table-fold/const-propagation/
+// dead-const-elimination), consuming everything above's output. It is a control-flow-sensitive
+// (but deliberately NOT a real fixpoint dataflow) sequential abstract interpreter, walked fresh
+// and independently per function-like scope, tracking a `Map<name, bigint | NAC>` per variable
+// per program point and substituting a read with its known value wherever provable.
+describe('tsPartialEval (LOCAL, per-function constant propagation)', () => {
+  it('straight-line reassignment folds all the way through to the final read', () => {
+    const out = tsPartialEval(`function f() { let x = 1n; x = x + 3n; x = x + 4n; return x; }`, 'f.ts');
+
+    expect(out).toContain('return 8n;');
+  });
+
+  it('if/else where BOTH branches assign the SAME constant: still constant after the merge, and substitutes correctly', () => {
+    const out = tsPartialEval(
+      `function f(cond) { let x = 1n; if (cond) { x = 5n; } else { x = 5n; } return x; }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('return 5n;');
+  });
+
+  it('if/else where the branches assign DIFFERENT constants: NAC after the merge — a read after the if must NOT be substituted (the single most important soundness guard in this feature)', () => {
+    const out = tsPartialEval(
+      `function f(cond) { let x = 1n; if (cond) { x = 5n; } else { x = 6n; } return x; }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('return x;'); // NOT substituted to 5n, 6n, or anything else
+    expect(out).not.toContain('return 5n;');
+    expect(out).not.toContain('return 6n;');
+  });
+
+  it('if/else where only ONE branch reassigns a variable: correctly merges the touched branch against the PRE-IF value the untouched branch implicitly keeps', () => {
+    // The (missing) else branch implicitly keeps x's pre-if value (5n); the then-branch
+    // reassigns it to that SAME value, so the merge still yields a constant.
+    const agree = tsPartialEval(`function f(cond) { let x = 5n; if (cond) { x = 5n; } return x; }`, 'f.ts');
+
+    expect(agree).toContain('return 5n;');
+
+    // Same shape, but the then-branch's reassignment DISAGREES with the untouched branch's
+    // pre-if value — proving the merge is a genuine value comparison, not a "one side
+    // touched it, keep whatever it set" shortcut.
+    const disagree = tsPartialEval(`function f(cond) { let x = 5n; if (cond) { x = 9n; } return x; }`, 'f.ts');
+
+    expect(disagree).toContain('return x;');
+    expect(disagree).not.toContain('return 9n;');
+  });
+
+  it('a variable reassigned inside a genuine (non-unrolled) runtime loop is NAC both inside the loop and after it — even the FIRST reference, textually before any write', () => {
+    const out = tsPartialEval(
+      `function f(n) {
+         let sum = 0n;
+         for (let i = 0n; i < n; i++) {
+           console.log(sum);
+           sum = sum + i;
+         }
+         console.log(sum);
+         return sum;
+       }`,
+      'f.ts',
+    );
+
+    // `n` is a parameter (non-constant bound) — the EXISTING loop-unroller bails, so this
+    // stays a real runtime `for` by the time this pass sees it, and `sum` is written inside.
+    expect(out).toContain('for (');
+    expect(out).not.toContain('console.log(0n)');
+    expect(out.match(/console\.log\(sum\)/g)?.length).toBe(2); // neither reference substituted
+    expect(out).toContain('return sum;'); // not `return 0n;` or any other literal
+  });
+
+  it('a variable NEVER written inside a loop, read both inside and after it, still correctly propagates through', () => {
+    const out = tsPartialEval(
+      `function f(n) {
+         const RATE = 5n;
+         let count = 0n;
+         for (let i = 0n; i < n; i++) {
+           console.log(RATE);
+           count = count + 1n;
+         }
+         console.log(RATE);
+         return count;
+       }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('for (');
+    expect(out.match(/console\.log\(5n\)/g)?.length).toBe(2); // both references substituted
+    expect(out).not.toContain('console.log(RATE)');
+    expect(out).toContain('return count;'); // count IS written every iteration — NAC
+  });
+
+  it('a nested function/arrow closing over and REASSIGNING an outer local variable bails the WHOLE outer function — left completely untouched (regression/soundness guard)', () => {
+    const code = `
+      function outer() {
+        let x = 1n;
+        const inner = () => { x = 2n; };
+        return x;
+      }
+    `;
+    const out = tsPartialEval(code, 'f.ts');
+
+    // Were this pass NOT to bail, it would see only the straight-line `let x = 1n;` in
+    // outer's OWN sequential walk (a nested function-like scope is an opaque leaf to it) and
+    // wrongly substitute the final read to `return 1n;` — silently wrong, since this
+    // compiler compiles a `.catch()`-style handler's body against the SAME context as its
+    // surrounding code (`processBlock` in compiler/src/processor/expression.ts), so a real
+    // reassignment inside one genuinely affects the enclosing scope, not a harmless no-op.
+    expect(out).toContain('return x;');
+    expect(out).not.toContain('return 1n;');
+    expect(out).not.toContain('return 2n;');
+  });
+
+  it('a nested function/arrow that only touches its OWN locals (no outer-local closure) does NOT bail the outer function', () => {
+    const code = `
+      function outer() {
+        let x = 1n;
+        const inner = () => { let x = 2n; return x; };
+        return x;
+      }
+    `;
+    const out = tsPartialEval(code, 'f.ts');
+
+    // `inner` shadows with its OWN local `x` — never touches outer's — so outer's own
+    // never-reassigned `x` still resolves normally.
+    expect(out).toContain('return 1n;');
+  });
+
+  it('a nested function/arrow that only READS (never reassigns) an outer local variable ALSO bails the whole outer function — same closure-bail rule, a distinct code path (collectFreeIdentifierNames treats read and write identically) from the write-case above, worth its own regression test', () => {
+    const code = `
+      function outer() {
+        let x = 5n;
+        const inner = () => { console.log(x); };
+        return x;
+      }
+    `;
+    const out = tsPartialEval(code, 'f.ts');
+
+    expect(out).toContain('return x;');
+    expect(out).not.toContain('return 5n;');
+  });
+
+  it.each([
+    ['switch', `function f(cond) { let x = 1n; switch (cond) { case 1: x = 2n; break; default: break; } return x; }`],
+    ['try/catch', `function f() { let x = 1n; try { x = 2n; } catch (e) { x = 3n; } return x; }`],
+    ['for...of', `function f(arr) { let x = 1n; for (const a of arr) { x = a; } return x; }`],
+    ['for...in', `function f(obj) { let x = 1n; for (const k in obj) { x = 2n; } return x; }`],
+    ['labeled break/continue', `function f() { let x = 1n; outer: while (cond) { x = 2n; break outer; } return x; }`],
+  ])(
+    'bails the WHOLE containing function on a %s construct — the final read stays a genuine (unsubstituted) runtime reference, never folded to any of the values assigned inside (regression guard: none of these 5 has a case in the real compiler processStatement switch, so bailing costs nothing, but a future refactor narrowing containsDisallowedConstruct must not silently start mis-optimizing them)',
+    (_label, code) => {
+      const out = tsPartialEval(code, 'f.ts');
+
+      expect(out).toContain('return x;');
+      expect(out).not.toContain('return 1n;');
+      expect(out).not.toContain('return 2n;');
+      expect(out).not.toContain('return 3n;');
+    },
+  );
+
+  it('a top-level const read from inside a function body, alongside a genuine local, interacts correctly — no duplicate substitution, no conflict with the existing whole-file pass', () => {
+    const out = tsPartialEval(`const RATE = 3n;\nfunction f() { let x = 1n; let y = x + RATE; return y; }`, 'f.ts');
+
+    expect(out).not.toContain('RATE');
+    expect(out).not.toContain('const RATE');
+    expect(out).toContain('return 4n;');
+  });
+
+  it('does not gratuitously rewrite an already-literal declaration that has nothing to fold (no identifier involved)', () => {
+    // Regression guard for the `containsIdentifier` check in `foldOrSubstitute`: without it,
+    // `toLiteralNode` would silently upgrade a plain NumericLiteral into a canonical BigInt
+    // literal on every touch, even when nothing was actually substituted.
+    const out = tsPartialEval(`function f() { const a = 2; return a; }`, 'f.ts');
+
+    expect(out).toContain('const a = 2;'); // NOT rewritten to `const a = 2n;`
+    expect(out).toContain('return 2n;'); // the READ still correctly resolves (as a bigint literal)
+  });
+
+  it("a top-level const colliding with a name FIRST introduced by a `let` inside an if branch is never read back through this pass's own top-level-consts fallback — walkIfStatement's merge must see the name too (soundness guard: this pass's own `env` pre-seed must cover every name reachable in the function's body, not just this statement list's OWN direct declarations)", () => {
+    const out = tsPartialEval(
+      `const FEE = 100n;\nfunction f(cond) {\n  if (cond) {\n    let FEE = 5n;\n  }\n  return FEE;\n}`,
+      'f.ts',
+    );
+
+    // Before the fix: `FEE` was never a pre-if key of `env` (only directly-declared names in
+    // the FUNCTION's own top-level statement list are pre-seeded, and this `let` is nested
+    // inside the if's own block) — so `walkIfStatement`'s merge silently skipped it, and the
+    // later `return FEE;` fell through this pass's own top-level-consts fallback, wrongly
+    // resolving to the top-level `100n` and discarding `cond` (and the branch's own write)
+    // entirely.
+    expect(out).toContain('return FEE;');
+    expect(out).not.toContain('return 100n;');
+  });
+
+  it('the same collision shape with the shadowing name introduced by ONLY the else branch', () => {
+    const out = tsPartialEval(
+      `const FEE = 100n;\nfunction f(cond) {\n  if (cond) {\n  } else {\n    let FEE = 5n;\n  }\n  return FEE;\n}`,
+      'f.ts',
+    );
+
+    expect(out).toContain('return FEE;');
+    expect(out).not.toContain('return 100n;');
+  });
+
+  it('a destructuring-assignment target invalidates (marks NAC) every scalar name it writes — defensive fail-closed guard, even though the real compiler does not yet support this assignment shape (processAssignmentMutation throws for it) so it is unreachable via compile() today', () => {
+    const arrayPattern = tsPartialEval(`function f() {\n  let x = 1n;\n  [x] = someCall();\n  return x;\n}`, 'f.ts');
+    const objectPattern = tsPartialEval(
+      `function f() {\n  let x = 1n;\n  ({ x } = someCall());\n  return x;\n}`,
+      'f.ts',
+    );
+
+    // Before the fix: `walkAssignmentExpr` only ever invalidated `env` when `expr.left` was a
+    // bare Identifier — an ArrayLiteralExpression/ObjectLiteralExpression target (destructuring
+    // assignment) left the STALE tracked value (`1n`) in `env`, so the read after it was
+    // wrongly folded to `return 1n;` instead of staying the real, now-unknown runtime value.
+    expect(arrayPattern).toContain('return x;');
+    expect(arrayPattern).not.toContain('return 1n;');
+    expect(objectPattern).toContain('return x;');
+    expect(objectPattern).not.toContain('return 1n;');
+  });
+
+  it("a call to an eligible same-file top-level function now folds even when its argument only becomes constant through this pass's OWN local flow analysis — a natural side effect of reusing the real 4-argument tsEvalConst/tsEvalCall family rather than a separate evaluator", () => {
+    const out = tsPartialEval(
+      `function double(n) { return n * 2n; }\nfunction f() { let x = 3n; let y = double(x); return y + 1n; }`,
+      'f.ts',
+    );
+
+    expect(out).toContain('return 7n;');
+  });
+
+  it('never folds a call whose callee name is shadowed by a NESTED function declaration inside the SAME local scope this pass is walking — the local pass must not resolve the call against an unrelated top-level function of the same name', () => {
+    const out = tsPartialEval(
+      `function calc(x) { return x + 1n; }
+       function outer() {
+         function calc(x) { return x + 100n; }
+         let y = 1n;
+         return calc(y);
+       }`,
+      'f.ts',
+    );
+
+    // Folding against the OUTER `calc` would hardcode 2n (1+1) instead of leaving the real
+    // (inner) call for the compiler to resolve against the nested declaration.
+    expect(out).not.toContain('return 2n;');
+  });
+});
+
 // ── tsPartialEval (effectively-const let/var detection — top-level scope only) ──
 //
 // A top-level `let`/`var` written EXACTLY ONCE across its entire (shadow-respecting) file is
@@ -879,14 +1194,18 @@ describe('tsPartialEval (effectively-const let/var detection)', () => {
       expect(functionCase).toContain('console.log(a);');
     });
 
-    it("shadowing: an inner function's own same-named let, reassigned inside that inner scope, does not disqualify the OUTER effectively-const variable — and the inner reassignment is untouched", () => {
+    it("shadowing: an inner function's own same-named let, reassigned inside that inner scope, does not disqualify the OUTER effectively-const variable — and the inner reassignment is never resolved against the OUTER value", () => {
       const code = `let a = 1n;\nfunction f() {\n  let a = 2n;\n  a = 3n;\n  return a;\n}\nconsole.log(a);`;
       const out = tsPartialEval(code, 'f.ts');
 
-      // The inner (shadowed) declaration/reassignment/read are completely untouched.
+      // The inner (shadowed) declaration/reassignment are untouched by THIS (top-level) pass.
       expect(out).toContain('let a = 2n;');
-      expect(out).toContain('a = 3n;');
-      expect(out).toContain('return a;');
+      // The final inner read is never substituted against the OUTER effectively-const value
+      // (`1n`) — the LATER, local (per-function) pass separately resolves the inner
+      // reassignment chain to its OWN correct value, `3n` (see the "LOCAL, per-function
+      // constant propagation" describe block below for that dedicated coverage).
+      expect(out).toContain('return 3n;');
+      expect(out).not.toContain('return 1n;');
       // The OUTER (unshadowed) read correctly resolves to the outer effectively-const value.
       expect(out).toContain('console.log(1n);');
     });
