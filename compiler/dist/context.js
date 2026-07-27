@@ -135,6 +135,7 @@ export class CompilerContext {
             fold: true,
             accounts: new AccountRegistry(),
             staged: false,
+            returnKinds: new Map(),
         };
         for (const [name, config] of Object.entries(contracts)) {
             this.registerContract(name, config.abi);
@@ -191,6 +192,18 @@ export class CompilerContext {
     }
     recordFunction(meta) {
         this.module.funcMeta.push(meta);
+    }
+    /**
+     * Record a same-file function's analyzed return kind (see `SharedModule.returnKinds`).
+     * Set once, up front, by the `analyzeFunctionReturnKinds` pre-pass — never mutated
+     * during ordinary body compilation.
+     */
+    setFunctionReturnKind(name, kind) {
+        this.module.returnKinds.set(name, kind);
+    }
+    /** A same-file function's analyzed return kind, or undefined if never recorded. */
+    getFunctionReturnKind(name) {
+        return this.module.returnKinds.get(name);
     }
     // ── v12 stack-variable tracking ──
     /** Push a named value onto the (tracked) EVM stack — e.g. a function param. */

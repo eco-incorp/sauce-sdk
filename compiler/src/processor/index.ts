@@ -38,6 +38,7 @@ import {
 } from './statement.js';
 import { processArrayExpression, processObjectExpression } from './collection.js';
 import { evalConst, evalConstBool } from './const-eval.js';
+import { analyzeFunctionReturnKinds } from './return-kind.js';
 import { tsPartialEval } from '../ts-frontend.js';
 import {
   extractInlineDeclarations,
@@ -415,6 +416,21 @@ function processProgram(program: Program, ctx: CompilerContext): SaucerLike[] {
   // AFTER inline expansion so a real function reachable only THROUGH an inline function's
   // (now-spliced) body is correctly seen as reachable.
   if (ctx.treeshake) declarations = treeshake(declarations, ctx);
+
+  // Analyze every (surviving) declared function's own RETURN storage kind up front — a
+  // fixpoint pre-pass (return-kind.ts), independent of declaration order — and record it
+  // on the shared module BEFORE either target compiles a single body. This is what lets
+  // `inferKindWithContext` (inference.ts) infer `let arr = helper();` as `dynamic` when
+  // `helper()` returns a `new Array(n)`-built TUPLE, on BOTH v1 and v12/svm (a v12/svm
+  // helper's own child context shares the same module, see `forFunction()`). Running here
+  // (after treeshake, before the v1/v12 dispatch) means an unreachable function's shape
+  // never affects analysis, and both targets see identical results. `ctx` is passed through
+  // so a `const [n, xs] = Contract.at(addr).method();` destructuring return can resolve its
+  // bound names' REAL per-output ABI kinds (`ctx.lookupContract` is already populated by
+  // `collectImportedFunctions` above, well before this line runs).
+  const returnKinds = analyzeFunctionReturnKinds(declarations, ctx);
+
+  for (const [name, kind] of returnKinds) ctx.setFunctionReturnKind(name, kind);
 
   if (ctx.isV12) {
     return processProgramV12(declarations, mainFunc, ctx);

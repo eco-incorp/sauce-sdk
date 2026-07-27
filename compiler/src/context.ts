@@ -88,6 +88,21 @@ interface SharedModule {
    * function context sees the gate.
    */
   staged: boolean;
+  /**
+   * Same-file user function name → its analyzed RETURN storage kind, populated once
+   * up front by `analyzeFunctionReturnKinds` (processor/return-kind.ts), a fixpoint
+   * pre-pass run in `processProgram` right after treeshake and before the v1/v12
+   * dispatch. Module-shared (like `functions`/`funcMeta`) so a helper's own child
+   * context (`forFunction()`) sees the SAME map main's compilation does — this is what
+   * lets `inferKindWithContext` (inference.ts) correctly infer `let arr = helper();` as
+   * `dynamic` when `helper()`'s own body returns a `new Array(n)`-built TUPLE,
+   * regardless of whether `helper` is declared before or after its caller (see the
+   * "Same-file user-function return-kind inference" CLAUDE.md note). Absent an entry
+   * (a name the pre-pass never saw, e.g. it runs before this map is populated) is
+   * treated as "unknown", NOT "scalar" — `getFunctionReturnKind` returns `undefined`,
+   * and callers fall back to the pre-existing ctx-free inference.
+   */
+  returnKinds: Map<string, VariableKind>;
 }
 
 export class CompilerContext {
@@ -238,6 +253,7 @@ export class CompilerContext {
       fold: true,
       accounts: new AccountRegistry(),
       staged: false,
+      returnKinds: new Map(),
     };
 
     for (const [name, config] of Object.entries(contracts)) {
@@ -308,6 +324,20 @@ export class CompilerContext {
 
   recordFunction(meta: FunctionMeta): void {
     this.module.funcMeta.push(meta);
+  }
+
+  /**
+   * Record a same-file function's analyzed return kind (see `SharedModule.returnKinds`).
+   * Set once, up front, by the `analyzeFunctionReturnKinds` pre-pass — never mutated
+   * during ordinary body compilation.
+   */
+  setFunctionReturnKind(name: string, kind: VariableKind): void {
+    this.module.returnKinds.set(name, kind);
+  }
+
+  /** A same-file function's analyzed return kind, or undefined if never recorded. */
+  getFunctionReturnKind(name: string): VariableKind | undefined {
+    return this.module.returnKinds.get(name);
   }
 
   // ── v12 stack-variable tracking ──

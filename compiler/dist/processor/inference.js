@@ -132,6 +132,28 @@ export const abiOutputKind = (param) => param.type === 'bytes' || param.type ===
     ? 'dynamic'
     : 'scalar';
 export const inferKindWithContext = (expr, ctx) => {
+    // Plain aliasing of an existing variable (`let b = a;`): the source variable's OWN
+    // tracked kind is the ground truth — the ctx-free `inferKind` has no notion of
+    // variables at all and would otherwise always default an Identifier to 'scalar',
+    // silently dropping a dynamic value's TUPLE/heap descriptor on the alias's own store.
+    if (expr.type === 'Identifier') {
+        return ctx.getVar(expr.name)?.kind ?? inferKind(expr);
+    }
+    // A call to a same-file, user-declared function: consult its analyzed return kind
+    // (`analyzeFunctionReturnKinds`, processor/return-kind.ts — a fixpoint pre-pass run
+    // once per compile, before either target's body-compilation begins) rather than the
+    // ctx-free `inferKind`'s generic CallExpression case, which only recognizes specific
+    // GLOBAL/builtin call shapes and has no way to know a same-file function's own return
+    // shape. Absent an entry (an import/global/anything else `getFunctionReturnKind`
+    // doesn't cover) falls through to the existing behavior below.
+    if (expr.type === 'CallExpression') {
+        const call = expr;
+        if (call.callee.type === 'Identifier') {
+            const returnKind = ctx.getFunctionReturnKind(call.callee.name);
+            if (returnKind)
+                return returnKind;
+        }
+    }
     if (expr.type !== 'MemberExpression')
         return inferKind(expr);
     const member = expr;
