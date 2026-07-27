@@ -452,8 +452,10 @@ table-fold-specific diagnostic either. The now-fully-dead declaration is then re
 `deadConstEliminationTransformer` dead-declaration-elimination pass already used for scalar consts
 (extended to also track table names). **Explicitly out of scope**, a literal simply never becoming
 a candidate (left completely untouched, same as any other non-fully-foldable initializer):
-`new Array(n)` (a wholly different, engine-level HEAP-allocated SauceScript concept, untouched by
-any of this); a spread element inside the literal itself (`[...x]`, `{...x}`); an object literal's
+`new Array(n)` (a wholly different, engine-level HEAP-allocated SauceScript concept — untouched
+by *this* table-folding feature specifically; a *function-local* `new Array(n)` construction is
+folded by a separate mechanism, see "Local `new Array(n)` construction folding" below); a spread
+element inside the literal itself (`[...x]`, `{...x}`); an object literal's
 shorthand/method/getter/setter property or a COMPUTED property name in the declaration itself
 (`{ [k]: v }` — only plain `key: value` / `"key": value` properties are supported); a nested
 array/object literal as an element/property value ("tables of tables" — deliberately rejected
@@ -488,10 +490,99 @@ declined `for...of` (e.g. a table with >256 elements) leaves a `ForOfStatement` 
 runtime-bytecode fallback at all, so `compile()` — even with `tsSource: true` — throws `not
 implemented: ForOfStatement` rather than compiling suboptimally.
 
-**Local (per-function) constant propagation** (`localConstPropagationTransformer`, a FIFTH
+**Local `new Array(n)` construction folding** (`localArrayFoldTransformer`): a FIFTH `before`
+stage, running after `deadConstEliminationTransformer` and strictly BEFORE the local
+constant-propagation pass below (which becomes the sixth), that eliminates a function-local
+`new Array(n)` — SauceScript's only heap/TUPLE construct (`NEW_ARRAY` 0x9c, written via
+`SET_INDEX` 0x9b, read via `INDEX` 0x97) — entirely at compile time when its size, its every
+element, and its every read index are all provably constant and the binding provably never
+escapes. Concretely: `function main() { const arr = new Array(3); for (let i = 0n; i < 3n; i++)
+{ arr[i] = i * 2n; } return arr[1]; }` previously emitted `NEW_ARRAY(3)` + three `SET_INDEX`es +
+a real `INDEX` read *even though the loop had already unrolled and every index/value was
+already a literal*; it now compiles byte-identically to `function main() { return 2n; }`.
+
+Why it runs where it runs: **after** `foldTransformer`, because it only recognizes straight-line
+`arr[k] = v;` statements, which exist solely because `unrollCountingLoop` splices
+counter-substituted body copies into the *enclosing* statement list — recognizing an
+un-unrolled loop directly would duplicate `extractStep`/`unrollCountingLoop`/
+`bodyBlocksUnrolling` and their 256-iteration cap; **after** `tableFoldTransformer`/
+`constPropagationTransformer` so a write value spelled `TIERS[0]` or a bare top-level const is
+already a literal by the time this pass looks at it; and **before** the local
+constant-propagation pass, because a folded element read is what lets that pass finish the job
+(`total += fees[0]` → `total += 100n` → `return 3600n`) — the reverse order would leave the
+accumulator NAC. The price of this direction, paid deliberately: a write VALUE that only
+function-local scalar reasoning can resolve (`let base = 10n; arr[0] = base;`) is NOT folded by
+this pass.
+
+Why it is a SEPARATE pass rather than a new `LocalValue` variant in the local pass's own
+`Map<name, bigint | NAC>` env: extending that env would make `collectWrittenNames`'s own
+documented justification false (it deliberately does not collect an `arr[i] = x` write target
+*because* an array-shaped local is always NAC regardless — see that function's own comment
+below), turning a non-unrollable `while (cond) { arr[0] = x; }` into a genuine stale-value
+unsoundness; and deletion is a whole-function verdict (every index written exactly once, every
+remaining use resolvable, or nothing changes) that the local pass's emit-as-you-go forward walk
+cannot decide without a separate pre-analysis anyway.
+
+The rules, in the same taxonomy style as the lookup-table section above: the declaration must be
+a direct, single-declarator `let`/`const` statement of the function body's own top-level
+statement list (`fn.body.statements`) — never nested inside an `if`/loop/block, since
+SauceScript shares scope across `if`/`while` bodies (see this file's repeated shadow-fix notes),
+so a binding first introduced inside a branch genuinely persists past it and can't be dismissed
+as block-scoped; the size must resolve to `1..MAX_FOLDED_ARRAY_ELEMENTS` (256, its own constant,
+same value as `MAX_UNROLL_ITERATIONS` but bounding a different thing — the tracked element table
+and write-match count, not emitted bytecode growth); every index in `[0, size)` must be written
+EXACTLY once by a plain-`=` `arr[k] = v;` statement in the construction region, with every index
+and value constant and neither referencing any tracked array (self- or cross-referential
+construction is out of scope for v1); write ORDER is unconstrained (unobservable, since every
+write in the region necessarily precedes every read — any other occurrence of the name in the
+region disqualifies outright); and every remaining occurrence of the name must be the base of an
+`ElementAccessExpression` with a constant, in-range index, in read position, after the
+construction region — a strict ALLOWLIST whose default branch disqualifies, so aliasing, a call
+argument, `return arr`, a spread, `for...of`, `arr.length`, any method call, rebinding, a
+compound/update element write, a destructuring-assignment target, an occurrence before the
+declaration, an occurrence inside a nested function-like scope, and a redeclaration of the name
+anywhere in the function all fail closed by construction rather than by enumeration.
+
+Two ways this is STRICTER than the lookup-table feature above, and why: (a) safe is not
+enough — every surviving occurrence must also be provably RESOLVABLE, because this pass DELETES
+the backing allocation, so a single unresolvable read would dangle (the table feature can leave
+one unresolvable access untouched precisely because it only ever removes a declaration that
+*already* has zero references); (b) all-or-nothing per array, with no partial-fold mode, since
+keeping the array alive to serve one runtime-indexed read means keeping every write anyway,
+leaving `NEW_ARRAY`/`SET_INDEX` in place for a rounding-error saving.
+
+**The parent-pointer trap**, a mechanism note in the same spirit as this file's others:
+`isSafeTableRead`/`isTableAccessUnsafeUsage` classify by walking UP through `node.parent`, but a
+node SYNTHESIZED by an earlier transformer stage — exactly what loop unrolling produces — has
+`parent === undefined` (confirmed directly against a factory-created node), which would make an
+unrolled `arr[0n] = 5n;` look like a *safe read* to that walk-up style of check. This pass
+therefore uses a TOP-DOWN scan (`scanArrayUses`) that classifies a node BEFORE descending into
+it, and never consults `.parent` at all. Likewise, `tsEvalConst`'s `NumericLiteral` branch calls
+`getText()`, which THROWS on a synthesized literal (caught by its own try/catch, returning
+`undefined`) — so a plain-number unrolled counter (`for (let i = 0; i < 3; i++)`) would silently
+never fold without a fix; `evalArrayConst` adds a synthesized-`NumericLiteral` `.text` fallback
+LOCAL to this pass (rather than changing the shared evaluator, which would alter fold behavior
+for every other pass in this file).
+
+**Explicitly out of scope** for this first cut (left completely untouched, same as any
+non-qualifying shape, and each sound to add later): a top-level `new Array` (uncompilable
+regardless — `top-level statements not allowed`, so this scope restriction costs nothing); a
+declaration nested inside an `if`/loop/block; holes (a partially-written array, even if only the
+read indices are covered); duplicate/last-write-wins writes to one index; self-referential
+construction (`arr[1] = arr[0] + 1n`); compound element writes (`arr[i] += x`); `arr.length`
+(foldable in principle to the size literal, excluded until an on-chain integration test verifies
+`new Array(3).length` actually equals `3n` at runtime); `for (const v of arr)` over a local
+array, which remains a hard `not implemented: ForOfStatement` — unrolling it would be an
+ENABLING feature (plain acorn has no `ForOfStatement` handling at all), deliberately deferred
+rather than folded in this pass; and a ternary index/value resolvable only through
+function-local reasoning (this pass has no `LocalResolution`/local-value bridge of its own).
+
+
+**Local (per-function) constant propagation** (`localConstPropagationTransformer`, a SIXTH
 `before` stage, appended LAST — after `foldTransformer`, `tableFoldTransformer`,
-`constPropagationTransformer`, and `deadConstEliminationTransformer`, consuming everything
-above's output): everything above tracks only same-file TOP-LEVEL `const`s (plus
+`constPropagationTransformer`, `deadConstEliminationTransformer`, and `localArrayFoldTransformer`
+(the "Local `new Array(n)` construction folding" pass just above), consuming everything above's
+output): everything above tracks only same-file TOP-LEVEL `const`s (plus
 effectively-const `let`/`var`s and lookup tables — still all top-level). A `let`/`const`
 declared and reassigned INSIDE a function body got none of that benefit — this is a NEW,
 SEPARATE pass closing that gap: a control-flow-sensitive (but deliberately NOT a real fixpoint
@@ -644,11 +735,14 @@ regression of the shadow-tracking the earlier passes are responsible for.
 
 **Known limitation (not fixed)**: this only folds/propagates compile-time-known COUNTERS/BOUNDS,
 same-file top-level `const` VALUES, function-LOCAL scalar values via the pass above, the narrow
-same-file/single-return/constant-args CALL shape, and the narrow compile-time-only lookup-table
-case above — not general array/object DATA processing (`arr[i]`/`.push()`/`for...of` on non-table
-data, mutable arrays, arrays built at runtime) — ts-evaluator's no-checker mode can't resolve
-property/array access or function calls at all, and a full `ts.Program`/TypeChecker is a much
-bigger lift, out of scope here.
+same-file/single-return/constant-args CALL shape, the narrow compile-time-only lookup-table case
+above, and — a narrow carve-out, see "Local `new Array(n)` construction folding" above — a
+fully-constant, never-escaping, function-local `new Array(n)` construction — not general
+array/object DATA processing (`arr[i]`/`.push()`/`for...of` on non-table, non-this-narrow-case
+data, mutable arrays, arrays built at runtime with a non-constant size or written with
+non-constant values/indices) — ts-evaluator's no-checker mode can't resolve property/array access
+or function calls at all, and a full `ts.Program`/TypeChecker is a much bigger lift, out of scope
+here.
 
 **Assignment expressions are never folded.** The TS AST represents `=`/`+=`/etc. as a
 `BinaryExpression`, and `ts-evaluator`'s `evaluate()` "succeeds" on a bare assignment (e.g.
