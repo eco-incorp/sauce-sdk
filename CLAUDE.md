@@ -537,11 +537,13 @@ construction is out of scope for v1); write ORDER is unconstrained (unobservable
 write in the region necessarily precedes every read — any other occurrence of the name in the
 region disqualifies outright); and every remaining occurrence of the name must be the base of an
 `ElementAccessExpression` with a constant, in-range index, in read position, after the
-construction region — a strict ALLOWLIST whose default branch disqualifies, so aliasing, a call
-argument, `return arr`, a spread, `for...of`, `arr.length`, any method call, rebinding, a
-compound/update element write, a destructuring-assignment target, an occurrence before the
-declaration, an occurrence inside a nested function-like scope, and a redeclaration of the name
-anywhere in the function all fail closed by construction rather than by enumeration.
+construction region, **or** — the one other authorized shape, see below — the SOLE, entire
+operand of a `ReturnStatement` in `main()` — a strict ALLOWLIST (now with exactly TWO authorized
+shapes) whose default branch disqualifies, so aliasing, a call argument, a spread, `for...of`,
+`arr.length`, any method call, rebinding, a compound/update element write, a
+destructuring-assignment target, an occurrence before the declaration, an occurrence inside a
+nested function-like scope, and a redeclaration of the name anywhere in the function all fail
+closed by construction rather than by enumeration.
 
 Two ways this is STRICTER than the lookup-table feature above, and why: (a) safe is not
 enough — every surviving occurrence must also be provably RESOLVABLE, because this pass DELETES
@@ -550,6 +552,98 @@ one unresolvable access untouched precisely because it only ever removes a decla
 *already* has zero references); (b) all-or-nothing per array, with no partial-fold mode, since
 keeping the array alive to serve one runtime-indexed read means keeping every write anyway,
 leaving `NEW_ARRAY`/`SET_INDEX` in place for a rounding-error saving.
+
+**The one escaping shape that IS authorized: `main()`'s own `return arr;`.** `return arr;` (or
+`return (arr);` — seen through `stripParens`) as the SOLE, entire operand of a `ReturnStatement`,
+in a top-level `FunctionDeclaration` named exactly `main`, for a fully-resolved candidate (every
+element known, none negative), becomes `return [lit0, …, litN-1];` — the declaration and every
+construction write deleted exactly as in the element-reads case (`scanArrayUses`'s Rule 6b →
+`LocalArrayPlan.returnArrays` → `rewriteFoldedArrayBody`). Multiple such returns in one `main`
+each fold independently, and a return can coexist with an element-read of the same array
+(`if (c) { return a; } return a[0];` folds both).
+
+WHY IT IS SAFE, stated as measured facts rather than argued: today a `new Array(n)`-built TUPLE
+returned from a Sauce program leaks raw Solidity MEMORY ADDRESSES of per-element structs —
+`cook()` on `const arr = new Array(3); arr[0]=0n; arr[1]=2n; arr[2]=4n; return arr;` returns
+`0x…03c0 …0480 …0540` (960/1152/1344 decimal), not `0/2/4` and not any recognizable ABI encoding;
+v1's `execute()` (`Execution.sol`) returns `ctx.dynamicResult.data` verbatim for a TUPLE, and
+`DynamicData.sol`'s own doc comment describes that data as "an array of Dynamic pointers… each
+pointer references a Dynamic struct" allocated in a call frame that's discarded the instant the
+call returns — meaningless to any external caller. A literal TUPLE return (`return {a:0n,b:2n}` →
+`0x260/0x2e0/0x360`) and `return helper()` (calling into a function that itself returns a heap
+array) leak the exact same way — of every ARRAY/TUPLE-*shaped* return, the packed STATIC ARRAY
+literal this fold produces is the ONLY one with a defined wire encoding (three 32-byte words,
+exactly `abi.encode`d `uint256[3]`) — a plain scalar return already had one, unaffected by any of
+this. Nothing in this monorepo decodes a Sauce program's TOP-LEVEL return
+as an array/tuple today, so this is a strict improvement with no real consumer to regress.
+
+WHY `main()` ONLY, again as measured facts: a HELPER's returned array has no working consumer
+today — `let x = helper(); return x[0];` reverts `SauceInvalidOperationArgs` with payload `0x97`
+(`INDEX`); `x[0] = 5n;` reverts with payload `0x9b` (`SET_INDEX`) — and reverts IDENTICALLY
+(same two payloads) when `helper()` is changed to return a LITERAL array instead of a heap one,
+since `Variable.immutablePacked` (the check that would otherwise reject `x[0] = 5n` at COMPILE
+time — `processor/statement.ts`, "array literals are immutable (packed)") can only fire when the
+compiler statically sees the literal at the assignment site, never across a call boundary — so a
+literal escaping via a helper's return degrades to the SAME runtime revert, not a new compile
+error. But if this PRE-EXISTING cross-function heap-descriptor gap is ever fixed, a helper
+returning a genuinely mutable `new Array(n)` TUPLE would become meaningful — and this fold, having
+already turned it into an immutable packed literal, would keep it broken while the un-folded
+program started working. `main()` structurally cannot have this exposure: its return value exits
+the SauceScript program entirely, and `main` itself is never callable (it's inlined on v12, is the
+sole entry point on v1, and `collectImportedFunctions` hard-rejects an imported module defining
+`main`). Useful corollary: because an imported module may never define `main`, this fold can NEVER
+fire through the `.ts` IMPORT seam (`ctx.transformModule`/`collectImportedFunctions`) — so that
+seam needed zero changes, and there is no narrow/wide inconsistency to reconcile there.
+
+**Forcing uint256 element width.** `encodeArray`/`packStaticElements` (`saucer/array.ts`) pick the
+SMALLEST byte width across all elements' own magnitudes (via `encodeInt`/`minBytesNeeded` —
+`saucer/integer.ts`, the SAME auto-narrowing every plain scalar literal in the language already
+gets), so an ordinary `[0n, 2n, 4n]` packs to 1 byte per element (`0x000204` on the wire) —
+deterministic, but not ABI-decodable. This fold instead forces BYTE_32 for the literal it
+synthesizes, so `cook()` returns three real 32-byte words — exactly `abi.encode`d `uint256[3]`,
+verified against the deployed engine (`0x9203` + `20` + three 32-byte words decodes cleanly;
+`compiler/integration-test/ts-frontend-array.test.ts`'s "return-escape fold" describe block is the
+executable record).
+
+THE CHANNEL, and why it has this shape: `tsPartialEval` returns plain TEXT that `acorn.parse`
+re-parses from scratch, so a node this pass SYNTHESIZES can carry no metadata of its own by the
+time `compile()` sees it — the width has to ride ALONGSIDE the text, out-of-band, not through the
+AST. `tsPartialEvalWithMeta(code, filePath): { text, wideReturnArrays }` is a non-breaking SIBLING
+of `tsPartialEval` (whose own `(code, filePath) => string` signature is kept byte-for-byte — it
+now just delegates, `return tsPartialEvalWithMeta(code, filePath).text`) — so the `.ts` IMPORT
+seam and any external caller of `tsPartialEval` are completely untouched. `wideReturnArrays` is a
+`Set<string>` of `elements.join(',')` fingerprints (e.g. `"0,2,4"`), one per fold-synthesized
+literal array return, populated by `rewriteFoldedArrayBody` at the moment it builds the literal.
+`compile()` (`src/index.ts`) stashes a non-empty set onto a new `CompilerContext.wideReturnArrays`
+field; `processReturnStatement` (`processor/index.ts`) checks a return-position array literal's
+OWN fingerprint against that set and, on a match, calls `processArrayExpression(...,
+forcedWidth: 32)` instead of the ordinary path — which threads through `saucer.array(elements,
+forcedWidth)` (all three of `Saucer`/`V12Saucer`/`SaucerLike` gained this same optional parameter)
+down to `encodeArray(elements, forcedWidth)`, whose one-line change is `Math.max(forcedWidth,
+natural)` for the chosen width — a forced width can only WIDEN an encoding, never truncate one, so
+`packStaticElements`/`padToWidth` (which already zero-left-pad to whatever width they're handed)
+needed no change at all. One encoder covers all three targets: v1's `Saucer`, v12's `V12Saucer`
+(which already delegated to the shared `encodeArray`), and `svm` (a v12 dialect, so it reuses
+`V12Saucer` unmodified) all emit the identical wide bytes (v1 with its usual trailing halt byte,
+v12/svm without).
+
+THE INVARIANT this channel preserves: an ORDINARY user-written array literal keeps its existing
+auto-narrowed encoding, everywhere, on both the `tsSource` and plain paths, INCLUDING in the same
+file as a fold — `compile('function main(){ return [0n,2n,4n]; }')` emits the identical narrow
+`92030100020400` with `tsSource` on or off, and a single `main` containing both a user-written
+`return [1n, 2n];` and a fold-synthesized `return [0n,2n,4n];` emits the narrow form for the first
+and the wide form for the second (measured — see the test file above). Two residual, deliberately
+accepted imprecisions, both cost-free in practice: (1) the match is a pure VALUE fingerprint, not
+a node-identity one, so a user-written return-position literal in `main()` whose elements exactly
+equal a fold-synthesized one would ALSO widen — harmless, since the values are identical and the
+result is only MORE ABI-conformant, never wrong; narrowed (not eliminated) by gating the whole
+mechanism behind a second field, `CompilerContext.isMainBody` (true only while compiling `main`'s
+own body — set directly on v1's module-level `ctx` right before compiling `mainFunc`, and copied
+onto v12/svm's per-function child context in `processFunctionV12` alongside the existing
+`ctx.isMainFunction`), so the same-valued literal would have to sit in `main()` ITSELF to widen,
+never in an unrelated helper. (2) A negative element in the source `wideReturnFingerprint` scans
+is rejected outright (matching Rule 6b's own guard below), so a user literal with a negative
+element never even risks the (harmless) match in the first place.
 
 **The parent-pointer trap**, a mechanism note in the same spirit as this file's others:
 `isSafeTableRead`/`isTableAccessUnsafeUsage` classify by walking UP through `node.parent`, but a
@@ -576,6 +670,27 @@ array, which remains a hard `not implemented: ForOfStatement` — unrolling it w
 ENABLING feature (plain acorn has no `ForOfStatement` handling at all), deliberately deferred
 rather than folded in this pass; and a ternary index/value resolvable only through
 function-local reasoning (this pass has no `LocalResolution`/local-value bridge of its own).
+
+Specific to the `return arr;` return-escape shape (Rule 6b) above: **any NEGATIVE element
+disqualifies** the whole candidate — `encodeInt` emits a `[OPS.NEG, opcode, …]` node for a
+negative value, so `encodeArray`'s `allStatic`/`allDynamic` check rejects it with `array elements
+must be literals or dynamic types`, which would turn a program that compiles TODAY (the heap
+`new Array` spelling) into a compile ERROR (confirmed: `compile('function main(){ return [-5n,
+1n]; }')` already throws exactly that). A two's-complement widening is a plausible later
+extension, deliberately deferred pending engine-side verification of how a NEG scalar actually
+materializes on each target. **The bytecode-SIZE direction** is unique to this sub-case: every
+OTHER fold in this whole pass SHRINKS bytecode (an eliminated `NEW_ARRAY`/`SET_INDEX`/`INDEX`
+costs far more than the literal replacing it), but a forced-wide (BYTE_32) literal element costs
+32 bytes against roughly 10 for the `SET_INDEX` it replaces — measured ~3.5× growth at 64 elements
+(2052 vs 586 bytes). `MAX_FOLDED_RETURN_ARRAY_ELEMENTS` (64) is therefore its OWN, deliberately
+SMALLER cap than `MAX_FOLDED_ARRAY_ELEMENTS` (256) — at the shared 256 cap this sub-case's worst
+case would be roughly 8.2 KB, which the pass's own "capped so it can't blow up bytecode size"
+charter would no longer actually promise for this one direction. **A helper's `return arr;`**,
+however provable, still disqualifies (Rule 6b only ever authorizes a top-level `function main`);
+and a returned array actually CONSUMED further by other SauceScript code (`let x = helper();
+x[0]`) remains exactly as broken as it is today regardless of this fold (see the "one escaping
+shape that IS authorized" note above for the measured revert data that is this scope decision's
+entire justification).
 
 
 **Local (per-function) constant propagation** (`localConstPropagationTransformer`, a SIXTH
@@ -780,6 +895,11 @@ the decoded tuple is never stored and the v1 descriptor round-trip fault can't h
 (`const s = pool.slot0()` then `s[k]`) keeps its store byte-identical (arrakis/pendle `return result`
 bare reads still compile), but the indexed reads/writes that were guaranteed v1 runtime faults
 (`SauceInvalidOperationArgs(INDEX)`) are now compile errors pointing at destructuring; v12 untouched.
+(e) **`return arr;` in `main()` for a fully-constant local `new Array(n)` now folds to a literal
+array** (BYTE_32-forced, so `cook()` returns a real `uint256[N]`) instead of leaking the raw
+memory-pointer garbage a `new Array(n)`-built TUPLE return produces today — see "Local `new
+Array(n)` construction folding" above (`scanArrayUses` Rule 6b, `wideReturnArrays`, and the
+"Forcing uint256 element width" mechanism note) for the full design and the measured proof.
 
 **Known v12 limit (follow-up):** the Huff runtime's dynamic-value descriptor packs the data pointer in
 16 bits (region `0x5000`→`0xFFFF`, ≈45 KB), so a program whose total dynamic data exceeds that gets a
