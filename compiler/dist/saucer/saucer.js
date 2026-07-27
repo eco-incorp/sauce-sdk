@@ -132,8 +132,8 @@ export class Saucer {
     string(value) {
         return this.with(encodeString(value));
     }
-    array(elements) {
-        return this.with(encodeArray(elements));
+    array(elements, forcedWidth) {
+        return this.with(encodeArray(elements, forcedWidth));
     }
     tuple(elements) {
         return this.with(encodeTuple(elements));

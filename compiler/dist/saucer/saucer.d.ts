@@ -67,7 +67,7 @@ export declare class Saucer implements SaucerLike {
     int(value: bigint): Saucer;
     bytes(data: Uint8Array): Saucer;
     string(value: string): Saucer;
-    array(elements: Saucer[]): Saucer;
+    array(elements: Saucer[], forcedWidth?: number): Saucer;
     tuple(elements: Saucer[]): Saucer;
     index(arr: Saucer, idx: Saucer): Saucer;
     setIndex(arr: Saucer, idx: Saucer, value: Saucer): Saucer;

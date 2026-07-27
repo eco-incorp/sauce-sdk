@@ -8,7 +8,7 @@ import { encodeBytes } from './saucer/bytes.js';
 import { concatBytes, V12Saucer } from './saucer/saucer-v12.js';
 import { estimatePacket } from './planner/index.js';
 import { compileCacheKey, cloneCompileResult, getDefaultCompileCache } from './cache.js';
-import { tsPartialEval } from './ts-frontend.js';
+import { tsPartialEvalWithMeta } from './ts-frontend.js';
 export { createCompileCache, compileCacheKey, cloneCompileResult, getDefaultCompileCache, clearDefaultCompileCache, } from './cache.js';
 export { Saucer } from './saucer/saucer.js';
 export { V12Saucer } from './saucer/saucer-v12.js';
@@ -81,7 +81,13 @@ function compileFresh(source, options = {}) {
     if (staged && target !== 'svm') {
         throw new Error(`staged compilation requires target 'svm', got '${target}'`);
     }
-    const sourceText = options.tsSource ? tsPartialEval(source, options.label ?? 'source.ts') : source;
+    // `tsPartialEvalWithMeta` (not the signature-preserving `tsPartialEval` wrapper) so the
+    // out-of-band width-forcing signal the return-array escape fold produces (see
+    // ts-frontend.ts's "Forcing uint256 element width" doc note) survives past the plain-string
+    // hand-off to `acorn.parse` — `pre` is `undefined` entirely for a non-tsSource compile, so
+    // `ctx.wideReturnArrays` below is never even touched in that case.
+    const pre = options.tsSource ? tsPartialEvalWithMeta(source, options.label ?? 'source.ts') : undefined;
+    const sourceText = pre ? pre.text : source;
     const ast = acorn.parse(sourceText, {
         ecmaVersion: 'latest',
         sourceType: 'module',
@@ -92,6 +98,8 @@ function compileFresh(source, options = {}) {
     ctx.treeshake = options.treeshake ?? true;
     ctx.fold = options.fold ?? true;
     ctx.setStaged(staged);
+    if (pre && pre.wideReturnArrays.size > 0)
+        ctx.wideReturnArrays = pre.wideReturnArrays;
     if (options.defines)
         ctx.setDefines(options.defines);
     if (options.args && options.args.length > 0) {

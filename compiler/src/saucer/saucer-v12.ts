@@ -359,11 +359,11 @@ export class V12Saucer implements SaucerLike {
     return this.nary(elements, [OPS.TUPLE, elements.length], this.naryEffect(elements), true);
   }
 
-  array(elements: SaucerLike[]): V12Saucer {
+  array(elements: SaucerLike[], forcedWidth?: number): V12Saucer {
     // An array literal is a self-contained constant whose encoding (static-packed
     // for fixed-width literals, inlined for dynamic literals) is identical in v1
     // and v12 — the engine reads it the same way. Reuse the shared encoder.
-    return this.withBytes(encodeArray(elements), this.stackEffect + 1, true);
+    return this.withBytes(encodeArray(elements, forcedWidth), this.stackEffect + 1, true);
   }
 
   private naryEffect(elements: SaucerLike[]): number {

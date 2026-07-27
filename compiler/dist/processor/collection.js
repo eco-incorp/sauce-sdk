@@ -17,10 +17,10 @@ const assertConsistentStructFields = (elements) => {
     if (mismatch)
         throw new Error('array elements must have consistent struct fields');
 };
-export const processArrayExpression = (expr, ctx, saucer) => {
+export const processArrayExpression = (expr, ctx, saucer, forcedWidth) => {
     const elements = expr.elements.map(assertValidArrayElement);
     assertConsistentStructFields(elements);
-    return saucer.array(elements.map((el) => processExpression(el, ctx)));
+    return saucer.array(elements.map((el) => processExpression(el, ctx)), forcedWidth);
 };
 export const processObjectExpression = (expr, ctx, saucer) => {
     const sorted = extractSortedProperties(expr);

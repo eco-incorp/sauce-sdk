@@ -12,6 +12,7 @@ import type {
   ExpressionStatement,
   ReturnStatement,
   ThrowStatement,
+  ArrayExpression,
 } from 'acorn';
 import type { SaucerLike } from '../saucer/index.js';
 import { V12Saucer } from '../saucer/index.js';
@@ -26,6 +27,7 @@ import {
   processMemberExpression,
   processNewExpression,
   processTaggedTemplateExpression,
+  literalToInt,
 } from './expression.js';
 import {
   processVariableDeclaration,
@@ -437,6 +439,13 @@ function processProgram(program: Program, ctx: CompilerContext): SaucerLike[] {
     processFunction(stmt, ctx.forFunction()),
   );
 
+  // main compiles directly on the module-level `ctx` (not a `forFunction()` child, unlike every
+  // helper above) — flip `isMainBody` only NOW, after every helper has already compiled against
+  // its own separate child context, so no helper ever sees it set. Narrows
+  // `ctx.wideReturnArrays`'s (value-based, not node-identity) fingerprint match to main()'s own
+  // return — see `processReturnStatement`/`CompilerContext.isMainBody`.
+  ctx.isMainBody = true;
+
   return [...functions, processFunction(mainFunc, ctx)];
 }
 
@@ -470,6 +479,15 @@ function processFunctionV12(stmt: FunctionDeclaration, parentCtx: CompilerContex
   // Helpers self-terminate every `return` with FUNC_RETURN; main is inlined and
   // just leaves its value (see CompilerContext.isMainFunction / V12Saucer.return).
   ctx.isMainFunction = isMain;
+  // `forFunction()` is a FRESH CompilerContext instance for every function (helpers AND main
+  // alike, on v12/svm) — unlike v1's main (compiled directly on the module-level `ctx`, see
+  // `processProgram`), so `wideReturnArrays`/`isMainBody` need an explicit copy from
+  // `parentCtx` here (mirroring the existing `parentCtx.mainArgTypes` read just below) rather
+  // than relying on shared module state. Copying unconditionally is harmless: a helper's own
+  // `ctx.isMainBody` stays false, so `processReturnStatement`'s width-forcing branch never
+  // fires for one regardless of whether `wideReturnArrays` happens to be set.
+  ctx.wideReturnArrays = parentCtx.wideReturnArrays;
+  ctx.isMainBody = isMain;
   const argTypes = isMain ? parentCtx.mainArgTypes : undefined;
 
   // Params live on the EVM stack (isParam) in declaration order.
@@ -526,8 +544,64 @@ export function processStatement(stmt: Statement, ctx: CompilerContext, saucer: 
   }
 }
 
+/**
+ * The VALUE-based fingerprint the ts-frontend's return-array escape fold keys `wideReturnArrays`
+ * by (`localArrayFoldTransformer`'s Rule 6b in ts-frontend.ts: `candidate.elements.join(',')`).
+ * `undefined` for anything other than an array literal whose every element is a non-negative
+ * integer `Literal` (bigint or integer number) — a spread element, a non-literal expression, a
+ * float, or a negative value all decline (matching Rule 6b's own guard, which never lets a
+ * negative element reach `wideReturnArrays` in the first place). This is a pure VALUE match, not
+ * a node-identity one: a user hand-written return-position array literal with the exact same
+ * element values also matches — see `CompilerContext.wideReturnArrays`'s own doc comment for why
+ * that's harmless (can only WIDEN an already-correct value, never change it), and `isMainBody`
+ * for how the match is additionally narrowed to main()'s own return.
+ */
+function wideReturnFingerprint(expr: Expression): string | undefined {
+  if (expr.type !== 'ArrayExpression') return undefined;
+
+  const values: bigint[] = [];
+
+  for (const el of (expr as ArrayExpression).elements) {
+    if (!el || el.type !== 'Literal') return undefined;
+
+    const lit = el as Literal;
+
+    if (typeof lit.value !== 'number' && typeof lit.value !== 'bigint') return undefined;
+
+    let value: bigint;
+
+    try {
+      value = literalToInt(lit);
+    } catch {
+      return undefined;
+    }
+
+    if (value < 0n) return undefined;
+
+    values.push(value);
+  }
+
+  return values.join(',');
+}
+
 function processReturnStatement(stmt: ReturnStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {
-  return stmt.argument ? saucer.return(processExpression(stmt.argument, ctx)) : saucer.return();
+  if (!stmt.argument) return saucer.return();
+
+  // Force BYTE_32 (uint256) element width for a return-position array literal the ts-frontend's
+  // local-array return-escape fold synthesized (see CompilerContext.wideReturnArrays and
+  // ts-frontend.ts's "Forcing uint256 element width" doc note). `ctx.wideReturnArrays` is
+  // populated ONLY for a tsSource compile that actually performed such a fold, and `isMainBody`
+  // narrows the (value-based, not node-identity) fingerprint match to main()'s own return — so
+  // this branch is completely dead for a plain .js/.sauce source, a tsSource compile with no
+  // such fold, or a helper's own return, and an ordinary array-literal return keeps its existing
+  // auto-narrowed encoding everywhere else.
+  const fp = ctx.isMainBody && ctx.wideReturnArrays ? wideReturnFingerprint(stmt.argument) : undefined;
+
+  if (fp !== undefined && ctx.wideReturnArrays?.has(fp)) {
+    return saucer.return(processArrayExpression(stmt.argument as ArrayExpression, ctx, ctx.newSaucer(), 32));
+  }
+
+  return saucer.return(processExpression(stmt.argument, ctx));
 }
 
 function processThrowStatement(stmt: ThrowStatement, ctx: CompilerContext, saucer: SaucerLike): SaucerLike {

@@ -25,11 +25,19 @@ const assertConsistentStructFields = (elements: Expression[]): void => {
   if (mismatch) throw new Error('array elements must have consistent struct fields');
 };
 
-export const processArrayExpression = (expr: ArrayExpression, ctx: CompilerContext, saucer: SaucerLike): SaucerLike => {
+export const processArrayExpression = (
+  expr: ArrayExpression,
+  ctx: CompilerContext,
+  saucer: SaucerLike,
+  forcedWidth?: number,
+): SaucerLike => {
   const elements = expr.elements.map(assertValidArrayElement);
   assertConsistentStructFields(elements);
 
-  return saucer.array(elements.map((el) => processExpression(el, ctx)));
+  return saucer.array(
+    elements.map((el) => processExpression(el, ctx)),
+    forcedWidth,
+  );
 };
 
 export const processObjectExpression = (

@@ -93,7 +93,7 @@ export declare class V12Saucer implements SaucerLike {
     bytes(data: Uint8Array): V12Saucer;
     string(value: string): V12Saucer;
     tuple(elements: SaucerLike[]): V12Saucer;
-    array(elements: SaucerLike[]): V12Saucer;
+    array(elements: SaucerLike[], forcedWidth?: number): V12Saucer;
     private naryEffect;
     index(arr: SaucerLike, idx: SaucerLike): V12Saucer;
     length(arr: SaucerLike): V12Saucer;

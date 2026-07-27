@@ -112,6 +112,37 @@ export declare class CompilerContext {
         structType?: StructType;
     }[];
     /**
+     * Populated ONLY for a `tsSource` compile whose ts-frontend pass
+     * (`localArrayFoldTransformer`'s return-escape Rule 6b, ts-frontend.ts — gated to a top-level
+     * `function main` only) actually folded a `return arr;` into a literal array: a set of
+     * `elements.join(',')` fingerprints (e.g. `"0,2,4"`), one per fold-synthesized literal.
+     * Consulted by `processReturnStatement` (processor/index.ts) to force BYTE_32 (uint256)
+     * element width for a matching return-position array literal — so `cook()`'s return value is
+     * real ABI-decodable `uint256[N]` instead of the auto-narrowed (and, for the `new Array(n)`
+     * TUPLE this fold replaces, otherwise raw-memory-pointer-leaking) encoding a plain array
+     * literal would otherwise get. See the "Forcing uint256 element width" doc note in CLAUDE.md.
+     * `undefined` for a plain `.js`/`.sauce` source or any `tsSource` compile that performed no
+     * such fold — `processReturnStatement`'s width-forcing branch is then completely dead, so an
+     * ordinary array-literal return is entirely unaffected either way. Set once, on the top-level
+     * `ctx` `compileFresh` (src/index.ts) creates, before `processNode` ever runs; a v12 helper's
+     * own per-function child context (`forFunction()`) gets a COPY of the same reference (see
+     * `processFunctionV12`) so `ctx.isMainBody` alone is what actually gates its use (a helper
+     * could in principle see this set, but never matches it — see `isMainBody`).
+     */
+    wideReturnArrays?: ReadonlySet<string>;
+    /**
+     * True ONLY while compiling `main()`'s own body — v1 directly on the module-level `ctx`
+     * (`processProgram` flips it right before `processFunction(mainFunc, ctx)`, after every
+     * helper has already compiled against its own separate `forFunction()` child); v12/svm via
+     * `processFunctionV12`'s own per-function child context (`ctx.isMainBody = isMain`, alongside
+     * the existing `ctx.isMainFunction`). Narrows `wideReturnArrays`'s fingerprint match (a pure
+     * VALUE match, not a node-identity one — see there) to main()'s own return only, mirroring the
+     * return-escape fold's own main()-only scope: a same-VALUED array literal hand-written inside
+     * a HELPER must never widen just because it happens to match a fold that only ever fires in
+     * main. Defaults false.
+     */
+    isMainBody: boolean;
+    /**
      * Optional hook to transform an imported SOURCE module's text before it is parsed —
      * e.g. strip TypeScript types. Receives (code, absoluteFilePath); returns plain JS the
      * acorn parser accepts. Set from CompileOptions.transformModule. Consulted ONLY for

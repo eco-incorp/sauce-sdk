@@ -51,7 +51,7 @@ export interface SaucerLike {
   int(value: bigint): SaucerLike;
   bytes(data: Uint8Array): SaucerLike;
   string(value: string): SaucerLike;
-  array(elements: SaucerLike[]): SaucerLike;
+  array(elements: SaucerLike[], forcedWidth?: number): SaucerLike;
   tuple(elements: SaucerLike[]): SaucerLike;
   index(arr: SaucerLike, idx: SaucerLike): SaucerLike;
   setIndex(arr: SaucerLike, idx: SaucerLike, value: SaucerLike): SaucerLike;

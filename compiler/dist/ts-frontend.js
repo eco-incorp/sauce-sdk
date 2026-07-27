@@ -50,6 +50,17 @@ const MAX_UNROLL_ITERATIONS = 256;
  * disqualified by this pass anyway. Enforced at the declaration gate (`newArraySize`), before any
  * `bigint[]` element table is even allocated, so a hostile `new Array(1e9)` costs one comparison. */
 const MAX_FOLDED_ARRAY_ELEMENTS = 256;
+/** A `return arr;` return-escape fold (see Rule 6b in `scanArrayUses`, and the "one escaping
+ * shape that IS authorized" note above it) only ever fires for `candidate.size` up to THIS,
+ * a separate and deliberately SMALLER cap than `MAX_FOLDED_ARRAY_ELEMENTS`. Every OTHER
+ * sub-case of this pass shrinks bytecode (an eliminated `NEW_ARRAY`/`SET_INDEX`/`INDEX`
+ * costs far more than the literal it's replaced by); this one is the exception — a wide
+ * (BYTE_32-forced, see "Forcing uint256 element width") literal element costs 32 bytes
+ * against roughly 10 for the `SET_INDEX` it replaces, a measured ~3.5× growth at 64
+ * elements (2052 vs 586 bytes) that would be ~8.2 KB at the shared 256 cap. Kept well
+ * under that so this one growth-direction sub-case can't blow up bytecode size the way
+ * the pass's own charter (capped so it can't) already promises for every other rule. */
+const MAX_FOLDED_RETURN_ARRAY_ELEMENTS = 64;
 /** Shared empty shadow set — module (top-level) scope has nothing shadowing it, and a
  * same-file top-level function's own body/defaults are evaluated fresh against this (see
  * `tsEvalCall`): its free variables can only be OTHER top-level bindings, never whatever
@@ -2560,13 +2571,15 @@ function scanAssignmentTarget(node, name, scan, disqualify) {
     scan(target);
 }
 /**
- * The whole-function, top-down, fail-closed ALLOWLIST escape scan for `candidate`: the ONE
- * authorized shape is the base identifier of an `ElementAccessExpression`, in READ position,
- * whose index resolves to an in-range constant — every other occurrence of `candidate.name`
- * anywhere in `body` disqualifies the whole candidate. Same philosophy as the lookup-table
- * feature's `isSafeTableRead`/`checkTableSafety` above, with one MANDATORY implementation
- * difference and two deliberate strengthenings (see this section's own header comment for the
- * full "why"):
+ * The whole-function, top-down, fail-closed ALLOWLIST escape scan for `candidate`: TWO
+ * authorized shapes — the base identifier of an `ElementAccessExpression`, in READ position,
+ * whose index resolves to an in-range constant (Rule 6); and, ONLY when `allowReturnEscape` is
+ * true (a top-level `function main`, set by `localArrayFoldTransformer`), the bare identifier as
+ * the SOLE, entire operand of a `ReturnStatement` (Rule 6b) — every other occurrence of
+ * `candidate.name` anywhere in `body` disqualifies the whole candidate. Same philosophy as the
+ * lookup-table feature's `isSafeTableRead`/`checkTableSafety` above, with one MANDATORY
+ * implementation difference and two deliberate strengthenings (see this section's own header
+ * comment for the full "why"):
  *
  *  * MANDATORY: this must be a TOP-DOWN walk that classifies a node BEFORE descending into it,
  *    never consulting `.parent`. `isTableAccessUnsafeUsage` walks UP through `node.parent` — but
@@ -2596,7 +2609,7 @@ function scanAssignmentTarget(node, name, scan, disqualify) {
  * so a legitimate cross-array READ of `candidate` sitting inside it is still found and folded,
  * independent of whether `other` itself ever validates.
  */
-function scanArrayUses(candidate, body, statements, shadowed, top, out) {
+function scanArrayUses(candidate, body, statements, shadowed, top, out, allowReturnEscape, returnOut) {
     const name = candidate.name;
     let ok = true;
     const disqualify = () => {
@@ -2683,12 +2696,48 @@ function scanArrayUses(candidate, body, statements, shadowed, top, out) {
             scan(node.argumentExpression);
             return;
         }
+        // Rule 6b: THE one OTHER authorized shape — `return arr;` (or `return (arr);`, via
+        // `stripParens`) where `arr` is the SOLE, entire operand of a `ReturnStatement`, ONLY when
+        // `allowReturnEscape` is true (a top-level `function main` — see
+        // `localArrayFoldTransformer`; never a helper, see the "one escaping shape that IS
+        // authorized" doc note above this function). MUST sit before Rule 7 (the bare-Identifier
+        // catch-all that disqualifies `return arr;` today) and MUST intercept at the
+        // ReturnStatement level, since this scan is top-down and never consults `.parent` — by the
+        // time a bare `arr` reached as `node.expression` got to Rule 7, there would be no way to
+        // tell it apart from an alias/call-argument/spread bare identifier. Falling through WITHOUT
+        // matching (wrong shape, or `allowReturnEscape` false) leaves `node.expression` to be
+        // scanned normally below, so `return arr[0] + 1n;`/`return foo(arr);`/`return (arr, 5n);`
+        // still correctly reach Rules 6/5/7 exactly as before this rule existed.
+        if (allowReturnEscape && ts.isReturnStatement(node) && node.expression) {
+            const inner = stripParens(node.expression);
+            if (ts.isIdentifier(inner) && inner.text === name) {
+                // A negative element would make `encodeArray` (saucer/array.ts) THROW ("array elements
+                // must be literals or dynamic types") for a program that compiles fine TODAY via the
+                // heap `new Array` spelling (`compile('function main(){ return [-5n, 1n]; }')` already
+                // throws that same error) — folding must never turn a compiling program into a compile
+                // error, so bail instead of authorizing the escape. See "Forcing uint256 element width".
+                if (candidate.elements.some((v) => v < 0n)) {
+                    disqualify();
+                    return;
+                }
+                // This is the ONE sub-case of this whole pass that GROWS bytecode (a forced-wide 32-byte
+                // literal element vs. the small `SET_INDEX` it replaces) — a dedicated, smaller cap than
+                // `MAX_FOLDED_ARRAY_ELEMENTS` bounds that growth; see `MAX_FOLDED_RETURN_ARRAY_ELEMENTS`.
+                if (candidate.size > MAX_FOLDED_RETURN_ARRAY_ELEMENTS) {
+                    disqualify();
+                    return;
+                }
+                returnOut.set(inner, candidate.elements);
+                return;
+            }
+        }
         // Rule 7: a bare Identifier named `name`, reached by ANY other path — an alias, a call
-        // argument, `return arr;`, a spread, a template interpolation, `for (const v of arr)`'s
-        // iterated expression, `arr.length`/`arr.anything` (via its PropertyAccessExpression's
-        // `.expression` child, reached through rule 8's generic recursion), a redeclaration of the
-        // name anywhere in this same function scope (its OWN declaration binding name reached this
-        // way too, but is already skipped by the statement-identity check above) — disqualifies.
+        // argument, a spread, a template interpolation, `for (const v of arr)`'s iterated
+        // expression, `arr.length`/`arr.anything` (via its PropertyAccessExpression's `.expression`
+        // child, reached through rule 8's generic recursion), a redeclaration of the name anywhere
+        // in this same function scope (its OWN declaration binding name reached this way too, but
+        // is already skipped by the statement-identity check above), or `return arr;` when Rule 6b
+        // didn't authorize it (a helper, i.e. `allowReturnEscape` false) — disqualifies.
         // This single rule is what makes the allowlist TOTAL: no special case is needed for any of
         // the shapes just listed, or any shape not yet invented.
         if (ts.isIdentifier(node)) {
@@ -2707,12 +2756,16 @@ function scanArrayUses(candidate, body, statements, shadowed, top, out) {
  * (`containsNewArrayConstruction`), `collectArrayCandidates`, then — per candidate — the TDZ
  * check (any occurrence in `statements[0, declIndex)` disqualifies — real TDZ; SauceScript would
  * reject it as `undefined variable:` regardless) and `scanArrayUses`. Accumulates every
- * successfully-folded candidate's deletions/access-values into ONE `LocalArrayPlan` — a function
- * with two independent local arrays where only one validates still gets that one folded, the
- * other left completely untouched. Returns `undefined` (nothing to do) when the gate fails, no
- * candidates exist, or every candidate fails its own scan.
+ * successfully-folded candidate's deletions/access-values/return-arrays into ONE
+ * `LocalArrayPlan` — a function with two independent local arrays where only one validates still
+ * gets that one folded, the other left completely untouched. Returns `undefined` (nothing to do)
+ * when the gate fails, no candidates exist, or every candidate fails its own scan.
+ *
+ * `allowReturnEscape` (default false — every existing caller/behavior is unchanged) gates
+ * `scanArrayUses`'s Rule 6b, the ONE new authorized escape shape: `localArrayFoldTransformer`
+ * passes `true` only for a top-level `function main`.
  */
-function analyzeLocalArrays(body, shadowed, top) {
+function analyzeLocalArrays(body, shadowed, top, allowReturnEscape = false) {
     if (!containsNewArrayConstruction(body))
         return undefined;
     const statements = body.statements;
@@ -2721,6 +2774,7 @@ function analyzeLocalArrays(body, shadowed, top) {
         return undefined;
     const deleteStatements = new Set();
     const accessValues = new Map();
+    const returnArrays = new Map();
     const deletedNames = new Set();
     for (const candidate of candidates) {
         let occursBeforeDecl = false;
@@ -2731,18 +2785,22 @@ function analyzeLocalArrays(body, shadowed, top) {
         if (occursBeforeDecl)
             continue;
         const candidateAccessValues = new Map();
-        if (!scanArrayUses(candidate, body, statements, shadowed, top, candidateAccessValues))
+        const candidateReturnArrays = new Map();
+        if (!scanArrayUses(candidate, body, statements, shadowed, top, candidateAccessValues, allowReturnEscape, candidateReturnArrays)) {
             continue;
+        }
         deleteStatements.add(candidate.declStatement);
         for (const w of candidate.writeStatements)
             deleteStatements.add(w);
         for (const [node, value] of candidateAccessValues)
             accessValues.set(node, value);
+        for (const [node, values] of candidateReturnArrays)
+            returnArrays.set(node, values);
         deletedNames.add(candidate.name);
     }
     if (deletedNames.size === 0)
         return undefined;
-    return { deleteStatements, accessValues, deletedNames };
+    return { deleteStatements, accessValues, returnArrays, deletedNames };
 }
 /**
  * Applies a validated `LocalArrayPlan` to `body`: drops every statement in
@@ -2753,17 +2811,27 @@ function analyzeLocalArrays(body, shadowed, top) {
  * flattener/the STRETCH `for...of` table unroller — no need for
  * `collidesWithSurroundingDeclarations` either: REMOVING statements can never introduce a
  * duplicate lexical declaration the way INSERTING spliced copies can. What's left is then
- * visited once, replacing every node present in `plan.accessValues` with its literal by IDENTITY
- * — this rewriter never re-derives or re-checks anything the analysis already proved; a node
- * either is one of the accepted `ElementAccessExpression`s or it isn't, so there is no scope
+ * visited once, replacing every node present in `plan.returnArrays`/`plan.accessValues` with its
+ * literal by IDENTITY — this rewriter never re-derives or re-checks anything the analysis
+ * already proved; a node either is one of the accepted nodes or it isn't, so there is no scope
  * logic and no `.parent` access here at all. A nested function-like scope is an OPAQUE LEAF
  * (mirroring `substituteLocalReads`'s identical treatment one section below) — by
  * `scanArrayUses` rule 2, no candidate ever survives with a use inside one, so there is nothing
  * to replace there anyway; it gets its own independent visit from the driver regardless.
+ *
+ * `wideSink` (the out-of-band width-forcing meta channel — see "Forcing uint256 element width")
+ * records the fingerprint (`elements.join(',')`) of every literal array THIS rewrite
+ * synthesizes from a `plan.returnArrays` entry, so `compile()` can force BYTE_32 element width
+ * for the matching return-position array literal once `acorn` re-parses the emitted text.
  */
-function rewriteFoldedArrayBody(body, plan, context) {
+function rewriteFoldedArrayBody(body, plan, context, wideSink) {
     const survivors = body.statements.filter((s) => !plan.deleteStatements.has(s));
     const visit = (node) => {
+        const returnValues = plan.returnArrays.get(node);
+        if (returnValues !== undefined) {
+            wideSink?.add(returnValues.join(','));
+            return ts.factory.createArrayLiteralExpression(returnValues.map((v) => toLiteralNode(v)));
+        }
         const value = plan.accessValues.get(node);
         if (value !== undefined)
             return toLiteralNode(value) ?? node;
@@ -2790,8 +2858,13 @@ function rewriteFoldedArrayBody(body, plan, context) {
  * `for` loop pushes a genuine new one), and — for a named function declaration/expression only,
  * never an arrow or a method/getter/setter, which can't reference their own key as a variable —
  * its own name.
+ *
+ * `wideSink` (optional — the out-of-band width-forcing meta channel `tsPartialEvalWithMeta`
+ * threads through, see "Forcing uint256 element width") is handed straight to
+ * `rewriteFoldedArrayBody`, which records a fingerprint there whenever it actually synthesizes a
+ * literal array from a Rule 6b return-escape.
  */
-function localArrayFoldTransformer(top) {
+function localArrayFoldTransformer(top, wideSink) {
     return (context) => {
         const visit = (node) => {
             if (isOutOfScopeForPropagation(node))
@@ -2809,16 +2882,30 @@ function localArrayFoldTransformer(top) {
             if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) {
                 shadowed.add(node.name.text);
             }
-            const plan = analyzeLocalArrays(node.body, shadowed, top);
+            // The ONE new authorized escape shape (`scanArrayUses` Rule 6b, `return arr;`) is gated to
+            // a top-level `function main` ONLY — see the "one escaping shape that IS authorized" doc
+            // note above `scanArrayUses` for the full "why" (a helper's returned array has no working
+            // consumer TODAY — every read/write across the call boundary already reverts — but folding
+            // it into an IMMUTABLE packed literal could regress a future fix to that PRE-EXISTING gap;
+            // main's return value structurally can't have that exposure — it exits the SauceScript
+            // program entirely and `main` itself is never callable). `node.name?.text === 'main'` also
+            // correctly sees through `export function main() {…}` (an ordinary `FunctionDeclaration`
+            // either way) and correctly excludes `const main = () => {…}` (an ArrowFunction, not a
+            // FunctionDeclaration) and a method/getter/setter/accessor named `main`.
+            const isMain = ts.isFunctionDeclaration(node) && node.name?.text === 'main';
+            const plan = analyzeLocalArrays(node.body, shadowed, top, isMain);
             if (!plan)
                 return ts.visitEachChild(node, visit, context);
-            const rewritten = rewriteFoldedArrayBody(node.body, plan, context);
+            const rewritten = rewriteFoldedArrayBody(node.body, plan, context, wideSink);
             // Post-condition guard: sound BY CONSTRUCTION per the scan's own allowlist argument, but
             // cheap enough to also verify BY CHECKING — converting "sound by argument" into "sound by
             // construction" the same way `deadConstEliminationTransformer`'s own design note
             // discusses. If any deleted name still occurs anywhere in the rewritten body, the whole
             // rewrite for THIS scope is thrown away (falls back to the original, untouched node)
-            // rather than ever risk handing back a dangling reference to a removed declaration.
+            // rather than ever risk handing back a dangling reference to a removed declaration. This
+            // still does real work for a Rule 6b fold: the folded `return arr;` no longer mentions
+            // `arr` at all once rewritten to a literal array, so a leftover occurrence of `arr`
+            // ANYWHERE else in the rewritten body still throws the whole rewrite away.
             const stale = [...plan.deletedNames].some((name) => referencesIdentifier(rewritten, name));
             const newNode = stale ? node : updateFunctionLikeBody(node, rewritten);
             return ts.visitEachChild(newNode, visit, context);
@@ -3635,12 +3722,7 @@ function localConstPropagationTransformer(top) {
         };
     };
 }
-/**
- * Fold provably-constant branches/expressions/loops in a `.ts`/`.sauce.ts` module and
- * strip types, returning plain JS text ready for `acorn.parse`. Pure function of its input
- * text.
- */
-export function tsPartialEval(code, filePath) {
+export function tsPartialEvalWithMeta(code, filePath) {
     const sourceFile = ts.createSourceFile(filePath, code, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
     const functions = collectTopLevelFunctions(sourceFile);
     const { consts, primaryNames, pairNames } = analyzeTopLevelConsts(sourceFile, functions);
@@ -3649,6 +3731,7 @@ export function tsPartialEval(code, filePath) {
     // prune away (see the "Array/object lookup-table folding" section above).
     const tables = collectTopLevelTables(sourceFile, consts, functions);
     const topLevelContext = { consts, functions };
+    const wideReturnArrays = new Set();
     const result = ts.transpileModule(code, {
         fileName: filePath,
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
@@ -3665,8 +3748,9 @@ export function tsPartialEval(code, filePath) {
                 // why this runs AFTER every top-level-scoped pass above (a write value may read a table/
                 // top-level const only THEY resolve) but strictly BEFORE the local scalar pass below (a
                 // folded element read is what lets THAT pass finish an accumulator all the way to a
-                // literal — the reverse order would leave it NAC).
-                localArrayFoldTransformer(topLevelContext),
+                // literal — the reverse order would leave it NAC). `wideReturnArrays` is populated here,
+                // in place, whenever Rule 6b actually fires (see `rewriteFoldedArrayBody`).
+                localArrayFoldTransformer(topLevelContext, wideReturnArrays),
                 // Runs LAST, consuming everything above's output: a control-flow-sensitive, LOCAL
                 // (per-function) constant propagation — see the "Local (per-function) constant
                 // propagation" section above for the full design.
@@ -3674,5 +3758,14 @@ export function tsPartialEval(code, filePath) {
             ],
         },
     });
-    return result.outputText;
+    return { text: result.outputText, wideReturnArrays };
+}
+/**
+ * Fold provably-constant branches/expressions/loops in a `.ts`/`.sauce.ts` module and
+ * strip types, returning plain JS text ready for `acorn.parse`. Pure function of its input
+ * text. A thin, signature-preserving wrapper over `tsPartialEvalWithMeta` — see there for the
+ * width-forcing meta channel this drops.
+ */
+export function tsPartialEval(code, filePath) {
+    return tsPartialEvalWithMeta(code, filePath).text;
 }

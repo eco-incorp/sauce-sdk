@@ -19,7 +19,7 @@ import { estimatePacket } from './planner/index.js';
 import type { AccountPlan } from './planner/index.js';
 import { compileCacheKey, cloneCompileResult, getDefaultCompileCache } from './cache.js';
 import type { CompileCache } from './cache.js';
-import { tsPartialEval } from './ts-frontend.js';
+import { tsPartialEvalWithMeta } from './ts-frontend.js';
 
 export {
   createCompileCache,
@@ -298,7 +298,13 @@ function compileFresh(source: string, options: CompileOptions = {}): CompileResu
     throw new Error(`staged compilation requires target 'svm', got '${target}'`);
   }
 
-  const sourceText = options.tsSource ? tsPartialEval(source, options.label ?? 'source.ts') : source;
+  // `tsPartialEvalWithMeta` (not the signature-preserving `tsPartialEval` wrapper) so the
+  // out-of-band width-forcing signal the return-array escape fold produces (see
+  // ts-frontend.ts's "Forcing uint256 element width" doc note) survives past the plain-string
+  // hand-off to `acorn.parse` — `pre` is `undefined` entirely for a non-tsSource compile, so
+  // `ctx.wideReturnArrays` below is never even touched in that case.
+  const pre = options.tsSource ? tsPartialEvalWithMeta(source, options.label ?? 'source.ts') : undefined;
+  const sourceText = pre ? pre.text : source;
 
   const ast = acorn.parse(sourceText, {
     ecmaVersion: 'latest',
@@ -311,6 +317,8 @@ function compileFresh(source: string, options: CompileOptions = {}): CompileResu
   ctx.treeshake = options.treeshake ?? true;
   ctx.fold = options.fold ?? true;
   ctx.setStaged(staged);
+
+  if (pre && pre.wideReturnArrays.size > 0) ctx.wideReturnArrays = pre.wideReturnArrays;
 
   if (options.defines) ctx.setDefines(options.defines);
 

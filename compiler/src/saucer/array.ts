@@ -43,7 +43,20 @@ const encodeLength = (length: number): { op: number; bytes: number[] } =>
     ? { op: OPS.ARRAY, bytes: [length] }
     : { op: OPS.ARRAY_2, bytes: [(length >> 8) & 0xff, length & 0xff] };
 
-export const encodeArray = (elements: BuilderNode[]): Uint8Array => {
+/**
+ * `forcedWidth` (optional): only ever passed by `processReturnStatement`'s width-forcing branch
+ * for a return-position array literal the ts-frontend's local-array return-escape fold
+ * synthesized (see ts-frontend.ts's "Forcing uint256 element width" doc note) — NOT a general
+ * width-selection knob for an ordinary, directly user-written array literal, which keeps its
+ * existing auto-narrowed encoding (via `maxByteWidth`) completely unchanged either way.
+ * `Math.max(forcedWidth, natural)` means a forced width can only WIDEN a value's encoding,
+ * never truncate one — `packStaticElements`/`padToWidth` need no change at all, since they
+ * already zero-left-pad to whatever `width` they're given. Only meaningful in the `allStatic`
+ * branch (every element the fold synthesizes is a non-negative bigint literal, which always
+ * encodes as a STATIC type) — passing it alongside a dynamic-element array throws defensively,
+ * since there is no such caller today and honoring it silently would be misleading.
+ */
+export const encodeArray = (elements: BuilderNode[], forcedWidth?: number): Uint8Array => {
   if (elements.length === 0) return new Uint8Array([OPS.ARRAY, 0, OPS.BYTE_1]);
 
   if (elements.length > MAX_BYTE_2)
@@ -52,9 +65,21 @@ export const encodeArray = (elements: BuilderNode[]): Uint8Array => {
   const { op, bytes: lengthBytes } = encodeLength(elements.length);
 
   if (allStatic(elements)) {
-    const width = maxByteWidth(elements);
+    const natural = maxByteWidth(elements);
+    const width = forcedWidth !== undefined ? Math.max(forcedWidth, natural) : natural;
+
+    if (!(width in BYTE_OPS)) throw new Error(`invalid forced array element width: ${width} (must be 1..32)`);
 
     return new Uint8Array([op, ...lengthBytes, BYTE_OPS[width], ...packStaticElements(elements, width)]);
+  }
+
+  if (forcedWidth !== undefined) {
+    // Defensive, unreachable in practice today: the only caller of `forcedWidth`
+    // (the return-array escape fold) only ever synthesizes non-negative bigint element
+    // literals, which always take the `allStatic` branch above — this guards against a
+    // future caller misapplying `forcedWidth` to a dynamic-element array literal, where
+    // "width" has no meaning.
+    throw new Error('forcedWidth is only supported for a static (fixed-width) array literal');
   }
 
   if (!allDynamic(elements))

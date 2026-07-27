@@ -223,8 +223,8 @@ export class Saucer implements SaucerLike {
     return this.with(encodeString(value));
   }
 
-  array(elements: Saucer[]): Saucer {
-    return this.with(encodeArray(elements));
+  array(elements: Saucer[], forcedWidth?: number): Saucer {
+    return this.with(encodeArray(elements, forcedWidth));
   }
 
   tuple(elements: Saucer[]): Saucer {
