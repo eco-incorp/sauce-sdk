@@ -1,5 +1,5 @@
-import { compile, type CompileTarget } from '../src/index.js';
-import { tsPartialEval } from '../src/ts-frontend.js';
+import { compile, type CompileTarget, clearDefaultCompileCache } from '../src/index.js';
+import { tsPartialEval, tsPartialEvalWithMeta } from '../src/ts-frontend.js';
 import { OPS } from '../src/saucer/ops.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -1277,6 +1277,231 @@ describe('tsPartialEval (local `new Array(n)` construction folding)', () => {
     expect(out).toContain('if (');
   });
 
+  // ── return-escape fold: `return arr;` in main() → a literal array, forced to uint256/BYTE_32 ──
+  //
+  // The ONE new authorized escape shape beyond Rule 6's element read (`scanArrayUses` Rule 6b):
+  // `return arr;` (or `return (arr);`), as the SOLE, entire operand of a `ReturnStatement`, in a
+  // top-level `function main` ONLY, for a fully-resolved (every element known, none negative)
+  // candidate. WHY this is safe at all: today a `new Array(n)`-built TUPLE returned from a Sauce
+  // program leaks raw Solidity MEMORY ADDRESSES (v1's `execute()` returns `ctx.dynamicResult.data`
+  // verbatim for a TUPLE — see the integration test's own real-EVM proof), so replacing it with a
+  // REAL, well-defined literal array is a strict improvement, not a behavior change any real
+  // consumer could observe. WHY main()-only: a helper's returned array has no working consumer
+  // TODAY (every read/write across the call boundary already reverts — see the integration
+  // test's `ts-frontend-array.test.ts` note), but folding it into an IMMUTABLE packed literal
+  // could regress a FUTURE fix to that gap; main's value structurally can't have that exposure —
+  // it exits the program and `main` itself is never callable.
+  describe('return-escape fold: `return arr;` in main() → literal array, forced-width encoding', () => {
+    it('the motivating case (formerly a decline test): `return arr;` in main() now folds to a literal array', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return arr; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).not.toContain('new Array');
+      expect(out).toContain('return [1n, 2n];');
+    });
+
+    it('straight-line construction folds to a literal array return', () => {
+      const source = `
+        function main() {
+          const arr = new Array(3);
+          arr[0] = 0n;
+          arr[1] = 2n;
+          arr[2] = 4n;
+          return arr;
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).not.toContain('new Array');
+      expect(out).toContain('return [0n, 2n, 4n];');
+    });
+
+    it('an unrolled-loop construction folds to the SAME literal array return as straight-line writes — composes with the loop unroller exactly like the existing element-read rule does', () => {
+      const source = `
+        function main() {
+          const arr = new Array(3);
+          for (let i = 0n; i < 3n; i++) { arr[i] = i * 2n; }
+          return arr;
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).not.toContain('new Array');
+      expect(out).toContain('return [0n, 2n, 4n];');
+    });
+
+    it('parenthesized `return (arr);` folds too — `stripParens` sees through the wrapper', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return (arr); }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).not.toContain('new Array');
+      expect(out).toContain('[1n, 2n]');
+
+      // The parenthesized shape still compiles end to end (not just a text-shape assertion).
+      const result = compile(source, { tsSource: true });
+
+      expect(Array.from(result.bytecode[0])).not.toContain(OPS.NEW_ARRAY);
+    });
+
+    it('`export function main` folds too — `extractFunctionDeclarations` already treats it as main', () => {
+      const source = `export function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return arr; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).not.toContain('new Array');
+      expect(out).toContain('return [1n, 2n];');
+    });
+
+    it('multiple returns of the same array all fold, AND a return coexists with an element-read of the same array — both fold independently', () => {
+      const source = `
+        function main(c) {
+          const a = new Array(2);
+          a[0] = 1n;
+          a[1] = 2n;
+          if (c === 1n) { return a; }
+          return a[0];
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).not.toContain('new Array');
+      expect(out).not.toContain('a[');
+      expect(out).toContain('return [1n, 2n];');
+      expect(out).toContain('return 1n;');
+    });
+
+    describe('MAX_FOLDED_RETURN_ARRAY_ELEMENTS (64) boundary', () => {
+      const makeSource = (n: number): string => {
+        const writes = Array.from({ length: n }, (_, i) => `arr[${i}] = ${i}n;`).join(' ');
+
+        return `function main() { const arr = new Array(${n}); ${writes} return arr; }`;
+      };
+
+      it('exactly at the cap (64 elements) folds', () => {
+        const out = tsPartialEval(makeSource(64), 'f.ts');
+
+        expect(out).not.toContain('new Array');
+      });
+
+      it('one over the cap (65 elements) disqualifies — the growth-direction cap is separate from (and smaller than) MAX_FOLDED_ARRAY_ELEMENTS (256)', () => {
+        const out = tsPartialEval(makeSource(65), 'f.ts');
+
+        expect(out).toContain('new Array(');
+      });
+    });
+
+    describe('width mechanism: forcing BYTE_32 (uint256) element width', () => {
+      it('bytecode-exact: the folded array literal is BYTE_32-forced — element-type byte 0x20 and 3 32-byte words, not the auto-narrowed 1-byte packing', () => {
+        const source = `
+          function main() {
+            const arr = new Array(3);
+            arr[0] = 0n;
+            arr[1] = 2n;
+            arr[2] = 4n;
+            return arr;
+          }
+        `;
+        const result = compile(source, { tsSource: true });
+        const bytes = result.bytecode[0];
+
+        expect(bytes[0]).toBe(OPS.ARRAY);
+        expect(bytes[1]).toBe(3); // length
+        expect(bytes[2]).toBe(OPS.BYTE_32); // element-type byte — forced wide, not BYTE_1
+        // header(op,len,type) + 3 32-byte words + v1's trailing halt byte.
+        expect(bytes.length).toBe(3 + 3 * 32 + 1);
+
+        const hex = Buffer.from(bytes).toString('hex');
+        const word = (n: number): string => n.toString(16).padStart(64, '0');
+
+        // Word 0 = 0, word 1 = 2, word 2 = 4, each a full 32-byte big-endian value —
+        // exactly ABI-decodable as uint256[3].
+        expect(hex).toBe('9203' + '20' + word(0) + word(2) + word(4) + '00');
+      });
+
+      it('width non-contamination: an ordinary user-written array literal keeps its existing auto-narrowed encoding — identical WITH and WITHOUT tsSource, and unaffected by a fold elsewhere in the same file', () => {
+        const plainSource = `function main() { return [0n, 2n, 4n]; }`;
+        const withoutTs = compile(plainSource);
+        const withTs = compile(plainSource, { tsSource: true });
+
+        expect(Buffer.from(withoutTs.bytecode[0]).toString('hex')).toBe('92030100020400');
+        expect(Buffer.from(withTs.bytecode[0]).toString('hex')).toBe('92030100020400');
+      });
+
+      it('width non-contamination, the mixed-file case: a user-written return-position literal and a fold-synthesized one in the SAME main() both compile — the user one stays narrow, the fold-synthesized one is wide', () => {
+        const source = `
+          function main(c) {
+            if (c === 1n) { return [1n, 2n]; }
+            const arr = new Array(3);
+            arr[0] = 0n;
+            arr[1] = 2n;
+            arr[2] = 4n;
+            return arr;
+          }
+        `;
+        const result = compile(source, { tsSource: true, args: [1n] });
+        const hex = Buffer.from(result.bytecode[0]).toString('hex');
+
+        expect(hex).toContain('9202010102'); // narrow, user-written [1n, 2n]: op,len(2),type(BYTE_1),01,02
+        expect(hex).toContain('920320'); // wide, fold-synthesized [0n, 2n, 4n]: op,len(3),type(BYTE_32)
+      });
+
+      it('`tsPartialEvalWithMeta` returns the expected fingerprint set; `tsPartialEval` keeps its plain-string, non-breaking signature', () => {
+        const source = `
+          function main() {
+            const arr = new Array(3);
+            arr[0] = 0n;
+            arr[1] = 2n;
+            arr[2] = 4n;
+            return arr;
+          }
+        `;
+        const meta = tsPartialEvalWithMeta(source, 'f.ts');
+
+        expect(meta.wideReturnArrays).toEqual(new Set(['0,2,4']));
+        expect(meta.text).toBe(tsPartialEval(source, 'f.ts'));
+        expect(typeof tsPartialEval(source, 'f.ts')).toBe('string');
+      });
+
+      it('`tsPartialEvalWithMeta` returns an EMPTY fingerprint set for a source with no such fold', () => {
+        const meta = tsPartialEvalWithMeta(`function main() { return 5n; }`, 'f.ts');
+
+        expect(meta.wideReturnArrays.size).toBe(0);
+      });
+
+      it("v12 and svm targets produce the same wide array-literal bytes as v1 (minus v1's trailing halt byte) — the encoder is shared across all three targets", () => {
+        const source = `
+          function main() {
+            const arr = new Array(3);
+            arr[0] = 0n;
+            arr[1] = 2n;
+            arr[2] = 4n;
+            return arr;
+          }
+        `;
+        const v1 = compile(source, { tsSource: true, target: 'v1' });
+        const v12 = compile(source, { tsSource: true, target: 'v12' });
+        const svm = compile(source, { tsSource: true, target: 'svm' });
+
+        const v1Hex = Buffer.from(v1.bytecode[0]).toString('hex');
+        const v12Hex = Buffer.from(v12.bytecode[0]).toString('hex');
+        const svmHex = Buffer.from(svm.bytecode[0]).toString('hex');
+
+        expect(v1Hex).toBe(v12Hex + '00'); // v1 appends a trailing halt byte
+        expect(svmHex).toBe(v12Hex); // svm shares v12's postfix encoder exactly
+      });
+
+      it('a cached recompile of a main()-return-fold source still returns the wide (BYTE_32) bytecode', () => {
+        clearDefaultCompileCache();
+        const source = `function main() { const arr = new Array(3); arr[0] = 0n; arr[1] = 2n; arr[2] = 4n; return arr; }`;
+        const first = compile(source, { tsSource: true });
+        const second = compile(source, { tsSource: true }); // cache hit — same (source, options) key
+
+        expect(Array.from(second.bytecode[0])).toEqual(Array.from(first.bytecode[0]));
+        expect(second.bytecode[0][2]).toBe(OPS.BYTE_32);
+        clearDefaultCompileCache();
+      });
+    });
+  });
+
   describe('adversarial: every one of these DECLINES to fold (leaves real NEW_ARRAY/SET_INDEX/INDEX bytecode) — still correct, just unfolded', () => {
     it('aliasing (`const b = arr; return b[0];`) disqualifies', () => {
       const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; const b = arr; return b[0]; }`;
@@ -1304,11 +1529,125 @@ describe('tsPartialEval (local `new Array(n)` construction folding)', () => {
       expect(out).toContain('new Array(');
     });
 
-    it('returning the bare identifier (`return arr;`) disqualifies', () => {
-      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return arr; }`;
+    // The bare-identifier `return arr;` shape ITSELF now FOLDS in main() — see the new
+    // "return-escape fold" describe block right after this one for that positive coverage and
+    // the width mechanism it relies on. The decline coverage below replaces this test with the
+    // shapes that still correctly disqualify even with the new Rule 6b in play.
+    it('`return arr;` in a HELPER (not main) still disqualifies — the return-escape fold is gated to main() ONLY', () => {
+      const source = `
+        function h() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          return arr;
+        }
+        function main() {
+          return h();
+        }
+      `;
       const out = tsPartialEval(source, 'f.ts');
 
       expect(out).toContain('new Array(');
+
+      const result = compile(source, { tsSource: true, treeshake: false });
+
+      expect(Array.from(result.bytecode[0])).toContain(OPS.NEW_ARRAY);
+    });
+
+    it('`return arr;` from an ARROW-bound `main` still disqualifies — the fold only recognizes a top-level `function main`', () => {
+      const source = `
+        const main = () => {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          return arr;
+        };
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('a NEGATIVE element disqualifies the return-escape fold — folding it would turn a compiling program into a compile ERROR', () => {
+      const source = `
+        function main() {
+          const arr = new Array(2);
+          arr[0] = -5n;
+          arr[1] = 2n;
+          return arr;
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+
+      // Pinning WHY the bail exists: the equivalent hand-written literal already throws today,
+      // independent of this feature — `encodeArray`'s `allStatic`/`allDynamic` check rejects a
+      // NEG-prefixed element outright.
+      expect(() => compile('function main(){ return [-5n, 1n]; }')).toThrow(/array elements must be literals/);
+    });
+
+    it('`return (arr, 5n);` (a comma expression, not the bare identifier) disqualifies', () => {
+      const source = `
+        function main() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          return (arr, 5n);
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('`const b = arr; return b;` (aliasing, THEN returning the alias) disqualifies', () => {
+      const source = `
+        function main() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          const b = arr;
+          return b;
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('`return foo(arr);` (the array passed as a call argument, in return position) disqualifies', () => {
+      const source = `
+        function foo(x) { return x[0]; }
+        function main() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          return foo(arr);
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('a HOLE (partial writes) plus `return arr;` disqualifies — Rule 6b never even runs for a candidate that never validated in the first place', () => {
+      const source = `
+        function main() {
+          const arr = new Array(3);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          return arr;
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+
+      const result = compile(source, { tsSource: true });
+
+      expect(Array.from(result.bytecode[0])).toContain(OPS.NEW_ARRAY);
+      expect(Array.from(result.bytecode[0])).toContain(OPS.SET_INDEX);
     });
 
     it('partial writes (a hole — only 2 of 3 indices written) disqualifies', () => {

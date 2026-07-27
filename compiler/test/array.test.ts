@@ -1,5 +1,7 @@
 import { compile } from '../src/index.js';
 import { OPS } from '../src/saucer/index.js';
+import { encodeArray } from '../src/saucer/array.js';
+import { encodeInt } from '../src/saucer/integer.js';
 
 describe('array', () => {
   it('compiles integer array', () => {
@@ -90,5 +92,50 @@ describe('array', () => {
     expect(result.bytecode[0][4]).toBe(OPS.ARRAY);
     expect(result.bytecode[0][5]).toBe(2); // length
     expect(result.bytecode[0][6]).toBe(OPS.BYTES); // element type is BYTES (dynamic)
+  });
+
+  // `encodeArray`'s `forcedWidth` parameter — the width-forcing mechanism the ts-frontend's
+  // `return arr;` return-escape fold (see ts-frontend.ts's "Forcing uint256 element width" doc
+  // note) uses to make a synthesized literal array return real ABI-decodable `uint256[N]`
+  // instead of the auto-narrowed encoding an ordinary array literal gets. `encodeArray` itself
+  // has no notion of ts-frontend/main()/folds — these are pure encoder-level unit tests.
+  describe('encodeArray forcedWidth', () => {
+    const node = (value: bigint) => ({ _bytes: encodeInt(value) });
+
+    it('omitted forcedWidth is unchanged — auto-narrows exactly like before', () => {
+      const bytes = encodeArray([node(0n), node(2n), node(4n)]);
+
+      expect(Array.from(bytes)).toEqual([OPS.ARRAY, 3, OPS.BYTE_1, 0, 2, 4]);
+    });
+
+    it('forcedWidth widens a narrower-than-forced encoding', () => {
+      const bytes = encodeArray([node(0n), node(2n), node(4n)], 32);
+
+      expect(bytes[0]).toBe(OPS.ARRAY);
+      expect(bytes[1]).toBe(3); // length
+      expect(bytes[2]).toBe(OPS.BYTE_32); // forced element-type byte
+      expect(bytes.length).toBe(3 + 3 * 32); // header + 3 32-byte words
+      // Each element is left-zero-padded to 32 bytes, e.g. element 0 (value 2) is
+      // 31 zero bytes then 0x02.
+      const word1 = bytes.slice(3 + 32, 3 + 64);
+      expect(Array.from(word1)).toEqual([...Array(31).fill(0), 2]);
+    });
+
+    it("forcedWidth narrower than an element's OWN natural width never truncates it (Math.max floor)", () => {
+      // A 32-byte-magnitude element already needs BYTE_32 on its own — forcing width 1 must not
+      // shrink the encoding and silently corrupt the value.
+      const big = (1n << 256n) - 1n; // 2^256 - 1, needs the full 32 bytes
+      const bytes = encodeArray([node(big)], 1);
+
+      expect(bytes[2]).toBe(OPS.BYTE_32);
+      expect(bytes.length).toBe(3 + 32);
+      expect(Array.from(bytes.slice(3))).toEqual(Array(32).fill(0xff));
+    });
+
+    it('forcedWidth on a dynamic-element array throws defensively (unreachable via any real caller today)', () => {
+      const dynamicNode = { _bytes: new Uint8Array([OPS.BYTES, 1, 0xff]) };
+
+      expect(() => encodeArray([dynamicNode], 32)).toThrow('forcedWidth is only supported');
+    });
   });
 });
