@@ -296,6 +296,36 @@ const transpilerVectors: {
     expected: 42, // object literal is a TUPLE (mutable) → SET_INDEX by field index
     kind: 'uint',
   },
+  // ── same-file function return-kind inference (regression lock — v12/svm already
+  // worked before this fix, for an unrelated reason: V12Saucer.store derives its kind
+  // from value.isDynamic, not the _kind parameter inference.ts computes — see CLAUDE.md's
+  // "Same-file user-function return-kind inference" note). These lock in that v12 stays
+  // correct now that v1 (compiler/integration-test/function-return-kind.test.ts) has been
+  // fixed to agree.
+  {
+    name: 'helper_returns_array_mutate',
+    src: `
+      function helper() { let a = new Array(3); a[0] = 1; a[1] = 2; a[2] = 3; return a }
+      function main() { let arr = helper(); arr[0] = 42; return arr[0] + arr[1] * 10 }
+    `,
+    expected: 62,
+    kind: 'uint',
+  },
+  {
+    name: 'helper_returns_array_readonly',
+    src: `
+      function helper() { let a = new Array(3); a[0] = 1; a[1] = 2; a[2] = 3; return a }
+      function main() { let arr = helper(); return arr[1] }
+    `,
+    expected: 2,
+    kind: 'uint',
+  },
+  {
+    name: 'alias_dynamic_local',
+    src: 'function main(){ let a = new Array(3); a[1] = 2; let b = a; b[0] = 42; return b[0] + b[1] * 10 }',
+    expected: 62,
+    kind: 'uint',
+  },
   {
     // A bare value-returning call must be SDROP'd or it leaks on the stack and
     // corrupts the fixed-position return — so a missing drop would make this return
@@ -397,6 +427,7 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(names.has('for_sum')).toBe(true); // loop back-jump arithmetic
     expect(names.has('newarray_setindex')).toBe(true); // builder array mutation
     expect(names.has('array_compound_assign')).toBe(true); // transpiler array mutation
+    expect(names.has('helper_returns_array_mutate')).toBe(true); // same-file return-kind inference
     expect(vectors.length).toBeGreaterThanOrEqual(25);
   });
 
@@ -412,6 +443,9 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(forgeOutput).toMatch(/ok unused_call_dropped 7/); // bare call result SDROP'd, stack balanced
     expect(forgeOutput).toMatch(/ok slice_cast_be_word_extract 1124073372/); // destructuring fast-path word extraction (incl. signed intN)
     expect(forgeOutput).toMatch(/ok destructure_fastpath_echo 2728699561/); // = 0x51525354*2+1 — end-to-end fast path via identity precompile (operand-order-sensitive)
+    expect(forgeOutput).toMatch(/ok helper_returns_array_mutate 62/); // same-file function return-kind inference (regression lock)
+    expect(forgeOutput).toMatch(/ok helper_returns_array_readonly 2/);
+    expect(forgeOutput).toMatch(/ok alias_dynamic_local 62/);
     expect(forgeOutput).not.toMatch(/\[FAIL/);
   });
 });

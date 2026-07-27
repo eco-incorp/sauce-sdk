@@ -139,6 +139,31 @@ describeSvm('integration: svm pure compute', () => {
       src: 'function main() { const d = abi.decode(abi.encode(1, 2, 3), "uint256", "uint256", "uint256"); return d[0] + d[1] + d[2] }',
       expected: 6n,
     },
+    // ── same-file function return-kind inference (regression lock) ──
+    // The v1 fix (compiler/src/processor/return-kind.ts + inference.ts) — see CLAUDE.md's
+    // "Same-file user-function return-kind inference" note — was needed because v1 stores
+    // a dynamic value's descriptor in a bare 32-byte VALUE slot if the storage kind is
+    // wrong, which silently destroys it. svm (a v12 dialect) already worked BEFORE that
+    // fix, for an unrelated reason: `V12Saucer.store` derives its kind straight from
+    // `value.isDynamic`, never consulting the (wrong, pre-fix) inferred `_kind` parameter
+    // at all — a dynamic value is a single 32-byte descriptor word here, so even a
+    // VALUE-region store/read round-trips it losslessly. These lock in that this stays
+    // true now that v1 has been fixed to agree.
+    {
+      name: 'helper returns new Array(n); main mutates arr[0] and combines with arr[1]',
+      src: 'function helper() { let a = new Array(3); a[0] = 1; a[1] = 2; a[2] = 3; return a }\nfunction main() { let arr = helper(); arr[0] = 42; return arr[0] + arr[1] * 10 }',
+      expected: 62n,
+    },
+    {
+      name: 'helper returns new Array(n); main reads an element with no mutation',
+      src: 'function helper() { let a = new Array(3); a[0] = 1; a[1] = 2; a[2] = 3; return a }\nfunction main() { let arr = helper(); return arr[1] }',
+      expected: 2n,
+    },
+    {
+      name: 'plain aliasing of a dynamic local (no function call)',
+      src: 'function main() { let a = new Array(3); a[1] = 2; let b = a; b[0] = 42; return b[0] + b[1] * 10 }',
+      expected: 62n,
+    },
   ];
 
   for (const { name, src, expected } of cases) {

@@ -116,37 +116,37 @@ describe('integration: local new Array(n) construction folding (ts-frontend)', (
   // allocation) — proving a decline path never silently changes the executed VALUE, and a
   // fold never changes it either, only the bytecode shape.
   //
-  // NOTE: an aliasing fixture (`const b = arr;`) and a call-argument fixture (`helper(arr)`)
-  // were deliberately tried here and DROPPED — both DO correctly decline to fold (confirmed:
-  // `compile(src, {tsSource:true})` and `compile(src)` emit byte-identical bytecode either
-  // way), but BOTH revert at real EVM execution with `SauceInvalidOperationArgs(INDEX)`
-  // regardless of tsSource — a genuine, PRE-EXISTING gap in the base compiler's handling of a
-  // heap-array descriptor escaping its own declaring scope (across a second variable, or a
-  // function-call boundary), wholly unrelated to this feature (this pass never touches either
-  // fixture — the identical revert with tsSource on AND off is the proof). Out of scope here.
+  // NOTE (UPDATED — see CLAUDE.md's "Same-file user-function return-kind inference" note):
+  // an aliasing fixture (`const b = arr;`) and a helper-return fixture (`let x = helper();
+  // x[0] = 5n; return x[0];`) were originally tried here and DROPPED, because both reverted
+  // at real EVM execution regardless of tsSource — a compile-time-VARIABLE-KIND-inference
+  // gap in the base (core-acorn-stack) compiler, wholly unrelated to this ts-frontend-only
+  // fold feature (this pass never touches either fixture — the identical revert with
+  // tsSource on AND off was the proof). That gap is now FIXED (a separate change, gated on
+  // neither `tsSource` nor this file's own fold feature): `inferKindWithContext`
+  // (processor/inference.ts) now infers a plain `Identifier` read against the SOURCE
+  // variable's own tracked kind (fixing aliasing), and a same-file function call against a
+  // fixpoint-analyzed `analyzeFunctionReturnKinds` map (processor/return-kind.ts, fixing the
+  // helper-return shape) instead of always defaulting to `scalar`. Both shapes — including
+  // the exact `helper()`-mutate/read-only pair once documented broken here — are now covered,
+  // with real EVM execution proof, in `integration-test/function-return-kind.test.ts`; this
+  // file is left AS IS below (still exercising ts-frontend-only fold/decline behavior, which
+  // is unaffected either way) rather than duplicating that coverage here.
   //
-  // EXTENDED (this branch, the return-escape fold's own justification): the SAME gap, in the
-  // RETURN direction, independently measured against the real deployed engine
-  // (`0xF342E9...` in one such run — the address `cook()` targets each test run, see
-  // `getSauceAddress()`), not merely asserted from the design brief:
-  //   function helper() { const a = new Array(2); a[0] = 1n; a[1] = 2n; return a; }
-  //   function main() { let x = helper(); x[0] = 5n; return x[0]; }
-  // reverts `SauceInvalidOperationArgs(0x9b)` (SET_INDEX) — the caller's mutation of the
-  // returned heap array. The read-only variant (`return x[0];` with no mutation) reverts
-  // `SauceInvalidOperationArgs(0x97)` (INDEX). Swapping `helper()`'s body for the LITERAL-array
-  // spelling this fold would produce (`function helper() { return [1n, 2n]; }`) reverts with the
-  // BYTE-IDENTICAL error in both cases (0x9b for the mutate variant, 0x97 for the read-only
-  // one) — so converting a helper's `return arr;` into an immutable packed literal changes
-  // NOTHING observable for either consumption shape; both were already broken identically. The
-  // ONE non-reverting cross-function shape, `function main() { const x = helper(); return x; }`
-  // (a bare variable round-trip, no indexing at all), returns `0x…0040` (64) for the heap
-  // spelling and `0x…0002` (2) for the literal spelling — both are meaningless garbage from a
-  // corrupted store/read round-trip (see the pointer-leak fixture below for what a REAL
-  // returned-array encoding looks like), just DIFFERENT garbage; no consumer can depend on
-  // either, and this shape never arises under the return-escape fold's actual main()-only scope
-  // regardless (a helper's return is never folded, only main's). This is the full empirical
-  // basis for gating the return-escape fold (`scanArrayUses` Rule 6b, ts-frontend.ts) to a
-  // top-level `function main` ONLY, not any function's return.
+  // STILL BROKEN, deliberately NOT fixed by the same change (a third, distinct instance of
+  // the same failure family — see `integration-test/function-return-kind.test.ts`'s own
+  // "KNOWN GAP" test and CLAUDE.md): a call-ARGUMENT fixture (`helper(arr)`, passing an
+  // existing dynamic local INTO a same-file function) still reverts
+  // `SauceInvalidOperationArgs(INDEX)` regardless of tsSource — the callee's own parameter is
+  // always inferred `scalar` with no per-call-site reasoning, and v1's engine additionally
+  // splits a dynamic argument into a separate heap-argument index space the compiler doesn't
+  // account for. Tracked, not silently missed; out of scope for this fix.
+  //
+  // The return-escape fold below (`scanArrayUses` Rule 6b, ts-frontend.ts) remains the ONLY
+  // way `main()`'s own bare `return arr;` (built directly inside `main`, not via a helper) is
+  // turned into the well-defined `uint256[N]` wire encoding — that fold is unrelated to (and
+  // unaffected by) the return-kind inference fix above, and still applies only to a
+  // provably-fully-constant array built directly in `main`'s own body.
   describe('equivalence: cook(tsSource) === cook(plain), fold and decline alike', () => {
     const fixtures: Record<string, string> = {
       'folds (straight-line writes)': `
