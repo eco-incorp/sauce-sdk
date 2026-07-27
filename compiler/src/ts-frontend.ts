@@ -44,6 +44,18 @@ const POLICY: NonNullable<EvaluateOptions['policy']> = {
 /** A countable `for` loop unrolls into at most this many copies of its body. */
 const MAX_UNROLL_ITERATIONS = 256;
 
+/** A local `new Array(n)` construction (see the "Local `new Array(n)` construction folding"
+ * section further below) folds only when `n` resolves to `1..this`. A SEPARATE cap, deliberately
+ * not a reuse of `MAX_UNROLL_ITERATIONS` even though it starts at the same value: that one bounds
+ * emitted BYTECODE GROWTH (N copies of a loop body), this one bounds the tracked ELEMENT TABLE
+ * and how many write statements the region classifier must match — sharing the identifier would
+ * silently couple two unrelated tuning decisions. 256 is the natural value regardless: a
+ * construction run realistically comes FROM an unrolled loop, itself capped at 256 — an array
+ * larger than that can only have been written by a loop that did NOT unroll, whose writes are
+ * disqualified by this pass anyway. Enforced at the declaration gate (`newArraySize`), before any
+ * `bigint[]` element table is even allocated, so a hostile `new Array(1e9)` costs one comparison. */
+const MAX_FOLDED_ARRAY_ELEMENTS = 256;
+
 /** Shared empty shadow set — module (top-level) scope has nothing shadowing it, and a
  * same-file top-level function's own body/defaults are evaluated fresh against this (see
  * `tsEvalCall`): its free variables can only be OTHER top-level bindings, never whatever
@@ -2178,10 +2190,12 @@ function countIdentifierRefs(root: ts.Node, name: string, exclude: ReadonlySet<t
 //
 // Explicitly OUT OF SCOPE (a literal simply never becomes a candidate, left alone like any other
 // non-fully-foldable initializer): `new Array(n)` (a wholly different, engine-level HEAP-allocated
-// SauceScript concept, untouched by any of this); a spread element inside the literal (`[...x]`,
-// `{...x}`); an object literal's shorthand/method/getter/setter property or a COMPUTED property
-// name in the DECLARATION itself (`{ [k]: v }`) — only plain `key: value` / `"key": value`
-// properties are supported; and a NESTED array/object literal as an element/property value
+// SauceScript concept — untouched by *this* table-folding feature specifically; a *function-local*
+// `new Array(n)` construction is folded by a separate mechanism, `localArrayFoldTransformer`, see
+// the "Local `new Array(n)` construction folding" section further below); a spread element inside
+// the literal (`[...x]`, `{...x}`); an object literal's shorthand/method/getter/setter property or
+// a COMPUTED property name in the DECLARATION itself (`{ [k]: v }`) — only plain `key: value` /
+// `"key": value` properties are supported; and a NESTED array/object literal as an element/property value
 // ("tables of tables") — deliberately rejected rather than supported, keeping the recursive-fold
 // requirement to one flat level and avoiding the extra soundness surface a nested escape analysis
 // would need. `for...in` is untouched (this feature only ever folds direct index/property reads,
@@ -2967,6 +2981,871 @@ function deadConstEliminationTransformer(
           ),
         ];
       });
+
+      return ts.factory.updateSourceFile(sourceFile, statements);
+    };
+  };
+}
+
+// ── Local `new Array(n)` construction folding ──
+//
+// SauceScript's only heap/TUPLE construct is `new Array(n)` — allocated at runtime via the
+// `NEW_ARRAY` opcode, written element-by-element via `SET_INDEX`, read via `INDEX`
+// (compiler/src/saucer/ops.ts). The loop-unroller above already turns a constant-bounded
+// `for`/`while` that BUILDS one of these (`for (let i = 0n; i < 3n; i++) { arr[i] = i * 2n; }`)
+// into N straight-line `arr[k] = v;` statements with `k`/`v` substituted to literals — but the
+// array itself stays a REAL runtime heap object even when every index and every written value
+// is already a literal by the time this pass runs: `NEW_ARRAY`/every `SET_INDEX`/every `INDEX`
+// remain genuine bytecode operations. This pass closes that gap: when a function-local
+// `new Array(n)`'s size, every element, and every later read index are ALL provably constant,
+// and the binding provably never escapes (aliased, returned, passed as an argument, mutated via
+// any method, iterated, etc.), the declaration, every construction write, and every resolvable
+// read are eliminated entirely, replaced by the bare literal each read would have produced.
+// Confirmed end to end: `function main() { const arr = new Array(3); for (let i = 0n; i < 3n;
+// i++) { arr[i] = i * 2n; } return arr[1]; }` now compiles BYTE-IDENTICAL to
+// `function main() { return 2n; }` — no NEW_ARRAY, no SET_INDEX, no INDEX anywhere.
+//
+// Runs as a SIXTH `before` stage in `tsPartialEval`'s pipeline — stage 5 of 6, inserted between
+// `deadConstEliminationTransformer` and `localConstPropagationTransformer` (which becomes stage
+// 6). Both boundaries are load-bearing, not arbitrary:
+//
+//  * AFTER `foldTransformer` — mandatory, not merely convenient. This pass recognizes ONLY
+//    already-straight-line `arr[k] = v;` statements; the motivating shape only BECOMES
+//    straight-line because `unrollCountingLoop`/`tryUnrollForLoop`/`tryUnrollCountingWhile`
+//    splice counter-substituted body copies directly into the ENCLOSING statement list.
+//    Recognizing an un-unrolled loop here would duplicate `extractStep`/`unrollCountingLoop`/
+//    `bodyBlocksUnrolling` wholesale, and re-derive `MAX_UNROLL_ITERATIONS` and
+//    `collidesWithSurroundingDeclarations` — this pass instead gets the `while`-counting idiom
+//    and the `for...of`-over-a-tracked-table unroller for free, since both produce the exact
+//    same spliced-statement shape the numeric `for` unroller does.
+//  * AFTER `tableFoldTransformer`/`constPropagationTransformer` — a write value may read a
+//    top-level lookup table (`arr[0] = TIERS[0];`) or a bare top-level const
+//    (`arr[0] = RATE;`); only those two stages turn either into a literal `evalArrayConst` can
+//    resolve. `foldTransformer` itself never substitutes a BARE Identifier read (only
+//    Binary/Unary/Template/Call — see its own header comment), so a bare top-level const read
+//    needs `constPropagationTransformer` to have already run.
+//  * BEFORE `localConstPropagationTransformer` — the load-bearing DIRECTION choice. Folding a
+//    read here is what lets the local scalar pass finish the job: the accumulator idiom
+//    (`const fees = new Array(3); fees[0] = 100n; ...; let total = 0n; for (...) { total +=
+//    fees[i]; }`) unrolls to `total += fees[0n]; total += fees[1n]; total += fees[2n];` — THIS
+//    pass turns each into `total += 100n;` etc., which is what lets stage 6 finish folding
+//    `total` all the way down to a bare `3600n` return. Run in the other order, stage 6 would
+//    already have given up on `total` (its RHS is an unresolvable `ElementAccessExpression` →
+//    NAC) before this pass ever got a chance to turn it into a literal. The price of this
+//    direction, paid deliberately: a write VALUE resolvable only through function-local scalar
+//    reasoning (`let base = 10n; arr[0] = base;`) is NOT folded by this pass (it has no
+//    `LocalResolution`/local-value bridge of its own — only `tsEvalConst` against the same-file
+//    TOP-LEVEL `consts`/`functions` this whole file's other top-level-scoped passes already
+//    trust) — a documented, deliberate v1 non-goal (see "Deliberately out of scope" below).
+//
+// A SEPARATE pass rather than a new `bigint | ArrayValue | NAC` variant threaded into
+// `localConstPropagationTransformer`'s own `env`: that pass's `collectWrittenNames` explicitly
+// (and correctly, TODAY) never collects a write through `arr[i] = x`, on the documented
+// rationale that "since this pass only ever tracks scalar bigint values — any array/heap-shaped
+// local is already NAC from its own declaration onward regardless". Teaching that `env` about
+// arrays would make that sentence FALSE, and turn a non-unrollable `while (cond) { arr[0] =
+// runtimeValue; }` into a genuine unsoundness (a later `arr[0]` read could fold to a STALE
+// literal). Keeping this as its own pass, running strictly BEFORE the local scalar pass, keeps
+// that invariant literally true and leaves the file's most delicate pass byte-for-byte
+// unmodified. Deletion is also a WHOLE-FUNCTION verdict (every index must be written, every use
+// must be resolvable, or NOTHING about the array changes) that a single forward emit-as-you-go
+// walk cannot decide without a separate up-front analysis anyway — see "Deliberately rejected
+// alternatives" further down for the two considered-and-rejected ways to recover the
+// `arr[0] = base` direction too.
+//
+// Scope: function-local ONLY — never top level, never a nested block, never a concise
+// (non-Block) arrow body.
+//
+//  1. Top level isn't merely unhelpful here, it's UNCOMPILABLE: `processProgram`
+//     (compiler/src/processor/index.ts) rejects any non-declaration top-level statement
+//     outright ("top-level statements not allowed, use function main()"), so a top-level
+//     `new Array` construction SEQUENCE (a declaration plus `arr[k] = v;` statements) can never
+//     exist in a compilable program to begin with. This also keeps the existing pinned test
+//     ("`new Array(n)` … is never treated as a lookup table") green BY CONSTRUCTION, not by
+//     luck: this pass never even looks at a top-level statement list.
+//  2. The construct is inherently function-local in real code: every one of the real
+//     `../sauce-recipes/ecoswap/ecoswap.sauce.ts` recipe's ~30 `new Array(...)` declarations is
+//     a `let` inside a function body.
+//  3. The declaration must be a DIRECT, single-declarator `let`/`const` entry of the function
+//     body's own top-level statement list (`fn.body.statements`) — never nested inside an
+//     `if`/loop/bare block. A construction started inside a conditionally-executed branch but
+//     read after it is genuinely path-sensitive, AND — because SauceScript shares scope across
+//     `if`/`while` bodies (`processIfStatement`/`processWhileStatement` never call
+//     `ctx.pushScope`, unlike `processForStatement` — see this file's repeated shadow-fix notes
+//     elsewhere) — such a binding really does persist past the branch, so it can't be dismissed
+//     as block-scoped. Fail closed instead; this costs nothing for the motivating shape, since
+//     `unrollCountingLoop` splices a loop's writes into whatever list the LOOP sat in — a
+//     top-level loop yields top-level writes.
+//  4. Nested function-like scopes are visited INDEPENDENTLY by the driver (the same recursion
+//     shape `localConstPropagationTransformer` uses one section below), each with its own fresh
+//     analysis; an outer candidate whose name occurs ANYWHERE inside a nested scope is
+//     disqualified outright (see `scanArrayUses` rule 2).
+//  5. A concise (non-`Block`) arrow body is skipped — nothing to delete a statement FROM.
+//
+// Read-fold rule: folding is a pure NODE-IDENTITY lookup, all-or-nothing per array. If even one
+// remaining occurrence of the name fails the escape scan, the WHOLE candidate is dropped and
+// NOTHING about it changes — unlike the lookup-table feature above (which can leave a single
+// unresolvable access untouched, since it only ever removes a declaration that already has zero
+// references), this pass DELETES the backing allocation, so "fold what's resolvable, leave the
+// rest" would leave a dangling reference to a removed binding — a hard `undefined variable:`
+// compile error, turning a WORKING program into a broken one. Declining always costs only an
+// optimization here: `new Array`/`SET_INDEX`/`INDEX` are fully supported runtime constructs on
+// both targets today, so every adversarial shape below still compiles, just less optimally.
+//
+// Deliberately out of scope for this first cut (each sound to add later, none blocking): partial
+// folding / read-index-only coverage (holes); duplicate writes under last-write-wins;
+// self-referential construction (`arr[1] = arr[0] + 1n`); compound element writes
+// (`arr[i] += x`); `.length` on a folded array (compiles today via `OPS.LENGTH`, but never
+// verified on-chain to equal the allocation size, so it disqualifies rather than folds);
+// unrolling `for (const v of arr)` over a proven local array (an ENABLING feature — today a hard
+// `not implemented: ForOfStatement` — deferred, since it needs the full
+// `tryUnrollForOfArrayTable`-style statement-list splicing apparatus); a ternary index/value
+// resolvable only through function-local reasoning (this pass has no `LocalResolution` bridge of
+// its own); and recovering the `arr[0] = base` direction, either by running this pass again
+// after the local scalar pass (cheap and idempotent — a folded array has no declaration left to
+// re-find — but deferred purely to keep the documented pipeline at six comprehensible stages for
+// this first cut) or by merging array tracking into the local pass's own env (rejected — see the
+// "SEPARATE pass" paragraph above for the unsoundness that would introduce).
+
+/**
+ * Everything this pass proves about ONE candidate `new Array(n)` local, computed inside the
+ * SAME `visit` call that will go on to rewrite the scope it was found in — so, unlike
+ * `analyzeTopLevelConsts` (which parses its OWN separate `ts.SourceFile` and can therefore only
+ * ever return NAMES), every node reference here is guaranteed valid: `declStatement`/
+ * `writeStatements` are real members of the CURRENT `fn.body.statements`, the same guarantee
+ * `deadConstEliminationTransformer` relies on and calls out ("identity is safe here — these node
+ * references come from THIS SAME sourceFile").
+ */
+interface LocalArrayCandidate {
+  /** The bound identifier's text. */
+  readonly name: string;
+  /** `1..MAX_FOLDED_ARRAY_ELEMENTS` — the resolved `new Array(<expr>)` argument. */
+  readonly size: number;
+  /** The whole declaring statement (single declarator, `let` or `const`). */
+  readonly declStatement: ts.VariableStatement;
+  /** Its index into `fn.body.statements`. */
+  readonly declIndex: number;
+  /** Exactly `size` recognized `arr[k] = v;` statements — a SUBSET of `fn.body.statements`. */
+  readonly writeStatements: ReadonlySet<ts.Statement>;
+  /** The `fn.body.statements` index of the LAST (by list position, not by write order — write
+   * order is unconstrained, see `classifyConstructionRegion`) recognized write. */
+  readonly lastWriteIndex: number;
+  /** TOTAL — length always `=== size`, never a hole — index `k` is the array's value at `k`. */
+  readonly elements: readonly bigint[];
+}
+
+/**
+ * The result of successfully folding one or more `LocalArrayCandidate`s in a single function
+ * scope — accumulated across every candidate that independently survives `scanArrayUses`, so a
+ * function with two arrays where only one folds still gets that one folded.
+ */
+interface LocalArrayPlan {
+  /** Every statement to drop — each candidate's OWN declaration + every one of its
+   * `writeStatements`, unioned across every successfully-folded candidate in this scope. */
+  readonly deleteStatements: ReadonlySet<ts.Statement>;
+  /** Every proven-resolvable `ElementAccessExpression` READ node → its literal value, keyed by
+   * node IDENTITY (never re-derived by the rewriter — see `rewriteFoldedArrayBody`). */
+  readonly accessValues: ReadonlyMap<ts.Node, bigint>;
+  /** Every candidate name actually folded — consulted only by the post-condition guard in
+   * `localArrayFoldTransformer` (a cheap, independent "did we actually get this right" check,
+   * on top of — not instead of — the scan's own soundness argument). */
+  readonly deletedNames: ReadonlySet<string>;
+}
+
+/** `node`, paren-stripped. Shared by every write/escape/target check below — TypeScript
+ * represents `(arr[0]) = 1n;`/`(arr) = new Array(2);` etc. with the parens as their own wrapper
+ * node, so every shape-check here must see through them the same way `tsEvalConst`'s own
+ * `ts.isParenthesizedExpression` case does. */
+function stripParens(node: ts.Expression): ts.Expression {
+  return ts.isParenthesizedExpression(node) ? stripParens(node.expression) : node;
+}
+
+/**
+ * `tsEvalConst`'s `ts.isNumericLiteral` branch calls `node.getText()` — which THROWS
+ * (`Debug Failure. False expression: Node must have a real position for this operation`,
+ * confirmed directly against a factory-synthesized node) for any node with no real source
+ * position (`node.pos < 0`), a case `tsEvalConst`'s own try/catch already converts to
+ * `undefined` for ITS callers. This matters specifically HERE: `unrollCountingLoop`'s
+ * `substituteCounter` step synthesizes EXACTLY such a node whenever the unrolled loop's counter
+ * is a plain `number` literal rather than a `bigint` one (`for (let i = 0; i < 3; i++)` — see
+ * `toLiteralNode`, which is what builds it) — and this pass exists specifically to recognize the
+ * straight-line writes THAT unrolling produces, so declining this shape entirely would silently
+ * never fold the whole plain-number-counter family. This is a NARROW, LOCAL-TO-THIS-PASS
+ * fallback (see `evalArrayConst`) rather than a change to `tsEvalConst` itself — fixing it there
+ * would alter fold behavior for every other existing pass, a separate change with its own
+ * regression tests. A synthesized node's `.text` field (unlike `getText()`) is populated
+ * directly at construction and is always safe to read — and since a literal built this way is
+ * always exactly what `toLiteralNode` produced from a real bigint (canonical, decimal, no
+ * separators), `BigInt(node.text)` needs no further validation, unlike `tsEvalConst`'s own
+ * `getText()` path (which must also strip user-typed numeric separators). A synthesized
+ * `BigIntLiteral` needs no equivalent handling: `tsEvalConst`'s own `ts.isBigIntLiteral` branch
+ * already reads `.text` directly, never `getText()`, so it's already safe regardless of position.
+ */
+function synthesizedNumericValue(node: ts.Node): bigint | undefined {
+  if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.MinusToken) {
+    const inner = synthesizedNumericValue(node.operand);
+
+    return inner === undefined ? undefined : -inner;
+  }
+
+  if (!ts.isNumericLiteral(node) || node.pos >= 0) return undefined; // has a real position — tsEvalConst already handles it
+
+  try {
+    return BigInt(node.text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `tsEvalConst` first (the ordinary, real-position case — literals, same-file top-level
+ * `consts`/`functions`, all unchanged), `synthesizedNumericValue` as the ONLY fallback (a
+ * synthesized plain-number counter/value the loop-unroller produced). Used everywhere this pass
+ * needs to resolve a compile-time constant: the `new Array(<expr>)` size argument, a
+ * construction write's index/value, and a later read's index.
+ */
+function evalArrayConst(
+  expr: ts.Expression,
+  consts: ReadonlyMap<string, bigint>,
+  functions: TopLevelFunctions,
+  shadowed: ReadonlySet<string>,
+): bigint | undefined {
+  const direct = tsEvalConst(expr, consts, functions, shadowed);
+
+  return direct !== undefined ? direct : synthesizedNumericValue(expr);
+}
+
+/**
+ * Recognizes `new Array(<expr>)` (matching `processNewExpression`'s own arity rule,
+ * compiler/src/processor/expression.ts: exactly 1 argument) and resolves that argument to an
+ * in-range constant size via `evalArrayConst`. Because the argument resolves ONLY through
+ * `tsEvalConst`, whose only call-folding path is `tsEvalCall` (same-file, single-`return`, ZERO
+ * nested `Call`/`New` anywhere in the callee's body), a resolvable size argument is provably
+ * side-effect-free — discarding its evaluation (this whole pass's premise) is therefore sound.
+ * Anything else (wrong callee, wrong arity, an unresolvable/non-integer/out-of-range argument —
+ * a parameter, `pools.length`, a call with a side effect) returns `undefined`: not a candidate,
+ * left completely untouched, no diagnostic. This alone rejects the entire real-world population
+ * of `../sauce-recipes/ecoswap/ecoswap.sauce.ts`'s ~30 `new Array(pools.length)` declarations at
+ * the cheapest possible gate, before any per-candidate scanning ever begins.
+ */
+function newArraySize(
+  init: ts.Expression,
+  consts: ReadonlyMap<string, bigint>,
+  functions: TopLevelFunctions,
+  shadowed: ReadonlySet<string>,
+): number | undefined {
+  if (!ts.isNewExpression(init)) return undefined;
+
+  if (!ts.isIdentifier(init.expression) || init.expression.text !== 'Array') return undefined;
+
+  if (!init.arguments || init.arguments.length !== 1) return undefined;
+
+  const size = evalArrayConst(init.arguments[0], consts, functions, shadowed);
+
+  if (size === undefined || size < 1n || size > BigInt(MAX_FOLDED_ARRAY_ELEMENTS)) return undefined;
+
+  return Number(size);
+}
+
+/** True the moment ANY `new Array(...)` call occurs anywhere in `node`, WITHOUT crossing into a
+ * nested function-like scope (that scope is analyzed independently, on its own merits, by the
+ * driver — see `localArrayFoldTransformer`). The cheapest possible per-function gate: a body
+ * containing zero of these can never have a fold opportunity, so both the driver and
+ * `analyzeLocalArrays` check this FIRST, before building a shadow set or walking statements. */
+function containsNewArrayConstruction(node: ts.Node): boolean {
+  if (isFunctionLikeScope(node)) return false;
+
+  if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'Array') return true;
+
+  let found = false;
+
+  ts.forEachChild(node, (child) => {
+    if (!found && containsNewArrayConstruction(child)) found = true;
+  });
+
+  return found;
+}
+
+/** Does any Identifier anywhere in `node` have its text in `names`? The multi-name analogue of
+ * `referencesIdentifier` — used only by `isCandidateWriteStatement`'s defense-in-depth
+ * self/cross-referential-construction check (see its own comment for why this is checked
+ * EXPLICITLY rather than left to `evalArrayConst` merely failing to resolve an
+ * `ElementAccessExpression`, which it always does today, but this pass must not silently depend
+ * on that remaining true). */
+function referencesAnyName(node: ts.Node, names: ReadonlySet<string>): boolean {
+  if (names.size === 0) return false;
+
+  if (ts.isIdentifier(node)) return names.has(node.text);
+
+  let found = false;
+
+  ts.forEachChild(node, (child) => {
+    if (!found && referencesAnyName(child, names)) found = true;
+  });
+
+  return found;
+}
+
+/**
+ * `arr[k] = v;` — a PLAIN (`=` only; a compound operator like `+=` is deliberately rejected
+ * here, so it falls through to the escape rules as an ordinary disqualifying use — this is
+ * exactly the `a[i] += 5` shape pinned by the existing `test/index.test.ts:209` fixture, which
+ * must never be mistaken for a pure construction write) assignment statement whose LEFT is an
+ * `ElementAccessExpression` based on `name`, and whose index AND value both resolve to a
+ * constant via `evalArrayConst` — with NEITHER the index nor the value expression referencing
+ * ANY candidate array name in `candidateNames` (rejects `arr[1] = arr[0] + 1n` — self-
+ * referential construction, deliberately out of scope for v1 — and any cross-array read during
+ * construction, checked EXPLICITLY here rather than relying on `evalArrayConst` incidentally
+ * failing to resolve an `ElementAccessExpression`, which it always does today since
+ * `tsEvalConst` has no case for one at all — but this soundness argument must not silently
+ * depend on that remaining true forever). Anything else (not an `ExpressionStatement`, a
+ * compound/update operator, a non-candidate target, an unresolvable or negative index, an
+ * unresolvable value, a self- or cross-referential expression) returns `undefined` — simply not
+ * a recognized write; the caller (`classifyConstructionRegion`) treats that exactly like any
+ * other non-write occurrence of the name.
+ */
+function isCandidateWriteStatement(
+  stmt: ts.Statement,
+  name: string,
+  candidateNames: ReadonlySet<string>,
+  shadowed: ReadonlySet<string>,
+  top: TopLevelContext,
+): { index: bigint; value: bigint } | undefined {
+  if (!ts.isExpressionStatement(stmt)) return undefined;
+
+  const expr = stripParens(stmt.expression);
+
+  if (!ts.isBinaryExpression(expr) || expr.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return undefined;
+
+  const left = stripParens(expr.left);
+
+  if (!ts.isElementAccessExpression(left)) return undefined;
+
+  if (!ts.isIdentifier(left.expression) || left.expression.text !== name) return undefined;
+
+  if (referencesAnyName(left.argumentExpression, candidateNames) || referencesAnyName(expr.right, candidateNames)) {
+    return undefined;
+  }
+
+  const index = evalArrayConst(left.argumentExpression, top.consts, top.functions, shadowed);
+
+  if (index === undefined || index < 0n) return undefined;
+
+  const value = evalArrayConst(expr.right, top.consts, top.functions, shadowed);
+
+  if (value === undefined) return undefined;
+
+  return { index, value };
+}
+
+/**
+ * Scans forward from `declIndex + 1` over `statements` (the function body's own flat top-level
+ * list), accumulating exactly `size` recognized writes (`isCandidateWriteStatement`) to DISTINCT
+ * in-range indices. COMPLETENESS is required — every index in `[0, size)` written EXACTLY
+ * once — not merely "every index that's later read": this is what makes `elements` a TOTAL
+ * array, so the read-fold path can never encounter a hole and never has to model what an
+ * unwritten `new Array` slot contains at runtime (a real engine property this pass has not
+ * verified on-chain and deliberately refuses to depend on — the read-index-only relaxation is a
+ * sound, but explicitly deferred, v2 item). WRITE ORDER IS UNCONSTRAINED
+ * (`arr[2]=…; arr[0]=…; arr[1]=…` is accepted): within the region, every occurrence of `name`
+ * that ISN'T a recognized write disqualifies the WHOLE candidate outright (so every write
+ * necessarily precedes every read), and every index is written exactly once — so write order is
+ * simply unobservable, and completeness + uniqueness are the only properties this fold depends
+ * on. A statement that doesn't mention `name` AT ALL is skipped (allowed to sit inside the
+ * region) — this is what lets two independent arrays' constructions interleave, and lets an
+ * unrelated statement (`let z = 1n;`) sit between writes. Returns `undefined` (disqualify the
+ * whole candidate) on: a duplicate write to an already-written index, an out-of-range write
+ * index, any statement that mentions `name` but isn't a recognized write (a runtime-indexed
+ * write, a compound/update write, a plain read, …), or running out of statements before every
+ * index is covered (a hole).
+ */
+function classifyConstructionRegion(
+  statements: readonly ts.Statement[],
+  declIndex: number,
+  name: string,
+  size: number,
+  candidateNames: ReadonlySet<string>,
+  shadowed: ReadonlySet<string>,
+  top: TopLevelContext,
+): { writeStatements: ReadonlySet<ts.Statement>; lastWriteIndex: number; elements: bigint[] } | undefined {
+  const elements: (bigint | undefined)[] = new Array(size).fill(undefined);
+  const writeStatements = new Set<ts.Statement>();
+  let written = 0;
+
+  for (let i = declIndex + 1; i < statements.length; i++) {
+    const stmt = statements[i];
+    const write = isCandidateWriteStatement(stmt, name, candidateNames, shadowed, top);
+
+    if (write) {
+      const idx = Number(write.index);
+
+      if (idx >= size || elements[idx] !== undefined) return undefined; // out of range, or a duplicate write to one index
+
+      elements[idx] = write.value;
+      writeStatements.add(stmt);
+      written++;
+
+      if (written === size) return { writeStatements, lastWriteIndex: i, elements: elements as bigint[] };
+
+      continue;
+    }
+
+    if (referencesIdentifier(stmt, name)) return undefined; // mentions `name` but isn't a recognized write — disqualify
+
+    // Doesn't mention `name` at all — an unrelated statement (another array's own
+    // construction, a sibling local, …) is allowed to sit inside the region, skipped.
+  }
+
+  return undefined; // ran out of statements before every index was covered — a hole, disqualify
+}
+
+/**
+ * Declaration recognition + construction-region classification, over ONE function body's own
+ * flat top-level statement list. First pass: every DIRECT, single-declarator `let`/`const`
+ * statement (never `var` — see the design's scope rule 3) whose initializer is a
+ * `new Array(<const>)` resolving to an in-range size (`newArraySize`) is a raw declaration —
+ * gathered into `candidateNames` FIRST, independent of whether its construction region will
+ * later validate, purely so `isCandidateWriteStatement`'s self/cross-referential check (see its
+ * own comment) can see every candidate name in the function, not just the one currently being
+ * classified. Second pass: each raw declaration is independently run through
+ * `classifyConstructionRegion`; only those that fully validate become a `LocalArrayCandidate`.
+ */
+function collectArrayCandidates(
+  statements: readonly ts.Statement[],
+  shadowed: ReadonlySet<string>,
+  top: TopLevelContext,
+): LocalArrayCandidate[] {
+  const rawDeclarations: { index: number; name: string; size: number; stmt: ts.VariableStatement }[] = [];
+
+  for (let i = 0; i < statements.length; i++) {
+    const stmt = statements[i];
+
+    if (!ts.isVariableStatement(stmt)) continue;
+
+    const flags = stmt.declarationList.flags;
+
+    if (!(flags & ts.NodeFlags.Let) && !(flags & ts.NodeFlags.Const)) continue; // `var` — never a candidate
+
+    if (stmt.declarationList.declarations.length !== 1) continue;
+
+    const decl = stmt.declarationList.declarations[0];
+
+    if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
+
+    const size = newArraySize(decl.initializer, top.consts, top.functions, shadowed);
+
+    if (size === undefined) continue;
+
+    rawDeclarations.push({ index: i, name: decl.name.text, size, stmt });
+  }
+
+  const candidateNames = new Set(rawDeclarations.map((d) => d.name));
+  const candidates: LocalArrayCandidate[] = [];
+
+  for (const { index: declIndex, name, size, stmt } of rawDeclarations) {
+    const region = classifyConstructionRegion(statements, declIndex, name, size, candidateNames, shadowed, top);
+
+    if (!region) continue;
+
+    candidates.push({
+      name,
+      size,
+      declStatement: stmt,
+      declIndex,
+      writeStatements: region.writeStatements,
+      lastWriteIndex: region.lastWriteIndex,
+      elements: region.elements,
+    });
+  }
+
+  return candidates;
+}
+
+/**
+ * Scans an assignment/update TARGET — the left side of `=`/a compound-assignment operator, or a
+ * `++`/`--` operand — for `candidate`'s escape scan (`scanArrayUses`' rules 3/4): mirrors
+ * `visitAssignmentTarget`/`visitLocalAssignmentTarget`'s exact dispatch one section below
+ * (recurse into a genuine nested READ — a computed member-access key, e.g.
+ * `other[arr[0]] = 5n;` — via the ordinary `scan` callback; never treat the bound
+ * identifier/base itself as a read), but CLASSIFYING (disqualify-or-scan-nested) instead of
+ * substituting. `disqualify` fires the moment the target's OWN base is the candidate (a
+ * rebind — `arr = …` — or an element/property WRITE — `arr[i] = …`/`arr.x = …`) or the target is
+ * a destructuring pattern (object/array-literal reused as an assignment target) mentioning the
+ * candidate anywhere inside — rule 20's "at any depth" requirement, deliberately without trying
+ * to distinguish a destructuring default's own genuinely-read value from its binding position,
+ * unlike the real substitution passes: ANY occurrence there is conservatively treated as an
+ * escape, matching this pass's stricter-than-the-table-feature "resolvable, not just safe"
+ * standard (see this section's own header comment).
+ */
+function scanAssignmentTarget(
+  node: ts.Expression,
+  name: string,
+  scan: (n: ts.Node) => void,
+  disqualify: () => void,
+): void {
+  const target = stripParens(node);
+
+  if (ts.isIdentifier(target)) {
+    if (target.text === name) disqualify(); // a rebind: `arr = …`
+
+    return;
+  }
+
+  if (ts.isElementAccessExpression(target)) {
+    if (ts.isIdentifier(target.expression) && target.expression.text === name) {
+      disqualify(); // an element WRITE: `arr[i] = …`
+
+      return;
+    }
+
+    scan(target.expression); // e.g. another candidate as the base: `other[i] = …`
+    scan(target.argumentExpression); // a genuine nested read: `other[arr[0]] = …`
+
+    return;
+  }
+
+  if (ts.isPropertyAccessExpression(target)) {
+    if (ts.isIdentifier(target.expression) && target.expression.text === name) {
+      disqualify(); // a property WRITE: `arr.x = …` (never a legal SauceScript shape, fail closed regardless)
+
+      return;
+    }
+
+    scan(target.expression);
+
+    return;
+  }
+
+  if (referencesIdentifier(target, name)) {
+    disqualify(); // a destructuring-assignment pattern mentioning the candidate anywhere inside
+
+    return;
+  }
+
+  scan(target);
+}
+
+/**
+ * The whole-function, top-down, fail-closed ALLOWLIST escape scan for `candidate`: the ONE
+ * authorized shape is the base identifier of an `ElementAccessExpression`, in READ position,
+ * whose index resolves to an in-range constant — every other occurrence of `candidate.name`
+ * anywhere in `body` disqualifies the whole candidate. Same philosophy as the lookup-table
+ * feature's `isSafeTableRead`/`checkTableSafety` above, with one MANDATORY implementation
+ * difference and two deliberate strengthenings (see this section's own header comment for the
+ * full "why"):
+ *
+ *  * MANDATORY: this must be a TOP-DOWN walk that classifies a node BEFORE descending into it,
+ *    never consulting `.parent`. `isTableAccessUnsafeUsage` walks UP through `node.parent` — but
+ *    a node SYNTHESIZED by an earlier transformer stage (confirmed directly: `ts.factory.
+ *    createNumericLiteral(7).parent` is `undefined`) has no parent chain to walk, and the
+ *    unrolled writes this pass exists to recognize are EXACTLY such synthesized nodes. Walking
+ *    up from a synthesized `arr[0n]` inside a synthesized `arr[0n] = 5n;` would silently report
+ *    a WRITE as a safe READ — a catastrophic, silent misclassification this pass cannot risk
+ *    (the existing table-fold guard has the identical weakness, but is harmless there only
+ *    because `checkTableSafety` already proved the file write-free on the fully-parented ORIGINAL
+ *    tree before that guard ever runs).
+ *  * STRENGTHENING (a): safe is not enough — every surviving occurrence must also be provably
+ *    RESOLVABLE, because this pass DELETES the backing allocation (the table feature can leave a
+ *    single unresolvable access untouched precisely because it only removes a declaration that
+ *    ALREADY has zero remaining references).
+ *  * STRENGTHENING (b): an occurrence textually BEFORE the declaration disqualifies (checked by
+ *    the caller, `analyzeLocalArrays` — real TDZ; SauceScript would reject it as an undefined
+ *    variable regardless, never silently fold it).
+ *
+ * `candidate.declStatement` and every one of `candidate.writeStatements` are skipped OUTRIGHT
+ * (by statement IDENTITY, before any classification) the moment the walk reaches them — they
+ * are pre-authorized by `classifyConstructionRegion`'s own narrower proof (a plain `=`, constant
+ * index/value, no self/cross-candidate reference), so descending into one would otherwise let
+ * rule 3 below wrongly flag the array's OWN legitimate construction write as a disqualifying
+ * write-to-self. This is deliberately NOT restricted to `candidate`'s own writes only: a
+ * DIFFERENT candidate's write statement (`other[0] = arr[0];`) is still fully descended into,
+ * so a legitimate cross-array READ of `candidate` sitting inside it is still found and folded,
+ * independent of whether `other` itself ever validates.
+ */
+function scanArrayUses(
+  candidate: LocalArrayCandidate,
+  body: ts.Block,
+  statements: readonly ts.Statement[],
+  shadowed: ReadonlySet<string>,
+  top: TopLevelContext,
+  out: Map<ts.Node, bigint>,
+): boolean {
+  const name = candidate.name;
+  let ok = true;
+
+  const disqualify = (): void => {
+    ok = false;
+  };
+
+  const scan = (node: ts.Node): void => {
+    if (!ok) return;
+
+    if (node === candidate.declStatement || candidate.writeStatements.has(node as ts.Statement)) return;
+
+    // Rule 1: out-of-scope node kinds (types, imports, break/continue, and — via
+    // `isOutOfScopeForPropagation`'s own membership — class/enum/namespace bodies) are left
+    // completely unrecursed, UNLESS the candidate's name occurs anywhere inside — mirroring
+    // `checkTableSafety`'s deliberate refusal to blanket-skip a class/enum/namespace body for a
+    // MUTABLE value (a class method or namespace function could legally mutate an outer array
+    // without ever reassigning its binding; this scan doesn't attempt to precisely re-derive
+    // safety inside a node shape it otherwise never has to reason about, so any textual
+    // occurrence there conservatively disqualifies rather than risk missing a real one).
+    if (isOutOfScopeForPropagation(node)) {
+      if (referencesIdentifier(node, name)) disqualify();
+
+      return;
+    }
+
+    // Rule 2: any nested function/arrow/method/accessor TOUCHING the candidate disqualifies it
+    // outright, regardless of how read-only it looks — the same real hazard
+    // `bailsForOuterClosure` documents further below (`something.catch(handler)` compiles the
+    // handler's body against the SAME `CompilerContext` as its surrounding code, so a nested
+    // body genuinely reaches the enclosing scope at the bytecode level, not a harmless JS
+    // closure no-op).
+    if (isFunctionLikeScope(node)) {
+      if (referencesIdentifier(node, name)) disqualify();
+
+      return;
+    }
+
+    // Rule 3: any assignment (plain `=` OR compound — `arr[0] += 1n` disqualifies here exactly
+    // like `arr[0] = 1n` outside the construction region would) — the target is classified by
+    // `scanAssignmentTarget`, the (already skipped, if this candidate's own) RHS is scanned
+    // normally.
+    if (ts.isBinaryExpression(node) && ASSIGNMENT_OPERATOR_TOKENS.has(node.operatorToken.kind)) {
+      scanAssignmentTarget(node.left, name, scan, disqualify);
+      scan(node.right);
+
+      return;
+    }
+
+    // Rule 4: `++`/`--` — the operand is an assignment target too.
+    if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)
+    ) {
+      scanAssignmentTarget(node.operand, name, scan, disqualify);
+
+      return;
+    }
+
+    // Rule 5: `delete arr[k]` / any call or `new` whose CALLEE references the candidate —
+    // `arr.anything(...)` (no method whitelist), `delete arr[0]`, or the candidate itself
+    // called as if it were a function. A call/new whose callee does NOT reference the
+    // candidate scans its arguments normally (`f(arr[0])` is fine; `f(arr)` is caught by rule 7
+    // once the bare `arr` argument is reached).
+    if (ts.isDeleteExpression(node)) {
+      if (referencesIdentifier(node.expression, name)) disqualify();
+
+      return;
+    }
+
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      if (referencesIdentifier(node.expression, name)) {
+        disqualify();
+
+        return;
+      }
+
+      if (node.arguments) for (const arg of node.arguments) scan(arg);
+
+      return;
+    }
+
+    // Rule 6: THE one authorized shape — `candidate`'s base identifier, immediately the
+    // subject of an ElementAccessExpression, in read position (never reached as a write target
+    // — rule 3 intercepts and classifies those before `scan` ever sees them as a plain
+    // ElementAccessExpression), with an index resolving to an in-range constant. Deliberately
+    // does NOT descend into `node.expression` (the base identifier is now fully accounted for)
+    // — only the index expression is scanned further, since it may itself reference another
+    // candidate.
+    if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+      const index = evalArrayConst(node.argumentExpression, top.consts, top.functions, shadowed);
+
+      if (index === undefined || index < 0n || index >= BigInt(candidate.size)) {
+        disqualify();
+
+        return;
+      }
+
+      out.set(node, candidate.elements[Number(index)]);
+      scan(node.argumentExpression);
+
+      return;
+    }
+
+    // Rule 7: a bare Identifier named `name`, reached by ANY other path — an alias, a call
+    // argument, `return arr;`, a spread, a template interpolation, `for (const v of arr)`'s
+    // iterated expression, `arr.length`/`arr.anything` (via its PropertyAccessExpression's
+    // `.expression` child, reached through rule 8's generic recursion), a redeclaration of the
+    // name anywhere in this same function scope (its OWN declaration binding name reached this
+    // way too, but is already skipped by the statement-identity check above) — disqualifies.
+    // This single rule is what makes the allowlist TOTAL: no special case is needed for any of
+    // the shapes just listed, or any shape not yet invented.
+    if (ts.isIdentifier(node)) {
+      if (node.text === name) disqualify();
+
+      return;
+    }
+
+    // Rule 8: anything else recurses ordinarily.
+    ts.forEachChild(node, scan);
+  };
+
+  scan(body);
+
+  return ok;
+}
+
+/**
+ * Runs the full per-candidate pipeline over ONE function body: the cheap gate
+ * (`containsNewArrayConstruction`), `collectArrayCandidates`, then — per candidate — the TDZ
+ * check (any occurrence in `statements[0, declIndex)` disqualifies — real TDZ; SauceScript would
+ * reject it as `undefined variable:` regardless) and `scanArrayUses`. Accumulates every
+ * successfully-folded candidate's deletions/access-values into ONE `LocalArrayPlan` — a function
+ * with two independent local arrays where only one validates still gets that one folded, the
+ * other left completely untouched. Returns `undefined` (nothing to do) when the gate fails, no
+ * candidates exist, or every candidate fails its own scan.
+ */
+function analyzeLocalArrays(
+  body: ts.Block,
+  shadowed: ReadonlySet<string>,
+  top: TopLevelContext,
+): LocalArrayPlan | undefined {
+  if (!containsNewArrayConstruction(body)) return undefined;
+
+  const statements = body.statements;
+  const candidates = collectArrayCandidates(statements, shadowed, top);
+
+  if (candidates.length === 0) return undefined;
+
+  const deleteStatements = new Set<ts.Statement>();
+  const accessValues = new Map<ts.Node, bigint>();
+  const deletedNames = new Set<string>();
+
+  for (const candidate of candidates) {
+    let occursBeforeDecl = false;
+
+    for (let i = 0; i < candidate.declIndex && !occursBeforeDecl; i++) {
+      if (referencesIdentifier(statements[i], candidate.name)) occursBeforeDecl = true;
+    }
+
+    if (occursBeforeDecl) continue;
+
+    const candidateAccessValues = new Map<ts.Node, bigint>();
+
+    if (!scanArrayUses(candidate, body, statements, shadowed, top, candidateAccessValues)) continue;
+
+    deleteStatements.add(candidate.declStatement);
+
+    for (const w of candidate.writeStatements) deleteStatements.add(w);
+
+    for (const [node, value] of candidateAccessValues) accessValues.set(node, value);
+
+    deletedNames.add(candidate.name);
+  }
+
+  if (deletedNames.size === 0) return undefined;
+
+  return { deleteStatements, accessValues, deletedNames };
+}
+
+/**
+ * Applies a validated `LocalArrayPlan` to `body`: drops every statement in
+ * `plan.deleteStatements` (the declaration and every construction write, for every
+ * successfully-folded candidate) — deletion happens ONLY among `body.statements` directly, by
+ * this pass's own scope rule (a candidate's declaration/writes can never be anywhere else), so
+ * there is no splicing/reindexing concern here, and — unlike `unrollCountingLoop`/the if-branch
+ * flattener/the STRETCH `for...of` table unroller — no need for
+ * `collidesWithSurroundingDeclarations` either: REMOVING statements can never introduce a
+ * duplicate lexical declaration the way INSERTING spliced copies can. What's left is then
+ * visited once, replacing every node present in `plan.accessValues` with its literal by IDENTITY
+ * — this rewriter never re-derives or re-checks anything the analysis already proved; a node
+ * either is one of the accepted `ElementAccessExpression`s or it isn't, so there is no scope
+ * logic and no `.parent` access here at all. A nested function-like scope is an OPAQUE LEAF
+ * (mirroring `substituteLocalReads`'s identical treatment one section below) — by
+ * `scanArrayUses` rule 2, no candidate ever survives with a use inside one, so there is nothing
+ * to replace there anyway; it gets its own independent visit from the driver regardless.
+ */
+function rewriteFoldedArrayBody(body: ts.Block, plan: LocalArrayPlan, context: ts.TransformationContext): ts.Block {
+  const survivors = body.statements.filter((s) => !plan.deleteStatements.has(s));
+
+  const visit = (node: ts.Node): ts.Node => {
+    const value = plan.accessValues.get(node);
+
+    if (value !== undefined) return toLiteralNode(value) ?? node;
+
+    if (isOutOfScopeForPropagation(node) || isFunctionLikeScope(node)) return node;
+
+    return ts.visitEachChild(node, visit, context);
+  };
+
+  return ts.factory.updateBlock(
+    body,
+    survivors.map((s) => visit(s) as ts.Statement),
+  );
+}
+
+/**
+ * The top-level driver: recursively finds every function-like scope in the file (the SAME
+ * recursion shape `localConstPropagationTransformer`'s own driver uses one section below — a
+ * deliberate duplication, not a shared helper, since the two passes need entirely different
+ * per-scope analyses) and, for each one with a `Block` body, attempts to fold away every
+ * function-local `new Array(n)` construction that provably never escapes. A concise (non-Block)
+ * arrow body is skipped outright — mirroring `transformFunctionLikeScopeBody`'s own early
+ * return — and the cheap `containsNewArrayConstruction` gate runs BEFORE building a `shadowed`
+ * set at all, so a function with no `new Array` anywhere pays only that one cheap walk.
+ *
+ * `shadowed` mirrors `foldTransformer`'s own `isPlainFunctionScope`/`isMethodLikeScope`
+ * construction exactly: every parameter name, every `var`-hoisted name (`collectVarNames`),
+ * every name `collectLexicalNamesInScope` finds anywhere in the body (crossing `if`/`while`/
+ * bare-block boundaries, since the real SauceScript compiler shares scope across those — only a
+ * `for` loop pushes a genuine new one), and — for a named function declaration/expression only,
+ * never an arrow or a method/getter/setter, which can't reference their own key as a variable —
+ * its own name.
+ */
+function localArrayFoldTransformer(top: TopLevelContext) {
+  return (context: ts.TransformationContext): ts.Transformer<ts.SourceFile> => {
+    const visit = (node: ts.Node): ts.Node => {
+      if (isOutOfScopeForPropagation(node)) return node;
+
+      if (!isFunctionLikeScope(node)) return ts.visitEachChild(node, visit, context);
+
+      if (!node.body || !ts.isBlock(node.body) || !containsNewArrayConstruction(node.body)) {
+        return ts.visitEachChild(node, visit, context);
+      }
+
+      const shadowed = new Set<string>();
+
+      for (const p of node.parameters) collectBindingNames(p.name, shadowed);
+
+      collectVarNames(node.body, shadowed);
+      collectLexicalNamesInScope(node.body, shadowed);
+
+      if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) {
+        shadowed.add(node.name.text);
+      }
+
+      const plan = analyzeLocalArrays(node.body, shadowed, top);
+
+      if (!plan) return ts.visitEachChild(node, visit, context);
+
+      const rewritten = rewriteFoldedArrayBody(node.body, plan, context);
+
+      // Post-condition guard: sound BY CONSTRUCTION per the scan's own allowlist argument, but
+      // cheap enough to also verify BY CHECKING — converting "sound by argument" into "sound by
+      // construction" the same way `deadConstEliminationTransformer`'s own design note
+      // discusses. If any deleted name still occurs anywhere in the rewritten body, the whole
+      // rewrite for THIS scope is thrown away (falls back to the original, untouched node)
+      // rather than ever risk handing back a dangling reference to a removed declaration.
+      const stale = [...plan.deletedNames].some((name) => referencesIdentifier(rewritten, name));
+      const newNode = stale ? node : (updateFunctionLikeBody(node, rewritten) as FunctionLikeNode);
+
+      return ts.visitEachChild(newNode, visit, context);
+    };
+
+    return (sourceFile) => {
+      const statements = sourceFile.statements.map((stmt) => visit(stmt) as ts.Statement);
 
       return ts.factory.updateSourceFile(sourceFile, statements);
     };
@@ -4153,9 +5032,15 @@ export function tsPartialEval(code: string, filePath: string): string {
         tableFoldTransformer(tables, consts, functions),
         constPropagationTransformer(consts),
         deadConstEliminationTransformer(consts, primaryNames, pairNames, tables),
-        // Runs LAST, consuming everything above's output: a FOURTH kind of constant
-        // propagation, this one control-flow-sensitive and LOCAL (per-function) — see the
-        // "Local (per-function) constant propagation" section above for the full design.
+        // Stage 5 of 6 — see the "Local `new Array(n)` construction folding" section above for
+        // why this runs AFTER every top-level-scoped pass above (a write value may read a table/
+        // top-level const only THEY resolve) but strictly BEFORE the local scalar pass below (a
+        // folded element read is what lets THAT pass finish an accumulator all the way to a
+        // literal — the reverse order would leave it NAC).
+        localArrayFoldTransformer(topLevelContext),
+        // Runs LAST, consuming everything above's output: a control-flow-sensitive, LOCAL
+        // (per-function) constant propagation — see the "Local (per-function) constant
+        // propagation" section above for the full design.
         localConstPropagationTransformer(topLevelContext),
       ],
     },
