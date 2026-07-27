@@ -1038,6 +1038,483 @@ describe('tsPartialEval (foldTransformer never folds a shadowed identifier again
   });
 });
 
+// ── tsPartialEval (local `new Array(n)` construction folding) ──
+//
+// Stage 5 of 6 in `tsPartialEval`'s pipeline, between `deadConstEliminationTransformer` and
+// `localConstPropagationTransformer`: when a function-local `new Array(n)`'s size, every
+// element, and every later read index are ALL provably constant, and the binding provably
+// never escapes, the declaration, every construction write, and every resolvable read are
+// eliminated entirely, replaced by the bare literal each read would have produced. This is what
+// makes the motivating probe below compile BYTE-IDENTICAL to a bare `return 2n;` — before this
+// pass, the unrolled loop already turned every index/value into a literal, but `NEW_ARRAY`/every
+// `SET_INDEX`/the final `INDEX` stayed real runtime bytecode regardless.
+const localArrayTargets: CompileTarget[] = ['v1', 'v12'];
+
+describe('tsPartialEval (local `new Array(n)` construction folding)', () => {
+  describe('positive: folds completely — byte-identical to the fully-inlined literal, on both targets', () => {
+    for (const target of localArrayTargets) {
+      describe(`target ${target}`, () => {
+        it('the motivating probe: an unrolled bigint-counter loop construction + a read — folds to a bare literal', () => {
+          const source = `
+            function main(): Uint256 {
+              const arr = new Array(3);
+              for (let i = 0n; i < 3n; i++) {
+                arr[i] = i * 2n;
+              }
+              return arr[1];
+            }
+          `;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 2n; }`, { target });
+          const bytes = Array.from(result.bytecode[0]);
+
+          expect(bytes).toEqual(Array.from(literal.bytecode[0]));
+          expect(bytes).not.toContain(OPS.NEW_ARRAY);
+          expect(bytes).not.toContain(OPS.SET_INDEX);
+          expect(bytes).not.toContain(OPS.INDEX);
+        });
+
+        it('a PLAIN-NUMBER counter unroll pins the synthesized-NumericLiteral fallback (`evalArrayConst`) — without it, this family silently never folds', () => {
+          const source = `
+            function main() {
+              const arr = new Array(3);
+              for (let i = 0; i < 3; i++) {
+                arr[i] = i * 2;
+              }
+              return arr[1];
+            }
+          `;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 2n; }`, { target });
+
+          expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+        });
+
+        it('straight-line writes with no loop at all', () => {
+          const source = `function main() { const a = new Array(2); a[0] = 5n; a[1] = 7n; return a[1]; }`;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 7n; }`, { target });
+
+          expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+        });
+
+        it("the `while`-counting idiom constructs the array — exercises `tryUnrollCountingWhile`'s splice path", () => {
+          const source = `
+            function main() {
+              const arr = new Array(3);
+              let i = 0n;
+              while (i < 3n) { arr[i] = i; i++; }
+              return arr[2];
+            }
+          `;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 2n; }`, { target });
+
+          expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+        });
+
+        it('a read index via a top-level const folds', () => {
+          const source = `
+            const K = 1n;
+            function main() {
+              const arr = new Array(3);
+              arr[0] = 10n; arr[1] = 20n; arr[2] = 30n;
+              return arr[K];
+            }
+          `;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 20n; }`, { target });
+
+          expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+        });
+
+        it('out-of-order writes still fold — write order is unobservable once every index is written exactly once', () => {
+          // Each read folds to its literal independently (`10n + 20n + 30n`), but the SURROUNDING
+          // arithmetic isn't re-collapsed to a single `60n` — `foldTransformer` (the pass that
+          // folds literal arithmetic) already ran, strictly BEFORE this one, back when these
+          // operands were still real `ElementAccessExpression`s; re-running it isn't part of
+          // this pipeline. The load-bearing claim is that the ARRAY itself is fully gone (no
+          // NEW_ARRAY/SET_INDEX/INDEX) — the real EVM integration test proves the arithmetic
+          // still computes the right VALUE (60n) end to end.
+          const source = `
+            function main() {
+              const arr = new Array(3);
+              arr[2] = 30n; arr[0] = 10n; arr[1] = 20n;
+              return arr[0] + arr[1] + arr[2];
+            }
+          `;
+          const out = tsPartialEval(source, 'f.ts');
+
+          expect(out).not.toContain('new Array');
+          expect(out).not.toContain('arr[');
+          expect(out).toContain('10n + 20n + 30n');
+
+          const bytes = Array.from(compile(source, { tsSource: true, target }).bytecode[0]);
+
+          expect(bytes).not.toContain(OPS.NEW_ARRAY);
+          expect(bytes).not.toContain(OPS.SET_INDEX);
+          expect(bytes).not.toContain(OPS.INDEX);
+        });
+
+        it('two independent arrays fold — both a sequential and an INTERLEAVED construction', () => {
+          const sequential = `
+            function main() {
+              const a = new Array(2);
+              a[0] = 1n; a[1] = 2n;
+              const b = new Array(2);
+              b[0] = 10n; b[1] = 20n;
+              return a[0] + a[1] + b[0] + b[1];
+            }
+          `;
+          const interleaved = `
+            function main() {
+              const a = new Array(2);
+              const b = new Array(2);
+              a[0] = 1n;
+              b[0] = 10n;
+              a[1] = 2n;
+              b[1] = 20n;
+              return a[0] + a[1] + b[0] + b[1];
+            }
+          `;
+
+          for (const source of [sequential, interleaved]) {
+            const out = tsPartialEval(source, 'f.ts');
+
+            expect(out).not.toContain('new Array');
+            expect(out).not.toContain('a[');
+            expect(out).not.toContain('b[');
+            expect(out).toContain('1n + 2n + 10n + 20n');
+
+            const bytes = Array.from(compile(source, { tsSource: true, target }).bytecode[0]);
+
+            expect(bytes).not.toContain(OPS.NEW_ARRAY);
+            expect(bytes).not.toContain(OPS.SET_INDEX);
+            expect(bytes).not.toContain(OPS.INDEX);
+          }
+        });
+
+        it('zero reads — pure dead-code elimination of the whole construction', () => {
+          const source = `function main() { const a = new Array(2); a[0] = 1n; a[1] = 2n; return 5n; }`;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 5n; }`, { target });
+
+          expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+        });
+
+        it("a `let`-declared array (the real recipe-code style, e.g. ecoswap's `let inp: Tuple = new Array(...)`) folds too", () => {
+          const source = `function main() { let arr = new Array(2); arr[0] = 3n; arr[1] = 4n; return arr[0]; }`;
+          const result = compile(source, { tsSource: true, target });
+          const literal = compile(`function main() { return 3n; }`, { target });
+
+          expect(Array.from(result.bytecode[0])).toEqual(Array.from(literal.bytecode[0]));
+        });
+
+        it('composes with stage 6 (LOCAL scalar propagation): an accumulator loop over a folded array feeds the scalar engine all the way to the RETURN literal — the load-bearing pipeline-DIRECTION proof', () => {
+          // `total`'s own `let`/`+=` bookkeeping isn't itself dead-code-eliminated (neither this
+          // pass nor the local scalar pass attempts that cleanup — see both passes' own "out of
+          // scope" notes), so the emitted bytecode isn't byte-identical to a bare `return 3600n;`
+          // — but the ARRAY is completely gone (no NEW_ARRAY/SET_INDEX/INDEX), and the RETURN
+          // value itself resolves to the literal `3600n` (0x0e10), proving each folded read fed
+          // straight into the scalar constant-propagation pass, exactly as designed.
+          const source = `
+            function main() {
+              const fees = new Array(3);
+              fees[0] = 100n; fees[1] = 500n; fees[2] = 3000n;
+              let total = 0n;
+              for (let i = 0n; i < 3n; i++) { total += fees[i]; }
+              return total;
+            }
+          `;
+          const out = tsPartialEval(source, 'f.ts');
+
+          expect(out).not.toContain('new Array');
+          expect(out).not.toContain('fees[');
+          expect(out).toContain('return 3600n;');
+
+          const bytes = Array.from(compile(source, { tsSource: true, target }).bytecode[0]);
+
+          expect(bytes).not.toContain(OPS.NEW_ARRAY);
+          expect(bytes).not.toContain(OPS.SET_INDEX);
+          expect(bytes).not.toContain(OPS.INDEX);
+          expect(Buffer.from(bytes).toString('hex')).toContain('0e10'); // the 2-byte push of 3600
+        });
+      });
+    }
+  });
+
+  it('tsPartialEval string check: the motivating probe has no `new Array`, no `arr[`, and a bare `return 2n;`', () => {
+    const out = tsPartialEval(
+      `function main() {
+        const arr = new Array(3);
+        for (let i = 0n; i < 3n; i++) { arr[i] = i * 2n; }
+        return arr[1];
+      }`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('new Array');
+    expect(out).not.toContain('arr[');
+    expect(out).toContain('return 2n;');
+  });
+
+  it('a nested if AFTER construction reading the array: BOTH reads fold, and the (runtime-conditioned) `if` correctly survives untouched', () => {
+    const out = tsPartialEval(
+      `function main(c) {
+        const arr = new Array(2);
+        arr[0] = 10n;
+        arr[1] = 20n;
+        if (c === 1n) { return arr[0]; }
+        return arr[1];
+      }`,
+      'f.ts',
+    );
+
+    expect(out).not.toContain('new Array');
+    expect(out).not.toContain('arr[');
+    expect(out).toContain('return 10n;');
+    expect(out).toContain('return 20n;');
+    expect(out).toContain('if (');
+  });
+
+  describe('adversarial: every one of these DECLINES to fold (leaves real NEW_ARRAY/SET_INDEX/INDEX bytecode) — still correct, just unfolded', () => {
+    it('aliasing (`const b = arr; return b[0];`) disqualifies', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; const b = arr; return b[0]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+
+      const result = compile(source, { tsSource: true });
+
+      expect(Array.from(result.bytecode[0])).toContain(OPS.NEW_ARRAY);
+    });
+
+    it('passing the bare identifier as a call argument (`helper(arr)`) disqualifies', () => {
+      const source = `
+        function helper(x) { return x[0]; }
+        function main() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          return helper(arr);
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('returning the bare identifier (`return arr;`) disqualifies', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return arr; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('partial writes (a hole — only 2 of 3 indices written) disqualifies', () => {
+      const source = `function main() { const arr = new Array(3); arr[0] = 1n; arr[1] = 2n; return arr[0]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+
+      const result = compile(source, { tsSource: true });
+
+      expect(Array.from(result.bytecode[0])).toContain(OPS.NEW_ARRAY);
+      expect(Array.from(result.bytecode[0])).toContain(OPS.SET_INDEX);
+    });
+
+    it('a duplicate write to the SAME index disqualifies (last-write-wins is deliberately NOT permitted)', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; arr[0] = 3n; return arr[0]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+
+      const result = compile(source, { tsSource: true });
+
+      expect(Array.from(result.bytecode[0])).toContain(OPS.NEW_ARRAY);
+    });
+
+    it('a write AFTER a read disqualifies', () => {
+      const source = `function main() { const a = new Array(2); const x = a[0]; a[1] = 9n; return x + a[1]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('a non-constant write index inside a NON-unrollable loop (a parameter-derived bound) disqualifies', () => {
+      const source = `
+        function main(n) {
+          const arr = new Array(3);
+          arr[0] = 0n; arr[1] = 0n; arr[2] = 0n;
+          for (let i = 0n; i < n; i++) { arr[i] = i; }
+          return arr[0];
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+      expect(out).toContain('for (');
+
+      expect(() => compile(source, { tsSource: true })).not.toThrow();
+    });
+
+    it('a non-constant read index (`return arr[n];`, `n` a parameter) disqualifies', () => {
+      const source = `function main(n) { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return arr[n]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+
+      expect(() => compile(source, { tsSource: true })).not.toThrow();
+    });
+
+    it('a compound element write (`arr[0] += 1n;`) disqualifies', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; arr[0] += 1n; return arr[0]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('rebinding the array (`arr = new Array(2);` later) disqualifies', () => {
+      const source = `
+        function main() {
+          let arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          arr = new Array(2);
+          return arr[0];
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('`arr.length` disqualifies (foldable in principle to the size literal, but never verified on-chain, so excluded from v1)', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; return arr.length; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('a method call on the array (`arr.push(1n)`) disqualifies — no method whitelist', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = 2n; arr.push(1n); return arr[0]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('`for (const v of arr)` over a local array is untouched — still throws `not implemented: ForOfStatement`, exactly like today (a deliberate v1 non-goal, not a regression)', () => {
+      const source = `
+        function main() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          let sum = 0n;
+          for (const v of arr) { sum = sum + v; }
+          return sum;
+        }
+      `;
+
+      expect(() => compile(source, { tsSource: true })).toThrow(/ForOfStatement/);
+    });
+
+    it('a nested closure touching the array disqualifies — a nested arrow reading `arr[0]`', () => {
+      const source = `
+        function main() {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          const f = () => arr[0];
+          return f();
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+
+    it('the name redeclared inside an if-branch disqualifies — the exact shadowing class this session fixed three times elsewhere in this file', () => {
+      const source = `
+        function main(c) {
+          const arr = new Array(2);
+          arr[0] = 1n;
+          arr[1] = 2n;
+          if (c) { let arr = 5n; }
+          return arr[0];
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+      expect(out).toContain('return arr[0];');
+    });
+
+    it('an out-of-range read (`arr[5]` on a size-3 array) disqualifies', () => {
+      const source = `function main() { const arr = new Array(3); arr[0] = 1n; arr[1] = 2n; arr[2] = 3n; return arr[5]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+      expect(() => compile(source, { tsSource: true })).not.toThrow();
+    });
+
+    it('a runtime size (`new Array(n)`, `n` a parameter) is never even a candidate — rejected at the cheapest gate', () => {
+      const source = `function main(n) { const arr = new Array(n); arr[0] = 1n; return arr[0]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(n)');
+    });
+
+    it("a declaration nested inside an if-block is never a candidate — not a DIRECT entry of the function body's own statement list", () => {
+      const source = `
+        function main(c) {
+          let result = 0n;
+          if (c) {
+            const arr = new Array(2);
+            arr[0] = 1n;
+            arr[1] = 2n;
+            result = arr[0] + arr[1];
+          }
+          return result;
+        }
+      `;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(2)');
+      expect(() => compile(source, { tsSource: true })).not.toThrow();
+    });
+
+    it('self-referential construction (`arr[1] = arr[0] + 1n;`) disqualifies — deliberately out of scope for v1', () => {
+      const source = `function main() { const arr = new Array(2); arr[0] = 1n; arr[1] = arr[0] + 1n; return arr[1]; }`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(');
+    });
+  });
+
+  describe('regression + zero-change guards', () => {
+    it('regression guard: the existing top-level `new Array` fixture (never a lookup-table candidate) is completely untouched by this NEW pass too — by construction, this pass never examines a top-level statement list', () => {
+      const source = `const arr = new Array(3n);\narr[0] = 1n;\nconsole.log(arr[0]);`;
+      const out = tsPartialEval(source, 'f.ts');
+
+      expect(out).toContain('new Array(3n)');
+      expect(out).toContain('console.log(arr[0]);');
+    });
+
+    it('zero-change guard: the identical (untyped) source compiled WITHOUT tsSource never invokes this pass — real NEW_ARRAY/SET_INDEX opcodes remain, for a fold-eligible AND a decline-eligible fixture', () => {
+      const foldEligible = `function main() { const arr = new Array(3); arr[0] = 0n; arr[1] = 2n; arr[2] = 4n; return arr[1]; }`;
+      const declineEligible = `function main() { const arr = new Array(3); arr[0] = 0n; return arr[0]; }`;
+
+      for (const source of [foldEligible, declineEligible]) {
+        const result = compile(source); // no tsSource — plain acorn path, ts-frontend.ts never runs
+        const bytes = Array.from(result.bytecode[0]);
+
+        expect(bytes).toContain(OPS.NEW_ARRAY);
+        expect(bytes).toContain(OPS.SET_INDEX);
+      }
+    });
+  });
+});
+
 // ── tsPartialEval (LOCAL, per-function constant propagation) ──
 //
 // Everything above tracks only same-file TOP-LEVEL `const`s (plus effectively-const `let`/
