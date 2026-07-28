@@ -15,7 +15,7 @@ import type {
 } from 'acorn';
 import type { SaucerLike } from '../saucer/index.js';
 import { isImmutablePackedArray, OPS, V12Saucer } from '../saucer/index.js';
-import type { CompilerContext, ElementType } from '../context.js';
+import type { CompilerContext, ElementType, VariableKind } from '../context.js';
 import type { AbiParameter } from '../contracts.js';
 import { processExpression, processStatement } from './index.js';
 import {
@@ -337,11 +337,14 @@ export function storeExpression(name: string, expr: Expression, ctx: CompilerCon
       return processUpdateStore(name, expr as UpdateExpression, ctx, saucer);
     default: {
       const value = processExpression(expr, ctx);
+      const kind = singleDynamicAbiOutputKind(expr, ctx) ?? inferKindWithContext(expr, ctx);
+
+      rejectV1ScalarToDynamicReassignment(name, kind, ctx);
 
       const result = saucer.store(
         name,
         value,
-        inferKindWithContext(expr, ctx),
+        kind,
         inferElementTypeWithContext(expr, ctx),
         inferStructTypeWithContext(expr, ctx),
       );
@@ -400,6 +403,62 @@ function multiOutputCallOutputs(
   return target && (target.method.outputs?.length ?? 0) > 1 ? target.method.outputs : undefined;
 }
 
+/**
+ * A direct external contract-method call with a SINGLE, non-destructured dynamic ABI
+ * output stored straight into a variable (`let xs = List.at(addr).list();` where
+ * `list()` returns e.g. `uint256[]`) — a THIRD instance of the return-kind
+ * under-classification bug family (see CLAUDE.md's "Same-file user-function
+ * return-kind inference" note for the first two): `inferKindWithContext`'s
+ * CallExpression case only special-cases a SAME-FILE user function's own analyzed
+ * return kind; a direct contract-method call falls through to the ctx-free
+ * `inferKind`, whose generic CallExpression case has no notion of a contract call at
+ * all and defaults to 'scalar' — dropping the descriptor on v1 exactly like the
+ * already-fixed shapes (a later indexed read/write faults SauceInvalidOperationArgs).
+ *
+ * Returns undefined (never 'scalar') so a caller composes it as an override ONLY when
+ * the call resolves to a genuinely single dynamic output — anything else (no
+ * resolvable target, multi-output, a resolvable-but-scalar output, a `.catch()`
+ * chain — mirroring `multiOutputCallOutputs`'s own exclusion just above) falls
+ * through unchanged to the existing `inferKindWithContext`/`inferKind` chain.
+ */
+function singleDynamicAbiOutputKind(expr: Expression, ctx: CompilerContext): VariableKind | undefined {
+  if (expr.type !== 'CallExpression' || resolveCatchChain(expr as CallExpression)) return undefined;
+
+  const target = resolveContractCallTarget(expr, ctx);
+  const outputs = target?.method.outputs;
+
+  if (!outputs || outputs.length !== 1) return undefined;
+
+  return abiOutputKind(outputs[0]) === 'dynamic' ? 'dynamic' : undefined;
+}
+
+/**
+ * v1 cannot re-class an ALREADY-declared slot: `Saucer.store` (saucer.ts) always
+ * uses the EXISTING variable's OWN tracked kind once `ctx.getVar(name)` finds one,
+ * silently ignoring whatever `kind` THIS store computes — so assigning a
+ * provably-dynamic value into a variable first declared scalar (`let x = 5n; x =
+ * arr;`, or the analogous `if (cond) { x = arr; }`) would drop the value's
+ * TUPLE/heap descriptor at runtime (a later indexed read/write faults
+ * `SauceInvalidOperationArgs`) rather than fail loudly at compile time. Reject it
+ * here instead, mirroring this file's other "can't repair it, so refuse it"
+ * guards (`processMemberAssignment`'s `multiOutputCall`/`immutablePacked` checks
+ * just below). v12/svm are unaffected and therefore exempt: `V12Saucer.store`
+ * derives the real storage kind straight from `value.isDynamic`, never from an
+ * existing variable's stale tag, so no descriptor is ever at risk there — see
+ * CLAUDE.md's "Same-file user-function return-kind inference" note.
+ */
+function rejectV1ScalarToDynamicReassignment(name: string, kind: VariableKind, ctx: CompilerContext): void {
+  const existing = ctx.getVar(name);
+
+  if (!ctx.isV12 && existing && existing.kind === 'scalar' && kind === 'dynamic') {
+    throw new Error(
+      `cannot assign a dynamic value to '${name}': it was first declared as a scalar variable and the v1 ` +
+        `engine cannot re-class a slot after declaration — give '${name}' a dynamic value (e.g. an array or a ` +
+        `dynamic contract-call result) on its FIRST assignment instead`,
+    );
+  }
+}
+
 function processTernaryStore(
   name: string,
   expr: ConditionalExpression,
@@ -418,8 +477,46 @@ function processTernaryStore(
   const condition = processExpression(expr.test, ctx);
   const consequent = processExpression(expr.consequent, ctx);
   const alternate = processExpression(expr.alternate, ctx);
-  const thenStore = ctx.newSaucer().store(name, consequent);
-  const elseStore = ctx.newSaucer().store(name, alternate);
+
+  // A ternary stored directly (first declaration OR a plain reassignment) needs the
+  // SAME dynamic-kind PROMOTION the sibling return-kind/aliasing/single-output fixes
+  // already apply elsewhere in this bug family (see CLAUDE.md's "Same-file
+  // user-function return-kind inference" note): v1's scalar (WRITE_VALUE) slot
+  // storage silently drops a dynamic value's TUPLE/heap descriptor, so EITHER branch
+  // resolving dynamic must promote the WHOLE variable to dynamic storage — the sound
+  // direction (storing a scalar in a HEAP slot round-trips fine — the same rule the
+  // mixed-return-function analysis in return-kind.ts already relies on), never a
+  // mis-classification the other way. This must live HERE, not in
+  // `inferKindWithContext`: `storeExpression`'s switch routes a `ConditionalExpression`
+  // to THIS function directly, bypassing `inferKindWithContext` entirely — a case
+  // added there would simply never be consulted for a ternary declaration/assignment.
+  //
+  // ADVERSARIAL-AUDIT FIX (this branch): each branch ALSO tries `singleDynamicAbiOutputKind`
+  // first, exactly mirroring the plain (non-ternary) store path a few lines above
+  // (`storeExpression`'s default branch: `singleDynamicAbiOutputKind(expr, ctx) ??
+  // inferKindWithContext(expr, ctx)`). `inferKindWithContext` alone has NO notion of a direct
+  // external contract call (`Contract.at(addr).method()`) with a single dynamic ABI output —
+  // only a same-file user function's own analyzed return kind — so a ternary branch that is
+  // itself such a call (`let x = cond ? List.at(addr).list() : 0n;` where `list()` returns
+  // `uint256[]`) was always classified 'scalar' here, even though the IDENTICAL call shape
+  // outside a ternary already correctly infers 'dynamic'. Confirmed via real EVM execution:
+  // this compiled cleanly and reverted `SauceInvalidOperationArgs(0x97)` (INDEX) on the caller's
+  // indexed read whenever the dynamic branch was taken — see
+  // `integration-test/dynamic-kind-sweep.test.ts`'s "ternary branchKind" describe block.
+  const consequentKind = singleDynamicAbiOutputKind(expr.consequent, ctx) ?? inferKindWithContext(expr.consequent, ctx);
+  const alternateKind = singleDynamicAbiOutputKind(expr.alternate, ctx) ?? inferKindWithContext(expr.alternate, ctx);
+  const branchKind: VariableKind = consequentKind === 'dynamic' || alternateKind === 'dynamic' ? 'dynamic' : 'scalar';
+
+  // v1 can only apply that promotion on a FIRST declaration (Saucer.store lets the
+  // passed kind decide when `ctx.getVar(name)` finds nothing yet) — a REASSIGNMENT of
+  // an already-scalar variable can't be repaired the same way (see
+  // `rejectV1ScalarToDynamicReassignment`'s own doc comment), so reject it instead of
+  // silently miscompiling. v12/svm are unaffected (V12Saucer.store derives the real
+  // kind from value.isDynamic itself, ignoring this parameter either way).
+  rejectV1ScalarToDynamicReassignment(name, branchKind, ctx);
+
+  const thenStore = ctx.newSaucer().store(name, consequent, branchKind);
+  const elseStore = ctx.newSaucer().store(name, alternate, branchKind);
 
   // Recompute (don't leave stale): the variable is immutable-packed only if a
   // branch actually stores a packed array literal — clear it otherwise so a later

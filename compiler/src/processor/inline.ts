@@ -346,6 +346,20 @@ function makeLiteral(value: bigint): Literal {
   return { type: 'Literal', value, raw: `${value}n`, start: 0, end: 0 } as unknown as Literal;
 }
 
+// A dynamic-KIND placeholder literal — an empty string, which `inferKind`
+// (processor/inference.ts) already classifies 'dynamic' for any ordinary string literal.
+// Used ONLY to seed `#inline_result_N`'s FIRST declaration when `couldReturnBeDynamic`
+// (below) determines the callee might return a dynamic value — see `expandInlineCall`'s own
+// doc comment for why. The specific SHAPE of a dynamic value doesn't matter for this: v1's
+// WRITE_HEAP/READ_HEAP (`saucer/memory.ts`'s encodeHeapStore/encodeHeapRead) just moves
+// whatever heap descriptor the current value produced — an empty string here, an array/tuple
+// descriptor once the real return value is assigned — so seeding 'dynamic' storage with a
+// throwaway empty string is completely generic and safe regardless of what the callee
+// actually returns.
+function makeDynamicPlaceholder(): Literal {
+  return { type: 'Literal', value: '', raw: '""', start: 0, end: 0 } as unknown as Literal;
+}
+
 function makeReturn(expr: Expression): ReturnStatement {
   return { type: 'ReturnStatement', argument: expr, start: 0, end: 0 } as unknown as ReturnStatement;
 }
@@ -848,6 +862,162 @@ function hoistExpr(expr: Expression, state: ExpandState): HoistResult {
   }
 }
 
+// ── conservative "could the call's result be dynamic?" analysis ──
+//
+// `expandInlineCall` (below) shares ONE variable (`#inline_result_N`) across every reachable
+// `return` in the callee body — a guard-clause function may set it from more than one branch
+// (see `eliminateReturns`'s own doc comment) — so its FIRST declaration needs an initializer
+// literal up front, before any real return value is known. Before this fix that initializer
+// was ALWAYS the scalar literal `0n` — fine for the overwhelmingly common scalar-arithmetic
+// guard-clause shape this feature was built for, but WRONG whenever the callee could actually
+// return a dynamic value (an array/object literal, a `new Array(n)` TUPLE, a `.concat()`/
+// `.slice()` string, …): `rejectV1ScalarToDynamicReassignment` (processor/statement.ts) then
+// correctly refuses to let a LATER assignment re-class `#inline_result_N` from scalar to
+// dynamic — a hard, unconditional compile error for every dynamic-returning inline function
+// (confirmed: BEFORE that guard existed, the identical source compiled cleanly and then
+// silently dropped the descriptor at runtime, reverting `SauceInvalidOperationArgs(0x97)` on
+// real EVM execution — so the guard is doing its job; the SENTINEL's own kind was simply
+// never being classified as dynamic in the first place).
+//
+// This is a pure ACORN-AST, ctx-FREE scan (inline expansion runs before `CompilerContext`
+// compiles any body — see this file's own top-of-file doc comment), so it CANNOT be as
+// precise as the real, ctx-aware `inferKindWithContext` that eventually compiles each actual
+// return assignment. It doesn't need to be: it only decides `#inline_result_N`'s INITIAL
+// kind, and `rejectV1ScalarToDynamicReassignment` remains the real soundness backstop — if
+// this scan ever UNDER-estimates (misses a genuinely-dynamic return), the result is a
+// (still-safe) compile-time rejection of a rare/unusual shape, never a silent runtime
+// descriptor drop. So this scan is deliberately biased toward "unsure → assume dynamic"
+// for anything it doesn't specifically recognize as scalar, while still recognizing the
+// common, purely-arithmetic guard-clause shape (this feature's own motivating case) as
+// scalar so EXISTING scalar-only inline functions keep their current (WRITE_VALUE) bytecode
+// shape, byte-for-byte.
+function couldReturnBeDynamic(entry: InlineFnEntry, argExprs: Expression[]): boolean {
+  const locals = new Map<string, boolean>();
+
+  // A parameter that's simply returned unchanged is only as "scalar" as whatever the
+  // CALLER actually passed — resolved with the SAME conservative scan, applied to the
+  // real argument expression at this call site.
+  entry.params.forEach((p, i) => locals.set(p, exprCouldBeDynamic(argExprs[i], locals)));
+
+  return bodyCouldReturnDynamic(entry.body, locals);
+}
+
+// Mirrors return-kind.ts's own OR-across-every-reachable-return rule (a mixed scalar/dynamic
+// guard-clause function is classified dynamic) and its flat, non-block-scoped local tracking
+// (validateInlineable already restricts an inline body to VariableDeclaration/IfStatement/
+// ReturnStatement/ExpressionStatement/ThrowStatement — no loops/switch/try/nested functions —
+// so this only ever needs to walk those five shapes).
+function bodyCouldReturnDynamic(stmts: Statement[], locals: Map<string, boolean>): boolean {
+  let dynamic = false;
+
+  for (const stmt of stmts) {
+    switch (stmt.type) {
+      case 'VariableDeclaration':
+        for (const d of (stmt as VariableDeclaration).declarations) {
+          if (d.id.type === 'Identifier' && d.init) {
+            locals.set((d.id as Identifier).name, exprCouldBeDynamic(d.init as Expression, locals));
+          }
+        }
+
+        break;
+
+      case 'ExpressionStatement': {
+        const expr = (stmt as ExpressionStatement).expression;
+
+        if (expr.type === 'AssignmentExpression') {
+          const assign = expr as AssignmentExpression;
+
+          if (assign.operator === '=' && assign.left.type === 'Identifier') {
+            // Promote-only, same sound direction as every other pass in this bug family.
+            if (exprCouldBeDynamic(assign.right as Expression, locals)) {
+              locals.set((assign.left as Identifier).name, true);
+            }
+          }
+        }
+
+        break;
+      }
+
+      case 'IfStatement': {
+        const ifStmt = stmt as IfStatement;
+
+        if (bodyCouldReturnDynamic(blockToStatements(ifStmt.consequent), locals)) dynamic = true;
+
+        if (ifStmt.alternate && bodyCouldReturnDynamic(blockToStatements(ifStmt.alternate), locals)) dynamic = true;
+
+        break;
+      }
+
+      case 'ReturnStatement': {
+        const ret = stmt as ReturnStatement;
+
+        if (ret.argument && exprCouldBeDynamic(ret.argument as Expression, locals)) dynamic = true;
+
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  return dynamic;
+}
+
+// "Could `expr` be dynamic?" — deliberately biased toward TRUE (see the doc comment above):
+// only a shape provably built from scalars is `false`; anything unrecognized (a call, a
+// property/index access base whose OWN kind is unknown, …) defaults to `true`. An indexed/
+// property access (`arr[i]`, `arr.length`) is `false` regardless of the base's own kind —
+// reading an ELEMENT or a COUNT off a container always yields a scalar in this language,
+// never the container's own dynamic descriptor.
+function exprCouldBeDynamic(expr: Expression, locals: Map<string, boolean>): boolean {
+  switch (expr.type) {
+    case 'Literal':
+      return typeof (expr as Literal).value === 'string';
+
+    case 'Identifier':
+      return locals.get((expr as Identifier).name) ?? false;
+
+    case 'ArrayExpression':
+    case 'ObjectExpression':
+    case 'NewExpression':
+    case 'TaggedTemplateExpression':
+      return true;
+
+    case 'UnaryExpression':
+      return exprCouldBeDynamic((expr as UnaryExpression).argument as Expression, locals);
+
+    case 'BinaryExpression':
+      return (
+        exprCouldBeDynamic((expr as BinaryExpression).left as Expression, locals) ||
+        exprCouldBeDynamic((expr as BinaryExpression).right as Expression, locals)
+      );
+
+    case 'LogicalExpression':
+      return (
+        exprCouldBeDynamic((expr as LogicalExpression).left as Expression, locals) ||
+        exprCouldBeDynamic((expr as LogicalExpression).right as Expression, locals)
+      );
+
+    case 'ConditionalExpression': {
+      const c = expr as ConditionalExpression;
+
+      return (
+        exprCouldBeDynamic(c.consequent as Expression, locals) || exprCouldBeDynamic(c.alternate as Expression, locals)
+      );
+    }
+
+    case 'MemberExpression':
+      return false;
+
+    default:
+      // Anything else (a CallExpression — same-file function, contract call, global/builtin,
+      // …) is unknown from a pure ctx-free AST scan — conservatively assume dynamic. Costs at
+      // most an extra heap slot on a scalar-returning call; NEVER a dropped descriptor.
+      return true;
+  }
+}
+
 /**
  * Splice ONE call to inline function `name` at its use site: bind each (already-expanded)
  * argument to a fresh param const, alpha-rename the callee's body, run return-elimination,
@@ -908,7 +1078,17 @@ function expandInlineCall(
   const stmts: Statement[] = [];
 
   entry.params.forEach((p, i) => stmts.push(makeConstDecl(renameMap.get(p)!, argExprs[i])));
-  stmts.push(makeLetDecl(resultVar, makeLiteral(0n)));
+
+  // Seed `#inline_result_N`'s FIRST declaration with a DYNAMIC-kind placeholder whenever the
+  // callee might return a dynamic value — see `couldReturnBeDynamic`'s own doc comment for
+  // why (a scalar-first declaration would make `rejectV1ScalarToDynamicReassignment` reject
+  // the later real-value assignment outright, a hard, unconditional compile error for every
+  // dynamic-returning inline function). Computed against the ORIGINAL (pre-rename) callee
+  // body/params — alpha-renaming doesn't change any node's TYPE, only identifier text, so it
+  // makes no difference to this scan either way.
+  const resultInit = couldReturnBeDynamic(entry, argExprs) ? makeDynamicPlaceholder() : makeLiteral(0n);
+
+  stmts.push(makeLetDecl(resultVar, resultInit));
   stmts.push(makeLetDecl(doneVar, makeLiteral(0n)));
 
   const renamedBody = entry.body.map((s) => renameStatement(s, renameMap));

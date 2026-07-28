@@ -465,6 +465,32 @@ function resolveStandaloneBinding(expr, ctx) {
     ctx.setPendingContractBinding(contract.name, BINDING_METHODS[propertyName]);
     return processExpression(expr.arguments[0], ctx);
 }
+/**
+ * Shape-only match for a standalone contract binding (`Contract.at(addr)` / `.view(addr)` /
+ * `.lib(addr)`) — the SAME shape `resolveStandaloneBinding` above recognizes, but without
+ * touching `ctx` at all (no `setPendingContractBinding`, no argument emission). Exists purely
+ * so `analyzeFunctionReturnKinds`'s fixpoint pre-pass (`processor/return-kind.ts`) can track a
+ * `let pool = Contract.at(addr);` declaration's contract binding INSIDE its own, pass-local
+ * bookkeeping — that pass runs against the bare module-level `ctx` strictly BEFORE any function
+ * body is actually compiled, so it must never call the real, side-effecting
+ * `setPendingContractBinding`/`consumePendingContractBinding` pair (that would corrupt the
+ * `ctx.boundContracts` state the REAL compile pass depends on afterward). The caller looks the
+ * contract name up via `ctx.lookupContract` itself (read-only, always safe).
+ */
+export function matchStandaloneBindingShape(expr) {
+    if (expr.type !== 'CallExpression')
+        return undefined;
+    const call = expr;
+    if (call.callee.type !== 'MemberExpression')
+        return undefined;
+    const member = call.callee;
+    if (member.object.type !== 'Identifier' || member.property.type !== 'Identifier')
+        return undefined;
+    const propertyName = member.property.name;
+    if (!(propertyName in BINDING_METHODS))
+        return undefined;
+    return { contractName: member.object.name, callTypeOverride: BINDING_METHODS[propertyName] };
+}
 export const processCallExpression = (expr, ctx, saucer) => {
     // Pattern: .catch(handler) — ERC20.at(addr).transfer(to, amount).catch(() => { ... })
     const catchInfo = resolveCatchChain(expr);

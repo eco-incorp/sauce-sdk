@@ -513,7 +513,36 @@ export class V12Saucer implements SaucerLike {
 
     if (existing?.isParam) {
       // SET: [value][SSWAP_pos][SDROP] — replace the param in place on the stack.
-      const pos = this.ctx.findStackVar(name);
+      //
+      // `findStackVar` alone is only the STATIC distance from the top of the param
+      // block, assuming this write executes with NOTHING else on the stack above the
+      // frame's params — true only for a bare `main()` writing its own single-value
+      // top-level parameter. It omits two things the READ path (below) already
+      // accounts for via its patched SDUP sentinel (see `compile()`'s
+      // `depth + 1 + paramCount - paramIndex` for a helper / `depth + paramCount -
+      // paramIndex` for main): (1) the +1 call-frame return-address word a HELPER's
+      // frame carries (main has none — it's inlined, never called), and (2) the
+      // live expression-stack depth already built up by the time this SSWAP actually
+      // executes — `this.stackEffect` (bytes already emitted before `value`) plus
+      // `value.stackEffect` (what `value`'s own bytes push). Omitting both meant a
+      // param write was only ever correct for main() writing its sole parameter with
+      // an empty stack — every other shape (a helper's own param, the 2nd/3rd of
+      // several params, a write nested inside an `if`/`while` body, two writes to one
+      // param) silently computed the WRONG SSWAP target, either corrupting an
+      // unrelated stack slot or (for a scalar write) just returning the pre-write
+      // value with NO revert at all. Confirmed via one-byte bytecode patches on the
+      // real Huff runtime before this fix landed (see CLAUDE.md's "v12/svm parameter
+      // WRITE" note) — reproducing identically on the pinned AND a newer engine-v12
+      // checkout, so this is compiler-side, not engine-side.
+      //
+      // The final `- 1` is SSWAPn-vs-SDUPn semantics, not a second omission: SDUPn
+      // (EVM DUPn) duplicates the nth stack item counting the top as n=1, but SSWAPn
+      // (EVM SWAPn) exchanges the top with the (n+1)th item — SWAP1 swaps position 1
+      // (top) with position 2. So the SAME "position from top" the read path patches
+      // directly into a DUPn needs one subtracted to become the matching SWAPn.
+      const depth = this.stackEffect + value.stackEffect;
+      const frame = this.ctx.isMainFunction ? 0 : 1;
+      const pos = depth + frame + this.ctx.findStackVar(name) - 1;
 
       if (pos < 1 || pos > 16) throw new Error(`param '${name}' out of stack range: ${pos}`);
 
