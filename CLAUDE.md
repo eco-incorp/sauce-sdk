@@ -1154,6 +1154,407 @@ two-array split — a materially bigger change than the return-direction fix abo
 for a follow-up (or an interim compile-time rejection mirroring the existing `multiOutputCall`
 guard) rather than bundled in here.
 
+**v12/svm call-argument gap: CONFIRMED NOT PRESENT, plus a real (unrelated) v12/svm bug found
+while proving it.** The FIFTH-instance gap above is documented as v1's own engine-level
+funcHeap/funcValues split — a question this branch resolved empirically rather than assuming: does
+v12 (the postfix, stack-based dialect) have any equivalent gap? **No.** Verified via real execution
+on all three engines (a deployed v1 `Sauce.sol` on anvil, `forge test --ffi` against
+`v12/Runtime.huff` on both the pinned engine-v12 checkout and a newer live one, and the vendored
+svm `engine.so` via LiteSVM): the exact motivating example
+(`function h(a){ return a[1]; } function main(){ const arr = new Array(3); …; return h(arr); }`)
+returns the correct value on v12 and svm while still reverting on v1, and so does every variant
+tried — mixed scalar/dynamic argument order, a helper chain forwarding the argument two frames
+deep, a helper's returned array passed straight into another call, an array-literal argument, a
+RECURSIVE call passing a dynamic argument, a two-hop alias (`let b = a; return b[1];`) inside the
+callee, and a dynamic parameter's `.length`. This is structural, not incidental: v12 has no
+funcHeap/funcValues split to get wrong in the first place — `V12Saucer.callFunction`
+(`saucer/saucer-v12.ts`) just emits each argument's own builder (for a dynamic local, a single
+`READ_HEAP <slot>` — one 32-byte descriptor word) forward on the ordinary EVM stack, then
+`CALL_FUNCTION`; and the callee's parameter is read back via `V12Saucer.read`'s `isParam` branch
+(an SDUP sentinel), which **never even looks at the parameter's `kind` tag** — only the *non-param*
+branch of `read`/`store` picks `READ_VALUE`/`WRITE_VALUE` vs `READ_HEAP`/`WRITE_HEAP` by kind. So
+`processFunctionV12` tagging every helper parameter `kind: 'scalar'` (`processor/index.ts`, same
+line the FIFTH-instance gap above cites) is **dead metadata on v12/svm** — confirmed by also
+testing the kind-sensitive follow-on shapes explicitly (a callee doing `let b = a; b[0] = 9n; return
+b[0] + b[1]*10n;` on its own dynamic parameter round-trips correctly; so does a nested
+`o[0][0]` read through a parameter, even with `elementType` undefined). Regression-locked (not
+merely re-confirmed by reasoning) as `callarg_*` transpiler vectors in
+`integration-test/v12-execution.test.ts` and cases in `integration-test/svm-execution.test.ts`, plus
+`self_recursive_dynamic_return`/`mutual_recursive_dynamic_return` (the fixpoint in
+`return-kind.ts` converges through a call cycle, and the runtime descriptor round-trips a
+recursive RETURN correctly, on v12/svm exactly as it already does on v1 — see
+`integration-test/dynamic-kind-sweep.test.ts` for the v1-side proof of the identical shapes). The
+v1 gap itself is UNCHANGED and still deliberately unfixed — `function-return-kind.test.ts`'s "KNOWN
+GAP" test is retitled "KNOWN GAP (unfixed, v1-only)" so it is never misread as an engine-agnostic
+limitation, and `dynamic-kind-sweep.test.ts` extends the same v1-only revert coverage to the
+two-hop/recursive/compound-assignment variants. **One shape fails SILENTLY on v1 rather than
+reverting**, worth calling out on its own: a dynamic parameter's `.length` — e.g. a `string`
+parameter — reads the SCALAR WORD WIDTH (32) instead of the real length, with no revert at all
+(`dynamic-kind-sweep.test.ts`'s "SILENT" test pins `"AB".length` via a parameter returning `32n`,
+not `2n`); v12/svm read the correct length through the same ordinary stack parameter.
+
+**NEW BUG FOUND while proving the above, and FIXED: v12/svm silently computed the WRONG stack
+position for every WRITE to a function parameter** — `V12Saucer.store`'s (`saucer/saucer-v12.ts`)
+`isParam` branch used `this.ctx.findStackVar(name)` directly as the `SSWAPn` argument, which is
+only the STATIC distance from the top of the param block assuming NOTHING else is on the stack
+above the frame's params at that point — true only for `main()` writing its own single parameter
+with an empty stack. It silently omitted exactly the two things the READ path (`V12Saucer.read`'s
+`isParam` branch, patched in `compile()`) already accounts for: (1) the **+1 call-frame
+return-address word** a HELPER's frame carries (main has none — it's inlined, never called), and
+(2) the **live expression-stack depth** already built up by the time the `SSWAP` actually executes
+(`this.stackEffect` from bytes already emitted, plus the new value's own `stackEffect`). The
+consequence, confirmed via a one-byte bytecode patch on the real Huff runtime before any
+source-level fix existed (`e1`→`e2` turning `SSWAP1` into `SSWAP2` flipped a wrong-5 result to the
+correct 6): a plain scalar parameter write (`function h(x){ x = x + 1n; return x; }` called as
+`h(5n)`) **silently returned the PRE-write value (5) with NO revert at all** — a materially worse
+failure mode than every other bug in this family, all of which at least revert. Every OTHER
+parameter-write shape either corrupted a DIFFERENT, wrong stack slot (writing the middle of three
+params, a write inside an `if`/`while` body, two writes to the same parameter) or reverted outright
+(any DYNAMIC write — `a[0] = 9n;`, `a[0] += 10n;`, `a = new Array(2);` — through a parameter).
+Reproduced identically on both the pinned engine-v12 checkout and a newer live one, so this is
+compiler-side, not engine-side. Fixed by computing the real position the same way the read path
+already does, one level lower (an `SSWAPn` exchanges the top with the `(n+1)`th item — EVM
+`SWAP1` swaps position 1 with position 2 — so it needs one LESS than the "position from top" a
+`SDUPn`/EVM `DUPn` consumes directly):
+
+```ts
+const depth = this.stackEffect + value.stackEffect;
+const frame = this.ctx.isMainFunction ? 0 : 1;
+const pos = depth + frame + this.ctx.findStackVar(name) - 1;
+```
+
+Verified end to end: fixes every one of the shapes above on both v12 and svm, leaves every
+`main()`-level parameter write byte-compatible (the new formula collapses to the old value there —
+`main` has `frame = 0` and, for its own top-level statements, `depth` starts at 0 too), and the full
+compiler suite (all 64 files, 1582/1582 with `SAUCE_ENGINE_V12` pointed at a full checkout so
+`v12-execution`/`svm-execution` actually run) and sdk suite (1782/1782) stay green.
+Regression-locked as `param_write_*` transpiler vectors in `integration-test/v12-execution.test.ts`
+and matching cases in `integration-test/svm-execution.test.ts` (a scalar write in a helper, the
+middle of three params, inside an `if`, inside a `while`, two writes to one param, a dynamic
+element write, and a write two call frames deep) — plus `callarg_compound_assign_on_param` /
+`callarg_string_param_length`, which additionally lock in that a param write that reverts on v1 (a
+DIFFERENT, unfixed gap — see above) now correctly round-trips on v12/svm.
+
+**A SIXTH instance of the return-kind bug family, FIXED: a single, non-destructured dynamic ABI
+output stored directly in a variable.** `let xs = List.at(addr).list2();`, where `list2()` returns
+exactly ONE dynamic component (e.g. `uint256[]`) — NOT a multi-output call, so the pre-existing
+`multiOutputCall` tag mechanism (`processor/statement.ts`) never applied — used to under-classify
+`xs` as `'scalar'`: `inferKindWithContext`'s `CallExpression` case only special-cases a same-file
+user function's own analyzed return kind, so a direct contract-method call fell through to the
+ctx-free `inferKind`, whose generic `CallExpression` case has no notion of a contract call at all
+and defaults to `'scalar'` — the identical descriptor-drop hazard as the three original instances,
+confirmed via real EVM execution against an etched single-output mock contract
+(`integration-test/dynamic-kind-sweep.test.ts`): `xs[1]` reverted `SauceInvalidOperationArgs(0x97)`
+(INDEX), `xs.length` silently returned 32 instead of the real length, and both faults propagated
+identically through aliasing and through a HELPER that stores-then-returns the call. Two coordinated
+fixes, mirroring the shape of the destructuring fix's own two-site pattern: (a)
+`processor/statement.ts`'s `storeExpression` default branch now tries a new
+`singleDynamicAbiOutputKind(expr, ctx)` helper BEFORE falling back to `inferKindWithContext` — it
+resolves the call's target via the same `resolveContractCallTarget` the destructuring lowering
+uses, and returns `'dynamic'` only when the call resolves to EXACTLY one dynamic-kind ABI output
+(never `'scalar'` — an override, not a replacement — so a multi-output call, an unresolvable
+target, a resolvable-but-scalar output, or a `.catch()` chain all fall through unchanged); (b)
+`processor/return-kind.ts`'s `kindOfExpr` (the fixpoint pre-pass's own per-expression classifier)
+gained the identical case, so a HELPER that stores and returns such a call is classified correctly
+too — without it, fix (a) alone only helped the DIRECT store site, and a helper doing the same
+thing stayed mis-classified (the fourth-instance bug's exact shape, recurring one level shallower).
+Verified: direct read, `.length`, aliasing, the helper-return shape, two sequential calls (proving
+one doesn't clobber the other's stored result on v1), and a call with an unrelated `.catch()`-chain
+call in between all round-trip correctly now; v12/svm bytecode is completely unchanged by this fix
+(`V12Saucer.store` ignores `_kind` regardless, per the established pattern above), and the only
+shape still failing afterward is passing the result as a call ARGUMENT — the separate, still-open
+gap documented above.
+
+**A SEVENTH instance, FIXED: a ternary whose branches are dynamic, on its FIRST declaration.**
+`let x = cond ? arr : other;` used to always store `x` via a bare `'scalar'` default —
+`processTernaryStore` (`processor/statement.ts`) never consulted ANY kind inference at all before
+this fix, unlike the ordinary (non-ternary) assignment path in the very same file. Confirmed via
+real EVM execution that this silently dropped whichever branch's dynamic descriptor was actually
+taken (`SauceInvalidOperationArgs(0x97)` on the later `x[1]`), on both a compile-time-resolvable
+condition and a genuinely runtime one (`main(cond)`'s own parameter), and on the structurally
+identical `if (cond) { let x = arr; } else { let x = other; }` idiom (SauceScript shares scope
+across `if`/`else`, so this is the SAME persisting `x`, not two block-scoped ones — see this file's
+repeated shadow-fix notes elsewhere). Fixed by computing a `branchKind` — `'dynamic'` if EITHER
+`inferKindWithContext(expr.consequent, ctx)` or `…(expr.alternate, ctx)` resolves dynamic, else
+`'scalar'` — and passing it into BOTH branches' `store()` calls; this can only happen HERE, not in
+`inferKindWithContext` itself, because `storeExpression`'s own `switch` routes a
+`ConditionalExpression` to `processTernaryStore` directly, bypassing `inferKindWithContext`
+entirely — a case added there would simply never be consulted for a ternary declaration/
+assignment. The promote-when-either-branch-is-dynamic rule mirrors the exact same "sound direction"
+`analyzeFunctionReturnKinds`'s mixed-return-function handling already relies on (storing a scalar
+in a HEAP slot round-trips losslessly on v1; the reverse does not). Verified: both branches of the
+FIRST-declaration ternary round-trip correctly now (`integration-test/dynamic-kind-sweep.test.ts`),
+and v12/svm — already correct before this fix, for the same "the tag is dead metadata" reason as
+everywhere else in this family — are unaffected.
+
+**A companion compile-time REJECTION, new in this branch: a v1 REASSIGNMENT that would need to
+re-class an already-scalar variable to dynamic.** The ternary fix above only helps a FIRST
+declaration — `Saucer.store` (v1) always uses an EXISTING variable's OWN tracked kind once
+`ctx.getVar(name)` finds one, silently ignoring whatever kind a LATER store computes, so `let x =
+5n; x = arr;` (a plain reassignment), the analogous `if (cond) { x = arr; }`, and a ternary
+REASSIGNMENT (`x = cond ? arr : other;` where `x` was already scalar) all used to compile cleanly
+and then drop the descriptor at runtime — confirmed via real EVM execution
+(`SauceInvalidOperationArgs(0x97)` on the later indexed read in every case). v1 cannot repair this
+(there is no mechanism to re-class a slot after declaration), so `rejectV1ScalarToDynamicReassignment`
+(`processor/statement.ts`, called from both `storeExpression`'s default branch and
+`processTernaryStore`) now rejects it at compile time instead — a strict improvement (a clear error
+beats a silent runtime revert) — whenever `!ctx.isV12 && existing?.kind === 'scalar' && newKind ===
+'dynamic'`. This SUPERSEDES two existing unit tests in `test/destructuring.test.ts`
+(`'clears the tag on reassignment'` / `'ternary reassignment clears a stale tag'`) that had
+previously asserted these exact shapes "kept compiling" — they did, but only because nothing before
+this fix noticed the reassignment was unsafe; both are updated to assert the new rejection instead,
+with the real-execution evidence that motivated the change recorded in their comments. The reverse
+direction (a scalar stored into an ALREADY-dynamic slot) is untouched and still round-trips fine,
+exactly like the mixed-return-function case; only `existing.kind === 'scalar'` triggers the
+rejection. v12/svm are exempt outright (`V12Saucer.store` derives the real kind from
+`value.isDynamic`, never from an existing variable's stale tag) and every rejected v1 shape compiles
+cleanly there — see `test/dynamic-reassignment-guard.test.ts` for the full compile-time matrix
+(rejected shapes, the one shape correctly NOT rejected, and the v12 unaffected-control).
+
+**A pre-existing v12/svm FEATURE GAP found and closed with a compile-time rejection (not a
+kind-inference bug): a NESTED array literal.** `const a = [[1n, 2n], [3n, 4n]]; return a[1][0];`
+compiles and executes correctly on v1 in every form tried (direct, aliased, returned from a helper —
+`elementType`/kind inference already handles it) — only passing one as a call ARGUMENT hits the
+separate, already-documented v1 call-argument gap above. But on v12 AND svm, the identical literal
+fails in EVERY form (an empty revert on v12, `InvalidInstructionData` on svm), confirmed via real
+execution — while a FLAT literal (`[1n, 2n, 3n]`) and an equivalent NESTED structure built with
+`new Array(n)` (`outer[0] = inner;`) both work fine on v12/svm, isolating the fault to the nested
+literal's own STATIC encoding specifically, not to nesting or dynamism in general. This is a
+pre-existing engine-v12/svm feature gap (no nested-ARRAY encoding in `DynamicData.huff`/the svm
+engine yet), not a compiler kind-inference defect, so there is no descriptor to "fix" — but leaving
+it as an opaque runtime revert is worse than necessary. `processor/collection.ts`'s
+`processArrayExpression` now calls a new `assertNoNestedArrayLiteral` guard that rejects, at compile
+time, any array literal with an `ArrayExpression` element whenever `ctx.isV12` — pointing at the
+working `new Array(n)` alternative — while leaving v1 (and a flat/`new Array`-nested literal on
+every target) completely untouched. See `test/array.test.ts`'s "nested array literal" describe
+block for the full matrix (v1 unaffected, v12/svm rejected with a clear message, flat/`new
+Array`-nested unaffected).
+
+**Sweep findings investigated and confirmed NOT reproduced (documented so they are not
+re-investigated as this same bug family):**
+- **`&&`/`||` are boolean operators, not JS-style value-returning short-circuits** — SauceScript
+  lowers them to `BOOL_AND`/`BOOL_OR` (`processor/expression.ts`'s `processLogicalExpression`), so
+  `cond && arr` yields a boolean engine-consistently on every target; indexing the result is a
+  meaningless program (`x[1]` on a boolean), not a dropped descriptor. Confirmed via real execution
+  that `let c = 1n; let x = c && 3n; return x;` returns `1n` (never `3n`) on v1 — locked in
+  `integration-test/dynamic-kind-sweep.test.ts`.
+- **A recursive same-file function's fixpoint convergence, and the runtime round-trip across a
+  recursive RETURN, are both already correct** — confirmed for self-recursion AND mutual recursion,
+  on v1 (`integration-test/dynamic-kind-sweep.test.ts`) and on v12/svm
+  (`self_recursive_dynamic_return`/`mutual_recursive_dynamic_return`). The height-1-lattice fixpoint
+  in `analyzeFunctionReturnKinds` (`return-kind.ts`) converges through a call CYCLE exactly as
+  designed, non-vacuously (both vectors require at least one promotion to propagate through the
+  recursive call before the fixpoint stabilizes).
+- **`.catch(handler)` introduces no descriptor-kind gap of its own** — a handler mutating an
+  enclosing dynamic local, and a dynamic local declared before an unrelated intervening `.catch()`
+  chain, both round-trip correctly on v1 (`integration-test/dynamic-kind-sweep.test.ts`, reusing the
+  existing `MockTarget.revertWithMessage()` fixture from `try-catch.test.ts`) — consistent with
+  `resolveCatchChain` compiling the handler against the SAME `CompilerContext` as its surrounding
+  code, a real (not merely theoretical) closure-sharing mechanism documented elsewhere in this file.
+- **Compound assignment (`+=`) and its aliasing composition are clean** — `arr[0] += 10n;` and the
+  same through an alias (`let b = a; b[0] += 10n;`, proving the write lands on the shared backing
+  array) both round-trip correctly on every target; `arr[0]++` remains a clean `not implemented:
+  update on MemberExpression` compile error everywhere, a feature gap, not a miscompile. Only a
+  compound assignment through a CALL-ARGUMENT parameter inherits the pre-existing (v1-only, now
+  regression-locked both ways) call-argument gap.
+- **Object-literal property read/write and a bare parameter's property read are already rejected
+  outright at compile time** (`test/index.test.ts`) — there is no object-shaped LOCAL variable or
+  parameter whose storage kind could ever be mis-inferred, since the struct/object path only exists
+  for ABI struct call arguments (`processAbiArg`), never for a local value.
+
+**Deliberately NOT actioned in this branch: a separate, PRE-EXISTING v12 ENGINE bug found while
+investigating the above, affecting the PINNED engine only.** While proving the single-dynamic-output
+fix's `.catch()`-composition case, a later heap allocation or external call was found to clobber an
+ALREADY-DECODED dynamic ABI output on the currently-PINNED `engine-v12` (including through the
+SHIPPED `const [n, xs] = …` destructuring syntax) — but the identical vectors all PASS against a
+newer, live `engine-v12` checkout, so the fix already exists upstream; this is not a compiler defect.
+Actioning it means repinning the `sauce` git dependency to a fixed commit and following this file's
+own repin ritual (`sync-engine-artifacts` + committing the refreshed EVM/svm artifacts) — deliberately
+NOT done here: identifying the exact upstream commit that fixed it needs its own investigation, and a
+repin changes engine artifacts widely enough (affecting far more than this branch's own scope) that
+it belongs in its own dedicated change, not bundled into a compiler-focused fix. Left as an open
+follow-up; the pinned-vs-live split itself is the only evidence needed that this is engine-side.
+
+**Adversarial-audit fixes (this branch), three more instances of the same failure families:**
+
+1. **The SIXTH-instance return-kind fix's `kindOfExpr` gap: a variable-BOUND contract call
+   (`let pool = Contract.at(addr); pool.method();`) inside a HELPER couldn't resolve during the
+   fixpoint pre-pass.** `analyzeFunctionReturnKinds` (return-kind.ts) runs against the bare
+   module-level `ctx`, strictly before any function body is actually compiled — so
+   `ctx.lookupBoundContract` (only ever populated on a per-function CHILD context via
+   `consumePendingContractBinding`, which runs while REALLY compiling a body) has nothing
+   registered yet. `kindOfExpr`'s single-dynamic-output-call case therefore fell through to the
+   ctx-free `inferKind` fallback for a bound-variable call specifically (the INLINE
+   `Contract.at(addr).method()` chain shape was already fine, resolvable via `ctx.lookupContract`
+   alone) — silently under-classifying a helper like `function helper() { let pool =
+   List.at(addr); return pool.list2(); }` as `'scalar'`, dropping the descriptor exactly like the
+   original bug. Fixed by tracking a `let pool = Contract.at(addr);` declarator into a NEW,
+   pass-local `localBoundContracts` map (mirroring `consumePendingContractBinding`'s real
+   registration, but never mutating the shared `ctx` itself — see `matchStandaloneBindingShape`,
+   a new side-effect-free sibling of `resolveStandaloneBinding` in expression.ts) so
+   `resolveMethodTarget` (return-kind.ts) can resolve the later `pool.method()` call within the
+   SAME function during this pass too. `applyDestructuringKinds` (the sibling destructuring-
+   declarator case) is DELIBERATELY left untouched: it already handles this exact unresolvable
+   shape by conservatively promoting every bound name to `'dynamic'` — see
+   `integration-test/function-return-kind.test.ts`'s own "conservative fallback" test, which pins
+   that as intentional, already-safe behavior, not a bug. Regression-locked in
+   `test/return-kind.test.ts` (compile-time bytecode-shape proof) and
+   `integration-test/dynamic-kind-sweep.test.ts` (real EVM execution).
+
+2. **Inline (arrow-const) functions could no longer return ANY dynamic-kind value on v1 — a
+   hard, unconditional compile-time regression caused by this same session's OWN
+   `rejectV1ScalarToDynamicReassignment` guard.** The inline splicer shares ONE variable
+   (`#inline_result_N`) across every reachable `return` in a guard-clause body, always seeded
+   with the scalar placeholder literal `0n` — so a callee that actually returns a dynamic value
+   (a `new Array(n)` TUPLE, an array/object literal, a `.concat()`/`.slice()` string, …) tripped
+   the reassignment guard on its first real return assignment: a hard compile error, for EVERY
+   dynamic-returning inline function, with no way to write one at all. Confirmed genuinely part
+   of this bug family, not a false positive: on the pre-guard commit the identical source
+   compiled cleanly and then reverted `SauceInvalidOperationArgs(0x97)` (INDEX) on real EVM
+   execution — the guard was correctly catching a real, previously-SILENT descriptor drop; the
+   sentinel's own kind was simply never classified dynamic in the first place. Fixed by
+   `couldReturnBeDynamic` (inline.ts): a conservative, ctx-free scan of the callee's own
+   (pre-splice) return expressions — mirroring return-kind.ts's OR-across-every-reachable-return
+   rule — that seeds `#inline_result_N` with a dynamic-kind placeholder (an empty string literal;
+   any dynamic value's storage kind is generic on both engines, so the specific placeholder shape
+   is irrelevant) whenever the callee MIGHT return dynamic. Deliberately biased toward
+   "unsure → assume dynamic" for anything not specifically recognized as scalar (a call, a
+   property/index-access base of unknown kind, …), while still recognizing the common,
+   purely-arithmetic guard-clause shape (`tickArg`/`kyberOut`, this feature's own motivating
+   case) as scalar, so EXISTING scalar-only inline functions keep their byte-identical
+   (`WRITE_VALUE`) bytecode. A parameter returned unchanged is checked against the ACTUAL
+   call-site argument expression, not the callee's own (opaque) parameter name — but a bare
+   Identifier argument (as opposed to a directly-dynamic-LOOKING one) is deliberately left
+   scalar-seeded rather than blanket-promoted, since promoting every identifier argument would
+   regress the `tickArg(shifted, OFFSET)` motivating shape itself (two ordinary scalar
+   identifiers). Residual, deliberately accepted gap: identity-style passthrough of an EXISTING
+   dynamic caller-scope local through an inline function (`identity(arr)` where `arr` is a `new
+   Array(n)` local) still hits the reassignment guard — a real but narrower gap than the
+   original finding, and still SAFE (a clear compile error, never a silent drop). Regression-
+   locked in `test/inline-functions.test.ts` (compile-time, including the negative control that
+   pins the unaffected scalar bytecode shape byte-for-byte) and
+   `integration-test/inline-functions.test.ts` (real EVM execution).
+
+3. **A NINTH instance of the dynamic-value storage-kind family, structurally different from the
+   other eight: an object-literal FIELD reading an EXISTING dynamic-kind variable.**
+   `processObjectExpression` (collection.ts) had no safety check analogous to
+   `processArrayExpression`/`encodeArray`'s own static/dynamic element-consistency check — `{ a:
+   inner, b: 5n }` (`inner` a `new Array(2)` local) compiled cleanly on BOTH v1 and v12, and then
+   silently returned a raw internal heap-descriptor artifact instead of the real data when `s.a`
+   was read back (confirmed via real execution on v1 — anvil + deployed `Sauce.sol` — AND v12 —
+   the real Huff runtime via a local `engine-v12/test/V12-execparity` checkout — both returning
+   the identical wrong word, not `[111,222]` or any recognizable ABI encoding; the sibling scalar
+   field `s.b` read back correctly, isolating the fault to the dynamic FIELD specifically, so
+   `s`'s own storage kind is inferred fine). Contrast, ALSO verified via real execution on both
+   targets: a DIRECTLY-CONSTRUCTED dynamic value at the property position — a string/array
+   literal, a `.concat()` call, a nested plain object literal — round-trips correctly, since each
+   allocates its OWN fresh dynamic value at that exact point rather than re-embedding an EXISTING
+   heap descriptor from elsewhere; only a plain READ of a pre-existing dynamic variable (or an
+   alias of one) is broken. Fixed by `assertNoDynamicVariableObjectField` (collection.ts): rejects
+   a property whose PROCESSED value's leading opcode is `READ_HEAP` (the exact, empirically-
+   isolated broken shape) — a directly-constructed dynamic value at the property position is
+   untouched, and a violation nested inside an object literal's own nested-struct field is still
+   caught, since `processExpression` routes a nested `ObjectExpression` back through this same
+   function regardless of depth. Applies to BOTH v1 and v12/svm (unlike `assertNoNestedArrayLiteral`
+   just above, which is v12-only) — this is the first guard in this whole family confirmed broken
+   on both engines by direct execution rather than reasoned about from the postfix-descriptor
+   design. Regression-locked in `test/struct.test.ts` (the compile-time rejection matrix, including
+   negative controls for every already-supported shape) and `integration-test/struct.test.ts` (real
+   EVM execution proving the working alternative the error message itself points at).
+
+**Second-round adversarial-audit fixes (this branch): three more defects found by an
+independent review of the fixes above — none caught by that diff's own tests.**
+
+1. **`return-kind.ts`'s `localBoundContracts` went stale on a REASSIGNMENT, not just on first
+   declaration.** `walkStatement`'s `VariableDeclaration` case tracks a `let pool =
+   Contract.at(addr);` declarator into the fixpoint pre-pass's own pass-local
+   `localBoundContracts` map (see the "SIXTH-instance" fix above), but the sibling
+   `ExpressionStatement`/`AssignmentExpression` case never updated that map when `pool` was
+   later REASSIGNED to a DIFFERENT bound contract (`pool = Contract2.at(addr2);`) — the stale
+   FIRST binding stayed there for the rest of the function, even though the REAL compile
+   stage's own `ctx.boundContracts` updates correctly on this exact reassignment
+   (`consumePendingContractBinding` fires for every store whose RHS was a standalone binding
+   call, real or pre-pass). Two confirmed failure modes, both reachable and both fixed:  a
+   false-positive **compile CRASH** — `resolveMethodTarget` still consulted the stale contract
+   for a method that exists only on the NEW one, throwing `Unknown method "..." on contract
+   "..."` and aborting the compile of a program the real, `ctx.boundContracts`-backed compile
+   stage accepts just fine (confirmed: `compile()` throws before the fix, doesn't after,
+   `test/return-kind.test.ts`'s "does NOT throw" case); and a **silent under-classification** —
+   when the two contracts share a method NAME but differ in output shape, the stale entry's
+   output shape (e.g. scalar) masks the new binding's REAL one (e.g. dynamic), so `helper`'s
+   registered return kind is wrong and a caller storing the result drops the descriptor via
+   WRITE_VALUE instead of WRITE_HEAP — confirmed via real EVM execution
+   (`integration-test/dynamic-kind-sweep.test.ts`'s "a reassigned variable-bound contract"
+   describe block): `SauceInvalidOperationArgs(0x97)` on the caller's indexed read before the
+   fix, `2211n` (the real, dynamic-branch value) after. Fixed by making the
+   `AssignmentExpression` case mirror the `VariableDeclaration` case's own tracking exactly:
+   `matchStandaloneBindingShape` on the RHS resolves a NEW binding into `localBoundContracts`,
+   and anything else (a plain value, an aliasing read, an unresolvable name) `delete`s the
+   stale entry instead of leaving it around — costs at most a missed optimization (falling back
+   to the generic `inferKind` guess), never a wrong classification, the same "when unsure, don't
+   guess against stale state" rule this whole file already applies elsewhere. (A THIRD shape —
+   reassigning to something that ISN'T a resolvable contract binding at all, then still calling
+   `.method()` on it — was investigated but turns out not to be independently observable in a
+   unit test: the REAL compile stage's own `ctx.boundContracts` has the identical, separate,
+   pre-existing staleness characteristic for a non-rebinding reassignment, so the pre-pass's own
+   choice to delete vs. leave-stale doesn't change `compile()`'s overall outcome for that
+   specific probe, verified empirically while writing the test. The deletion is still correct
+   and still implemented — it just doesn't have its own clean red/green unit test the way the
+   two confirmed failure modes do.)
+
+2. **`processTernaryStore`'s `branchKind` had no notion of a direct dynamic-ABI-output contract
+   call.** The SEVENTH-instance fix above taught `processTernaryStore` to promote a ternary's
+   storage to `dynamic` when either branch's `inferKindWithContext` resolves dynamic — but
+   `inferKindWithContext` alone has NO notion of a direct external contract call
+   (`Contract.at(addr).method()`) with a single dynamic ABI output; only `singleDynamicAbiOutputKind`
+   (a few lines above, in the SAME file) closes that gap, and the plain (non-ternary) store path
+   already tries it first (`singleDynamicAbiOutputKind(expr, ctx) ?? inferKindWithContext(expr,
+   ctx)`) — `processTernaryStore`'s `branchKind` computation never consulted it, only
+   `inferKindWithContext` directly. So `let x = cond ? List.at(addr).list() : 0n;` (`list()`
+   returning a single `uint256[]`) was always classified `'scalar'`, even though the IDENTICAL call
+   shape outside a ternary already correctly infers `'dynamic'`. Confirmed via real EVM execution
+   (`integration-test/dynamic-kind-sweep.test.ts`'s "ternary branchKind" case, reusing the existing
+   `List2` single-dynamic-output mock): `SauceInvalidOperationArgs(0x97)` on the caller's indexed
+   read whenever the dynamic branch was taken, before the fix; `2211n` after. Fixed by computing
+   `consequentKind`/`alternateKind` the SAME way the plain store path does —
+   `singleDynamicAbiOutputKind(branch, ctx) ?? inferKindWithContext(branch, ctx)` — for each branch
+   independently, then promoting `branchKind` to `'dynamic'` if either resolves dynamic, exactly as
+   before. Regression-locked in `test/destructuring.test.ts`'s "ternary branchKind" describe block
+   (compile-time bytecode-shape proof for both the consequent- and alternate-branch positions, plus
+   a both-scalar negative control) and the integration test above (real-EVM value proof).
+
+3. **`assertNoDynamicVariableObjectField` (the NINTH-instance fix just above) false-positived on
+   v12/svm for a SCALAR-producing postfix operator applied directly to an existing dynamic
+   variable.** The guard's check (`processed[i]._bytes[0] === OPS.READ_HEAP`) is correct on v1's
+   PREFIX encoding, where an outer operator's own opcode is always the LEADING byte — `arr.length`
+   there emits `[LENGTH, READ_HEAP, slot]`, so `bytes[0] === LENGTH`, not `READ_HEAP`. But on
+   v12/svm's POSTFIX encoding, `V12Saucer.unary()` (and `binary`/`ternary`/`nary`) APPEND their own
+   opcode AFTER the operand's bytes (`concat(this._bytes, operand._bytes, [op])`), so `arr.length`
+   (`V12Saucer.length` → `unary(OPS.LENGTH, arr, false)`) emits `[READ_HEAP, slot, LENGTH]` — the
+   dynamic base's `READ_HEAP` is still the LEADING byte even though the overall expression
+   (`isDynamic: false`) is a genuine scalar. This made `{ x: arr.length, y: 5n }` throw on
+   `target: 'v12'`/`'svm'` even though the identical shape compiles (and is intended to be treated
+   as a safe, directly-computed scalar, per the existing v1 tests) on v1 — confirmed reachable via
+   both `keccak256(arr)` (same `unary()` path, `V12Saucer.keccak256`) and `.length`, though only
+   `.length` is exercised in the regression tests below. Fixed by ALSO requiring
+   `_bytes.length === 2`: a bare `READ_HEAP` read is always EXACTLY 2 bytes on EITHER encoding
+   direction — `[READ_HEAP, slot]`, since a slot index is always a single byte (`context.ts`'s own
+   "slot indices are 1 byte" invariant) — so this narrows the check to "the whole processed
+   expression IS just a bare variable read" without reopening the real bug: a genuine bare
+   dynamic-variable read (or an ALIAS of one) is still exactly 2 bytes and is still correctly
+   rejected on every target, confirmed by re-running the EXISTING "rejects ... on v12 too" test
+   alongside new ones for svm and for an aliased local. On v1 this is a no-op change (a bare read
+   was ALREADY exactly 2 bytes there too, so `length === 2` never excludes anything v1 used to
+   reject). Verified via real execution on BOTH v12 (a transpiler vector run against the real Huff
+   runtime, `integration-test/v12-execution.test.ts`'s `object_field_length_of_dynamic_var` —
+   before the fix this vector doesn't even COMPILE, crashing `buildVectors()` outright; after, it
+   executes and returns the correct length, `3`) and svm (`integration-test/svm-execution.test.ts`,
+   offline via the vendored `engine.so` — same before/after contrast). Regression-locked in
+   `test/struct.test.ts`'s "object literal field applying a SCALAR-producing postfix op" describe
+   block: the false positive fixed on v12/svm, a v1 negative control proving no behavior change
+   there, and the real bug (a bare read, and a bare-read-of-an-alias) still rejected on v1, v12,
+   AND svm.
+
 **`sdk/`** — a data registry, no runtime logic. `src/protocols/<slug>/` per protocol (`info`,
 `addresses`, `abis` as-const, `functions` SauceScript templates); `src/protocols/index.ts` is the
 query registry. `src/skills/*.md` are AI-ready per-protocol docs (loaded by `loader.ts`, shipped in
