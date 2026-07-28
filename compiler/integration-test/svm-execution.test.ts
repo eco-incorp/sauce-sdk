@@ -164,6 +164,135 @@ describeSvm('integration: svm pure compute', () => {
       src: 'function main() { let a = new Array(3); a[1] = 2; let b = a; b[0] = 42; return b[0] + b[1] * 10 }',
       expected: 62n,
     },
+    // ── dynamic value passed as a CALL ARGUMENT (regression lock — svm already
+    // worked here, UNLIKE v1, which has a known, deliberately-unfixed gap; see
+    // CLAUDE.md's "Same-file user-function return-kind inference" note and
+    // compiler/integration-test/function-return-kind.test.ts's "KNOWN GAP
+    // (unfixed, v1-only)" test. svm is a v12 dialect: a parameter is an ordinary
+    // stack value and a dynamic value is a single 32-byte descriptor word, so
+    // there is no funcHeap/funcValues index-space split for a wrong argument
+    // index to corrupt.) Mirrors v12-execution.test.ts's `callarg_*` vectors.
+    {
+      name: 'callarg: dynamic param read',
+      src: 'function h(a) { return a[1] }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return h(arr) }',
+      expected: 2n,
+    },
+    {
+      name: 'callarg: dynamic param stored to a local then read',
+      src: 'function h(a) { let b = a; return b[1] }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return h(arr) }',
+      expected: 2n,
+    },
+    {
+      name: 'callarg: dynamic param stored to a local then mutated',
+      src: 'function h(a) { let b = a; b[0] = 9; return b[0] + b[1] * 10 }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return h(arr) }',
+      expected: 29n,
+    },
+    {
+      name: 'callarg: mixed dynamic+scalar param order (both orders)',
+      src: 'function h(a, s) { return a[1] + s }\nfunction g(s, a) { return s + a[1] }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return h(arr, 21) + g(21, arr) }',
+      expected: 46n, // 23 + 23
+    },
+    {
+      name: 'callarg: helper chain (outer forwards the dynamic param to inner)',
+      src: 'function inner(a) { return a[1] }\nfunction outer(a) { return inner(a) }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return outer(arr) }',
+      expected: 2n,
+    },
+    {
+      name: 'callarg: .length on a dynamic param',
+      src: 'function h(a) { return a.length }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return h(arr) }',
+      expected: 3n,
+    },
+    {
+      name: 'callarg: a helper-returned dynamic value passed as another call argument',
+      src: 'function f() { let a = new Array(2); a[0] = 3; a[1] = 8; return a }\nfunction g(a) { return a[1] }\nfunction main() { return g(f()) }',
+      expected: 8n,
+    },
+    {
+      name: 'callarg: a dynamic argument round-trips through a recursive call',
+      src: 'function walk(a, n) { if (n === 0) { return a[1] } return walk(a, n - 1) }\nfunction main() { const arr = new Array(2); arr[0] = 1; arr[1] = 4; return walk(arr, 3) }',
+      expected: 4n,
+    },
+    {
+      name: 'recursive same-file function returning a dynamic value (self-recursion)',
+      src: 'function build(n) { if (n === 0) { let a = new Array(3); a[0] = 5; return a } let inner = build(n - 1); return inner }\nfunction main() { let r = build(2); return r[0] }',
+      expected: 5n,
+    },
+    {
+      name: 'recursive same-file functions returning a dynamic value (mutual recursion)',
+      src: 'function isEven(n) { if (n === 0) { let a = new Array(1); a[0] = 5; return a } return isOdd(n - 1) }\nfunction isOdd(n) { if (n === 0) { let a = new Array(1); a[0] = 9; return a } return isEven(n - 1) }\nfunction main() { let r = isEven(4); return r[0] }',
+      expected: 5n,
+    },
+    // ── v12/svm parameter-WRITE fix regression lock (saucer-v12.ts's `store()`
+    // isParam branch — see CLAUDE.md's "v12/svm parameter WRITE" note). Before
+    // the fix a scalar param write silently returned the PRE-write value (no
+    // revert), and a dynamic (element) write reverted outright.
+    {
+      name: 'param write: scalar param reassigned inside a helper',
+      src: 'function h(x) { x = x + 1; return x }\nfunction main() { return h(5) }',
+      expected: 6n,
+    },
+    {
+      name: 'param write: the middle of three params',
+      src: 'function h(a, b, c) { b = 100; return a + b + c }\nfunction main() { return h(1, 2, 3) }',
+      expected: 104n,
+    },
+    {
+      name: 'param write: inside an if body',
+      src: 'function h(x, cond) { if (cond === 1) { x = 15 } return x }\nfunction main() { return h(5, 1) }',
+      expected: 15n,
+    },
+    {
+      name: 'param write: inside a while loop',
+      src: 'function h(x) { let i = 0; while (i < 3) { x = x + 1; i = i + 1 } return x }\nfunction main() { return h(5) }',
+      expected: 8n,
+    },
+    {
+      name: 'param write: twice to the same param',
+      src: 'function h(x) { x = x + 1; x = x + 1; return x }\nfunction main() { return h(10) }',
+      expected: 12n,
+    },
+    {
+      name: 'param write: dynamic element write through a param',
+      src: 'function h(a) { a[0] = 9; return a[0] }\nfunction main() { const arr = new Array(3); arr[0] = 1; arr[1] = 2; arr[2] = 3; return h(arr) }',
+      expected: 9n,
+    },
+    {
+      name: 'param write: mutated two call frames deep',
+      src: 'function inner(a) { a[0] = 9; return a[0] }\nfunction outer(a) { return inner(a) }\nfunction main() { const arr = new Array(2); arr[0] = 1; arr[1] = 2; return outer(arr) }',
+      expected: 9n,
+    },
+    {
+      // v1-only KNOWN GAP (see dynamic-kind-sweep.test.ts): compound assignment on a
+      // dynamic parameter's element reverts on v1; on svm it is the ordinary
+      // INDEX-read + SET_INDEX-write pattern through a stack param.
+      name: 'callarg: compound assignment on a dynamic param element',
+      src: 'function h(a) { a[0] += 10; return a[0] }\nfunction main() { const arr = new Array(1); arr[0] = 2; return h(arr) }',
+      expected: 12n,
+    },
+    {
+      // v1-only SILENT-wrong-answer half of the call-argument gap (see
+      // dynamic-kind-sweep.test.ts): a string param's `.length` reads the scalar word
+      // width (32) on v1 instead of the real length; svm reads it correctly.
+      name: 'callarg: string param .length reads the real length',
+      src: 'function h(s) { return s.length }\nfunction main() { return h("AB") }',
+      expected: 2n,
+    },
+    // ── ADVERSARIAL-AUDIT FINDING (this branch): object-literal field applying a
+    // SCALAR-producing postfix op to a dynamic base — v12/svm false positive ──
+    //
+    // `assertNoDynamicVariableObjectField` (processor/collection.ts) used to reject
+    // `.length` of an existing dynamic array as an object field value on svm too (the
+    // postfix encoding's `[READ_HEAP, slot, LENGTH]` shape has READ_HEAP as its LEADING
+    // byte even though the overall expression is a genuine scalar) — before the fix,
+    // this program wouldn't even COMPILE on `target: 'svm'`. Fixed by also requiring
+    // `_bytes.length === 2` (a bare dynamic-variable read is always exactly 2 bytes on
+    // every target). See test/struct.test.ts's "object literal field applying a
+    // SCALAR-producing postfix op" describe block for the compile-time-shape proof.
+    {
+      name: 'object literal field reads .length of an existing dynamic array (was a compile-time false positive)',
+      src: 'function main() { let a = new Array(3); a[0] = 11; a[1] = 22; a[2] = 33; let s = { x: a.length, y: 5 }; return s.x }',
+      expected: 3n,
+    },
   ];
 
   for (const { name, src, expected } of cases) {

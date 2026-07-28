@@ -87,6 +87,40 @@ describe('array', () => {
     expect(result.bytecode[0][6]).toBe(OPS.ARRAY); // element type is ARRAY (dynamic)
   });
 
+  // A nested array literal compiles and executes correctly on v1 (the '2D array'
+  // test just above), but the engine-v12/svm runtimes have no nested-ARRAY encoding
+  // yet — confirmed via real execution (v12 empty-reverts, svm InvalidInstructionData)
+  // on every access shape (direct, aliased, from a helper, as a call argument). Reject
+  // it at compile time on those targets instead of an opaque runtime failure. A FLAT
+  // literal and a nested structure built with `new Array(n)` are both unaffected —
+  // this is a feature gap in the literal ENCODING specifically, not a kind-inference bug.
+  describe('nested array literal — v12/svm compile-time rejection (v1 unaffected)', () => {
+    const nested = 'function main() { const a = [[1, 2], [3, 4]]; return a[1][0]; }';
+
+    it('still compiles (and already worked) on v1', () => {
+      expect(() => compile(nested)).not.toThrow();
+    });
+
+    it('rejects on v12 with a clear message pointing at new Array(n)', () => {
+      expect(() => compile(nested, { target: 'v12' })).toThrow(/nested array literals.*new Array\(n\)/s);
+    });
+
+    it('rejects on svm the same way', () => {
+      expect(() => compile(nested, { target: 'svm' })).toThrow(/nested array literals.*new Array\(n\)/s);
+    });
+
+    it('a FLAT array literal is unaffected on v12', () => {
+      expect(() => compile('function main() { const a = [1, 2, 3]; return a[1]; }', { target: 'v12' })).not.toThrow();
+    });
+
+    it('a nested structure built with new Array(n) is unaffected on v12', () => {
+      const src =
+        'function main() { let outer = new Array(1); let inner = new Array(2); inner[0] = 7; outer[0] = inner; return outer[0][0]; }';
+
+      expect(() => compile(src, { target: 'v12' })).not.toThrow();
+    });
+  });
+
   it('compiles array of Uint8Array', () => {
     const result = compile('function main() { const arr = [new Uint8Array([1, 2]), new Uint8Array([3, 4, 5])]; }');
     expect(result.bytecode[0][4]).toBe(OPS.ARRAY);

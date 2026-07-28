@@ -742,4 +742,167 @@ describe('inline (arrow-const) functions', () => {
     expect(result.bytecode).toHaveLength(1); // main only — no real helper at all
     expect(countByte(result.bytecode[0], OPS.CALL_FUNCTION)).toBe(0);
   });
+
+  // FINDING fix: an inline function returning ANY dynamic-kind value used to be an
+  // unconditional v1 compile error — `#inline_result_N`'s FIRST declaration was always the
+  // scalar literal `0n`, so a later reassignment to a dynamic value (an array/object
+  // literal, a `new Array(n)` TUPLE, a `.concat()`/`.slice()` string, …) tripped
+  // `rejectV1ScalarToDynamicReassignment` (processor/statement.ts). Confirmed this ISN'T a
+  // false positive: on the pre-fix commit the identical source compiled cleanly and then
+  // reverted `SauceInvalidOperationArgs(0x97)` on real EVM execution (dropped descriptor) —
+  // see integration-test/inline-functions.test.ts's "dynamic return value" describe block
+  // for that real-execution proof. Fixed by `couldReturnBeDynamic` (inline.ts): a
+  // conservative, ctx-free scan of the callee's own return expressions that seeds the
+  // sentinel with a DYNAMIC-kind placeholder whenever it might return dynamic.
+  describe('inline function returning a dynamic value (v1)', () => {
+    it('a `new Array(n)`-built TUPLE return compiles and is dynamic (HEAP) storage', () => {
+      const source = `
+        const build = () => {
+          const a = new Array(2);
+          a[0] = 7n;
+          a[1] = 8n;
+          return a;
+        };
+        function main() {
+          let r = build();
+          return r[0];
+        }
+      `;
+
+      expect(() => compile(source, { target: 'v1' })).not.toThrow();
+
+      const result = compile(source, { target: 'v1' });
+      const main = result.bytecode[result.bytecode.length - 1];
+
+      expect(Array.from(main)).toEqual(expect.arrayContaining([OPS.ALLOCATE_HEAP, OPS.WRITE_HEAP, OPS.READ_HEAP]));
+    });
+
+    it('a guard-clause function mixing a SCALAR return on one path and a DYNAMIC return on another compiles', () => {
+      const source = `
+        const classify = (x) => {
+          if (x === 0n) {
+            return 0n;
+          }
+          const arr = new Array(2);
+          arr[0] = x;
+          arr[1] = x * 2n;
+          return arr;
+        };
+        function main(x) {
+          let r = classify(x);
+          return r[1];
+        }
+      `;
+
+      expect(() => compile(source, { target: 'v1', args: [1n] })).not.toThrow();
+    });
+
+    it('a `.concat()` (string) return compiles', () => {
+      const source = `
+        const greet = () => {
+          return "hi".concat("there");
+        };
+        function main() {
+          let s = greet();
+          return s.length;
+        }
+      `;
+
+      expect(() => compile(source, { target: 'v1' })).not.toThrow();
+    });
+
+    it('an object-literal return compiles', () => {
+      // Indexed access (`s[0]`), not `.a` field access: a helper-returned object literal's
+      // `.field` access is a SEPARATE, PRE-EXISTING gap independent of inline functions or
+      // this fix (confirmed: `function helper() { return {a:1n,b:2n}; } function main() {
+      // let s = helper(); return s.a; }` — no inline functions at all — already throws
+      // "property 'a' access not supported, use array indexing arr[i]" before AND after
+      // this change) — out of scope here.
+      const source = `
+        const build = () => {
+          return { a: 1n, b: 2n };
+        };
+        function main() {
+          let s = build();
+          return s[0];
+        }
+      `;
+
+      expect(() => compile(source, { target: 'v1' })).not.toThrow();
+    });
+
+    it('negative control: a purely scalar-arithmetic guard-clause function keeps its EXISTING scalar (WRITE_VALUE) bytecode shape, byte-for-byte', () => {
+      const source = `
+        const tickArg = (x) => {
+          if (x < 0n) { return 0n; }
+          return x + 1n;
+        };
+        function main() { return tickArg(5n); }
+      `;
+
+      const result = compile(source, { target: 'v1' });
+      const main = result.bytecode[result.bytecode.length - 1];
+
+      expect(main).not.toContain(OPS.ALLOCATE_HEAP);
+    });
+
+    it('a parameter returned unchanged stays scalar-seeded when the call-site argument is a plain identifier — even one referencing an existing DYNAMIC caller-scope local', () => {
+      // `couldReturnBeDynamic` (inline.ts) is a pure, ctx-free AST scan with no visibility
+      // into the CALLER's own variable kinds — a bare Identifier argument (as opposed to a
+      // directly-dynamic-LOOKING one: an array/object/`new Array`/string literal, all of
+      // which ARE recognized) is deliberately left classified the SAME as any other
+      // ctx-free-unresolvable shape (scalar-seeded), rather than blanket-promoting every
+      // Identifier argument to dynamic — that alternative would regress the tickArg/kyberOut
+      // motivating shape this whole feature was built for (`tickArg(shifted, OFFSET)` passes
+      // two ORDINARY, always-scalar caller-scope identifiers; forcing every identifier
+      // argument dynamic would needlessly heap-allocate that common, pure-arithmetic case).
+      //
+      // The cost of this deliberate choice: identity-style passthrough of an EXISTING
+      // dynamic caller-scope local through an inline function still hits
+      // `rejectV1ScalarToDynamicReassignment` — a real, narrower residual gap, but a SAFE
+      // one: a clear compile-time error, never the silent descriptor drop this whole bug
+      // family exists to prevent. Pinned here (not silently left undocumented) so a future
+      // improvement — or an accidental regression — is noticed either way.
+      const source = `
+        const identity = (x) => x;
+        function main() {
+          const arr = new Array(1);
+          arr[0] = 42n;
+          let r = identity(arr);
+          return r[0];
+        }
+      `;
+
+      expect(() => compile(source, { target: 'v1' })).toThrow(/cannot assign a dynamic value to '#inline_result_0'/);
+
+      // The common, motivating case — a plain SCALAR argument through the same identity
+      // shape — is completely unaffected: no heap allocation at all.
+      const scalarArgSource = `
+        const identity = (x) => x;
+        function main() { return identity(5n); }
+      `;
+
+      const result = compile(scalarArgSource, { target: 'v1' });
+      const main = result.bytecode[result.bytecode.length - 1];
+
+      expect(main).not.toContain(OPS.ALLOCATE_HEAP);
+    });
+
+    it('v12 is unaffected either way (V12Saucer.store derives kind from value.isDynamic, never a stale tag)', () => {
+      const source = `
+        const build = () => {
+          const a = new Array(2);
+          a[0] = 7n;
+          a[1] = 8n;
+          return a;
+        };
+        function main() {
+          let r = build();
+          return r[0];
+        }
+      `;
+
+      expect(() => compile(source, { target: 'v12' })).not.toThrow();
+    });
+  });
 });

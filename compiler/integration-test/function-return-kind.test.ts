@@ -378,7 +378,7 @@ describe('integration: same-file function return-kind inference (dynamic/heap ro
     });
   });
 
-  // ── documented, STILL-OPEN gap (deliberately NOT fixed by this change) ──
+  // ── documented, STILL-OPEN gap — v1 ONLY (deliberately NOT fixed by this change) ──
   //
   // Passing a dynamic (heap) local as a CALL ARGUMENT into a same-file function is a
   // DIFFERENT (third) instance of the same failure family — NOT addressed by the
@@ -390,7 +390,17 @@ describe('integration: same-file function return-kind inference (dynamic/heap ro
   // accounts for. Pinned here (still expected to revert) so a regression — or an
   // accidental future fix that should come with its own test update — is noticed, not
   // silently missed. See CLAUDE.md's "Same-file user-function return-kind inference" note.
-  it('KNOWN GAP (unfixed): passing a dynamic local as a call argument still reverts on v1', () => {
+  //
+  // **This gap is v1-ONLY, confirmed via real execution on all three targets** — v12 (the
+  // postfix, stack-based dialect) has no structural equivalent of v1's funcHeap/funcValues
+  // two-index-space split at all: a v12/svm parameter is just an ordinary EVM stack value
+  // (`isParam`, read via SDUP/written via SSWAP — see `saucer-v12.ts`), and a dynamic value
+  // there is a single 32-byte descriptor word, not an out-of-band side channel — so there is
+  // nothing for a "wrong index space" bug to corrupt. See
+  // `compiler/integration-test/v12-execution.test.ts`'s `callarg_*` vectors and
+  // `compiler/integration-test/svm-execution.test.ts`'s analogous cases for the passing
+  // regression lock — do NOT read this v1-only revert as an engine-agnostic limitation.
+  it('KNOWN GAP (unfixed, v1-only): passing a dynamic local as a call argument still reverts on v1', () => {
     const source = `
       function h(a) { return a[1]; }
       function main() {

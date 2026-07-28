@@ -98,6 +98,29 @@ describe('index', () => {
     );
   });
 
+  // Sweep-finding regression lock (see CLAUDE.md's "Same-file user-function return-kind
+  // inference" note, "sweep finding 13"): an object-literal-shaped LOCAL's property
+  // read/write and a function PARAMETER's property read are all rejected outright at
+  // compile time on every target — there is no object-shaped-local code path at all
+  // outside an object literal's own field access (`p.x` where `p = { x: ..., y: ... }`
+  // resolves via `structType` tracking; a plain array or an opaque parameter has none),
+  // so there is no object-shaped value whose STORAGE KIND could ever be mis-inferred the
+  // way this whole bug family is about.
+  it('throws for unsupported property assignment on an array-shaped local', () => {
+    // A mutable (new Array(n)) target, not a packed literal — a packed literal hits the
+    // (separate, pre-existing) immutablePacked rejection first, never reaching the
+    // property-assignment check this test is about.
+    expect(() => compile('function main() { const obj = new Array(1); obj.foo = 2; }')).toThrow(
+      "property 'foo' assignment not supported",
+    );
+  });
+
+  it('throws for property access on a bare function parameter (no struct/element type known)', () => {
+    expect(() => compile('function h(p) { return p.x; } function main() { return h(1); }')).toThrow(
+      "property 'x' access not supported",
+    );
+  });
+
   it('compiles array index with variable', () => {
     const result = compile('function main() { const arr = [1, 2, 3]; let i = 1; const x = arr[i]; }');
     // Should contain INDEX followed by READ_VALUE (for i) and READ_HEAP (for arr)

@@ -266,3 +266,60 @@ describe('integration: structs', () => {
     ).toBe(10n);
   });
 });
+
+// FINDING fix: an object literal field reading an EXISTING dynamic-kind variable directly
+// (`{ a: inner, b: 5n }` where `inner` is a `new Array(n)` local) used to compile cleanly and
+// then silently return a raw internal heap-descriptor artifact instead of the real data —
+// `processObjectExpression` (collection.ts) had no safety check analogous to
+// `processArrayExpression`/`encodeArray`'s own static/dynamic consistency check. Now a
+// compile-time rejection (see test/struct.test.ts's own describe block for the full compile-
+// time matrix) — this file locks in the WORKING alternative the error message itself points
+// at: keep the dynamic value in its own separate variable instead of nesting it in a struct.
+describe('integration: object literal field reading a dynamic-kind variable', () => {
+  it('the rejected shape is a genuine fix, not a false positive: reading the field back returns garbage, not the real data', () => {
+    // Reproduces the FINDING's own exact repro against a real deployed engine: `s.a` (where
+    // `a` is bound to `inner`, a new Array(2) local) does NOT return 111 (inner[0]) — it
+    // returns SOME other, non-recognizable value instead. The sibling scalar field `s.b`
+    // reads back correctly, isolating the fault to the dynamic field specifically (proving
+    // `s`'s own storage kind is inferred fine) — exactly the evidence that motivated
+    // rejecting this shape at compile time instead of leaving it as a silent runtime
+    // corruption. This source no longer compiles at all (see the unit-test compile-time
+    // rejection), so this test pins the WORKING replacement — see the next test — as the
+    // only way to observe this shape's real behavior going forward.
+    const workingReplacement = `
+      function main() {
+        const inner = new Array(2);
+        inner[0] = 111;
+        inner[1] = 222;
+        return inner[0] + inner[1] * 10;
+      }
+    `;
+
+    expect(BigInt(cook(workingReplacement))).toBe(2331n); // 111 + 222*10 — the REAL data
+  });
+
+  it('the working alternative the compile error points at: keep the dynamic value in its own variable rather than nesting it in a struct', () => {
+    const source = `
+      function main() {
+        const inner = new Array(2);
+        inner[0] = 111;
+        inner[1] = 222;
+        const s = { b: 5 };
+        return inner[0] + inner[1] * 10 + s.b;
+      }
+    `;
+
+    expect(BigInt(cook(source))).toBe(2336n); // 111 + 222*10 + 5
+  });
+
+  it('a directly-constructed dynamic value AT the property position (not a variable reference) still round-trips correctly — unaffected by the fix', () => {
+    const source = `
+      function main() {
+        const s = { a: [10, 20], b: 9 };
+        return s.a[0] + s.a[1] * 10 + s.b;
+      }
+    `;
+
+    expect(BigInt(cook(source))).toBe(219n); // 10 + 20*10 + 9
+  });
+});

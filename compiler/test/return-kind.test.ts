@@ -426,4 +426,213 @@ describe('return-kind inference: helper() return value stored in a variable', ()
       compile('function main() { const s = Pool.at(1).slot0(); return s[0]; }', { contracts: contracts as never }),
     ).toThrow(/multi-output call result stored in a variable/);
   });
+
+  it('infers dynamic (HEAP) storage when a helper returns a single dynamic ABI output through a VARIABLE-BOUND contract call (`let pool = X.at(addr); pool.method();`)', () => {
+    // FINDING fix: kindOfExpr's CallExpression case (the "single dynamic ABI output" case)
+    // only ever resolved the INLINE `Contract.at(addr).method()` chain shape via
+    // resolveContractCallTarget(call, ctx) — a call through a VARIABLE-BOUND contract
+    // (`let pool = Contract.at(addr); pool.method();`) could never resolve THIS early,
+    // because ctx.lookupBoundContract is only ever populated on a per-function CHILD
+    // context while actually compiling a body (via consumePendingContractBinding), and this
+    // whole pass runs against the bare module-level ctx BEFORE any body is compiled. Before
+    // this fix, `helper`'s `return pool.list();` silently fell through to the ctx-free
+    // `inferKind` fallback and was mis-classified 'scalar' — so `main()`'s `let arr =
+    // helper();` stored the result via WRITE_VALUE, dropping the descriptor (a runtime
+    // SauceInvalidOperationArgs(INDEX) revert on `arr[0]` — see
+    // integration-test/dynamic-kind-sweep.test.ts's real-EVM proof of this exact shape).
+    // Fixed by tracking a `let pool = Contract.at(addr);` declarator into this pass's own
+    // pass-local `localBoundContracts` map (mirroring `consumePendingContractBinding`'s real
+    // registration, but never mutating the shared `ctx` itself) so `resolveMethodTarget` can
+    // resolve the later `pool.method()` call within the SAME function.
+    const contracts = {
+      List: {
+        abi: [
+          {
+            type: 'function',
+            name: 'list',
+            inputs: [],
+            outputs: [{ name: 'xs', type: 'uint256[]' }],
+            stateMutability: 'view',
+          },
+        ] as const,
+      },
+    };
+
+    const result = compile(
+      `
+        function helper() {
+          let pool = List.at(1);
+          return pool.list();
+        }
+        function main() {
+          let arr = helper();
+          return arr[0];
+        }
+      `,
+      { contracts: contracts as never },
+    );
+
+    const mainBytecode = result.bytecode[result.bytecode.length - 1];
+
+    // Fixed: `arr` is now dynamic (HEAP) storage — no WRITE_VALUE/READ_VALUE for it at all.
+    expect(mainBytecode).not.toContain(OPS.WRITE_VALUE);
+    expect(Array.from(mainBytecode)).toEqual(
+      expect.arrayContaining([OPS.ALLOCATE_HEAP, OPS.WRITE_HEAP, OPS.READ_HEAP]),
+    );
+  });
+
+  it('negative control: a variable-bound contract call returning a SCALAR-only output stays scalar, unaffected', () => {
+    const contracts = {
+      Counter: {
+        abi: [
+          {
+            type: 'function',
+            name: 'value',
+            inputs: [],
+            outputs: [{ name: 'v', type: 'uint256' }],
+            stateMutability: 'view',
+          },
+        ] as const,
+      },
+    };
+
+    const result = compile(
+      `
+        function helper() {
+          let c = Counter.at(1);
+          return c.value();
+        }
+        function main() {
+          let v = helper();
+          return v + 1n;
+        }
+      `,
+      { contracts: contracts as never },
+    );
+
+    const mainBytecode = result.bytecode[result.bytecode.length - 1];
+
+    expect(mainBytecode).not.toContain(OPS.ALLOCATE_HEAP);
+  });
+
+  // ── ADVERSARIAL-AUDIT FINDING (this branch): a REASSIGNED bound-contract variable
+  // went stale in this pass's own `localBoundContracts` bookkeeping ──
+  //
+  // `walkStatement`'s `VariableDeclaration` case tracks `let pool = Contract.at(addr);`
+  // into `localBoundContracts` so a LATER `pool.method()` call in the same function can
+  // resolve during this pre-pass. The sibling `AssignmentExpression` case never updated
+  // that map when `pool` was later REASSIGNED to a DIFFERENT bound contract
+  // (`pool = Contract2.at(addr2);`) — the stale FIRST binding stayed in
+  // `localBoundContracts` forever, even though the REAL compile stage's own
+  // `ctx.boundContracts` updates correctly on this exact reassignment (via
+  // `consumePendingContractBinding`, which fires for every store whose RHS was a
+  // standalone binding call). Two confirmed failure modes, both fixed by making the
+  // `AssignmentExpression` case mirror the `VariableDeclaration` case's own tracking.
+  describe('a reassigned variable-bound contract (localBoundContracts staleness)', () => {
+    const contracts = {
+      First: {
+        abi: [
+          {
+            type: 'function',
+            name: 'onlyOnFirst',
+            inputs: [],
+            outputs: [{ name: 'v', type: 'uint256' }],
+            stateMutability: 'view',
+          },
+          {
+            type: 'function',
+            name: 'shared',
+            inputs: [],
+            outputs: [{ name: 'v', type: 'uint256' }], // scalar on First
+            stateMutability: 'view',
+          },
+        ] as const,
+      },
+      Second: {
+        abi: [
+          {
+            type: 'function',
+            name: 'onlyOnSecond',
+            inputs: [],
+            outputs: [{ name: 'v', type: 'uint256' }],
+            stateMutability: 'view',
+          },
+          {
+            type: 'function',
+            name: 'shared',
+            inputs: [],
+            outputs: [{ name: 'xs', type: 'uint256[]' }], // dynamic on Second
+            stateMutability: 'view',
+          },
+        ] as const,
+      },
+    };
+
+    it('does NOT throw "Unknown method" when the reassigned contract has a method the FIRST one lacks (false-positive compile crash)', () => {
+      // Before the fix: `resolveMethodTarget` still consulted the STALE `First`
+      // binding for `pool.onlyOnSecond()`, and `First` has no such method — this
+      // pre-pass threw `Unknown method "onlyOnSecond" on contract "First"`, aborting
+      // the ENTIRE compile of a program that (per the real ctx.boundContracts-backed
+      // compile stage) is perfectly valid.
+      expect(() =>
+        compile(
+          `
+            function helper() {
+              let pool = First.at(1);
+              pool = Second.at(2);
+              return pool.onlyOnSecond();
+            }
+            function main() { return helper(); }
+          `,
+          { contracts: contracts as never },
+        ),
+      ).not.toThrow();
+    });
+
+    it('resolves the method against the NEW (reassigned) contract, not the stale first binding', () => {
+      // `shared` exists on BOTH contracts, so the stale lookup would NOT throw here —
+      // it would silently resolve against First's SCALAR `shared`, wrongly classifying
+      // `helper`'s return kind as 'scalar' even though the REAL, reassigned binding
+      // (Second) returns a DYNAMIC `uint256[]`. Fixed: `pool.shared()` now resolves
+      // against Second, so `helper`'s registered return kind is 'dynamic' and `main()`'s
+      // `let arr = helper();` stores it via ALLOCATE_HEAP/WRITE_HEAP, not WRITE_VALUE —
+      // see integration-test/dynamic-kind-sweep.test.ts for the real-EVM value proof
+      // (this test only pins the compiled bytecode SHAPE).
+      const result = compile(
+        `
+          function helper() {
+            let pool = First.at(1);
+            pool = Second.at(2);
+            return pool.shared();
+          }
+          function main() {
+            let arr = helper();
+            return arr[0];
+          }
+        `,
+        { contracts: contracts as never },
+      );
+
+      const mainBytecode = result.bytecode[result.bytecode.length - 1];
+
+      expect(mainBytecode).not.toContain(OPS.WRITE_VALUE);
+      expect(Array.from(mainBytecode)).toEqual(
+        expect.arrayContaining([OPS.ALLOCATE_HEAP, OPS.WRITE_HEAP, OPS.READ_HEAP]),
+      );
+    });
+
+    // Note on the OTHER half of the fix (invalidating `localBoundContracts` when the
+    // reassignment ISN'T a resolvable contract binding, e.g. `pool = 5n;`): reassigning
+    // to a value that happens to not be a contract at all, then still calling
+    // `.method()` on it, is not independently observable as a PASS/FAIL distinction in
+    // a unit test here — the REAL compile stage's own `ctx.boundContracts` has the
+    // identical (separate, pre-existing, out-of-scope) staleness characteristic for a
+    // non-rebinding reassignment, so whether this pre-pass's own copy resolves via a
+    // stale entry or falls back to a generic 'scalar' guess, the overall `compile()`
+    // outcome for that specific probe is unchanged either way (verified empirically
+    // while writing this test). The invalidation is still implemented (deleting a
+    // stale entry can only ever cost a missed optimization — falling back to the
+    // conservative generic default — never a wrong classification), matching this
+    // file's established "when unsure, don't guess against stale state" convention.
+  });
 });

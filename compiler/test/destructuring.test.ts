@@ -555,8 +555,21 @@ describe('shape B — multi-output call result stored in a variable (v1 guard)',
     expect(() => compileMain('const pool = Pool.at(1); const result = pool.getPair(); return result;')).not.toThrow();
   });
 
-  it('clears the tag on reassignment (indexing works again)', () => {
-    expect(() => compileMain('let s = Pool.at(1).slot0(); s = [1, 2, 3]; return s[0];')).not.toThrow();
+  // Before the "single dynamic ABI output" / ternary-branch-promotion fixes (see
+  // CLAUDE.md's "Same-file user-function return-kind inference" note), this compiled
+  // cleanly — but `s` stayed a SCALAR slot (the multi-output tag mechanism doesn't
+  // promote kind), so storing the array literal's dynamic/heap value into it was a
+  // SILENT, undetected instance of the identical descriptor-drop hazard this whole
+  // bug family is about: confirmed via real EVM execution that the analogous
+  // `let s = 5n; s = [10n, 20n, 30n]; return s[0];` reverts
+  // SauceInvalidOperationArgs(0x97) (INDEX) on v1 today. `rejectV1ScalarToDynamicReassignment`
+  // (statement.ts) now catches this at compile time instead — a strict improvement
+  // (a clear error beats a silent runtime revert), so the "clears the tag" behavior
+  // this test used to pin is superseded by an even earlier, louder rejection.
+  it('rejects reassigning an array literal into an already-scalar variable (was a silent runtime INDEX fault)', () => {
+    expect(() => compileMain('let s = Pool.at(1).slot0(); s = [1, 2, 3]; return s[0];')).toThrow(
+      /cannot assign a dynamic value to 's'/,
+    );
   });
 
   it('does NOT tag a dynamic-kind destination (heap round-trip preserves the tuple on v1)', () => {
@@ -571,10 +584,15 @@ describe('shape B — multi-output call result stored in a variable (v1 guard)',
     expect(() => compileMain('let s = 0; s = Pool.at(1).slot0(); return s[0];')).toThrow(/cannot index 's'/);
   });
 
-  it('ternary reassignment clears a stale tag (previously-working program keeps compiling)', () => {
-    expect(() =>
-      compileMain('let s = Pool.at(1).slot0(); s = msg.value > 0 ? [1, 2] : [3, 4]; return s[0];'),
-    ).not.toThrow();
+  // Same latent hazard as the array-literal case just above, via the ternary path:
+  // `processTernaryStore` promotes to 'dynamic' storage when EITHER branch resolves
+  // dynamic (both do here — two array literals), and `rejectV1ScalarToDynamicReassignment`
+  // then rejects the reassignment of an already-scalar `s` — a compile-time catch of
+  // what was previously a silent runtime INDEX fault, not a "keeps compiling" case.
+  it('rejects a ternary reassignment whose branches are dynamic into an already-scalar variable', () => {
+    expect(() => compileMain('let s = Pool.at(1).slot0(); s = msg.value > 0 ? [1, 2] : [3, 4]; return s[0];')).toThrow(
+      /cannot assign a dynamic value to 's'/,
+    );
   });
 
   it('update-expression reassignment clears a stale tag', () => {
@@ -623,5 +641,93 @@ describe('shape B — multi-output call result stored in a variable (v1 guard)',
     // v12 decodes ONCE at the call site — the stored tuple survives its
     // round-trip there, so no guard applies.
     expect(count(v12, OPS.ABI_DECODE)).toBe(1);
+  });
+});
+
+// ── ADVERSARIAL-AUDIT FINDING (this branch): `processTernaryStore`'s `branchKind`
+// computation had NO notion of a direct external contract call with a single dynamic
+// ABI output ──
+//
+// `singleDynamicAbiOutputKind` (statement.ts, a few lines above `processTernaryStore`)
+// closes this exact gap for the PLAIN (non-ternary) store path — `storeExpression`'s
+// default branch tries it BEFORE falling back to `inferKindWithContext` — but
+// `processTernaryStore`'s own `branchKind` computation never consulted it, only
+// `inferKindWithContext` directly for each branch. `inferKindWithContext` has no
+// notion of a direct contract-method call at all (only a same-file user function's
+// analyzed return kind, via its own CallExpression case), so a ternary branch that is
+// itself a direct `Contract.at(addr).method()` call with a single dynamic ABI output
+// was always classified 'scalar' by `branchKind` — even though the sibling plain-store
+// path (`let x = Contract.at(addr).method();`, no ternary) already correctly infers
+// 'dynamic' for the IDENTICAL call shape via `singleDynamicAbiOutputKind`.
+describe('ternary branchKind: a direct dynamic-ABI-output contract call (FINDING fix)', () => {
+  const listAbi = [
+    {
+      type: 'function' as const,
+      name: 'list2',
+      inputs: [],
+      outputs: [{ name: 'xs', type: 'uint256[]' }],
+      stateMutability: 'view' as const,
+    },
+  ];
+
+  let listTmpDir: string;
+  let listBaseDirs: string[];
+
+  beforeAll(() => {
+    listTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sauce-ternary-dynamic-call-'));
+    fs.writeFileSync(path.join(listTmpDir, 'List2.json'), JSON.stringify({ abi: listAbi }));
+    listBaseDirs = [listTmpDir];
+  });
+
+  afterAll(() => {
+    fs.rmSync(listTmpDir, { recursive: true, force: true });
+  });
+
+  const LIST_IMPORT = 'import { List2 } from "./List2.json";';
+
+  it('infers dynamic (HEAP) storage for a ternary whose CONSEQUENT is a direct dynamic-output contract call', () => {
+    const result = compile(
+      `${LIST_IMPORT}
+       function main(cond) {
+         let x = cond === 1n ? List2.at(1).list2() : 0n;
+         return x[0];
+       }`,
+      { baseDirs: listBaseDirs },
+    );
+
+    // Fixed: `x` is dynamic (HEAP) storage — no WRITE_VALUE/READ_VALUE for it at all.
+    expect(result.bytecode[0]).not.toContain(OPS.WRITE_VALUE);
+    expect(Array.from(result.bytecode[0])).toEqual(
+      expect.arrayContaining([OPS.ALLOCATE_HEAP, OPS.WRITE_HEAP, OPS.READ_HEAP]),
+    );
+  });
+
+  it('infers dynamic (HEAP) storage for a ternary whose ALTERNATE is a direct dynamic-output contract call', () => {
+    const result = compile(
+      `${LIST_IMPORT}
+       function main(cond) {
+         let x = cond === 1n ? 0n : List2.at(1).list2();
+         return x[0];
+       }`,
+      { baseDirs: listBaseDirs },
+    );
+
+    expect(result.bytecode[0]).not.toContain(OPS.WRITE_VALUE);
+    expect(Array.from(result.bytecode[0])).toEqual(
+      expect.arrayContaining([OPS.ALLOCATE_HEAP, OPS.WRITE_HEAP, OPS.READ_HEAP]),
+    );
+  });
+
+  it('negative control: BOTH branches scalar stays scalar, unaffected', () => {
+    const result = compile(
+      `${LIST_IMPORT}
+       function main(cond) {
+         let x = cond === 1n ? 1n : 2n;
+         return x;
+       }`,
+      { baseDirs: listBaseDirs },
+    );
+
+    expect(result.bytecode[0]).not.toContain(OPS.ALLOCATE_HEAP);
   });
 });

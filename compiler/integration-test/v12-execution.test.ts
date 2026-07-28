@@ -335,6 +335,286 @@ const transpilerVectors: {
     expected: 7,
     kind: 'uint',
   },
+  // ── dynamic value passed as a CALL ARGUMENT (regression lock — v12/svm already
+  // worked here, UNLIKE v1, which has a known, deliberately-unfixed gap: see
+  // CLAUDE.md's "Same-file user-function return-kind inference" note and
+  // compiler/integration-test/function-return-kind.test.ts's "KNOWN GAP (unfixed,
+  // v1-only)" test. A v12/svm parameter is an ordinary EVM stack value (`isParam`),
+  // and a dynamic value there is a single 32-byte descriptor word — there is no
+  // out-of-band side channel and no funcHeap/funcValues index-space split the way
+  // v1 has, so passing one as an argument is structurally no different from
+  // passing a scalar. These vectors prove that, on the real Huff runtime, not just
+  // by reasoning about the codegen.
+  {
+    name: 'callarg_dynamic_read',
+    src: `
+      function h(a) { return a[1] }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr);
+      }
+    `,
+    expected: 2,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_dynamic_store_then_use',
+    src: `
+      function h(a) { let b = a; return b[1] }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr);
+      }
+    `,
+    expected: 2,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_dynamic_store_then_mutate',
+    src: `
+      function h(a) { let b = a; b[0] = 9; return b[0] + b[1] * 10 }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr);
+      }
+    `,
+    expected: 29, // 9 + 2*10
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_two_alias_hops',
+    src: `
+      function h(a) { let b = a; let c = b; return c[1] }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr);
+      }
+    `,
+    expected: 2,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_dynamic_then_scalar',
+    src: `
+      function h(a, s) { return a[1] + s }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr, 21);
+      }
+    `,
+    expected: 23,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_scalar_then_dynamic',
+    src: `
+      function h(s, a) { return s + a[1] }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(21, arr);
+      }
+    `,
+    expected: 23,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_helper_chain',
+    src: `
+      function inner(a) { return a[1] }
+      function outer(a) { return inner(a) }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return outer(arr);
+      }
+    `,
+    expected: 2,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_param_length',
+    src: `
+      function h(a) { return a.length }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr);
+      }
+    `,
+    expected: 3,
+    kind: 'uint',
+  },
+  {
+    name: 'callarg_helper_return_as_arg',
+    src: `
+      function f() { let a = new Array(2); a[0] = 3; a[1] = 8; return a }
+      function g(a) { return a[1] }
+      function main() { return g(f()) }
+    `,
+    expected: 8,
+    kind: 'uint',
+  },
+  {
+    // A dynamic ARGUMENT round-tripping through a RECURSIVE call — combines the
+    // (v1-only) call-argument gap with recursion, on a target where neither is a
+    // problem: v12/svm has no per-call-site kind gap and this fixpoint composes
+    // fine with recursion (see the self/mutual-recursion return-kind vectors above
+    // — this is the analogous ARGUMENT-direction shape).
+    name: 'callarg_recursive_argument',
+    src: `
+      function walk(a, n) {
+        if (n === 0) { return a[1] }
+        return walk(a, n - 1);
+      }
+      function main() {
+        const arr = new Array(2);
+        arr[0] = 1; arr[1] = 4;
+        return walk(arr, 3);
+      }
+    `,
+    expected: 4,
+    kind: 'uint',
+  },
+  // ── recursive same-file function returning a DYNAMIC value (regression lock —
+  // both the return-kind fixpoint's convergence through a cycle and the runtime
+  // descriptor round-trip through a recursive RETURN are already correct on
+  // v12/svm; see function-return-kind.test.ts for the v1-side proof of the exact
+  // same shapes).
+  {
+    name: 'self_recursive_dynamic_return',
+    src: `
+      function build(n) {
+        if (n === 0) {
+          let a = new Array(3);
+          a[0] = 5;
+          return a;
+        }
+        let inner = build(n - 1);
+        return inner;
+      }
+      function main() { let r = build(2); return r[0] }
+    `,
+    expected: 5,
+    kind: 'uint',
+  },
+  {
+    name: 'mutual_recursive_dynamic_return',
+    src: `
+      function isEven(n) {
+        if (n === 0) {
+          let a = new Array(1);
+          a[0] = 5;
+          return a;
+        }
+        return isOdd(n - 1);
+      }
+      function isOdd(n) {
+        if (n === 0) {
+          let a = new Array(1);
+          a[0] = 9;
+          return a;
+        }
+        return isEven(n - 1);
+      }
+      function main() { let r = isEven(4); return r[0] }
+    `,
+    expected: 5,
+    kind: 'uint',
+  },
+  // ── v12/svm parameter-WRITE fix regression lock (saucer-v12.ts's `store()`
+  // isParam branch — see CLAUDE.md's "v12/svm parameter WRITE" note). Before the
+  // fix, EVERY one of these silently computed the wrong SSWAP target: a plain
+  // scalar write returned the PRE-write value with NO revert at all (proven via a
+  // one-byte bytecode patch before any source-level fix existed), and a dynamic
+  // (element) write reverted outright.
+  {
+    name: 'param_write_scalar_in_helper',
+    src: 'function h(x){ x = x + 1; return x } function main(){ return h(5) }',
+    expected: 6,
+    kind: 'uint',
+  },
+  {
+    name: 'param_write_middle_of_three',
+    src: 'function h(a, b, c){ b = 100; return a + b + c } function main(){ return h(1, 2, 3) }',
+    expected: 104, // 1 + 100 + 3
+    kind: 'uint',
+  },
+  {
+    name: 'param_write_inside_if',
+    src: 'function h(x, cond){ if (cond === 1) { x = 15 } return x } function main(){ return h(5, 1) }',
+    expected: 15,
+    kind: 'uint',
+  },
+  {
+    name: 'param_write_inside_while',
+    src: 'function h(x){ let i = 0; while (i < 3) { x = x + 1; i = i + 1 } return x } function main(){ return h(5) }',
+    expected: 8, // 5 + 1 + 1 + 1
+    kind: 'uint',
+  },
+  {
+    name: 'param_write_twice',
+    src: 'function h(x){ x = x + 1; x = x + 1; return x } function main(){ return h(10) }',
+    expected: 12,
+    kind: 'uint',
+  },
+  {
+    name: 'param_write_dynamic_element',
+    src: `
+      function h(a) { a[0] = 9; return a[0] }
+      function main() {
+        const arr = new Array(3);
+        arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        return h(arr);
+      }
+    `,
+    expected: 9,
+    kind: 'uint',
+  },
+  {
+    name: 'param_write_two_frames_deep',
+    src: `
+      function inner(a) { a[0] = 9; return a[0] }
+      function outer(a) { return inner(a) }
+      function main() {
+        const arr = new Array(2);
+        arr[0] = 1; arr[1] = 2;
+        return outer(arr);
+      }
+    `,
+    expected: 9,
+    kind: 'uint',
+  },
+  {
+    // Compound assignment (`+=`) on a dynamic PARAMETER's element — a v1-only KNOWN GAP
+    // (compiler/integration-test/dynamic-kind-sweep.test.ts pins the v1 revert); on v12
+    // this is just the ordinary INDEX-read + SET_INDEX-write pattern through a stack param.
+    name: 'callarg_compound_assign_on_param',
+    src: `
+      function h(a) { a[0] += 10; return a[0] }
+      function main() {
+        const arr = new Array(1);
+        arr[0] = 2;
+        return h(arr);
+      }
+    `,
+    expected: 12,
+    kind: 'uint',
+  },
+  {
+    // The v1-only SILENT-wrong-answer half of the call-argument gap (a string param's
+    // `.length` reads the scalar word width, 32, instead of the real length) — v12/svm
+    // read the correct length through an ordinary stack param.
+    name: 'callarg_string_param_length',
+    src: 'function h(s){ return s.length } function main(){ return h("AB") }',
+    expected: 2,
+    kind: 'uint',
+  },
   {
     // The destructuring fast path's building block, executed on the real runtime:
     // CAST_BE(SLICE(bytes, k*32 + (32-N), N)) must equal the canonical
@@ -380,6 +660,35 @@ const transpilerVectors: {
         ],
       },
     },
+  },
+  // ── ADVERSARIAL-AUDIT FINDING (this branch): object-literal field applying a
+  // SCALAR-producing postfix op to a dynamic base — v12/svm false positive ──
+  //
+  // `assertNoDynamicVariableObjectField` (processor/collection.ts) used to reject this
+  // shape on v12/svm with a compile-time error (`bytes[0] === OPS.READ_HEAP`, true for
+  // `arr.length`'s postfix encoding `[READ_HEAP, slot, LENGTH]` even though the overall
+  // expression is a genuine scalar) — so before the fix, this vector wouldn't even
+  // COMPILE on `target: 'v12'`, let alone execute. Fixed by also requiring
+  // `_bytes.length === 2` (a bare dynamic-variable read is always exactly 2 bytes on
+  // every target). See test/struct.test.ts's "object literal field applying a
+  // SCALAR-producing postfix op" describe block for the compile-time-shape proof (both
+  // targets, plus the negative controls proving a genuine bare dynamic-variable read is
+  // STILL correctly rejected); this vector proves the fixed shape not only compiles but
+  // executes CORRECTLY on the real Huff runtime.
+  {
+    name: 'object_field_length_of_dynamic_var',
+    src: `
+      function main(){
+        let a = new Array(3);
+        a[0] = 11;
+        a[1] = 22;
+        a[2] = 33;
+        let s = { x: a.length, y: 5 };
+        return s.x;
+      }
+    `,
+    expected: 3,
+    kind: 'uint',
   },
 ];
 
@@ -428,6 +737,9 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(names.has('newarray_setindex')).toBe(true); // builder array mutation
     expect(names.has('array_compound_assign')).toBe(true); // transpiler array mutation
     expect(names.has('helper_returns_array_mutate')).toBe(true); // same-file return-kind inference
+    expect(names.has('callarg_dynamic_read')).toBe(true); // dynamic call-argument regression lock
+    expect(names.has('param_write_scalar_in_helper')).toBe(true); // param-write fix regression lock
+    expect(names.has('object_field_length_of_dynamic_var')).toBe(true); // postfix false-positive fix regression lock
     expect(vectors.length).toBeGreaterThanOrEqual(25);
   });
 
@@ -446,6 +758,33 @@ describeIfForge('v12 execution parity (TS bytecode on the Huff runtime)', () => 
     expect(forgeOutput).toMatch(/ok helper_returns_array_mutate 62/); // same-file function return-kind inference (regression lock)
     expect(forgeOutput).toMatch(/ok helper_returns_array_readonly 2/);
     expect(forgeOutput).toMatch(/ok alias_dynamic_local 62/);
+    // dynamic call-argument passing (regression lock — v1-only known gap, see
+    // function-return-kind.test.ts's "KNOWN GAP (unfixed, v1-only)" test)
+    expect(forgeOutput).toMatch(/ok callarg_dynamic_read 2/);
+    expect(forgeOutput).toMatch(/ok callarg_dynamic_store_then_use 2/);
+    expect(forgeOutput).toMatch(/ok callarg_dynamic_store_then_mutate 29/);
+    expect(forgeOutput).toMatch(/ok callarg_two_alias_hops 2/);
+    expect(forgeOutput).toMatch(/ok callarg_dynamic_then_scalar 23/);
+    expect(forgeOutput).toMatch(/ok callarg_scalar_then_dynamic 23/);
+    expect(forgeOutput).toMatch(/ok callarg_helper_chain 2/);
+    expect(forgeOutput).toMatch(/ok callarg_param_length 3/);
+    expect(forgeOutput).toMatch(/ok callarg_helper_return_as_arg 8/);
+    expect(forgeOutput).toMatch(/ok callarg_recursive_argument 4/);
+    expect(forgeOutput).toMatch(/ok self_recursive_dynamic_return 5/);
+    expect(forgeOutput).toMatch(/ok mutual_recursive_dynamic_return 5/);
+    // v12/svm parameter-WRITE fix (saucer-v12.ts store()'s isParam branch)
+    expect(forgeOutput).toMatch(/ok param_write_scalar_in_helper 6/);
+    expect(forgeOutput).toMatch(/ok param_write_middle_of_three 104/);
+    expect(forgeOutput).toMatch(/ok param_write_inside_if 15/);
+    expect(forgeOutput).toMatch(/ok param_write_inside_while 8/);
+    expect(forgeOutput).toMatch(/ok param_write_twice 12/);
+    expect(forgeOutput).toMatch(/ok param_write_dynamic_element 9/);
+    expect(forgeOutput).toMatch(/ok param_write_two_frames_deep 9/);
+    expect(forgeOutput).toMatch(/ok callarg_compound_assign_on_param 12/);
+    expect(forgeOutput).toMatch(/ok callarg_string_param_length 2/);
+    // object-literal field applying a scalar-producing postfix op to a dynamic base
+    // (adversarial-audit fix — was a compile-time false positive on v12/svm)
+    expect(forgeOutput).toMatch(/ok object_field_length_of_dynamic_var 3/);
     expect(forgeOutput).not.toMatch(/\[FAIL/);
   });
 });
