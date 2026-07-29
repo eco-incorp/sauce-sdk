@@ -1,8 +1,9 @@
 # SVM venue facts
 
-Normative reference for the **12 venue adapters** in `sdk/src/svm/venues/` — **seven v1 (solswap)
+Normative reference for the **13 venue adapters** in `sdk/src/svm/venues/` — **eight v1 (solswap)
 adapters** (raydium-cp-swap, raydium-amm-v4, pumpswap, orca-legacy-token-swap, meteora-damm-v2,
-saber-stableswap, meteora-damm-v1-stable) plus **five ladder-only EcoSwapSVM v2 families**: the
+saber-stableswap, meteora-damm-v1-stable, meteora-damm-v1-cp) plus **five ladder-only EcoSwapSVM v2
+families**: the
 tick-walk CLMMs orca-whirlpool and raydium-clmm, the bin-walk meteora-dlmm, the CLOB manifest, and
 the oracle-anchored prop-AMM obric-v2. Every byte offset, quote formula, rounding rule, gate and
 pinned constant that the adapters and their test suites cite lives here. The adapters were written
@@ -1322,6 +1323,75 @@ Mainnet USDC/USDT pool `32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG`
 - `t < last_report` cannot happen on-chain (the vault crank stamps last_report from the same
   clock); if it ever wrapped, the ratio would exceed 1e12 and the fragment falls back to
   `total_amount`. `referenceQuote` throws on it instead.
+
+## meteora-damm-v1-cp
+
+Meteora DAMM v1 (Dynamic AMM, ex-Mercurial), ConstantProduct curve — the sibling of
+`meteora-damm-v1-stable` above for `curve_type` tag 0. Same program, same Pool/Vault account layouts,
+same dynamic-vault share math (locked-profit decay, LP-supply reserves) and deposit/withdraw
+simulations (see steps 1, 2, 5, 7, 8 above — identical). Only the curve step (3) differs. Quotes
+exact-in A → B (the pool's canonical direction), same convention as the stable sibling.
+
+### Pool account
+
+Same discriminator and offsets as `meteora-damm-v1-stable` above, EXCEPT: a ConstantProduct pool's
+content ENDS at offset 875 (right after the `curve_type` tag) — there is no amp / token-multiplier /
+depeg payload (those are Stable-only fields at 875+). `POOL_MIN_LENGTH` is therefore 875, not 925.
+`curve_type` tag 0 = ConstantProduct (vs. 1 = Stable).
+
+### Quote (exactIn, A → B)
+
+Steps 1–2 (unlocked amounts, share-math reserves) and 4–5 (protocol fee, vault deposit simulation)
+are identical to the stable sibling. Step 3 (trade fee) is identical too. The curve step replaces
+Newton stableswap with the ceiling-divided constant-product form — the same spl-token-swap-lineage
+spelling as `orca-legacy-token-swap`'s quote:
+
+```
+ni = reserveIn + srcNet
+dest = reserveOut − ceil(reserveIn · reserveOut / ni)
+```
+
+where `ceil(a/b) = floor((a + b − 1) / b)`; a zero floor-quotient (`floor(reserveIn·reserveOut/ni) ==
+0`) means the swap fails on-chain. Steps 7–8 (vault withdraw simulation, strict idle-float bound) are
+identical to the stable sibling.
+
+Gates: discriminators, pool length ≥ 875, vault length ≥ 1227, enabled, curve tag 0
+(ConstantProduct), slot-based activation (same rule as the stable sibling).
+
+### Swap instruction
+
+Byte-identical shape to the stable sibling: same discriminator, same 24-byte data layout, same
+15-account list (protocol_token_a_fee at index 11 — A → B only, single direction).
+
+### Pinned worked example
+
+Mainnet USDC/SOL pool `5yuefgbJJpmFNK2iiYbLSpv1aZXq7F9AUKkZKErTYCvs`
+(`sdk/test/svm/fixtures/meteora-damm-v1-cp/`, dumped 2026-07-29 from mainnet-beta, one of only 8
+on-chain pools with `curve_type` tag 0 — DAMM v1 ConstantProduct pools are rare, most liquidity having
+migrated to DAMM v2): trade fee 25/10_000 (0.25%), protocol fee 20_000/100_000 (20% of the trade fee),
+vault_a/b last_report 1_785_363_978.
+
+- 1_000_000 uUSDC at the exact snapshot clock t = 1_785_363_978 → **13_563_294** lamports SOL.
+
+This worked example is INTERNALLY derived from this adapter's own `referenceQuote` (cross-checked
+against the v2 ladder's `referenceQuote`, which must and does agree exactly) — unlike the stable
+sibling's pinned example, it has no independent on-chain CPI confirmation yet (no real-binary LiteSVM
+harness run against this family as of this writing). The curve-lineage assumption (that DAMM v1's
+ConstantProduct arm is bit-for-bit the same `checked_ceil_div` form spl-token-swap and
+`orca-legacy-token-swap` use) is the one thing a future real-CPI test should verify before this family
+is treated as fully load-bearing.
+
+### Caveats
+
+- Same caveats as the stable sibling (8 read-only quote accounts, `a_lp_mint`/`b_lp_mint` not
+  reliably canonical, the wrapped-clock `t < last_report` mirroring) — see above.
+- Single direction (A → B) only, matching the stable sibling's existing precedent; a B → A variant
+  is a natural follow-up (the pool already carries `protocol_token_b_fee`, decoded but unused here,
+  exactly like the stable sibling).
+- CU coefficients in the recipes' `ecoswap/svm/budget.ts` (`CU_FAMILIES['meteora-damm-v1-cp']`) are a
+  REASONED PLACEHOLDER (bracketed between `orca-legacy-token-swap` and `obric-v2`'s measured numbers),
+  not yet fitted against a real engine run — the family is absent from
+  `test/svm/ecoswap-svm.cu.e2e.test.ts`'s auto-calibration table in the recipes repo.
 
 ## obric-v2 (prop-AMM oracle-anchored, tier P-A)
 
