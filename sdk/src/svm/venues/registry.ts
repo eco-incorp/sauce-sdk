@@ -1,4 +1,5 @@
 import type { SvmVenueAdapter } from './types.js';
+import { meteoraDammV1Cp } from './meteora-damm-v1-cp/index.js';
 import { meteoraDammV1Stable } from './meteora-damm-v1-stable/index.js';
 import { meteoraDammV2 } from './meteora-damm-v2/index.js';
 import { orcaLegacyTokenSwap } from './orca-legacy-token-swap/index.js';
@@ -18,6 +19,7 @@ const adapters: Record<string, SvmVenueAdapter> = {
   [meteoraDammV2.slug]: meteoraDammV2,
   [saberStableswap.slug]: saberStableswap,
   [meteoraDammV1Stable.slug]: meteoraDammV1Stable,
+  [meteoraDammV1Cp.slug]: meteoraDammV1Cp,
 };
 
 /** Known venue slugs, in table order. */
