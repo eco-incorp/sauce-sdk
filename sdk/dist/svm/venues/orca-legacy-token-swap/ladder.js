@@ -15,8 +15,12 @@ export const orcaLegacyTokenSwapLadder = {
     },
     // fees.rs calculate_fee (floor, min 1 when rate and amount are nonzero) on
     // both fee legs, then the ceiling-divided constant-product curve rounding
-    // against the trader. Venue-rejected inputs (fees swallow x, zero
-    // quotient, zero output) return 0 instead of throwing.
+    // against the trader. Venue-rejected inputs (fees swallow x, a dead pool)
+    // return 0 instead of throwing. No early "would underflow" return: the
+    // ceil-division below is well-defined and monotone for any x once
+    // rin > 0 && rout > 0 (see the file header) — an early return there used
+    // to collapse the quote back to 0 past a reachable, non-astronomical x
+    // for thin pools, manufacturing a negative ladder-rung dOut.
     helpers() {
         return [
             {
@@ -24,6 +28,7 @@ export const orcaLegacyTokenSwapLadder = {
                 source: [
                     'function qOrca(x, rin, rout, tn, td, on, od) {',
                     '  if (x === 0) { return 0 }',
+                    '  if (rin === 0 || rout === 0) { return 0 }',
                     '  let tf = 0;',
                     '  if (tn > 0) { tf = x * tn / td; if (tf === 0) { tf = 1 } }',
                     '  let of = 0;',
@@ -31,7 +36,6 @@ export const orcaLegacyTokenSwapLadder = {
                     '  if (tf + of >= x) { return 0 }',
                     '  const net = x - tf - of;',
                     '  const ni = rin + net;',
-                    '  if (rin * rout / ni === 0) { return 0 }',
                     '  const no = (rin * rout + ni - 1) / ni;',
                     '  if (no >= rout) { return 0 }',
                     '  return rout - no;',
@@ -107,6 +111,8 @@ export const orcaLegacyTokenSwapLadder = {
         return (x) => {
             if (x === 0n)
                 return 0n;
+            if (rin === 0n || rout === 0n)
+                return 0n;
             let tf = 0n;
             if (tn > 0n) {
                 tf = (x * tn) / td;
@@ -123,8 +129,6 @@ export const orcaLegacyTokenSwapLadder = {
                 return 0n;
             const net = x - tf - of;
             const ni = rin + net;
-            if ((rin * rout) / ni === 0n)
-                return 0n;
             const no = (rin * rout + ni - 1n) / ni;
             if (no >= rout)
                 return 0n;
