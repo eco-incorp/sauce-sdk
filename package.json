@@ -42,6 +42,10 @@
     "./svm": {
       "types": "./sdk/dist/svm/index.d.ts",
       "default": "./sdk/dist/svm/index.js"
+    },
+    "./verify": {
+      "types": "./sdk/dist/verify/index.d.ts",
+      "default": "./sdk/dist/verify/index.js"
     }
   },
   "bin": {
