@@ -32,6 +32,10 @@
     "./svm": {
       "types": "./dist/svm/index.d.ts",
       "default": "./dist/svm/index.js"
+    },
+    "./verify": {
+      "types": "./dist/verify/index.d.ts",
+      "default": "./dist/verify/index.js"
     }
   },
   "files": [

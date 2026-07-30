@@ -1,0 +1,53 @@
+import type { Hex } from "viem";
+
+export interface ConformanceVector {
+  name: string;
+  tokens: Hex[];
+  minOut: bigint;
+  recipient: Hex;
+  /** The exact compiled program these args produce — measured against this package's compiler
+   *  pin (`CURRENT_SETTLE_TEMPLATE.compilerSha`), not hand-assembled. */
+  program: Hex;
+}
+
+const U = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Hex; // Base USDC
+const W = "0x4200000000000000000000000000000000000006" as Hex; // Base WETH
+const Z = "0x0000000000000000000000000000000000ff00aa" as Hex; // leading-zero-byte address — THE TRAP
+
+/**
+ * Golden wire-format vectors — the Go/Solidity/Python conformance corpus. Each `program` was
+ * obtained by actually compiling `ecoswap.settle.sauce.ts` with the given args (not hand-encoded),
+ * so it doubles as a regression pin on the compiler's emission shape. See decode.ts's module
+ * docstring for the grammar these bytes instantiate.
+ *
+ * `v3` is the trap vector: `Z = 0x0000000000000000000000000000000000ff00aa` has two leading zero
+ * bytes, so its minimal-length PUSH is only 3 bytes wide (`03 ff00aa`), not the naive 20 — a fixed
+ * 20-byte read at that offset silently misframes everything after it. `v3` also (together with
+ * `v1`) pins the reversal: the FIRST push on the wire is the LAST logical token.
+ */
+export const SETTLE_VECTORS: readonly ConformanceVector[] = [
+  {
+    name: "v1 — single token, minOut disabled",
+    tokens: [U],
+    minOut: 0n,
+    recipient: W,
+    program:
+      "0x14833589fcd6edb6e08f4c7c32d4f71b54bda0291394010100144200000000000000000000000000000000000006c0050100d397c10001005000649401a0900470a082319602a3a1012097c1010100d245b028d1500146b022901f65636f737761703a20616d6f756e744f75742062656c6f77206d696e4f7574b60100c102b2075002010121c102d251500246b0405002d397c10301005003649401a0900470a082319602a3a1012097c1040100500445b01a0100500301005004d49402a09004a9059cbb9602a2a1010197e0b44e5001f200" as Hex,
+  },
+  {
+    name: "v2 — two tokens, large minOut",
+    tokens: [U, W],
+    minOut: 1234567890123456789012n,
+    recipient: W,
+    program:
+      "0x14420000000000000000000000000000000000000614833589fcd6edb6e08f4c7c32d4f71b54bda0291394020942ed123b0bd8203a14144200000000000000000000000000000000000006c0050100d397c10001005000649401a0900470a082319602a3a1012097c1010100d245b028d1500146b022901f65636f737761703a20616d6f756e744f75742062656c6f77206d696e4f7574b60100c102b2075002010121c102d251500246b0405002d397c10301005003649401a0900470a082319602a3a1012097c1040100500445b01a0100500301005004d49402a09004a9059cbb9602a2a1010197e0b44e5001f200" as Hex,
+  },
+  {
+    name: "v3 — leading-zero-byte address (THE TRAP: 3-byte push, not 20)",
+    tokens: [Z, U],
+    minOut: 1n,
+    recipient: Z,
+    program:
+      "0x14833589fcd6edb6e08f4c7c32d4f71b54bda0291303ff00aa9402010103ff00aac0050100d397c10001005000649401a0900470a082319602a3a1012097c1010100d245b028d1500146b022901f65636f737761703a20616d6f756e744f75742062656c6f77206d696e4f7574b60100c102b2075002010121c102d251500246b0405002d397c10301005003649401a0900470a082319602a3a1012097c1040100500445b01a0100500301005004d49402a09004a9059cbb9602a2a1010197e0b44e5001f200" as Hex,
+  },
+];
