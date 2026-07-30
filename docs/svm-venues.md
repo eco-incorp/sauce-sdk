@@ -1029,6 +1029,22 @@ overflow bound unconditional: sqrt prices < 2^97, so `L · sqrt_price < 2^225`,
 `amount_in << 128 < 2^192` — all below the engine's 2^256 wrap, no `Math.mulDiv` needed (a
 band-violating bToA `sp · next` may wrap, but every such quote is clamped to 0 before use).
 
+**v1 (`emitQuote`/`referenceQuote`, the best-of-N solswap surface) vs v2 (the EcoSwapSVM ladder
+fragment, `ladder.ts`)** quote the SAME formula above but differ past the band: v1 stays
+clamped-to-0 (correct there — solswap compares ONE quote per venue at a fixed amount, never
+differences a grid, and a full-amount CPI past the band would revert anyway, so losing the
+election is the right outcome). The v2 ladder instead SATURATES: `emitLadderQuote`/
+`emitFinalQuote`/`referenceQuote` evaluate the quote at `min(x, C)` for the closed-form capacity
+`C` (the largest gross input the live band absorbs — aToB inverts `next(x) >= sqrt_min_price`
+directly, bToA inverts `next(din) <= sqrt_max_price` in fee-adjusted `din`-space and, when
+`collect_fee_mode == 1`, inverts the fee-adjustment itself), and `capacityInputVar`/
+`referenceCapacities` fold each ladder rung's `dIn` to `min(x, C)` too. A raw pointwise
+clamp-to-0 differenced across a rung that straddles `C` manufactures a negative `dOut`, which the
+plain-bigint mirror and the on-chain u256-wrapping merge read differently — a real, engine-measured
+gate divergence (see `ecoswap/svm` in the recipes repo). Saturating instead keeps the ladder
+non-decreasing, matching the adapter contract every other capacity-aware ladder family
+(orca-whirlpool/raydium-clmm/meteora-dlmm/manifest) already implements.
+
 ### Swap instruction
 
 Data (24 bytes): discriminator `sha256('global:swap')[0..8]` =
