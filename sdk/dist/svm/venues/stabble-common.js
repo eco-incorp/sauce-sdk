@@ -426,6 +426,14 @@ export function stableYWarmHelperSource(n) {
     lines.push(`  const cNum = d2 * 1000;`);
     lines.push(`  const cDen = ampN * p2;`);
     lines.push(`  let c = 0;`);
+    // Plain ceil-div `(a+b-1)/b`, NOT Math.mulDiv — MEASURED: on this engine
+    // Math.mulDiv carries a substantial fixed per-call cost that makes it
+    // MORE expensive than plain arithmetic for operands that don't need its
+    // 512-bit-safe path (our magnitudes here never approach that width) —
+    // swapping this loop's ceil-divs and the y*y product to Math.mulDiv
+    // measured WORSE (1.2M -> 1.39M CU @ 2 rungs) than plain ops, the opposite
+    // of the initial hypothesis. Kept as plain arithmetic throughout; see the
+    // ladder's module doc for the full measured comparison.
     lines.push(`  if (cDen > 0) { c = ((cNum + cDen - 1) / cDen) * bal1 }`);
     lines.push(`  const bTerm = Math.mulDiv(d, 1000, ampN) + sum2;`);
     lines.push(`  let y = y0;`);
