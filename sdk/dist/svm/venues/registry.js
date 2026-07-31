@@ -19,6 +19,10 @@ import { saberStableswap } from './saber-stableswap/index.js';
 import { saberStableswapLadder } from './saber-stableswap/ladder.js';
 import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
+import { stabbleStableSwap } from './stabble-stable-swap/index.js';
+import { stabbleStableSwapLadder } from './stabble-stable-swap/ladder.js';
+import { stabbleWeightedSwap } from './stabble-weighted-swap/index.js';
+import { stabbleWeightedSwapLadder } from './stabble-weighted-swap/ladder.js';
 // Adapter table. Keys MUST equal adapter.slug — venueAdapter reports them as
 // the known-venue list. Constant-product venues first, then the sqrt-price
 // and stable ones (the venue-matrix order in the solswap README).
@@ -30,6 +34,8 @@ const adapters = {
     [meteoraDammV2.slug]: meteoraDammV2,
     [saberStableswap.slug]: saberStableswap,
     [meteoraDammV1Stable.slug]: meteoraDammV1Stable,
+    [stabbleStableSwap.slug]: stabbleStableSwap,
+    [stabbleWeightedSwap.slug]: stabbleWeightedSwap,
 };
 /** Known venue slugs, in table order. */
 export function listVenues() {
@@ -71,6 +77,8 @@ const ladderAdapters = {
     [obricV2Ladder.slug]: obricV2Ladder,
     [solfiV2Ladder.slug]: solfiV2Ladder,
     [quantumLadder.slug]: quantumLadder,
+    [stabbleStableSwapLadder.slug]: stabbleStableSwapLadder,
+    [stabbleWeightedSwapLadder.slug]: stabbleWeightedSwapLadder,
 };
 /** Known ladder-family slugs, in table order. */
 export function listLadderVenues() {
