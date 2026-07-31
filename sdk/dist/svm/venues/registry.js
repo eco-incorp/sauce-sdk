@@ -20,6 +20,7 @@ import { saberStableswap } from './saber-stableswap/index.js';
 import { saberStableswapLadder } from './saber-stableswap/ladder.js';
 import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
+import { woofiLadder } from './woofi/ladder.js';
 // Adapter table. Keys MUST equal adapter.slug — venueAdapter reports them as
 // the known-venue list. Constant-product venues first, then the sqrt-price
 // and stable ones (the venue-matrix order in the solswap README).
@@ -72,6 +73,7 @@ const ladderAdapters = {
     [obricV2Ladder.slug]: obricV2Ladder,
     [solfiV2Ladder.slug]: solfiV2Ladder,
     [quantumLadder.slug]: quantumLadder,
+    [woofiLadder.slug]: woofiLadder,
     [deriverseLadder.slug]: deriverseLadder,
 };
 /** Known ladder-family slugs, in table order. */
