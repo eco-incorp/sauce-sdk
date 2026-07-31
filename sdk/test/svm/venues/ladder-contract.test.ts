@@ -81,6 +81,8 @@ import {
   meteoraDammV1StableLadder,
   meteoraDammV2,
   meteoraDammV2Ladder,
+  meteoraDbc,
+  meteoraDbcLadder,
   meteoraDlmmLadder,
   fetchMeteoraDlmmConfig,
   goonfiV2Ladder,
@@ -311,6 +313,25 @@ const FAMILIES: Family[] = [
       return [
         { label: 'aToB', cfg: { ...cfg, direction: 'aToB' }, state },
         { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'meteora-dbc',
+    ladder: meteoraDbcLadder,
+    async variants() {
+      // Real, non-migrated, single-segment (segIdx 0) mainnet pool — static
+      // 2% base fee (period_frequency == 0, dynamic fee disabled). The
+      // closed-form segment/migration capacity is real and merge-reachable
+      // in both directions on this fixture (see meteora-dbc.test.ts).
+      const POOL = address('5HXw3UDdd9n6aNsiPCNkB23JJBAZv3qSMf11oiJxL5z8');
+      const fixtures = fixturesFor('meteora-dbc');
+      const cfg = await meteoraDbc.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      const now = 2_000_000_000n; // far past any real activation_point — deterministic forever
+      return [
+        { label: 'quoteToBase', cfg: { ...cfg, direction: 'quoteToBase' }, state, now },
+        { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state, now },
       ];
     },
   },
@@ -758,10 +779,10 @@ const FAMILIES: Family[] = [
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 19 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 20 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(19);
-    expect(FAMILIES).toHaveLength(19);
+    expect(registered).toHaveLength(20);
+    expect(FAMILIES).toHaveLength(20);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
