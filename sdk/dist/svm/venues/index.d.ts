@@ -40,4 +40,6 @@ export * from './woofi/index.js';
 export * from './woofi/ladder.js';
 export * from './deriverse/index.js';
 export * from './deriverse/ladder.js';
+export * from './tesserav/index.js';
+export * from './tesserav/ladder.js';
 //# sourceMappingURL=index.d.ts.map
