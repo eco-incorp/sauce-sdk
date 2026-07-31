@@ -73,6 +73,8 @@ import { resolve } from 'path';
 import { address } from '@solana/kit';
 import {
   listLadderVenues,
+  deriverse,
+  deriverseLadder,
   manifestLadder,
   fetchManifestConfig,
   meteoraDammV1Stable,
@@ -101,6 +103,8 @@ import {
   saberStableswapLadder,
   solfiV2,
   solfiV2Ladder,
+  fetchWoofiConfig,
+  woofiLadder,
 } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
@@ -595,13 +599,55 @@ const FAMILIES: Family[] = [
       ];
     },
   },
+  {
+    slug: 'woofi',
+    ladder: woofiLadder,
+    async variants() {
+      // The real SOL/USDC mainnet dump (test/svm/fixtures/woofi) has the
+      // venue's OWN feasibility gate genuinely tripped (a stale keeper price,
+      // see woofi.test.ts) — degenerate (always 0), so this sweep uses the
+      // SAME patched-fixture technique obric-v2's own tests use for its
+      // drained real snapshot: test/svm/fixtures/woofi-patched only touches
+      // the Pyth price/timestamps (feasibility), never the curve shape.
+      const fixtures = fixturesFor('woofi-patched');
+      const load = fixtureLoader(fixtures);
+      const state = fixtureBytesMap(fixtures);
+      const cfg = await fetchWoofiConfig(load, address('BEz2Suv2WvGKWouU1srbhZfudBGuw9v2VzkhMZHFBdvs'));
+      const now = 1_785_600_000n;
+      return [
+        { label: 'sellBase', cfg: { ...cfg, direction: 'sellBase' as const }, state, now },
+        { label: 'sellQuote', cfg: { ...cfg, direction: 'sellQuote' as const }, state, now },
+      ];
+    },
+  },
+  {
+    slug: 'deriverse',
+    ladder: deriverseLadder,
+    async variants() {
+      // A REAL, LIVE (non-drained) mainnet instrument — wSOL/USDC
+      // (8Wk2L1yD...), embedded-AMM reserves both nonzero at this snapshot,
+      // unlike obric-v2's own checked-in fixture. No `declaredCliffs`: the
+      // isqrt-based circuit-breaker capacity clamp SATURATES the standalone
+      // cold referenceQuote too (see ladder.ts's module doc) — the same
+      // no-entry shape as raydium-*/pumpswap/meteora-damm-v2/saber, not the
+      // whirlpool/clmm/dlmm/solfi-v2/damm-v1-stable "latent cliff" class.
+      const POOL = address('8Wk2L1yDovBJifCN1o86X7g7pDcqLau39m6tEsJ9Sheh');
+      const fixtures = fixturesFor('deriverse');
+      const cfg = await deriverse.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'sell', cfg: { ...cfg, side: 'sell' as const }, state },
+        { label: 'buy', cfg: { ...cfg, side: 'buy' as const }, state },
+      ];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 15 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 17 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(15);
-    expect(FAMILIES).toHaveLength(15);
+    expect(registered).toHaveLength(17);
+    expect(FAMILIES).toHaveLength(17);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
