@@ -562,11 +562,20 @@ export const woofiLadder: SvmVenueLadderV2 = {
     const c = woofiConfig(base);
     const make = (r: string, addr: Address, writable?: boolean): VenueAccount =>
       writable ? { ref: r, address: addr, writable: true } : { ref: r, address: addr };
+    // The ladder-v2 "patch" slot is ALWAYS exactly one runtime-written u64 (see
+    // LadderSwapTemplate's doc) — but the real `Swap` ix takes from_amount as a
+    // FULL u128 LE (16 bytes; swap_math.rs's handler signature). A real trade
+    // amount always fits in a u64 (it is, at most, a live SPL token balance),
+    // so the patched u64 supplies the LOW 8 bytes and the suffix supplies the
+    // HIGH 8 bytes (always 0) immediately after, followed by min_to_amount as
+    // a full u128 LE = 1 (the recipe's terminal delta owns the real bound).
+    const suffix = new Uint8Array(8 + 16);
+    suffix[8] = 1; // min_to_amount's LSB; everything else (the amountIn high
+    // 8 bytes + min_to_amount's remaining 15 bytes) stays 0.
     return {
       programId: WOOFI_PROGRAM_ID,
       prefix: Uint8Array.from(WOOFI_SWAP_DISCRIMINATOR),
-      // min_to_amount u128 LE = 1 (the recipe's terminal delta owns the bound).
-      suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+      suffix,
       patch: 'in',
       accounts: woofiSwapAccounts(c, user, make, (role) => ref(slot, role)),
     };
