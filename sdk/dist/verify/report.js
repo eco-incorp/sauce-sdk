@@ -36,6 +36,24 @@ function renderAddr(a) {
         return String(a);
     }
 }
+/** `BigInt(x)` throws (`TypeError`/`SyntaxError`) on a garbage `x` — every `expect.*` field is
+ *  caller-controlled and only TYPED as `Address`/`bigint`, so a runtime caller that bypasses the
+ *  type system (the exact scenario `verifySettleProgram`'s own recipient-required guard already
+ *  anticipates) can otherwise crash a function documented to "never throw". Returns `null` on any
+ *  parse failure instead — callers treat `null` as "cannot possibly match", i.e. a clean `'fail'`,
+ *  never an unchecked exception. */
+function safeBigInt(v) {
+    if (v === undefined || v === null)
+        return null;
+    if (typeof v === "bigint")
+        return v;
+    try {
+        return BigInt(v);
+    }
+    catch {
+        return null;
+    }
+}
 function matchTemplate(hash, templates) {
     const norm = hash.toLowerCase();
     return templates.find((t) => t.bodyHash.toLowerCase() === norm);
@@ -47,9 +65,9 @@ function push(build, check, code) {
     }
 }
 /** Shared engine behind both `inspectSettleProgram` and `verifySettleProgram` — builds every
- *  check that does NOT depend on caller expectations (shape/body/template/floorToken/serverEcho),
- *  plus the decoded value, effects, and disclosures. `verifySettleProgram` appends the three
- *  intent.* checks on top of this. */
+ *  check that does NOT depend on caller expectations (shape/body/template/serverEcho), plus the
+ *  decoded value. Both entry points then call `pushIntentChecks` (with `null` or a real
+ *  expectation respectively) and `buildEffects` on top of what this returns. */
 function buildBase(program, opts) {
     const parse = parseSettleProgram(program);
     const decoded = bestEffortDecode(parse);
@@ -57,9 +75,22 @@ function buildBase(program, opts) {
     const templates = opts.templates ?? SETTLE_TEMPLATES;
     // shape.pushes — the leading token-push run (and, by extension, the minOut/recipient pushes
     // that follow it) all present and untruncated.
+    //
+    // The branch below tests `parse.fatal?.code === "NOT_SETTLE_SHAPED"` — NOT `parse.tokenPushes.
+    // length === 0` (the pre-fix condition). Both are true when byte 0 isn't a push opcode at all
+    // (the genuine NOT_SETTLE_SHAPED case), but `tokenPushes.length === 0` is ALSO true whenever the
+    // very FIRST token push fails a scan (a non-minimal push, an oversize address, or a plain
+    // truncation AT POSITION 0 — e.g. a single-token settle program with a malformed leading push):
+    // the scan loop returns immediately on that failure, before ever recording a push. Testing the
+    // array length there misattributed a real NON_MINIMAL_PUSH/OVERSIZE_ADDRESS to the generic
+    // NOT_SETTLE_SHAPED code and, worse, made `shape.canonical` below render 'unchecked' instead of
+    // the actual 'fail' — the SPECIFIC canonicality check the wire spec (§9) publishes as a stable,
+    // switchable failure code was silently skipped for exactly the input it exists to catch.
+    // `parse.fatal.code` carries the TRUE reason regardless of scan position, so testing it directly
+    // is both correct and simpler.
     const truncationCode = parse.fatal?.code === "EMPTY"
         ? "EMPTY"
-        : parse.tokenPushes.length === 0
+        : parse.fatal?.code === "NOT_SETTLE_SHAPED"
             ? "NOT_SETTLE_SHAPED"
             : parse.tokenScanError?.code === "TRUNCATED_PUSH"
                 ? "TRUNCATED_PUSH"
@@ -165,7 +196,12 @@ function buildBase(program, opts) {
             bodyHashExpected = opts.expectedBodyHash;
         }
         else {
-            hashSource = "pinned";
+            // The trust root consulted here is `templates` (declared above as `opts.templates ??
+            // SETTLE_TEMPLATES`) — when the CALLER supplied `opts.templates`, the table itself is
+            // caller-controlled even though no single `expectedBodyHash` was given, so the authenticity
+            // decision did NOT trust this package's own pinned table. Label it 'caller' — NOT 'pinned' —
+            // so a forwarded report never misattributes an override table's verdict to our own root.
+            hashSource = opts.templates !== undefined ? "caller" : "pinned";
             if (!tableMatch) {
                 authenticated = false;
                 bodyHashStatus = "fail";
@@ -211,17 +247,12 @@ function buildBase(program, opts) {
         actual: !actualHash ? "not reached" : !tableMatch ? "no table entry matches this body hash" : `${tableMatch.id}@${tableMatch.version} (${tableMatch.status})`,
         proves: "version skew between this program and the package's current template — informational; a superseded-but-accepted match is still authentic (see body.hash), this only flags that you're on an older audited version.",
     });
-    // intent.floorToken — informational, always available once decoded.
-    push(build, {
-        id: "intent.floorToken",
-        title: "tokens[0] is the floor token — checked before any transfer runs.",
-        status: decoded ? "pass" : "unchecked",
-        severity: "advisory",
-        compared: "position 0 of the decoded token list",
-        expected: "(informational — no expectation to compare; the floor token is POSITIONAL, not separately named)",
-        actual: decoded ? renderAddr(decoded.floorToken) : "not reached",
-        proves: "which token's Pot balance the minOut floor is checked against. Reversing the token list by mistake silently swaps this to the wrong token.",
-    });
+    // NOTE: `intent.floorToken` (and `intent.recipient`/`intent.tokens`/`intent.minOut`) are pushed
+    // by `pushIntentChecks` below — NOT here. `buildBase` is expectation-blind (it has no `expect`
+    // parameter — `inspectSettleProgram` never has one to give it), so every check that depends on
+    // whether an expectation was supplied lives in the one function both entry points call after
+    // this returns. See that function's doc for why `intent.floorToken` used to manufacture a `pass`
+    // here with nothing to compare against.
     // serverEcho.bodyHash — informational ONLY, never gates ok, never the expected value.
     if (opts.serverEchoBodyHash !== undefined) {
         const match = actualHash !== null && actualHash.toLowerCase() === opts.serverEchoBodyHash.toLowerCase();
@@ -248,8 +279,29 @@ function buildBase(program, opts) {
             proves: "NOT a security check — informational only; see above.",
         });
     }
+    // `structurallyValid`: every blocking check EXCEPT body.hash passes — i.e. the bytes are a
+    // well-formed, canonical `(tokens, minOut, recipient) || body[165]` wire program, independent of
+    // WHOSE program it is or whether the body matches our template. `authentic` (== the `authenticated`
+    // local above) is body.hash ALONE — the body matches an accepted template entry. Neither says
+    // anything about intent (tokens/recipient/minOut) — see `pushIntentChecks`' doc for that half.
+    const structurallyValid = build.checks.every((c) => c.severity !== "blocking" || c.id === "body.hash" || c.status === "pass");
+    return { build, decoded, templateId, templateVersion, hashSource, authenticated, structurallyValid };
+}
+/** Build `effects[]` — a BEHAVIORAL claim ("this program, if cooked, moves these tokens"), so it
+ *  is gated on `structurallyValid && authentic` (this IS our audited template, well-formed,
+ *  decodable), NOT on the full report `ok` (which also folds in `intent.*` — a caller's WRONG
+ *  expected recipient/tokens doesn't change what the bytecode actually does, it only fails the
+ *  comparison) and NOT on `authenticated`/body-hash alone as before: `parseSettleProgram` keeps
+ *  parsing the body (to show a rejected program's would-be state) even after a ZERO_RECIPIENT
+ *  fatal, so an authenticated-but-structurally-rejected program (e.g. a zero recipient) used to
+ *  still emit effect rows claiming a real transfer to `0x000…000` — a behavioral claim about a
+ *  program THIS report structurally rejected. `inspectSettleProgram`'s permanently-unchecked
+ *  `intent.*` (see `pushIntentChecks`) therefore does NOT suppress effects — "see what this
+ *  program does" is exactly inspect's job, and remains available whenever the bytes genuinely are
+ *  our template. */
+function buildEffects(decoded, structurallyValid, authentic) {
     const effects = [];
-    if (decoded && authenticated) {
+    if (decoded && structurallyValid && authentic) {
         decoded.tokens.forEach((t, i) => {
             effects.push({
                 position: i,
@@ -263,77 +315,99 @@ function buildBase(program, opts) {
             });
         });
     }
-    return { build, decoded, effects, templateId, templateVersion, hashSource, authenticated };
+    return effects;
 }
 /**
- * SEE — never throws, requires no expectations. This is the "show me the validation phase" call:
- * renders every shape/body/template check plus the decoded intent and the standing disclosures,
- * with no comparison against a caller's expected recipient/tokens/minOut (those checks simply
- * don't exist in this report — see `verifySettleProgram` for that).
+ * Push the four `intent.*` checks — `recipient`/`tokens`/`minOut`/`floorToken` — the ONE place
+ * both entry points build them, so `checks[]` is IDENTICAL in shape between `inspectSettleProgram`
+ * and `verifySettleProgram`: every check the report format supports is ALWAYS present with a real
+ * status, never omitted by mode (this is what `api/README.md`'s "one row per check ... never
+ * omitted" claim actually requires, and what makes `inspectSettleProgram`'s inability to check
+ * intent VISIBLE — a permanent 'unchecked' row — rather than the check simply not existing).
+ *
+ * `expect === null` is `inspectSettleProgram`'s call — there is NO expectation, ever, so:
+ *   - `intent.recipient` / `intent.tokens` render `'unchecked'` + `'blocking'` (code
+ *     `INTENT_UNCHECKED`) — NEVER `'pass'`, because passing would claim an assurance inspect
+ *     cannot provide. This is what makes `ok` permanently `false` for `inspectSettleProgram` (see
+ *     the module doc) — a designed consequence, not a special case bolted onto `ok` itself.
+ *   - `intent.minOut` / `intent.floorToken` render `'unchecked'` + `'advisory'` — informational
+ *     only (mirrors `verifySettleProgram`'s own "neither minOut field supplied" case below; a
+ *     floor was never claimed, so there is nothing to forcibly fail).
+ *
+ * `expect !== null` is `verifySettleProgram`'s call — `expect.recipient` is guaranteed present
+ * (enforced at that function's entry). The one NEW behavior versus the pre-existing per-field
+ * logic: `intent.floorToken`.
+ *   - Supplied (`expect.floorToken !== undefined`): a REAL, blocking pass/fail comparison against
+ *     `decoded.floorToken` (== `decoded.tokens[0]`).
+ *   - NOT supplied, but the caller supplied `minOut`/`minMinOut` AND did not pin position 0 via an
+ *     EXACT `tokens` list (only `allowTokens`, or no token expectation at all): this FORCES
+ *     `'unchecked'` + `'blocking'` (code `INTENT_UNCHECKED`) — a `minOut` expectation is a claim
+ *     about a SPECIFIC token's balance, and `allowTokens` is order-free by design (§ its own doc),
+ *     so without `floorToken` (or an exact `tokens` list) the floor's target is UNVERIFIED even
+ *     though the caller asked about it. This is the fix for the exact exploit it closes: `verify
+ *     (prog, {recipient, allowTokens:[OUT,IN], minOut})` used to return `ok:true` for BOTH the
+ *     honest `[OUT,IN]` program and an attacker's `[IN,OUT]` — permuting the SAME allowed set moves
+ *     the floor onto the leftover input while `intent.tokens`/`intent.minOut` both still pass. The
+ *     report now REFUSES `ok:true` for either UNTIL the caller pins the floor's identity — at which
+ *     point the honest program passes and the attacker's fails (`decoded.floorToken` differs).
+ *   - NOT supplied, `minOut`/`minMinOut` not supplied either (or position already pinned via exact
+ *     `tokens`): `'unchecked'` + `'advisory'` — informational, does not gate `ok` (an exact `tokens`
+ *     list already order-pins position 0 via `intent.tokens`, so no additional gate is needed).
  */
-export function inspectSettleProgram(program, opts = {}) {
-    const { build, decoded, effects, templateId, templateVersion, hashSource } = buildBase(program, opts);
-    const ok = build.checks.every((c) => c.severity !== "blocking" || c.status === "pass");
-    return {
-        ok,
-        mode: "inspect",
-        templateId,
-        templateVersion,
-        hashSource,
-        failureCode: ok ? null : build.failureCode,
-        decoded,
-        checks: build.checks,
-        effects,
-        disclosures: DISCLOSURES.slice(),
-    };
-}
-/**
- * GATE — never throws. `expect.recipient` is REQUIRED (see `SettleExpectation`). Adds
- * `intent.recipient` / `intent.tokens` / `intent.minOut` on top of everything
- * `inspectSettleProgram` reports, and derives `ok` over the full set.
- */
-export function verifySettleProgram(program, expect, opts = {}) {
-    if (!expect || expect.recipient === undefined || expect.recipient === null) {
-        throw new TypeError("verifySettleProgram: expect.recipient is REQUIRED (a runtime caller bypassed the type system)");
+function pushIntentChecks(build, decoded, expect) {
+    const e = expect ?? {};
+    // intent.recipient
+    if (expect === null) {
+        push(build, {
+            id: "intent.recipient",
+            title: "Decoded recipient matches the expected recipient.",
+            status: "unchecked",
+            severity: "blocking",
+            compared: "decoded recipient vs. expect.recipient",
+            expected: "(inspectSettleProgram takes no expectation — call verifySettleProgram with expect.recipient to check this)",
+            actual: decoded ? renderAddr(decoded.recipient) : "not reached",
+            proves: "the destination of every swept token, including the floor token's overflow above minOut.",
+        }, "INTENT_UNCHECKED");
     }
-    const { build, decoded, effects, templateId, templateVersion, hashSource } = buildBase(program, opts);
-    // intent.recipient — always checked (required field).
-    const recipMatch = decoded !== null && BigInt(decoded.recipient) === BigInt(expect.recipient);
-    push(build, {
-        id: "intent.recipient",
-        title: "Decoded recipient matches the expected recipient.",
-        status: decoded === null ? "unchecked" : recipMatch ? "pass" : "fail",
-        severity: "blocking",
-        compared: "decoded recipient vs. expect.recipient",
-        expected: renderAddr(expect.recipient),
-        actual: decoded ? renderAddr(decoded.recipient) : "not reached",
-        proves: "the destination of every swept token, including the floor token's overflow above minOut.",
-    }, decoded === null ? undefined : recipMatch ? undefined : "EXPECT_RECIPIENT");
+    else {
+        const expectRecip = safeBigInt(e.recipient);
+        const recipMatch = decoded !== null && expectRecip !== null && BigInt(decoded.recipient) === expectRecip;
+        push(build, {
+            id: "intent.recipient",
+            title: "Decoded recipient matches the expected recipient.",
+            status: decoded === null ? "unchecked" : recipMatch ? "pass" : "fail",
+            severity: "blocking",
+            compared: "decoded recipient vs. expect.recipient",
+            expected: renderAddr(e.recipient),
+            actual: decoded ? renderAddr(decoded.recipient) : "not reached",
+            proves: "the destination of every swept token, including the floor token's overflow above minOut.",
+        }, decoded === null ? undefined : recipMatch ? undefined : "EXPECT_RECIPIENT");
+    }
     // intent.tokens — blocking always; unchecked (forcing ok:false) when neither tokens nor
-    // allowTokens is supplied. `tokens` (exact, order-sensitive) takes precedence over `allowTokens`
-    // (containment) when both are given.
+    // allowTokens is supplied (including inspect's permanent no-expectation case). `tokens` (exact,
+    // order-sensitive) takes precedence over `allowTokens` (containment) when both are given.
     let tokensStatus;
     let tokensExpected;
     let tokensActual;
     let tokensCode;
-    if (expect.tokens !== undefined) {
-        tokensExpected = `[${expect.tokens.map(renderAddr).join(", ")}] (exact, in order)`;
+    if (e.tokens !== undefined) {
+        tokensExpected = `[${e.tokens.map(renderAddr).join(", ")}] (exact, in order)`;
         if (decoded === null) {
             tokensStatus = "unchecked";
             tokensActual = "not reached";
         }
         else {
-            const want = expect.tokens.map((t) => BigInt(t));
+            const want = e.tokens.map((t) => safeBigInt(t));
             const got = decoded.tokens.map((t) => BigInt(t));
-            const same = want.length === got.length && want.every((w, i) => w === got[i]);
+            const same = want.length === got.length && want.every((w, i) => w !== null && w === got[i]);
             tokensStatus = same ? "pass" : "fail";
             tokensActual = `[${decoded.tokens.map(renderAddr).join(", ")}]`;
             tokensCode = same ? undefined : "EXPECT_TOKENS";
         }
     }
-    else if (expect.allowTokens !== undefined) {
-        const allowSet = new Set(expect.allowTokens.map((t) => BigInt(t)));
-        tokensExpected = `every decoded token ∈ {${expect.allowTokens.map(renderAddr).join(", ")}}`;
+    else if (e.allowTokens !== undefined) {
+        const allowSet = new Set(e.allowTokens.map((t) => safeBigInt(t)).filter((v) => v !== null));
+        tokensExpected = `every decoded token ∈ {${e.allowTokens.map(renderAddr).join(", ")}}`;
         if (decoded === null) {
             tokensStatus = "unchecked";
             tokensActual = "not reached";
@@ -347,9 +421,12 @@ export function verifySettleProgram(program, expect, opts = {}) {
     }
     else {
         tokensStatus = "unchecked";
-        tokensExpected = "(neither expect.tokens nor expect.allowTokens supplied)";
+        tokensExpected =
+            expect === null
+                ? "(inspectSettleProgram takes no expectation — call verifySettleProgram with expect.tokens/allowTokens to check this)"
+                : "(neither expect.tokens nor expect.allowTokens supplied)";
         tokensActual = decoded ? `[${decoded.tokens.map(renderAddr).join(", ")}] — NOT compared against anything` : "not reached";
-        tokensCode = "EXPECT_TOKENS";
+        tokensCode = "INTENT_UNCHECKED";
     }
     push(build, {
         id: "intent.tokens",
@@ -361,34 +438,37 @@ export function verifySettleProgram(program, expect, opts = {}) {
         actual: tokensActual,
         proves: "the FULL_BALANCE_SWEEP hazard's actual scope: which tokens leave the Pot at their whole balance. An unchecked status here means NOTHING about the token list was verified — treat that as a failure, not a pass.",
     }, tokensCode);
-    // intent.minOut — advisory+unchecked when neither minOut nor minMinOut is supplied; becomes
-    // blocking (pass/fail) once either is.
-    const minOutSupplied = expect.minOut !== undefined || expect.minMinOut !== undefined;
+    // intent.minOut — advisory+unchecked when neither minOut nor minMinOut is supplied (including
+    // inspect's permanent no-expectation case); becomes blocking (pass/fail) once either is.
+    const minOutSupplied = e.minOut !== undefined || e.minMinOut !== undefined;
     let minOutStatus;
     let minOutActual;
     let minOutExpected;
     let minOutCode;
     if (!minOutSupplied) {
         minOutStatus = "unchecked";
-        minOutExpected = "(neither expect.minOut nor expect.minMinOut supplied)";
+        minOutExpected =
+            expect === null
+                ? "(inspectSettleProgram takes no expectation — call verifySettleProgram with expect.minOut/minMinOut to check this)"
+                : "(neither expect.minOut nor expect.minMinOut supplied)";
         minOutActual = decoded ? String(decoded.minOut) : "not reached";
     }
     else if (decoded === null) {
         minOutStatus = "unchecked";
-        minOutExpected = expect.minOut !== undefined ? `== ${expect.minOut}` : `>= ${expect.minMinOut}`;
+        minOutExpected = e.minOut !== undefined ? `== ${e.minOut}` : `>= ${e.minMinOut}`;
         minOutActual = "not reached";
     }
-    else if (expect.minOut !== undefined) {
-        const pass = decoded.minOut === expect.minOut;
+    else if (e.minOut !== undefined) {
+        const pass = decoded.minOut === e.minOut;
         minOutStatus = pass ? "pass" : "fail";
-        minOutExpected = `== ${expect.minOut}`;
+        minOutExpected = `== ${e.minOut}`;
         minOutActual = String(decoded.minOut);
         minOutCode = pass ? undefined : "EXPECT_MINOUT";
     }
     else {
-        const pass = decoded.minOut >= expect.minMinOut;
+        const pass = decoded.minOut >= e.minMinOut;
         minOutStatus = pass ? "pass" : "fail";
-        minOutExpected = `>= ${expect.minMinOut}`;
+        minOutExpected = `>= ${e.minMinOut}`;
         minOutActual = String(decoded.minOut);
         minOutCode = pass ? undefined : "EXPECT_MINOUT";
     }
@@ -402,6 +482,88 @@ export function verifySettleProgram(program, expect, opts = {}) {
         actual: minOutActual,
         proves: "minOut is checked against the Pot's WHOLE floor-token balance at settle time, not this trade's delta (see FLOOR_IS_LEVEL_NOT_DELTA) — a pass here is not proof this trade alone produced the amount.",
     }, minOutCode);
+    // intent.floorToken — see this function's doc for the forfeiture rule. `tokens[0]` is the ONLY
+    // token `minOut` is ever checked against (FLOOR_IS_LEVEL_NOT_DELTA), and it is POSITIONAL, so
+    // `allowTokens` (order-free by definition) can never itself pin it.
+    const positionPinned = e.tokens !== undefined; // an exact, order-sensitive list already covers position 0
+    const forfeited = expect !== null && !positionPinned && minOutSupplied; // a floor was claimed with no way to name its token
+    let floorStatus;
+    let floorSeverity;
+    let floorExpected;
+    let floorCode;
+    if (e.floorToken !== undefined) {
+        const expectFloor = safeBigInt(e.floorToken);
+        const floorMatch = decoded !== null && expectFloor !== null && BigInt(decoded.floorToken) === expectFloor;
+        floorStatus = decoded === null ? "unchecked" : floorMatch ? "pass" : "fail";
+        floorSeverity = "blocking";
+        floorExpected = renderAddr(e.floorToken);
+        floorCode = decoded === null ? undefined : floorMatch ? undefined : "EXPECT_FLOOR_TOKEN";
+    }
+    else if (forfeited) {
+        floorStatus = "unchecked";
+        floorSeverity = "blocking";
+        floorExpected =
+            "(minOut/minMinOut was supplied, but the floor token's identity was pinned by neither expect.floorToken nor an exact expect.tokens list — allowTokens is order-free and cannot pin position 0, so the floor's target is UNVERIFIED; this report cannot claim ok:true until one of those is supplied)";
+        floorCode = "INTENT_UNCHECKED";
+    }
+    else {
+        floorStatus = "unchecked";
+        floorSeverity = "advisory";
+        floorExpected =
+            expect === null
+                ? "(inspectSettleProgram takes no expectation — call verifySettleProgram with expect.floorToken to check this)"
+                : "(no expect.floorToken supplied, and no minOut/minMinOut floor was claimed that would need one)";
+    }
+    push(build, {
+        id: "intent.floorToken",
+        title: "tokens[0] is the floor token — checked before any transfer runs.",
+        status: floorStatus,
+        severity: floorSeverity,
+        compared: "position 0 of the decoded token list vs. expect.floorToken",
+        expected: floorExpected,
+        actual: decoded ? renderAddr(decoded.floorToken) : "not reached",
+        proves: "which token's Pot balance the minOut floor is checked against. Reversing the token list by mistake (or permuting an allowTokens-only set) silently swaps this to the wrong token — an 'unchecked' status here means minOut's target token was NOT verified, and forces ok:false whenever a floor was actually claimed (severity:'blocking').",
+    }, floorCode);
+}
+/**
+ * SEE — never throws, requires no expectations. This is the "show me the validation phase" call:
+ * renders EVERY check `verifySettleProgram` would (shape/body/template/serverEcho AND the four
+ * `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever. Because
+ * of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`, which
+ * makes this function's `ok` PERMANENTLY `false` — see the module doc for why that is correct, not
+ * a defect: `ok` is a gate result, and this function never gates anything. Use
+ * `structurallyValid`/`authentic` for "is this genuinely our template, well-formed" instead.
+ */
+export function inspectSettleProgram(program, opts = {}) {
+    const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
+    pushIntentChecks(build, decoded, null);
+    const ok = build.checks.every((c) => c.severity !== "blocking" || c.status === "pass");
+    return {
+        ok,
+        mode: "inspect",
+        templateId,
+        templateVersion,
+        hashSource,
+        structurallyValid,
+        authentic: authenticated,
+        failureCode: build.failureCode,
+        decoded,
+        checks: build.checks,
+        effects: buildEffects(decoded, structurallyValid, authenticated),
+        disclosures: DISCLOSURES.slice(),
+    };
+}
+/**
+ * GATE — never throws. `expect.recipient` is REQUIRED (see `SettleExpectation`). Calls
+ * `pushIntentChecks` with the REAL expectation (real pass/fail comparisons, not permanently-
+ * unchecked placeholders) and derives `ok` over the full check set.
+ */
+export function verifySettleProgram(program, expect, opts = {}) {
+    if (!expect || expect.recipient === undefined || expect.recipient === null) {
+        throw new TypeError("verifySettleProgram: expect.recipient is REQUIRED (a runtime caller bypassed the type system)");
+    }
+    const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
+    pushIntentChecks(build, decoded, expect);
     const ok = build.checks.every((c) => c.severity !== "blocking" || c.status === "pass");
     return {
         ok,
@@ -409,10 +571,12 @@ export function verifySettleProgram(program, expect, opts = {}) {
         templateId,
         templateVersion,
         hashSource,
-        failureCode: ok ? null : build.failureCode,
+        structurallyValid,
+        authentic: authenticated,
+        failureCode: build.failureCode,
         decoded,
         checks: build.checks,
-        effects,
+        effects: buildEffects(decoded, structurallyValid, authenticated),
         disclosures: DISCLOSURES.slice(),
     };
 }
@@ -422,7 +586,11 @@ const STATUS_GLYPH = { pass: "✓", fail: "✗", unchecked: "·" };
  *  `console.log`, not a JSON-schema exercise. */
 export function formatSettleReport(r) {
     const lines = [];
-    lines.push(`SETTLE PROGRAM REPORT — mode=${r.mode} ok=${r.ok} template=${r.templateId ?? "?"}@${r.templateVersion ?? "?"} hashSource=${r.hashSource}`);
+    lines.push(`SETTLE PROGRAM REPORT — mode=${r.mode} ok=${r.ok} structurallyValid=${r.structurallyValid} authentic=${r.authentic} ` +
+        `template=${r.templateId ?? "?"}@${r.templateVersion ?? "?"} hashSource=${r.hashSource}`);
+    if (r.mode === "inspect") {
+        lines.push("  (inspect mode NEVER checks intent — ok is permanently false here; read structurallyValid/authentic and checks[] instead)");
+    }
     if (r.failureCode)
         lines.push(`  failureCode: ${r.failureCode}`);
     lines.push("");
@@ -438,7 +606,7 @@ export function formatSettleReport(r) {
     lines.push("");
     lines.push(`effects (${r.effects.length}):`);
     if (r.effects.length === 0) {
-        lines.push("  (none — program not authenticated as the settle template; no behavioral claim can be made)");
+        lines.push("  (none — program is not both structurally valid AND authentic; no behavioral claim can be made)");
     }
     for (const e of r.effects) {
         lines.push(`  #${e.position} ${e.token}${e.isFloorToken ? " (FLOOR TOKEN)" : ""} -> ${e.amount} -> ${e.to}`);

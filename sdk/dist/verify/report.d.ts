@@ -76,20 +76,48 @@ export interface SettleExpectation {
      *  `allowTokens`; if both are given, `tokens` (the stricter check) wins. */
     tokens?: Address[];
     /** Looser alternative to `tokens`: every decoded token must be a member of this set,
-     *  order-free. Ignored when `tokens` is also supplied. */
+     *  order-free. Ignored when `tokens` is also supplied.
+     *
+     *  ⚠ `allowTokens` alone does NOT pin WHICH member sits at position 0 — the settle wire's floor
+     *  token is POSITIONAL (`tokens[0]`, see `intent.floorToken`), and reordering the SAME allowed
+     *  set moves the floor onto a different token without failing this check. If you also supply
+     *  `minOut`/`minMinOut`, either supply `floorToken` (or the stricter, order-sensitive `tokens`)
+     *  too, or the report cannot claim `ok:true` — see `intent.floorToken`'s doc below. */
     allowTokens?: Address[];
     /** Exact required `minOut`. */
     minOut?: bigint;
     /** Floor-on-the-floor: decoded `minOut` must be `>= minMinOut`. Ignored when `minOut` is also
      *  supplied (the exact check subsumes it). */
     minMinOut?: bigint;
+    /** Exact required floor token — `decoded.tokens[0]` (== `decoded.floorToken`), the ONE token
+     *  `minOut` is actually checked against (see FLOOR_IS_LEVEL_NOT_DELTA). Redundant (but harmless)
+     *  alongside an exact `tokens` list, which already pins position 0; REQUIRED to get `ok:true`
+     *  out of a `minOut`/`minMinOut` expectation when the token identity is otherwise expressed only
+     *  via the order-free `allowTokens` (or not expressed at all) — see `allowTokens`'s doc above. */
+    floorToken?: Address;
 }
 export interface SettleReportEnvelope {
+    /** `checks.every(c => c.severity !== 'blocking' || c.status === 'pass')` — see the module doc.
+     *  `inspectSettleProgram` NEVER supplies an expectation, so `intent.recipient`/`intent.tokens`
+     *  are PERMANENTLY `'unchecked'`+`'blocking'` there (see `pushIntentChecks`), which makes `ok`
+     *  PERMANENTLY `false` for every `inspectSettleProgram` call — by design: a single boolean must
+     *  never read `true` for a program whose intent was never checked, and inspect mode never checks
+     *  it. Use `structurallyValid`/`authentic` below for "is this genuinely our template", and
+     *  `checks`/`effects` for everything else — never treat `ok:false` from `inspectSettleProgram`
+     *  as a rejection signal on its own. */
     ok: boolean;
     mode: "verify" | "inspect";
     templateId: string | null;
     templateVersion: string | null;
     hashSource: HashSource;
+    /** Every blocking check EXCEPT `body.hash` passes — the bytes are a well-formed, canonical
+     *  `(tokens, minOut, recipient) || body[165]` wire program. Says NOTHING about whose program it
+     *  is or what tokens/recipient it names. */
+    structurallyValid: boolean;
+    /** `body.hash` passes — the body matches an accepted (non-revoked) template entry. Independent
+     *  of `structurallyValid` (a malformed prologue can front an otherwise-authentic body suffix,
+     *  and vice versa) and, like it, says NOTHING about tokens/recipient/minOut intent. */
+    authentic: boolean;
     failureCode: SettleFailureCode | null;
     decoded: DecodedSettleProgram | null;
     checks: VerifyCheck[];
@@ -104,15 +132,18 @@ export type SettleReport = SettleReportEnvelope & {
 };
 /**
  * SEE — never throws, requires no expectations. This is the "show me the validation phase" call:
- * renders every shape/body/template check plus the decoded intent and the standing disclosures,
- * with no comparison against a caller's expected recipient/tokens/minOut (those checks simply
- * don't exist in this report — see `verifySettleProgram` for that).
+ * renders EVERY check `verifySettleProgram` would (shape/body/template/serverEcho AND the four
+ * `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever. Because
+ * of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`, which
+ * makes this function's `ok` PERMANENTLY `false` — see the module doc for why that is correct, not
+ * a defect: `ok` is a gate result, and this function never gates anything. Use
+ * `structurallyValid`/`authentic` for "is this genuinely our template, well-formed" instead.
  */
 export declare function inspectSettleProgram(program: Hex, opts?: VerifyOpts): SettleInspection;
 /**
- * GATE — never throws. `expect.recipient` is REQUIRED (see `SettleExpectation`). Adds
- * `intent.recipient` / `intent.tokens` / `intent.minOut` on top of everything
- * `inspectSettleProgram` reports, and derives `ok` over the full set.
+ * GATE — never throws. `expect.recipient` is REQUIRED (see `SettleExpectation`). Calls
+ * `pushIntentChecks` with the REAL expectation (real pass/fail comparisons, not permanently-
+ * unchecked placeholders) and derives `ok` over the full check set.
  */
 export declare function verifySettleProgram(program: Hex, expect: SettleExpectation, opts?: VerifyOpts): SettleReport;
 /** Render a report as fixed-width plain text — checks, then effects, then disclosures. This is
