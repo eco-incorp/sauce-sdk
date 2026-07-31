@@ -12,10 +12,18 @@ const DISCLOSURES = [
             "caller-chosen. A dust swap naming an unrelated token emits a program that moves that token's whole " +
             "balance to a caller-chosen recipient (cook-proven at 777e18 of a third party's parked balance). " +
             "Cooking is owner-gated, so this is not a public drain — it bites an operator whose relayer cooks " +
-            "/swap output it did not originate. A passing body.hash check does NOT make this safe; only a " +
-            "`verdict:'MATCHES_DECLARED_INTENT'` from an independently-formed (`intentSource:'caller'`) " +
-            "expectation does — reconciling the token list and recipient against your own intent before " +
-            "cooking is your responsibility, not this validator's. See `sweepScope` for the machine-readable form.",
+            "/swap output it did not originate. A passing body.hash check does NOT make this safe, and " +
+            "neither does `verdict:'MATCHES_DECLARED_INTENT'` by itself: that verdict proves ONLY that the " +
+            "decoded recipient, tokens and floor token equal the values you passed as `declaredIntent` — " +
+            "nothing about who formed `declaredIntent`, or when. It is meaningful ONLY if YOU authored " +
+            "`declaredIntent`, in your own process, from your own intent, BEFORE you ever saw this program. " +
+            "`intentSource` is a caller-supplied DISCLOSURE of how `declaredIntent` claims to have been " +
+            "formed — it is NOT something this module verifies or can verify. Independence is a property of " +
+            "your own process, invisible to this library, and `intentSource:'caller'` is simply the DEFAULT " +
+            "value, trivially true of any expectation regardless of who or what built it. Treat " +
+            "`intentSource` as non-load-bearing metadata, never as proof of independence. Reconciling the " +
+            "token list and recipient against your own pre-formed intent before cooking is your " +
+            "responsibility, not this validator's. See `sweepScope` for the machine-readable form.",
     },
     {
         id: "FLOOR_IS_LEVEL_NOT_DELTA",

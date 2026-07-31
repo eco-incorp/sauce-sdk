@@ -28,11 +28,15 @@ import { authenticateBodyAgainstRoot } from "./internal/root-testing.js";
 //     authenticate their own forgery) was wrong at the design level, not just in its edge cases.
 //     Independent of `structurallyValid`, says nothing about intent.
 //   - `intentSource`      — `'none'` (no expectation was ever supplied — `inspectSettleProgram`,
-//     ALWAYS), `'caller'` (the function's caller supplied a real, independently-formed
-//     expectation — the DEFAULT for `verifySettleProgram`), or `'server-echo'` (the caller has
-//     DISCLOSED, via `opts.intentSourceLabel`, that the expectation is itself derived from the
-//     same request that produced this program — self-certifying, and now visible as such rather
-//     than indistinguishable from an independent check).
+//     ALWAYS), `'caller'` (the DEFAULT for `verifySettleProgram` — the caller supplied SOME
+//     `declaredIntent`; this is a disclosure of the FIELD'S DEFAULT VALUE, not a verified fact
+//     about how that expectation was formed), or `'server-echo'` (the caller has DISCLOSED, via
+//     `opts.intentSourceLabel`, that the expectation is itself derived from the same request that
+//     produced this program — self-certifying). Neither value is proof of independence: this
+//     module cannot observe whether a caller formed `declaredIntent` from its own prior intent or
+//     copied it back out of the very program being checked — that only `'server-echo'` bothers to
+//     disclose is a caller CHOICE, not something verified. Treat `intentSource` as non-load-bearing
+//     metadata always — see the FULL_BALANCE_SWEEP disclosure below.
 //   - `intentReconciled`  — `null` (an expectation was never supplied, OR a required identity
 //     check — e.g. the settle floor's target token — was left unpinned: NOT fully compared),
 //     `false` (fully compared, at least one field did not match), `true` (fully compared, all
@@ -137,10 +141,15 @@ export interface Disclosure {
  *  narrow `authentic` toward `false`, never establish it. */
 export type HashSource = "pinned" | "none";
 
-/** WHO authored `declaredIntent` — see this module's header doc. `'server-echo'` CAPS `verdict` at
+/** WHAT THE CALLER DISCLOSED about how `declaredIntent` was formed — see this module's header
+ *  doc. This is a caller-supplied LABEL, not a verified fact: this module has no way to observe
+ *  whether `declaredIntent` was actually formed independently of `program`, only whether the
+ *  caller SAID so via `opts.intentSourceLabel`. `'server-echo'` CAPS `verdict` at
  *  `INTENT_UNCHECKED` even when every intent field matches — see `deriveVerdict`'s doc: a
  *  self-disclosed tautology (the same request that produced `program` also produced `expect`) must
- *  never read as an independently-confirmed match. */
+ *  never read as an independently-confirmed match. `'caller'` is simply the DEFAULT when no label
+ *  is given — it is NOT evidence of independence, and treating it as such is the exact mistake the
+ *  FULL_BALANCE_SWEEP disclosure now calls out explicitly. */
 export type IntentSource = "caller" | "server-echo" | "none";
 
 /**
@@ -191,10 +200,13 @@ export interface VerifyOpts {
   /** ONLY meaningful on `verifySettleProgram` (ignored by `inspectSettleProgram`, which always
    *  reports `intentSource:'none'`). Self-disclosure that `expect` is itself derived from the SAME
    *  request/data that produced the program being checked — e.g. a server building its own
-   *  "expectation" from the parameters it just compiled with. Defaults to `'caller'` (an
-   *  independently-formed expectation). Set `'server-echo'` so a report never implies an
+   *  "expectation" from the parameters it just compiled with. Defaults to `'caller'` — that default
+   *  is a LABEL, not a claim: it does NOT mean the expectation is independently-formed, only that
+   *  no `'server-echo'` disclosure was made. Set `'server-echo'` so a report never implies an
    *  independent check ran when it did not — see `IntentSource`'s doc; `verdict` is CAPPED at
-   *  `INTENT_UNCHECKED` under this label even on a full field match (see `deriveVerdict`). */
+   *  `INTENT_UNCHECKED` under this label even on a full field match (see `deriveVerdict`). Genuine
+   *  independence (forming `declaredIntent` from your own intent, before ever seeing `program`) is
+   *  a property of YOUR process that this module cannot observe or verify under either label. */
   intentSourceLabel?: "caller" | "server-echo";
   /** ECHO-ONLY on `inspectSettleProgram` (ignored by `verifySettleProgram`, which always echoes
    *  its own required `expect` argument instead). Lets a server that has no independent
@@ -322,10 +334,15 @@ export interface SettleReportEnvelope {
    *                                 our audited template — the bytes alone cannot refute it.
    *   - `INTENT_MISMATCH`         — `intentReconciled` is `false`: every required intent
    *                                 comparison actually ran and at least one did not match.
-   *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true` AND `intentSource` is
-   *                                 `'caller'` (an independently-formed expectation): every
-   *                                 required intent comparison ran and ALL matched. The ONLY
-   *                                 verdict meaning "safe to cook against what was declared".
+   *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true` AND `intentSource` is `'caller'`:
+   *                                 every required intent comparison ran and ALL matched the
+   *                                 `declaredIntent` you passed in. This proves ONLY that
+   *                                 agreement — it is NOT proof that `declaredIntent` was formed
+   *                                 independently of `program` (this module cannot observe that;
+   *                                 see the `intentSource` doc above and the FULL_BALANCE_SWEEP
+   *                                 disclosure). It is meaningful ONLY when the caller itself
+   *                                 authored `declaredIntent`, before ever seeing `program`, from
+   *                                 the caller's own prior intent.
    *                                 `intentSource:'server-echo'` CAPS this outcome to
    *                                 `INTENT_UNCHECKED` even on a full field match — see
    *                                 `deriveVerdict`'s doc: a self-disclosed tautology (the same
@@ -393,10 +410,18 @@ const DISCLOSURES: readonly Disclosure[] = [
       "caller-chosen. A dust swap naming an unrelated token emits a program that moves that token's whole " +
       "balance to a caller-chosen recipient (cook-proven at 777e18 of a third party's parked balance). " +
       "Cooking is owner-gated, so this is not a public drain — it bites an operator whose relayer cooks " +
-      "/swap output it did not originate. A passing body.hash check does NOT make this safe; only a " +
-      "`verdict:'MATCHES_DECLARED_INTENT'` from an independently-formed (`intentSource:'caller'`) " +
-      "expectation does — reconciling the token list and recipient against your own intent before " +
-      "cooking is your responsibility, not this validator's. See `sweepScope` for the machine-readable form.",
+      "/swap output it did not originate. A passing body.hash check does NOT make this safe, and " +
+      "neither does `verdict:'MATCHES_DECLARED_INTENT'` by itself: that verdict proves ONLY that the " +
+      "decoded recipient, tokens and floor token equal the values you passed as `declaredIntent` — " +
+      "nothing about who formed `declaredIntent`, or when. It is meaningful ONLY if YOU authored " +
+      "`declaredIntent`, in your own process, from your own intent, BEFORE you ever saw this program. " +
+      "`intentSource` is a caller-supplied DISCLOSURE of how `declaredIntent` claims to have been " +
+      "formed — it is NOT something this module verifies or can verify. Independence is a property of " +
+      "your own process, invisible to this library, and `intentSource:'caller'` is simply the DEFAULT " +
+      "value, trivially true of any expectation regardless of who or what built it. Treat " +
+      "`intentSource` as non-load-bearing metadata, never as proof of independence. Reconciling the " +
+      "token list and recipient against your own pre-formed intent before cooking is your " +
+      "responsibility, not this validator's. See `sweepScope` for the machine-readable form.",
   },
   {
     id: "FLOOR_IS_LEVEL_NOT_DELTA",

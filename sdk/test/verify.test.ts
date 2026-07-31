@@ -1,6 +1,7 @@
 import {
   decodeSettleProgram,
   encodeSettleProgram,
+  parseSettleProgram,
   SettleDecodeError,
   SETTLE_VECTORS,
   SETTLE_TEMPLATES,
@@ -844,6 +845,119 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
         expect(ranByInspect).toBe(cases.length);
         expect(ranByVerify).toBe(cases.length);
         expect(ranByInspect).toBe(ranByVerify);
+      });
+    });
+  });
+
+  // PR-41 review — the two blockers the trust-model-inversion PR was rejected on. Both are
+  // documentation/data fixes on top of an already-shipped mechanical fix (the server-echo verdict
+  // cap, `deriveVerdict`, and the caller-supplied-table deletion, both covered above) — see each
+  // describe block's header for the exact false claim / unfrozen state each closes.
+  describe('PR-41 BLOCKER FIXES', () => {
+    const bv1 = SETTLE_VECTORS[0]!;
+    const VICTIM = bv1.tokens[0]!;
+    const ATTACKER = '0x00000000000000000000000000000000DeaDBeef' as Hex;
+    const genuineBody = ('0x' + Buffer.from(parseSettleProgram(bv1.program).body!).toString('hex')) as Hex;
+
+    // BLOCKER 1 — the FULL_BALANCE_SWEEP disclosure used to name `verdict:'MATCHES_DECLARED_INTENT'`
+    // from an "independently-formed (`intentSource:'caller'`)" expectation as the only safe read of
+    // a full-balance sweep. MEASURED false: `intentSource:'caller'` is the DEFAULT — trivially true
+    // of an attacker-authored `expect` checked against an attacker-authored `program` — and
+    // independence is a property of the CALLER's own process, invisible to this library. A
+    // consumer gating on the sentence's own stated criterion greened a cook-proven drain.
+    describe('BLOCKER 1 — intentSource:"caller" is no longer offered as evidence of independence', () => {
+      // PINNED VERBATIM. If this ever silently reverts to the old sentence (the exact failure mode
+      // that let the false claim survive an entire PR cycle unnoticed), this test goes RED.
+      const EXPECTED_FULL_BALANCE_SWEEP_TEXT =
+        "The settle half moves the Pot's FULL current balance of every listed token, and the token list is " +
+        "caller-chosen. A dust swap naming an unrelated token emits a program that moves that token's whole " +
+        "balance to a caller-chosen recipient (cook-proven at 777e18 of a third party's parked balance). " +
+        "Cooking is owner-gated, so this is not a public drain — it bites an operator whose relayer cooks " +
+        "/swap output it did not originate. A passing body.hash check does NOT make this safe, and " +
+        "neither does `verdict:'MATCHES_DECLARED_INTENT'` by itself: that verdict proves ONLY that the " +
+        "decoded recipient, tokens and floor token equal the values you passed as `declaredIntent` — " +
+        "nothing about who formed `declaredIntent`, or when. It is meaningful ONLY if YOU authored " +
+        "`declaredIntent`, in your own process, from your own intent, BEFORE you ever saw this program. " +
+        "`intentSource` is a caller-supplied DISCLOSURE of how `declaredIntent` claims to have been " +
+        "formed — it is NOT something this module verifies or can verify. Independence is a property of " +
+        "your own process, invisible to this library, and `intentSource:'caller'` is simply the DEFAULT " +
+        "value, trivially true of any expectation regardless of who or what built it. Treat " +
+        "`intentSource` as non-load-bearing metadata, never as proof of independence. Reconciling the " +
+        "token list and recipient against your own pre-formed intent before cooking is your " +
+        "responsibility, not this validator's. See `sweepScope` for the machine-readable form.";
+
+      it('FULL_BALANCE_SWEEP.text is pinned to the exact rewritten sentence', () => {
+        const disc = inspectSettleProgram(bv1.program).disclosures.find((d) => d.id === 'FULL_BALANCE_SWEEP')!;
+        expect(disc.text).toBe(EXPECTED_FULL_BALANCE_SWEEP_TEXT);
+      });
+
+      it('the sentence never again cites intentSource:"caller" as proof of independence, and explicitly says intentSource is non-load-bearing', () => {
+        const disc = inspectSettleProgram(bv1.program).disclosures.find((d) => d.id === 'FULL_BALANCE_SWEEP')!;
+        expect(disc.text).not.toMatch(/independently-formed \(`intentSource:'caller'`\)/);
+        expect(disc.text.toLowerCase()).toContain('non-load-bearing');
+        expect(disc.text).toContain('BEFORE you ever saw this program');
+      });
+
+      it('re-runs the exact falsification: a GENUINE drain (pinned body verbatim) still reports authentic:true / MATCHES_DECLARED_INTENT / intentSource:"caller" under the default label — that is UNCHANGED (independence genuinely cannot be verified by this module) — but the disclosure this same report carries no longer claims that pair is what makes it safe', () => {
+        const drain = encodeSettleProgram([VICTIM], 0n, ATTACKER, genuineBody);
+        const selfEchoExpect: SettleExpectation = { recipient: ATTACKER, tokens: [VICTIM], minOut: 0n, floorToken: VICTIM };
+        const r = verifySettleProgram(drain, selfEchoExpect);
+        expect(r.authentic).toBe(true);
+        expect(r.verdict).toBe('MATCHES_DECLARED_INTENT');
+        expect(r.intentSource).toBe('caller');
+        const disc = inspectSettleProgram(drain).disclosures.find((d) => d.id === 'FULL_BALANCE_SWEEP')!;
+        expect(disc.text).toBe(EXPECTED_FULL_BALANCE_SWEEP_TEXT);
+        expect(disc.text).not.toMatch(/independently-formed \(`intentSource:'caller'`\)/);
+      });
+    });
+
+    // BLOCKER 2 — SETTLE_TEMPLATES is the SOLE authenticity root (`report.ts`'s `authenticateBody`
+    // always calls with this exact constant) and is re-exported from the PUBLIC `./verify` barrel.
+    // A `readonly`-TYPED array is a compile-time-only annotation; MEASURED
+    // `Object.isFrozen(SETTLE_TEMPLATES) === false` pre-fix meant `SETTLE_TEMPLATES.push({id:"pwn",
+    // status:"current", bodyHash:<forgedHash>, ...})` silently succeeded and a subsequent
+    // `verifySettleProgram` call authenticated the forgery — the same class of escape as
+    // monkeypatching the function, closed here with a runtime `Object.freeze` on the array AND
+    // every entry.
+    describe('BLOCKER 2 — SETTLE_TEMPLATES is runtime-FROZEN, not merely readonly-typed', () => {
+      it('the array itself is frozen', () => {
+        expect(Object.isFrozen(SETTLE_TEMPLATES)).toBe(true);
+      });
+
+      it('every entry in the array is frozen', () => {
+        expect(SETTLE_TEMPLATES.length).toBeGreaterThan(0);
+        for (const entry of SETTLE_TEMPLATES) {
+          expect(Object.isFrozen(entry)).toBe(true);
+        }
+      });
+
+      it('CURRENT_SETTLE_TEMPLATE (found via .find over the same frozen array) is frozen too', () => {
+        expect(Object.isFrozen(CURRENT_SETTLE_TEMPLATE)).toBe(true);
+      });
+
+      it('REGRESSION PIN: pushing a forged entry does not silently succeed — the table is unchanged either way (throws in strict-mode ESM, no-ops otherwise; this asserts the STATE invariant that holds under both)', () => {
+        const lengthBefore = SETTLE_TEMPLATES.length;
+        const forgedHash = ('0x' + 'ab'.repeat(32)) as Hex;
+        const forgedEntry = { id: 'pwn', version: 'x', bodyHash: forgedHash, bodySize: 165, compilerSha: 'x', status: 'current' as const, since: '2026', notes: 'forged' };
+        try {
+          (SETTLE_TEMPLATES as unknown as Array<typeof forgedEntry>).push(forgedEntry);
+        } catch {
+          // strict-mode ESM throws on a frozen-array mutation — expected, not a test failure.
+        }
+        expect(SETTLE_TEMPLATES.length).toBe(lengthBefore);
+        expect(SETTLE_TEMPLATES.some((t) => t.id === 'pwn')).toBe(false);
+        expect(CURRENT_SETTLE_TEMPLATE.id).toBe('ecoswap-settle');
+      });
+
+      it('REGRESSION PIN: mutating an existing entry in place does not silently succeed', () => {
+        const before = CURRENT_SETTLE_TEMPLATE.bodyHash;
+        try {
+          (CURRENT_SETTLE_TEMPLATE as unknown as { bodyHash: string }).bodyHash = ('0x' + 'ab'.repeat(32));
+        } catch {
+          // strict-mode ESM throws on a frozen-object mutation — expected, not a test failure.
+        }
+        expect(CURRENT_SETTLE_TEMPLATE.bodyHash).toBe(before);
+        expect(SETTLE_TEMPLATES.find((t) => t.id === 'ecoswap-settle' && t.status === 'current')!.bodyHash).toBe(before);
       });
     });
   });

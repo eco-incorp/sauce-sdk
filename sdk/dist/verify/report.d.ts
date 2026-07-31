@@ -67,10 +67,15 @@ export interface Disclosure {
  *  genuinely recompiles its own output should use instead — a CROSS-CHECK that can only ever
  *  narrow `authentic` toward `false`, never establish it. */
 export type HashSource = "pinned" | "none";
-/** WHO authored `declaredIntent` — see this module's header doc. `'server-echo'` CAPS `verdict` at
+/** WHAT THE CALLER DISCLOSED about how `declaredIntent` was formed — see this module's header
+ *  doc. This is a caller-supplied LABEL, not a verified fact: this module has no way to observe
+ *  whether `declaredIntent` was actually formed independently of `program`, only whether the
+ *  caller SAID so via `opts.intentSourceLabel`. `'server-echo'` CAPS `verdict` at
  *  `INTENT_UNCHECKED` even when every intent field matches — see `deriveVerdict`'s doc: a
  *  self-disclosed tautology (the same request that produced `program` also produced `expect`) must
- *  never read as an independently-confirmed match. */
+ *  never read as an independently-confirmed match. `'caller'` is simply the DEFAULT when no label
+ *  is given — it is NOT evidence of independence, and treating it as such is the exact mistake the
+ *  FULL_BALANCE_SWEEP disclosure now calls out explicitly. */
 export type IntentSource = "caller" | "server-echo" | "none";
 /**
  * The single machine-gateable field. See `SettleReportEnvelope.verdict`'s doc for the full
@@ -118,10 +123,13 @@ export interface VerifyOpts {
     /** ONLY meaningful on `verifySettleProgram` (ignored by `inspectSettleProgram`, which always
      *  reports `intentSource:'none'`). Self-disclosure that `expect` is itself derived from the SAME
      *  request/data that produced the program being checked — e.g. a server building its own
-     *  "expectation" from the parameters it just compiled with. Defaults to `'caller'` (an
-     *  independently-formed expectation). Set `'server-echo'` so a report never implies an
+     *  "expectation" from the parameters it just compiled with. Defaults to `'caller'` — that default
+     *  is a LABEL, not a claim: it does NOT mean the expectation is independently-formed, only that
+     *  no `'server-echo'` disclosure was made. Set `'server-echo'` so a report never implies an
      *  independent check ran when it did not — see `IntentSource`'s doc; `verdict` is CAPPED at
-     *  `INTENT_UNCHECKED` under this label even on a full field match (see `deriveVerdict`). */
+     *  `INTENT_UNCHECKED` under this label even on a full field match (see `deriveVerdict`). Genuine
+     *  independence (forming `declaredIntent` from your own intent, before ever seeing `program`) is
+     *  a property of YOUR process that this module cannot observe or verify under either label. */
     intentSourceLabel?: "caller" | "server-echo";
     /** ECHO-ONLY on `inspectSettleProgram` (ignored by `verifySettleProgram`, which always echoes
      *  its own required `expect` argument instead). Lets a server that has no independent
@@ -243,10 +251,15 @@ export interface SettleReportEnvelope {
      *                                 our audited template — the bytes alone cannot refute it.
      *   - `INTENT_MISMATCH`         — `intentReconciled` is `false`: every required intent
      *                                 comparison actually ran and at least one did not match.
-     *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true` AND `intentSource` is
-     *                                 `'caller'` (an independently-formed expectation): every
-     *                                 required intent comparison ran and ALL matched. The ONLY
-     *                                 verdict meaning "safe to cook against what was declared".
+     *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true` AND `intentSource` is `'caller'`:
+     *                                 every required intent comparison ran and ALL matched the
+     *                                 `declaredIntent` you passed in. This proves ONLY that
+     *                                 agreement — it is NOT proof that `declaredIntent` was formed
+     *                                 independently of `program` (this module cannot observe that;
+     *                                 see the `intentSource` doc above and the FULL_BALANCE_SWEEP
+     *                                 disclosure). It is meaningful ONLY when the caller itself
+     *                                 authored `declaredIntent`, before ever seeing `program`, from
+     *                                 the caller's own prior intent.
      *                                 `intentSource:'server-echo'` CAPS this outcome to
      *                                 `INTENT_UNCHECKED` even on a full field match — see
      *                                 `deriveVerdict`'s doc: a self-disclosed tautology (the same
