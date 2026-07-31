@@ -431,6 +431,154 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
     });
   });
 
+  describe('B1 — the "rederived" hashSourceLabel must not restore the self-referential authenticity tautology', () => {
+    const v1 = SETTLE_VECTORS[0]!;
+    const goodBody = decodeSettleProgram(v1.program).body;
+    const bodyHexChars = 165 * 2;
+    const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
+    const forgedBodyHex = '00' + goodBody.slice(4); // flip one byte — matches no table entry
+    const forged = (prologueHex + forgedBodyHex) as Hex;
+    const forgedHash = decodeSettleProgram(forged).bodyHash;
+
+    it('ROUTE 1 — expectedBodyHash: keccak256(forgedBody), hashSourceLabel: "rederived" must NOT authenticate arbitrary bytes just because the caller labels their self-referential hash "rederived"', () => {
+      const ATTACKER = '0x000000000000000000000000000000000000dEaD' as Hex;
+      const VICTIM = v1.tokens[0]!;
+      const r = verifySettleProgram(forged, { recipient: ATTACKER, tokens: [VICTIM] }, { expectedBodyHash: forgedHash, hashSourceLabel: 'rederived' });
+      expect(r.hashSource).toBe('rederived');
+      // The exploit: this must NOT read authentic:true / verdict:MATCHES_DECLARED_INTENT — a
+      // caller who controls both the forged bytes AND the hash checked against them can trivially
+      // satisfy hashMatchesClaim regardless of the label attached to it.
+      expect(r.authentic).toBe(false);
+      expect(r.templateId).toBeNull();
+      expect(r.checks.find((c) => c.id === 'body.hash')!.status).toBe('fail');
+      expect(r.verdict).not.toBe('MATCHES_DECLARED_INTENT');
+      expect(r.verdict).toBe('NOT_OUR_TEMPLATE');
+      // sweepScope/effects must be empty — no behavioral claim about an unauthenticated program.
+      expect(r.sweepScope.tokens.length).toBe(0);
+      expect(r.effects.length).toBe(0);
+    });
+
+    it('a GENUINE "rederived" pin (the recipes package\'s real reportOwnSettleProgram use case — a hash independently recompiled from the audited template) still authenticates — this fix must not regress the legitimate case', () => {
+      const r = inspectSettleProgram(v1.program, { expectedBodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash, hashSourceLabel: 'rederived' });
+      expect(r.hashSource).toBe('rederived');
+      expect(r.authentic).toBe(true);
+      expect(r.templateId).not.toBeNull();
+      expect(r.checks.find((c) => c.id === 'body.hash')!.status).toBe('pass');
+    });
+
+    it('ROUTE 2 — a caller-controlled opts.templates override does not, by itself, let templateId!==null be mistaken for a security gate; hashSource still names it "caller"', () => {
+      // Demonstrates why "assert templateId !== null" would be the WRONG mitigation: a caller who
+      // controls their own templates table can make an arbitrary forged body match a "current"
+      // entry trivially. hashSource:'caller' is the honest signal here, not templateId.
+      const forgedTable = [{ id: 'ecoswap-settle', version: 'forged', bodyHash: forgedHash, bodySize: 165, compilerSha: 'forged', status: 'current' as const, since: '2026', notes: 'forged' }];
+      const r = inspectSettleProgram(forged, { templates: forgedTable });
+      expect(r.templateId).not.toBeNull();
+      expect(r.hashSource).toBe('caller');
+      // authentic:true here is the DOCUMENTED consequence of a caller overriding their OWN trust
+      // root (see VerifyOpts.templates) — not the tautology this fix closes. A consumer that wants
+      // ONLY the SDK's own pinned root must additionally check hashSource==='pinned'.
+      expect(r.authentic).toBe(true);
+    });
+  });
+
+  describe('B2 — every gateable field must be false-or-null whenever verdict is not affirmative (the "ok" defect recurring one field over)', () => {
+    const v1 = SETTLE_VECTORS[0]!;
+    const goodBody = decodeSettleProgram(v1.program).body;
+
+    function nonAffirmativeCases(): Array<{ label: string; report: ReturnType<typeof verifySettleProgram> | ReturnType<typeof inspectSettleProgram>; expectVerdict: string }> {
+      // MALFORMED: body truncated to 100 bytes (not 165) — prologue (tokens/minOut/recipient)
+      // still decodes cleanly and matches the expectation below, so an intent computation that
+      // is not gated by verdict would read intentReconciled:true even though structurallyValid
+      // is false.
+      const shortBody = ('0x' + 'ab'.repeat(100)) as Hex;
+      const malformedProgram = encodeSettleProgram(v1.tokens, v1.minOut, v1.recipient, shortBody);
+      const malformed = verifySettleProgram(malformedProgram, { recipient: v1.recipient, tokens: v1.tokens });
+
+      // NOT_OUR_TEMPLATE: a forged (but 165-byte, structurally valid) body — same prologue as v1,
+      // so the SAME expectation would again spuriously "match" if computed independently of
+      // authenticity.
+      const bodyHexChars = 165 * 2;
+      const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
+      const forgedBodyHex = '00' + goodBody.slice(4);
+      const forgedProgram = (prologueHex + forgedBodyHex) as Hex;
+      const notOurTemplate = verifySettleProgram(forgedProgram, { recipient: v1.recipient, tokens: v1.tokens });
+
+      const intentMismatch = verifySettleProgram(v1.program, { recipient: '0x000000000000000000000000000000000000dEaD' as Hex, tokens: v1.tokens });
+      const intentUnchecked = inspectSettleProgram(v1.program);
+
+      return [
+        { label: 'MALFORMED', report: malformed, expectVerdict: 'MALFORMED' },
+        { label: 'NOT_OUR_TEMPLATE', report: notOurTemplate, expectVerdict: 'NOT_OUR_TEMPLATE' },
+        { label: 'INTENT_MISMATCH', report: intentMismatch, expectVerdict: 'INTENT_MISMATCH' },
+        { label: 'INTENT_UNCHECKED', report: intentUnchecked, expectVerdict: 'INTENT_UNCHECKED' },
+      ];
+    }
+
+    it('sets up each of the four non-affirmative verdicts correctly (fixture sanity)', () => {
+      for (const { report, expectVerdict } of nonAffirmativeCases()) {
+        expect(report.verdict).toBe(expectVerdict);
+      }
+    });
+
+    it('intentReconciled is NEVER true for any non-affirmative verdict, even when the underlying intent checks would independently "match"', () => {
+      for (const { label, report } of nonAffirmativeCases()) {
+        expect(report.intentReconciled === true ? label : report.intentReconciled).not.toBe(label);
+      }
+    });
+
+    // Enumerated invariant: every gateable field's value must be EXACTLY what its own verdict
+    // permits — never merely "not obviously wrong". This is written so a NEW field added to the
+    // envelope in the future that fails to consult `verdict` is caught by extending the ONE
+    // per-verdict expectation table below, not by writing a new ad-hoc test.
+    const EXPECTED_BY_VERDICT: Record<string, { structurallyValid: boolean; authentic: boolean | null; intentReconciled: boolean | null }> = {
+      MALFORMED: { structurallyValid: false, authentic: null /* not constrained by verdict */, intentReconciled: null },
+      NOT_OUR_TEMPLATE: { structurallyValid: true, authentic: false, intentReconciled: null },
+      INTENT_MISMATCH: { structurallyValid: true, authentic: true, intentReconciled: false },
+      INTENT_UNCHECKED: { structurallyValid: true, authentic: true, intentReconciled: null },
+    };
+
+    it('enumerated per-field invariant over every gateable boolean/nullable field, across all four non-affirmative verdicts', () => {
+      for (const { label, report } of nonAffirmativeCases()) {
+        const expected = EXPECTED_BY_VERDICT[label]!;
+        expect(report.structurallyValid).toBe(expected.structurallyValid);
+        if (expected.authentic !== null) expect(report.authentic).toBe(expected.authentic);
+        expect(report.intentReconciled).toBe(expected.intentReconciled);
+        // effects[]/sweepScope stay empty whenever the program is not both structurally valid AND
+        // authentic — the ONE place a behavioral claim is allowed to render regardless of intent.
+        if (!(report.structurallyValid && report.authentic)) {
+          expect(report.effects.length).toBe(0);
+          expect(report.sweepScope.tokens.length).toBe(0);
+        }
+      }
+    });
+  });
+
+  describe('B3 — never-throws must hold on CONTAINER ELEMENTS, not just the container array', () => {
+    const v1 = SETTLE_VECTORS[0]!;
+    const garbageElements = [null, undefined, {}, { bodyHash: 1 }, { bodyHash: null }] as unknown as Array<{ bodyHash: string }>;
+
+    it('inspectSettleProgram(program, {templates:[<garbage>]}) never throws, for every garbage element shape', () => {
+      for (const el of garbageElements) {
+        expect(() => inspectSettleProgram(v1.program, { templates: [el] as unknown as never })).not.toThrow();
+        const r = inspectSettleProgram(v1.program, { templates: [el] as unknown as never });
+        // A templates table with no real entry can never authenticate.
+        expect(r.authentic).toBe(false);
+      }
+    });
+
+    it('formatSettleReport(null) never throws', () => {
+      expect(() => formatSettleReport(null as unknown as ReturnType<typeof inspectSettleProgram>)).not.toThrow();
+    });
+
+    it('formatSettleReport({}) never throws', () => {
+      expect(() => formatSettleReport({} as unknown as ReturnType<typeof inspectSettleProgram>)).not.toThrow();
+    });
+
+    it('formatSettleReport(undefined) never throws', () => {
+      expect(() => formatSettleReport(undefined as unknown as ReturnType<typeof inspectSettleProgram>)).not.toThrow();
+    });
+  });
+
   describe('closure', () => {
     it('SETTLE_WIRE exposes the wire constants a foreign implementer needs', () => {
       expect(SETTLE_WIRE.TUPLE_OP).toBe(0x94);
