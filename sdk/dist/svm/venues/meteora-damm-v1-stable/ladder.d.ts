@@ -16,13 +16,16 @@ export declare const meteoraDammV1StableLadder: {
     emitQuoteCall: undefined;
     /**
      * Ladder rung at cumulative grid point x: skips all computation once
-     * `s<slot>cap` has latched (a prior rung's candidate already reached the
-     * idle float — permanent and monotonic, so every later rung would only
-     * re-confirm the same breach); otherwise runs the fee/vault/Newton chain
-     * and either latches cap (candidate >= idle) or records the new
-     * (lo, lx) = (output, cumulative input) checkpoint. Reports the CURRENT
-     * checkpoint every rung — 0 dOut/dIn once frozen, exactly the
-     * window-walking convention (types.ts's capacityInputVar doc).
+     * `s<slot>cap` has latched (a prior rung's own grid point already exceeded
+     * the analytic clamp `s<slot>xc` — permanent, since rungs are
+     * non-decreasing cumulative inputs, so nothing later can ever be
+     * smaller); otherwise clamps this rung's input to `min(x, xc)` (latching
+     * `cap` if the clamp bound) and runs the WARM fee/vault/Newton chain,
+     * which records the new (lo, lx) = (output, cumulative input) checkpoint
+     * whenever the forward-evaluated candidate genuinely clears the idle
+     * float. Reports the CURRENT checkpoint every rung — 0 dOut/dIn once
+     * frozen, exactly the window-walking convention (types.ts's
+     * capacityInputVar doc).
      */
     emitLadderQuote(_base: PoolConfig, slot: number, rung: number, x: string, outVar: string): string;
     capacityInputVar(slot: number): string;
@@ -31,15 +34,25 @@ export declare const meteoraDammV1StableLadder: {
     /**
      * Shared fee/vault/Newton computation up to the post-vault-withdraw
      * candidate `<v>ov`; `warm` threads the shared `s<slot>wy` cursor
-     * (mutated in place) and TAILS into the capacity FREEZE (latch cap,
-     * or record the new checkpoint); cold declares a fresh `y` const and
-     * TAILS into the raw idle-float COLLAPSE, assigning `coldOutVar`.
+     * (mutated in place) and TAILS into a residual never-over-quote guard
+     * (the caller already clamped `x` to the analytic capacity, so `<v>ov` is
+     * PROVEN to clear the idle float — this guard only ever fails to fire,
+     * see this file's module doc); cold declares a fresh `y` const and TAILS
+     * into the raw idle-float COLLAPSE, assigning `coldOutVar` (the declared,
+     * merge-unreachable, latent gap this family shares with
+     * orca-whirlpool/raydium-clmm/meteora-dlmm/solfi-v2).
      */
     emitQuoteAt(slot: number, tag: string, x: string, y0: string, warm: boolean, coldOutVar?: string): string[];
     buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
     referenceQuote(base: PoolConfig, state: AccountBytesMap, _params: readonly bigint[], now?: bigint): (x: bigint) => bigint;
     referenceLadderQuotes(base: PoolConfig, state: AccountBytesMap, _params: readonly bigint[], now?: bigint): (grid: readonly bigint[]) => bigint[];
-    /** Mirror of capacityInputVar: the cumulative PRODUCTIVE input at each ordered grid point — frozen at the last checkpoint below the idle float once the cap latches. Lockstep with referenceLadderQuotes (same walk, same latch condition). */
+    /**
+     * Mirror of capacityInputVar: the cumulative PRODUCTIVE input at each
+     * ordered grid point — clamped to the analytic capacity `xc` once a
+     * rung's own grid point would exceed it (never the raw grid point past
+     * that; see this file's module doc), frozen forever after. Lockstep with
+     * referenceLadderQuotes (same walk, same clamp).
+     */
     referenceCapacities(base: PoolConfig, state: AccountBytesMap, _params: readonly bigint[], now?: bigint): (grid: readonly bigint[]) => bigint[];
     depthReserves(base: PoolConfig, state: AccountBytesMap, now?: bigint): {
         reserveIn: bigint;

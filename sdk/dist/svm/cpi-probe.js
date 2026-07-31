@@ -14,7 +14,12 @@
  *     introspects the enclosing transaction (router-path / anti-sandwich /
  *     caller gating) ⇒ CPI-hostile (candidate P-C). A signer other than the
  *     user (a maker seat, an oracle writer) is likewise a gating candidate.
- *     `PRESENT` is a hard P-C signal; `absent` is necessary-but-not-sufficient.
+ *     NEITHER verdict is definitive — step 2 decides. `PRESENT` is a P-C
+ *     *candidate*, not a hard signal: a program can read the sysvar to price a
+ *     caller **fee tier** rather than to reject, in which case an unrecognized
+ *     caller's CPI succeeds and merely pays the worst tier (measured on ZeroFi
+ *     — see docs/svm-venues.md). `absent` is likewise
+ *     necessary-but-not-sufficient.
  *
  *  2. UNRECOGNIZED-CALLER SIMULATION (the definitive test): build the venue
  *     swap ix from an address the venue has never seen (wrapped in a non-router
