@@ -70,3 +70,5 @@ export * from './quantum/index.js';
 export * from './quantum/ladder.js';
 export * from './solfi-v2/index.js';
 export * from './solfi-v2/ladder.js';
+export * from './perps-jlp/index.js';
+export * from './perps-jlp/ladder.js';
