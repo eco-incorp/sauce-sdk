@@ -31,22 +31,46 @@ export function isqrt(value) {
     return x;
 }
 /**
- * The COLD (final, venue-exact) oracle-anchored quote: the shifted-CP output
- * for gross input x, or 0 PAST CAPACITY (output would exceed reserveOut — the
- * venue's "Insufficient active" revert; a 0 final quote skips the CPI). This
- * is the predicted output the minOut check and the real swap see. `kq` is the
- * quote bigK (0 ⇒ deactivated: out-of-band oracle / underflow).
+ * Closed-form capacity: the largest gross input C for which `gg(x) = cOut −
+ * floor(kq/(cIn+x))` stays `<= rOut` (see the file header derivation).
+ * `cOut <= rOut` can never bind (gg is always `<= cOut <= rOut`) — U64_MAX,
+ * the uncapped sentinel. Clamped to 0 (never negative) if the live state is
+ * already past capacity at x=0.
  */
-export function obricColdQuote(x, cIn, cOut, kq, rOut, fee) {
+export function obricCapacity(cIn, cOut, kq, rOut) {
+    if (kq === 0n || cOut <= rOut)
+        return U64_MAX;
+    const target = cOut - rOut;
+    const c = kq / target - cIn;
+    return c < 0n ? 0n : c;
+}
+/**
+ * The COLD (final, venue-exact) oracle-anchored quote: the shifted-CP output
+ * for gross input x, SATURATING (not collapsing) once x pushes past the live
+ * output vault's capacity (see the file header — the capacity clamp is
+ * applied by the caller via obricCapacity; this is the raw, unclamped curve).
+ * `kq` is the quote bigK (0 ⇒ deactivated: out-of-band oracle / underflow).
+ */
+export function obricRawQuote(x, cIn, cOut, kq, fee) {
     if (x === 0n || kq === 0n)
         return 0n;
     const nOut = kq / (cIn + x);
     let g = 0n;
     if (nOut < cOut)
         g = cOut - nOut;
-    if (g > rOut)
-        return 0n; // past capacity — skip the CPI
     return g - (g * fee) / FEE_DEN;
+}
+/**
+ * The COLD (final, venue-exact) oracle-anchored quote, capacity-clamped:
+ * `obricRawQuote(min(x, C))`. This is the predicted output the minOut check
+ * and the real swap see. `kq` is the quote bigK (0 ⇒ deactivated: out-of-band
+ * oracle / underflow).
+ */
+export function obricColdQuote(x, cIn, cOut, kq, rOut, fee) {
+    if (kq === 0n)
+        return 0n;
+    const cap = obricCapacity(cIn, cOut, kq, rOut);
+    return obricRawQuote(x > cap ? cap : x, cIn, cOut, kq, fee);
 }
 /** The reference twin of emitSetup: derive the live curve anchor from account bytes + params. */
 function liveCurve(cfg, state, params) {
@@ -164,9 +188,13 @@ export const obricV2Ladder = {
             `  const ${p}fe = ${fee};`,
             // Curve anchor + sanity band (EXPENSIVE — isqrt/products gated on enable).
             `  let ${p}ci = 0; let ${p}co = 0; let ${p}kq = 0; let ${p}ro = 0;`,
-            // Ladder-chain state (last-good output + capped flag) and quote temps —
-            // declared here, reassigned per rung (one enable-gated ladder block).
-            `  let ${p}lo = 0; let ${p}cap = 0; let ${p}ni = 0; let ${p}no = 0; let ${p}gg = 0;`,
+            // Capacity clamp (closed form, see the file header) + ladder quote
+            // temps — declared here, reassigned per rung (one enable-gated block).
+            // icap defaults to the uncapped sentinel (U64_MAX): a disabled/deactivated
+            // slot's clamp is a no-op (cx is min(x, U64_MAX) === x), and cx > 0 &&
+            // kq !== 0 still gates the quote to 0.
+            `  let ${p}icap = ${U64_MAX};`,
+            `  let ${p}cx = 0; let ${p}ni = 0; let ${p}no = 0; let ${p}gg = 0;`,
             `  if (${en} !== 0) {`,
             `    let ${p}ok = 1;`,
             `    if (${p}mx === 0) { ${p}ok = 0 }`,
@@ -186,45 +214,58 @@ export const obricV2Ladder = {
             `        const ${p}cx = ${p}tk - ${targetX} + ${p}rx;`,
             `        const ${p}cy = ${p}bk / ${p}cx;`,
             `        ${assign}`,
+            // Closed form: gg(x)=co−floor(kq/(ci+x)); co<=ro never binds (uncapped);
+            // else target=co−ro>0 and gg(x)<=ro ⟺ ci+x <= floor(kq/target).
+            `        if (${p}co > ${p}ro) {`,
+            `          const ${p}tgt = ${p}co - ${p}ro;`,
+            `          ${p}icap = ${p}kq / ${p}tgt - ${p}ci;`,
+            `          if (${p}icap < 0) { ${p}icap = 0 }`,
+            `        }`,
             `      }`,
             `    }`,
             `  }`,
         ].join('\n');
     },
+    capacityInputVar(slot) {
+        return `s${slot}cx`;
+    },
     /**
-     * Ladder rung at cumulative grid point `x`: the shifted-CP output, reported
-     * as the LAST-GOOD value once the walk passes capacity (g > reserveOut) — so
-     * a capped rung's dOut is 0 and the merge never over-fills obric past what
-     * the venue can pay. Monotone nondecreasing; quote(0)=0. Mirrored by
-     * referenceLadderQuotes.
+     * Ladder rung at cumulative grid point `x`: `qRaw(min(x, C))` — SATURATING,
+     * never collapsing past the live output vault's capacity (see the file
+     * header). Stateless (every rung is an independent closed-form evaluation,
+     * byte-identical to the cold quote at that grid point) — `rung` is unused.
+     * Monotone nondecreasing; quote(0)=0. Mirrored by referenceLadderQuotes.
      */
     emitLadderQuote(base, slot, _rung, x, outVar) {
         obricConfig(base);
         const p = `s${slot}`;
         return [
-            `    if (${p}cap === 0 && ${x} > 0 && ${p}kq !== 0) {`,
-            `      ${p}ni = ${p}ci + ${x};`,
+            `    ${p}cx = ${x};`,
+            `    if (${p}cx > ${p}icap) { ${p}cx = ${p}icap }`,
+            `    let ${outVar} = 0;`,
+            `    if (${p}cx > 0 && ${p}kq !== 0) {`,
+            `      ${p}ni = ${p}ci + ${p}cx;`,
             `      ${p}no = ${p}kq / ${p}ni;`,
             `      ${p}gg = 0;`,
             `      if (${p}no < ${p}co) { ${p}gg = ${p}co - ${p}no }`,
-            `      if (${p}gg > ${p}ro) { ${p}cap = 1 }`,
-            `      else { ${p}lo = ${p}gg - (${p}gg * ${p}fe) / ${FEE_DEN} }`,
+            `      ${outVar} = ${p}gg - (${p}gg * ${p}fe) / ${FEE_DEN};`,
             `    }`,
-            `    const ${outVar} = ${p}lo;`,
         ].join('\n');
     },
-    /** Cold final quote at the elected slice: g(fill)−fee, or 0 past capacity (skip the CPI). */
+    /** Cold final quote — same capacity clamp, fresh locals (no rung state to reuse). */
     emitFinalQuote(base, slot, x, outVar) {
         obricConfig(base);
         const p = `s${slot}`;
         return [
+            `  let ${p}fcx = ${x};`,
+            `  if (${p}fcx > ${p}icap) { ${p}fcx = ${p}icap }`,
             `  let ${outVar} = 0;`,
-            `  if (${x} > 0 && ${p}kq !== 0) {`,
-            `    ${p}ni = ${p}ci + ${x};`,
-            `    ${p}no = ${p}kq / ${p}ni;`,
-            `    ${p}gg = 0;`,
-            `    if (${p}no < ${p}co) { ${p}gg = ${p}co - ${p}no }`,
-            `    if (${p}gg <= ${p}ro) { ${outVar} = ${p}gg - (${p}gg * ${p}fe) / ${FEE_DEN} }`,
+            `  if (${p}fcx > 0 && ${p}kq !== 0) {`,
+            `    const ${p}fni = ${p}ci + ${p}fcx;`,
+            `    const ${p}fno = ${p}kq / ${p}fni;`,
+            `    let ${p}fgg = 0;`,
+            `    if (${p}fno < ${p}co) { ${p}fgg = ${p}co - ${p}fno }`,
+            `    ${outVar} = ${p}fgg - (${p}fgg * ${p}fe) / ${FEE_DEN};`,
             `  }`,
         ].join('\n');
     },
@@ -247,27 +288,23 @@ export const obricV2Ladder = {
         const { cIn, cOut, kq, rOut, fee } = liveCurve(cfg, state, params);
         return (x) => obricColdQuote(x, cIn, cOut, kq, rOut, fee);
     },
-    /** The LAST-GOOD ladder chain — mirrors emitLadderQuote (monotone, flat past capacity). */
+    /** Stateless (every grid point is its own closed-form evaluation) — mirrors emitLadderQuote's `min(x, C)` clamp. */
     referenceLadderQuotes(base, state, params) {
         const cfg = obricConfig(base);
         const { cIn, cOut, kq, rOut, fee } = liveCurve(cfg, state, params);
-        return (grid) => {
-            let lo = 0n;
-            let capped = false;
-            return grid.map((x) => {
-                if (!capped && x > 0n && kq !== 0n) {
-                    const nOut = kq / (cIn + x);
-                    let g = 0n;
-                    if (nOut < cOut)
-                        g = cOut - nOut;
-                    if (g > rOut)
-                        capped = true;
-                    else
-                        lo = g - (g * fee) / FEE_DEN;
-                }
-                return lo;
-            });
-        };
+        const cap = obricCapacity(cIn, cOut, kq, rOut);
+        return (grid) => grid.map((x) => obricRawQuote(x > cap ? cap : x, cIn, cOut, kq, fee));
+    },
+    /**
+     * Cumulative productive input per ORDERED grid point — `min(g, C)`. Every
+     * rung's dIn folds to its in-band portion (flat once fully past C),
+     * mirroring `capacityInputVar` lamport-for-lamport (see the file header).
+     */
+    referenceCapacities(base, state, params) {
+        const cfg = obricConfig(base);
+        const { cIn, cOut, kq, rOut } = liveCurve(cfg, state, params);
+        const cap = obricCapacity(cIn, cOut, kq, rOut);
+        return (grid) => grid.map((g) => (g > cap ? cap : g));
     },
     /**
      * Depth = the actual VAULT balances (isqrt(reserveIn·reserveOut)). A drained

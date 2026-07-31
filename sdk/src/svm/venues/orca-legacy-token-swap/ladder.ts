@@ -10,6 +10,25 @@
  * (zero quotient / zero output), the ladder helper returns 0 — a dust rung
  * never wins the merge, and the recipe skips the CPI for a slot whose
  * predicted output is 0.
+ *
+ * MONOTONICITY (2026-07): the formula used to short-circuit to 0 whenever
+ * `floor(rin*rout / ni) === 0` — i.e. whenever the post-trade invariant
+ * reserve `ni = rin + net` grew past `rin*rout` (net input already larger
+ * than the pool's own product), which for a THIN/near-drained pool (rin as
+ * small as a handful of raw units) is reachable at ordinary, single-digit
+ * input sizes, not just astronomical ones. That early return COLLAPSED the
+ * quote back to 0 for a larger x after a smaller x had already returned a
+ * positive output — differencing that pointwise curve across a ladder rung
+ * manufactures a negative dOut (the same class of bug fixed in
+ * meteora-damm-v2/ladder.ts). The check was also UNNECESSARY: continuing to
+ * the ceil-division `no = ceil(rin*rout/ni)` is well-defined and >= 1
+ * whenever `rin*rout > 0`, so `rout - no < rout` always holds without it —
+ * the curve asymptotically approaches (never reaches) `rout` as x grows,
+ * which is the correct CP-AMM shape and requires no capacity clamp (no
+ * capacityInputVar/referenceCapacities needed — nothing ever collapses).
+ * Fixed: the early return is now only the genuine dead-pool guard
+ * (`rin === 0 || rout === 0`); the `no >= rout` check stays as a defensive
+ * no-op (unreachable once rin*rout > 0, kept for symmetry with the fragment).
  */
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
@@ -43,8 +62,12 @@ export const orcaLegacyTokenSwapLadder = {
 
   // fees.rs calculate_fee (floor, min 1 when rate and amount are nonzero) on
   // both fee legs, then the ceiling-divided constant-product curve rounding
-  // against the trader. Venue-rejected inputs (fees swallow x, zero
-  // quotient, zero output) return 0 instead of throwing.
+  // against the trader. Venue-rejected inputs (fees swallow x, a dead pool)
+  // return 0 instead of throwing. No early "would underflow" return: the
+  // ceil-division below is well-defined and monotone for any x once
+  // rin > 0 && rout > 0 (see the file header) — an early return there used
+  // to collapse the quote back to 0 past a reachable, non-astronomical x
+  // for thin pools, manufacturing a negative ladder-rung dOut.
   helpers(): { name: string; source: string }[] {
     return [
       {
@@ -52,6 +75,7 @@ export const orcaLegacyTokenSwapLadder = {
         source: [
           'function qOrca(x, rin, rout, tn, td, on, od) {',
           '  if (x === 0) { return 0 }',
+          '  if (rin === 0 || rout === 0) { return 0 }',
           '  let tf = 0;',
           '  if (tn > 0) { tf = x * tn / td; if (tf === 0) { tf = 1 } }',
           '  let of = 0;',
@@ -59,7 +83,6 @@ export const orcaLegacyTokenSwapLadder = {
           '  if (tf + of >= x) { return 0 }',
           '  const net = x - tf - of;',
           '  const ni = rin + net;',
-          '  if (rin * rout / ni === 0) { return 0 }',
           '  const no = (rin * rout + ni - 1) / ni;',
           '  if (no >= rout) { return 0 }',
           '  return rout - no;',
@@ -142,6 +165,7 @@ export const orcaLegacyTokenSwapLadder = {
 
     return (x: bigint): bigint => {
       if (x === 0n) return 0n;
+      if (rin === 0n || rout === 0n) return 0n;
       let tf = 0n;
       if (tn > 0n) {
         tf = (x * tn) / td;
@@ -155,7 +179,6 @@ export const orcaLegacyTokenSwapLadder = {
       if (tf + of >= x) return 0n;
       const net = x - tf - of;
       const ni = rin + net;
-      if ((rin * rout) / ni === 0n) return 0n;
       const no = (rin * rout + ni - 1n) / ni;
       if (no >= rout) return 0n;
       return rout - no;

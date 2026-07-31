@@ -46,6 +46,48 @@
  * agree because nothing wraps): inner (u128) * base (u64) < 2^192; 1e18 * quote
  * (u64) < 2^128; both far below 2^256. The venue's own u128 guard is mirrored
  * by the SENT check.
+ *
+ * FIXED (2026-07): quoteIn (buy base) COLLAPSED instead of saturating — the
+ * SAME class of bug fixed in meteora-damm-v2/orca-legacy-token-swap. Two
+ * distinct gaps in one branch:
+ *
+ * 1. The full-level-match arm consumed `remaining -= level.aux` without first
+ *    checking `level.aux >= SENT` — the baseIn branch always had this guard
+ *    (`if (level.aux >= SENT) break`), but quoteIn's mirrored aux (the
+ *    full-order matched-quote, precomputed DOWN in readLevels/emitOrderRead)
+ *    was consumed unconditionally. A resting order whose price*size overflows
+ *    the venue's own u128/u64 checks (an order the program itself would
+ *    reject) produced `level.aux === SENT` (2^65); with `bl >= level.size` (a
+ *    full match), `remaining -= SENT` drove `remaining` NEGATIVE.
+ *
+ * 2. The bigger gap: `bl = manifestBaseForQuote(price, remaining, false)` can
+ *    overflow to SENT for an ORDINARY (non-astronomical) `remaining` whenever
+ *    a shipped level's price is low relative to it — `bl` grows with
+ *    `remaining` at rate ~1e18/price, so a cheap level's base_limit crosses
+ *    u64::MAX at a `remaining` that is reachable well within a real ladder's
+ *    grid (the merge-measured case: dIn=-2,991,397,830 / dOut=-36,607,379,770
+ *    at amountIn=3e18, rungs=3 — a SMALLER grid point quoted normally, the
+ *    next one hit this and broke with NOTHING). The old code's response to
+ *    either overflow was `break` — return whatever `out`/`remaining` were
+ *    BEFORE this level, discarding any progress an EARLIER, smaller `x` had
+ *    already made at THIS SAME level. Differencing that across ladder rungs
+ *    manufactures a negative dOut, and `coldWalkConsumed`'s
+ *    `consumed = x - remaining` (unaffected by gap 1 alone) a negative dIn —
+ *    the merge clamps a negative dIn to `remaining`, electing the whole trade
+ *    onto a slot that delivers 0.
+ *
+ * Fixed: `manifestBaseForQuoteSafeCap`/`mfCap` derive, per level, the largest
+ * `remaining` its OWN price can convert without overflowing
+ * (`((u64::MAX+1)*inner - 1) / 1e18`). When the walk's live `remaining`
+ * exceeds it, `bl` AT that safe cap decides which of two things is going on:
+ * the level's own full-match threshold sits BELOW the cap (an ordinary full
+ * match the venue's real arithmetic also reaches — keep walking, gap 1's
+ * `aux >= SENT` guard still applies), or the level genuinely cannot fully
+ * match without overflowing — the arithmetic-safety cliff, SATURATED at the
+ * cap (a real trade this large reverts on-chain too, so no further level is
+ * reachable at a larger x) instead of collapsed to 0. Both `coldWalk`/
+ * `coldWalkConsumed` (TS mirror) and the emitted `emitWalk` quoteIn step
+ * transcribe the same three-way branch.
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
@@ -132,6 +174,20 @@ const HELPERS: { name: string; source: string }[] = [
       '}',
     ].join('\n'),
   },
+  {
+    // The largest `quote` for which mfBfq(inner, quote, 0) does NOT overflow
+    // (floor(1e18*quote/inner) <= u64::MAX): quote <= ((u64::MAX+1)*inner - 1)
+    // / 1e18. inner === 0 is uncapped (mfBfq short-circuits to 0 for any
+    // quote) — SENT doubles as the "no cap" sentinel since no real remaining
+    // exceeds it. See the quoteIn walk step below for why this exists.
+    name: 'mfCap',
+    source: [
+      'function mfCap(inner) {',
+      '  if (inner === 0) { return ' + SENT + ' }',
+      `  return ((${U64_MAX} + 1) * inner - 1) / ${PRICE_D18};`,
+      '}',
+    ].join('\n'),
+  },
 ];
 
 /** TS mirror of mfQfb (checked_quote_for_base). */
@@ -151,6 +207,12 @@ export function manifestBaseForQuote(inner: bigint, quote: bigint, roundUp: bool
   let b = d / inner;
   if (roundUp && b * inner < d) b += 1n;
   return b > U64_MAX ? SENT : b;
+}
+
+/** TS mirror of mfCap — see the HELPERS entry above for the derivation. */
+export function manifestBaseForQuoteSafeCap(inner: bigint): bigint {
+  if (inner === 0n) return SENT;
+  return ((U64_MAX + 1n) * inner - 1n) / PRICE_D18;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,14 +289,40 @@ function coldWalk(levels: readonly ManifestLevel[], baseIn: boolean, x: bigint):
       }
     } else {
       // buy base: impact_base_atoms over asks. base_limit floor; full when >= size.
-      const bl = manifestBaseForQuote(level.price, remaining, false);
-      if (bl >= SENT) break;
-      if (bl >= level.size) {
-        out += level.size;
-        remaining -= level.aux; // aux = qfb(size, DOWN) = matched_quote for a full fill
+      const cap = manifestBaseForQuoteSafeCap(level.price);
+      if (remaining > cap) {
+        // The UNCAPPED base_limit would overflow (checked_base_for_quote) at
+        // this remaining. bl AT the largest safe remaining (`cap`) decides
+        // which of two things is really going on:
+        const blAtCap = manifestBaseForQuote(level.price, cap, false); // never overflows by construction
+        if (blAtCap >= level.size) {
+          // The level fully matches well inside the safe zone (its own
+          // full-match threshold sits below `cap`) — an ORDINARY full match;
+          // the overflow at the uncapped remaining is never actually reached
+          // by the venue's own arithmetic either. Keep walking.
+          if (level.aux >= SENT) break; // defensive — unreachable once blAtCap >= size
+          out += level.size;
+          remaining -= level.aux;
+        } else {
+          // Even at the largest safe remaining this level can't fully match:
+          // the genuine arithmetic-safety cliff (a real trade this large
+          // reverts here, so no further level is reachable at a larger x
+          // either). SATURATE at `cap` instead of collapsing to 0 (the same
+          // capacity-clamp contract as meteora-damm-v2 / orca-legacy-token-swap).
+          out += blAtCap;
+          remaining -= cap;
+          break;
+        }
       } else {
-        out += bl;
-        remaining = 0n;
+        const bl = manifestBaseForQuote(level.price, remaining, false);
+        if (bl >= level.size) {
+          if (level.aux >= SENT) break; // full-order quote itself overflows — venue would reject
+          out += level.size;
+          remaining -= level.aux; // aux = qfb(size, DOWN) = matched_quote for a full fill
+        } else {
+          out += bl;
+          remaining = 0n;
+        }
       }
     }
   }
@@ -267,14 +355,29 @@ function coldWalkConsumed(levels: readonly ManifestLevel[], baseIn: boolean, x: 
         remaining = 0n;
       }
     } else {
-      const bl = manifestBaseForQuote(level.price, remaining, false);
-      if (bl >= SENT) break;
-      if (bl >= level.size) {
-        out += level.size;
-        remaining -= level.aux;
+      const cap = manifestBaseForQuoteSafeCap(level.price);
+      if (remaining > cap) {
+        // See coldWalk's mirror of this branch for the full derivation.
+        const blAtCap = manifestBaseForQuote(level.price, cap, false);
+        if (blAtCap >= level.size) {
+          if (level.aux >= SENT) break;
+          out += level.size;
+          remaining -= level.aux;
+        } else {
+          out += blAtCap;
+          remaining -= cap;
+          break;
+        }
       } else {
-        out += bl;
-        remaining = 0n;
+        const bl = manifestBaseForQuote(level.price, remaining, false);
+        if (bl >= level.size) {
+          if (level.aux >= SENT) break; // full-order quote itself overflows — venue would reject
+          out += level.size;
+          remaining -= level.aux;
+        } else {
+          out += bl;
+          remaining = 0n;
+        }
       }
     }
   }
@@ -302,10 +405,24 @@ function emitWalk(p: string, baseIn: boolean, xExpr: string, outVar: string, tag
         `${indent}    }`,
       ]
     : [
-        `${indent}    ${p}bl = mfBfq(${p}pr[${p}k], ${p}rm, 0);`,
-        `${indent}    if (${p}bl >= ${SENT}) { ${p}dn = 1 }`,
-        `${indent}    else {`,
-        `${indent}      if (${p}bl >= ${p}sz[${p}k]) { ${p}out = ${p}out + ${p}sz[${p}k]; ${p}rm = ${p}rm - ${p}au[${p}k]; ${p}k = ${p}k + 1; }`,
+        `${indent}    ${p}cap = mfCap(${p}pr[${p}k]);`,
+        `${indent}    if (${p}rm > ${p}cap) {`,
+        // bl AT the largest safe remaining decides which of two things is
+        // really going on: a level whose OWN full-match threshold sits below
+        // `cap` (an ordinary full match — the uncapped overflow is never
+        // actually reached by the venue's own arithmetic either) vs a level
+        // that genuinely cannot fully match without overflowing
+        // (checked_base_for_quote) — the arithmetic-safety cliff, saturated
+        // at `cap` instead of collapsed to 0 (the same capacity-clamp
+        // contract as meteora-damm-v2 / orca-legacy-token-swap).
+        `${indent}      ${p}bl = mfBfq(${p}pr[${p}k], ${p}cap, 0);`,
+        `${indent}      if (${p}bl >= ${p}sz[${p}k] && ${p}au[${p}k] >= ${SENT}) { ${p}dn = 1 }`,
+        `${indent}      else if (${p}bl >= ${p}sz[${p}k]) { ${p}out = ${p}out + ${p}sz[${p}k]; ${p}rm = ${p}rm - ${p}au[${p}k]; ${p}k = ${p}k + 1; }`,
+        `${indent}      else { ${p}out = ${p}out + ${p}bl; ${p}rm = ${p}rm - ${p}cap; ${p}dn = 1; }`,
+        `${indent}    } else {`,
+        `${indent}      ${p}bl = mfBfq(${p}pr[${p}k], ${p}rm, 0);`,
+        `${indent}      if (${p}bl >= ${p}sz[${p}k] && ${p}au[${p}k] >= ${SENT}) { ${p}dn = 1 }`,
+        `${indent}      else if (${p}bl >= ${p}sz[${p}k]) { ${p}out = ${p}out + ${p}sz[${p}k]; ${p}rm = ${p}rm - ${p}au[${p}k]; ${p}k = ${p}k + 1; }`,
         `${indent}      else { ${p}out = ${p}out + ${p}bl; ${p}rm = 0; }`,
         `${indent}    }`,
       ];
@@ -402,6 +519,7 @@ export const manifestLadder = {
       `  let ${p}ix = 0;`,
       // Walk cursor (shared by the rungs and the cold final quote — main scope).
       `  let ${p}rm = 0; let ${p}out = 0; let ${p}k = 0; let ${p}dn = 0; let ${p}bl = 0; let ${p}pv = 0;`,
+      `  let ${p}cap = 0;`,
       `  let ${p}lo = 0; let ${p}lx = 0;`,
       `  if (${enabled} !== 0) {`,
       ...Array.from({ length: MANIFEST_MAX_ORDERS }, (_, k) => emitOrderRead(p, slot, k, baseIn, params)).flat(),

@@ -66,3 +66,5 @@ export * from './meteora-damm-v1-stable/index.js';
 export * from './meteora-damm-v1-stable/ladder.js';
 export * from './obric-v2/index.js';
 export * from './obric-v2/ladder.js';
+export * from './solfi-v2/index.js';
+export * from './solfi-v2/ladder.js';

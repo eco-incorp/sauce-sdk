@@ -5,6 +5,8 @@ export { MANIFEST_MAX_ORDERS };
 export declare function manifestQuoteForBase(inner: bigint, base: bigint, roundUp: boolean): bigint;
 /** TS mirror of mfBfq (checked_base_for_quote). */
 export declare function manifestBaseForQuote(inner: bigint, quote: bigint, roundUp: boolean): bigint;
+/** TS mirror of mfCap — see the HELPERS entry above for the derivation. */
+export declare function manifestBaseForQuoteSafeCap(inner: bigint): bigint;
 export declare const manifestLadder: {
     slug: string;
     /**
