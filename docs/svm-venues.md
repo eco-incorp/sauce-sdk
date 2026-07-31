@@ -1488,7 +1488,7 @@ quarterly).** The decisive discriminant is the Instructions sysvar in a captured
 | BisonFi | `BiSoNHVp…` | 2048 B (23) | 3, no introspection | absent | internal push-oracle mid (NOT an on-chain book) | P-B |
 | SolFi (v1) | `SoLFiHG9…` | 2800 B (40) | 3, no introspection | absent | internal mid in the pool acct | P-B |
 | Tessera V | `TessVdML…` | 1264 B (24) | 2, no introspection | absent | internal (Wintermute), opaque | P-B (hard) |
-| ZeroFi | `ZERor4xh…` | 1072 B+38 KB | 14 | **PRESENT** | internal + introspection gate | P-C |
+| ZeroFi | `ZERor4xh…` | 1072 B+38 KB | 14 | **PRESENT (fee tier, NOT a gate)** | separate readable feed (128 B, `W1LDCARDa…`), f64 mid | **P-A (curve open)** — see below |
 | GoonFi V2 | `goonuddt…` | 2048 B+719 KB | 14 | **PRESENT** | internal + introspection gate | P-C |
 | AlphaQ | `ALPHAQme…` | 336/672 B (41) | 14 | **PRESENT** | internal + introspection gate | P-C |
 | SolFi V2 | `SV2EYYJy…` | 1728 B+1 MB | 13 | **PRESENT** | internal + introspection gate | P-C |
@@ -1505,6 +1505,74 @@ quarterly).** The decisive discriminant is the Instructions sysvar in a captured
   (Correction to the working hypothesis: **BisonFi is NOT an on-chain 10-level order book** — its
   10-level book is an off-chain pricing construct pushed to the chain as a compact oracle payload;
   on-chain it is a 3-account push-oracle swap like HumidiFi/SolFi.)
-- **P-C (external best-scan or drop): SolFi V2, ZeroFi, GoonFi V2, AlphaQ** carry the Instructions
+- **P-C (external best-scan or drop): SolFi V2, GoonFi V2, AlphaQ** carry the Instructions
   sysvar (introspecting); **Tessera V** is P-B but maximally opaque; **Lifinity** wound down. Reach
   them only through `quoteViaSimulation` if the probe returns ACCEPT.
+- **ZeroFi is NOT P-C — the reclassification is measured, see the section below.** Its Instructions
+  sysvar read is a *caller fee tier*, not an accept/reject gate: an unrecognized caller's CPI
+  succeeds and just pays the worst tier. The static screen's "Instructions sysvar ⇒ hard P-C" rule
+  produced a false negative here; **treat sysvar-presence as P-C-*candidate* and let step 2's
+  unrecognized-caller simulation decide**, exactly as the probe's own text says for `absent`.
+
+### ZeroFi (`ZERor4xh…`) — gate opened, quote path executed, curve still OPEN
+
+Everything here is measured in-process against the real mainnet `.so` in LiteSVM (mainnet account
+dumps, 5 pools). It supersedes the earlier "internal + introspection gate / P-C" row.
+
+**1. The `swap_v4` prologue `Custom(5)` is a cluster-restart guard, not introspection.** At `.text`
+`0x1ce78`–`0x1ced8` the handler calls a helper (`0x16818`) that does
+`sol_get_sysvar(SysvarLastRestartS1ot…, offset 0, len 8)` and requires the result to **equal** a u64
+stored in the pool account at `+0x1910`; mismatch returns `5`. Every synthetic transaction failed it
+because LiteSVM defaults `last_restart_slot` to 0 while mainnet (and the pool field) hold
+`246464040`. `svm.setLastRestartSlot(<mainnet value>)` opens it — the quote path then runs, ~24.7k CU
+small / ~37k CU large. Nothing about the enclosing transaction is inspected for this check. A real
+adapter must treat a *stale* pool value as a **self-drop**, not a revert: the pool refuses to quote
+after a cluster restart until the operator refreshes it.
+
+**2. CPI from an unknown program SUCCEEDS.** A throwaway stub program CPI-ing `swap_v4` fills
+normally. The Instructions sysvar (account 13, required — a bogus account there yields
+`InvalidArgument`) is read to identify the **outermost** instruction's program id and select a fee
+tier. Measured on one pool/size: Jupiter v6 `164858917` > OKX `164851728` > DFlow `164835240` >
+ZeroFi-as-top-level `164829633` > **every unrecognized caller `164807704`** — 8 random ids and a
+one-bit-apart pair all landed on that single value at an identical 31218 CU (a full no-match scan).
+So **Sauce deterministically gets the worst tier, which is the conservative side**: whitelisting can
+only improve the realized fill relative to a model built on the default tier.
+
+**3. The quote's causal input set is tiny and fully enumerated** (per-8-byte-word perturbation scans
+with both an integer-sized `+1` and an f64-mantissa-sized `+2^32` delta, at flat *and* impacted
+sizes, in both directions):
+
+- oracle account `+0x30` — **f64 mid**, pass-through exactly 1 (residual < 1 wei over a ±100 bps sweep);
+- oracle account `+0x38` / `+0x3c` — two u32 spreads in units of 1e-7, selected by **canonical**
+  direction (`[0]` for side0→side1, `[1]` for side1→side0);
+- in-side account `+0x360` and out-side account `+0x364` — i32 skews, also 1e-7 units;
+- the **out-vault balance**, which acts purely as a cap (the fill **saturates** at it — it never
+  collapses to zero);
+- **all 4772 words of the 38 KB pool account are causally inert**, and the in-vault balance is inert.
+
+**4. What is closed.** On the reference SOL/USDC pool, in the flat region, the default (Sauce) tier is
+wei-exact over a wide synthetic parameter sweep (30/30, including asymmetric skews):
+
+```
+sk   = skewIn0 + min(skewOut1, 0)            // out-side skew counts only when negative
+sk   = clamp(sk, -8000, POSCAP)              // floor is on the SUM, not per-term
+dev  = -(2000 + 2*spr[dir]) + sk             // units of 1e-7; 2000 == the 2 bps default-tier fee
+out  = floor(amountIn * rate * (1e7 + dev) / 1e7)     // rate = mid or 1/mid, exact rational from the f64 bits
+```
+With every parameter zeroed, `out == floor(amountIn * rate)` exactly — **there is no base protocol
+fee**; the whole spread is the oracle's `spr` plus the skews plus the caller tier.
+
+**5. What is NOT closed — do not ship an adapter.** Two independent gaps:
+- a **notional-slice impact term** above roughly $300–$500 of notional, visible as a CU ladder
+  (24.7k → 27k → 30k → 33k → 37k → 43k) that no readable account word controls. The fields that
+  plausibly drive it (the in-side ladder at `+0x88/+0x98/+0x1d8/+0x1e0/+0x208/+0x210/+0x230…+0x288`)
+  reject every perturbation with `Custom(10)`, so they are cross-validated and were not identifiable
+  by perturbation.
+- the flat form **does not generalize across pools with live parameters**: of 3 pools quoting in both
+  directions it holds on 1, and on a wide-spread pool (`spr=10490`, `skewOut1=-8132`) it over-quotes
+  from `amountIn=50` upward — so at least the `-8000` floor and `POSCAP` are per-pool, not constants.
+
+A favourable model error on a venue quoting a few bps of spread manufactures a head that wins
+elections it should lose, so the bar is **zero over-quotes or no adapter**. The remaining work is
+localized: defeat the `Custom(10)` cross-check on the in-side ladder (or disassemble the impact loop)
+and re-run the multi-pool exactness sweep.
