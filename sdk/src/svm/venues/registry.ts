@@ -24,6 +24,10 @@ import { saberStableswap } from './saber-stableswap/index.js';
 import { saberStableswapLadder } from './saber-stableswap/ladder.js';
 import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
+import { stabbleStableSwap } from './stabble-stable-swap/index.js';
+import { stabbleStableSwapLadder } from './stabble-stable-swap/ladder.js';
+import { stabbleWeightedSwap } from './stabble-weighted-swap/index.js';
+import { stabbleWeightedSwapLadder } from './stabble-weighted-swap/ladder.js';
 import { tesseravLadder } from './tesserav/ladder.js';
 import { woofiLadder } from './woofi/ladder.js';
 import { perpsJlpLadder } from './perps-jlp/ladder.js';
@@ -40,6 +44,8 @@ const adapters: Record<string, SvmVenueAdapter> = {
   [saberStableswap.slug]: saberStableswap,
   [meteoraDammV1Stable.slug]: meteoraDammV1Stable,
   [meteoraDbc.slug]: meteoraDbc,
+  [stabbleStableSwap.slug]: stabbleStableSwap,
+  [stabbleWeightedSwap.slug]: stabbleWeightedSwap,
 };
 
 /** Known venue slugs, in table order. */
@@ -65,7 +71,7 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * without a corresponding entry here gets ZERO contract coverage, silently —
  * the count assertion is what turns that into a loud CI failure instead.
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
- * SUBSET — 8 of these 20 families also implement the v1 surface; manifest/
+ * SUBSET — 10 of these 22 families also implement the v1 surface; manifest/
  * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/goonfi-v2/solfi-v2/
  * quantum/tesserav/woofi/deriverse/perps-jlp are ladder-only).
  */
@@ -90,6 +96,8 @@ const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [woofiLadder.slug]: woofiLadder,
   [deriverseLadder.slug]: deriverseLadder,
   [perpsJlpLadder.slug]: perpsJlpLadder,
+  [stabbleStableSwapLadder.slug]: stabbleStableSwapLadder,
+  [stabbleWeightedSwapLadder.slug]: stabbleWeightedSwapLadder,
 };
 
 /** Known ladder-family slugs, in table order. */

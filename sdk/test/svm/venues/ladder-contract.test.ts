@@ -105,6 +105,10 @@ import {
   saberStableswapLadder,
   solfiV2,
   solfiV2Ladder,
+  stabbleStableSwap,
+  stabbleStableSwapLadder,
+  stabbleWeightedSwap,
+  stabbleWeightedSwapLadder,
   fetchTesseraVConfig,
   tesseravLadder,
   fetchWoofiConfig,
@@ -624,6 +628,37 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'stabble-stable-swap',
+    ladder: stabbleStableSwapLadder,
+    async variants() {
+      // Real mainnet USDT/USDC pool (2 tokens, live amp ramp) — no discrete
+      // window/idle-float bound (unlike its stable-kind siblings), so no
+      // declaredCliffs entry: the N-token Newton has no hard capacity cap.
+      const POOL = address('5K7CHUbBYAh6wrantyJvDDqwT4VoKuZTi73CN1DTUUer');
+      const fixtures = fixturesFor('stabble-stable-swap');
+      const cfg = await stabbleStableSwap.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [{ label: 'AtoB', cfg, state, now: 1_785_000_000n }];
+    },
+  },
+  {
+    slug: 'stabble-weighted-swap',
+    ladder: stabbleWeightedSwapLadder,
+    async variants() {
+      // Real mainnet wSOL/USDC pool (50/50 weights, exponent==ONE, the
+      // exact-integer pow_up fast path). The real, on-chain MAX_IN_RATIO
+      // (30%-of-balance) hard cap is modeled as a SATURATING clamp in BOTH
+      // the ladder chain and the standalone cold quote (see ladder.ts's
+      // module doc) — unlike meteora-damm-v1-stable/solfi-v2's collapse-to-
+      // zero cliff, this family never collapses, so no declaredCliffs entry.
+      const POOL = address('JV4MkRFn58xpyrhF2oDxQYwnq5jFVzTQUKcUzce1FQA');
+      const fixtures = fixturesFor('stabble-weighted-swap');
+      const cfg = await stabbleWeightedSwap.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [{ label: 'AtoB', cfg, state }];
+    },
+  },
+  {
     slug: 'woofi',
     ladder: woofiLadder,
     async variants() {
@@ -779,10 +814,10 @@ const FAMILIES: Family[] = [
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 20 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 22 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(20);
-    expect(FAMILIES).toHaveLength(20);
+    expect(registered).toHaveLength(22);
+    expect(FAMILIES).toHaveLength(22);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
