@@ -35,7 +35,25 @@ export declare const OFF_POOL_FEE_RATE = 105;
 export declare const OFF_POOL_MAX_GAMMA = 107;
 export declare const OFF_POOL_MAX_NOTIONAL_SWAP = 123;
 export declare const OFF_POOL_CAP_BAL = 139;
+/** u16, NOT u128 — bisection-verified against the real binary (see OFF_POOL_RESERVE's doc): a
+ * wider read here would swallow OFF_POOL_RESERVE's low bytes. Always 0 on every live pool today. */
 export declare const OFF_POOL_MIN_SWAP_AMOUNT = 155;
+/**
+ * A LIVE (not baked) per-pool accounting value the real `Swap` ix's newer,
+ * deployed-only require (`ReserveLessThanFee`, not present in the audited
+ * source this adapter otherwise mirrors) checks on the FROM side's own pool
+ * before it will move anything. Bisection-verified against the real binary
+ * (not documented anywhere): flipping only this field's low byte on a real
+ * mainnet dump (woopoolBase, this pool's actual live bytes) took the swap
+ * from a hard revert to succeeding. Semantics beyond "a floor this pool's own
+ * activity must clear" are NOT independently confirmed (its exact relation
+ * to swap_fee/from_amount, and its true width past 8 bytes, are unverified)
+ * — modeled here as a conservative DIRECT cap on the tradable amount
+ * (ladder.ts), the same one-sided-safe treatment as capBal. It reads 0 on
+ * every live pool sampled 2026-07-31 (this pool's own real recent swaps all
+ * fail on mainnet too — consistent with a currently-zeroed floor).
+ */
+export declare const OFF_POOL_RESERVE = 157;
 export declare const OFF_POOL_TOKEN_MINT = 187;
 export declare const OFF_POOL_TOKEN_VAULT = 219;
 export declare const OFF_POOL_BASE_DECIMALS = 283;

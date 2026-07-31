@@ -1,5 +1,5 @@
 import { readUintLE } from '../math.js';
-import { OFF_ORACLE_PRICE, OFF_ORACLE_SPREAD, OFF_ORACLE_UPDATED_AT, OFF_PYTH_PRICE, OFF_PYTH_PUBLISH_TIME, OFF_PYTH_VERIFICATION_TAG, ONE_E18, ONE_E5, PYTH_VERIFICATION_FULL, WOOFI_PROGRAM_ID, WOOFI_SWAP_DISCRIMINATOR, woofiSwapAccounts, } from './index.js';
+import { OFF_ORACLE_PRICE, OFF_ORACLE_SPREAD, OFF_ORACLE_UPDATED_AT, OFF_POOL_RESERVE, OFF_PYTH_PRICE, OFF_PYTH_PUBLISH_TIME, OFF_PYTH_VERIFICATION_TAG, ONE_E18, ONE_E5, PYTH_VERIFICATION_FULL, WOOFI_PROGRAM_ID, WOOFI_SWAP_DISCRIMINATOR, woofiSwapAccounts, } from './index.js';
 const SLUG = 'woofi';
 const U64_MAX = (1n << 64n) - 1n;
 /** SPL token account `amount` u64 LE offset. */
@@ -119,6 +119,7 @@ function liveState(cfg, state, now) {
     const basePyth = state[cfg.priceUpdateBase];
     const quotePyth = state[cfg.priceUpdateQuote];
     const vaultData = state[cfg.direction === 'sellBase' ? cfg.quoteTokenVault : cfg.tokenVaultBase];
+    const fromPoolData = state[cfg.direction === 'sellBase' ? cfg.woopoolBase : cfg.woopoolQuote];
     if (wooconfigData === undefined)
         throw new Error(`${SLUG} reference is missing wooconfig ${cfg.wooconfig}`);
     if (oracleData === undefined)
@@ -129,6 +130,8 @@ function liveState(cfg, state, now) {
         throw new Error(`${SLUG} reference is missing price-update ${cfg.priceUpdateQuote}`);
     if (vaultData === undefined)
         throw new Error(`${SLUG} reference is missing a capacity vault`);
+    if (fromPoolData === undefined)
+        throw new Error(`${SLUG} reference is missing the from-side woopool`);
     const paused = wooconfigData[WOOCONFIG_PAUSED_OFF] !== 0;
     const wooraclePrice = readUintLE(oracleData, OFF_ORACLE_PRICE, 8) | (readUintLE(oracleData, OFF_ORACLE_PRICE + 8, 8) << 64n);
     const updatedAt = readUintLE(oracleData, OFF_ORACLE_UPDATED_AT, 8);
@@ -140,6 +143,7 @@ function liveState(cfg, state, now) {
     const quotePythPrice = readUintLE(quotePyth, OFF_PYTH_PRICE, 8);
     const quotePythPublishTime = readUintLE(quotePyth, OFF_PYTH_PUBLISH_TIME, 8);
     const vaultAvailable = readUintLE(vaultData, AMOUNT_OFF, 8);
+    const poolReserve = readUintLE(fromPoolData, OFF_POOL_RESERVE, 8);
     const priceOut = woofiPriceOut({
         now,
         wooraclePrice,
@@ -158,9 +162,15 @@ function liveState(cfg, state, now) {
         pythQuoteDecPow: cfg.pythQuoteDecPow,
         paused,
     });
-    const capacity = cfg.direction === 'sellBase'
+    let capacity = cfg.direction === 'sellBase'
         ? woofiSellBaseCapacity(priceOut, cfg.priceDec, cfg.quoteDec, cfg.baseDec, cfg.coeff, cfg.maxGamma, cfg.maxNotionalSwap, cfg.capBal, cfg.minSwapAmount, vaultAvailable)
         : woofiSellQuoteCapacity(priceOut, cfg.priceDec, cfg.quoteDec, cfg.baseDec, cfg.coeff, cfg.maxGamma, cfg.maxNotionalSwap, cfg.capBal, vaultAvailable);
+    // OFF_POOL_RESERVE (see index.ts's doc) — a live, real, currently-binding
+    // floor on the FROM side's own pool the deployed program's newer
+    // ReserveLessThanFee require checks; modeled as a direct conservative cap
+    // (same units as x, since it is always read from the FROM pool).
+    if (poolReserve < capacity)
+        capacity = poolReserve;
     return { priceOut, capacity, spread };
 }
 function referenceQuoteOf(cfg, x, live) {
@@ -227,6 +237,11 @@ export const woofiLadder = {
         // already part of the swap CPI's 17-account list either way (buildSwapV2
         // attaches both unconditionally), so this adds no new on-chain account.
         const otherVault = c.direction === 'sellBase' ? c.tokenVaultBase : c.quoteTokenVault;
+        // The FROM side's own WooPool bytes — needed live for OFF_POOL_RESERVE
+        // (see index.ts's doc on that constant). Already part of the swap CPI's
+        // account list either way (woopoolBase/woopoolQuote both ride it via
+        // woofiSwapAccounts), so this adds no new on-chain account either.
+        const fromPool = c.direction === 'sellBase' ? c.woopoolBase : c.woopoolQuote;
         return [
             { ref: ref(slot, 'wc'), address: c.wooconfig },
             { ref: ref(slot, 'or'), address: c.wooracleBase },
@@ -234,6 +249,7 @@ export const woofiLadder = {
             { ref: ref(slot, 'pq'), address: c.priceUpdateQuote },
             { ref: ref(slot, 'vc'), address: vault },
             { ref: ref(slot, 'vo'), address: otherVault },
+            { ref: ref(slot, 'wp'), address: fromPool },
         ];
     },
     emitSetup(base, slot, params, enableVar) {
@@ -245,6 +261,7 @@ export const woofiLadder = {
         const pb = JSON.stringify(ref(slot, 'pb'));
         const pq = JSON.stringify(ref(slot, 'pq'));
         const vc = JSON.stringify(ref(slot, 'vc'));
+        const wp = JSON.stringify(ref(slot, 'wp'));
         const pe = paramExprs(params);
         const sellBase = c.direction === 'sellBase';
         const lines = [];
@@ -264,6 +281,10 @@ export const woofiLadder = {
         lines.push(`  const ${p}qpx = accountUint(${pq}, ${OFF_PYTH_PRICE}, 8);`);
         lines.push(`  const ${p}qpt = accountUint(${pq}, ${OFF_PYTH_PUBLISH_TIME}, 8);`);
         lines.push(`  const ${p}vav = accountUint(${vc}, ${AMOUNT_OFF}, 8);`);
+        // OFF_POOL_RESERVE — a live floor on the FROM side's own pool the deployed
+        // program's newer ReserveLessThanFee require checks (see index.ts's doc on
+        // OFF_POOL_RESERVE); folded in as a direct conservative cap below.
+        lines.push(`  const ${p}pres = accountUint(${wp}, ${OFF_POOL_RESERVE}, 8);`);
         lines.push(`  const ${p}maxg = (${pe.maxGammaHi} << 64) | ${pe.maxGammaLo};`);
         lines.push(`  const ${p}maxn = (${pe.maxNotionalHi} << 64) | ${pe.maxNotionalLo};`);
         lines.push(`  const ${p}cbal = (${pe.capBalHi} << 64) | ${pe.capBalLo};`);
@@ -310,6 +331,7 @@ export const woofiLadder = {
             lines.push(`      if (${p}ca3 < ${p}cac) { ${p}cac = ${p}ca3 }`);
             lines.push(`      ${p}icap = (${p}cac * ${p}pdec) / ${p}po;`);
             lines.push(`      if (${p}cbal < ${p}icap) { ${p}icap = ${p}cbal }`);
+            lines.push(`      if (${p}pres < ${p}icap) { ${p}icap = ${p}pres }`);
             lines.push(`      if (${p}icap < 0) { ${p}icap = 0 }`);
         }
         else {
@@ -321,6 +343,7 @@ export const woofiLadder = {
             lines.push(`      if (${p}cg < ${p}icap) { ${p}icap = ${p}cg }`);
             lines.push(`      if (${p}cbx < ${p}icap) { ${p}icap = ${p}cbx }`);
             lines.push(`      if (${p}cvx < ${p}icap) { ${p}icap = ${p}cvx }`);
+            lines.push(`      if (${p}pres < ${p}icap) { ${p}icap = ${p}pres }`);
             lines.push(`      if (${p}icap < 0) { ${p}icap = 0 }`);
         }
         lines.push(`    }`);

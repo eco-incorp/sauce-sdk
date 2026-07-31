@@ -181,7 +181,7 @@ describe('the emitted fragment compiles as valid SauceScript', () => {
     ].join('\n');
     const { bytecode, accountPlan } = compile(source, { target: 'svm' });
     expect(bytecode[0].length).toBeGreaterThan(0);
-    expect(accountPlan?.metas.map((m) => m.ref).sort()).toEqual(['s0:wc', 's0:or', 's0:pb', 's0:pq', 's0:vc'].sort());
+    expect(accountPlan?.metas.map((m) => m.ref).sort()).toEqual(['s0:wc', 's0:or', 's0:pb', 's0:pq', 's0:vc', 's0:wp'].sort());
   });
 });
 
