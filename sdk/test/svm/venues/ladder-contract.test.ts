@@ -114,7 +114,9 @@ import {
   fetchWoofiConfig,
   woofiLadder,
   perpsJlpLadder,
+  juplendAmmLadder,
 } from '../../../src/svm/index.js';
+import type { JuplendAmmPoolConfig } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 import { evaluateQuoteContract, mergeAltitudeAmounts, U64_MAX, type DeclaredCliff } from './ladder-probe.js';
@@ -262,6 +264,32 @@ function goonfiOracleBytes(price: bigint): Uint8Array {
   view.setBigUint64(0, price, true);
   view.setBigUint64(8, price, true);
   view.setUint32(20, 1_000_000, true); // denom
+  return data;
+}
+
+// juplend-amm: synthetic (no mainnet fixture checked in — see ladder.ts's
+// module doc, "juplend-amm.test.ts" for the real-mainnet-state decode this
+// mirrors). Only the two byte ranges the ladder actually reads (Dex's
+// center_price @109, the position's amount/ceiling @73/81) are populated;
+// every other field is inert to the quote math.
+const JUPLEND_DEX = address('So11111111111111111111111111111111111111112');
+const JUPLEND_POS0 = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const JUPLEND_POS1 = address('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB');
+const JUPLEND_DUMMY = address('75HgnSvXbWKZBpZHveX68ZzAhDqMzNDS29X6BGLtxMo1');
+
+function juplendDexBytes(centerPrice: bigint): Uint8Array {
+  const data = new Uint8Array(329);
+  const view = new DataView(data.buffer);
+  view.setBigUint64(109, centerPrice & ((1n << 64n) - 1n), true);
+  view.setBigUint64(109 + 8, centerPrice >> 64n, true);
+  return data;
+}
+
+function juplendPositionBytes(amount: bigint, ceiling: bigint): Uint8Array {
+  const data = new Uint8Array(120);
+  const view = new DataView(data.buffer);
+  view.setBigUint64(73, amount, true);
+  view.setBigUint64(81, ceiling, true);
   return data;
 }
 
@@ -817,13 +845,48 @@ const FAMILIES: Family[] = [
       return [{ label: 'solToUsdc', cfg, state }];
     },
   },
+  {
+    slug: 'juplend-amm',
+    ladder: juplendAmmLadder,
+    async variants() {
+      const cfg: JuplendAmmPoolConfig = {
+        venue: 'juplend-amm' as const,
+        pool: JUPLEND_DEX,
+        swap0to1: true,
+        token0: JUPLEND_DUMMY,
+        token1: JUPLEND_DUMMY,
+        tokenProgram0: JUPLEND_DUMMY,
+        tokenProgram1: JUPLEND_DUMMY,
+        tokenReserve0: JUPLEND_DUMMY,
+        tokenReserve1: JUPLEND_DUMMY,
+        vault0: JUPLEND_DUMMY,
+        vault1: JUPLEND_DUMMY,
+        rateModel0: JUPLEND_DUMMY,
+        rateModel1: JUPLEND_DUMMY,
+        liquidity: JUPLEND_DUMMY,
+        positionKind: 'supply',
+        position0: JUPLEND_POS0,
+        position1: JUPLEND_POS1,
+        feePpm: 1_000n,
+      };
+      const state: AccountBytesMap = {
+        [JUPLEND_DEX]: juplendDexBytes(1_000_000_000_000_000n), // center_price = 1.0
+        [JUPLEND_POS0]: juplendPositionBytes(100_000_000n, 1_000_000_000n), // cap = 900,000,000
+        [JUPLEND_POS1]: juplendPositionBytes(200_000_000n, 1_000_000_000n), // cap = 800,000,000
+      };
+      return [
+        { label: 'swap0to1', cfg, state },
+        { label: 'swap1to0', cfg: { ...cfg, swap0to1: false }, state },
+      ];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 22 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(22);
-    expect(FAMILIES).toHaveLength(22);
+    expect(registered).toHaveLength(23);
+    expect(FAMILIES).toHaveLength(23);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });

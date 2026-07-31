@@ -52,6 +52,8 @@ export * from './stabble-stable-swap/index.js';
 export * from './stabble-stable-swap/ladder.js';
 export * from './stabble-weighted-swap/index.js';
 export * from './stabble-weighted-swap/ladder.js';
+export * from './juplend-amm/index.js';
+export * from './juplend-amm/ladder.js';
 // --- migrated venue adapters (formerly sauce-recipes ecoswap/svm/venues/**) ---
 // scale-common: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `scaleCommon`/`SCALE_COMMON` prefix.
