@@ -73,6 +73,8 @@ import { resolve } from 'path';
 import { address } from '@solana/kit';
 import {
   listLadderVenues,
+  deriverse,
+  deriverseLadder,
   manifestLadder,
   fetchManifestConfig,
   meteoraDammV1Stable,
@@ -509,13 +511,34 @@ const FAMILIES: Family[] = [
       ];
     },
   },
+  {
+    slug: 'deriverse',
+    ladder: deriverseLadder,
+    async variants() {
+      // A REAL, LIVE (non-drained) mainnet instrument — wSOL/USDC
+      // (8Wk2L1yD...), embedded-AMM reserves both nonzero at this snapshot,
+      // unlike obric-v2's own checked-in fixture. No `declaredCliffs`: the
+      // isqrt-based circuit-breaker capacity clamp SATURATES the standalone
+      // cold referenceQuote too (see ladder.ts's module doc) — the same
+      // no-entry shape as raydium-*/pumpswap/meteora-damm-v2/saber, not the
+      // whirlpool/clmm/dlmm/solfi-v2/damm-v1-stable "latent cliff" class.
+      const POOL = address('8Wk2L1yDovBJifCN1o86X7g7pDcqLau39m6tEsJ9Sheh');
+      const fixtures = fixturesFor('deriverse');
+      const cfg = await deriverse.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'sell', cfg: { ...cfg, side: 'sell' as const }, state },
+        { label: 'buy', cfg: { ...cfg, side: 'buy' as const }, state },
+      ];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 13 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 15 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(14);
-    expect(FAMILIES).toHaveLength(14);
+    expect(registered).toHaveLength(15);
+    expect(FAMILIES).toHaveLength(15);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
