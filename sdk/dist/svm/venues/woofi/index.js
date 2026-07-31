@@ -26,8 +26,12 @@
  * the bundle equal to `quoteTokenMint` — are wired (`sellBase` sells the
  * non-quote side for the quote; `sellQuote` is the reverse). Of the 6 live
  * bundles, 3 are quote-paired (SOL/USDC, USDT/USDC, the third token/USDC) and
- * immediately tradeable; the other 3 (SOL/USDT, SOL/<third>, USDT/<third>)
- * are genuine BASE-TO-BASE pairs. The real `Swap` instruction DOES support
+ * fully modeled end to end (feasibility, math, and capacity, INCLUDING a
+ * real, currently-live `OFF_POOL_RESERVE` floor this deployment's swap
+ * checks — see that constant's doc; it reads 0 on this deployment's SOL and
+ * USDC pools today, so those two specific pools correctly self-drop right
+ * now rather than "are immediately tradeable"); the other 3 (SOL/USDT,
+ * SOL/<third>, USDT/<third>) are genuine BASE-TO-BASE pairs. The real `Swap` instruction DOES support
  * base-to-base directly (three account tuples: from/to/quote-settlement —
  * `woopool_quote`/`quote_price_update`/`quote_token_vault` are ALWAYS present
  * even for a quote-paired trade, where they simply alias the quote-side's own
