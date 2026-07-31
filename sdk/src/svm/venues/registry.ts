@@ -6,6 +6,8 @@ import { meteoraDammV2Ladder } from './meteora-damm-v2/ladder.js';
 import { meteoraDlmmLadder } from './meteora-dlmm/ladder.js';
 import { manifestLadder } from './manifest/ladder.js';
 import { obricV2Ladder } from './obric-v2/ladder.js';
+import { meteoraDbc } from './meteora-dbc/index.js';
+import { meteoraDbcLadder } from './meteora-dbc/ladder.js';
 import { orcaLegacyTokenSwap } from './orca-legacy-token-swap/index.js';
 import { orcaLegacyTokenSwapLadder } from './orca-legacy-token-swap/ladder.js';
 import { orcaWhirlpoolLadder } from './orca-whirlpool/ladder.js';
@@ -32,6 +34,7 @@ const adapters: Record<string, SvmVenueAdapter> = {
   [meteoraDammV2.slug]: meteoraDammV2,
   [saberStableswap.slug]: saberStableswap,
   [meteoraDammV1Stable.slug]: meteoraDammV1Stable,
+  [meteoraDbc.slug]: meteoraDbc,
 };
 
 /** Known venue slugs, in table order. */
@@ -57,7 +60,7 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * without a corresponding entry here gets ZERO contract coverage, silently —
  * the count assertion is what turns that into a loud CI failure instead.
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
- * SUBSET — 7 of these 14 families also implement the v1 surface; manifest/
+ * SUBSET — 8 of these 15 families also implement the v1 surface; manifest/
  * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/solfi-v2/quantum are
  * ladder-only).
  */
@@ -76,6 +79,7 @@ const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [obricV2Ladder.slug]: obricV2Ladder,
   [solfiV2Ladder.slug]: solfiV2Ladder,
   [quantumLadder.slug]: quantumLadder,
+  [meteoraDbcLadder.slug]: meteoraDbcLadder,
 };
 
 /** Known ladder-family slugs, in table order. */
