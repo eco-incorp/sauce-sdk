@@ -751,6 +751,20 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
         expect(result.authentic).toBe(true);
         expect(result.code).toBeUndefined();
       });
+
+      // B3, carried forward: `matchInRoot` (internal/root-testing.ts) guards CONTAINER ELEMENTS,
+      // not just the container array — a garbage element must never throw, only never match. The
+      // container itself is guarded by the caller (Array.isArray) in the original B3 fix; this is
+      // its direct analogue against the new root-parameterized function.
+      it('B3 (carried forward): a root array containing garbage elements never throws, and none of them match', () => {
+        const garbageElements = [null, undefined, {}, { bodyHash: 1 }, { bodyHash: null }] as unknown as Array<{ bodyHash: string }>;
+        for (const el of garbageElements) {
+          expect(() => authenticateBodyAgainstRoot(CURRENT_SETTLE_TEMPLATE.bodyHash, true, [el] as any)).not.toThrow();
+          const result = authenticateBodyAgainstRoot(CURRENT_SETTLE_TEMPLATE.bodyHash, true, [el] as any);
+          expect(result.authentic).toBe(false);
+          expect(result.entry).toBeNull();
+        }
+      });
     });
 
     // T5 — the status ALLOW-LIST (via the internal hook, which can inject arbitrary statuses;
