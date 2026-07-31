@@ -76,11 +76,17 @@ function liveState(cfg, state, now) {
     return { rin, rout, au, bu, alp, asu, bsu, fn, fd, pn, pd, amp, ma, mb, idle, d };
 }
 /**
- * One quote over the live state with a caller-supplied Newton start (the
- * warm chain threads y0; the cold path passes d). Returns the new y cursor
- * alongside the output so the chain can advance even on a 0-quote rung.
+ * One RAW pointwise quote over the live state with a caller-supplied Newton
+ * start (the warm chain threads y0; the cold path passes d). Returns the new
+ * y cursor alongside the output so the chain can advance even on a 0-quote
+ * rung. Does NOT apply the idle-float capacity bound — `reached` is false
+ * for the two fee/dust guards (transient: true only for the smallest inputs,
+ * and — unlike the idle bound — never re-trips once it has cleared, so a
+ * caller must not latch on it); the idle bound itself is the caller's
+ * responsibility (a permanent, monotonic cliff once reached — the cold path
+ * collapses on it, the ladder-chain path freezes on it).
  */
-function quoteWithStart(live, x, y0) {
+function quoteRaw(live, x, y0) {
     // Input-token fees, min-1 (calculate_fee); protocol fee is a cut of the trade fee.
     let tf = engineDiv(x * live.fn, live.fd);
     if (live.fn > 0n && tf === 0n)
@@ -96,19 +102,22 @@ function quoteWithStart(live, x, y0) {
     // Dust guard: fees exceeding the simulated total would wrap in-VM and
     // revert on-chain — quote 0, keep the cursor.
     if (after < live.rin + tf)
-        return { out: 0n, y: y0 };
+        return { out: 0n, y: y0, reached: false };
     const srcNet = after - live.rin - tf;
     const y = stableComputeYWarm(live.amp, (live.rin + srcNet) * live.ma, live.d, y0);
     const db = live.rout * live.mb;
     if (db <= y)
-        return { out: 0n, y };
+        return { out: 0n, y, reached: false };
     const dest = engineDiv(db - y - 1n, live.mb);
-    // Vault withdraw simulation (two more floors), then the strict idle-float bound.
+    // Vault withdraw simulation (two more floors).
     const outLp = engineDiv(dest * live.bsu, live.bu);
-    let out = engineDiv(outLp * live.bu, live.bsu);
-    if (out >= live.idle)
-        out = 0n;
-    return { out, y };
+    const out = engineDiv(outLp * live.bu, live.bsu);
+    return { out, y, reached: true };
+}
+/** COLD collapsing quote: quoteRaw plus the idle-float collapse (the declared, merge-unreachable, latent gap — see capacityInputVar/referenceCapacities). */
+function quoteColdCollapsing(live, x, y0) {
+    const r = quoteRaw(live, x, y0);
+    return { out: r.reached && r.out >= live.idle ? 0n : r.out, y: r.y };
 }
 export const meteoraDammV1StableLadder = {
     slug: SLUG,
@@ -176,54 +185,93 @@ export const meteoraDammV1StableLadder = {
             // Newton D — ONCE per trade, only for an enabled, funded slot.
             `  let s${slot}d = 0;`,
             `  if (${enabled} !== 0 && s${slot}rin > 0 && s${slot}rout > 0) { s${slot}d = stableD(s${slot}amp, s${slot}rin * s${slot}ma, s${slot}rout * s${slot}mb) }`,
+            // Capacity freeze state (idle-float bound): cap latches PERMANENTLY the
+            // first rung whose candidate reaches the idle float; lo/lx hold the
+            // last productive (output, cumulative input) pair — see
+            // emitLadderQuote/capacityInputVar.
+            `  let s${slot}cap = 0;`,
+            `  let s${slot}lo = 0;`,
+            `  let s${slot}lx = 0;`,
         ].join('\n');
     },
     emitQuoteCall: undefined,
+    /**
+     * Ladder rung at cumulative grid point x: skips all computation once
+     * `s<slot>cap` has latched (a prior rung's candidate already reached the
+     * idle float — permanent and monotonic, so every later rung would only
+     * re-confirm the same breach); otherwise runs the fee/vault/Newton chain
+     * and either latches cap (candidate >= idle) or records the new
+     * (lo, lx) = (output, cumulative input) checkpoint. Reports the CURRENT
+     * checkpoint every rung — 0 dOut/dIn once frozen, exactly the
+     * window-walking convention (types.ts's capacityInputVar doc).
+     */
     emitLadderQuote(_base, slot, rung, x, outVar) {
         return [
             ...(rung === 0 ? [`    let s${slot}wy = s${slot}d;`] : []),
-            ...this.emitQuoteBody(slot, `${rung}`, x, outVar, `s${slot}wy`, true),
+            `    if (s${slot}cap === 0 && s${slot}d > 0 && ${x} > 0) {`,
+            ...this.emitQuoteAt(slot, `${rung}`, x, `s${slot}wy`, true),
+            '    }',
+            `    const ${outVar} = s${slot}lo;`,
         ].join('\n');
     },
-    emitFinalQuote(_base, slot, x, outVar) {
-        // COLD: y0 = D — byte-identical to the venue's own swap path.
-        return this.emitQuoteBody(slot, 'f', x, outVar, `s${slot}d`, false).join('\n');
+    capacityInputVar(slot) {
+        return `s${slot}lx`;
     },
-    /** Shared quote body; `warm` threads the y cursor local, cold reads y0 fresh. */
-    emitQuoteBody(slot, tag, x, outVar, y0, warm) {
-        const v = (name) => `s${slot}${name}${tag}`;
-        const yVar = warm ? `s${slot}wy` : v('y');
+    /** Cold final quote: reuse the ladder's last-good value if x lands exactly there, else recompute fresh from D (byte-identical to the venue's own swap path) — the DECLARED, merge-unreachable, latent collapse past the idle float (see this file's module doc). */
+    emitFinalQuote(_base, slot, x, outVar) {
         return [
             `  let ${outVar} = 0;`,
             `  if (s${slot}d > 0 && ${x} > 0) {`,
-            // Input-token fees with the min-1 rule; protocol fee is a cut of the trade fee.
-            `    let ${v('tf')} = ${x} * s${slot}fn / s${slot}fd;`,
-            `    if (s${slot}fn > 0 && ${v('tf')} === 0) { ${v('tf')} = 1 }`,
-            `    let ${v('pf')} = ${v('tf')} * s${slot}pn / s${slot}pd;`,
-            `    if (s${slot}pn > 0 && ${v('tf')} > 0 && ${v('pf')} === 0) { ${v('pf')} = 1 }`,
-            `    ${v('tf')} = ${v('tf')} - ${v('pf')};`,
-            `    const ${v('in')} = ${x} - ${v('pf')};`,
-            // Vault deposit simulation (unlocked' = unlocked + inNet).
-            `    const ${v('lp')} = ${v('in')} * s${slot}asu / s${slot}au;`,
-            `    const ${v('af')} = (${v('lp')} + s${slot}alp) * (s${slot}au + ${v('in')}) / (s${slot}asu + ${v('lp')});`,
-            // Dust guard: fees past the simulated total would wrap in-VM (and
-            // revert on-chain) — quote 0, keep the warm cursor.
-            `    if (${v('af')} >= s${slot}rin + ${v('tf')}) {`,
-            `      const ${v('sn')} = ${v('af')} - s${slot}rin - ${v('tf')};`,
-            ...(warm
-                ? [`      ${yVar} = stableYW(s${slot}amp, (s${slot}rin + ${v('sn')}) * s${slot}ma, s${slot}d, ${y0});`]
-                : [`      const ${yVar} = stableYW(s${slot}amp, (s${slot}rin + ${v('sn')}) * s${slot}ma, s${slot}d, ${y0});`]),
-            `      const ${v('db')} = s${slot}rout * s${slot}mb;`,
-            `      if (${v('db')} > ${yVar}) {`,
-            `        const ${v('de')} = (${v('db')} - ${yVar} - 1) / s${slot}mb;`,
-            // Vault withdraw simulation, then the strict idle-float bound.
-            `        const ${v('ol')} = ${v('de')} * s${slot}bsu / s${slot}bu;`,
-            `        let ${v('ov')} = ${v('ol')} * s${slot}bu / s${slot}bsu;`,
-            `        if (${v('ov')} >= s${slot}idl) { ${v('ov')} = 0 }`,
-            `        ${outVar} = ${v('ov')};`,
-            '      }',
+            `    if (s${slot}lx === ${x}) { ${outVar} = s${slot}lo }`,
+            '    else {',
+            ...this.emitQuoteAt(slot, 'f', x, `s${slot}d`, false, outVar),
             '    }',
             '  }',
+        ].join('\n');
+    },
+    /**
+     * Shared fee/vault/Newton computation up to the post-vault-withdraw
+     * candidate `<v>ov`; `warm` threads the shared `s<slot>wy` cursor
+     * (mutated in place) and TAILS into the capacity FREEZE (latch cap,
+     * or record the new checkpoint); cold declares a fresh `y` const and
+     * TAILS into the raw idle-float COLLAPSE, assigning `coldOutVar`.
+     */
+    emitQuoteAt(slot, tag, x, y0, warm, coldOutVar) {
+        const v = (name) => `s${slot}${name}${tag}`;
+        const yVar = warm ? `s${slot}wy` : v('y');
+        return [
+            // Input-token fees with the min-1 rule; protocol fee is a cut of the trade fee.
+            `      let ${v('tf')} = ${x} * s${slot}fn / s${slot}fd;`,
+            `      if (s${slot}fn > 0 && ${v('tf')} === 0) { ${v('tf')} = 1 }`,
+            `      let ${v('pf')} = ${v('tf')} * s${slot}pn / s${slot}pd;`,
+            `      if (s${slot}pn > 0 && ${v('tf')} > 0 && ${v('pf')} === 0) { ${v('pf')} = 1 }`,
+            `      ${v('tf')} = ${v('tf')} - ${v('pf')};`,
+            `      const ${v('in')} = ${x} - ${v('pf')};`,
+            // Vault deposit simulation (unlocked' = unlocked + inNet).
+            `      const ${v('lp')} = ${v('in')} * s${slot}asu / s${slot}au;`,
+            `      const ${v('af')} = (${v('lp')} + s${slot}alp) * (s${slot}au + ${v('in')}) / (s${slot}asu + ${v('lp')});`,
+            // Dust guard: fees past the simulated total would wrap in-VM (and
+            // revert on-chain) — quote 0, keep the warm cursor untouched.
+            `      if (${v('af')} >= s${slot}rin + ${v('tf')}) {`,
+            `        const ${v('sn')} = ${v('af')} - s${slot}rin - ${v('tf')};`,
+            ...(warm
+                ? [`        ${yVar} = stableYW(s${slot}amp, (s${slot}rin + ${v('sn')}) * s${slot}ma, s${slot}d, ${y0});`]
+                : [`        const ${yVar} = stableYW(s${slot}amp, (s${slot}rin + ${v('sn')}) * s${slot}ma, s${slot}d, ${y0});`]),
+            `        const ${v('db')} = s${slot}rout * s${slot}mb;`,
+            `        if (${v('db')} > ${yVar}) {`,
+            `          const ${v('de')} = (${v('db')} - ${yVar} - 1) / s${slot}mb;`,
+            // Vault withdraw simulation (two more floors).
+            `          const ${v('ol')} = ${v('de')} * s${slot}bsu / s${slot}bu;`,
+            `          let ${v('ov')} = ${v('ol')} * s${slot}bu / s${slot}bsu;`,
+            // Idle-float bound tail: FREEZE (warm, ladder-chain) vs COLLAPSE (cold, declared latent gap).
+            ...(warm
+                ? [
+                    `          if (${v('ov')} >= s${slot}idl) { s${slot}cap = 1 }`,
+                    `          else { s${slot}lo = ${v('ov')}; s${slot}lx = ${x}; }`,
+                ]
+                : [`          if (${v('ov')} >= s${slot}idl) { ${v('ov')} = 0 }`, `          ${coldOutVar} = ${v('ov')};`]),
+            '        }',
+            '      }',
         ];
     },
     buildSwapV2(base, slot, user) {
@@ -261,19 +309,52 @@ export const meteoraDammV1StableLadder = {
         return (x) => {
             if (live.d === 0n || x === 0n)
                 return 0n;
-            return quoteWithStart(live, x, live.d).out; // COLD
+            // COLD — the DECLARED, merge-unreachable, latent idle-float collapse
+            // (see this file's module doc; capacityInputVar/referenceCapacities
+            // keep the ladder-chain path itself from ever reaching it).
+            return quoteColdCollapsing(live, x, live.d).out;
         };
     },
     referenceLadderQuotes(base, state, _params, now) {
         const live = liveState(d1sConfig(base), state, now ?? BigInt(Math.floor(Date.now() / 1000)));
         return (grid) => {
             let wy = live.d;
+            let lo = 0n;
+            let capped = false;
             return grid.map((g) => {
-                if (live.d === 0n || g === 0n)
-                    return 0n; // cursor unchanged, exactly like the fragment
-                const { out, y } = quoteWithStart(live, g, wy);
-                wy = y;
-                return out;
+                if (live.d === 0n || g === 0n || capped)
+                    return lo; // cursor unchanged, exactly like the fragment
+                const r = quoteRaw(live, g, wy);
+                wy = r.y;
+                if (r.reached) {
+                    if (r.out >= live.idle)
+                        capped = true;
+                    else
+                        lo = r.out;
+                }
+                return lo;
+            });
+        };
+    },
+    /** Mirror of capacityInputVar: the cumulative PRODUCTIVE input at each ordered grid point — frozen at the last checkpoint below the idle float once the cap latches. Lockstep with referenceLadderQuotes (same walk, same latch condition). */
+    referenceCapacities(base, state, _params, now) {
+        const live = liveState(d1sConfig(base), state, now ?? BigInt(Math.floor(Date.now() / 1000)));
+        return (grid) => {
+            let wy = live.d;
+            let lx = 0n;
+            let capped = false;
+            return grid.map((g) => {
+                if (live.d === 0n || g === 0n || capped)
+                    return lx;
+                const r = quoteRaw(live, g, wy);
+                wy = r.y;
+                if (r.reached) {
+                    if (r.out >= live.idle)
+                        capped = true;
+                    else
+                        lx = g;
+                }
+                return lx;
             });
         };
     },
