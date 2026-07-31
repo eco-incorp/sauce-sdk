@@ -390,8 +390,13 @@ export const meteoraDlmmLadder = {
                 // bin_array_bitmap_extension is an Option<AccountLoader>: pass the real
                 // account only when it exists on-chain, else the DLMM program-id None
                 // sentinel (mirrors host_fee_in below). A derived-but-uninitialized PDA
-                // makes Anchor try Some(deserialize) and revert every real swap.
-                roled('bmx', cfg.bitmapExtensionExists ? cfg.bitmapExtension : METEORA_DLMM_PROGRAM_ID),
+                // makes Anchor try Some(deserialize) and revert every real swap. When
+                // the account IS passed, Anchor's `#[account(mut)]` on the Option field
+                // requires it writable (Error 2000 ConstraintMut otherwise, proven
+                // against the deployed program); the None sentinel is the program id
+                // itself, which the runtime rejects if marked writable, so the flag
+                // must track existence, never be unconditional either way.
+                roled('bmx', cfg.bitmapExtensionExists ? cfg.bitmapExtension : METEORA_DLMM_PROGRAM_ID, cfg.bitmapExtensionExists),
                 roled('rx', cfg.reserveX, true),
                 roled('ry', cfg.reserveY, true),
                 { ref: swapForY ? user.inAta : user.outAta, writable: true }, // user_token_in (x-side)
