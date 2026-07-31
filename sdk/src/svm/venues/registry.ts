@@ -18,6 +18,7 @@ import { raydiumCpSwap } from './raydium-cp-swap/index.js';
 import { raydiumCpSwapLadder } from './raydium-cp-swap/ladder.js';
 import { saberStableswap } from './saber-stableswap/index.js';
 import { saberStableswapLadder } from './saber-stableswap/ladder.js';
+import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
 
 // Adapter table. Keys MUST equal adapter.slug — venueAdapter reports them as
@@ -56,8 +57,9 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * without a corresponding entry here gets ZERO contract coverage, silently —
  * the count assertion is what turns that into a loud CI failure instead.
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
- * SUBSET — 7 of these 13 families also implement the v1 surface; manifest/
- * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/solfi-v2 are ladder-only).
+ * SUBSET — 7 of these 14 families also implement the v1 surface; manifest/
+ * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/solfi-v2/quantum are
+ * ladder-only).
  */
 const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
@@ -73,6 +75,7 @@ const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [meteoraDammV1StableLadder.slug]: meteoraDammV1StableLadder,
   [obricV2Ladder.slug]: obricV2Ladder,
   [solfiV2Ladder.slug]: solfiV2Ladder,
+  [quantumLadder.slug]: quantumLadder,
 };
 
 /** Known ladder-family slugs, in table order. */
