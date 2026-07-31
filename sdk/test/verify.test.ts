@@ -99,11 +99,16 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
   describe('inspectSettleProgram / verifySettleProgram — the visible report', () => {
     const v1 = SETTLE_VECTORS[0]!;
 
-    it('inspectSettleProgram on a genuine program is ok:true with every check present', () => {
+    it('inspectSettleProgram on a genuine, authentic program is structurallyValid:true, authentic:true, but ok:false — inspect NEVER checks intent, so ok can never claim it did', () => {
       const r = inspectSettleProgram(v1.program);
-      expect(r.ok).toBe(true);
+      // This IS the "cooked drain" shape: a well-formed, authentic (body-hash-matching) program —
+      // inspect has no expectation to compare tokens/recipient against, so a single `ok:true` here
+      // would read as "safe to cook" for ANY choice of tokens/recipient, including a hostile one.
+      expect(r.ok).toBe(false);
       expect(r.mode).toBe('inspect');
-      expect(r.failureCode).toBeNull();
+      expect(r.structurallyValid).toBe(true);
+      expect(r.authentic).toBe(true);
+      expect(r.failureCode).toBe('INTENT_UNCHECKED');
       expect(r.decoded).not.toBeNull();
       const ids = r.checks.map((c) => c.id);
       expect(ids).toEqual(
@@ -116,13 +121,29 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
           'body.size',
           'body.hash',
           'template.status',
+          'intent.recipient',
+          'intent.tokens',
+          'intent.minOut',
           'intent.floorToken',
           'serverEcho.bodyHash',
         ]),
       );
-      // inspect never asks about intent.recipient/tokens/minOut
-      expect(ids).not.toEqual(expect.arrayContaining(['intent.recipient']));
+      // The intent checks ARE present (never omitted — see api/README.md's "one row per check ...
+      // never omitted" contract) but PERMANENTLY unchecked+blocking, which is what forces `ok:false`.
+      const recip = r.checks.find((c) => c.id === 'intent.recipient')!;
+      expect(recip.status).toBe('unchecked');
+      expect(recip.severity).toBe('blocking');
+      const tokens = r.checks.find((c) => c.id === 'intent.tokens')!;
+      expect(tokens.status).toBe('unchecked');
+      expect(tokens.severity).toBe('blocking');
+      // BLOCKER 3: intent.floorToken must NEVER manufacture a 'pass' just because `decoded` is
+      // non-null — it is 'unchecked' unless an expectation (expect.floorToken) was actually
+      // supplied, exactly like every other check.
+      const floorToken = r.checks.find((c) => c.id === 'intent.floorToken')!;
+      expect(floorToken.status).toBe('unchecked');
       expect(r.disclosures.map((d) => d.id)).toEqual(expect.arrayContaining(['FULL_BALANCE_SWEEP', 'FLOOR_IS_LEVEL_NOT_DELTA']));
+      // effects[] is a BEHAVIORAL claim gated on structurallyValid && authentic, NOT on ok (a
+      // caller's absent expectation doesn't change what the program actually does) — still renders.
       expect(r.effects.length).toBe(v1.tokens.length);
       expect(r.effects[0]!.amount).toBe('ENTIRE_POT_BALANCE');
     });
@@ -170,6 +191,89 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
         expect(r.checks.find((c) => c.id === id)!.status).toBe('pass');
       }
       expect(r.effects.length).toBe(0); // unauthenticated — no behavioral claim
+    });
+
+    it('BLOCKER 2 — allowTokens + minOut alone forfeits the ok:true claim for BOTH orderings; expect.floorToken discriminates honest from attacker', () => {
+      const v2 = SETTLE_VECTORS.find((v) => v.name.startsWith('v2'))!;
+      const [honestFloor, honestOther] = v2.tokens; // [U, W] — U is genuinely tokens[0]
+      const d = decodeSettleProgram(v2.program);
+      // The attacker's program: SAME body/minOut/recipient, tokens REORDERED — the floor now sits
+      // on what was the honest program's second (non-floor) token.
+      const attackerProgram = encodeSettleProgram([honestOther, honestFloor], v2.minOut, v2.recipient, d.body);
+
+      const looseExpect = { recipient: v2.recipient, allowTokens: v2.tokens, minOut: v2.minOut };
+      const honestLoose = verifySettleProgram(v2.program, looseExpect);
+      const attackerLoose = verifySettleProgram(attackerProgram, looseExpect);
+      // BEFORE the fix this pair was ok:true / ok:true — indistinguishable. Now neither claims
+      // ok:true: allowTokens is order-free and never pinned position 0, so a minOut expectation
+      // with no floorToken (and no exact tokens list) cannot be honored — the report forfeits.
+      expect(honestLoose.ok).toBe(false);
+      expect(attackerLoose.ok).toBe(false);
+      expect(honestLoose.checks.find((c) => c.id === 'intent.floorToken')!.status).toBe('unchecked');
+      expect(honestLoose.checks.find((c) => c.id === 'intent.floorToken')!.severity).toBe('blocking');
+
+      // Pin the floor explicitly: now the honest program passes and the attacker's — whose
+      // decoded.floorToken has genuinely moved — fails, on the SAME allowTokens/minOut expectation.
+      const pinnedExpect = { ...looseExpect, floorToken: honestFloor };
+      const honestPinned = verifySettleProgram(v2.program, pinnedExpect);
+      const attackerPinned = verifySettleProgram(attackerProgram, pinnedExpect);
+      expect(honestPinned.ok).toBe(true);
+      expect(attackerPinned.ok).toBe(false);
+      expect(attackerPinned.checks.find((c) => c.id === 'intent.floorToken')!.status).toBe('fail');
+      expect(attackerPinned.failureCode).toBe('EXPECT_FLOOR_TOKEN');
+
+      // An exact (order-sensitive) `tokens` list already pins position 0 without floorToken.
+      const exactExpect = { recipient: v2.recipient, tokens: v2.tokens, minOut: v2.minOut };
+      expect(verifySettleProgram(v2.program, exactExpect).ok).toBe(true);
+      const exactAttacker = verifySettleProgram(attackerProgram, { recipient: v2.recipient, tokens: v2.tokens, minOut: v2.minOut });
+      expect(exactAttacker.ok).toBe(false); // intent.tokens itself catches the reordering
+    });
+
+    it('BLOCKER 5 — a malformed FIRST token push (single-token program) reports the SPECIFIC canonicality code, not NOT_SETTLE_SHAPED', () => {
+      const good = decodeSettleProgram(SETTLE_VECTORS[0]!.program).body; // v1's genuine 165-byte body
+      // A single-token settle program whose ONLY token push is non-minimal (leading zero byte,
+      // width 0x15 = 21 bytes) — the scan fails on the very FIRST push, before any push is
+      // recorded, which is exactly the condition that used to misattribute the failure.
+      const nonMinimalFirstPush = ('0x15' + '00' + '833589fcd6edb6e08f4c7c32d4f71b54bda02913' + '9401' + '0100' + '144200000000000000000000000000000000000006' + good.slice(2)) as Hex;
+
+      const r = inspectSettleProgram(nonMinimalFirstPush);
+      expect(r.failureCode).toBe('NON_MINIMAL_PUSH');
+      expect(r.checks.find((c) => c.id === 'shape.pushes')!.status).toBe('pass'); // the push run itself is complete, just non-minimal
+      expect(r.checks.find((c) => c.id === 'shape.canonical')!.status).toBe('fail'); // NOT 'unchecked'
+      expect(r.structurallyValid).toBe(false);
+    });
+
+    it('SHOULD-FIX: neither function throws on a garbage runtime value bypassing the type system', () => {
+      // A non-string `program` (inspectSettleProgram takes no expectations to blame instead).
+      expect(() => inspectSettleProgram(12345 as unknown as Hex)).not.toThrow();
+      const garbageProgram = inspectSettleProgram(12345 as unknown as Hex);
+      expect(garbageProgram.ok).toBe(false);
+      // A garbage (non-hex, non-bigint) expect.recipient/tokens/allowTokens.
+      expect(() =>
+        verifySettleProgram(v1.program, { recipient: 'not-an-address' as unknown as Hex, tokens: v1.tokens }),
+      ).not.toThrow();
+      expect(() =>
+        verifySettleProgram(v1.program, { recipient: v1.recipient, tokens: ['also-not-an-address'] as unknown as Hex[] }),
+      ).not.toThrow();
+      const garbageExpect = verifySettleProgram(v1.program, { recipient: 'not-an-address' as unknown as Hex, tokens: v1.tokens });
+      expect(garbageExpect.ok).toBe(false);
+      expect(garbageExpect.checks.find((c) => c.id === 'intent.recipient')!.status).toBe('fail');
+    });
+
+    it('SHOULD-FIX: hashSource is "caller" (not "pinned") when opts.templates overrides the trust root, even without expectedBodyHash', () => {
+      const overrideTable = SETTLE_TEMPLATES.map((t) => ({ ...t }));
+      const r = inspectSettleProgram(v1.program, { templates: overrideTable });
+      expect(r.hashSource).toBe('caller');
+    });
+
+    it('SHOULD-FIX: effects[] is empty for a structurally-rejected program (zero recipient), even though the body still parses', () => {
+      const good = decodeSettleProgram(SETTLE_VECTORS[0]!.program).body;
+      const zeroRecipient = ('0x14833589fcd6edb6e08f4c7c32d4f71b54bda02913' + '9401' + '0100' + '0100' + good.slice(2)) as Hex;
+      const r = inspectSettleProgram(zeroRecipient);
+      expect(r.checks.find((c) => c.id === 'shape.recipientNonZero')!.status).toBe('fail');
+      expect(r.structurallyValid).toBe(false);
+      expect(r.decoded).not.toBeNull(); // the body still parses — an operator can see what WOULD have run
+      expect(r.effects.length).toBe(0); // but no behavioral claim is made about a structurally-rejected program
     });
 
     it('formatSettleReport renders every check id, token, and disclosure', () => {

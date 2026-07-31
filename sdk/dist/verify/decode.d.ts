@@ -36,7 +36,16 @@ import { keccak256, type Hex } from "viem";
  *  decoder makes; `NON_MINIMAL_PUSH`, `OVERSIZE_ADDRESS`, and `ZERO_RECIPIENT` are the three
  *  gaps the recipes package's original decoder did NOT check (all three independently confirmed
  *  to validate `ok:true` against it). */
-export type SettleFailureCode = "EMPTY" | "TRUNCATED_PUSH" | "NON_MINIMAL_PUSH" | "OVERSIZE_ADDRESS" | "NOT_SETTLE_SHAPED" | "ARITY_MISMATCH" | "TRUNCATED_MINOUT" | "TRUNCATED_RECIPIENT" | "ZERO_RECIPIENT" | "BODY_LENGTH" | "BODY_HASH" | "TEMPLATE_REVOKED" | "EXPECT_RECIPIENT" | "EXPECT_TOKENS" | "EXPECT_MINOUT";
+export type SettleFailureCode = "EMPTY" | "TRUNCATED_PUSH" | "NON_MINIMAL_PUSH" | "OVERSIZE_ADDRESS" | "NOT_SETTLE_SHAPED" | "ARITY_MISMATCH" | "TRUNCATED_MINOUT" | "TRUNCATED_RECIPIENT" | "ZERO_RECIPIENT" | "BODY_LENGTH" | "BODY_HASH" | "TEMPLATE_REVOKED" | "EXPECT_RECIPIENT" | "EXPECT_TOKENS" | "EXPECT_MINOUT" | "EXPECT_FLOOR_TOKEN"
+/** A blocking check that was NEVER COMPARED against a caller expectation — distinct from the
+ *  EXPECT_* codes above (which mean "compared and mismatched"). `inspectSettleProgram` sets this
+ *  for `intent.recipient`/`intent.tokens` on EVERY call (it takes no expectation, ever — see
+ *  report.ts's module doc for why that is what keeps `ok` from reading true for a program whose
+ *  intent was never checked). `verifySettleProgram` sets it for `intent.floorToken` when the
+ *  caller supplied `minOut`/`minMinOut` but pinned neither `floorToken` nor an exact `tokens`
+ *  list — the settle floor's target token would otherwise be unverified even though a floor
+ *  value was requested (see the FULL_BALANCE_SWEEP disclosure). */
+ | "INTENT_UNCHECKED";
 export declare class SettleDecodeError extends Error {
     readonly code: SettleFailureCode;
     constructor(code: SettleFailureCode, message: string);
