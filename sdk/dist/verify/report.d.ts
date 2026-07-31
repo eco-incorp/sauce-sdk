@@ -40,22 +40,31 @@ export interface Disclosure {
  *  - `'pinned'`  — matched against this package's own `SETTLE_TEMPLATES` table (the default).
  *  - `'caller'`  — the caller supplied `opts.expectedBodyHash` directly (without labelling it
  *    `'rederived'`), OR overrode `opts.templates` (a caller-controlled table is not this package's
- *    own root, even without a single explicit hash). A bare, unlabelled `expectedBodyHash` pin is
- *    a SELF-CERTIFIABLE claim — a caller who controls both the program bytes and the hash it is
- *    checked against can trivially construct a match with arbitrary, non-audited bytes (the same
- *    tautology the deleted `ok` boolean used to hide). To prevent `authentic:true` from ever
- *    pairing with `templateId:null` (an internal contradiction — claiming "this IS our audited
- *    template" for a body matching none), a plain `'caller'` pin authenticates ONLY when it ALSO
- *    independently matches a real, accepted (non-revoked, `acceptSuperseded`-respecting) entry in
- *    `templates` — exactly the same acceptance rule the no-`expectedBodyHash` path already uses,
- *    just narrowed to the one hash the caller named instead of "any accepted entry".
+ *    own root, even without a single explicit hash).
  *  - `'rederived'` — the caller supplied `opts.expectedBodyHash` AND labelled it as obtained by
  *    actually recompiling the template (e.g. the recipes package's own producer-side check) —
  *    NEVER set this for a hash that merely arrived alongside the program being checked (that is
  *    self-certification — see `serverEcho.bodyHash` below for the only legitimate use of a
- *    served hash). This is the one case where authenticity is trusted WITHOUT a `templates` table
- *    match — an explicit, self-disclosed, out-of-band claim, the same trust model this module
- *    already uses for `intentSource`'s `'caller'` vs `'server-echo'` split. */
+ *    served hash).
+ *
+ *  BOTH `'caller'` and `'rederived'` are, by construction, a bare ASSERTION that `expectedBodyHash`
+ *  is trustworthy — and a caller who controls both the program bytes and the hash it is checked
+ *  against can trivially construct a match with arbitrary, non-audited bytes (the same tautology
+ *  the deleted `ok` boolean used to hide). An earlier revision of this module trusted a
+ *  `'rederived'`-labelled hash at face value, UNCONDITIONALLY skipping the table-match requirement
+ *  the `'caller'` branch already carried — the label alone (a plain string in the same
+ *  caller-supplied `opts` object) was enough to restore the exact tautology this module exists to
+ *  close. There is no way for this module to verify OUT OF BAND that a `'rederived'` hash was
+ *  genuinely obtained by recompiling anything real, so `authentic` is EQUALLY conditioned on the
+ *  SAME acceptance rule for both labels: `hashMatchesClaim` (the caller's claim reproduces the
+ *  program's actual body hash) AND an independent match against a real, accepted (non-revoked,
+ *  `acceptSuperseded`-respecting) entry in `templates` — exactly the same acceptance rule the
+ *  no-`expectedBodyHash` path already uses, just narrowed to the one hash the caller named instead
+ *  of "any accepted entry". This never regresses a genuine caller: the recipes package's own
+ *  `reportOwnSettleProgram` labels `'rederived'` with a hash obtained by ACTUALLY recompiling the
+ *  audited template, which — being audited — already lives in `SETTLE_TEMPLATES` and passes this
+ *  same check. The label remains meaningful purely as PROVENANCE/disclosure (how the caller says
+ *  they obtained the hash — useful for an audit trail), never as a different security boundary. */
 export type HashSource = "pinned" | "caller" | "rederived";
 /** WHO authored `declaredIntent` — see this module's header doc. */
 export type IntentSource = "caller" | "server-echo" | "none";
@@ -272,8 +281,13 @@ export declare function inspectSettleProgram(program: Hex, opts?: VerifyOpts): S
  * (see `VerifyOpts.intentSourceLabel`'s doc).
  */
 export declare function verifySettleProgram(program: Hex, expect: SettleExpectation, optsIn?: VerifyOpts): SettleReport;
-/** Render a report as fixed-width plain text — checks, then sweepScope/floorClaim, then
- *  disclosures. This is the deliverable a partner pastes into a support ticket: "seeing the
- *  validation phase" is a `console.log`, not a JSON-schema exercise. */
+/** B3: `formatSettleReport` is documented (see `jsonSafe`'s doc above) to never throw, but that
+ *  guarantee used to hold only for a genuine `SettleReport`/`SettleInspection` value — a runtime
+ *  caller bypassing the type system (`null`, `undefined`, `{}`, or any object missing a field this
+ *  renderer assumed present) crashed immediately: `r.mode` on `null`/`undefined` before a single
+ *  line was even built, `for (const c of r.checks)` on a value with no `checks` array at all. Every
+ *  field this function reads is now read DEFENSIVELY — a missing/garbage container renders a
+ *  placeholder instead of throwing, exactly the "guard the elements, don't just guard the
+ *  container" fix `matchTemplate` above needed for the same reason. */
 export declare function formatSettleReport(r: SettleReport | SettleInspection): string;
 //# sourceMappingURL=report.d.ts.map

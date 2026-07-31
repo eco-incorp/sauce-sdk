@@ -57,9 +57,18 @@ function safeBigInt(v) {
         return null;
     }
 }
+/** B3: `opts.templates` is validated as an ARRAY (`Array.isArray`) before this is ever called — but
+ *  a runtime caller bypassing the type system can still populate that array with garbage ELEMENTS
+ *  (`null`, `undefined`, `{}`, `{bodyHash: 1}`, `{bodyHash: null}`) that are not `TemplateEntry`
+ *  values at all. `t.bodyHash.toLowerCase()` used to assume every element was a well-formed entry
+ *  and crashed on the first one that wasn't — the "never throws" guarantee this module documents
+ *  everywhere else only ever guarded the CONTAINER (the array itself), never its elements. Each
+ *  element is now type-checked before its `bodyHash` is read; a malformed element simply never
+ *  matches (the same "unrecognized input treated as no match" rule every other garbage-input path
+ *  in this module already follows) rather than throwing. */
 function matchTemplate(hash, templates) {
     const norm = hash.toLowerCase();
-    return templates.find((t) => t.bodyHash.toLowerCase() === norm);
+    return templates.find((t) => t !== null && typeof t === "object" && typeof t.bodyHash === "string" && t.bodyHash.toLowerCase() === norm);
 }
 function push(build, check, code) {
     build.checks.push(check);
@@ -81,6 +90,34 @@ function deriveVerdict(structurallyValid, authentic, intentReconciled) {
     if (intentReconciled === false)
         return "INTENT_MISMATCH";
     return "INTENT_UNCHECKED";
+}
+/**
+ * B2 — THE INVARIANT: any field a consumer can gate on must be false-or-null whenever `verdict` is
+ * not the one fully-affirmative outcome (`MATCHES_DECLARED_INTENT`).
+ *
+ * `pushIntentChecks` computes its OWN, independent comparison of `decoded` against `expect` — but
+ * `decoded` is a BEST-EFFORT parse that can populate real-looking tokens/recipient/minOut even when
+ * the program is `MALFORMED` (e.g. a truncated body) or `NOT_OUR_TEMPLATE` (e.g. a forged body that
+ * happens to share a genuine program's prologue). That raw comparison can therefore independently
+ * read `true` in exactly the cases `verdict` says "not proven safe" — a REAL prior defect: a
+ * forged-but-prologue-identical body reported `verdict:NOT_OUR_TEMPLATE` while `intentReconciled`
+ * still read `true`, and a truncated body reported `verdict:MALFORMED` with the same leak. Returning
+ * that raw value verbatim in the envelope reintroduced the deleted `ok` boolean's exact failure —
+ * fused-and-tautological — one field over.
+ *
+ * The fix is structural, not a per-case patch: the PUBLICLY-EXPOSED `intentReconciled` is ALWAYS
+ * derived FROM `verdict` (this function), NEVER returned as `pushIntentChecks`' raw value directly.
+ * That makes divergence between the two impossible by construction, and is the pattern any FUTURE
+ * gateable field must follow — derive from `verdict`, never compute and expose independently.
+ * `test/verify.test.ts`'s "B2" suite enumerates every current gateable field across all four
+ * non-affirmative verdicts specifically so a field that skips this pattern fails loudly.
+ */
+function gateIntentReconciled(verdict) {
+    if (verdict === "MATCHES_DECLARED_INTENT")
+        return true;
+    if (verdict === "INTENT_MISMATCH")
+        return false;
+    return null; // MALFORMED / NOT_OUR_TEMPLATE / INTENT_UNCHECKED — never affirmatively "true"
 }
 /** A runtime caller that bypasses the type system entirely (passes `null`/a non-object as `opts`)
  *  must not crash a function documented to never throw — the default parameter (`opts: VerifyOpts
@@ -226,26 +263,21 @@ function buildBase(program, optsIn) {
         if (expectedBodyHash !== undefined) {
             hashSource = opts.hashSourceLabel === "rederived" ? "rederived" : "caller";
             const hashMatchesClaim = actualHash.toLowerCase() === expectedBodyHash.toLowerCase();
-            if (hashSource === "rederived") {
-                // 'rederived' is an explicit, self-disclosed, OUT-OF-BAND claim ("I obtained this hash by
-                // actually recompiling the template myself" — see HashSource's doc) — the same trust model
-                // this module already uses for `intentSource`'s 'caller' vs 'server-echo' split. Trusted at
-                // face value, independent of whether this package's own SETTLE_TEMPLATES table has an
-                // entry for it (that is the whole point of the escape hatch).
-                authenticated = hashMatchesClaim;
-            }
-            else {
-                // R2: an UNLABELLED 'caller' pin is a bare assertion — and a caller who controls BOTH the
-                // program bytes AND the `expectedBodyHash` it is checked against can trivially satisfy
-                // `hashMatchesClaim` with ARBITRARY, non-audited bytes (the exact self-referential
-                // tautology the deleted `ok` boolean used to hide, relocated here). Demote: a plain
-                // 'caller' pin authenticates ONLY when it ALSO independently matches a real, accepted
-                // table entry — never "authentic" with `templateId:null` at the same time, which used to
-                // be an internally contradictory pair (claiming "this IS our audited template" for a body
-                // matching no known template at all).
-                const claimAccepted = !!tableMatch && tableMatch.status !== "revoked" && (tableMatch.status !== "superseded" || opts.acceptSuperseded !== false);
-                authenticated = hashMatchesClaim && claimAccepted;
-            }
+            // B1: an expectedBodyHash pin — whether labelled 'caller' or 'rederived' — is, either way, a
+            // bare ASSERTION supplied in the SAME caller-controlled `opts` object as the program under
+            // test. A caller who controls both the program bytes and `expectedBodyHash` can trivially
+            // satisfy `hashMatchesClaim` with ARBITRARY, non-audited bytes regardless of which label they
+            // attach — 'rederived' used to be trusted at face value and skip this requirement entirely,
+            // which restored the exact self-referential tautology the deleted `ok` boolean used to hide,
+            // one string away. Both labels now require the SAME independent acceptance: the claimed hash
+            // must ALSO match a real, accepted (non-revoked, `acceptSuperseded`-respecting) entry in
+            // `templates` — never "authentic" with `templateId:null` at the same time, which would be an
+            // internally contradictory pair (claiming "this IS our audited template" for a body matching
+            // no known template at all). See `HashSource`'s doc: this never regresses a genuine
+            // 'rederived' caller — a hash actually obtained by recompiling the audited template already
+            // lives in the templates table by construction.
+            const claimAccepted = !!tableMatch && tableMatch.status !== "revoked" && (tableMatch.status !== "superseded" || opts.acceptSuperseded !== false);
+            authenticated = hashMatchesClaim && claimAccepted;
             bodyHashStatus = authenticated ? "pass" : "fail";
             bodyHashCode = authenticated ? undefined : "BODY_HASH";
             bodyHashActual = actualHash;
@@ -693,8 +725,12 @@ function pushIntentChecks(build, decoded, expect) {
  */
 export function inspectSettleProgram(program, opts = {}) {
     const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
-    const intentReconciled = pushIntentChecks(build, decoded, null);
-    const verdict = deriveVerdict(structurallyValid, authenticated, intentReconciled);
+    const rawIntentReconciled = pushIntentChecks(build, decoded, null);
+    const verdict = deriveVerdict(structurallyValid, authenticated, rawIntentReconciled);
+    // B2: NEVER expose `rawIntentReconciled` directly — see `gateIntentReconciled`'s doc. The public
+    // field is derived FROM `verdict`, so it cannot leak `true`/`false` past a MALFORMED/
+    // NOT_OUR_TEMPLATE verdict even when the raw (best-effort-decode-based) comparison would.
+    const intentReconciled = gateIntentReconciled(verdict);
     const effects = buildEffects(decoded, structurallyValid, authenticated);
     return {
         verdict,
@@ -734,8 +770,11 @@ export function verifySettleProgram(program, expect, optsIn = {}) {
     // bypassing the type system, the exact scenario this same guard already anticipates elsewhere).
     const opts = normalizeOpts(optsIn);
     const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
-    const intentReconciled = pushIntentChecks(build, decoded, expect);
-    const verdict = deriveVerdict(structurallyValid, authenticated, intentReconciled);
+    const rawIntentReconciled = pushIntentChecks(build, decoded, expect);
+    const verdict = deriveVerdict(structurallyValid, authenticated, rawIntentReconciled);
+    // B2: see `gateIntentReconciled`'s doc — the public field is derived FROM `verdict`, never the
+    // raw comparison, so it cannot leak past a MALFORMED/NOT_OUR_TEMPLATE verdict.
+    const intentReconciled = gateIntentReconciled(verdict);
     const intentSource = opts.intentSourceLabel === "server-echo" ? "server-echo" : "caller";
     const effects = buildEffects(decoded, structurallyValid, authenticated);
     return {
@@ -769,47 +808,75 @@ function jsonSafe(v) {
         return String(v);
     }
 }
-/** Render a report as fixed-width plain text — checks, then sweepScope/floorClaim, then
- *  disclosures. This is the deliverable a partner pastes into a support ticket: "seeing the
- *  validation phase" is a `console.log`, not a JSON-schema exercise. */
+/** B3: `formatSettleReport` is documented (see `jsonSafe`'s doc above) to never throw, but that
+ *  guarantee used to hold only for a genuine `SettleReport`/`SettleInspection` value — a runtime
+ *  caller bypassing the type system (`null`, `undefined`, `{}`, or any object missing a field this
+ *  renderer assumed present) crashed immediately: `r.mode` on `null`/`undefined` before a single
+ *  line was even built, `for (const c of r.checks)` on a value with no `checks` array at all. Every
+ *  field this function reads is now read DEFENSIVELY — a missing/garbage container renders a
+ *  placeholder instead of throwing, exactly the "guard the elements, don't just guard the
+ *  container" fix `matchTemplate` above needed for the same reason. */
 export function formatSettleReport(r) {
+    if (r === null || r === undefined || typeof r !== "object") {
+        return "SETTLE PROGRAM REPORT — INVALID: formatSettleReport was called with a non-report value (a runtime caller bypassed the type system). Nothing to render.";
+    }
+    const report = r;
     const lines = [];
-    lines.push(`SETTLE PROGRAM REPORT — mode=${r.mode} verdict=${r.verdict} intentReconciled=${r.intentReconciled === null ? "null" : r.intentReconciled} ` +
-        `intentSource=${r.intentSource} structurallyValid=${r.structurallyValid} authentic=${r.authentic} ` +
-        `template=${r.templateId ?? "?"}@${r.templateVersion ?? "?"} hashSource=${r.hashSource}`);
-    if (r.mode === "inspect") {
+    lines.push(`SETTLE PROGRAM REPORT — mode=${report.mode ?? "?"} verdict=${report.verdict ?? "?"} intentReconciled=${report.intentReconciled === null || report.intentReconciled === undefined ? "null" : report.intentReconciled} ` +
+        `intentSource=${report.intentSource ?? "?"} structurallyValid=${report.structurallyValid ?? "?"} authentic=${report.authentic ?? "?"} ` +
+        `template=${report.templateId ?? "?"}@${report.templateVersion ?? "?"} hashSource=${report.hashSource ?? "?"}`);
+    if (report.mode === "inspect") {
         lines.push("  (inspect mode supplies NO expectation — intentReconciled is always null; read structurallyValid/authentic and checks[] for what IS proven)");
     }
-    if (r.failureCode)
-        lines.push(`  failureCode: ${r.failureCode}`);
-    if (r.declaredIntent)
-        lines.push(`  declaredIntent (source=${r.intentSource}): ${jsonSafe(r.declaredIntent)}`);
+    if (report.failureCode)
+        lines.push(`  failureCode: ${report.failureCode}`);
+    if (report.declaredIntent)
+        lines.push(`  declaredIntent (source=${report.intentSource}): ${jsonSafe(report.declaredIntent)}`);
     lines.push("");
     lines.push("checks:");
-    for (const c of r.checks) {
-        const glyph = STATUS_GLYPH[c.status];
-        lines.push(`  ${glyph} [${c.severity}] ${c.id} — ${c.title}`);
-        lines.push(`      compared: ${c.compared}`);
-        lines.push(`      expected: ${c.expected}`);
-        lines.push(`      actual:   ${c.actual}`);
-        lines.push(`      proves:   ${c.proves}`);
+    const checks = Array.isArray(report.checks) ? report.checks : [];
+    if (checks.length === 0)
+        lines.push("  (none — malformed input: no checks[] array present on this report)");
+    for (const c of checks) {
+        if (c === null || typeof c !== "object") {
+            lines.push("  (skipped a malformed checks[] entry)");
+            continue;
+        }
+        const glyph = STATUS_GLYPH[c.status] ?? "?";
+        lines.push(`  ${glyph} [${c.severity ?? "?"}] ${c.id ?? "?"} — ${c.title ?? "?"}`);
+        lines.push(`      compared: ${c.compared ?? "?"}`);
+        lines.push(`      expected: ${c.expected ?? "?"}`);
+        lines.push(`      actual:   ${c.actual ?? "?"}`);
+        lines.push(`      proves:   ${c.proves ?? "?"}`);
     }
     lines.push("");
-    lines.push(`sweepScope: unbounded=${r.sweepScope.unbounded} basis=${r.sweepScope.basis} tokens(${r.sweepScope.tokens.length}):`);
-    if (r.sweepScope.tokens.length === 0) {
+    const sweepScope = report.sweepScope && typeof report.sweepScope === "object" ? report.sweepScope : undefined;
+    const sweepTokens = Array.isArray(sweepScope?.tokens) ? sweepScope.tokens : [];
+    lines.push(`sweepScope: unbounded=${sweepScope?.unbounded ?? "?"} basis=${sweepScope?.basis ?? "?"} tokens(${sweepTokens.length}):`);
+    if (sweepTokens.length === 0) {
         lines.push("  (none — program is not both structurally valid AND authentic; no behavioral claim can be made)");
     }
-    for (const t of r.sweepScope.tokens) {
-        lines.push(`  #${t.position} ${t.token}${t.isFloorToken ? " (FLOOR TOKEN)" : ""} -> ENTIRE_POT_BALANCE -> ${t.to}`);
+    for (const t of sweepTokens) {
+        if (t === null || typeof t !== "object") {
+            lines.push("  (skipped a malformed sweepScope entry)");
+            continue;
+        }
+        lines.push(`  #${t.position ?? "?"} ${t.token ?? "?"}${t.isFloorToken ? " (FLOOR TOKEN)" : ""} -> ENTIRE_POT_BALANCE -> ${t.to ?? "?"}`);
     }
     lines.push("");
-    lines.push(`floorClaim: present=${r.floorClaim.present} token=${r.floorClaim.token ?? "n/a"} minOut=${r.floorClaim.minOut ?? "n/a"} ` +
-        `basis=${r.floorClaim.basis} comparableToUnsplitFloor=${r.floorClaim.comparableToUnsplitFloor}`);
+    const floorClaim = report.floorClaim && typeof report.floorClaim === "object" ? report.floorClaim : undefined;
+    lines.push(`floorClaim: present=${floorClaim?.present ?? "?"} token=${floorClaim?.token ?? "n/a"} minOut=${floorClaim?.minOut ?? "n/a"} ` +
+        `basis=${floorClaim?.basis ?? "?"} comparableToUnsplitFloor=${floorClaim?.comparableToUnsplitFloor ?? "?"}`);
     lines.push("");
     lines.push("disclosures:");
-    for (const d of r.disclosures) {
-        lines.push(`  [${d.id}] ${d.title}`);
-        lines.push(`      ${d.text}`);
+    const disclosures = Array.isArray(report.disclosures) ? report.disclosures : [];
+    for (const d of disclosures) {
+        if (d === null || typeof d !== "object") {
+            lines.push("  (skipped a malformed disclosures[] entry)");
+            continue;
+        }
+        lines.push(`  [${d.id ?? "?"}] ${d.title ?? "?"}`);
+        lines.push(`      ${d.text ?? "?"}`);
     }
     return lines.join("\n");
 }
