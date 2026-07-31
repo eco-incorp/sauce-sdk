@@ -360,20 +360,28 @@ describe('meteora-damm-v1-stable LADDER idle-float CAPACITY — collapse-to-zero
     expect(bytecode[0].length).toBeGreaterThan(0);
   });
 
-  it('the LADDER-CHAIN path (referenceLadderQuotes + referenceCapacities) FREEZES at the last productive checkpoint instead of collapsing — capacities pin the exact checkpoint at the cliff', async () => {
+  it('the LADDER-CHAIN path (referenceLadderQuotes + referenceCapacities) reports the ANALYTIC CLAMP boundary, not the exact geometric cliff: 2 units of cumulative input and 1 unit of output surrendered as PROVABLE headroom against a floored-inverse wobble (never a search, never a collapse — see ladder.ts module doc for the closed-form derivation)', async () => {
     const cfg = await fetchConfig();
     const doctored = withIdleFloat(state, 500_000_000_000n);
     const params = meteoraDammV1StableLadder.paramsFor(cfg);
     const CLIFF = 499_992_225_659n;
-    const PEAK = 499_999_999_998n;
+    // The analytic clamp this fix computes (emitSetup's s<slot>xc / the TS
+    // mirror's analyticCapacity): 2 units of cumulative input below the
+    // exact geometric CLIFF, and its forward quote sits 1 unit below the
+    // true PEAK (499,999,999,998) — the margin is deliberate, provable
+    // headroom (never an over-quote), not an approximation error.
+    const XC = 499_992_225_657n;
+    const OUT_AT_XC = 499_999_999_997n;
     const ladderQuotes = meteoraDammV1StableLadder.referenceLadderQuotes!(cfg, doctored, params, CLOCK_T);
     const capacities = meteoraDammV1StableLadder.referenceCapacities!(cfg, doctored, params, CLOCK_T);
     const [outAtCliff, outPastCliff] = ladderQuotes([CLIFF, CLIFF + 1n]);
     const [capAtCliff, capPastCliff] = capacities([CLIFF, CLIFF + 1n]);
-    expect(outAtCliff).toBe(PEAK);
-    expect(outPastCliff).toBe(PEAK); // FROZEN, not collapsed to 0
-    expect(capAtCliff).toBe(CLIFF);
-    expect(capPastCliff).toBe(CLIFF); // cumulative productive input frozen too — dIn folds to 0 past here
+    expect(outAtCliff).toBe(OUT_AT_XC);
+    expect(outPastCliff).toBe(OUT_AT_XC); // FROZEN, not collapsed to 0
+    expect(capAtCliff).toBe(XC);
+    expect(capPastCliff).toBe(XC); // cumulative productive input frozen too — dIn folds to 0 past here
+    expect(XC).toBeLessThanOrEqual(CLIFF); // the clamp never reaches past the true geometric cliff
+    expect(OUT_AT_XC).toBeLessThan(500_000_000_000n); // strictly below the idle float — the safety property itself
   });
 
   it('MERGE-ALTITUDE (the actual defect): differencing the pre-fix pointwise collapse across a ladder rung manufactured a NEGATIVE dOut — the post-fix capacity pair never does, across every rung straddling the cliff at 2/3/4 rungs', async () => {
