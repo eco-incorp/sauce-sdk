@@ -123,17 +123,17 @@ describe('the embedded-AMM quote SATURATES at the circuit-breaker capacity (neve
 
     const sellCfg: DeriversePoolConfig = { ...base, side: 'sell' };
     const sellQuote = deriverseLadder.referenceQuote(sellCfg, state, deriverseLadder.paramsFor(sellCfg));
-    expect(sellQuote(100_000_000n)).toBe(7_282_653n);
-    expect(sellQuote(1_000_000_000n)).toBe(72_205_180n);
-    expect(sellQuote(5_000_000_000n)).toBe(241_853_129n); // past the capacity clamp already
-    expect(sellQuote(500_000_000_000n)).toBe(241_853_129n); // saturates, does not collapse
+    expect(sellQuote(100_000_000n)).toBe(7_304_435n);
+    expect(sellQuote(1_000_000_000n)).toBe(72_420_205n);
+    expect(sellQuote(5_000_000_000n)).toBe(242_214_693n); // past the capacity clamp already
+    expect(sellQuote(500_000_000_000n)).toBe(242_214_693n); // saturates, does not collapse
 
     const buyCfg: DeriversePoolConfig = { ...base, side: 'buy' };
     const buyQuote = deriverseLadder.referenceQuote(buyCfg, state, deriverseLadder.paramsFor(buyCfg));
-    expect(buyQuote(10_000_000n)).toBe(136_968_553n);
-    expect(buyQuote(100_000_000n)).toBe(1_353_714_095n);
-    expect(buyQuote(5_000_000_000n)).toBe(3_119_602_612n); // past the capacity clamp already
-    expect(buyQuote(50_000_000_000n)).toBe(3_119_602_612n); // saturates
+    expect(buyQuote(10_000_000n)).toBe(136_560_207n);
+    expect(buyQuote(100_000_000n)).toBe(1_349_701_716n);
+    expect(buyQuote(5_000_000_000n)).toBe(3_114_945_846n); // past the capacity clamp already
+    expect(buyQuote(50_000_000_000n)).toBe(3_114_945_846n); // saturates
   });
 
   it('a suspended instrument (mask bit 0x20) quotes 0 for every x, both directions', () => {

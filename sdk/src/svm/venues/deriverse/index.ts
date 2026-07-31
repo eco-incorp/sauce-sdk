@@ -46,12 +46,17 @@
  * trade SATURATES at the breaker instead of a pure, unclamped curve
  * over-promising past what the real instruction would ever deliver.
  *
- * SCOPE GATE: Tokenkeg-only (both `asset`/`crncy` decimals and mint
- * addresses come straight from the instrument header — no extra account
- * read is needed, so the swap CPI carries exactly one token program,
- * matching raydium-amm-v4/obric-v2's own "Tokenkeg-only, no Token-2022"
- * scope note; a Token-2022 transfer-fee mint would desync the wire amount
- * from the curve and is out of scope for this first integration).
+ * SCOPE GATE: Tokenkeg-only. Mint addresses come straight from the
+ * instrument header; the VAULT addresses do not (a Deriverse `TokenState`
+ * bookkeeping PDA per mint carries the real vault in its own
+ * `program_address` field, distinct from the TokenState PDA itself — see
+ * fetchPoolConfig), so resolving the swap CPI's account list needs two
+ * extra one-time reads (never repeated per quote — the ladder's live
+ * reads are the pool account alone). Both legs are assumed classic Tokenkeg
+ * (one token program for the whole swap), matching raydium-amm-v4/
+ * obric-v2's own "Tokenkeg-only, no Token-2022" scope note; a Token-2022
+ * transfer-fee mint would desync the wire amount from the curve and is out
+ * of scope for this first integration.
  */
 import { getAddressCodec, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
@@ -90,6 +95,17 @@ const TAG_SPOT_LINES = 18;
  * fetchPoolConfig accepts anything >= this size, never an exact match.
  */
 export const INSTR_ACCOUNT_HEADER_MIN_SIZE = 1064;
+
+/**
+ * TokenState (drv-smart-contract-common state/token.rs): discriminator(8) +
+ * address(32) + program_address(32) + id(4) + mask(4) + reserved(4) +
+ * base_crncy_index(4) = 88 bytes, verified against real mainnet dumps
+ * (wSOL/USDC/USDT all decode to exactly 88 bytes). `program_address` (the
+ * REAL vault SPL token account, distinct from the TokenState PDA itself) is
+ * at offset 40.
+ */
+const TOKEN_STATE_SIZE = 88;
+const OFF_TOKEN_STATE_PROGRAM_ADDRESS = 40;
 
 // InstrAccountHeader field offsets — all within the STABLE PREFIX (< byte
 // 480, before asset_mint/crncy_mint), verified against real mainnet accounts
@@ -257,7 +273,14 @@ export const deriverse = {
     const crncyMint = pubkeyAt(OFF_CRNCY_MINT);
     const mapsAddress = pubkeyAt(OFF_MAPS_ADDRESS);
 
-    const [assetVault, crncyVault, asksTree, askOrders, bidsTree, bidOrders, lines, clientInfos] = await Promise.all([
+    // asset/crncy VAULTS are NOT the TokenState PDA itself — TokenState is a
+    // small Deriverse bookkeeping record (id/decimals/mask) whose OWN
+    // `program_address` field (offset 40, 32 bytes) names the real SPL
+    // token account holding the instrument's reserves. Conflating the two
+    // (using the TokenState PDA directly as the vault) would attach the
+    // wrong account to the Swap CPI — verified against real mainnet TokenState
+    // dumps (wSOL/USDC/USDT), where the PDA and program_address differ.
+    const [assetTokenStateAddr, crncyTokenStateAddr, asksTree, askOrders, bidsTree, bidOrders, lines, clientInfos] = await Promise.all([
       spotAccForMint(assetMint),
       spotAccForMint(crncyMint),
       spotAcc(TAG_SPOT_ASKS_TREE, assetTokenId, crncyTokenId),
@@ -267,6 +290,17 @@ export const deriverse = {
       spotAcc(TAG_SPOT_LINES, assetTokenId, crncyTokenId),
       spotAcc(TAG_SPOT_CLIENT_INFOS, assetTokenId, crncyTokenId),
     ]);
+    const [assetTokenStateData, crncyTokenStateData] = await Promise.all([load(assetTokenStateAddr), load(crncyTokenStateAddr)]);
+    if (assetTokenStateData === null) throw new Error(`${SLUG} pool ${pool} asset TokenState ${assetTokenStateAddr} not found`);
+    if (crncyTokenStateData === null) throw new Error(`${SLUG} pool ${pool} crncy TokenState ${crncyTokenStateAddr} not found`);
+    if (assetTokenStateData.length < TOKEN_STATE_SIZE) {
+      throw new Error(`${SLUG} pool ${pool} asset TokenState ${assetTokenStateAddr} is ${assetTokenStateData.length} bytes, expected at least ${TOKEN_STATE_SIZE}`);
+    }
+    if (crncyTokenStateData.length < TOKEN_STATE_SIZE) {
+      throw new Error(`${SLUG} pool ${pool} crncy TokenState ${crncyTokenStateAddr} is ${crncyTokenStateData.length} bytes, expected at least ${TOKEN_STATE_SIZE}`);
+    }
+    const assetVault = codec.decode(assetTokenStateData.subarray(OFF_TOKEN_STATE_PROGRAM_ADDRESS, OFF_TOKEN_STATE_PROGRAM_ADDRESS + 32));
+    const crncyVault = codec.decode(crncyTokenStateData.subarray(OFF_TOKEN_STATE_PROGRAM_ADDRESS, OFF_TOKEN_STATE_PROGRAM_ADDRESS + 32));
 
     return {
       venue: SLUG,
