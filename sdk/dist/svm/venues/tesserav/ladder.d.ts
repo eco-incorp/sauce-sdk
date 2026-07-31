@@ -8,8 +8,6 @@ export declare function tesseraVQuoteAB(x: bigint, price0: bigint, mid: bigint, 
 export declare function tesseraVQuoteBA(x: bigint, price0: bigint, mid: bigint, capIn: bigint): bigint;
 export declare const tesseravLadder: {
     slug: string;
-    /** Single-rung: the level-0-only model is one flat rate, so one rung reproduces it exactly. */
-    defaultRungs: number;
     shapeKey(base: PoolConfig): string;
     helpers(base: PoolConfig): {
         name: string;

@@ -121,10 +121,10 @@ describe('tesserav ladder', () => {
     for (let i = 1; i < caps.length; i++) expect(caps[i] >= caps[i - 1]).toBe(true);
   });
 
-  test('shapeKey is direction-scoped and defaultRungs is 1 (a single flat-rate level)', async () => {
+  test('shapeKey is direction-scoped; rungs ride the CP default (the flat-rate model is exact at any rung count)', async () => {
     const { cfg } = await loadConfig();
     expect(tesseravLadder.shapeKey(cfg)).toBe('tesserav:aToB');
-    expect(tesseravLadder.defaultRungs).toBe(1);
+    expect(tesseravLadder.defaultRungs).toBeUndefined();
   });
 
   test('the real per-CPI CU this pass measured stays under the CU_FAMILIES budget the recipe wires (documentation pin, not a live measurement)', () => {
