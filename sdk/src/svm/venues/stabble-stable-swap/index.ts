@@ -143,7 +143,7 @@ export const stabbleStableSwap: SvmVenueAdapter = {
       vault: common.vault,
       authorityBump: common.authorityBump,
       isActive: common.isActive,
-      ampInitialFactor: readUintLE(data as Uint8Array, AMP_INITIAL_OFFSET, 2) as unknown as number,
+      ampInitialFactor: Number(readUintLE(data as Uint8Array, AMP_INITIAL_OFFSET, 2)),
       ampTargetFactor: Number(readUintLE(data as Uint8Array, AMP_TARGET_OFFSET, 2)),
       rampStartTs: readUintLE(data as Uint8Array, RAMP_START_OFFSET, 8),
       rampStopTs: readUintLE(data as Uint8Array, RAMP_STOP_OFFSET, 8),

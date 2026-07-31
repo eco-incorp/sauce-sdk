@@ -80,7 +80,7 @@ export const stabbleStableSwap = {
             vault: common.vault,
             authorityBump: common.authorityBump,
             isActive: common.isActive,
-            ampInitialFactor: readUintLE(data, AMP_INITIAL_OFFSET, 2),
+            ampInitialFactor: Number(readUintLE(data, AMP_INITIAL_OFFSET, 2)),
             ampTargetFactor: Number(readUintLE(data, AMP_TARGET_OFFSET, 2)),
             rampStartTs: readUintLE(data, RAMP_START_OFFSET, 8),
             rampStopTs: readUintLE(data, RAMP_STOP_OFFSET, 8),
