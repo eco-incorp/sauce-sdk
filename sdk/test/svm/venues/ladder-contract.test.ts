@@ -100,6 +100,8 @@ import {
   saberStableswapLadder,
   solfiV2,
   solfiV2Ladder,
+  fetchWoofiConfig,
+  woofiLadder,
 } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
@@ -509,13 +511,34 @@ const FAMILIES: Family[] = [
       ];
     },
   },
+  {
+    slug: 'woofi',
+    ladder: woofiLadder,
+    async variants() {
+      // The real SOL/USDC mainnet dump (test/svm/fixtures/woofi) has the
+      // venue's OWN feasibility gate genuinely tripped (a stale keeper price,
+      // see woofi.test.ts) — degenerate (always 0), so this sweep uses the
+      // SAME patched-fixture technique obric-v2's own tests use for its
+      // drained real snapshot: test/svm/fixtures/woofi-patched only touches
+      // the Pyth price/timestamps (feasibility), never the curve shape.
+      const fixtures = fixturesFor('woofi-patched');
+      const load = fixtureLoader(fixtures);
+      const state = fixtureBytesMap(fixtures);
+      const cfg = await fetchWoofiConfig(load, address('BEz2Suv2WvGKWouU1srbhZfudBGuw9v2VzkhMZHFBdvs'));
+      const now = 1_785_600_000n;
+      return [
+        { label: 'sellBase', cfg: { ...cfg, direction: 'sellBase' as const }, state, now },
+        { label: 'sellQuote', cfg: { ...cfg, direction: 'sellQuote' as const }, state, now },
+      ];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 13 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 15 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(14);
-    expect(FAMILIES).toHaveLength(14);
+    expect(registered).toHaveLength(15);
+    expect(FAMILIES).toHaveLength(15);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
