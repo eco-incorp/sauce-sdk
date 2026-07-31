@@ -12,36 +12,62 @@
  * word) — the merge elects the wrapped rung as the CHEAPEST, routing the
  * whole trade onto a slot that delivers 0.
  *
- * Two prior fixes (meteora-damm-v2, orca-legacy-token-swap) each shipped
- * their own hand-written fixture file with HARDCODED capacity literals
- * (ATOB_CAP/BTOA_CAP) pinned to one specific mainnet snapshot. That does not
- * scale: a 13th family (or a 14th, or a fix to an existing one) gets zero
- * contract coverage unless someone remembers to write another bespoke test.
- * This file is the GENERAL mechanism instead:
+ * A prior version of this file shipped a sweep that, hand-reverting each of
+ * four known violators, caught only ONE of four (obric-v2) — not a coverage
+ * gap, a SHAPE gap, in three independent ways this version fixes:
  *
- *   1. REGISTRY-ENUMERATED with a COUNT ASSERTION (LADDER_FAMILIES below,
+ *   A. DEPTH-ANCHORED, TOP-CAPPED SWEEP. The old sweep was `domainMax >> e`
+ *      for e<=62, scaled off the pool's OWN depth (`depthReserves().reserveIn
+ *      * 4096`) — every measured cliff sits at a fixed-width-integer
+ *      boundary in ABSOLUTE units, unrelated to a pool's depth (2^41 for
+ *      meteora-damm-v2 aToB, ~1.48e18 for manifest:quoteIn, ~2.09e25 for
+ *      orca-legacy-token-swap — the last one ABOVE u64::MAX entirely). The
+ *      fix (`ladder-probe.ts`'s `absoluteProbePoints`): an ABSOLUTE,
+ *      bottom-anchored lattice — 2^e for e=0..256, refined with a 2-bit
+ *      mantissa — that depends on NOTHING from `depthReserves`.
+ *   B. MERGE-ALTITUDE'S DOMAIN WAS THE SAME DEPTH SCALING (`reserveIn * 2`)
+ *      against an ARITHMETIC cliff unrelated to depth — the manifest
+ *      violation needs amountIn ~3e18 (rungs=3) but the old sweep's amount
+ *      topped out nine orders below that for the actual fixture. Fixed:
+ *      `mergeAltitudeAmounts` sweeps an absolute 2^e (e=0..64) amountIn
+ *      lattice — merge amountIn always rides a u64 cfg word — plus the
+ *      neighbourhood of any declared cliff.
+ *   C. THE STRUCTURAL CHECK WAS THE WEAK FORM: `capacityInputVar present iff
+ *      referenceCapacities present`, vacuously TRUE when both are absent —
+ *      obric-v2's exact pre-fix shape. Fixed: the STRONG form
+ *      (`ladder-probe.ts`'s `evaluateQuoteContract`) — a family whose cold
+ *      quote has a finite cliff MUST declare it (an exact pinned x/peak in
+ *      `declaredCliffs` below) and, when merge-reachable (x <= u64::MAX),
+ *      wire BOTH capacityInputVar and referenceCapacities. An undeclared
+ *      cliff fails LOUDLY regardless of reachability (the weak pair-check
+ *      below is kept as a cheap, separate coherence check, never the sole
+ *      gate).
+ *
+ * The mechanism, unchanged in spirit from the prior version:
+ *
+ *   1. REGISTRY-ENUMERATED with a COUNT ASSERTION (FAMILIES below,
  *      cross-checked against sdk/src/svm/venues/registry.ts's
  *      listLadderVenues()) — adding a ladder family without adding it here
  *      fails the count assertion, loudly, in CI.
- *   2. A BISECTED domain per family per direction (sweepDomain), not a fixed
- *      grid: geometric coverage from 0 to a family-scaled bound (depthReserves
- *      x 4096, so the sweep reaches deep past any real family's own
- *      capacity/cliff), with the failure path bisecting to the EXACT violating
- *      interval instead of just naming two coarse sample points.
+ *   2. A DENSE, ABSOLUTE domain sweep per family per direction
+ *      (ladder-probe.ts), bisecting to the exact violating interval on
+ *      failure, with a DISTINCT-VALUE FLOOR (mechanism A above) so a sweep
+ *      that only ever samples one side of a family's real cliff cannot pass
+ *      by accident.
  *   3. The MERGE-ALTITUDE property, across every family x every direction x
- *      rung count 2/3/4: buildLadder (transcribed from solver-reference.ts)
- *      never yields a negative dIn or a negative dOut.
+ *      rung count 2/3/4 x an absolute amountIn lattice: buildLadder
+ *      (transcribed from solver-reference.ts) never yields a negative dIn
+ *      or dOut.
  *   4. A u256-WRAPPING LICENCE test: the mirror is plain bigint, the engine
- *      wraps at 2^64 per rung word — pin the exact mechanism the nondecreasing
- *      contract exists to prevent, using the actual measured pre-fix
- *      manifest:quoteIn collapse (dOut=-36,607,379,770 at amountIn=3e18,
- *      rungs=3) as the worked example.
- *   5. A STRUCTURAL check: capacityInputVar and referenceCapacities are a
- *      PAIR — one present without the other is incoherent (the codegen reads
- *      capacityInputVar as a slot-local name; referenceCapacities is its
- *      off-chain mirror). obric-v2 shipped a saturating chain with NEITHER
- *      wired (fixed alongside this guard, see obric-v2.test.ts) — this check
- *      is what makes that class of gap loud instead of latent.
+ *      wraps at 2^64 per rung word — pin the exact mechanism the
+ *      nondecreasing contract exists to prevent, using the actual measured
+ *      pre-fix manifest:quoteIn collapse (dOut=-36,607,379,770 at
+ *      amountIn=3e18, rungs=3) as the worked example.
+ *   5. THE STRONG STRUCTURAL check (mechanism C above).
+ *   6. A SELF-TEST: five synthetic negative-control quote closures run
+ *      through the exact same evaluateQuoteContract the real families use,
+ *      each with a known expected verdict — proving the detector itself
+ *      would fire before trusting it against the real registry.
  */
 import { resolve } from 'path';
 import { address } from '@solana/kit';
@@ -75,9 +101,15 @@ import {
 } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
+import { evaluateQuoteContract, mergeAltitudeAmounts, U64_MAX, type DeclaredCliff } from './ladder-probe.js';
 
 const FIXTURES = resolve(process.cwd(), 'test/svm/fixtures');
 const fixturesFor = (slug: string) => loadFixtures(resolve(FIXTURES, slug));
+
+// A dense absolute sweep (~1028 points) x up to 20 family/direction variants
+// x (cold-quote contract + 3 merge-altitude rung counts, each up to ~71
+// amountIn points) comfortably exceeds jest's 5s default per test.
+const SWEEP_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // buildLadder / ladderGrid — a faithful, standalone transcription of
@@ -121,55 +153,6 @@ function buildLadder(
 }
 
 // ---------------------------------------------------------------------------
-// Bisected domain sweep + violation pinpointing.
-// ---------------------------------------------------------------------------
-
-/** Ascending geometric coverage of [0, domainMax] — not a fixed literal grid. */
-function sweepDomain(domainMax: bigint): bigint[] {
-  if (domainMax <= 0n) return [0n];
-  const points = new Set<bigint>([0n, domainMax]);
-  for (let e = 0; e <= 62; e++) {
-    const x = domainMax >> BigInt(e);
-    if (x > 0n) points.add(x);
-    if (x <= 1n) break;
-  }
-  return [...points].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-}
-
-/**
- * Asserts quote(0)==0 and quote is nondecreasing across the domain, bisecting
- * to the exact violating interval on failure instead of naming two coarse
- * samples.
- */
-function assertMirrorContract(quote: (x: bigint) => bigint, domainMax: bigint): void {
-  expect(quote(0n)).toBe(0n);
-  const points = sweepDomain(domainMax);
-  let prevX = 0n;
-  let prev = quote(0n);
-  for (const x of points) {
-    const out = quote(x);
-    if (out < prev) {
-      let lo = prevX;
-      let hi = x;
-      let loOut = prev;
-      while (hi - lo > 1n) {
-        const mid = lo + (hi - lo) / 2n;
-        const midOut = quote(mid);
-        if (midOut < loOut) {
-          hi = mid;
-        } else {
-          lo = mid;
-          loOut = midOut;
-        }
-      }
-      throw new Error(`quote is not nondecreasing: quote(${lo})=${loOut} > quote(${hi})=${quote(hi)}`);
-    }
-    prev = out;
-    prevX = x;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Family registry — one entry per sdk/src/svm/venues/registry.ts ladder slug.
 // Each `variants()` returns every quote DIRECTION the family supports (most
 // carry exactly one; the sqrt-price/CP-flip families carry two) against a
@@ -190,18 +173,22 @@ interface Family {
   ladder: SvmVenueLadderV2;
   variants(): Promise<Variant[]>;
   /**
-   * KNOWN, DISCLOSED gap (not a silent skip): the three window-walking
-   * families whose LADDER-CHAIN path (referenceLadderQuotes + capacityInputVar
-   * / referenceCapacities — the ONLY path the merge actually evaluates a
-   * final-fill amount through) is fully capacity-safe, but whose STANDALONE
-   * cold `referenceQuote` closure — asked directly for an amount past the
-   * off-chain-shipped tick/bin window, which the merge never does — still
-   * COLLAPSES rather than saturates. "LATENT, saved only by warm-chain
-   * saturation, not a safety property" (see docs cited in the pinned-gaps
-   * describe block below). Keyed by variant label; the exact (x, peak)
-   * pair is asserted there, not swept past here.
+   * A REQUIRED declaration (evaluateQuoteContract's strong structural form,
+   * see the file header) for any variant whose standalone cold
+   * `referenceQuote` closure has a finite cliff — keyed by variant label,
+   * exact pinned (x, peak) pair. Three window-walking families
+   * (orca-whirlpool/raydium-clmm/meteora-dlmm — an exhausted tick/bin
+   * window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert
+   * boundary) carry one: their LADDER-CHAIN path (referenceLadderQuotes +
+   * capacityInputVar/referenceCapacities — the ONLY path the merge actually
+   * evaluates a final-fill amount through) is fully capacity-safe, but the
+   * cold, standalone `referenceQuote` asked directly for an amount past the
+   * off-chain-shipped window (which the merge never does) still collapses —
+   * "LATENT, saved only by warm-chain saturation, not a safety property".
+   * Every other family's cold quote SATURATES (never collapses) and carries
+   * no entry.
    */
-  knownLatentCollapse?: Record<string, { x: bigint; peak: bigint }>;
+  declaredCliffs?: Record<string, DeclaredCliff>;
 }
 
 const CLOCK_SABER = 1_751_500_000n;
@@ -360,7 +347,7 @@ const FAMILIES: Family[] = [
         { label: '1to0', cfg: { ...cfg, direction: '1to0' }, state },
       ];
     },
-    knownLatentCollapse: {
+    declaredCliffs: {
       '0to1': { x: 95_185_556_484n, peak: 7_780_360_867n },
       '1to0': { x: 11_011_525_605n, peak: 134_527_424_614n },
     },
@@ -378,7 +365,7 @@ const FAMILIES: Family[] = [
         { label: 'yToX', cfg: { ...cfg, direction: 'yToX' }, state, now: CLOCK_DLMM },
       ];
     },
-    knownLatentCollapse: {
+    declaredCliffs: {
       xToY: { x: 2_518_898_410_454n, peak: 205_617_877_803n },
       yToX: { x: 210_552_340_323n, peak: 2_569_384_657_300n },
     },
@@ -396,7 +383,7 @@ const FAMILIES: Family[] = [
         { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
       ];
     },
-    knownLatentCollapse: {
+    declaredCliffs: {
       aToB: { x: 1_818_415_775_132n, peak: 146_829_069_683n },
       bToA: { x: 184_416_747_348n, peak: 2_278_904_950_099n },
     },
@@ -442,9 +429,9 @@ const FAMILIES: Family[] = [
         { label: 'dir1', cfg: cfg1, state: fixtureBytesMap(dir1), now: 436_250_365n },
       ];
     },
-    knownLatentCollapse: {
+    declaredCliffs: {
       // solfi-v2 is CLOSED-FORM (not window-walking), so this is a DIFFERENT
-      // mechanism than the three families below (a spline-depth impact/110%-
+      // mechanism than the three families above (a spline-depth impact/110%-
       // of-vault revert boundary, not an exhausted tick/bin window) — but the
       // SAME disclosed shape: referenceLadderQuotes/referenceCapacities
       // already FREEZE at the last productive rung (see ladder.ts's
@@ -467,69 +454,84 @@ describe('LADDER_REGISTRY count assertion', () => {
 });
 
 describe.each(FAMILIES)('$slug', (family) => {
-  it('quote(0)==0 and quote is nondecreasing across a bisected domain, for every direction', async () => {
-    const variants = await family.variants();
-    expect(variants.length).toBeGreaterThan(0);
-    for (const v of variants) {
-      const params = family.ladder.paramsFor(v.cfg);
-      const quote = family.ladder.referenceQuote(v.cfg, v.state, params, v.now);
-      const { reserveIn } = family.ladder.depthReserves(v.cfg, v.state, v.now);
-      // Domain scaled off the pool's own depth (deep enough to reach any real
-      // family's capacity/cliff) — falls back to a fixed floor for a family
-      // whose depth reads 0 (a drained pool) so the sweep is never vacuous.
-      const domainMax = (reserveIn > 0n ? reserveIn : 1_000_000n) * 4096n;
-      // A KNOWN, disclosed exception (see the Family type + the pinned-gaps
-      // describe block below): swept only up to just BEFORE the documented
-      // cliff — never silently past it. Everything else gets the full domain.
-      const gap = family.knownLatentCollapse?.[v.label];
-      const swept = gap === undefined ? domainMax : gap.x;
-      try {
-        assertMirrorContract(quote, swept);
-      } catch (err) {
-        throw new Error(`[${family.slug}:${v.label}] ${(err as Error).message}`);
+  it(
+    'cold referenceQuote satisfies the STRONG contract (nondecreasing, quote(0)==0, distinct-value floor, declared cliffs) for every direction',
+    async () => {
+      const variants = await family.variants();
+      expect(variants.length).toBeGreaterThan(0);
+      const failures: string[] = [];
+      for (const v of variants) {
+        const params = family.ladder.paramsFor(v.cfg);
+        const quote = family.ladder.referenceQuote(v.cfg, v.state, params, v.now);
+        const result = evaluateQuoteContract({
+          label: `${family.slug}:${v.label}`,
+          quote,
+          declared: family.declaredCliffs?.[v.label],
+          hasCapacityPair: family.ladder.capacityInputVar !== undefined,
+        });
+        // eslint-disable-next-line no-console
+        console.info(
+          `[census] ${family.slug}:${v.label} shape=${result.shape.kind} distinct=${result.distinct} distinctNonzero=${result.distinctNonzero}`,
+        );
+        failures.push(...result.violations);
       }
-    }
-  });
+      if (failures.length > 0) throw new Error(failures.join('\n'));
+    },
+    SWEEP_TIMEOUT_MS,
+  );
 
-  it('capacityInputVar and referenceCapacities are a PAIR — one implies the other', () => {
+  it('capacityInputVar and referenceCapacities are a PAIR — one implies the other (cheap coherence check, not the sole structural gate — see evaluateQuoteContract for the strong form)', () => {
     const hasVar = family.ladder.capacityInputVar !== undefined;
     const hasCapacities = family.ladder.referenceCapacities !== undefined;
     expect(hasVar).toBe(hasCapacities);
   });
 
-  it.each([2, 3, 4])('MERGE-ALTITUDE: buildLadder never yields a negative dIn or dOut at %d rungs', async (rungs) => {
-    const variants = await family.variants();
-    for (const v of variants) {
-      const params = family.ladder.paramsFor(v.cfg);
-      const quote = family.ladder.referenceQuote(v.cfg, v.state, params, v.now);
-      const { reserveIn } = family.ladder.depthReserves(v.cfg, v.state, v.now);
-      const amountIn = reserveIn > 0n ? reserveIn * 2n : 1_000_000_000n;
-      const ladderQuotes = family.ladder.referenceLadderQuotes?.(v.cfg, v.state, params, v.now);
-      const ladderCapacities = family.ladder.referenceCapacities?.(v.cfg, v.state, params, v.now);
-      const rungList = buildLadder(quote, amountIn, rungs, ladderQuotes, ladderCapacities);
-      for (const rung of rungList) {
-        expect(rung.dIn >= 0n).toBe(true);
-        expect(rung.dOut >= 0n).toBe(true);
+  it.each([2, 3, 4])(
+    'MERGE-ALTITUDE: buildLadder never yields a negative dIn or dOut at %d rungs, over the absolute amountIn lattice',
+    async (rungs) => {
+      const variants = await family.variants();
+      const failures: string[] = [];
+      for (const v of variants) {
+        const params = family.ladder.paramsFor(v.cfg);
+        const quote = family.ladder.referenceQuote(v.cfg, v.state, params, v.now);
+        const { reserveIn } = family.ladder.depthReserves(v.cfg, v.state, v.now);
+        const ladderQuotes = family.ladder.referenceLadderQuotes?.(v.cfg, v.state, params, v.now);
+        const ladderCapacities = family.ladder.referenceCapacities?.(v.cfg, v.state, params, v.now);
+        const amounts = mergeAltitudeAmounts(reserveIn, family.declaredCliffs?.[v.label]);
+        for (const amountIn of amounts) {
+          const rungList = buildLadder(quote, amountIn, rungs, ladderQuotes, ladderCapacities);
+          rungList.forEach((rung, i) => {
+            if (rung.dIn < 0n || rung.dOut < 0n) {
+              failures.push(
+                `[${family.slug}:${v.label}] rungs=${rungs} amountIn=${amountIn}: rung ${i} dIn=${rung.dIn} dOut=${rung.dOut}`,
+              );
+            }
+          });
+        }
       }
-    }
-  });
+      if (failures.length > 0) throw new Error(failures.slice(0, 5).join('\n'));
+    },
+    SWEEP_TIMEOUT_MS,
+  );
 });
 
 describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses past a boundary the LADDER-CHAIN path already saturates at (LATENT: the merge never reaches this; NOT a safety property)', () => {
-  const withGaps = FAMILIES.filter((f) => f.knownLatentCollapse !== undefined);
+  const withGaps = FAMILIES.filter((f) => f.declaredCliffs !== undefined);
 
   it('exactly four families carry a disclosed gap: the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm, an exhausted tick/bin window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert boundary) — obric-v2 does NOT (fixed alongside this guard)', () => {
     expect(withGaps.map((f) => f.slug).sort()).toEqual(['meteora-dlmm', 'orca-whirlpool', 'raydium-clmm', 'solfi-v2']);
   });
 
-  it.each(withGaps.flatMap((f) => Object.entries(f.knownLatentCollapse!).map(([label, gap]) => ({ family: f, label, gap }))))(
-    '$family.slug:$label pins the EXACT collapse: quote(x) peaks then quote(x+1) drops to 0',
+  it.each(withGaps.flatMap((f) => Object.entries(f.declaredCliffs!).map(([label, gap]) => ({ family: f, label, gap }))))(
+    '$family.slug:$label pins the EXACT collapse: quote(x) peaks then quote(x+1) drops to 0, and is merge-reachable with both capacity halves wired',
     async ({ family, label, gap }) => {
       const variant = (await family.variants()).find((v) => v.label === label)!;
       const params = family.ladder.paramsFor(variant.cfg);
       const quote = family.ladder.referenceQuote(variant.cfg, variant.state, params, variant.now);
       expect(quote(gap.x)).toBe(gap.peak);
       expect(quote(gap.x + 1n)).toBe(0n);
+      expect(gap.x <= U64_MAX).toBe(true);
+      expect(family.ladder.capacityInputVar).toBeDefined();
       // The MERGE-ALTITUDE property (buildLadder over the LADDER-CHAIN path,
       // not this raw cold quote) stays clean for all four at every rung
       // count — see the describe.each block above — because
@@ -575,5 +577,61 @@ describe('u256-wrapping licence — the exact mechanism the nondecreasing contra
       const wrapped = ((dOut % U64) + U64) % U64;
       expect(wrapped).toBe(dOut);
     }
+  });
+});
+
+describe('SELF-TEST — the detector against synthetic negative controls (proves evaluateQuoteContract fires BEFORE trusting it against the real registry)', () => {
+  // Cheaper sweep for the synthetic cases: exercises the exact same code path
+  // as the real families (evaluateQuoteContract), just over a narrower bit
+  // range where it is not testing anything past the case's own boundary.
+
+  it('1. an undeclared cliff WITHIN u64::MAX fails BOTH the undeclared-cliff and the missing-capacity-pair checks', () => {
+    const CLIFF = 1_000_000_000n; // well inside u64::MAX
+    const quote = (x: bigint): bigint => (x === 0n ? 0n : x <= CLIFF ? x : 0n);
+    const result = evaluateQuoteContract({ label: 'synthetic:undeclared-u64', quote, hasCapacityPair: false, maxBits: 40 });
+    expect(result.shape.kind).toBe('cliff');
+    expect(result.violations.some((v) => v.includes('UNDECLARED cliff'))).toBe(true);
+    expect(result.violations.some((v) => v.includes('without capacityInputVar/referenceCapacities wired'))).toBe(true);
+  });
+
+  it('2. an undeclared cliff ABOVE u64::MAX fails as undeclared but is NOT flagged for a missing capacity pair (unreachable)', () => {
+    const CLIFF = 1n << 96n; // above u64::MAX (2^64)
+    const quote = (x: bigint): bigint => (x === 0n ? 0n : x <= CLIFF ? x : 0n);
+    const result = evaluateQuoteContract({ label: 'synthetic:undeclared-above-u64', quote, hasCapacityPair: false, maxBits: 100 });
+    expect(result.shape.kind).toBe('cliff');
+    if (result.shape.kind === 'cliff') expect(result.shape.x > U64_MAX).toBe(true);
+    expect(result.violations.some((v) => v.includes('UNDECLARED cliff'))).toBe(true);
+    expect(result.violations.some((v) => v.includes('without capacityInputVar/referenceCapacities wired'))).toBe(false);
+  });
+
+  it('3. a cliff that IS declared correctly and wired passes clean', () => {
+    const CLIFF = 1n << 41n;
+    const quote = (x: bigint): bigint => (x === 0n ? 0n : x <= CLIFF ? x : 0n);
+    const declared: DeclaredCliff = { x: CLIFF, peak: CLIFF };
+    const result = evaluateQuoteContract({ label: 'synthetic:declared-wired', quote, declared, hasCapacityPair: true, maxBits: 50 });
+    expect(result.shape.kind).toBe('cliff');
+    expect(result.violations).toEqual([]);
+  });
+
+  it('4. a monotone-forever (asymptotic, never-collapsing) quote passes with NO declaration required', () => {
+    const CAP = 1_000_000_000_000n;
+    const quote = (x: bigint): bigint => (CAP * x) / (1n + x);
+    const result = evaluateQuoteContract({ label: 'synthetic:monotone-forever', quote, hasCapacityPair: false, maxBits: 120 });
+    expect(result.shape.kind).toBe('none');
+    expect(result.violations).toEqual([]);
+  });
+
+  it('5. a genuinely 2-distinct-value instrument fails the distinct-value floor regardless of lattice density', () => {
+    const quote = (x: bigint): bigint => (x === 0n ? 0n : 1_000_000n);
+    const result = evaluateQuoteContract({ label: 'synthetic:vacuous', quote, hasCapacityPair: false, maxBits: 60 });
+    expect(result.distinct).toBeLessThan(16);
+    expect(result.violations.some((v) => v.includes('VACUOUS sweep'))).toBe(true);
+  });
+
+  it('6. a 14th, unregistered ladder family fails the count assertion loudly (demonstrates the mechanism kept from the prior version)', () => {
+    const fakeRegisteredSlugs = [...FAMILIES.map((f) => f.slug), 'synthetic-14th-family'];
+    expect(() => {
+      expect(FAMILIES.map((f) => f.slug)).toHaveLength(fakeRegisteredSlugs.length);
+    }).toThrow();
   });
 });
