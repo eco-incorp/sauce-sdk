@@ -21,6 +21,7 @@ import { saberStableswap } from './saber-stableswap/index.js';
 import { saberStableswapLadder } from './saber-stableswap/ladder.js';
 import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
+import { tesseravLadder } from './tesserav/ladder.js';
 import { woofiLadder } from './woofi/ladder.js';
 import { perpsJlpLadder } from './perps-jlp/ladder.js';
 // Adapter table. Keys MUST equal adapter.slug — venueAdapter reports them as
@@ -58,7 +59,7 @@ export function venueAdapter(slug) {
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
  * SUBSET — 7 of these 18 families also implement the v1 surface; manifest/
  * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/goonfi-v2/solfi-v2/
- * quantum/woofi/deriverse/perps-jlp are ladder-only).
+ * quantum/tesserav/woofi/deriverse/perps-jlp are ladder-only).
  */
 const ladderAdapters = {
     [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
@@ -76,6 +77,7 @@ const ladderAdapters = {
     [goonfiV2Ladder.slug]: goonfiV2Ladder,
     [solfiV2Ladder.slug]: solfiV2Ladder,
     [quantumLadder.slug]: quantumLadder,
+    [tesseravLadder.slug]: tesseravLadder,
     [woofiLadder.slug]: woofiLadder,
     [deriverseLadder.slug]: deriverseLadder,
     [perpsJlpLadder.slug]: perpsJlpLadder,

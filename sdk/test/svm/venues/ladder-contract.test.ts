@@ -103,6 +103,8 @@ import {
   saberStableswapLadder,
   solfiV2,
   solfiV2Ladder,
+  fetchTesseraVConfig,
+  tesseravLadder,
   fetchWoofiConfig,
   woofiLadder,
   perpsJlpLadder,
@@ -643,6 +645,21 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'tesserav',
+    ladder: tesseravLadder,
+    async variants() {
+      // ONE verified direction only — see tesserav/ladder.ts's module doc:
+      // 'bToA' is a hard gate in fetchTesseraVConfig (unverified swap-CPI
+      // account order; a launched-then-failing CPI aborts the whole cook on
+      // SVM, so this stays a gate, not a self-drop, until a second live
+      // replay confirms the reverse shape).
+      const POOL = address('FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n');
+      const fixtures = fixturesFor('tesserav');
+      const cfg = await fetchTesseraVConfig(fixtureLoader(fixtures), POOL, 'aToB');
+      return [{ label: 'aToB', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
     slug: 'perps-jlp',
     ladder: perpsJlpLadder,
     async variants() {
@@ -741,10 +758,10 @@ const FAMILIES: Family[] = [
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 18 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 19 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(18);
-    expect(FAMILIES).toHaveLength(18);
+    expect(registered).toHaveLength(19);
+    expect(FAMILIES).toHaveLength(19);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
