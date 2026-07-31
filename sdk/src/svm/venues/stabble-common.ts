@@ -302,6 +302,32 @@ export function stableCalcInvariantN(amplification: bigint, balances: readonly b
 }
 
 /** get_token_balance_given_invariant_n_all_other_balances — <=64 rounds, converged when |Δ| <= 1. */
+function stableSolveY(amplification: bigint, balances: readonly bigint[], invariant: bigint, excludedBalance: bigint, y0: bigint): bigint {
+  const n = BigInt(balances.length);
+  const ampTimesTotal = amplification * n;
+  let sum = balances[0];
+  let p = balances[0] * n;
+  for (let i = 1; i < balances.length; i++) {
+    const pI = balances[i] * n;
+    p = mulDivDown(p, pI, invariant);
+    sum = sum + balances[i];
+  }
+  sum = sum - excludedBalance;
+  const invariant2 = invariant * invariant;
+  const c = mulDivUp(invariant2, STABLE_AMP_PRECISION, ampTimesTotal * p) * excludedBalance;
+  const b = mulDivDown(invariant, STABLE_AMP_PRECISION, ampTimesTotal) + sum;
+
+  let tokenBalance = y0;
+  for (let round = 0; round < 64; round++) {
+    const prev = tokenBalance;
+    tokenBalance = divUpRaw(tokenBalance * tokenBalance + c, 2n * tokenBalance + b - invariant);
+    const diff = tokenBalance > prev ? tokenBalance - prev : prev - tokenBalance;
+    if (diff <= STABLE_BALANCE_THRESHOLD) return tokenBalance;
+  }
+  return tokenBalance; // best-effort after 64 rounds — see stableCalcInvariantN
+}
+
+/** get_token_balance_given_invariant_n_all_other_balances — cold start (the venue's own initial guess), see stableSolveY for the shared Newton loop. */
 export function stableGetBalanceGivenInvariant(
   amplification: bigint,
   balances: readonly bigint[],
@@ -321,15 +347,19 @@ export function stableGetBalanceGivenInvariant(
   const invariant2 = invariant * invariant;
   const c = mulDivUp(invariant2, STABLE_AMP_PRECISION, ampTimesTotal * p) * excludedBalance;
   const b = mulDivDown(invariant, STABLE_AMP_PRECISION, ampTimesTotal) + sum;
+  const y0 = divUpRaw(invariant2 + c, invariant + b);
+  return stableSolveY(amplification, balances, invariant, excludedBalance, y0);
+}
 
-  let tokenBalance = divUpRaw(invariant2 + c, invariant + b);
-  for (let round = 0; round < 64; round++) {
-    const prev = tokenBalance;
-    tokenBalance = divUpRaw(tokenBalance * tokenBalance + c, 2n * tokenBalance + b - invariant);
-    const diff = tokenBalance > prev ? tokenBalance - prev : prev - tokenBalance;
-    if (diff <= STABLE_BALANCE_THRESHOLD) return tokenBalance;
-  }
-  return tokenBalance; // best-effort after 64 rounds — see stableCalcInvariantN
+/** Ladder warm-start variant: same Newton recursion, starting from a caller-supplied y0 (the previous rung's converged y) instead of the cold initial guess. Passing y0 = invariant reproduces the cold start exactly. */
+export function stableGetBalanceGivenInvariantWarm(
+  amplification: bigint,
+  balances: readonly bigint[],
+  invariant: bigint,
+  excludedBalance: bigint,
+  y0: bigint,
+): bigint {
+  return stableSolveY(amplification, balances, invariant, excludedBalance, y0);
 }
 
 /** calc_out_given_in — the exact-in quote (wrapped units, no fee applied yet). Returns 0 (not throw) on a degenerate/dust input the venue's own checked_sub would fail on, matching the engine's div-by-zero-yields-0 convention used throughout this codebase for quote fragments. */
@@ -395,6 +425,94 @@ export function stableGetAmplification(
  * never a revert — matched here so a degenerate pool quotes 0 instead of
  * poisoning the merge.
  */
+/**
+ * SauceScript SOURCE for the N-token D-Newton ALONE (calc_invariant) — the
+ * ladder's warm-start split of `stableQuoteHelperSource`: an N-token pool's
+ * D depends only on the reserves, so it is computed ONCE per trade (in
+ * `emitSetup`), not once per rung. Same <=64 rounds / converge |Δ|<=100 as
+ * the combined helper; see that function's doc for the ceiling-division and
+ * zero-divisor conventions (identical here).
+ */
+export function stableDHelperSource(n: number): { name: string; source: string } {
+  if (!Number.isInteger(n) || n < STABLE_MIN_TOKENS || n > STABLE_MAX_TOKENS) {
+    throw new Error(`stableDHelperSource needs N in [${STABLE_MIN_TOKENS}, ${STABLE_MAX_TOKENS}], got ${n}`);
+  }
+  const name = `stabbleStableDN${n}`;
+  const balParams = Array.from({ length: n }, (_, i) => `bal${i}`).join(', ');
+  const sumExpr = Array.from({ length: n }, (_, i) => `bal${i}`).join(' + ');
+  const lines: string[] = [];
+  lines.push(`function ${name}(amp, ${balParams}) {`);
+  lines.push(`  const sum = ${sumExpr};`);
+  lines.push(`  let d = 0;`);
+  lines.push(`  if (sum > 0) {`);
+  lines.push(`    const ampN = amp * ${n};`);
+  lines.push(`    d = sum;`);
+  lines.push(`    let ddiff = 101;`);
+  lines.push(`    for (let iter = 0; iter < 64 && ddiff > 100; iter++) {`);
+  lines.push(`      let p = d;`);
+  for (let i = 0; i < n; i++) lines.push(`      p = Math.mulDiv(p, d, bal${i} * ${n});`);
+  lines.push(`      const prevD = d;`);
+  lines.push(
+    `      d = Math.mulDiv(Math.mulDiv(ampN, sum, 1000) + p * ${n}, d, Math.mulDiv(ampN - 1000, d, 1000) + ${n + 1} * p);`,
+  );
+  lines.push(`      ddiff = d - prevD;`);
+  lines.push(`      if (prevD > d) { ddiff = prevD - d }`);
+  lines.push(`    }`);
+  lines.push(`  }`);
+  lines.push(`  return d;`);
+  lines.push(`}`);
+  return { name, source: lines.join('\n') };
+}
+
+/**
+ * SauceScript SOURCE for the excluded-balance Y-Newton ALONE, WARM-STARTABLE
+ * from a caller-supplied `y0` (the ladder's warm-start split of
+ * `stableQuoteHelperSource`): identical math to
+ * `stableGetBalanceGivenInvariant` EXCEPT the cold initial-guess formula is
+ * replaced by the caller's `y0` — passing `y0 = d` (the venue's own cold
+ * start) reproduces the venue-exact final quote; a ladder thread the
+ * PREVIOUS rung's converged y instead, cutting iterations to ~1-2 (a larger
+ * cumulative input means a smaller y, so the previous rung's y still
+ * approaches the fixed point from above — exactly `stableYW`'s justification
+ * for the 2-coin case, unchanged by generalizing to N tokens). Same
+ * ceiling-division / zero-divisor conventions as `stableQuoteHelperSource`.
+ */
+export function stableYWarmHelperSource(n: number): { name: string; source: string } {
+  if (!Number.isInteger(n) || n < STABLE_MIN_TOKENS || n > STABLE_MAX_TOKENS) {
+    throw new Error(`stableYWarmHelperSource needs N in [${STABLE_MIN_TOKENS}, ${STABLE_MAX_TOKENS}], got ${n}`);
+  }
+  const name = `stabbleStableYWarmN${n}`;
+  const balParams = Array.from({ length: n }, (_, i) => `bal${i}`).join(', ');
+  const lines: string[] = [];
+  lines.push(`function ${name}(amp, ${balParams}, amountIn, d, y0) {`);
+  lines.push(`  const ampN = amp * ${n};`);
+  lines.push(`  const newBal0 = bal0 + amountIn;`);
+  const sum2Terms = ['newBal0', ...Array.from({ length: n - 1 }, (_, i) => `bal${i + 1}`)];
+  lines.push(`  let sum2 = ${sum2Terms.join(' + ')};`);
+  lines.push(`  let p2 = newBal0 * ${n};`);
+  for (let i = 1; i < n; i++) lines.push(`  p2 = Math.mulDiv(p2, bal${i} * ${n}, d);`);
+  lines.push(`  sum2 = sum2 - bal1;`);
+  lines.push(`  const d2 = d * d;`);
+  lines.push(`  const cNum = d2 * 1000;`);
+  lines.push(`  const cDen = ampN * p2;`);
+  lines.push(`  let c = 0;`);
+  lines.push(`  if (cDen > 0) { c = ((cNum + cDen - 1) / cDen) * bal1 }`);
+  lines.push(`  const bTerm = Math.mulDiv(d, 1000, ampN) + sum2;`);
+  lines.push(`  let y = y0;`);
+  lines.push(`  let ydiff = 2;`);
+  lines.push(`  for (let iter = 0; iter < 64 && ydiff > 1; iter++) {`);
+  lines.push(`    const prevY = y;`);
+  lines.push(`    const yNum = y * y + c;`);
+  lines.push(`    const yDen = 2 * y + bTerm - d;`);
+  lines.push(`    if (yDen > 0) { y = (yNum + yDen - 1) / yDen }`);
+  lines.push(`    ydiff = y - prevY;`);
+  lines.push(`    if (prevY > y) { ydiff = prevY - y }`);
+  lines.push(`  }`);
+  lines.push(`  return y;`);
+  lines.push(`}`);
+  return { name, source: lines.join('\n') };
+}
+
 export function stableQuoteHelperSource(n: number): { name: string; source: string } {
   if (!Number.isInteger(n) || n < STABLE_MIN_TOKENS || n > STABLE_MAX_TOKENS) {
     throw new Error(`stableQuoteHelperSource needs N in [${STABLE_MIN_TOKENS}, ${STABLE_MAX_TOKENS}], got ${n}`);

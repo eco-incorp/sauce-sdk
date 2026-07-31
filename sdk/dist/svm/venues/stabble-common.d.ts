@@ -75,8 +75,10 @@ export declare const STABLE_MIN_TOKENS = 2;
 export declare const STABLE_MAX_TOKENS = 5;
 /** calc_invariant — Newton-Raphson D, <=64 rounds, converged when |D - Dprev| <= 100 (NOT 1 — Stabble's own default threshold, distinct from the 2-coin curve's threshold of 1). */
 export declare function stableCalcInvariantN(amplification: bigint, balances: readonly bigint[]): bigint;
-/** get_token_balance_given_invariant_n_all_other_balances — <=64 rounds, converged when |Δ| <= 1. */
+/** get_token_balance_given_invariant_n_all_other_balances — cold start (the venue's own initial guess), see stableSolveY for the shared Newton loop. */
 export declare function stableGetBalanceGivenInvariant(amplification: bigint, balances: readonly bigint[], invariant: bigint, excludedBalance: bigint): bigint;
+/** Ladder warm-start variant: same Newton recursion, starting from a caller-supplied y0 (the previous rung's converged y) instead of the cold initial guess. Passing y0 = invariant reproduces the cold start exactly. */
+export declare function stableGetBalanceGivenInvariantWarm(amplification: bigint, balances: readonly bigint[], invariant: bigint, excludedBalance: bigint, y0: bigint): bigint;
 /** calc_out_given_in — the exact-in quote (wrapped units, no fee applied yet). Returns 0 (not throw) on a degenerate/dust input the venue's own checked_sub would fail on, matching the engine's div-by-zero-yields-0 convention used throughout this codebase for quote fragments. */
 export declare function stableCalcOutGivenIn(amplification: bigint, balances: readonly bigint[], tokenIndexIn: number, tokenIndexOut: number, amountIn: bigint, invariant: bigint): bigint;
 /** get_amplification: linear ramp interpolation, clamped at the ramp window's ends (60s-quantized elapsed, matching the on-chain `checked_div(60)?.checked_mul(60)?`). */
@@ -106,6 +108,35 @@ export declare function stableGetAmplification(ampInitialFactor: number, ampTarg
  * never a revert — matched here so a degenerate pool quotes 0 instead of
  * poisoning the merge.
  */
+/**
+ * SauceScript SOURCE for the N-token D-Newton ALONE (calc_invariant) — the
+ * ladder's warm-start split of `stableQuoteHelperSource`: an N-token pool's
+ * D depends only on the reserves, so it is computed ONCE per trade (in
+ * `emitSetup`), not once per rung. Same <=64 rounds / converge |Δ|<=100 as
+ * the combined helper; see that function's doc for the ceiling-division and
+ * zero-divisor conventions (identical here).
+ */
+export declare function stableDHelperSource(n: number): {
+    name: string;
+    source: string;
+};
+/**
+ * SauceScript SOURCE for the excluded-balance Y-Newton ALONE, WARM-STARTABLE
+ * from a caller-supplied `y0` (the ladder's warm-start split of
+ * `stableQuoteHelperSource`): identical math to
+ * `stableGetBalanceGivenInvariant` EXCEPT the cold initial-guess formula is
+ * replaced by the caller's `y0` — passing `y0 = d` (the venue's own cold
+ * start) reproduces the venue-exact final quote; a ladder thread the
+ * PREVIOUS rung's converged y instead, cutting iterations to ~1-2 (a larger
+ * cumulative input means a smaller y, so the previous rung's y still
+ * approaches the fixed point from above — exactly `stableYW`'s justification
+ * for the 2-coin case, unchanged by generalizing to N tokens). Same
+ * ceiling-division / zero-divisor conventions as `stableQuoteHelperSource`.
+ */
+export declare function stableYWarmHelperSource(n: number): {
+    name: string;
+    source: string;
+};
 export declare function stableQuoteHelperSource(n: number): {
     name: string;
     source: string;
