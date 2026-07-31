@@ -52,9 +52,28 @@ export type SettleFailureCode =
   | "BODY_LENGTH"
   | "BODY_HASH"
   | "TEMPLATE_REVOKED"
+  /** The pinned-root match itself was internally inconsistent (a matched entry with no `id`) —
+   *  see `internal/root-testing.ts`'s fail-closed guard. Reachable only through that file's
+   *  test-only `root` parameter; `SETTLE_TEMPLATES` itself never produces this. */
+  | "INTERNAL_INCONSISTENT"
+  /** `opts.rederivedBodyHash` (the producer's own independently-recompiled hash) disagreed with
+   *  this program's actual body hash — see `VerifyOpts.rederivedBodyHash`'s doc. Distinct from
+   *  `BODY_HASH` (which means "the pinned table rejected this body"): this means "the producer's
+   *  own cross-check disagrees with what it is reporting on". */
+  | "PRODUCER_HASH_DIVERGED"
   | "EXPECT_RECIPIENT"
   | "EXPECT_TOKENS"
-  | "EXPECT_MINOUT";
+  | "EXPECT_MINOUT"
+  | "EXPECT_FLOOR_TOKEN"
+  /** A blocking check that was NEVER COMPARED against a caller expectation — distinct from the
+   *  EXPECT_* codes above (which mean "compared and mismatched"). `inspectSettleProgram` sets this
+   *  for `intent.recipient`/`intent.tokens` on EVERY call (it takes no expectation, ever — see
+   *  report.ts's module doc for why that is what keeps `ok` from reading true for a program whose
+   *  intent was never checked). `verifySettleProgram` sets it for `intent.floorToken` when the
+   *  caller supplied `minOut`/`minMinOut` but pinned neither `floorToken` nor an exact `tokens`
+   *  list — the settle floor's target token would otherwise be unverified even though a floor
+   *  value was requested (see the FULL_BALANCE_SWEEP disclosure). */
+  | "INTENT_UNCHECKED";
 
 export class SettleDecodeError extends Error {
   readonly code: SettleFailureCode;
@@ -97,10 +116,12 @@ function bytesToHexLocal(bytes: Uint8Array): Hex {
   return hex as Hex;
 }
 
-/** Returns `null` (never throws) on malformed hex — odd length or a non-hex character — so
+/** Returns `null` (never throws) on malformed hex — odd length, a non-hex character, or a
+ *  non-string `hex` argument entirely (a runtime caller bypassing the type system) — so
  *  `parseSettleProgram` can report it as an `EMPTY`-coded fatal rather than throwing out of a
  *  function documented to never throw. */
 function hexToBytesLocal(hex: string): Uint8Array | null {
+  if (typeof hex !== "string") return null;
   const clean = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
   if (clean.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(clean)) return null;
   const out = new Uint8Array(clean.length / 2);
@@ -161,7 +182,15 @@ export function parseSettleProgram(program: Hex): SettleParse {
     fatal: null,
   };
   if (decodedHex === null) {
-    result.fatal = { code: "EMPTY", message: `not a valid hex string: ${JSON.stringify(program).slice(0, 80)}` };
+    let rendered: string;
+    try {
+      rendered = JSON.stringify(program).slice(0, 80);
+    } catch {
+      // `program` was a type JSON.stringify itself rejects (e.g. a bigint) — never throw out of a
+      // function documented to always return a report.
+      rendered = String(program).slice(0, 80);
+    }
+    result.fatal = { code: "EMPTY", message: `not a valid hex string: ${rendered}` };
     return result;
   }
   if (bytes.length === 0) {

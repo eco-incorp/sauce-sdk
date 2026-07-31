@@ -50,10 +50,13 @@ function bytesToHexLocal(bytes) {
         hex += b.toString(16).padStart(2, "0");
     return hex;
 }
-/** Returns `null` (never throws) on malformed hex — odd length or a non-hex character — so
+/** Returns `null` (never throws) on malformed hex — odd length, a non-hex character, or a
+ *  non-string `hex` argument entirely (a runtime caller bypassing the type system) — so
  *  `parseSettleProgram` can report it as an `EMPTY`-coded fatal rather than throwing out of a
  *  function documented to never throw. */
 function hexToBytesLocal(hex) {
+    if (typeof hex !== "string")
+        return null;
     const clean = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
     if (clean.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(clean))
         return null;
@@ -88,7 +91,16 @@ export function parseSettleProgram(program) {
         fatal: null,
     };
     if (decodedHex === null) {
-        result.fatal = { code: "EMPTY", message: `not a valid hex string: ${JSON.stringify(program).slice(0, 80)}` };
+        let rendered;
+        try {
+            rendered = JSON.stringify(program).slice(0, 80);
+        }
+        catch {
+            // `program` was a type JSON.stringify itself rejects (e.g. a bigint) — never throw out of a
+            // function documented to always return a report.
+            rendered = String(program).slice(0, 80);
+        }
+        result.fatal = { code: "EMPTY", message: `not a valid hex string: ${rendered}` };
         return result;
     }
     if (bytes.length === 0) {

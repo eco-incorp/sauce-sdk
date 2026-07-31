@@ -22,14 +22,25 @@ export {
   formatSettleReport,
   type CheckStatus,
   type CheckSeverity,
+  type CheckKind,
   type VerifyCheck,
   type EffectAmount,
   type SettleEffect,
   type Disclosure,
   type HashSource,
+  type IntentSource,
+  type SettleVerdict,
+  type Rederivation,
+  type DeclaredIntent,
+  type SweepScopeEntry,
+  type SweepScope,
+  type FloorClaim,
   type VerifyOpts,
   type SettleExpectation,
   type SettleReportEnvelope,
   type SettleInspection,
   type SettleReport,
 } from "./report.js";
+// NOTE: `./internal/root-testing.js` is deliberately NOT re-exported here — see its own header
+// doc. The only way to reach `authenticateBodyAgainstRoot` is a relative import of that file
+// itself (as `sdk/test/verify.test.ts` does), never a package subpath.

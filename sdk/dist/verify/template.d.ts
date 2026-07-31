@@ -43,6 +43,21 @@ export interface TemplateEntry {
  * `superseded` entry still authenticates (an older, still-audited body) but is flagged via the
  * `template.status` advisory check; `revoked` never authenticates at any setting — the escape
  * hatch for a template found defective after the fact.
+ *
+ * FROZEN — not just `readonly`-TYPED. `readonly` is a TYPE-LEVEL annotation only: it stops the
+ * compiler from letting well-typed code call `.push`/assign an index, but it does nothing at
+ * runtime, and this table is re-exported from the PUBLIC `./verify` barrel (`index.ts`), reachable
+ * by any consumer that imports the package. Without a runtime freeze, `SETTLE_TEMPLATES.push({id:
+ * "pwn", status: "current", bodyHash: <forgedHash>, ...})` silently succeeds and a subsequent
+ * `verifySettleProgram(forgedProgram, matchingExpect)` authenticates the forgery — the same class
+ * of escape as monkeypatching the function, and the obvious next shape of attack now that
+ * `opts.templates` (the caller-supplied-table escape) is gone. `Object.freeze` on both the array
+ * AND every entry closes that: a `push`/mutation throws in strict-mode ESM, and is a silent no-op
+ * otherwise — either way the table cannot change after this module first evaluates.
+ *
+ * Adding or rotating a template is therefore a PACKAGE VERSION BUMP — edit this literal, land the
+ * change, cut a release — NEVER a runtime `push` by a consumer. `sdk/test/verify.test.ts` pins
+ * `Object.isFrozen` on both the array and its one entry so this cannot silently revert.
  */
 export declare const SETTLE_TEMPLATES: readonly TemplateEntry[];
 /** The entry a fresh compile is expected to match. Exactly `SETTLE_TEMPLATES.find(t => t.status
