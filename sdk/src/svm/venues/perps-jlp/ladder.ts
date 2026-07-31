@@ -209,7 +209,7 @@ function coldQuote(cfg: PerpsJlpPoolConfig, s: SetupState, x: bigint): bigint {
 /** Shared per-x quote body (identical for every ladder rung and the cold final quote — no warm-start state). */
 function quoteLines(p: string, xExpr: string, outVar: string): string[] {
   return [
-    `    const ${p}su = (${xExpr} * ${p}pxi * ${p}uui) / ${p}udi;`,
+    `    ${p}su = (${xExpr} * ${p}pxi * ${p}uui) / ${p}udi;`,
     // feeBpsIn (increment = true)
     `    ${p}vin = ${p}mult * ${p}su;`,
     `    ${p}nin = ${p}iui + ${p}vin;`,

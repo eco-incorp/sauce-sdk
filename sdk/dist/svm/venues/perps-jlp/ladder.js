@@ -109,7 +109,7 @@ function coldQuote(cfg, s, x) {
 /** Shared per-x quote body (identical for every ladder rung and the cold final quote — no warm-start state). */
 function quoteLines(p, xExpr, outVar) {
     return [
-        `    const ${p}su = (${xExpr} * ${p}pxi * ${p}uui) / ${p}udi;`,
+        `    ${p}su = (${xExpr} * ${p}pxi * ${p}uui) / ${p}udi;`,
         // feeBpsIn (increment = true)
         `    ${p}vin = ${p}mult * ${p}su;`,
         `    ${p}nin = ${p}iui + ${p}vin;`,
