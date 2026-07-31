@@ -30,10 +30,16 @@ export * from './meteora-damm-v1-stable/index.js';
 export * from './meteora-damm-v1-stable/ladder.js';
 export * from './obric-v2/index.js';
 export * from './obric-v2/ladder.js';
+export * from './goonfi-v2/index.js';
+export * from './goonfi-v2/ladder.js';
 export * from './quantum/index.js';
 export * from './quantum/ladder.js';
 export * from './solfi-v2/index.js';
 export * from './solfi-v2/ladder.js';
+export * from './woofi/index.js';
+export * from './woofi/ladder.js';
+export * from './deriverse/index.js';
+export * from './deriverse/ladder.js';
 export * from './tesserav/index.js';
 export * from './tesserav/ladder.js';
 //# sourceMappingURL=index.d.ts.map

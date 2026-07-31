@@ -46,6 +46,10 @@
     "./verify": {
       "types": "./sdk/dist/verify/index.d.ts",
       "default": "./sdk/dist/verify/index.js"
+    },
+    "./verify/compile": {
+      "types": "./sdk/dist/verify/compile.d.ts",
+      "default": "./sdk/dist/verify/compile.js"
     }
   },
   "bin": {
@@ -74,12 +78,13 @@
   "dependencies": {
     "acorn": "^8.15.0",
     "dotenv": "^17.3.1",
+    "ts-evaluator": "^2.0.0",
+    "typescript": "^5.7.0",
     "viem": "^2.45.3"
   },
   "devDependencies": {
     "@uniswap/v3-core": "^1.0.1",
-    "hardhat": "^2.22.0",
-    "typescript": "^5.7.0"
+    "hardhat": "^2.22.0"
   },
   "packageManager": "pnpm@10.28.2",
   "engines": {

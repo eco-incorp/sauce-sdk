@@ -1,3 +1,4 @@
+import { deriverseLadder } from './deriverse/ladder.js';
 import { meteoraDammV1Stable } from './meteora-damm-v1-stable/index.js';
 import { meteoraDammV1StableLadder } from './meteora-damm-v1-stable/ladder.js';
 import { meteoraDammV2 } from './meteora-damm-v2/index.js';
@@ -5,6 +6,7 @@ import { meteoraDammV2Ladder } from './meteora-damm-v2/ladder.js';
 import { meteoraDlmmLadder } from './meteora-dlmm/ladder.js';
 import { manifestLadder } from './manifest/ladder.js';
 import { obricV2Ladder } from './obric-v2/ladder.js';
+import { goonfiV2Ladder } from './goonfi-v2/ladder.js';
 import { orcaLegacyTokenSwap } from './orca-legacy-token-swap/index.js';
 import { orcaLegacyTokenSwapLadder } from './orca-legacy-token-swap/ladder.js';
 import { orcaWhirlpoolLadder } from './orca-whirlpool/ladder.js';
@@ -20,6 +22,7 @@ import { saberStableswapLadder } from './saber-stableswap/ladder.js';
 import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
 import { tesseravLadder } from './tesserav/ladder.js';
+import { woofiLadder } from './woofi/ladder.js';
 // Adapter table. Keys MUST equal adapter.slug — venueAdapter reports them as
 // the known-venue list. Constant-product venues first, then the sqrt-price
 // and stable ones (the venue-matrix order in the solswap README).
@@ -53,9 +56,9 @@ export function venueAdapter(slug) {
  * without a corresponding entry here gets ZERO contract coverage, silently —
  * the count assertion is what turns that into a loud CI failure instead.
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
- * SUBSET — 7 of these 15 families also implement the v1 surface; manifest/
- * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/solfi-v2/quantum/tesserav
- * are ladder-only).
+ * SUBSET — 7 of these 18 families also implement the v1 surface; manifest/
+ * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/goonfi-v2/solfi-v2/
+ * quantum/tesserav/woofi/deriverse are ladder-only).
  */
 const ladderAdapters = {
     [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
@@ -70,9 +73,12 @@ const ladderAdapters = {
     [saberStableswapLadder.slug]: saberStableswapLadder,
     [meteoraDammV1StableLadder.slug]: meteoraDammV1StableLadder,
     [obricV2Ladder.slug]: obricV2Ladder,
+    [goonfiV2Ladder.slug]: goonfiV2Ladder,
     [solfiV2Ladder.slug]: solfiV2Ladder,
     [quantumLadder.slug]: quantumLadder,
     [tesseravLadder.slug]: tesseravLadder,
+    [woofiLadder.slug]: woofiLadder,
+    [deriverseLadder.slug]: deriverseLadder,
 };
 /** Known ladder-family slugs, in table order. */
 export function listLadderVenues() {
