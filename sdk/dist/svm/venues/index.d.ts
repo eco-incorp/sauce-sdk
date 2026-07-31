@@ -44,6 +44,8 @@ export * from './deriverse/index.js';
 export * from './deriverse/ladder.js';
 export * from './tesserav/index.js';
 export * from './tesserav/ladder.js';
+export * from './perps-jlp/index.js';
+export * from './perps-jlp/ladder.js';
 export * from './stabble-common.js';
 export * from './stabble-stable-swap/index.js';
 export * from './stabble-stable-swap/ladder.js';
