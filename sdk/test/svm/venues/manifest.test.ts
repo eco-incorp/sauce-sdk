@@ -53,12 +53,15 @@ describe('manifestBaseForQuoteSafeCap', () => {
     const price = 10n;
     const cap = manifestBaseForQuoteSafeCap(price);
     expect(manifestBaseForQuote(price, cap, false) <= (1n << 64n) - 1n).toBe(true);
-    expect(manifestBaseForQuote(price, cap + 1n, false)).toBe(1n << 65n); // SENT
+    // String()-wrapped: see ladder-contract.test.ts's note on raw-bigint
+    // .toBe() failures vanishing whole suites under jest workers (BigInt is
+    // not JSON-serializable, and jest-worker's IPC to the parent uses JSON).
+    expect(String(manifestBaseForQuote(price, cap + 1n, false))).toBe(String(1n << 65n)); // SENT
   });
 
   it('is unbounded (SENT sentinel) for a zero price — manifestBaseForQuote always returns 0 there', () => {
-    expect(manifestBaseForQuoteSafeCap(0n)).toBe(1n << 65n);
-    expect(manifestBaseForQuote(0n, 10_000_000_000n, false)).toBe(0n);
+    expect(String(manifestBaseForQuoteSafeCap(0n))).toBe(String(1n << 65n));
+    expect(String(manifestBaseForQuote(0n, 10_000_000_000n, false))).toBe(String(0n));
   });
 });
 
@@ -90,7 +93,9 @@ describe('quoteIn arithmetic-safety cliff (the collapse fix)', () => {
   }
 
   it('sanity: cap sits strictly between the two probed grid points (100 < 184 < 234)', () => {
-    expect(cap).toBe(184n);
+    // String()-wrapped: see ladder-contract.test.ts's note on raw-bigint
+    // .toBe() failures vanishing whole suites under jest workers.
+    expect(String(cap)).toBe(String(184n));
     expect(100n < cap).toBe(true);
     expect(cap < 234n).toBe(true);
   });
@@ -103,19 +108,19 @@ describe('quoteIn arithmetic-safety cliff (the collapse fix)', () => {
     expect(outLarge).toBeGreaterThanOrEqual(outSmall);
     // Saturates exactly at the cap's own output — going past the arithmetic
     // boundary buys nothing more from this level.
-    expect(outLarge).toBe(blAtCap);
+    expect(String(outLarge)).toBe(String(blAtCap));
   });
 
   it('referenceCapacities is nondecreasing across the same two points (never a negative dIn)', () => {
     const capacities = refCapacities();
     const [cSmall, cLarge] = capacities([100n, 234n]);
-    expect(cSmall).toBe(100n);
-    expect(cLarge).toBe(cap); // saturates the PRODUCTIVE input at the safety cap
+    expect(String(cSmall)).toBe(String(100n));
+    expect(String(cLarge)).toBe(String(cap)); // saturates the PRODUCTIVE input at the safety cap
     expect(cLarge).toBeGreaterThanOrEqual(cSmall);
   });
 
   it('quote(0) == 0', () => {
-    expect(refQuote()(0n)).toBe(0n);
+    expect(String(refQuote()(0n))).toBe(String(0n));
   });
 
   it('REGRESSION: reproduces the pre-fix collapse shape via the raw (unpatched) arithmetic — proves the bug was real', () => {
@@ -132,7 +137,9 @@ describe('quoteIn arithmetic-safety cliff (the collapse fix)', () => {
     const small = oldWalk(100n);
     const large = oldWalk(234n);
     expect(small.out).toBeGreaterThan(0n);
-    expect(large.out).toBe(0n); // the collapse
+    // String()-wrapped: see ladder-contract.test.ts's note on raw-bigint
+    // .toBe() failures vanishing whole suites under jest workers.
+    expect(String(large.out)).toBe(String(0n)); // the collapse
     expect(large.out).toBeLessThan(small.out); // dOut < 0 across this pair — the merge-altitude violation
     expect(large.consumed).toBeLessThan(small.consumed); // dIn < 0 too
   });

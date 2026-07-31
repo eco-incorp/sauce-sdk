@@ -528,8 +528,15 @@ describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses pas
       const variant = (await family.variants()).find((v) => v.label === label)!;
       const params = family.ladder.paramsFor(variant.cfg);
       const quote = family.ladder.referenceQuote(variant.cfg, variant.state, params, variant.now);
-      expect(quote(gap.x)).toBe(gap.peak);
-      expect(quote(gap.x + 1n)).toBe(0n);
+      // Wrapped in String(): a raw-bigint .toBe() that FAILS cannot be
+      // reported under jest workers — JSON.stringify (jest-worker's IPC to
+      // the parent process) throws "Do not know how to serialize a BigInt",
+      // which silently vanishes this entire suite from the run instead of
+      // reporting a failing assertion (see this file's header / the PR body
+      // for the reproduced experiment). String() keeps the comparison exact
+      // (decimal digits, no precision loss) while making a failure printable.
+      expect(String(quote(gap.x))).toBe(String(gap.peak));
+      expect(String(quote(gap.x + 1n))).toBe(String(0n));
       expect(gap.x <= U64_MAX).toBe(true);
       expect(family.ladder.capacityInputVar).toBeDefined();
       // The MERGE-ALTITUDE property (buildLadder over the LADDER-CHAIN path,
@@ -629,9 +636,15 @@ describe('SELF-TEST — the detector against synthetic negative controls (proves
   });
 
   it('6. a 14th, unregistered ladder family fails the count assertion loudly (demonstrates the mechanism kept from the prior version)', () => {
-    const fakeRegisteredSlugs = [...FAMILIES.map((f) => f.slug), 'synthetic-14th-family'];
+    // Exercises the REAL mechanism from the "LADDER_REGISTRY count assertion"
+    // block above (listLadderVenues() cross-checked against FAMILIES) — not
+    // a synthetic length comparison that never calls the registry. Simulates
+    // registry.ts registering a 14th family this file was never updated for:
+    // the two slug sets diverge and the comparison must throw.
+    const registered = listLadderVenues();
+    const fakeRegistered = [...registered, 'synthetic-14th-family'];
     expect(() => {
-      expect(FAMILIES.map((f) => f.slug)).toHaveLength(fakeRegisteredSlugs.length);
+      expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...fakeRegistered].sort());
     }).toThrow();
   });
 });
