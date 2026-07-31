@@ -138,17 +138,17 @@ export const goonfiV2Ladder = {
         const vout = JSON.stringify(ref(slot, voutRole));
         const [da, t1, t2, t3, t4, t5, t6, t7, t8, t9, f1, f2, f3, f4, f5, f6, f7, f8, f9] = params;
         return [
-            `  const ${p}p1 = accountUint(${oracle}, ${OFF_ORACLE_P1}, 8);`,
-            `  const ${p}p2 = accountUint(${oracle}, ${OFF_ORACLE_P2}, 8);`,
+            `  const ${p}ov1 = accountUint(${oracle}, ${OFF_ORACLE_P1}, 8);`,
+            `  const ${p}ov2 = accountUint(${oracle}, ${OFF_ORACLE_P2}, 8);`,
             `  const ${p}dn = accountUint(${oracle}, ${OFF_ORACLE_DENOM}, 4);`,
             `  const ${p}rout = accountUint(${vout}, ${AMOUNT_OFF}, 8);`,
-            `  let ${p}pr = ${p}p1;`,
+            `  let ${p}pr = ${p}ov1;`,
             c.direction === 'xToY'
-                ? `  if (${p}p2 !== 0 && ${p}p2 < ${p}pr) { ${p}pr = ${p}p2 }`
-                : `  if (${p}p2 > ${p}pr) { ${p}pr = ${p}p2 }`,
+                ? `  if (${p}ov2 !== 0 && ${p}ov2 < ${p}pr) { ${p}pr = ${p}ov2 }`
+                : `  if (${p}ov2 > ${p}pr) { ${p}pr = ${p}ov2 }`,
             `  let ${p}kq = 1;`,
-            `  if (${p}p1 === 0) { ${p}kq = 0 }`,
-            `  if (${p}p2 === 0) { ${p}kq = 0 }`,
+            `  if (${p}ov1 === 0) { ${p}kq = 0 }`,
+            `  if (${p}ov2 === 0) { ${p}kq = 0 }`,
             `  if (${p}dn !== ${GOONFI_ASSUMED_DENOM.toString()}) { ${p}kq = 0 }`,
             `  const ${p}da = ${da};`,
             `  const ${p}t1 = ${t1}; const ${p}t2 = ${t2}; const ${p}t3 = ${t3}; const ${p}t4 = ${t4}; const ${p}t5 = ${t5};`,
