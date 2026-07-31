@@ -36,6 +36,10 @@
     "./verify": {
       "types": "./dist/verify/index.d.ts",
       "default": "./dist/verify/index.js"
+    },
+    "./verify/compile": {
+      "types": "./dist/verify/compile.d.ts",
+      "default": "./dist/verify/compile.js"
     }
   },
   "files": [
@@ -47,7 +51,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-verify-assets.mjs",
     "typecheck": "tsc --noEmit",
     "sync-engine-artifacts": "node scripts/sync-engine-artifacts.mjs",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.config.cjs"
