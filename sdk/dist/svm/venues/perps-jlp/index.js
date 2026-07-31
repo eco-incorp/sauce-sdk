@@ -9,12 +9,18 @@
  * discovery wiring): every other family's `pool` account embeds BOTH mints,
  * so one address fully identifies a tradable pair. A JLP `Custody` embeds
  * only ONE mint — the tradable unit is an (custodyIn, custodyOut) PAIR
- * sharing one `Pool`. `fetchPoolConfig` therefore takes the DIRECTED PAIR
- * (not just a pool-hint address) and derives both custody PDAs itself; the
- * recipe's `resolveSvmPoolSpec` threads `pair` into `entry.fetch` for
- * exactly this reason (an additive, backward-compatible widening — the
- * other 13 families' 2-arg fetchers are still assignable to the 3-arg field
- * type and never receive/use the extra argument).
+ * sharing one `Pool`. `fetchPoolConfig(load, custodyIn, mintOut)` self-
+ * discovers mintIn by decoding `custodyIn` directly (never taken on faith
+ * from a caller) and needs exactly ONE extra piece of information beyond
+ * every other family's `(load, pool)` shape: `mintOut`, the ONLY thing no
+ * single account embeds. The recipe threads it as a plain `direction` STRING
+ * (mintOut's base58) — not a struct — through `entry.fetch`'s existing
+ * `(load, pool, direction?)` field type (an additive widening: the other 13
+ * families' 2-arg fetchers stay assignable, ignoring the extra argument) —
+ * see ecoswap/svm/index.ts's `directionForPair` hook and its perps-jlp
+ * FAMILIES entry for how both call sites (fresh discovery AND the
+ * pre-codegen re-fetch, which only ever has `spec.direction` in scope, never
+ * the original pair) supply it identically.
  *
  * PDA DERIVATION (verified against real mainnet state 2026-07-31):
  *   custody   = findProgramAddress(["custody", pool, mint], PROGRAM_ID)
@@ -265,48 +271,59 @@ function decodePool(pool, data) {
  * the freshly-derived custodyIn PDA) but is not otherwise used: the pair
  * fully determines both custody PDAs.
  */
-export async function fetchPerpsJlpConfig(load, poolHint, pair, now = BigInt(Math.floor(Date.now() / 1000))) {
-    if (pair.inMint === pair.outMint)
-        throw new Error(`${SLUG}: inMint and outMint must differ`);
-    const [custodyIn, custodyOut, transferAuthority, perpetuals, eventAuthority] = await Promise.all([
-        custodyPda(JLP_POOL_ADDRESS, pair.inMint),
-        custodyPda(JLP_POOL_ADDRESS, pair.outMint),
+/**
+ * `custodyIn` is the account to decode DIRECTLY (its `mint` field IS mintIn —
+ * self-discovered, never taken on faith from a caller) — the address-source
+ * derives it deterministically from `pair.inMint` (see ladder discovery
+ * wiring), so this function never needs the input mint as a separate
+ * argument. `mintOut` is the ONE piece of information genuinely external:
+ * a basket has no single account embedding both sides, so SOMETHING must
+ * name which of the OTHER custodies this trade targets. Both this function's
+ * callers (the discovery resolver and the pre-codegen re-fetch) have it —
+ * the former from the requested pair directly, the latter from the spec's
+ * own `direction` string (this family stores `mintOut`'s base58 there, see
+ * ecoswap/svm/index.ts's FAMILIES entry) — so `fetchPoolConfig` never needs
+ * a signature wider than every other family's `(load, pool)` PLUS this one
+ * extra, always-a-plain-string `direction` parameter already threads through
+ * both call sites unchanged.
+ */
+export async function fetchPerpsJlpConfig(load, custodyIn, mintOut, now = BigInt(Math.floor(Date.now() / 1000))) {
+    const [custodyInData, transferAuthority, perpetuals, eventAuthority] = await Promise.all([
+        load(custodyIn),
         transferAuthorityPda(),
         perpetualsPda(),
         eventAuthorityPda(),
     ]);
-    if (custodyIn !== poolHint) {
-        throw new Error(`${SLUG}: candidate pool ${poolHint} does not match the derived custody ${custodyIn} for mint ${pair.inMint}`);
-    }
-    const [poolData, custodyInData, custodyOutData] = await Promise.all([load(JLP_POOL_ADDRESS), load(custodyIn), load(custodyOut)]);
+    if (custodyInData === null)
+        throw new Error(`${SLUG}: custody ${custodyIn} not found`);
+    const dIn = decodeCustody(custodyIn, custodyInData);
+    if (dIn.mint === mintOut)
+        throw new Error(`${SLUG}: inMint and outMint must differ`);
+    const custodyOut = await custodyPda(JLP_POOL_ADDRESS, mintOut);
+    const [poolData, custodyOutData] = await Promise.all([load(JLP_POOL_ADDRESS), load(custodyOut)]);
     if (poolData === null)
         throw new Error(`${SLUG}: pool ${JLP_POOL_ADDRESS} account not found`);
-    if (custodyInData === null)
-        throw new Error(`${SLUG}: custody ${custodyIn} (mint ${pair.inMint}) not found — mint not in the JLP basket`);
     if (custodyOutData === null)
-        throw new Error(`${SLUG}: custody ${custodyOut} (mint ${pair.outMint}) not found — mint not in the JLP basket`);
+        throw new Error(`${SLUG}: custody ${custodyOut} (mint ${mintOut}) not found — mint not in the JLP basket`);
     const pool = decodePool(JLP_POOL_ADDRESS, poolData);
     if (!pool.custodies.includes(custodyIn) || !pool.custodies.includes(custodyOut)) {
         throw new Error(`${SLUG}: derived custody not present in pool ${JLP_POOL_ADDRESS}'s custodies vec`);
     }
-    const dIn = decodeCustody(custodyIn, custodyInData);
     const dOut = decodeCustody(custodyOut, custodyOutData);
-    if (dIn.mint !== pair.inMint)
-        throw new Error(`${SLUG}: custody ${custodyIn} mint ${dIn.mint} != requested ${pair.inMint}`);
-    if (dOut.mint !== pair.outMint)
-        throw new Error(`${SLUG}: custody ${custodyOut} mint ${dOut.mint} != requested ${pair.outMint}`);
+    if (dOut.mint !== mintOut)
+        throw new Error(`${SLUG}: custody ${custodyOut} mint ${dOut.mint} != requested ${mintOut}`);
     if (!dIn.allowSwap)
         throw new Error(`${SLUG}: custody ${custodyIn} has swap disabled (Permissions.allowSwap == false)`);
     if (!dOut.allowSwap)
         throw new Error(`${SLUG}: custody ${custodyOut} has swap disabled (Permissions.allowSwap == false)`);
     // Tokenkeg-only (a token-2022 transfer-fee mint would desync wire amounts —
     // same restriction obric-v2/quantum apply to their own venues).
-    const [mintInData, mintOutData] = await Promise.all([load(pair.inMint), load(pair.outMint)]);
+    const [mintInData, mintOutData] = await Promise.all([load(dIn.mint), load(mintOut)]);
     if (mintInData === null || mintOutData === null)
         throw new Error(`${SLUG}: mint account(s) not found`);
     // classic SPL mint accounts are exactly 82 bytes.
     if (mintInData.length !== 82 || mintOutData.length !== 82) {
-        throw new Error(`${SLUG}: pair ${pair.inMint}/${pair.outMint} is not classic-Tokenkeg (swap2 is Tokenkeg-only here)`);
+        throw new Error(`${SLUG}: pair ${dIn.mint}/${mintOut} is not classic-Tokenkeg (swap2 is Tokenkeg-only here)`);
     }
     const [dovesInData, dovesOutData] = await Promise.all([load(dIn.dovesOracle), load(dOut.dovesOracle)]);
     if (dovesInData === null || dovesOutData === null)
@@ -321,7 +338,7 @@ export async function fetchPerpsJlpConfig(load, poolHint, pair, now = BigInt(Mat
     const tsIn = readUintLE(dovesInData, DOVES_TIMESTAMP_OFFSET, 8);
     const tsOut = readUintLE(dovesOutData, DOVES_TIMESTAMP_OFFSET, 8);
     if (now - tsIn > DOVES_MAX_AGE_SEC || now - tsOut > DOVES_MAX_AGE_SEC) {
-        throw new Error(`${SLUG}: a Doves feed is stale (age > ${DOVES_MAX_AGE_SEC}s) for pair ${pair.inMint}/${pair.outMint}`);
+        throw new Error(`${SLUG}: a Doves feed is stale (age > ${DOVES_MAX_AGE_SEC}s) for pair ${dIn.mint}/${mintOut}`);
     }
     const swapExponent = expoIn + ORACLE_EXPONENT_SCALE - expoOut;
     const fx = bakedDecimalScale(-dIn.decimals, swapExponent, -dOut.decimals);
@@ -337,8 +354,8 @@ export async function fetchPerpsJlpConfig(load, poolHint, pair, now = BigInt(Mat
     return {
         venue: SLUG,
         pool: JLP_POOL_ADDRESS,
-        mintIn: pair.inMint,
-        mintOut: pair.outMint,
+        mintIn: dIn.mint,
+        mintOut,
         custodyIn,
         custodyOut,
         tokenAccountIn: dIn.tokenAccount,

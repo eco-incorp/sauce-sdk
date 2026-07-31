@@ -102,10 +102,23 @@ export declare function eventAuthorityPda(): Promise<Address>;
  * the freshly-derived custodyIn PDA) but is not otherwise used: the pair
  * fully determines both custody PDAs.
  */
-export declare function fetchPerpsJlpConfig(load: AccountLoader, poolHint: Address, pair: {
-    inMint: Address;
-    outMint: Address;
-}, now?: bigint): Promise<PerpsJlpPoolConfig>;
+/**
+ * `custodyIn` is the account to decode DIRECTLY (its `mint` field IS mintIn —
+ * self-discovered, never taken on faith from a caller) — the address-source
+ * derives it deterministically from `pair.inMint` (see ladder discovery
+ * wiring), so this function never needs the input mint as a separate
+ * argument. `mintOut` is the ONE piece of information genuinely external:
+ * a basket has no single account embedding both sides, so SOMETHING must
+ * name which of the OTHER custodies this trade targets. Both this function's
+ * callers (the discovery resolver and the pre-codegen re-fetch) have it —
+ * the former from the requested pair directly, the latter from the spec's
+ * own `direction` string (this family stores `mintOut`'s base58 there, see
+ * ecoswap/svm/index.ts's FAMILIES entry) — so `fetchPoolConfig` never needs
+ * a signature wider than every other family's `(load, pool)` PLUS this one
+ * extra, always-a-plain-string `direction` parameter already threads through
+ * both call sites unchanged.
+ */
+export declare function fetchPerpsJlpConfig(load: AccountLoader, custodyIn: Address, mintOut: Address, now?: bigint): Promise<PerpsJlpPoolConfig>;
 /** Family facade for the recipe orchestrator (ladder-only — not in the v1 registry; see quantum/solfi-v2). */
 export declare const perpsJlp: {
     slug: string;
