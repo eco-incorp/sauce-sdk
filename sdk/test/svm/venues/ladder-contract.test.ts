@@ -109,6 +109,7 @@ import {
   tesseravLadder,
   fetchWoofiConfig,
   woofiLadder,
+  perpsJlpLadder,
 } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
@@ -679,13 +680,109 @@ const FAMILIES: Family[] = [
       return [{ label: 'aToB', cfg, state: fixtureBytesMap(fixtures) }];
     },
   },
+  {
+    slug: 'perps-jlp',
+    ladder: perpsJlpLadder,
+    async variants() {
+      // Synthetic-but-real-shaped state (the JLP Pool/Custody/Doves-feed
+      // byte layout, scale constants and bps parameters transcribed from a
+      // real mainnet SOL/USDC snapshot 2026-07-31 — see perps-jlp/index.ts's
+      // module doc) — no checked-in fixture (a basket AMM's fetchPoolConfig
+      // needs a live PDA derivation this offline harness does not run; every
+      // other family here that skips it, e.g. obric-v2, does the same).
+      // No `declaredCliffs`: the dispensing-custody-owned-balance clamp
+      // SATURATES the standalone cold referenceQuote (never collapses) —
+      // the same no-entry shape as raydium-*/deriverse/meteora-damm-v2.
+      const custodyIn = address('7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz');
+      const custodyOut = address('G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa');
+      const pool = address('5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq');
+      const dovesIn = address('39cWjvHrpHNz2SbXv6ME4NPhqBDBd4KsjUYv5JkHEAJU');
+      const dovesOut = address('A28T5pKtscnhDo6C1Sz786Tup88aTjt8uyKewjVvPrGk');
+      const mintIn = address('So11111111111111111111111111111111111111112');
+      const mintOut = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+      const cfg = {
+        venue: 'perps-jlp' as const,
+        pool,
+        mintIn,
+        mintOut,
+        custodyIn,
+        custodyOut,
+        tokenAccountIn: mintIn,
+        tokenAccountOut: mintOut,
+        dovesOracleIn: dovesIn,
+        dovesOracleOut: dovesOut,
+        pythAccountIn: mintIn,
+        pythAccountOut: mintOut,
+        tokenProgram: address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+        transferAuthority: address('AVzP2GeRmqGphJsMxWoqjpUifPpCret7LqWhD8NWQK49'),
+        perpetuals: address('H4ND9aYttUVLFmNypZqLjZ52FYiGvdEB45GmwNoKEjTj'),
+        eventAuthority: address('37hJBDnntwqhGbK7L6M1bLyvccj4u55CCUiLPdYkiqBN'),
+        decimalsIn: 9,
+        decimalsOut: 6,
+        fxScaleUp: 1n,
+        fxScaleDown: 1_000_000_000_000n,
+        usdScaleUpIn: 1n,
+        usdScaleDownIn: 100_000_000_000n,
+        usdScaleUpOut: 1n,
+        usdScaleDownOut: 100_000_000n,
+        isStableIn: false,
+        isStableOut: true,
+        targetRatioBpsIn: 4_700n,
+        targetRatioBpsOut: 3_000n,
+        baseFeeBps: 10n,
+        taxFeeBps: 100n,
+        multiplier: 100n,
+        externalMultiplierBps: 20_000n,
+        poolAumUsdOffset: 8n,
+        poolFeesOffset: 24n,
+      };
+      const poolBytes = new Uint8Array(24);
+      new DataView(poolBytes.buffer).setBigUint64(8, 797_450_521_854_735n, true); // aumUsd (low 8 bytes; high 8 stay 0)
+      const custodyInBytes = new Uint8Array(250);
+      {
+        const view = new DataView(custodyInBytes.buffer);
+        view.setBigUint64(222, 5_094_449_759_612_497n, true); // assets.owned
+        view.setBigUint64(230, 406_853_168_715_083n, true); // assets.locked
+        view.setBigUint64(238, 23_874_756_516_054n, true); // assets.guaranteedUsd
+      }
+      const custodyOutBytes = new Uint8Array(1_040);
+      {
+        const view = new DataView(custodyOutBytes.buffer);
+        view.setBigUint64(222, 133_324_712_281_091n, true); // assets.owned
+        view.setBigUint64(230, 32_485_051_391_576n, true); // assets.locked
+        view.setBigUint64(238, 0n, true); // assets.guaranteedUsd
+        // debt (u128 @1004) and borrowLendInterestsAccured (u128 @1020) — real
+        // magnitudes (USDC carries real internal-lending debt on mainnet).
+        const debt = 112_762_299_084_223_540_107_741n;
+        const accrued = 163_386_532_560_144_559n;
+        view.setBigUint64(1004, debt & 0xffff_ffff_ffff_ffffn, true);
+        view.setBigUint64(1012, debt >> 64n, true);
+        view.setBigUint64(1020, accrued & 0xffff_ffff_ffff_ffffn, true);
+        view.setBigUint64(1028, accrued >> 64n, true);
+      }
+      const dovesBytes = (price: bigint): Uint8Array => {
+        const data = new Uint8Array(91);
+        new DataView(data.buffer).setBigUint64(73, price, true);
+        data[81] = 0xf8; // expo = -8 (i8 two's complement) — unread by referenceQuote (baked into cfg's scales)
+        return data;
+      };
+      const state: AccountBytesMap = {
+        [pool]: poolBytes,
+        [custodyIn]: custodyInBytes,
+        [custodyOut]: custodyOutBytes,
+        [dovesIn]: dovesBytes(6_782_862_018n),
+        [dovesOut]: dovesBytes(99_967_793n),
+      };
+      return [{ label: 'solToUsdc', cfg, state }];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 19 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 20 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(19);
-    expect(FAMILIES).toHaveLength(19);
+    expect(registered).toHaveLength(20);
+    expect(FAMILIES).toHaveLength(20);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });

@@ -26,6 +26,7 @@ import { quantumLadder } from './quantum/ladder.js';
 import { solfiV2Ladder } from './solfi-v2/ladder.js';
 import { tesseravLadder } from './tesserav/ladder.js';
 import { woofiLadder } from './woofi/ladder.js';
+import { perpsJlpLadder } from './perps-jlp/ladder.js';
 
 // Adapter table. Keys MUST equal adapter.slug — venueAdapter reports them as
 // the known-venue list. Constant-product venues first, then the sqrt-price
@@ -64,9 +65,9 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * without a corresponding entry here gets ZERO contract coverage, silently —
  * the count assertion is what turns that into a loud CI failure instead.
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
- * SUBSET — 8 of these 19 families also implement the v1 surface; manifest/
+ * SUBSET — 8 of these 20 families also implement the v1 surface; manifest/
  * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/goonfi-v2/solfi-v2/
- * quantum/tesserav/woofi/deriverse are ladder-only).
+ * quantum/tesserav/woofi/deriverse/perps-jlp are ladder-only).
  */
 const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
@@ -88,6 +89,7 @@ const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [tesseravLadder.slug]: tesseravLadder,
   [woofiLadder.slug]: woofiLadder,
   [deriverseLadder.slug]: deriverseLadder,
+  [perpsJlpLadder.slug]: perpsJlpLadder,
 };
 
 /** Known ladder-family slugs, in table order. */
