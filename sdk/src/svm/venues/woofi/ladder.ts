@@ -417,12 +417,20 @@ export const woofiLadder: SvmVenueLadderV2 = {
   quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
     const c = woofiConfig(base);
     const vault = c.direction === 'sellBase' ? c.quoteTokenVault : c.tokenVaultBase;
+    // Both vaults ride the state map: `vc` is the ONLY one the fragment itself
+    // reads (the capacity clamp, direction-selected); `vo` (the OTHER side's
+    // vault) is never read on-chain but depthReserves (the off-chain
+    // relative-depth filter) needs BOTH reserveIn and reserveOut — it is
+    // already part of the swap CPI's 17-account list either way (buildSwapV2
+    // attaches both unconditionally), so this adds no new on-chain account.
+    const otherVault = c.direction === 'sellBase' ? c.tokenVaultBase : c.quoteTokenVault;
     return [
       { ref: ref(slot, 'wc'), address: c.wooconfig },
       { ref: ref(slot, 'or'), address: c.wooracleBase },
       { ref: ref(slot, 'pb'), address: c.priceUpdateBase },
       { ref: ref(slot, 'pq'), address: c.priceUpdateQuote },
       { ref: ref(slot, 'vc'), address: vault },
+      { ref: ref(slot, 'vo'), address: otherVault },
     ];
   },
 
