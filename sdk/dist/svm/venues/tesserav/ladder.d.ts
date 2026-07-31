@@ -27,7 +27,7 @@ export declare const tesseravLadder: {
         reserveIn: bigint;
         reserveOut: bigint;
     };
-    continuousFees(): {
+    continuousFees(base: PoolConfig, state: AccountBytesMap): {
         gammaPpm: bigint;
         muPpm: bigint;
     };

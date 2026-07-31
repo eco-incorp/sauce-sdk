@@ -206,11 +206,17 @@ export const tesseravLadder = {
         const capIn = capInFor(cfg.direction, price0, mid, capOut);
         return { reserveIn: capIn, reserveOut: capOut };
     },
-    continuousFees() {
-        // Flat-rate venue up to its (small, level-0) capacity: no CP curvature.
-        // gammaPpm=0 disables the continuous-oracle curve fit (measurement-only,
-        // never a gate — see types.ts's doc); muPpm carries the venue's own spread.
-        return { gammaPpm: 0n, muPpm: PRICE_PPM_DEN - (PRICE_PPM_DEN - (PRICE_PPM_DEN * SAFETY_NUM) / SAFETY_DEN) };
+    continuousFees(base, state) {
+        // Flat-rate venue up to its (small, level-0) capacity: no CP curvature
+        // (gammaPpm=0 disables the continuous-oracle curve fit — measurement
+        // only, never a gate, see types.ts's doc). muPpm is the LIVE level-0
+        // spread (price0/1e6) folded with the same safety haircut the quote uses.
+        const cfg = tvConfig(base);
+        const pool = state[cfg.pool];
+        if (pool === undefined)
+            throw new Error(`${SLUG} ladder fees are missing account ${cfg.pool}`);
+        const price0 = readUintLE(pool, level0PriceOffset(cfg.direction), 8);
+        return { gammaPpm: 0n, muPpm: (price0 * SAFETY_NUM) / SAFETY_DEN };
     },
 };
 //# sourceMappingURL=ladder.js.map
