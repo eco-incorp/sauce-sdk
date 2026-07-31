@@ -287,9 +287,51 @@ const FAMILIES: Family[] = [
     ladder: meteoraDammV1StableLadder,
     async variants() {
       const POOL = address('32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG');
+      const B_TOKEN_VAULT = address('DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE');
       const fixtures = fixturesFor('meteora-damm-v1-stable');
       const cfg = await meteoraDammV1Stable.fetchPoolConfig(fixtureLoader(fixtures), POOL);
-      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures), now: CLOCK_D1S }];
+      const state = fixtureBytesMap(fixtures);
+      // 'default' (the checked-in mainnet dump) has its OWN idle float
+      // (959,036,927,046) EXCEED the curve's own asymptotic max
+      // (~861,412,784,533) — the cliff is never reached under it, the exact
+      // accident that let the collapse-to-zero bug this fix addresses ship
+      // undetected through every existing test (see ladder.ts's module doc).
+      // 'lowIdle' doctors b_token_vault's SPL amount (u64 LE @ offset 64)
+      // down to an ORDINARY idle float that sits BELOW the asymptote, so the
+      // cliff is real and merge-reachable — this is the missing variant that
+      // would have caught the original bug had it existed from the start.
+      // 'idle1e9'/'idle100e9' are two MORE ordinary idle floats (smaller —
+      // retail-size territory, not a whale trade) added alongside it: the
+      // round-1-rejected collapse-to-zero defect scaled its collapse band
+      // with the idle float itself, so a single doctored fixture cannot
+      // stand in for "every idle float below the asymptote" — see the
+      // CAPACITY DENSITY describe block below, which sweeps all three.
+      const withIdleFloat = (idle: bigint): AccountBytesMap => {
+        const doctored = new Uint8Array(state[B_TOKEN_VAULT]);
+        new DataView(doctored.buffer).setBigUint64(64, idle, true);
+        return { ...state, [B_TOKEN_VAULT]: doctored };
+      };
+      return [
+        { label: 'default', cfg, state, now: CLOCK_D1S },
+        { label: 'lowIdle', cfg, state: withIdleFloat(500_000_000_000n), now: CLOCK_D1S },
+        { label: 'idle1e9', cfg, state: withIdleFloat(1_000_000_000n), now: CLOCK_D1S },
+        { label: 'idle100e9', cfg, state: withIdleFloat(100_000_000_000n), now: CLOCK_D1S },
+      ];
+    },
+    declaredCliffs: {
+      // Same disclosed shape as orca-whirlpool/raydium-clmm/meteora-dlmm/
+      // solfi-v2: the ladder-chain path (referenceLadderQuotes +
+      // capacityInputVar/referenceCapacities) is capacity-safe (the
+      // MERGE-ALTITUDE sweep below proves it never yields a negative dIn or
+      // dOut), but the standalone cold referenceQuote asked directly for an
+      // x past this boundary still collapses to 0 (ladder.ts's module doc).
+      // Each (x, peak) pair is the exact geometric cliff/peak of the
+      // STANDALONE cold quote — the TRUE boundary, not the analytic clamp's
+      // own (deliberately more conservative) reported value; see the
+      // CAPACITY DENSITY block below for the clamp side of this story.
+      lowIdle: { x: 499_992_225_659n, peak: 499_999_999_998n },
+      idle1e9: { x: 999_395_010n, peak: 999_999_999n },
+      idle100e9: { x: 99_968_830_253n, peak: 99_999_999_999n },
     },
   },
   {
@@ -543,8 +585,14 @@ describe.each(FAMILIES)('$slug', (family) => {
 describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses past a boundary the LADDER-CHAIN path already saturates at (LATENT: the merge never reaches this; NOT a safety property)', () => {
   const withGaps = FAMILIES.filter((f) => f.declaredCliffs !== undefined);
 
-  it('exactly four families carry a disclosed gap: the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm, an exhausted tick/bin window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert boundary) — obric-v2 does NOT (fixed alongside this guard)', () => {
-    expect(withGaps.map((f) => f.slug).sort()).toEqual(['meteora-dlmm', 'orca-whirlpool', 'raydium-clmm', 'solfi-v2']);
+  it('exactly five families carry a disclosed gap: the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm, an exhausted tick/bin window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert boundary) plus meteora-damm-v1-stable (closed-form, a strict idle-float bound) — obric-v2 does NOT (fixed alongside this guard)', () => {
+    expect(withGaps.map((f) => f.slug).sort()).toEqual([
+      'meteora-damm-v1-stable',
+      'meteora-dlmm',
+      'orca-whirlpool',
+      'raydium-clmm',
+      'solfi-v2',
+    ]);
   });
 
   it.each(withGaps.flatMap((f) => Object.entries(f.declaredCliffs!).map(([label, gap]) => ({ family: f, label, gap }))))(
@@ -576,6 +624,48 @@ describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses pas
       expect(capPast).toBeLessThanOrEqual(gap.x + 1n);
       expect(capPast).toBeGreaterThanOrEqual(capAtCliff);
     },
+  );
+});
+
+describe('meteora-damm-v1-stable CAPACITY DENSITY — the round-1-rejected mechanism: a 2-round bracketed search fails to find ANY productive point once amountIn sits far above the idle-float cliff, reporting the SAME (0, 0) a total collapse would. The fix (an ANALYTIC clamp, no search) must keep the venue alive at every multiple, at every rung count this family actually ships (defaultRungs=2, cap 4 — swept here through 8 for margin)', () => {
+  const damm1sFamily = FAMILIES.find((f) => f.slug === 'meteora-damm-v1-stable')!;
+  // 2/3/5/10/100/10,000x the cliff: the exact multiplier set the round-1
+  // rejection was measured against (density sweep, per-idle-float collapse
+  // counts) — see docs/ARB.md-style campaign notes / the PR body for the
+  // full table. rungs 2..8 spans the shipped defaultRungs (2) through past
+  // the shipped cap (4) for margin.
+  const MULTS = [2n, 3n, 5n, 10n, 100n, 10_000n];
+  const RUNGS = [2, 3, 4, 5, 6, 7, 8];
+  // Each family.declaredCliffs entry above IS the exact geometric cliff for
+  // that variant (the standalone cold quote's true boundary) — reused here
+  // as the multiplier base, not re-derived.
+  const CLIFF_LABELS = ['lowIdle', 'idle1e9', 'idle100e9'];
+
+  it.each(CLIFF_LABELS)(
+    '%s: every 2/3/5/10/100/10,000x-cliff amountIn keeps NONZERO final capacity and NONZERO final out at rungs 2..8 — a single zero cell is a total, not partial, loss of this venue',
+    async (label) => {
+      const variant = (await damm1sFamily.variants()).find((v) => v.label === label)!;
+      const params = damm1sFamily.ladder.paramsFor(variant.cfg);
+      const ladderQuotes = damm1sFamily.ladder.referenceLadderQuotes!(variant.cfg, variant.state, params, variant.now);
+      const ladderCapacities = damm1sFamily.ladder.referenceCapacities!(variant.cfg, variant.state, params, variant.now);
+      const cliff = damm1sFamily.declaredCliffs![label].x;
+      const failures: string[] = [];
+      for (const mult of MULTS) {
+        const amountIn = cliff * mult;
+        for (const rungs of RUNGS) {
+          const grid = ladderGrid(amountIn, rungs);
+          const outs = ladderQuotes(grid);
+          const caps = ladderCapacities(grid);
+          const finalOut = outs[outs.length - 1];
+          const finalCap = caps[caps.length - 1];
+          if (finalCap === 0n || finalOut === 0n) {
+            failures.push(`${label} x${mult} rungs=${rungs}: finalCap=${finalCap} finalOut=${finalOut} (amountIn=${amountIn})`);
+          }
+        }
+      }
+      if (failures.length > 0) throw new Error(failures.join('\n'));
+    },
+    SWEEP_TIMEOUT_MS,
   );
 });
 

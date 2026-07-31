@@ -9,8 +9,10 @@ import { address } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import { meteoraDammV1Stable } from '../../../src/svm/venues/meteora-damm-v1-stable/index.js';
 import type { MeteoraDammV1StablePoolConfig } from '../../../src/svm/venues/meteora-damm-v1-stable/index.js';
+import { meteoraDammV1StableLadder } from '../../../src/svm/venues/meteora-damm-v1-stable/ladder.js';
 import { fixtureBytesMap, fixtureData, fixtureLoader, loadFixtures } from '../fixtures.js';
 import type { AccountFixture } from '../fixtures.js';
+import type { AccountBytesMap } from '../../../src/svm/index.js';
 
 const FIXTURE_DIR = fileURLToPath(new URL('../fixtures/meteora-damm-v1-stable/', import.meta.url));
 
@@ -292,4 +294,144 @@ describe('meteora-damm-v1-stable buildSwap', () => {
   function refsFor(name: string): string {
     return `damm1s:${POOL}:${name}`;
   }
+});
+
+describe('meteora-damm-v1-stable LADDER idle-float CAPACITY — collapse-to-zero fixed to a freeze (types.ts capacityInputVar contract)', () => {
+  // State with b_token_vault's SPL amount (u64 LE @ TOKEN_AMOUNT offset 64)
+  // overridden — the out-side idle float the strict bound reads.
+  function withIdleFloat(base: AccountBytesMap, idle: bigint): AccountBytesMap {
+    const data = new Uint8Array(base[B_TOKEN_VAULT]);
+    new DataView(data.buffer).setBigUint64(64, idle, true);
+    return { ...base, [B_TOKEN_VAULT]: data };
+  }
+
+  function ladderGrid(amountIn: bigint, rungs: number): bigint[] {
+    const grid: bigint[] = [];
+    for (let j = 1; j <= rungs; j++) grid.push(amountIn >> BigInt(rungs - j));
+    return grid;
+  }
+
+  it('the CHECKED-IN fixture never reaches the idle-float bound at all (its idle float, 959036927046, happens to exceed the curve\'s own asymptotic max, ~861412784533) — this is WHY every pre-fix test passed for an accidental reason, not because the collapse was absent', async () => {
+    const cfg = await fetchConfig();
+    const params = meteoraDammV1StableLadder.paramsFor(cfg);
+    const quote = meteoraDammV1StableLadder.referenceQuote(cfg, state, params, CLOCK_T);
+    expect(quote(1n << 63n)).toBe(861_412_784_533n);
+    expect(quote((1n << 64n) - 1n)).toBe(861_412_784_533n); // same asymptote at u64::MAX — never climbs to idle
+  });
+
+  it('REGRESSION PIN: an ORDINARY idle float (500,000,000,000, well below that asymptote) puts the collapse at x=499,992,225,659 — a reachable, ordinary trade size, NOT an extreme one', async () => {
+    const cfg = await fetchConfig();
+    const doctored = withIdleFloat(state, 500_000_000_000n);
+    const params = meteoraDammV1StableLadder.paramsFor(cfg);
+    const quote = meteoraDammV1StableLadder.referenceQuote(cfg, doctored, params, CLOCK_T);
+    const CLIFF = 499_992_225_659n;
+    const PEAK = 499_999_999_998n;
+    expect(quote(CLIFF)).toBe(PEAK);
+    // The COLD, standalone quote still collapses past the boundary — the
+    // DECLARED, merge-UNREACHABLE latent gap (see ladder.ts's module doc):
+    // the ladder-chain path below never asks the cold quote for anything
+    // past what it has already proven productive.
+    expect(quote(CLIFF + 1n)).toBe(0n);
+    expect(CLIFF < 1n << 64n).toBe(true); // merge-reachable domain (u64 cfg word)
+  });
+
+  it('capacityInputVar / referenceCapacities are wired (the merge-relevant path this fix adds)', async () => {
+    expect(meteoraDammV1StableLadder.capacityInputVar).toBeDefined();
+    expect(meteoraDammV1StableLadder.referenceCapacities).toBeDefined();
+    expect(meteoraDammV1StableLadder.capacityInputVar!(7)).toBe('s7lx');
+  });
+
+  it('compiles as valid SauceScript (emitSetup + two ladder rungs + emitFinalQuote, target svm)', async () => {
+    const cfg = await fetchConfig();
+    const source = [
+      ...meteoraDammV1StableLadder.helpers().map((h) => h.source),
+      'function main() {',
+      '  let s0en = 1;',
+      meteoraDammV1StableLadder.emitSetup(cfg, 0, [], 's0en'),
+      meteoraDammV1StableLadder.emitLadderQuote!(cfg, 0, 0, 's0g1', 's0o1'),
+      meteoraDammV1StableLadder.emitLadderQuote!(cfg, 0, 1, '1000000000', 's0o2'),
+      meteoraDammV1StableLadder.emitFinalQuote!(cfg, 0, '1000000000', 'qFinal'),
+      '  return qFinal;',
+      '}',
+    ].join('\n');
+    const sourceWithGrid = source.replace('function main() {', 'function main() {\n  const s0g1 = 500000000;');
+    const { compile } = await import('@eco-incorp/sauce-compiler');
+    const { bytecode } = compile(sourceWithGrid, { target: 'svm' });
+    expect(bytecode[0].length).toBeGreaterThan(0);
+  });
+
+  it('the LADDER-CHAIN path (referenceLadderQuotes + referenceCapacities) reports the ANALYTIC CLAMP boundary, not the exact geometric cliff: 2 units of cumulative input and 1 unit of output surrendered as PROVABLE headroom against a floored-inverse wobble (never a search, never a collapse — see ladder.ts module doc for the closed-form derivation)', async () => {
+    const cfg = await fetchConfig();
+    const doctored = withIdleFloat(state, 500_000_000_000n);
+    const params = meteoraDammV1StableLadder.paramsFor(cfg);
+    const CLIFF = 499_992_225_659n;
+    // The analytic clamp this fix computes (emitSetup's s<slot>xc / the TS
+    // mirror's analyticCapacity): 2 units of cumulative input below the
+    // exact geometric CLIFF, and its forward quote sits 1 unit below the
+    // true PEAK (499,999,999,998) — the margin is deliberate, provable
+    // headroom (never an over-quote), not an approximation error.
+    const XC = 499_992_225_657n;
+    const OUT_AT_XC = 499_999_999_997n;
+    const ladderQuotes = meteoraDammV1StableLadder.referenceLadderQuotes!(cfg, doctored, params, CLOCK_T);
+    const capacities = meteoraDammV1StableLadder.referenceCapacities!(cfg, doctored, params, CLOCK_T);
+    const [outAtCliff, outPastCliff] = ladderQuotes([CLIFF, CLIFF + 1n]);
+    const [capAtCliff, capPastCliff] = capacities([CLIFF, CLIFF + 1n]);
+    expect(outAtCliff).toBe(OUT_AT_XC);
+    expect(outPastCliff).toBe(OUT_AT_XC); // FROZEN, not collapsed to 0
+    expect(capAtCliff).toBe(XC);
+    expect(capPastCliff).toBe(XC); // cumulative productive input frozen too — dIn folds to 0 past here
+    expect(XC).toBeLessThanOrEqual(CLIFF); // the clamp never reaches past the true geometric cliff
+    expect(OUT_AT_XC).toBeLessThan(500_000_000_000n); // strictly below the idle float — the safety property itself
+  });
+
+  it('MERGE-ALTITUDE (the actual defect): differencing the pre-fix pointwise collapse across a ladder rung manufactured a NEGATIVE dOut — the post-fix capacity pair never does, across every rung straddling the cliff at 2/3/4 rungs', async () => {
+    const cfg = await fetchConfig();
+    const doctored = withIdleFloat(state, 500_000_000_000n);
+    const params = meteoraDammV1StableLadder.paramsFor(cfg);
+    const CLIFF = 499_992_225_659n;
+    const sweep = [CLIFF - 1_000n, CLIFF, CLIFF + 1n, CLIFF + 1_000n, CLIFF * 2n, CLIFF * 10n, (1n << 64n) - 1n];
+    const ladderQuotes = meteoraDammV1StableLadder.referenceLadderQuotes!(cfg, doctored, params, CLOCK_T);
+    const capacities = meteoraDammV1StableLadder.referenceCapacities!(cfg, doctored, params, CLOCK_T);
+    let sawNegative = false;
+    for (const rungs of [2, 3, 4]) {
+      for (const amountIn of sweep) {
+        const grid = ladderGrid(amountIn, rungs);
+        const outs = ladderQuotes(grid);
+        const cins = capacities(grid);
+        let cPrev = 0n;
+        let oPrev = 0n;
+        for (let i = 0; i < grid.length; i++) {
+          const dIn = cins[i] - cPrev;
+          const dOut = outs[i] - oPrev;
+          if (dIn < 0n || dOut < 0n) sawNegative = true;
+          cPrev = cins[i];
+          oPrev = outs[i];
+        }
+      }
+    }
+    expect(sawNegative).toBe(false);
+  });
+
+  it('a WITHOUT-the-fix replay (the still-collapsing COLD quote, diffed pointwise per grid entry — exactly the pre-fix ladder-chain shape, which had no capacityInputVar and threaded warm y through the SAME collapsing formula) reproduces the historical NEGATIVE dOut at the SAME pinned cliff — proves the sweep above actually exercises the fixed mechanism, not passing vacuously', async () => {
+    const cfg = await fetchConfig();
+    const doctored = withIdleFloat(state, 500_000_000_000n);
+    const params = meteoraDammV1StableLadder.paramsFor(cfg);
+    const CLIFF = 499_992_225_659n;
+    const coldQuote = meteoraDammV1StableLadder.referenceQuote(cfg, doctored, params, CLOCK_T);
+    const amountIn = CLIFF * 2n; // straddles the cliff at the last (4th) rung
+    const grid = ladderGrid(amountIn, 4);
+    const outs = grid.map(coldQuote); // pointwise, still-collapsing — the pre-fix shape
+    const cinsRaw = grid; // no capacityInputVar -> raw geometric span, the pre-fix shape
+    let cPrev = 0n;
+    let oPrev = 0n;
+    let sawNegative = false;
+    for (let i = 0; i < grid.length; i++) {
+      const dIn = cinsRaw[i] - cPrev;
+      const dOut = outs[i] - oPrev;
+      if (dIn < 0n || dOut < 0n) sawNegative = true;
+      cPrev = cinsRaw[i];
+      oPrev = outs[i];
+    }
+    expect(sawNegative).toBe(true);
+  });
 });
