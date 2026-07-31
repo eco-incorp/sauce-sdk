@@ -1,4 +1,5 @@
 import type { SvmVenueAdapter, SvmVenueLadderV2 } from './types.js';
+import { deriverseLadder } from './deriverse/ladder.js';
 import { meteoraDammV1Stable } from './meteora-damm-v1-stable/index.js';
 import { meteoraDammV1StableLadder } from './meteora-damm-v1-stable/ladder.js';
 import { meteoraDammV2 } from './meteora-damm-v2/index.js';
@@ -58,9 +59,9 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * without a corresponding entry here gets ZERO contract coverage, silently —
  * the count assertion is what turns that into a loud CI failure instead.
  * Distinct from `adapters` above (the v1 SvmVenueAdapter registry, a strict
- * SUBSET — 7 of these 14 families also implement the v1 surface; manifest/
- * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/solfi-v2/quantum are
- * ladder-only).
+ * SUBSET — 7 of these 15 families also implement the v1 surface; manifest/
+ * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/solfi-v2/quantum/deriverse
+ * are ladder-only).
  */
 const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
@@ -78,6 +79,7 @@ const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [solfiV2Ladder.slug]: solfiV2Ladder,
   [quantumLadder.slug]: quantumLadder,
   [woofiLadder.slug]: woofiLadder,
+  [deriverseLadder.slug]: deriverseLadder,
 };
 
 /** Known ladder-family slugs, in table order. */
