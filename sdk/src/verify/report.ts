@@ -6,15 +6,39 @@ import { SETTLE_TEMPLATES, CURRENT_SETTLE_TEMPLATE, type TemplateEntry } from ".
 // THE VISIBLE VALIDATION SURFACE.
 //
 // `validateSettleProgram`-style callers historically got `{ok:false, reason:string}` — one
-// boolean and one prose sentence. This module replaces that with a REPORT: a list of checks, a
-// list of decoded effects, and a list of standing disclosures. `ok` is a DERIVED field, never the
-// product — see `deriveOk` below, stated here so nobody re-derives it differently:
+// boolean and one prose sentence. A LATER revision of this module replaced that with `{ok:
+// boolean, checks[], effects[], disclosures[]}` — but `ok` is GONE from this revision entirely,
+// because it turned out to be un-substantiable: a single boolean fuses a byte-fact ("this is our
+// audited template") with a caller-authored EXPECTATION ("these are the tokens/recipient I
+// wanted"), and its truth silently depends on WHO authored that expectation. Measured: a server
+// that builds its own "expectation" from the SAME request that produced the bytecode gets
+// `ok:true` on a cook-proven 777e18 drain — the check never independently confirmed anything, it
+// just compared a value to itself.
 //
-//   ok === checks.every(c => c.severity !== 'blocking' || c.status === 'pass')
+// This module now reports FIVE things instead of one boolean:
+//   - `structurallyValid` — every blocking check except `body.hash` passes (a well-formed,
+//     canonical wire program). Says nothing about whose program it is.
+//   - `authentic`         — `body.hash` matches an accepted template (this IS our audited body,
+//     verbatim). Independent of `structurallyValid`, says nothing about intent.
+//   - `intentSource`      — `'none'` (no expectation was ever supplied — `inspectSettleProgram`,
+//     ALWAYS), `'caller'` (the function's caller supplied a real, independently-formed
+//     expectation — the DEFAULT for `verifySettleProgram`), or `'server-echo'` (the caller has
+//     DISCLOSED, via `opts.intentSourceLabel`, that the expectation is itself derived from the
+//     same request that produced this program — self-certifying, and now visible as such rather
+//     than indistinguishable from an independent check).
+//   - `intentReconciled`  — `null` (an expectation was never supplied, OR a required identity
+//     check — e.g. the settle floor's target token — was left unpinned: NOT fully compared),
+//     `false` (fully compared, at least one field did not match), `true` (fully compared, all
+//     matched).
+//   - `verdict`           — the ONE machine-gateable field, folding the three booleans above into
+//     five named outcomes (`MALFORMED` / `NOT_OUR_TEMPLATE` / `INTENT_UNCHECKED` /
+//     `INTENT_MISMATCH` / `MATCHES_DECLARED_INTENT`) whose NAME states its own relativity — no
+//     badge or log-grep can read `INTENT_UNCHECKED` as an all-clear the way a bare `ok:true`
+//     could. See `SettleReportEnvelope.verdict`'s doc for the exact derivation.
 //
 // Every check the mode supports is ALWAYS present with a status — an expectation the caller did
-// not supply appears as `status:'unchecked'`, and if its severity is `blocking` that forces
-// `ok:false`. Silence is exactly the failure mode this surface exists to remove.
+// not supply appears as `status:'unchecked'`. Silence is exactly the failure mode this surface
+// exists to remove.
 //
 // Two entry points because "see" and "gate" are different jobs — but BOTH render the FULL,
 // IDENTICAL check set (`shape.*`, `body.*`, `template.status`, `serverEcho.bodyHash`, AND
@@ -23,11 +47,10 @@ import { SETTLE_TEMPLATES, CURRENT_SETTLE_TEMPLATE, type TemplateEntry } from ".
 //   - `inspectSettleProgram` needs no expectations — it calls `pushIntentChecks(build, decoded,
 //     null)`. Because there is NEVER an expectation to compare in this mode, `intent.recipient`/
 //     `intent.tokens` render PERMANENTLY `'unchecked'`+`'blocking'` (never `'pass'`) — which makes
-//     `ok` PERMANENTLY `false` for inspect. This is deliberate, not a bug: it is what keeps a
-//     single boolean from ever reading `true` for a program whose intent was never checked. A
+//     `intentReconciled` PERMANENTLY `null` and `verdict` PERMANENTLY `INTENT_UNCHECKED` (barring a
+//     structural/authenticity rejection, which takes priority). This is deliberate, not a bug: a
 //     caller that wants "is this at least genuinely our template" reads `structurallyValid`/
-//     `authentic` instead (see `SettleReportEnvelope`'s docs) — `ok` is a GATE result, and inspect
-//     never gates anything.
+//     `authentic` instead — `verdict` never claims an intent match inspect cannot provide.
 //   - `verifySettleProgram` REQUIRES `expect.recipient` (the whole hazard this guards is a
 //     caller-chosen recipient — see the FULL_BALANCE_SWEEP disclosure below) and calls
 //     `pushIntentChecks(build, decoded, expect)`, which does the REAL comparisons.
@@ -75,7 +98,8 @@ export interface Disclosure {
 /** Which root a report's authenticity check trusted. Always a first-class field so no reader can
  *  be confused about which one was used:
  *  - `'pinned'`  — matched against this package's own `SETTLE_TEMPLATES` table (the default).
- *  - `'caller'`  — the caller supplied `opts.expectedBodyHash` directly.
+ *  - `'caller'`  — the caller supplied `opts.expectedBodyHash` directly, OR overrode `opts.templates`
+ *    (a caller-controlled table is not this package's own root, even without a single explicit hash).
  *  - `'rederived'` — the caller supplied `opts.expectedBodyHash` AND labelled it as obtained by
  *    actually recompiling the template (e.g. the recipes package's own producer-side check) —
  *    NEVER set this for a hash that merely arrived alongside the program being checked (that is
@@ -83,13 +107,24 @@ export interface Disclosure {
  *    served hash). */
 export type HashSource = "pinned" | "caller" | "rederived";
 
+/** WHO authored `declaredIntent` — see this module's header doc. */
+export type IntentSource = "caller" | "server-echo" | "none";
+
+/**
+ * The single machine-gateable field. See `SettleReportEnvelope.verdict`'s doc for the full
+ * derivation and what each outcome does/does not prove.
+ */
+export type SettleVerdict = "MALFORMED" | "NOT_OUR_TEMPLATE" | "INTENT_UNCHECKED" | "INTENT_MISMATCH" | "MATCHES_DECLARED_INTENT";
+
 export interface VerifyOpts {
   /** Override the pinned table (e.g. to test against a specific historical entry). Defaults to
-   *  `SETTLE_TEMPLATES`. */
+   *  `SETTLE_TEMPLATES`. MUST be an array — a non-array value (a runtime caller bypassing the
+   *  type system) is treated as "not supplied" rather than thrown on. */
   templates?: readonly TemplateEntry[];
   /** Caller-pinned expected body hash — bypasses the table lookup for the authenticity
    *  pass/fail decision entirely (the table is still consulted for the informational
-   *  `template.status` row). Sets `hashSource` to `hashSourceLabel ?? 'caller'`. */
+   *  `template.status` row). Sets `hashSource` to `hashSourceLabel ?? 'caller'`. MUST be a
+   *  string — a non-string value is treated as "not supplied" rather than thrown on. */
   expectedBodyHash?: Hex;
   /** Only meaningful together with `expectedBodyHash` — see `HashSource`. Defaults to `'caller'`. */
   hashSourceLabel?: "caller" | "rederived";
@@ -101,8 +136,16 @@ export interface VerifyOpts {
   /** The `bodyHash` an api response echoed alongside the same program — admitted ONLY as the
    *  informational `serverEcho.bodyHash` check (comparing a program to a hash shipped beside it
    *  is self-certification and proves nothing on its own; this exists purely to surface version
-   *  skew between what the caller computed and what the server thinks it sent). */
+   *  skew between what the caller computed and what the server thinks it sent). MUST be a string
+   *  — a non-string value is treated as "not supplied" rather than thrown on. */
   serverEchoBodyHash?: Hex;
+  /** ONLY meaningful on `verifySettleProgram` (ignored by `inspectSettleProgram`, which always
+   *  reports `intentSource:'none'`). Self-disclosure that `expect` is itself derived from the SAME
+   *  request/data that produced the program being checked — e.g. a server building its own
+   *  "expectation" from the parameters it just compiled with. Defaults to `'caller'` (an
+   *  independently-formed expectation). Set `'server-echo'` so a report never implies an
+   *  independent check ran when it did not — see `IntentSource`'s doc. */
+  intentSourceLabel?: "caller" | "server-echo";
 }
 
 export interface SettleExpectation {
@@ -112,16 +155,20 @@ export interface SettleExpectation {
    *  with the intent checks simply absent — visibly, not silently. */
   recipient: Address;
   /** Exact token list, order-sensitive (position 0 is the floor token). Mutually usable with
-   *  `allowTokens`; if both are given, `tokens` (the stricter check) wins. */
+   *  `allowTokens`; if both are given, `tokens` (the stricter check) wins. MUST be an array — a
+   *  non-array value is a `fail`, never a thrown exception. */
   tokens?: Address[];
   /** Looser alternative to `tokens`: every decoded token must be a member of this set,
-   *  order-free. Ignored when `tokens` is also supplied.
+   *  order-free. Ignored when `tokens` is also supplied. MUST be an array — a non-array value is
+   *  a `fail`, never a thrown exception.
    *
    *  ⚠ `allowTokens` alone does NOT pin WHICH member sits at position 0 — the settle wire's floor
    *  token is POSITIONAL (`tokens[0]`, see `intent.floorToken`), and reordering the SAME allowed
-   *  set moves the floor onto a different token without failing this check. If you also supply
-   *  `minOut`/`minMinOut`, either supply `floorToken` (or the stricter, order-sensitive `tokens`)
-   *  too, or the report cannot claim `ok:true` — see `intent.floorToken`'s doc below. */
+   *  set moves the floor onto a different token without failing this check. Whenever the DECODED
+   *  program itself carries a nonzero `minOut` floor, either supply `floorToken` (or the
+   *  stricter, order-sensitive `tokens` list) too, or `intentReconciled` cannot be `true` — see
+   *  `intent.floorToken`'s doc below; this is keyed on the PROGRAM's own floor claim, not on
+   *  whether you happened to ask about `minOut`. */
   allowTokens?: Address[];
   /** Exact required `minOut`. */
   minOut?: bigint;
@@ -130,22 +177,99 @@ export interface SettleExpectation {
   minMinOut?: bigint;
   /** Exact required floor token — `decoded.tokens[0]` (== `decoded.floorToken`), the ONE token
    *  `minOut` is actually checked against (see FLOOR_IS_LEVEL_NOT_DELTA). Redundant (but harmless)
-   *  alongside an exact `tokens` list, which already pins position 0; REQUIRED to get `ok:true`
-   *  out of a `minOut`/`minMinOut` expectation when the token identity is otherwise expressed only
-   *  via the order-free `allowTokens` (or not expressed at all) — see `allowTokens`'s doc above. */
+   *  alongside an exact `tokens` list, which already pins position 0; REQUIRED for
+   *  `intentReconciled:true` whenever the DECODED program carries a nonzero `minOut` and the
+   *  token identity is otherwise expressed only via the order-free `allowTokens` (or not
+   *  expressed at all) — see `allowTokens`'s doc above. */
   floorToken?: Address;
 }
 
+/** Echo of the expectation actually supplied — `null` for `inspectSettleProgram` (there is never
+ *  one). Present so a downstream consumer can perform its OWN reconciliation against `decoded`
+ *  instead of trusting a report whose `intentSource` is `'server-echo'`/`'none'`. */
+export type DeclaredIntent = SettleExpectation;
+
+/** One swept token, restructured out of `effects[]` without the placeholder amount/note strings —
+ *  the machine-readable twin of the FULL_BALANCE_SWEEP disclosure. */
+export interface SweepScopeEntry {
+  position: number;
+  token: Address;
+  isFloorToken: boolean;
+  to: Address;
+}
+
+export interface SweepScope {
+  /** Always `true` — every listed token moves at its ENTIRE current Pot balance, never a trade
+   *  delta. See the FULL_BALANCE_SWEEP disclosure. A literal constant so a consumer can branch on
+   *  it without parsing prose. */
+  unbounded: true;
+  /** Always `'BALANCE_LEVEL'` — the sweep reads a balance LEVEL at cook time, never a pre/post
+   *  delta. */
+  basis: "BALANCE_LEVEL";
+  /** Empty unless `structurallyValid && authentic` — a behavioral claim about a rejected or
+   *  unauthenticated program would be meaningless. Identical rows to `effects[]`, restructured. */
+  tokens: SweepScopeEntry[];
+}
+
+/** The machine-readable twin of the FLOOR_IS_LEVEL_NOT_DELTA disclosure — what the DECODED
+ *  program itself claims about its floor, independent of whether any expectation about it was
+ *  supplied or matched. */
+export interface FloorClaim {
+  /** Whether the decoded program carries a nonzero `minOut` floor at all. */
+  present: boolean;
+  /** `decoded.floorToken` — the token `minOut` is checked against. `null` when `present` is
+   *  `false` or the program did not decode. */
+  token: Address | null;
+  /** `decoded.minOut`. `null` when `present` is `false` or the program did not decode. */
+  minOut: bigint | null;
+  /** Always `'BALANCE_LEVEL'` — `minOut` is checked against a whole-balance LEVEL at settle time,
+   *  never a pre/post-swap delta. See FLOOR_IS_LEVEL_NOT_DELTA. */
+  basis: "BALANCE_LEVEL";
+  /** Always `false` — an UNSPLIT cook's floor is a DELTA (`outBal - outBal0`); this floor is a
+   *  LEVEL. They are never the same guarantee — this field exists so a consumer can branch on
+   *  that fact instead of relying on prose to say so. */
+  comparableToUnsplitFloor: false;
+}
+
 export interface SettleReportEnvelope {
-  /** `checks.every(c => c.severity !== 'blocking' || c.status === 'pass')` — see the module doc.
-   *  `inspectSettleProgram` NEVER supplies an expectation, so `intent.recipient`/`intent.tokens`
-   *  are PERMANENTLY `'unchecked'`+`'blocking'` there (see `pushIntentChecks`), which makes `ok`
-   *  PERMANENTLY `false` for every `inspectSettleProgram` call — by design: a single boolean must
-   *  never read `true` for a program whose intent was never checked, and inspect mode never checks
-   *  it. Use `structurallyValid`/`authentic` below for "is this genuinely our template", and
-   *  `checks`/`effects` for everything else — never treat `ok:false` from `inspectSettleProgram`
-   *  as a rejection signal on its own. */
-  ok: boolean;
+  /**
+   * THE SINGLE MACHINE-GATEABLE FIELD. Its NAME states its own relativity — no reader can mistake
+   * "these bytes are well-formed" or "the server echoed its own request back to itself" for "this
+   * matches what an independent party asked for":
+   *
+   *   - `MALFORMED`               — `structurallyValid` is `false`: a blocking shape/body-size
+   *                                 check failed.
+   *   - `NOT_OUR_TEMPLATE`        — `structurallyValid` is `true` but `authentic` is `false`:
+   *                                 `body.hash` matches no accepted template.
+   *   - `INTENT_UNCHECKED`        — `structurallyValid && authentic`, but `intentReconciled` is
+   *                                 `null`: either NO expectation was ever supplied
+   *                                 (`inspectSettleProgram`, ALWAYS this case), or a REQUIRED
+   *                                 identity check (the settle floor's target token, whenever the
+   *                                 decoded program carries a nonzero `minOut`) was left unpinned.
+   *                                 NEVER read this as "safe" — this is the exact verdict a
+   *                                 cook-proven 777e18 drain reports, because a program that sweeps
+   *                                 an unrelated token to an attacker's address is, byte-for-byte,
+   *                                 our audited template — the bytes alone cannot refute it.
+   *   - `INTENT_MISMATCH`         — `intentReconciled` is `false`: every required intent
+   *                                 comparison actually ran and at least one did not match.
+   *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true`: every required intent
+   *                                 comparison ran and ALL matched. The only verdict meaning
+   *                                 "safe to cook against what was declared" — and even that is
+   *                                 only as trustworthy as `intentSource`: a `'server-echo'` or
+   *                                 `'none'` source means the declaration was not independent.
+   */
+  verdict: SettleVerdict;
+  /** `true`/`false`/`null` twin of `verdict`'s intent half. `null` — not fully compared (no
+   *  expectation supplied, or a required identity check left unpinned). `false` — fully compared,
+   *  at least one field did not match. `true` — fully compared, every field matched. ALWAYS `null`
+   *  for `inspectSettleProgram`. */
+  intentReconciled: boolean | null;
+  /** WHO authored `declaredIntent` — see this module's header doc and `IntentSource`. */
+  intentSource: IntentSource;
+  /** The expectation actually supplied, verbatim — `null` for `inspectSettleProgram` (there is
+   *  never one). Lets a downstream consumer reconcile `decoded` against its OWN copy of intent
+   *  rather than trusting a self-authored comparison. */
+  declaredIntent: DeclaredIntent | null;
   mode: "verify" | "inspect";
   templateId: string | null;
   templateVersion: string | null;
@@ -161,7 +285,13 @@ export interface SettleReportEnvelope {
   failureCode: SettleFailureCode | null;
   decoded: DecodedSettleProgram | null;
   checks: VerifyCheck[];
+  /** Kept for back-compat — identical rows to `sweepScope.tokens`, in the older shape (with the
+   *  placeholder `amount`/`note` strings). New code should read `sweepScope`. */
   effects: SettleEffect[];
+  /** Machine-readable twin of the FULL_BALANCE_SWEEP disclosure. */
+  sweepScope: SweepScope;
+  /** Machine-readable twin of the FLOOR_IS_LEVEL_NOT_DELTA disclosure. */
+  floorClaim: FloorClaim;
   disclosures: Disclosure[];
 }
 
@@ -179,9 +309,10 @@ const DISCLOSURES: readonly Disclosure[] = [
       "caller-chosen. A dust swap naming an unrelated token emits a program that moves that token's whole " +
       "balance to a caller-chosen recipient (cook-proven at 777e18 of a third party's parked balance). " +
       "Cooking is owner-gated, so this is not a public drain — it bites an operator whose relayer cooks " +
-      "/swap output it did not originate. A passing body.hash check does NOT make this safe; only the " +
-      "intent.tokens and intent.recipient checks (verifySettleProgram) do — reconciling the token list and " +
-      "recipient against your own intent before cooking is your responsibility, not this validator's.",
+      "/swap output it did not originate. A passing body.hash check does NOT make this safe; only a " +
+      "`verdict:'MATCHES_DECLARED_INTENT'` from an independently-formed (`intentSource:'caller'`) " +
+      "expectation does — reconciling the token list and recipient against your own intent before " +
+      "cooking is your responsibility, not this validator's. See `sweepScope` for the machine-readable form.",
   },
   {
     id: "FLOOR_IS_LEVEL_NOT_DELTA",
@@ -189,8 +320,10 @@ const DISCLOSURES: readonly Disclosure[] = [
     text:
       "The settle floor reads the Pot's CURRENT whole balance of tokens[0], where an unsplit (non-settle) " +
       "cook floors on (outBal - outBal0). A pre-existing or donated stash of the floor token counts toward " +
-      "the settle floor and is never excluded — so a passing intent.minOut check is evidence that the " +
-      "Pot's balance clears the floor, NOT evidence that this specific trade produced that amount.",
+      "the settle floor and is never excluded — so a matched `intent.minOut` check is evidence that the " +
+      "Pot's balance clears the floor, NOT evidence that this specific trade produced that amount. See " +
+      "`floorClaim` (`comparableToUnsplitFloor:false`, always) for the machine-readable form — the split " +
+      "and unsplit floors are never the same guarantee.",
   },
 ];
 
@@ -240,13 +373,25 @@ function push(build: CheckBuild, check: VerifyCheck, code?: SettleFailureCode): 
   }
 }
 
+/**
+ * `verdict` derivation — the ONE place this mapping is made, so nobody re-derives it differently.
+ * See `SettleReportEnvelope.verdict`'s doc for what each outcome does/does not prove.
+ */
+function deriveVerdict(structurallyValid: boolean, authentic: boolean, intentReconciled: boolean | null): SettleVerdict {
+  if (!structurallyValid) return "MALFORMED";
+  if (!authentic) return "NOT_OUR_TEMPLATE";
+  if (intentReconciled === true) return "MATCHES_DECLARED_INTENT";
+  if (intentReconciled === false) return "INTENT_MISMATCH";
+  return "INTENT_UNCHECKED";
+}
+
 /** Shared engine behind both `inspectSettleProgram` and `verifySettleProgram` — builds every
  *  check that does NOT depend on caller expectations (shape/body/template/serverEcho), plus the
  *  decoded value. Both entry points then call `pushIntentChecks` (with `null` or a real
  *  expectation respectively) and `buildEffects` on top of what this returns. */
 function buildBase(
   program: Hex,
-  opts: VerifyOpts,
+  optsIn: VerifyOpts,
 ): {
   build: CheckBuild;
   decoded: DecodedSettleProgram | null;
@@ -256,26 +401,56 @@ function buildBase(
   authenticated: boolean;
   structurallyValid: boolean;
 } {
+  // A runtime caller that bypasses the type system entirely (passes `null`/a non-object as
+  // `opts`) must not crash a function documented to never throw — the default parameter
+  // (`opts: VerifyOpts = {}`) only covers `undefined`, not an explicit `null`/garbage value.
+  const opts: VerifyOpts = optsIn && typeof optsIn === "object" ? optsIn : {};
+
   const parse = parseSettleProgram(program);
   const decoded = bestEffortDecode(parse);
   const build: CheckBuild = { checks: [], failureCode: null };
-  const templates = opts.templates ?? SETTLE_TEMPLATES;
 
-  // shape.pushes — the leading token-push run (and, by extension, the minOut/recipient pushes
-  // that follow it) all present and untruncated.
+  // `opts.templates`/`opts.expectedBodyHash`/`opts.serverEchoBodyHash` are all caller-controlled
+  // and only TYPED as array/`Hex` — a runtime caller bypassing the type system (a plain object
+  // instead of an array, a number instead of a hex string) must be treated as "not supplied"
+  // rather than crash `templates.find(...)`/`.toLowerCase()` on a value that has neither.
+  const templatesValid = Array.isArray(opts.templates);
+  const templates = templatesValid ? (opts.templates as readonly TemplateEntry[]) : SETTLE_TEMPLATES;
+  const expectedBodyHash = typeof opts.expectedBodyHash === "string" ? opts.expectedBodyHash : undefined;
+  const serverEchoBodyHash = typeof opts.serverEchoBodyHash === "string" ? opts.serverEchoBodyHash : undefined;
+
+  // shape.pushes — did the FULL leading prologue scan (at least one token push, TUPLE, arity,
+  // minOut, recipient) complete AT ALL, regardless of whether an individual push was CANONICAL
+  // (that is `shape.canonical`'s separate concern below) or of the zero-recipient/body-length
+  // checks that legitimately run only AFTER a complete scan. `pushesIncomplete` is exhaustive: the
+  // strict scanner (wire.ts) aborts immediately on ANY push failure — canonical or not — so an
+  // incomplete run means SOME push in the leading sequence was rejected, for ANY reason.
   //
-  // The branch below tests `parse.fatal?.code === "NOT_SETTLE_SHAPED"` — NOT `parse.tokenPushes.
-  // length === 0` (the pre-fix condition). Both are true when byte 0 isn't a push opcode at all
-  // (the genuine NOT_SETTLE_SHAPED case), but `tokenPushes.length === 0` is ALSO true whenever the
-  // very FIRST token push fails a scan (a non-minimal push, an oversize address, or a plain
-  // truncation AT POSITION 0 — e.g. a single-token settle program with a malformed leading push):
-  // the scan loop returns immediately on that failure, before ever recording a push. Testing the
-  // array length there misattributed a real NON_MINIMAL_PUSH/OVERSIZE_ADDRESS to the generic
-  // NOT_SETTLE_SHAPED code and, worse, made `shape.canonical` below render 'unchecked' instead of
-  // the actual 'fail' — the SPECIFIC canonicality check the wire spec (§9) publishes as a stable,
-  // switchable failure code was silently skipped for exactly the input it exists to catch.
-  // `parse.fatal.code` carries the TRUE reason regardless of scan position, so testing it directly
-  // is both correct and simpler.
+  // Previously this check tested only a narrow subset of "truncation" codes and rendered 'pass'
+  // with the literal text "...all well-formed" for a program whose FIRST push was non-minimal or
+  // oversize (neither code was in that narrow set) — misleading wording for a program this report
+  // otherwise correctly rejects via `shape.canonical`/`structurallyValid`. Using `pushesIncomplete`
+  // (whether every stage through `recipientPush` was actually recorded) instead of an enumerated
+  // code list is both correct and exhaustive by construction.
+  const pushesIncomplete = parse.tokenPushes.length === 0 || !parse.tupleOk || !parse.arityOk || parse.minOutPush === null || parse.recipientPush === null;
+  push(
+    build,
+    {
+      id: "shape.pushes",
+      title: "Leading minimal-length integer pushes found (the reversed token array, minOut, recipient).",
+      status: pushesIncomplete ? "fail" : "pass",
+      severity: "blocking",
+      compared: "byte 0 onward against the PUSH opcode range 0x01..0x20, tracking width/offset per push",
+      expected: "at least one well-formed, untruncated push run reaching a minOut push and a recipient push",
+      actual: pushesIncomplete ? (parse.fatal?.message ?? "the leading push run did not complete") : `${parse.tokenPushes.length} token push(es) + minOut + recipient, all well-formed`,
+      proves: "the program's leading bytes are a complete, in-bounds sequence of integer pushes. Does NOT prove the values are addresses, or that a template follows.",
+    },
+    pushesIncomplete ? (parse.fatal?.code ?? "NOT_SETTLE_SHAPED") : undefined,
+  );
+
+  // The OLDER, narrower "truncation" code set — kept, UNCHANGED, purely because `shape.canonical`/
+  // `shape.tuple` below key their own `unchecked` gating on it (see those checks' own history —
+  // not something this fix touches).
   const truncationCode: SettleFailureCode | null =
     parse.fatal?.code === "EMPTY"
       ? "EMPTY"
@@ -283,24 +458,7 @@ function buildBase(
         ? "NOT_SETTLE_SHAPED"
         : parse.tokenScanError?.code === "TRUNCATED_PUSH"
           ? "TRUNCATED_PUSH"
-          : (parse.minOutError?.code === "TRUNCATED_MINOUT" ? "TRUNCATED_MINOUT" : null) ??
-            (parse.recipientError?.code === "TRUNCATED_RECIPIENT" ? "TRUNCATED_RECIPIENT" : null);
-  push(
-    build,
-    {
-      id: "shape.pushes",
-      title: "Leading minimal-length integer pushes found (the reversed token array, minOut, recipient).",
-      status: truncationCode ? "fail" : "pass",
-      severity: "blocking",
-      compared: "byte 0 onward against the PUSH opcode range 0x01..0x20, tracking width/offset per push",
-      expected: "at least one well-formed, untruncated push run",
-      actual: truncationCode
-        ? (parse.fatal?.message ?? "truncated push")
-        : `${parse.tokenPushes.length} token push(es) + minOut + recipient, all well-formed`,
-      proves: "the program's leading bytes are a complete, in-bounds sequence of integer pushes. Does NOT prove the values are addresses, or that a template follows.",
-    },
-    truncationCode ?? undefined,
-  );
+          : (parse.minOutError?.code === "TRUNCATED_MINOUT" ? "TRUNCATED_MINOUT" : null) ?? (parse.recipientError?.code === "TRUNCATED_RECIPIENT" ? "TRUNCATED_RECIPIENT" : null);
 
   // shape.canonical — minimality + the 20-byte address cap (§6 of the wire spec — the three
   // gaps the recipes package's original decoder accepted).
@@ -320,7 +478,7 @@ function buildBase(
       expected: "no leading-zero, non-minimal pushes; no token/recipient push wider than 20 bytes",
       actual: canonUnchecked ? "not evaluated — an earlier truncation prevented a full scan" : canonError ? canonError.message : "all pushes minimal and correctly sized",
       proves:
-        "the encoding is the UNIQUE canonical form of its decoded value (no alternate byte string decodes to the same tokens/minOut/recipient). Rejects a non-minimal push and an oversized (>20 byte) address word — two shapes a naive decoder accepts as ok:true.",
+        "the encoding is the UNIQUE canonical form of its decoded value (no alternate byte string decodes to the same tokens/minOut/recipient). Rejects a non-minimal push and an oversized (>20 byte) address word — two shapes a naive decoder accepts without complaint.",
     },
     canonError?.code,
   );
@@ -409,20 +567,21 @@ function buildBase(
   let bodyHashExpected = "any accepted (non-revoked) template body hash";
 
   if (actualHash) {
-    if (opts.expectedBodyHash !== undefined) {
-      hashSource = opts.hashSourceLabel ?? "caller";
-      authenticated = actualHash.toLowerCase() === opts.expectedBodyHash.toLowerCase();
+    if (expectedBodyHash !== undefined) {
+      hashSource = opts.hashSourceLabel === "rederived" ? "rederived" : "caller";
+      authenticated = actualHash.toLowerCase() === expectedBodyHash.toLowerCase();
       bodyHashStatus = authenticated ? "pass" : "fail";
       bodyHashCode = authenticated ? undefined : "BODY_HASH";
       bodyHashActual = actualHash;
-      bodyHashExpected = opts.expectedBodyHash;
+      bodyHashExpected = expectedBodyHash;
     } else {
-      // The trust root consulted here is `templates` (declared above as `opts.templates ??
-      // SETTLE_TEMPLATES`) — when the CALLER supplied `opts.templates`, the table itself is
-      // caller-controlled even though no single `expectedBodyHash` was given, so the authenticity
-      // decision did NOT trust this package's own pinned table. Label it 'caller' — NOT 'pinned' —
-      // so a forwarded report never misattributes an override table's verdict to our own root.
-      hashSource = opts.templates !== undefined ? "caller" : "pinned";
+      // The trust root consulted here is `templates` (`opts.templates` when it validated as an
+      // array, else `SETTLE_TEMPLATES`) — when the CALLER supplied a valid override table, the
+      // table itself is caller-controlled even though no single `expectedBodyHash` was given, so
+      // the authenticity decision did NOT trust this package's own pinned table. Label it
+      // 'caller' — NOT 'pinned' — so a forwarded report never misattributes an override table's
+      // verdict to our own root.
+      hashSource = templatesValid ? "caller" : "pinned";
       if (!tableMatch) {
         authenticated = false;
         bodyHashStatus = "fail";
@@ -459,7 +618,11 @@ function buildBase(
     bodyHashCode,
   );
 
-  const templateId = tableMatch?.id ?? CURRENT_SETTLE_TEMPLATE.id;
+  // `templateId` is `null` — NEVER `CURRENT_SETTLE_TEMPLATE.id` — when no table entry matches this
+  // body hash. The old fallback silently reported the CURRENT template's id for a program that
+  // matched NO entry at all (a forged/foreign body), misrepresenting a `NOT_OUR_TEMPLATE` program
+  // as if it named a real (if outdated) template.
+  const templateId = tableMatch?.id ?? null;
   const templateVersion = tableMatch?.version ?? null;
   push(build, {
     id: "template.status",
@@ -477,19 +640,18 @@ function buildBase(
   // by `pushIntentChecks` below — NOT here. `buildBase` is expectation-blind (it has no `expect`
   // parameter — `inspectSettleProgram` never has one to give it), so every check that depends on
   // whether an expectation was supplied lives in the one function both entry points call after
-  // this returns. See that function's doc for why `intent.floorToken` used to manufacture a `pass`
-  // here with nothing to compare against.
+  // this returns.
 
-  // serverEcho.bodyHash — informational ONLY, never gates ok, never the expected value.
-  if (opts.serverEchoBodyHash !== undefined) {
-    const match = actualHash !== null && actualHash.toLowerCase() === opts.serverEchoBodyHash.toLowerCase();
+  // serverEcho.bodyHash — informational ONLY, never gates verdict, never the expected value.
+  if (serverEchoBodyHash !== undefined) {
+    const match = actualHash !== null && actualHash.toLowerCase() === serverEchoBodyHash.toLowerCase();
     push(build, {
       id: "serverEcho.bodyHash",
       title: "Locally computed body hash vs. the hash a server echoed alongside this same program.",
       status: actualHash ? (match ? "pass" : "fail") : "unchecked",
       severity: "advisory",
       compared: "locally computed keccak256(body) vs. opts.serverEchoBodyHash",
-      expected: opts.serverEchoBodyHash,
+      expected: serverEchoBodyHash,
       actual: actualHash ?? "not reached",
       proves:
         "NOT a security check — comparing a program to a hash shipped alongside that program is self-certification. This exists solely to surface version skew between what you computed and what the server believes it sent.",
@@ -519,14 +681,14 @@ function buildBase(
 
 /** Build `effects[]` — a BEHAVIORAL claim ("this program, if cooked, moves these tokens"), so it
  *  is gated on `structurallyValid && authentic` (this IS our audited template, well-formed,
- *  decodable), NOT on the full report `ok` (which also folds in `intent.*` — a caller's WRONG
+ *  decodable), NOT on `verdict`/`intentReconciled` (which also fold in intent — a caller's WRONG
  *  expected recipient/tokens doesn't change what the bytecode actually does, it only fails the
- *  comparison) and NOT on `authenticated`/body-hash alone as before: `parseSettleProgram` keeps
- *  parsing the body (to show a rejected program's would-be state) even after a ZERO_RECIPIENT
- *  fatal, so an authenticated-but-structurally-rejected program (e.g. a zero recipient) used to
- *  still emit effect rows claiming a real transfer to `0x000…000` — a behavioral claim about a
- *  program THIS report structurally rejected. `inspectSettleProgram`'s permanently-unchecked
- *  `intent.*` (see `pushIntentChecks`) therefore does NOT suppress effects — "see what this
+ *  comparison) and NOT on `authenticated`/body-hash alone: `parseSettleProgram` keeps parsing the
+ *  body (to show a rejected program's would-be state) even after a ZERO_RECIPIENT fatal, so an
+ *  authenticated-but-structurally-rejected program (e.g. a zero recipient) would otherwise still
+ *  emit effect rows claiming a real transfer to `0x000…000` — a behavioral claim about a program
+ *  this report structurally rejected. `inspectSettleProgram`'s permanently-unchecked `intent.*`
+ *  (see `pushIntentChecks`) therefore does NOT suppress effects/sweepScope — "see what this
  *  program does" is exactly inspect's job, and remains available whenever the bytes genuinely are
  *  our template. */
 function buildEffects(decoded: DecodedSettleProgram | null, structurallyValid: boolean, authentic: boolean): SettleEffect[] {
@@ -548,44 +710,78 @@ function buildEffects(decoded: DecodedSettleProgram | null, structurallyValid: b
   return effects;
 }
 
+function buildSweepScope(effects: SettleEffect[]): SweepScope {
+  return {
+    unbounded: true,
+    basis: "BALANCE_LEVEL",
+    tokens: effects.map((e) => ({ position: e.position, token: e.token, isFloorToken: e.isFloorToken, to: e.to })),
+  };
+}
+
+/** `floorClaim` describes what the DECODED PROLOGUE claims about its own floor — independent of
+ *  `structurallyValid`/`authentic` (the prologue can be read even when the body doesn't
+ *  authenticate) and independent of whether any expectation about it was supplied or matched
+ *  (that is `intent.floorToken`'s job). */
+function buildFloorClaim(decoded: DecodedSettleProgram | null): FloorClaim {
+  const present = decoded !== null && decoded.minOut > 0n;
+  return {
+    present,
+    token: present ? getAddress(decoded!.floorToken) : null,
+    minOut: present ? decoded!.minOut : null,
+    basis: "BALANCE_LEVEL",
+    comparableToUnsplitFloor: false,
+  };
+}
+
 /**
  * Push the four `intent.*` checks — `recipient`/`tokens`/`minOut`/`floorToken` — the ONE place
  * both entry points build them, so `checks[]` is IDENTICAL in shape between `inspectSettleProgram`
  * and `verifySettleProgram`: every check the report format supports is ALWAYS present with a real
- * status, never omitted by mode (this is what `api/README.md`'s "one row per check ... never
- * omitted" claim actually requires, and what makes `inspectSettleProgram`'s inability to check
- * intent VISIBLE — a permanent 'unchecked' row — rather than the check simply not existing).
+ * status, never omitted by mode. Returns `intentReconciled` — see `SettleReportEnvelope`'s doc for
+ * exactly what its three values mean; the derivation lives HERE (not duplicated at either call
+ * site): `null` whenever no expectation was supplied at all, OR whenever ANY check this function
+ * treats as `severity:'blocking'` for this call rendered `'unchecked'` (not fully compared);
+ * `false` when every blocking check WAS compared and at least one is `'fail'`; `true` only when
+ * every blocking check was compared and all are `'pass'`.
  *
  * `expect === null` is `inspectSettleProgram`'s call — there is NO expectation, ever, so:
  *   - `intent.recipient` / `intent.tokens` render `'unchecked'` + `'blocking'` (code
  *     `INTENT_UNCHECKED`) — NEVER `'pass'`, because passing would claim an assurance inspect
- *     cannot provide. This is what makes `ok` permanently `false` for `inspectSettleProgram` (see
- *     the module doc) — a designed consequence, not a special case bolted onto `ok` itself.
+ *     cannot provide. This is what makes `intentReconciled` permanently `null` for
+ *     `inspectSettleProgram`.
  *   - `intent.minOut` / `intent.floorToken` render `'unchecked'` + `'advisory'` — informational
  *     only (mirrors `verifySettleProgram`'s own "neither minOut field supplied" case below; a
- *     floor was never claimed, so there is nothing to forcibly fail).
+ *     floor was never claimed by the CALLER, so there is nothing to forcibly fail — though see
+ *     `intent.floorToken`'s own severity rule below, which is keyed on the PROGRAM's floor claim,
+ *     not the caller's).
  *
  * `expect !== null` is `verifySettleProgram`'s call — `expect.recipient` is guaranteed present
- * (enforced at that function's entry). The one NEW behavior versus the pre-existing per-field
- * logic: `intent.floorToken`.
+ * (enforced at that function's entry). `expect.tokens`/`expect.allowTokens` MUST be arrays; a
+ * runtime caller that bypasses the type system (a bare address string, say) gets a `'fail'`, never
+ * a thrown exception (see `safeBigInt`'s doc for the scalar analogue).
+ *
+ * `intent.floorToken`'s forfeiture rule is keyed on the PROGRAM's own floor claim
+ * (`decoded.minOut > 0n`), NOT on whether the caller happened to supply `expect.minOut`/
+ * `expect.minMinOut`. `tokens[0]` is the ONLY token `minOut` is ever checked against
+ * (FLOOR_IS_LEVEL_NOT_DELTA), and it is POSITIONAL, so `allowTokens` (order-free by definition) can
+ * never itself pin it:
  *   - Supplied (`expect.floorToken !== undefined`): a REAL, blocking pass/fail comparison against
  *     `decoded.floorToken` (== `decoded.tokens[0]`).
- *   - NOT supplied, but the caller supplied `minOut`/`minMinOut` AND did not pin position 0 via an
- *     EXACT `tokens` list (only `allowTokens`, or no token expectation at all): this FORCES
- *     `'unchecked'` + `'blocking'` (code `INTENT_UNCHECKED`) — a `minOut` expectation is a claim
- *     about a SPECIFIC token's balance, and `allowTokens` is order-free by design (§ its own doc),
- *     so without `floorToken` (or an exact `tokens` list) the floor's target is UNVERIFIED even
- *     though the caller asked about it. This is the fix for the exact exploit it closes: `verify
- *     (prog, {recipient, allowTokens:[OUT,IN], minOut})` used to return `ok:true` for BOTH the
- *     honest `[OUT,IN]` program and an attacker's `[IN,OUT]` — permuting the SAME allowed set moves
- *     the floor onto the leftover input while `intent.tokens`/`intent.minOut` both still pass. The
- *     report now REFUSES `ok:true` for either UNTIL the caller pins the floor's identity — at which
- *     point the honest program passes and the attacker's fails (`decoded.floorToken` differs).
- *   - NOT supplied, `minOut`/`minMinOut` not supplied either (or position already pinned via exact
- *     `tokens`): `'unchecked'` + `'advisory'` — informational, does not gate `ok` (an exact `tokens`
- *     list already order-pins position 0 via `intent.tokens`, so no additional gate is needed).
+ *   - NOT supplied, but the DECODED program carries a nonzero `minOut` AND the caller did not pin
+ *     position 0 via an EXACT `tokens` list (only `allowTokens`, or no token expectation at all):
+ *     this FORCES `'unchecked'` + `'blocking'` (code `INTENT_UNCHECKED`) regardless of whether the
+ *     caller ever asked about `minOut` at all — a program's OWN floor claim is what creates the
+ *     hazard, not the caller's curiosity about it. This is the fix for the exact exploit it
+ *     closes: `verify(prog, {recipient, allowTokens:[OUT,IN]})` — no `minOut` expectation supplied
+ *     — used to leave `intent.floorToken` `'unchecked'`+`'advisory'` (informational only) for BOTH
+ *     the honest `[OUT,IN]` program and an attacker's `[IN,OUT]` reordering, because the old rule
+ *     keyed off the CALLER's `minOut` claim rather than the PROGRAM's. Permuting the SAME allowed
+ *     set moves the floor onto the leftover input while `intent.tokens` still passes either way.
+ *   - NOT supplied, and EITHER the program carries no floor (`decoded.minOut === 0n`) OR position
+ *     is already pinned via an exact `tokens` list: `'unchecked'` + `'advisory'` — informational,
+ *     does not gate reconciliation.
  */
-function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | null, expect: SettleExpectation | null): void {
+function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | null, expect: SettleExpectation | null): boolean | null {
   const e: Partial<SettleExpectation> = expect ?? {};
 
   // intent.recipient
@@ -623,37 +819,58 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
     );
   }
 
-  // intent.tokens — blocking always; unchecked (forcing ok:false) when neither tokens nor
-  // allowTokens is supplied (including inspect's permanent no-expectation case). `tokens` (exact,
-  // order-sensitive) takes precedence over `allowTokens` (containment) when both are given.
+  // intent.tokens — blocking always; unchecked when neither tokens nor allowTokens is supplied
+  // (including inspect's permanent no-expectation case). `tokens` (exact, order-sensitive) takes
+  // precedence over `allowTokens` (containment) when both are given. Both MUST be arrays — a
+  // runtime caller supplying a bare address string instead (bypassing the type system) gets a
+  // 'fail', never a thrown `.map is not a function`.
+  const tokensArr = Array.isArray(e.tokens) ? e.tokens : undefined;
+  const tokensGivenInvalid = e.tokens !== undefined && tokensArr === undefined;
+  const allowArr = Array.isArray(e.allowTokens) ? e.allowTokens : undefined;
+  const allowGivenInvalid = e.allowTokens !== undefined && allowArr === undefined;
+
   let tokensStatus: CheckStatus;
   let tokensExpected: string;
   let tokensActual: string;
   let tokensCode: SettleFailureCode | undefined;
-  if (e.tokens !== undefined) {
-    tokensExpected = `[${e.tokens.map(renderAddr).join(", ")}] (exact, in order)`;
-    if (decoded === null) {
-      tokensStatus = "unchecked";
-      tokensActual = "not reached";
+  if (tokensArr !== undefined || tokensGivenInvalid) {
+    if (tokensGivenInvalid) {
+      tokensStatus = "fail";
+      tokensExpected = "an array (a runtime caller supplied a non-array expect.tokens, bypassing the type system)";
+      tokensActual = decoded ? `[${decoded.tokens.map(renderAddr).join(", ")}]` : "not reached";
+      tokensCode = "EXPECT_TOKENS";
     } else {
-      const want = e.tokens.map((t) => safeBigInt(t));
-      const got = decoded.tokens.map((t) => BigInt(t));
-      const same = want.length === got.length && want.every((w, i) => w !== null && w === got[i]);
-      tokensStatus = same ? "pass" : "fail";
-      tokensActual = `[${decoded.tokens.map(renderAddr).join(", ")}]`;
-      tokensCode = same ? undefined : "EXPECT_TOKENS";
+      tokensExpected = `[${tokensArr!.map(renderAddr).join(", ")}] (exact, in order)`;
+      if (decoded === null) {
+        tokensStatus = "unchecked";
+        tokensActual = "not reached";
+      } else {
+        const want = tokensArr!.map((t) => safeBigInt(t));
+        const got = decoded.tokens.map((t) => BigInt(t));
+        const same = want.length === got.length && want.every((w, i) => w !== null && w === got[i]);
+        tokensStatus = same ? "pass" : "fail";
+        tokensActual = `[${decoded.tokens.map(renderAddr).join(", ")}]`;
+        tokensCode = same ? undefined : "EXPECT_TOKENS";
+      }
     }
-  } else if (e.allowTokens !== undefined) {
-    const allowSet = new Set(e.allowTokens.map((t) => safeBigInt(t)).filter((v): v is bigint => v !== null));
-    tokensExpected = `every decoded token ∈ {${e.allowTokens.map(renderAddr).join(", ")}}`;
-    if (decoded === null) {
-      tokensStatus = "unchecked";
-      tokensActual = "not reached";
+  } else if (allowArr !== undefined || allowGivenInvalid) {
+    if (allowGivenInvalid) {
+      tokensStatus = "fail";
+      tokensExpected = "an array (a runtime caller supplied a non-array expect.allowTokens, bypassing the type system)";
+      tokensActual = decoded ? `[${decoded.tokens.map(renderAddr).join(", ")}]` : "not reached";
+      tokensCode = "EXPECT_TOKENS";
     } else {
-      const outside = decoded.tokens.filter((t) => !allowSet.has(BigInt(t)));
-      tokensStatus = outside.length === 0 ? "pass" : "fail";
-      tokensActual = outside.length === 0 ? `[${decoded.tokens.map(renderAddr).join(", ")}] — all allowed` : `contains disallowed token(s): [${outside.map(renderAddr).join(", ")}]`;
-      tokensCode = outside.length === 0 ? undefined : "EXPECT_TOKENS";
+      const allowSet = new Set(allowArr!.map((t) => safeBigInt(t)).filter((v): v is bigint => v !== null));
+      tokensExpected = `every decoded token ∈ {${allowArr!.map(renderAddr).join(", ")}}`;
+      if (decoded === null) {
+        tokensStatus = "unchecked";
+        tokensActual = "not reached";
+      } else {
+        const outside = decoded.tokens.filter((t) => !allowSet.has(BigInt(t)));
+        tokensStatus = outside.length === 0 ? "pass" : "fail";
+        tokensActual = outside.length === 0 ? `[${decoded.tokens.map(renderAddr).join(", ")}] — all allowed` : `contains disallowed token(s): [${outside.map(renderAddr).join(", ")}]`;
+        tokensCode = outside.length === 0 ? undefined : "EXPECT_TOKENS";
+      }
     }
   } else {
     tokensStatus = "unchecked";
@@ -675,13 +892,15 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
       expected: tokensExpected,
       actual: tokensActual,
       proves:
-        "the FULL_BALANCE_SWEEP hazard's actual scope: which tokens leave the Pot at their whole balance. An unchecked status here means NOTHING about the token list was verified — treat that as a failure, not a pass.",
+        "the FULL_BALANCE_SWEEP hazard's actual scope: which tokens leave the Pot at their whole balance. An unchecked status here means NOTHING about the token list was verified — treat that as unreconciled, not as a pass.",
     },
     tokensCode,
   );
 
   // intent.minOut — advisory+unchecked when neither minOut nor minMinOut is supplied (including
-  // inspect's permanent no-expectation case); becomes blocking (pass/fail) once either is.
+  // inspect's permanent no-expectation case); becomes blocking (pass/fail) once either is. This is
+  // the CALLER's curiosity about the value — `intent.floorToken` below is the separate, PROGRAM-
+  // keyed identity check.
   const minOutSupplied = e.minOut !== undefined || e.minMinOut !== undefined;
   let minOutStatus: CheckStatus;
   let minOutActual: string;
@@ -727,11 +946,13 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
     minOutCode,
   );
 
-  // intent.floorToken — see this function's doc for the forfeiture rule. `tokens[0]` is the ONLY
-  // token `minOut` is ever checked against (FLOOR_IS_LEVEL_NOT_DELTA), and it is POSITIONAL, so
-  // `allowTokens` (order-free by definition) can never itself pin it.
-  const positionPinned = e.tokens !== undefined; // an exact, order-sensitive list already covers position 0
-  const forfeited = expect !== null && !positionPinned && minOutSupplied; // a floor was claimed with no way to name its token
+  // intent.floorToken — see this function's doc for the forfeiture rule (KEYED ON THE PROGRAM'S
+  // OWN FLOOR CLAIM, not the caller's minOut curiosity). `tokens[0]` is the ONLY token `minOut` is
+  // ever checked against (FLOOR_IS_LEVEL_NOT_DELTA), and it is POSITIONAL, so `allowTokens`
+  // (order-free by definition) can never itself pin it.
+  const positionPinned = tokensArr !== undefined; // an exact, order-sensitive list already covers position 0
+  const programHasFloor = decoded !== null && decoded.minOut > 0n; // the PROGRAM's own claim — not the caller's
+  const forfeited = expect !== null && !positionPinned && programHasFloor;
   let floorStatus: CheckStatus;
   let floorSeverity: CheckSeverity;
   let floorExpected: string;
@@ -747,7 +968,7 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
     floorStatus = "unchecked";
     floorSeverity = "blocking";
     floorExpected =
-      "(minOut/minMinOut was supplied, but the floor token's identity was pinned by neither expect.floorToken nor an exact expect.tokens list — allowTokens is order-free and cannot pin position 0, so the floor's target is UNVERIFIED; this report cannot claim ok:true until one of those is supplied)";
+      `(the decoded program carries a nonzero minOut floor (${decoded!.minOut}) but its target token's identity was pinned by neither expect.floorToken nor an exact expect.tokens list — allowTokens is order-free and cannot pin position 0, so the floor's target is UNVERIFIED regardless of whether you asked about minOut; intent cannot be reconciled until one of those is supplied)`;
     floorCode = "INTENT_UNCHECKED";
   } else {
     floorStatus = "unchecked";
@@ -755,7 +976,7 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
     floorExpected =
       expect === null
         ? "(inspectSettleProgram takes no expectation — call verifySettleProgram with expect.floorToken to check this)"
-        : "(no expect.floorToken supplied, and no minOut/minMinOut floor was claimed that would need one)";
+        : "(no expect.floorToken supplied, and either the program carries no minOut floor or position 0 is already pinned via an exact expect.tokens list)";
   }
   push(
     build,
@@ -768,10 +989,24 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
       expected: floorExpected,
       actual: decoded ? renderAddr(decoded.floorToken) : "not reached",
       proves:
-        "which token's Pot balance the minOut floor is checked against. Reversing the token list by mistake (or permuting an allowTokens-only set) silently swaps this to the wrong token — an 'unchecked' status here means minOut's target token was NOT verified, and forces ok:false whenever a floor was actually claimed (severity:'blocking').",
+        "which token's Pot balance the minOut floor is checked against. Reversing the token list by mistake (or permuting an allowTokens-only set) silently swaps this to the wrong token — an 'unchecked' status here means minOut's target token was NOT verified, and blocks intent reconciliation whenever the program actually carries a floor (severity:'blocking').",
     },
     floorCode,
   );
+
+  // `intentReconciled` derivation — see this function's doc. `null` unless an expectation was
+  // supplied AND the program decoded AND every check this call treats as blocking was actually
+  // compared (no 'unchecked' among them).
+  if (expect === null || decoded === null) return null;
+  const byId = new Map(build.checks.map((c) => [c.id, c] as const));
+  const relevant: CheckStatus[] = [byId.get("intent.recipient")!.status, byId.get("intent.tokens")!.status];
+  const minOutCheck = byId.get("intent.minOut")!;
+  if (minOutCheck.severity === "blocking") relevant.push(minOutCheck.status);
+  const floorTokenCheck = byId.get("intent.floorToken")!;
+  if (floorTokenCheck.severity === "blocking") relevant.push(floorTokenCheck.status);
+  if (relevant.includes("unchecked")) return null;
+  if (relevant.includes("fail")) return false;
+  return true;
 }
 
 /**
@@ -779,16 +1014,21 @@ function pushIntentChecks(build: CheckBuild, decoded: DecodedSettleProgram | nul
  * renders EVERY check `verifySettleProgram` would (shape/body/template/serverEcho AND the four
  * `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever. Because
  * of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`, which
- * makes this function's `ok` PERMANENTLY `false` — see the module doc for why that is correct, not
- * a defect: `ok` is a gate result, and this function never gates anything. Use
+ * makes `intentReconciled` PERMANENTLY `null` and `verdict` PERMANENTLY `INTENT_UNCHECKED` (unless
+ * the bytes are malformed or inauthentic, which take priority) — this is correct, not a defect:
+ * this function never has an independent expectation to reconcile against. Use
  * `structurallyValid`/`authentic` for "is this genuinely our template, well-formed" instead.
  */
 export function inspectSettleProgram(program: Hex, opts: VerifyOpts = {}): SettleInspection {
   const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
-  pushIntentChecks(build, decoded, null);
-  const ok = build.checks.every((c) => c.severity !== "blocking" || c.status === "pass");
+  const intentReconciled = pushIntentChecks(build, decoded, null);
+  const verdict = deriveVerdict(structurallyValid, authenticated, intentReconciled);
+  const effects = buildEffects(decoded, structurallyValid, authenticated);
   return {
-    ok,
+    verdict,
+    intentReconciled,
+    intentSource: "none",
+    declaredIntent: null,
     mode: "inspect",
     templateId,
     templateVersion,
@@ -798,7 +1038,9 @@ export function inspectSettleProgram(program: Hex, opts: VerifyOpts = {}): Settl
     failureCode: build.failureCode,
     decoded,
     checks: build.checks,
-    effects: buildEffects(decoded, structurallyValid, authenticated),
+    effects,
+    sweepScope: buildSweepScope(effects),
+    floorClaim: buildFloorClaim(decoded),
     disclosures: DISCLOSURES.slice(),
   };
 }
@@ -806,17 +1048,25 @@ export function inspectSettleProgram(program: Hex, opts: VerifyOpts = {}): Settl
 /**
  * GATE — never throws. `expect.recipient` is REQUIRED (see `SettleExpectation`). Calls
  * `pushIntentChecks` with the REAL expectation (real pass/fail comparisons, not permanently-
- * unchecked placeholders) and derives `ok` over the full check set.
+ * unchecked placeholders) and derives `verdict`/`intentReconciled` over the full check set.
+ * `intentSource` is `'caller'` by default — pass `opts.intentSourceLabel:'server-echo'` to
+ * disclose that `expect` is itself derived from the same request/data that produced `program`
+ * (see `VerifyOpts.intentSourceLabel`'s doc).
  */
 export function verifySettleProgram(program: Hex, expect: SettleExpectation, opts: VerifyOpts = {}): SettleReport {
   if (!expect || expect.recipient === undefined || expect.recipient === null) {
     throw new TypeError("verifySettleProgram: expect.recipient is REQUIRED (a runtime caller bypassed the type system)");
   }
   const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
-  pushIntentChecks(build, decoded, expect);
-  const ok = build.checks.every((c) => c.severity !== "blocking" || c.status === "pass");
+  const intentReconciled = pushIntentChecks(build, decoded, expect);
+  const verdict = deriveVerdict(structurallyValid, authenticated, intentReconciled);
+  const intentSource: IntentSource = opts.intentSourceLabel === "server-echo" ? "server-echo" : "caller";
+  const effects = buildEffects(decoded, structurallyValid, authenticated);
   return {
-    ok,
+    verdict,
+    intentReconciled,
+    intentSource,
+    declaredIntent: expect,
     mode: "verify",
     templateId,
     templateVersion,
@@ -826,26 +1076,40 @@ export function verifySettleProgram(program: Hex, expect: SettleExpectation, opt
     failureCode: build.failureCode,
     decoded,
     checks: build.checks,
-    effects: buildEffects(decoded, structurallyValid, authenticated),
+    effects,
+    sweepScope: buildSweepScope(effects),
+    floorClaim: buildFloorClaim(decoded),
     disclosures: DISCLOSURES.slice(),
   };
 }
 
 const STATUS_GLYPH: Record<CheckStatus, string> = { pass: "✓", fail: "✗", unchecked: "·" };
 
-/** Render a report as fixed-width plain text — checks, then effects, then disclosures. This is
- *  the deliverable a partner pastes into a support ticket: "seeing the validation phase" is a
- *  `console.log`, not a JSON-schema exercise. */
+/** JSON.stringify chokes on `bigint` — `declaredIntent`/`floorClaim` carry them natively. A tiny
+ *  local replacer so this text renderer (documented to never throw) can still show them. */
+function jsonSafe(v: unknown): string {
+  try {
+    return JSON.stringify(v, (_k, val) => (typeof val === "bigint" ? val.toString() : val));
+  } catch {
+    return String(v);
+  }
+}
+
+/** Render a report as fixed-width plain text — checks, then sweepScope/floorClaim, then
+ *  disclosures. This is the deliverable a partner pastes into a support ticket: "seeing the
+ *  validation phase" is a `console.log`, not a JSON-schema exercise. */
 export function formatSettleReport(r: SettleReport | SettleInspection): string {
   const lines: string[] = [];
   lines.push(
-    `SETTLE PROGRAM REPORT — mode=${r.mode} ok=${r.ok} structurallyValid=${r.structurallyValid} authentic=${r.authentic} ` +
+    `SETTLE PROGRAM REPORT — mode=${r.mode} verdict=${r.verdict} intentReconciled=${r.intentReconciled === null ? "null" : r.intentReconciled} ` +
+      `intentSource=${r.intentSource} structurallyValid=${r.structurallyValid} authentic=${r.authentic} ` +
       `template=${r.templateId ?? "?"}@${r.templateVersion ?? "?"} hashSource=${r.hashSource}`,
   );
   if (r.mode === "inspect") {
-    lines.push("  (inspect mode NEVER checks intent — ok is permanently false here; read structurallyValid/authentic and checks[] instead)");
+    lines.push("  (inspect mode supplies NO expectation — intentReconciled is always null; read structurallyValid/authentic and checks[] for what IS proven)");
   }
   if (r.failureCode) lines.push(`  failureCode: ${r.failureCode}`);
+  if (r.declaredIntent) lines.push(`  declaredIntent (source=${r.intentSource}): ${jsonSafe(r.declaredIntent)}`);
   lines.push("");
   lines.push("checks:");
   for (const c of r.checks) {
@@ -857,14 +1121,18 @@ export function formatSettleReport(r: SettleReport | SettleInspection): string {
     lines.push(`      proves:   ${c.proves}`);
   }
   lines.push("");
-  lines.push(`effects (${r.effects.length}):`);
-  if (r.effects.length === 0) {
+  lines.push(`sweepScope: unbounded=${r.sweepScope.unbounded} basis=${r.sweepScope.basis} tokens(${r.sweepScope.tokens.length}):`);
+  if (r.sweepScope.tokens.length === 0) {
     lines.push("  (none — program is not both structurally valid AND authentic; no behavioral claim can be made)");
   }
-  for (const e of r.effects) {
-    lines.push(`  #${e.position} ${e.token}${e.isFloorToken ? " (FLOOR TOKEN)" : ""} -> ${e.amount} -> ${e.to}`);
-    lines.push(`      ${e.note}`);
+  for (const t of r.sweepScope.tokens) {
+    lines.push(`  #${t.position} ${t.token}${t.isFloorToken ? " (FLOOR TOKEN)" : ""} -> ENTIRE_POT_BALANCE -> ${t.to}`);
   }
+  lines.push("");
+  lines.push(
+    `floorClaim: present=${r.floorClaim.present} token=${r.floorClaim.token ?? "n/a"} minOut=${r.floorClaim.minOut ?? "n/a"} ` +
+      `basis=${r.floorClaim.basis} comparableToUnsplitFloor=${r.floorClaim.comparableToUnsplitFloor}`,
+  );
   lines.push("");
   lines.push("disclosures:");
   for (const d of r.disclosures) {
