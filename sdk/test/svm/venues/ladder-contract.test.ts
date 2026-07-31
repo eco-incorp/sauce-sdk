@@ -88,6 +88,8 @@ import {
   fetchOrcaWhirlpoolConfig,
   pumpswapAdapter,
   pumpswapLadder,
+  fetchQuantumConfig,
+  quantumLadder,
   raydiumAmmV4,
   raydiumAmmV4Ladder,
   raydiumClmmLadder,
@@ -442,13 +444,36 @@ const FAMILIES: Family[] = [
       dir1: { x: 1_895_911_984_180n, peak: 22_778_841_047_543n },
     },
   },
+  {
+    slug: 'quantum',
+    ladder: quantumLadder,
+    async variants() {
+      // Two REAL mainnet pools: BHrYr82... (9/6 decimals, per-pool impact
+      // params live) and 6TC3v1iA... (10/8 decimals) — different output
+      // scales, so the trapezoid's 2*10^outDec param differs per variant.
+      // `now` is a SLOT (the per-level expiry gate compares against
+      // Clock::slot, like solfi-v2's staleness gate — NOT unix seconds),
+      // pinned at each pool's own level-expiry floor so every level is live.
+      const bhr = fixturesFor('quantum');
+      const load = fixtureLoader(bhr);
+      const state = fixtureBytesMap(bhr);
+      const a = await fetchQuantumConfig(load, address('BHrYr82teMWH38Q6QSgNEzkfZjiyLP74vL9m9FG6bQAD'));
+      const b = await fetchQuantumConfig(load, address('6TC3v1iA6a17ABkdg2LFeUbwjFtLR5TzbNzUEgtosx8a'));
+      return [
+        { label: 'bhr:zeroIn', cfg: { ...a, direction: 'zeroIn' as const }, state, now: 436_213_243n },
+        { label: 'bhr:oneIn', cfg: { ...a, direction: 'oneIn' as const }, state, now: 436_213_243n },
+        { label: 'tc3:zeroIn', cfg: { ...b, direction: 'zeroIn' as const }, state, now: 435_803_506n },
+        { label: 'tc3:oneIn', cfg: { ...b, direction: 'oneIn' as const }, state, now: 435_803_506n },
+      ];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 13 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(13);
-    expect(FAMILIES).toHaveLength(13);
+    expect(registered).toHaveLength(14);
+    expect(FAMILIES).toHaveLength(14);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
@@ -635,7 +660,7 @@ describe('SELF-TEST — the detector against synthetic negative controls (proves
     expect(result.violations.some((v) => v.includes('VACUOUS sweep'))).toBe(true);
   });
 
-  it('6. a 14th, unregistered ladder family fails the count assertion loudly (demonstrates the mechanism kept from the prior version)', () => {
+  it('6. an unregistered ladder family fails the count assertion loudly (demonstrates the mechanism kept from the prior version)', () => {
     // Exercises the REAL mechanism from the "LADDER_REGISTRY count assertion"
     // block above (listLadderVenues() cross-checked against FAMILIES) — not
     // a synthetic length comparison that never calls the registry. Simulates

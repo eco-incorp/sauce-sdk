@@ -30,6 +30,8 @@ export * from './meteora-damm-v1-stable/index.js';
 export * from './meteora-damm-v1-stable/ladder.js';
 export * from './obric-v2/index.js';
 export * from './obric-v2/ladder.js';
+export * from './quantum/index.js';
+export * from './quantum/ladder.js';
 export * from './solfi-v2/index.js';
 export * from './solfi-v2/ladder.js';
 //# sourceMappingURL=index.d.ts.map
