@@ -42,22 +42,83 @@
  * DIFFERENTLY (a real negative bigint vs. a colossal wrapped unsigned word),
  * so the two elect DIFFERENT rungs from the SAME ladder.
  *
- * The fix: `emitLadderQuote`/`referenceLadderQuotes` FREEZE (never collapse)
- * — the first rung whose candidate would reach the idle float latches
- * `s<slot>cap`, and every rung from there on reports the last productive
- * (lo, lx) pair unchanged, exactly the window-walking convention
- * orca-whirlpool/raydium-clmm/meteora-dlmm/solfi-v2 already use (types.ts).
- * `capacityInputVar`/`referenceCapacities` fold each rung's dIn to the
- * cumulative productive input only, so a rung whose span crosses the cliff
- * contributes just its in-band portion. The Newton chain is genuinely
- * iterative (no closed-form inversion, unlike meteora-damm-v2's sqrt-price
- * band), so — like solfi-v2 — the truly STANDALONE cold quote
- * (`emitFinalQuote`/`referenceQuote` called at an arbitrary x the ladder
- * chain never walked) still collapses past the boundary: LATENT, saved only
- * by the ladder-chain's own capacity freeze (never merge-reachable, since
- * the merge only ever asks the final quote for the cumulative fill the
- * ladder chain itself produced — see ladder-contract.test.ts's declared-gap
- * cases for the other four families carrying the exact same shape).
+ * The fix: `emitLadderQuote`/`referenceLadderQuotes` never report a collapse,
+ * and never merely freeze at the last GRID checkpoint either (that shape —
+ * shipped in an earlier pass of this fix — still under-serves: with only
+ * `defaultRungs` grid points, the very FIRST rung can already land past the
+ * idle float, in which case "the last checkpoint" is `(0, 0)` — a TOTAL,
+ * not partial, loss of this venue's contribution). Instead, the first rung
+ * whose candidate would reach the idle float SEARCHES for the boundary —
+ * false position (regula falsi) with the Illinois anti-stall correction,
+ * bounded at `MAX_SEARCH_ROUNDS` (2 — see below for why exactly 2, a
+ * measured CU budget, not a precision target), looking for the largest
+ * cumulative input in (`s<slot>lx`, x] whose candidate still clears the
+ * idle float. This is the orca-whirlpool/raydium-clmm/meteora-dlmm
+ * `coldWalkClamped` convention ("the productive input AT THE WINDOW EDGE",
+ * types.ts's capacityInputVar doc) carried out by search rather than a
+ * discrete tick/bin walk (this curve has no discrete window to walk).
+ * `s<slot>cap` latches permanently once the search completes — even when it
+ * has NOT fully converged (see below), because a later rung's own grid
+ * point can only be even LARGER (rungs are non-decreasing cumulative
+ * inputs), so it could never do better than this search already tried;
+ * `capacityInputVar`/`referenceCapacities` report the search's result. The
+ * truly STANDALONE cold quote (`emitFinalQuote`'s cache-miss branch /
+ * `referenceQuote` called at an arbitrary x the ladder chain never walked)
+ * still collapses past the boundary: LATENT, saved only by the
+ * ladder-chain's own capacity freeze (never merge-reachable, since the
+ * merge only ever asks the final quote for the cumulative fill the ladder
+ * chain itself produced, or for `s<slot>lx` itself, which the cache-hit
+ * branch serves straight from `s<slot>lo` — see ladder-contract.test.ts's
+ * declared-gap cases for the other four families carrying the exact same
+ * shape).
+ *
+ * WHY ONLY 2 ROUNDS, AND WHY FALSE POSITION NOT PLAIN BISECTION — both
+ * measured on the real engine (LiteSVM), not assumed:
+ * - Each search round costs ~280k CU FLAT, dominated by the round's OWN
+ *   Newton solve (`stableYW`) — NOT by whether the round is reached via a
+ *   real function call or emitted inline (an earlier draft of this fix
+ *   assumed inlining made extra rounds ~free; that was an artifact of the
+ *   ONE test case it was measured against converging in a single round
+ *   regardless of the round cap — round 2 measurably costs another ~280k,
+ *   same as round 1). Setup + the breach-triggering rung already costs
+ *   ~500-580k CU on its own (this family's own module doc: "the heaviest
+ *   family"). 2 rounds lands at ~1.06M CU (measured), safely inside the
+ *   1.4M absolute per-tx ceiling; 3 rounds (~1.34M) leaves only ~60k of
+ *   slack once anything else shares the transaction — too tight to ship.
+ * - Given only 2 rounds are affordable, false position (using the
+ *   candidate's OUTPUT to place the next candidate, not just its sign)
+ *   matters far more than it would at 64 rounds: it is EXACT, in 2 rounds
+ *   or fewer, for a marginal breach — measured wei-exact on the real engine
+ *   for the actual shape of the "TOTAL collapse" trigger (a `defaultRungs`
+ *   grid whose first point lands just past the idle float, the scenario
+ *   this fix exists for). Plain bisection ignores the candidate's value
+ *   and would only have shaved the search interval by 4x in the same 2
+ *   rounds — nowhere near converged either way. For a grossly oversized
+ *   trade (measured: 2x/10x/2^63 the cliff) 2 rounds — with EITHER
+ *   algorithm — is not always enough to find any productive point at all
+ *   before the round budget runs out, and the search reports the SAME
+ *   (0, 0) the pre-fix code did: a DISCLOSED limit of the 2-round CU
+ *   budget (see MAX_SEARCH_ROUNDS's doc), not a claim that false position
+ *   "gets closer" in that regime — never a regression (0 either way, for
+ *   inputs this budget can't reach) and never unsafe: `s<slot>lx`/
+ *   `s<slot>lo` are only ever written from a REAL forward-evaluated
+ *   candidate (see `bisectCapacity`'s doc), so a search that runs out of
+ *   rounds without finding one simply leaves the prior checkpoint
+ *   untouched — never a fabricated value, never an over-quote.
+ * - The Illinois correction (halving the stale endpoint's weight after two
+ *   consecutive same-side updates) costs nothing extra (pure arithmetic on
+ *   values already in scope) and is what makes the marginal-breach case
+ *   exact within 2 rounds rather than needing more; it stays in even
+ *   though it does not rescue the grossly-oversized regime at this round
+ *   budget.
+ * - The search is emitted INLINE (textual, per-rung, like the rest of this
+ *   file) rather than as a second helper function calling a shared
+ *   `quoteAt`-style helper: a V12/svm function's params are stack-resident
+ *   and SDUP-reachable to a measured depth ceiling that this body's own
+ *   15-value live-state shape already exhausts calling just ONE nested
+ *   function (measured: "REF position out of range" once a second helper
+ *   forwards those same values on to a shared quote helper). Calling
+ *   nothing keeps this a non-issue.
  */
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
@@ -81,6 +142,33 @@ const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' as Address;
 const SWAP_DISCRIMINATOR = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
 const DEG = 1_000_000_000_000n;
+
+// MEASURED on the real engine (LiteSVM, the fee-aware SVM interpreter): each
+// search round costs ~280k CU FLAT — dominated by the round's own Newton
+// solve (stableYW), not by round count, not by inline-vs-call overhead (an
+// earlier draft assumed inlining made rounds ~free; measured false — a
+// converged round-1-only case looked "free" only because it never ran a
+// second round). Setup + the breach-triggering rung costs ~500-580k CU on
+// its own (this family's own module doc: "the heaviest family"). 2 search
+// rounds (~560k more) lands at ~1.06-1.32M CU depending on the gap
+// (measured across several), safely inside the 1.4M absolute per-tx
+// ceiling; 3 rounds (~1.34M in the cheapest case measured) leaves as little
+// as ~60k of slack once anything else shares the transaction — too tight
+// to ship, so this stays at 2. 2 rounds is EXACT — measured wei-exact on
+// the real engine, matching the TS reference bit-for-bit — for a marginal
+// breach: the `defaultRungs` grid landing just past the idle float, the
+// actual shape of the "TOTAL collapse" trigger this fix exists for. For a
+// grossly oversized trade (measured: 2x/10x/2^63 the cliff, starting from
+// no prior checkpoint) 2 rounds is NOT always enough to find ANY productive
+// point before the round budget runs out — the search can report the SAME
+// (0, 0) the pre-fix code did. This is a DISCLOSED LIMIT, not a silent one:
+// it is never a regression (0 is exactly what shipped before this fix, for
+// exactly the inputs where this fix's 2-round budget can't do better), and
+// it is never unsafe (see bisectCapacity's doc: `lx`/`lo` are only ever
+// written from a genuine forward-evaluated candidate, so a search that
+// exhausts its rounds without finding one just leaves the prior checkpoint
+// — 0 here, since there wasn't one — untouched, never a fabricated value).
+const MAX_SEARCH_ROUNDS = 2;
 
 // Pool / vault / SPL offsets (docs/svm-venues.md layout tables).
 const POOL = {
@@ -213,6 +301,118 @@ function quoteColdCollapsing(live: D1sLive, x: bigint, y0: bigint): { out: bigin
   return { out: r.reached && r.out >= live.idle ? 0n : r.out, y: r.y };
 }
 
+/**
+ * TS mirror of the emitted inline search (`emitQuoteAt`'s breach branch):
+ * false position (regula falsi) with the Illinois anti-stall correction,
+ * bounded at 64 rounds — see this file's module doc for why false position
+ * (not plain bisection) and why this is emitted INLINE (not a helper
+ * function call). `knownGoodX`/`knownGoodOut` may be (0, 0) (no prior
+ * checkpoint — out(0) = 0 < idle whenever idle > 0, a valid trivial lower
+ * bound); `knownBadX`/`knownBadOut` must already breach (the caller only
+ * invokes this once a candidate has been observed to).
+ *
+ * Returns the GENUINE (x, out) pair at the discovered boundary — `lx`/`lo`
+ * are updated ONLY from real forward evaluations (`midOv`, computed via
+ * `quoteRaw`), never from the Illinois-adjusted weight (`loW`/`hiOv`, used
+ * ONLY to steer the next candidate). This is the load-bearing invariant: a
+ * corrupted (Illinois-weighted) value must never be reported as an actual
+ * quote, or the merge could receive a value that doesn't match ANY real x —
+ * an over-quote risk. Lockstep with the emitted fragment: same loop bound,
+ * same false-position formula, same Illinois correction, same clamp.
+ */
+function bisectCapacity(
+  live: D1sLive,
+  knownGoodX: bigint,
+  knownGoodOut: bigint,
+  knownBadX: bigint,
+  knownBadOut: bigint,
+): { lx: bigint; lo: bigint } {
+  let lx = knownGoodX;
+  let lo = knownGoodOut;
+  let hiX = knownBadX;
+  let hiOv = knownBadOut;
+  let loW = knownGoodOut;
+  let stallLo = 0;
+  let stallHi = 0;
+  for (let it = 0; it < MAX_SEARCH_ROUNDS && hiX - lx > 1n; it++) {
+    let mid = lx + ((hiX - lx) * (live.idle - loW)) / (hiOv - loW);
+    if (mid <= lx) mid = lx + 1n;
+    if (mid >= hiX) mid = hiX - 1n;
+    const midOv = quoteRaw(live, mid, live.d).out;
+    if (midOv < live.idle) {
+      lx = mid;
+      lo = midOv;
+      loW = midOv;
+      stallLo++;
+      if (stallLo >= 2) {
+        hiOv = hiOv / 2n;
+        stallLo = 0;
+      }
+      stallHi = 0;
+    } else {
+      hiX = mid;
+      hiOv = midOv;
+      stallHi++;
+      if (stallHi >= 2) {
+        loW = loW + (live.idle - loW) / 2n;
+        stallHi = 0;
+      }
+      stallLo = 0;
+    }
+  }
+  return { lx, lo };
+}
+
+interface LadderWalkResult {
+  outs: bigint[];
+  caps: bigint[];
+}
+
+/**
+ * Shared walk backing both referenceLadderQuotes and referenceCapacities:
+ * warm-threads y across the grid exactly like the emitted fragment: a
+ * productive candidate (`reached && out < idle`) advances the (lo, lx)
+ * checkpoint; a breach (`reached && out >= idle`) bisects the EXACT boundary
+ * via `bisectCapacity` and freezes there PERMANENTLY (`capped`) — never the
+ * pre-breach checkpoint verbatim, so a total breach on the very first grid
+ * point still reports the real, nonzero productive capacity (the
+ * orca-whirlpool "productive input at the window edge" convention). A
+ * non-reach (the transient fee/dust guards, `!reached`) leaves the
+ * checkpoint untouched, exactly like the pre-existing fragment — it is NOT
+ * an idle-float breach and must never latch the freeze.
+ */
+function ladderWalk(live: D1sLive, grid: readonly bigint[]): LadderWalkResult {
+  let wy = live.d;
+  let lo = 0n;
+  let lx = 0n;
+  let capped = false;
+  const outs: bigint[] = [];
+  const caps: bigint[] = [];
+  for (const g of grid) {
+    if (live.d === 0n || g === 0n || capped) {
+      outs.push(lo);
+      caps.push(lx);
+      continue;
+    }
+    const r = quoteRaw(live, g, wy);
+    wy = r.y;
+    if (r.reached) {
+      if (r.out < live.idle) {
+        lo = r.out;
+        lx = g;
+      } else {
+        const found = bisectCapacity(live, lx, lo, g, r.out);
+        lx = found.lx;
+        lo = found.lo;
+        capped = true;
+      }
+    }
+    outs.push(lo);
+    caps.push(lx);
+  }
+  return { outs, caps };
+}
+
 export const meteoraDammV1StableLadder = {
   slug: SLUG,
 
@@ -300,12 +500,13 @@ export const meteoraDammV1StableLadder = {
 
   /**
    * Ladder rung at cumulative grid point x: skips all computation once
-   * `s<slot>cap` has latched (a prior rung's candidate already reached the
-   * idle float — permanent and monotonic, so every later rung would only
-   * re-confirm the same breach); otherwise runs the fee/vault/Newton chain
-   * and either latches cap (candidate >= idle) or records the new
-   * (lo, lx) = (output, cumulative input) checkpoint. Reports the CURRENT
-   * checkpoint every rung — 0 dOut/dIn once frozen, exactly the
+   * `s<slot>cap` has latched (the search below already found the EXACT
+   * global boundary — permanent, and no later rung's own candidate can ever
+   * exceed it, so nothing later can move it); otherwise runs the WARM
+   * fee/vault/Newton chain and either records the new (lo, lx) = (output,
+   * cumulative input) checkpoint (candidate clears the idle float) or, on a
+   * breach, searches for the exact boundary and latches cap. Reports the
+   * CURRENT checkpoint every rung — 0 dOut/dIn once frozen, exactly the
    * window-walking convention (types.ts's capacityInputVar doc).
    */
   emitLadderQuote(_base: PoolConfig, slot: number, rung: number, x: string, outVar: string): string {
@@ -338,9 +539,12 @@ export const meteoraDammV1StableLadder = {
   /**
    * Shared fee/vault/Newton computation up to the post-vault-withdraw
    * candidate `<v>ov`; `warm` threads the shared `s<slot>wy` cursor
-   * (mutated in place) and TAILS into the capacity FREEZE (latch cap,
-   * or record the new checkpoint); cold declares a fresh `y` const and
-   * TAILS into the raw idle-float COLLAPSE, assigning `coldOutVar`.
+   * (mutated in place) and TAILS into an inline false-position SEARCH for
+   * the exact idle-float boundary (never a collapse, never merely the
+   * pre-breach checkpoint — see this file's module doc); cold declares a
+   * fresh `y` const and TAILS into the raw idle-float COLLAPSE, assigning
+   * `coldOutVar` (the declared, merge-unreachable, latent gap this family
+   * shares with orca-whirlpool/raydium-clmm/meteora-dlmm/solfi-v2).
    */
   emitQuoteAt(slot: number, tag: string, x: string, y0: string, warm: boolean, coldOutVar?: string): string[] {
     const v = (name: string): string => `s${slot}${name}${tag}`;
@@ -368,16 +572,75 @@ export const meteoraDammV1StableLadder = {
       `          const ${v('de')} = (${v('db')} - ${yVar} - 1) / s${slot}mb;`,
       // Vault withdraw simulation (two more floors).
       `          const ${v('ol')} = ${v('de')} * s${slot}bsu / s${slot}bu;`,
-      `          let ${v('ov')} = ${v('ol')} * s${slot}bu / s${slot}bsu;`,
-      // Idle-float bound tail: FREEZE (warm, ladder-chain) vs COLLAPSE (cold, declared latent gap).
-      ...(warm
-        ? [
-            `          if (${v('ov')} >= s${slot}idl) { s${slot}cap = 1 }`,
-            `          else { s${slot}lo = ${v('ov')}; s${slot}lx = ${x}; }`,
-          ]
-        : [`          if (${v('ov')} >= s${slot}idl) { ${v('ov')} = 0 }`, `          ${coldOutVar} = ${v('ov')};`]),
+      `          const ${v('ov')} = ${v('ol')} * s${slot}bu / s${slot}bsu;`,
+      // Idle-float bound tail: FREEZE via inline SEARCH (warm, ladder-chain)
+      // vs COLLAPSE (cold, declared latent gap).
+      ...(warm ? this.emitBoundarySearch(slot, tag, x, v('ov')) : [`          if (${v('ov')} >= s${slot}idl) { ${v('ov')} = 0 }`, `          ${coldOutVar} = ${v('ov')};`]),
       '        }',
       '      }',
+    ];
+  },
+
+  /**
+   * Inline false-position (regula falsi) search with the Illinois anti-
+   * stall correction, bounded at 64 rounds — see this file's module doc for
+   * why false position (fast convergence via the candidate's VALUE, not
+   * just its sign) and why inline (a real function call is expensive on
+   * this target independent of what it computes; the SAME arithmetic
+   * inline costs the same regardless of round count — measured). Finds the
+   * exact largest cumulative input in (`s<slot>lx`, x] whose candidate still
+   * clears the idle float, given the already-computed breaching candidate
+   * `ovVar` at `x`. `s<slot>lx`/`s<slot>lo` are mutated ONLY from genuine
+   * forward-computed candidates (never the Illinois-adjusted weight
+   * `<v>low`/`<v>bhov`, which exists purely to steer the next candidate) —
+   * the load-bearing invariant that keeps every reported (lo, lx) pair a
+   * real, wei-exact quote (never an over-quote).
+   */
+  emitBoundarySearch(slot: number, tag: string, x: string, ovVar: string): string[] {
+    const v = (name: string): string => `s${slot}b${name}${tag}`;
+    return [
+      `          if (${ovVar} >= s${slot}idl) {`,
+      `            let ${v('hx')} = ${x};`,
+      `            let ${v('ho')} = ${ovVar};`,
+      `            let ${v('low')} = s${slot}lo;`,
+      `            let ${v('sl')} = 0;`,
+      `            let ${v('sh')} = 0;`,
+      `            for (let ${v('i')} = 0; ${v('i')} < ${MAX_SEARCH_ROUNDS} && ${v('hx')} - s${slot}lx > 1; ${v('i')} = ${v('i')} + 1) {`,
+      `              let ${v('mid')} = s${slot}lx + (${v('hx')} - s${slot}lx) * (s${slot}idl - ${v('low')}) / (${v('ho')} - ${v('low')});`,
+      `              if (${v('mid')} <= s${slot}lx) { ${v('mid')} = s${slot}lx + 1 }`,
+      `              if (${v('mid')} >= ${v('hx')}) { ${v('mid')} = ${v('hx')} - 1 }`,
+      `              let ${v('tf')} = ${v('mid')} * s${slot}fn / s${slot}fd;`,
+      `              if (s${slot}fn > 0 && ${v('tf')} === 0) { ${v('tf')} = 1 }`,
+      `              let ${v('pf')} = ${v('tf')} * s${slot}pn / s${slot}pd;`,
+      `              if (s${slot}pn > 0 && ${v('tf')} > 0 && ${v('pf')} === 0) { ${v('pf')} = 1 }`,
+      `              ${v('tf')} = ${v('tf')} - ${v('pf')};`,
+      `              const ${v('in')} = ${v('mid')} - ${v('pf')};`,
+      `              const ${v('lp')} = ${v('in')} * s${slot}asu / s${slot}au;`,
+      `              const ${v('af')} = (${v('lp')} + s${slot}alp) * (s${slot}au + ${v('in')}) / (s${slot}asu + ${v('lp')});`,
+      `              let ${v('mo')} = 0;`,
+      `              if (${v('af')} >= s${slot}rin + ${v('tf')}) {`,
+      `                const ${v('sn')} = ${v('af')} - s${slot}rin - ${v('tf')};`,
+      `                const ${v('y')} = stableYW(s${slot}amp, (s${slot}rin + ${v('sn')}) * s${slot}ma, s${slot}d, s${slot}d);`,
+      `                const ${v('db')} = s${slot}rout * s${slot}mb;`,
+      `                if (${v('db')} > ${v('y')}) {`,
+      `                  const ${v('de')} = (${v('db')} - ${v('y')} - 1) / s${slot}mb;`,
+      `                  const ${v('ol')} = ${v('de')} * s${slot}bsu / s${slot}bu;`,
+      `                  ${v('mo')} = ${v('ol')} * s${slot}bu / s${slot}bsu;`,
+      '                }',
+      '              }',
+      `              if (${v('mo')} < s${slot}idl) {`,
+      `                s${slot}lx = ${v('mid')}; s${slot}lo = ${v('mo')}; ${v('low')} = ${v('mo')}; ${v('sl')} = ${v('sl')} + 1;`,
+      `                if (${v('sl')} >= 2) { ${v('ho')} = ${v('ho')} / 2; ${v('sl')} = 0 }`,
+      `                ${v('sh')} = 0;`,
+      '              } else {',
+      `                ${v('hx')} = ${v('mid')}; ${v('ho')} = ${v('mo')}; ${v('sh')} = ${v('sh')} + 1;`,
+      `                if (${v('sh')} >= 2) { ${v('low')} = ${v('low')} + (s${slot}idl - ${v('low')}) / 2; ${v('sh')} = 0 }`,
+      `                ${v('sl')} = 0;`,
+      '              }',
+      '            }',
+      `            s${slot}cap = 1;`,
+      '          }',
+      `          else { s${slot}lo = ${ovVar}; s${slot}lx = ${x}; }`,
     ];
   },
 
@@ -436,24 +699,16 @@ export const meteoraDammV1StableLadder = {
     now?: bigint,
   ): (grid: readonly bigint[]) => bigint[] {
     const live = liveState(d1sConfig(base), state, now ?? BigInt(Math.floor(Date.now() / 1000)));
-    return (grid: readonly bigint[]): bigint[] => {
-      let wy = live.d;
-      let lo = 0n;
-      let capped = false;
-      return grid.map((g) => {
-        if (live.d === 0n || g === 0n || capped) return lo; // cursor unchanged, exactly like the fragment
-        const r = quoteRaw(live, g, wy);
-        wy = r.y;
-        if (r.reached) {
-          if (r.out >= live.idle) capped = true;
-          else lo = r.out;
-        }
-        return lo;
-      });
-    };
+    return (grid: readonly bigint[]): bigint[] => ladderWalk(live, grid).outs;
   },
 
-  /** Mirror of capacityInputVar: the cumulative PRODUCTIVE input at each ordered grid point — frozen at the last checkpoint below the idle float once the cap latches. Lockstep with referenceLadderQuotes (same walk, same latch condition). */
+  /**
+   * Mirror of capacityInputVar: the cumulative PRODUCTIVE input at each
+   * ordered grid point — the BISECTED exact boundary once a rung's candidate
+   * first breaches the idle float (never the last-observed grid checkpoint;
+   * see this file's module doc), frozen forever after. Lockstep with
+   * referenceLadderQuotes (same walk, same bisection).
+   */
   referenceCapacities(
     base: PoolConfig,
     state: AccountBytesMap,
@@ -461,21 +716,7 @@ export const meteoraDammV1StableLadder = {
     now?: bigint,
   ): (grid: readonly bigint[]) => bigint[] {
     const live = liveState(d1sConfig(base), state, now ?? BigInt(Math.floor(Date.now() / 1000)));
-    return (grid: readonly bigint[]): bigint[] => {
-      let wy = live.d;
-      let lx = 0n;
-      let capped = false;
-      return grid.map((g) => {
-        if (live.d === 0n || g === 0n || capped) return lx;
-        const r = quoteRaw(live, g, wy);
-        wy = r.y;
-        if (r.reached) {
-          if (r.out >= live.idle) capped = true;
-          else lx = g;
-        }
-        return lx;
-      });
-    };
+    return (grid: readonly bigint[]): bigint[] => ladderWalk(live, grid).caps;
   },
 
   depthReserves(base: PoolConfig, state: AccountBytesMap, now?: bigint): { reserveIn: bigint; reserveOut: bigint } {
@@ -495,4 +736,5 @@ export const meteoraDammV1StableLadder = {
   },
 } satisfies SvmVenueLadderV2 & {
   emitQuoteAt(slot: number, tag: string, x: string, y0: string, warm: boolean, coldOutVar?: string): string[];
+  emitBoundarySearch(slot: number, tag: string, x: string, ovVar: string): string[];
 };
