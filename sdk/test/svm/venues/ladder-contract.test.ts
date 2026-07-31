@@ -73,14 +73,19 @@ import { resolve } from 'path';
 import { address } from '@solana/kit';
 import {
   listLadderVenues,
+  deriverse,
+  deriverseLadder,
   manifestLadder,
   fetchManifestConfig,
   meteoraDammV1Stable,
   meteoraDammV1StableLadder,
   meteoraDammV2,
   meteoraDammV2Ladder,
+  meteoraDbc,
+  meteoraDbcLadder,
   meteoraDlmmLadder,
   fetchMeteoraDlmmConfig,
+  goonfiV2Ladder,
   obricV2Ladder,
   orcaLegacyTokenSwap,
   orcaLegacyTokenSwapLadder,
@@ -104,6 +109,10 @@ import {
   stabbleStableSwapLadder,
   stabbleWeightedSwap,
   stabbleWeightedSwapLadder,
+  fetchTesseraVConfig,
+  tesseravLadder,
+  fetchWoofiConfig,
+  woofiLadder,
 } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
@@ -221,6 +230,40 @@ function obricFeedBytes(price: bigint): Uint8Array {
   return data;
 }
 
+const GOONFI_DUMMY = address('So11111111111111111111111111111111111111112');
+const GOONFI_POOL = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const GOONFI_VAULT_A = address('75HgnSvXbWKZBpZHveX68ZzAhDqMzNDS29X6BGLtxMo1');
+const GOONFI_VAULT_B = address('APDFRM3HMr8CAGXwKHiu2f5ePSpaiEJhaURwhsRrUUt9');
+const GOONFI_ORACLE = address('JU8kmKzDHF9sXWsnoznaFDFezLsE5uomX2JkRMbmsQP');
+/** Real, measured schedule (see goonfi-v2/index.ts's module doc) — 6-decimal-scaled cumulative
+ *  size tiers, mintB-raw units. */
+const GOONFI_SIZE_TIERS_B: readonly bigint[] = [
+  500_000_000n,
+  1_000_000_000n,
+  2_500_000_000n,
+  5_000_000_000n,
+  10_000_000_000n,
+  50_000_000_000n,
+  100_000_000_000n,
+  250_000_000_000n,
+  1_000_000_000_000n,
+];
+const GOONFI_FEE_TIERS_PPM: readonly bigint[] = [1320n, 1450n, 1650n, 1950n, 2200n, 2800n, 3500n, 6000n, 11000n];
+
+function goonfiVaultBytes(amount: bigint): Uint8Array {
+  const data = new Uint8Array(72);
+  new DataView(data.buffer).setBigUint64(64, amount, true);
+  return data;
+}
+function goonfiOracleBytes(price: bigint): Uint8Array {
+  const data = new Uint8Array(32);
+  const view = new DataView(data.buffer);
+  view.setBigUint64(0, price, true);
+  view.setBigUint64(8, price, true);
+  view.setUint32(20, 1_000_000, true); // denom
+  return data;
+}
+
 const FAMILIES: Family[] = [
   {
     slug: 'raydium-cp-swap',
@@ -273,6 +316,25 @@ const FAMILIES: Family[] = [
       return [
         { label: 'aToB', cfg: { ...cfg, direction: 'aToB' }, state },
         { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'meteora-dbc',
+    ladder: meteoraDbcLadder,
+    async variants() {
+      // Real, non-migrated, single-segment (segIdx 0) mainnet pool — static
+      // 2% base fee (period_frequency == 0, dynamic fee disabled). The
+      // closed-form segment/migration capacity is real and merge-reachable
+      // in both directions on this fixture (see meteora-dbc.test.ts).
+      const POOL = address('5HXw3UDdd9n6aNsiPCNkB23JJBAZv3qSMf11oiJxL5z8');
+      const fixtures = fixturesFor('meteora-dbc');
+      const cfg = await meteoraDbc.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      const now = 2_000_000_000n; // far past any real activation_point — deterministic forever
+      return [
+        { label: 'quoteToBase', cfg: { ...cfg, direction: 'quoteToBase' }, state, now },
+        { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state, now },
       ];
     },
   },
@@ -380,6 +442,57 @@ const FAMILIES: Family[] = [
         { label: 'xToY', cfg, state },
         { label: 'yToX', cfg: { ...cfg, direction: 'yToX' }, state },
       ];
+    },
+  },
+  {
+    slug: 'goonfi-v2',
+    ladder: goonfiV2Ladder,
+    async variants() {
+      const decimalsA = 9;
+      const decimalsB = 6;
+      // Round p1===p2 price: 100 mintB-human-units per 1 mintA-human-unit.
+      const price = 100_000_000n;
+      const cfgYtoX = {
+        venue: 'goonfi-v2' as const,
+        pool: GOONFI_POOL,
+        direction: 'yToX' as const,
+        mintA: GOONFI_DUMMY,
+        mintB: GOONFI_DUMMY,
+        decimalsA,
+        decimalsB,
+        vaultA: GOONFI_VAULT_A,
+        vaultB: GOONFI_VAULT_B,
+        oracle: GOONFI_ORACLE,
+        tokenProgram: GOONFI_DUMMY,
+        feeSchedule: { sizeTiers: GOONFI_SIZE_TIERS_B, feeTiersPpm: GOONFI_FEE_TIERS_PPM },
+      };
+      // xToY thresholds are mintA-raw (the snapshot-price conversion fetchPoolConfig performs —
+      // see index.ts's module doc): T_A = T_B * denomAdjusted / snapshotPrice, with
+      // denomAdjusted = 1e6 * 10^9/10^6 = 1e9 and snapshotPrice = 1e8, i.e. T_A = T_B * 10.
+      const cfgXtoY = {
+        ...cfgYtoX,
+        direction: 'xToY' as const,
+        feeSchedule: { sizeTiers: GOONFI_SIZE_TIERS_B.map((t) => t * 10n), feeTiersPpm: GOONFI_FEE_TIERS_PPM },
+      };
+      const state: AccountBytesMap = {
+        [GOONFI_POOL]: new Uint8Array(8),
+        [GOONFI_VAULT_A]: goonfiVaultBytes(10_000_000_000_000n),
+        [GOONFI_VAULT_B]: goonfiVaultBytes(10_000_000_000_000n),
+        [GOONFI_ORACLE]: goonfiOracleBytes(price),
+      };
+      return [
+        { label: 'xToY', cfg: cfgXtoY, state },
+        { label: 'yToX', cfg: cfgYtoX, state },
+      ];
+    },
+    declaredCliffs: {
+      // Closed-form (not window-walking): the size-tier ceiling (the venue's OWN configured
+      // capacity, empirically confirmed against a real Jupiter "No routes found" at exactly this
+      // size — see index.ts's module doc). referenceLadderQuotes/referenceCapacities already
+      // FREEZE at the last productive rung (capacityInputVar wired above), so the merge-relevant
+      // path is safe; the standalone cold referenceQuote still collapses past the ceiling.
+      xToY: { x: 10_000_000_000_000n, peak: 989_000_000_000n },
+      yToX: { x: 1_000_000_000_000n, peak: 9_890_000_000_000n },
     },
   },
   {
@@ -544,13 +657,70 @@ const FAMILIES: Family[] = [
       return [{ label: 'AtoB', cfg, state }];
     },
   },
+  {
+    slug: 'woofi',
+    ladder: woofiLadder,
+    async variants() {
+      // The real SOL/USDC mainnet dump (test/svm/fixtures/woofi) has the
+      // venue's OWN feasibility gate genuinely tripped (a stale keeper price,
+      // see woofi.test.ts) — degenerate (always 0), so this sweep uses the
+      // SAME patched-fixture technique obric-v2's own tests use for its
+      // drained real snapshot: test/svm/fixtures/woofi-patched only touches
+      // the Pyth price/timestamps (feasibility), never the curve shape.
+      const fixtures = fixturesFor('woofi-patched');
+      const load = fixtureLoader(fixtures);
+      const state = fixtureBytesMap(fixtures);
+      const cfg = await fetchWoofiConfig(load, address('BEz2Suv2WvGKWouU1srbhZfudBGuw9v2VzkhMZHFBdvs'));
+      const now = 1_785_600_000n;
+      return [
+        { label: 'sellBase', cfg: { ...cfg, direction: 'sellBase' as const }, state, now },
+        { label: 'sellQuote', cfg: { ...cfg, direction: 'sellQuote' as const }, state, now },
+      ];
+    },
+  },
+  {
+    slug: 'deriverse',
+    ladder: deriverseLadder,
+    async variants() {
+      // A REAL, LIVE (non-drained) mainnet instrument — wSOL/USDC
+      // (8Wk2L1yD...), embedded-AMM reserves both nonzero at this snapshot,
+      // unlike obric-v2's own checked-in fixture. No `declaredCliffs`: the
+      // isqrt-based circuit-breaker capacity clamp SATURATES the standalone
+      // cold referenceQuote too (see ladder.ts's module doc) — the same
+      // no-entry shape as raydium-*/pumpswap/meteora-damm-v2/saber, not the
+      // whirlpool/clmm/dlmm/solfi-v2/damm-v1-stable "latent cliff" class.
+      const POOL = address('8Wk2L1yDovBJifCN1o86X7g7pDcqLau39m6tEsJ9Sheh');
+      const fixtures = fixturesFor('deriverse');
+      const cfg = await deriverse.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'sell', cfg: { ...cfg, side: 'sell' as const }, state },
+        { label: 'buy', cfg: { ...cfg, side: 'buy' as const }, state },
+      ];
+    },
+  },
+  {
+    slug: 'tesserav',
+    ladder: tesseravLadder,
+    async variants() {
+      // ONE verified direction only — see tesserav/ladder.ts's module doc:
+      // 'bToA' is a hard gate in fetchTesseraVConfig (unverified swap-CPI
+      // account order; a launched-then-failing CPI aborts the whole cook on
+      // SVM, so this stays a gate, not a self-drop, until a second live
+      // replay confirms the reverse shape).
+      const POOL = address('FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n');
+      const fixtures = fixturesFor('tesserav');
+      const cfg = await fetchTesseraVConfig(fixtureLoader(fixtures), POOL, 'aToB');
+      return [{ label: 'aToB', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
 ];
 
 describe('LADDER_REGISTRY count assertion', () => {
-  it('this file enumerates exactly the 16 families the SDK registers — adding one without wiring it here fails loudly', () => {
+  it('this file enumerates exactly the 21 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(16);
-    expect(FAMILIES).toHaveLength(16);
+    expect(registered).toHaveLength(21);
+    expect(FAMILIES).toHaveLength(21);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
@@ -620,8 +790,9 @@ describe.each(FAMILIES)('$slug', (family) => {
 describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses past a boundary the LADDER-CHAIN path already saturates at (LATENT: the merge never reaches this; NOT a safety property)', () => {
   const withGaps = FAMILIES.filter((f) => f.declaredCliffs !== undefined);
 
-  it('exactly five families carry a disclosed gap: the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm, an exhausted tick/bin window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert boundary) plus meteora-damm-v1-stable (closed-form, a strict idle-float bound) — obric-v2 does NOT (fixed alongside this guard)', () => {
+  it('exactly six families carry a disclosed gap: the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm, an exhausted tick/bin window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert boundary) plus meteora-damm-v1-stable (closed-form, a strict idle-float bound) plus goonfi-v2 (closed-form, its own configured size-tier ceiling) — obric-v2 does NOT (fixed alongside this guard)', () => {
     expect(withGaps.map((f) => f.slug).sort()).toEqual([
+      'goonfi-v2',
       'meteora-damm-v1-stable',
       'meteora-dlmm',
       'orca-whirlpool',
