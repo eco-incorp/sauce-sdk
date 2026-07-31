@@ -32,6 +32,8 @@ export * from './obric-v2/index.js';
 export * from './obric-v2/ladder.js';
 export * from './goonfi-v2/index.js';
 export * from './goonfi-v2/ladder.js';
+export * from './meteora-dbc/index.js';
+export * from './meteora-dbc/ladder.js';
 export * from './quantum/index.js';
 export * from './quantum/ladder.js';
 export * from './solfi-v2/index.js';
