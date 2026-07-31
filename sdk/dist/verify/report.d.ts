@@ -38,13 +38,24 @@ export interface Disclosure {
 /** Which root a report's authenticity check trusted. Always a first-class field so no reader can
  *  be confused about which one was used:
  *  - `'pinned'`  — matched against this package's own `SETTLE_TEMPLATES` table (the default).
- *  - `'caller'`  — the caller supplied `opts.expectedBodyHash` directly, OR overrode `opts.templates`
- *    (a caller-controlled table is not this package's own root, even without a single explicit hash).
+ *  - `'caller'`  — the caller supplied `opts.expectedBodyHash` directly (without labelling it
+ *    `'rederived'`), OR overrode `opts.templates` (a caller-controlled table is not this package's
+ *    own root, even without a single explicit hash). A bare, unlabelled `expectedBodyHash` pin is
+ *    a SELF-CERTIFIABLE claim — a caller who controls both the program bytes and the hash it is
+ *    checked against can trivially construct a match with arbitrary, non-audited bytes (the same
+ *    tautology the deleted `ok` boolean used to hide). To prevent `authentic:true` from ever
+ *    pairing with `templateId:null` (an internal contradiction — claiming "this IS our audited
+ *    template" for a body matching none), a plain `'caller'` pin authenticates ONLY when it ALSO
+ *    independently matches a real, accepted (non-revoked, `acceptSuperseded`-respecting) entry in
+ *    `templates` — exactly the same acceptance rule the no-`expectedBodyHash` path already uses,
+ *    just narrowed to the one hash the caller named instead of "any accepted entry".
  *  - `'rederived'` — the caller supplied `opts.expectedBodyHash` AND labelled it as obtained by
  *    actually recompiling the template (e.g. the recipes package's own producer-side check) —
  *    NEVER set this for a hash that merely arrived alongside the program being checked (that is
  *    self-certification — see `serverEcho.bodyHash` below for the only legitimate use of a
- *    served hash). */
+ *    served hash). This is the one case where authenticity is trusted WITHOUT a `templates` table
+ *    match — an explicit, self-disclosed, out-of-band claim, the same trust model this module
+ *    already uses for `intentSource`'s `'caller'` vs `'server-echo'` split. */
 export type HashSource = "pinned" | "caller" | "rederived";
 /** WHO authored `declaredIntent` — see this module's header doc. */
 export type IntentSource = "caller" | "server-echo" | "none";
@@ -104,7 +115,17 @@ export interface SettleExpectation {
      *  program itself carries a nonzero `minOut` floor, either supply `floorToken` (or the
      *  stricter, order-sensitive `tokens` list) too, or `intentReconciled` cannot be `true` — see
      *  `intent.floorToken`'s doc below; this is keyed on the PROGRAM's own floor claim, not on
-     *  whether you happened to ask about `minOut`. */
+     *  whether you happened to ask about `minOut`.
+     *
+     *  ⚠ CONTAINMENT PROVES A SUBSET, NEVER AN EQUALITY. A decoded token list that uses only SOME
+     *  of `allowTokens` still passes this check — a program that never sweeps one of the tokens you
+     *  allowed (its real balance left stranded, undelivered to `recipient`) is indistinguishable,
+     *  under `allowTokens` alone, from one that swept everything you expected. Because of that,
+     *  `allowTokens`-only reconciliation is NEVER, by itself, eligible to make `intentReconciled`
+     *  `true` / `verdict` `MATCHES_DECLARED_INTENT` — the check still catches a token OUTSIDE the
+     *  allowed set (`'fail'`), but a clean containment result caps out at `INTENT_UNCHECKED`, not an
+     *  affirmative match. Supply the exact, order-sensitive `tokens` list whenever you need the
+     *  affirmative verdict. */
     allowTokens?: Address[];
     /** Exact required `minOut`. */
     minOut?: bigint;
@@ -250,7 +271,7 @@ export declare function inspectSettleProgram(program: Hex, opts?: VerifyOpts): S
  * disclose that `expect` is itself derived from the same request/data that produced `program`
  * (see `VerifyOpts.intentSourceLabel`'s doc).
  */
-export declare function verifySettleProgram(program: Hex, expect: SettleExpectation, opts?: VerifyOpts): SettleReport;
+export declare function verifySettleProgram(program: Hex, expect: SettleExpectation, optsIn?: VerifyOpts): SettleReport;
 /** Render a report as fixed-width plain text — checks, then sweepScope/floorClaim, then
  *  disclosures. This is the deliverable a partner pastes into a support ticket: "seeing the
  *  validation phase" is a `console.log`, not a JSON-schema exercise. */

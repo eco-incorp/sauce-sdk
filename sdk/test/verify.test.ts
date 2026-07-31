@@ -241,13 +241,19 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(honestLoose.checks.find((c) => c.id === 'intent.floorToken')!.status).toBe('unchecked');
       expect(honestLoose.checks.find((c) => c.id === 'intent.floorToken')!.severity).toBe('blocking');
 
-      // Pin the floor explicitly: now the honest program reconciles and the attacker's — whose
-      // decoded.floorToken has genuinely moved — mismatches, on the SAME bare allowTokens.
+      // Pin the floor explicitly: the attacker's — whose decoded.floorToken has genuinely moved —
+      // still mismatches on the SAME bare allowTokens. The honest program's floorToken now DOES
+      // reconcile, but the overall verdict stays capped at INTENT_UNCHECKED (not the affirmative
+      // MATCHES_DECLARED_INTENT) — see the R1 fix (allowTokens containment test, below): pinning
+      // `floorToken` proves WHICH token holds the floor, but says nothing about whether every
+      // OTHER token in the bare `allowTokens` set was actually swept, so containment alone is
+      // still not eligible for the affirmative verdict even once the floor identity is pinned.
       const pinnedExpect = { ...looseExpect, floorToken: honestFloor };
       const honestPinned = verifySettleProgram(v2.program, pinnedExpect);
       const attackerPinned = verifySettleProgram(attackerProgram, pinnedExpect);
-      expect(honestPinned.verdict).toBe('MATCHES_DECLARED_INTENT');
-      expect(honestPinned.intentReconciled).toBe(true);
+      expect(honestPinned.checks.find((c) => c.id === 'intent.floorToken')!.status).toBe('pass');
+      expect(honestPinned.verdict).toBe('INTENT_UNCHECKED');
+      expect(honestPinned.intentReconciled).toBeNull();
       expect(attackerPinned.verdict).toBe('INTENT_MISMATCH');
       expect(attackerPinned.intentReconciled).toBe(false);
       expect(attackerPinned.checks.find((c) => c.id === 'intent.floorToken')!.status).toBe('fail');
@@ -355,6 +361,73 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(text).toContain('FLOOR_IS_LEVEL_NOT_DELTA');
       expect(text).toContain('verdict=');
       expect(text).not.toMatch(/\bok=/);
+    });
+  });
+
+  describe('R1-R4 fixes — the second adversarial pass', () => {
+    const v1 = SETTLE_VECTORS[0]!; // tokens=[U], minOut=0n, recipient=W
+    const v2 = SETTLE_VECTORS.find((v) => v.name.startsWith('v2'))!; // tokens=[U, W]
+
+    // R1: allowTokens CONTAINMENT proves the decoded set is a SUBSET of what's allowed — it
+    // never proves the decoded set is what the caller actually wanted. A decoded program that
+    // sweeps only ONE of the two allowed tokens (stranding the other's real balance in the Pot,
+    // undelivered to the recipient) still passes containment, and used to reconcile to
+    // MATCHES_DECLARED_INTENT for it — the affirmative verdict a partner gates a cook on.
+    it('R1 — allowTokens containment must NEVER by itself yield verdict:MATCHES_DECLARED_INTENT, even though the subset relation genuinely holds', () => {
+      // v1 decodes to tokens=[U] ONLY — W is never swept by this program at all. A partner who
+      // declared allowTokens:[U, W] (expecting the recipient could receive either) gets a program
+      // that silently never moves W — but W sat in the SAME allowed set, so naive containment
+      // reads this as a full match.
+      const r = verifySettleProgram(v1.program, { recipient: v1.recipient, allowTokens: [v1.tokens[0]!, v2.tokens[1]!] });
+      expect(r.checks.find((c) => c.id === 'intent.tokens')!.status).not.toBe('fail'); // the subset relation IS satisfied
+      expect(r.verdict).not.toBe('MATCHES_DECLARED_INTENT');
+      expect(r.intentReconciled).not.toBe(true);
+      // An exact `tokens` list, by contrast, DOES remain eligible for the affirmative verdict.
+      const exact = verifySettleProgram(v1.program, { recipient: v1.recipient, tokens: v1.tokens });
+      expect(exact.verdict).toBe('MATCHES_DECLARED_INTENT');
+      // A genuine violation (a token truly outside the allowed set) must still fail, exactly as
+      // before — this fix narrows the AFFIRMATIVE case only, it does not weaken detection.
+      const violated = verifySettleProgram(v1.program, { recipient: v1.recipient, allowTokens: [v2.tokens[1]!] });
+      expect(violated.checks.find((c) => c.id === 'intent.tokens')!.status).toBe('fail');
+      expect(violated.verdict).toBe('INTENT_MISMATCH');
+    });
+
+    // R2: a caller-pinned `expectedBodyHash` that merely equals the hash of the SAME arbitrary
+    // bytes being checked is self-certification — the identical tautology the deleted `ok`
+    // boolean used to hide, relocated to the authenticity check. `authentic:true` alongside
+    // `templateId:null` is an internal contradiction: it claims "this IS our audited template"
+    // for a body that matches NO entry in the templates table at all.
+    it('R2 — a caller-pinned expectedBodyHash must not authenticate arbitrary non-audited bytes as "our audited template" merely because it equals that same body\'s own hash', () => {
+      const goodBody = decodeSettleProgram(v1.program).body;
+      const bodyHexChars = 165 * 2;
+      const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
+      const forgedBody = '00' + goodBody.slice(4); // flip one byte — matches no table entry
+      const forged = (prologueHex + forgedBody) as Hex;
+      const forgedHash = decodeSettleProgram(forged).bodyHash;
+
+      // Default label ('caller') — a bare, self-referential assertion. Must NOT authenticate.
+      const r = inspectSettleProgram(forged, { expectedBodyHash: forgedHash });
+      expect(r.authentic).toBe(false);
+      expect(r.templateId).toBeNull(); // no longer a contradiction: authentic is also false
+      expect(r.hashSource).toBe('caller');
+      expect(r.checks.find((c) => c.id === 'body.hash')!.status).toBe('fail');
+      expect(r.verdict).not.toBe('MATCHES_DECLARED_INTENT');
+
+      // A genuinely accepted table hash, caller-pinned, still authenticates (non-regression).
+      const realPin = inspectSettleProgram(v1.program, { expectedBodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash });
+      expect(realPin.authentic).toBe(true);
+      expect(realPin.templateId).not.toBeNull();
+    });
+
+    // R3: `verifySettleProgram`'s own null-`opts` guard lives in `buildBase` — but this function
+    // reads `opts.intentSourceLabel` ITSELF, outside that guard, so an explicit `null` (a runtime
+    // caller bypassing the type system, exactly the scenario this same commit's guard elsewhere
+    // anticipates) throws a bare TypeError from a function documented "never throws".
+    it('R3 — verifySettleProgram(program, expect, null) must not throw', () => {
+      expect(() => verifySettleProgram(v1.program, { recipient: v1.recipient, tokens: v1.tokens }, null as unknown as undefined)).not.toThrow();
+      const r = verifySettleProgram(v1.program, { recipient: v1.recipient, tokens: v1.tokens }, null as unknown as undefined);
+      expect(r.intentSource).toBe('caller');
+      expect(r.verdict).toBe('MATCHES_DECLARED_INTENT');
     });
   });
 

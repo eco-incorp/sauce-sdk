@@ -82,15 +82,23 @@ function deriveVerdict(structurallyValid, authentic, intentReconciled) {
         return "INTENT_MISMATCH";
     return "INTENT_UNCHECKED";
 }
+/** A runtime caller that bypasses the type system entirely (passes `null`/a non-object as `opts`)
+ *  must not crash a function documented to never throw — the default parameter (`opts: VerifyOpts
+ *  = {}`) only covers `undefined`, not an explicit `null`/garbage value. R3: this guard used to
+ *  live ONLY inside `buildBase`'s own local scope, so it protected every check `buildBase` builds
+ *  but NOT a caller who dereferences `opts.*` again in the ENTRY POINT after `buildBase` returns —
+ *  exactly what `verifySettleProgram` does for `opts.intentSourceLabel`. Both entry points now
+ *  call this SAME function before touching `opts` at all, so the guard is uniform everywhere
+ *  `opts` is read, not just where `buildBase` happens to read it. */
+function normalizeOpts(optsIn) {
+    return optsIn && typeof optsIn === "object" ? optsIn : {};
+}
 /** Shared engine behind both `inspectSettleProgram` and `verifySettleProgram` — builds every
  *  check that does NOT depend on caller expectations (shape/body/template/serverEcho), plus the
  *  decoded value. Both entry points then call `pushIntentChecks` (with `null` or a real
  *  expectation respectively) and `buildEffects` on top of what this returns. */
 function buildBase(program, optsIn) {
-    // A runtime caller that bypasses the type system entirely (passes `null`/a non-object as
-    // `opts`) must not crash a function documented to never throw — the default parameter
-    // (`opts: VerifyOpts = {}`) only covers `undefined`, not an explicit `null`/garbage value.
-    const opts = optsIn && typeof optsIn === "object" ? optsIn : {};
+    const opts = normalizeOpts(optsIn);
     const parse = parseSettleProgram(program);
     const decoded = bestEffortDecode(parse);
     const build = { checks: [], failureCode: null };
@@ -217,7 +225,27 @@ function buildBase(program, optsIn) {
     if (actualHash) {
         if (expectedBodyHash !== undefined) {
             hashSource = opts.hashSourceLabel === "rederived" ? "rederived" : "caller";
-            authenticated = actualHash.toLowerCase() === expectedBodyHash.toLowerCase();
+            const hashMatchesClaim = actualHash.toLowerCase() === expectedBodyHash.toLowerCase();
+            if (hashSource === "rederived") {
+                // 'rederived' is an explicit, self-disclosed, OUT-OF-BAND claim ("I obtained this hash by
+                // actually recompiling the template myself" — see HashSource's doc) — the same trust model
+                // this module already uses for `intentSource`'s 'caller' vs 'server-echo' split. Trusted at
+                // face value, independent of whether this package's own SETTLE_TEMPLATES table has an
+                // entry for it (that is the whole point of the escape hatch).
+                authenticated = hashMatchesClaim;
+            }
+            else {
+                // R2: an UNLABELLED 'caller' pin is a bare assertion — and a caller who controls BOTH the
+                // program bytes AND the `expectedBodyHash` it is checked against can trivially satisfy
+                // `hashMatchesClaim` with ARBITRARY, non-audited bytes (the exact self-referential
+                // tautology the deleted `ok` boolean used to hide, relocated here). Demote: a plain
+                // 'caller' pin authenticates ONLY when it ALSO independently matches a real, accepted
+                // table entry — never "authentic" with `templateId:null` at the same time, which used to
+                // be an internally contradictory pair (claiming "this IS our audited template" for a body
+                // matching no known template at all).
+                const claimAccepted = !!tableMatch && tableMatch.status !== "revoked" && (tableMatch.status !== "superseded" || opts.acceptSuperseded !== false);
+                authenticated = hashMatchesClaim && claimAccepted;
+            }
             bodyHashStatus = authenticated ? "pass" : "fail";
             bodyHashCode = authenticated ? undefined : "BODY_HASH";
             bodyHashActual = actualHash;
@@ -460,6 +488,15 @@ function pushIntentChecks(build, decoded, expect) {
     let tokensExpected;
     let tokensActual;
     let tokensCode;
+    // R1: a containment ('pass') result on the `allowTokens` branch below proves the decoded set is
+    // a SUBSET of `allowTokens` — it never proves the decoded set is what the caller actually
+    // wanted, because a program that sweeps only SOME of the allowed tokens (stranding the rest,
+    // undelivered) is indistinguishable from one that swept everything expected.
+    // `tokensContainmentPass` records exactly that case so the reconciliation derivation below can
+    // refuse to let it alone produce `intentReconciled:true` — see `deriveVerdict`'s doc and the
+    // `allowTokens` doc on `SettleExpectation`. A genuine violation (a token truly outside the
+    // allowed set) is UNAFFECTED — it still fails here, same as before this fix.
+    let tokensContainmentPass = false;
     if (tokensArr !== undefined || tokensGivenInvalid) {
         if (tokensGivenInvalid) {
             tokensStatus = "fail";
@@ -500,7 +537,10 @@ function pushIntentChecks(build, decoded, expect) {
             else {
                 const outside = decoded.tokens.filter((t) => !allowSet.has(BigInt(t)));
                 tokensStatus = outside.length === 0 ? "pass" : "fail";
-                tokensActual = outside.length === 0 ? `[${decoded.tokens.map(renderAddr).join(", ")}] — all allowed` : `contains disallowed token(s): [${outside.map(renderAddr).join(", ")}]`;
+                tokensContainmentPass = outside.length === 0;
+                tokensActual = outside.length === 0
+                    ? `[${decoded.tokens.map(renderAddr).join(", ")}] — all allowed, but NOT proven to be the FULL expected set (containment only)`
+                    : `contains disallowed token(s): [${outside.map(renderAddr).join(", ")}]`;
                 tokensCode = outside.length === 0 ? undefined : "EXPECT_TOKENS";
             }
         }
@@ -522,7 +562,9 @@ function pushIntentChecks(build, decoded, expect) {
         compared: "decoded token list vs. expect.tokens / expect.allowTokens",
         expected: tokensExpected,
         actual: tokensActual,
-        proves: "the FULL_BALANCE_SWEEP hazard's actual scope: which tokens leave the Pot at their whole balance. An unchecked status here means NOTHING about the token list was verified — treat that as unreconciled, not as a pass.",
+        proves: tokensContainmentPass
+            ? "ONLY that no decoded token falls outside the allowed set — a SUBSET relation, never an equality. A program that sweeps just some of the allowed tokens (stranding the rest, undelivered to recipient) passes this exact same way a fully-expected sweep would. NOT sufficient, alone, for an affirmative (MATCHES_DECLARED_INTENT) verdict — see intentReconciled."
+            : "the FULL_BALANCE_SWEEP hazard's actual scope: which tokens leave the Pot at their whole balance. An unchecked status here means NOTHING about the token list was verified — treat that as unreconciled, not as a pass.",
     }, tokensCode);
     // intent.minOut — advisory+unchecked when neither minOut nor minMinOut is supplied (including
     // inspect's permanent no-expectation case); becomes blocking (pass/fail) once either is. This is
@@ -631,6 +673,12 @@ function pushIntentChecks(build, decoded, expect) {
         return null;
     if (relevant.includes("fail"))
         return false;
+    // R1: a clean `allowTokens` containment result is NOT eligible, by itself, to make
+    // intentReconciled `true` — it proved a subset, never an equality (see `tokensContainmentPass`'s
+    // doc above). Every other relevant check passed, so this is not a mismatch either — it caps out
+    // at "not fully reconciled", the same outcome an omitted expectation produces.
+    if (tokensContainmentPass)
+        return null;
     return true;
 }
 /**
@@ -676,10 +724,15 @@ export function inspectSettleProgram(program, opts = {}) {
  * disclose that `expect` is itself derived from the same request/data that produced `program`
  * (see `VerifyOpts.intentSourceLabel`'s doc).
  */
-export function verifySettleProgram(program, expect, opts = {}) {
+export function verifySettleProgram(program, expect, optsIn = {}) {
     if (!expect || expect.recipient === undefined || expect.recipient === null) {
         throw new TypeError("verifySettleProgram: expect.recipient is REQUIRED (a runtime caller bypassed the type system)");
     }
+    // R3: normalize BEFORE any `opts.*` dereference in THIS function — `buildBase` re-normalizes
+    // its own copy internally, but that guard never protected this function's own read of
+    // `opts.intentSourceLabel` below, which used to crash on an explicit `null` (a runtime caller
+    // bypassing the type system, the exact scenario this same guard already anticipates elsewhere).
+    const opts = normalizeOpts(optsIn);
     const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
     const intentReconciled = pushIntentChecks(build, decoded, expect);
     const verdict = deriveVerdict(structurallyValid, authenticated, intentReconciled);
