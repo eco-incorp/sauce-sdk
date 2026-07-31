@@ -52,6 +52,15 @@ export type SettleFailureCode =
   | "BODY_LENGTH"
   | "BODY_HASH"
   | "TEMPLATE_REVOKED"
+  /** The pinned-root match itself was internally inconsistent (a matched entry with no `id`) —
+   *  see `internal/root-testing.ts`'s fail-closed guard. Reachable only through that file's
+   *  test-only `root` parameter; `SETTLE_TEMPLATES` itself never produces this. */
+  | "INTERNAL_INCONSISTENT"
+  /** `opts.rederivedBodyHash` (the producer's own independently-recompiled hash) disagreed with
+   *  this program's actual body hash — see `VerifyOpts.rederivedBodyHash`'s doc. Distinct from
+   *  `BODY_HASH` (which means "the pinned table rejected this body"): this means "the producer's
+   *  own cross-check disagrees with what it is reporting on". */
+  | "PRODUCER_HASH_DIVERGED"
   | "EXPECT_RECIPIENT"
   | "EXPECT_TOKENS"
   | "EXPECT_MINOUT"

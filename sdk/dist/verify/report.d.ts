@@ -1,8 +1,21 @@
 import { type Address, type Hex } from "viem";
 import { type DecodedSettleProgram, type SettleFailureCode } from "./decode.js";
-import { type TemplateEntry } from "./template.js";
 export type CheckStatus = "pass" | "fail" | "unchecked";
 export type CheckSeverity = "blocking" | "advisory";
+/**
+ * WHAT KIND of thing a check proves — the ALLOW-LIST `structurallyValid` derives from (see its
+ * computation below), replacing a hand-maintained id-EXCLUSION-list (`c.id === 'body.hash'`) that
+ * had to be updated by hand every time a new non-shape check was added, and would silently sink
+ * `structurallyValid` for one that wasn't (as `producer.rederivedBodyHash` — `kind:'authenticity'`
+ * — would have, under the old id-list rule, since it is `blocking` but not a wire-shape fact):
+ *   - `'shape'`         — the wire is well-formed/canonical. Feeds `structurallyValid`.
+ *   - `'authenticity'`  — whether this body is our audited template (`body.hash`,
+ *     `producer.rederivedBodyHash`). Feeds `authentic`, never `structurallyValid`.
+ *   - `'intent'`        — a comparison against caller-declared expectation. Feeds
+ *     `intentReconciled`/`verdict`, never `structurallyValid`/`authentic` directly.
+ *   - `'informational'` — never gates anything (`template.status`, `serverEcho.bodyHash`).
+ */
+export type CheckKind = "shape" | "authenticity" | "intent" | "informational";
 export interface VerifyCheck {
     /** Stable, dot-namespaced id — safe to key a UI row on. */
     id: string;
@@ -10,6 +23,8 @@ export interface VerifyCheck {
     title: string;
     status: CheckStatus;
     severity: CheckSeverity;
+    /** See `CheckKind`'s doc — which derived field this check feeds, if any. */
+    kind: CheckKind;
     /** WHAT was compared, in words. */
     compared: string;
     /** Rendered expected value (or a sentence when there is no single value, e.g. "any accepted template"). */
@@ -35,56 +50,38 @@ export interface Disclosure {
     title: string;
     text: string;
 }
-/** Which root a report's authenticity check trusted. Always a first-class field so no reader can
- *  be confused about which one was used:
- *  - `'pinned'`  — matched against this package's own `SETTLE_TEMPLATES` table (the default).
- *  - `'caller'`  — the caller supplied `opts.expectedBodyHash` directly (without labelling it
- *    `'rederived'`), OR overrode `opts.templates` (a caller-controlled table is not this package's
- *    own root, even without a single explicit hash).
- *  - `'rederived'` — the caller supplied `opts.expectedBodyHash` AND labelled it as obtained by
- *    actually recompiling the template (e.g. the recipes package's own producer-side check) —
- *    NEVER set this for a hash that merely arrived alongside the program being checked (that is
- *    self-certification — see `serverEcho.bodyHash` below for the only legitimate use of a
- *    served hash).
+/** Which root a report's authenticity check consulted. Always a first-class field, and now a
+ *  CLOSED, two-value type — no string a caller passes can move it:
+ *  - `'pinned'` — a body hash was computed AND compared against `SETTLE_TEMPLATES`, this
+ *    package's own constant. This is the ONLY way `authentic` can ever be `true`.
+ *  - `'none'`   — the program never decoded far enough to have a body hash at all (there was
+ *    nothing to authenticate against anything).
  *
- *  BOTH `'caller'` and `'rederived'` are, by construction, a bare ASSERTION that `expectedBodyHash`
- *  is trustworthy — and a caller who controls both the program bytes and the hash it is checked
- *  against can trivially construct a match with arbitrary, non-audited bytes (the same tautology
- *  the deleted `ok` boolean used to hide). An earlier revision of this module trusted a
- *  `'rederived'`-labelled hash at face value, UNCONDITIONALLY skipping the table-match requirement
- *  the `'caller'` branch already carried — the label alone (a plain string in the same
- *  caller-supplied `opts` object) was enough to restore the exact tautology this module exists to
- *  close. There is no way for this module to verify OUT OF BAND that a `'rederived'` hash was
- *  genuinely obtained by recompiling anything real, so `authentic` is EQUALLY conditioned on the
- *  SAME acceptance rule for both labels: `hashMatchesClaim` (the caller's claim reproduces the
- *  program's actual body hash) AND an independent match against a real, accepted (non-revoked,
- *  `acceptSuperseded`-respecting) entry in `templates` — exactly the same acceptance rule the
- *  no-`expectedBodyHash` path already uses, just narrowed to the one hash the caller named instead
- *  of "any accepted entry". This never regresses a genuine caller: the recipes package's own
- *  `reportOwnSettleProgram` labels `'rederived'` with a hash obtained by ACTUALLY recompiling the
- *  audited template, which — being audited — already lives in `SETTLE_TEMPLATES` and passes this
- *  same check. The label remains meaningful purely as PROVENANCE/disclosure (how the caller says
- *  they obtained the hash — useful for an audit trail), never as a different security boundary. */
-export type HashSource = "pinned" | "caller" | "rederived";
-/** WHO authored `declaredIntent` — see this module's header doc. */
+ *  An earlier revision of this type also carried `'caller'`/`'rederived'` — labels attached to a
+ *  hash or table the CALLER supplied via `opts`. Both are DELETED, along with the `opts.templates`/
+ *  `opts.expectedBodyHash`/`opts.hashSourceLabel` fields that produced them: a caller who controls
+ *  both the program bytes and the table/hash checked against them can trivially construct a match
+ *  with arbitrary, non-audited bytes, and no label attached to that match (however it's spelled)
+ *  changes that fact. See `internal/root-testing.ts`'s header for the trust-boundary statement this
+ *  deletion enforces, and `VerifyOpts.rederivedBodyHash` for the replacement a producer that
+ *  genuinely recompiles its own output should use instead — a CROSS-CHECK that can only ever
+ *  narrow `authentic` toward `false`, never establish it. */
+export type HashSource = "pinned" | "none";
+/** WHO authored `declaredIntent` — see this module's header doc. `'server-echo'` CAPS `verdict` at
+ *  `INTENT_UNCHECKED` even when every intent field matches — see `deriveVerdict`'s doc: a
+ *  self-disclosed tautology (the same request that produced `program` also produced `expect`) must
+ *  never read as an independently-confirmed match. */
 export type IntentSource = "caller" | "server-echo" | "none";
 /**
  * The single machine-gateable field. See `SettleReportEnvelope.verdict`'s doc for the full
  * derivation and what each outcome does/does not prove.
  */
 export type SettleVerdict = "MALFORMED" | "NOT_OUR_TEMPLATE" | "INTENT_UNCHECKED" | "INTENT_MISMATCH" | "MATCHES_DECLARED_INTENT";
+/** Whether a producer's own independently-recomputed body hash (`opts.rederivedBodyHash`) agrees
+ *  with what this report itself computed from `program`. `'absent'` when the opt wasn't supplied —
+ *  never rendered as a failure. See `VerifyOpts.rederivedBodyHash`'s doc for the full contract. */
+export type Rederivation = "absent" | "agrees" | "disagrees";
 export interface VerifyOpts {
-    /** Override the pinned table (e.g. to test against a specific historical entry). Defaults to
-     *  `SETTLE_TEMPLATES`. MUST be an array — a non-array value (a runtime caller bypassing the
-     *  type system) is treated as "not supplied" rather than thrown on. */
-    templates?: readonly TemplateEntry[];
-    /** Caller-pinned expected body hash — bypasses the table lookup for the authenticity
-     *  pass/fail decision entirely (the table is still consulted for the informational
-     *  `template.status` row). Sets `hashSource` to `hashSourceLabel ?? 'caller'`. MUST be a
-     *  string — a non-string value is treated as "not supplied" rather than thrown on. */
-    expectedBodyHash?: Hex;
-    /** Only meaningful together with `expectedBodyHash` — see `HashSource`. Defaults to `'caller'`. */
-    hashSourceLabel?: "caller" | "rederived";
     /** Accept a `superseded` (but not `revoked`) template as authentic. Default `true` — see this
      *  package's template-rotation design: a stale partner pin can only ever admit an OLDER version
      *  of our own audited body, never arbitrary behavior (the failure direction is availability, not
@@ -94,15 +91,48 @@ export interface VerifyOpts {
      *  informational `serverEcho.bodyHash` check (comparing a program to a hash shipped beside it
      *  is self-certification and proves nothing on its own; this exists purely to surface version
      *  skew between what the caller computed and what the server thinks it sent). MUST be a string
-     *  — a non-string value is treated as "not supplied" rather than thrown on. */
+     *  — a non-string value is treated as "not supplied" rather than thrown on. Never feeds
+     *  `authentic` — see `rederivedBodyHash` for the ONLY hash opt that does (and only downward). */
     serverEchoBodyHash?: Hex;
+    /**
+     * A CROSS-CHECK, not a credential — the inverted contract deliberately distinguishes this from
+     * the deleted `expectedBodyHash`/`hashSourceLabel:'rederived'` pair. This is for a producer that
+     * ACTUALLY recompiled the template it is now reporting on (e.g. the recipes package's
+     * `reportOwnSettleProgram`, which passes its own `settleBodyHashV12()`) and wants that fact
+     * disclosed and CHECKED — never asserted at face value:
+     *   - It can only ever push `authentic` toward `false`, never establish it: `authentic` is
+     *     ALWAYS decided first, purely from `body.hash` against `SETTLE_TEMPLATES` (see
+     *     `internal/root-testing.ts`). This opt is compared SEPARATELY, against the program's OWN
+     *     computed body hash (R vs. the report's own P) — never against the table.
+     *   - Agreement (`rederivation:'agrees'`) changes nothing: a genuine producer's hash, by
+     *     construction, already matches whatever the table independently decided.
+     *   - Disagreement (`rederivation:'disagrees'`) FORCES `authentic:false` with
+     *     `failureCode:'PRODUCER_HASH_DIVERGED'`, regardless of what the table-only decision was —
+     *     a producer whose own recompiled hash doesn't match what it's reporting on is telling this
+     *     report something is wrong with ITSELF, distinct from "the pinned table rejected this
+     *     body". A hostile caller supplying junk here only ever harms their own report — this can
+     *     never authenticate an otherwise-rejected body, only reject an otherwise-accepted one.
+     *  MUST be a string — a non-string value is treated as "not supplied" (`rederivation:'absent'`).
+     */
+    rederivedBodyHash?: Hex;
     /** ONLY meaningful on `verifySettleProgram` (ignored by `inspectSettleProgram`, which always
      *  reports `intentSource:'none'`). Self-disclosure that `expect` is itself derived from the SAME
      *  request/data that produced the program being checked — e.g. a server building its own
      *  "expectation" from the parameters it just compiled with. Defaults to `'caller'` (an
      *  independently-formed expectation). Set `'server-echo'` so a report never implies an
-     *  independent check ran when it did not — see `IntentSource`'s doc. */
+     *  independent check ran when it did not — see `IntentSource`'s doc; `verdict` is CAPPED at
+     *  `INTENT_UNCHECKED` under this label even on a full field match (see `deriveVerdict`). */
     intentSourceLabel?: "caller" | "server-echo";
+    /** ECHO-ONLY on `inspectSettleProgram` (ignored by `verifySettleProgram`, which always echoes
+     *  its own required `expect` argument instead). Lets a server that has no independent
+     *  expectation of its own still hand a downstream consumer the request-derived intent it
+     *  compiled against — populating `declaredIntent` on the returned report — WITHOUT that
+     *  consumer ever being told a reconciliation happened: `intentSource` stays `'none'` and
+     *  `verdict` stays `INTENT_UNCHECKED` regardless of this opt. This is the replacement for the
+     *  old `reportOwnSettleProgram` pattern of spreading `declaredIntent` onto an already-built
+     *  report by hand after the fact — the SAME value, but produced by this module instead of
+     *  mutated in afterward. */
+    declaredIntent?: SettleExpectation;
 }
 export interface SettleExpectation {
     /** REQUIRED, nonzero. The entire hazard this surface guards is a caller-chosen recipient — a
@@ -213,35 +243,49 @@ export interface SettleReportEnvelope {
      *                                 our audited template — the bytes alone cannot refute it.
      *   - `INTENT_MISMATCH`         — `intentReconciled` is `false`: every required intent
      *                                 comparison actually ran and at least one did not match.
-     *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true`: every required intent
-     *                                 comparison ran and ALL matched. The only verdict meaning
-     *                                 "safe to cook against what was declared" — and even that is
-     *                                 only as trustworthy as `intentSource`: a `'server-echo'` or
-     *                                 `'none'` source means the declaration was not independent.
+     *   - `MATCHES_DECLARED_INTENT` — `intentReconciled` is `true` AND `intentSource` is
+     *                                 `'caller'` (an independently-formed expectation): every
+     *                                 required intent comparison ran and ALL matched. The ONLY
+     *                                 verdict meaning "safe to cook against what was declared".
+     *                                 `intentSource:'server-echo'` CAPS this outcome to
+     *                                 `INTENT_UNCHECKED` even on a full field match — see
+     *                                 `deriveVerdict`'s doc: a self-disclosed tautology (the same
+     *                                 request produced both `program` and `expect`) must never read
+     *                                 as an independently-confirmed match. `intentSource:'none'`
+     *                                 (`inspectSettleProgram`, always) can never reach this outcome
+     *                                 at all — `intentReconciled` is structurally never `true` there.
      */
     verdict: SettleVerdict;
     /** `true`/`false`/`null` twin of `verdict`'s intent half. `null` — not fully compared (no
-     *  expectation supplied, or a required identity check left unpinned). `false` — fully compared,
-     *  at least one field did not match. `true` — fully compared, every field matched. ALWAYS `null`
-     *  for `inspectSettleProgram`. */
+     *  expectation supplied, a required identity check left unpinned, or `intentSource` was
+     *  `'server-echo'` and got capped — see `deriveVerdict`). `false` — fully compared, at least one
+     *  field did not match. `true` — fully compared, every field matched, AND `intentSource` was
+     *  `'caller'`. ALWAYS `null` for `inspectSettleProgram`. */
     intentReconciled: boolean | null;
     /** WHO authored `declaredIntent` — see this module's header doc and `IntentSource`. */
     intentSource: IntentSource;
-    /** The expectation actually supplied, verbatim — `null` for `inspectSettleProgram` (there is
-     *  never one). Lets a downstream consumer reconcile `decoded` against its OWN copy of intent
-     *  rather than trusting a self-authored comparison. */
+    /** The expectation actually supplied, verbatim — `null` for `inspectSettleProgram` UNLESS
+     *  `opts.declaredIntent` was supplied (a pure ECHO in that case — never reconciled, `intentSource`
+     *  stays `'none'` regardless). Lets a downstream consumer reconcile `decoded` against its OWN
+     *  copy of intent rather than trusting a self-authored comparison. */
     declaredIntent: DeclaredIntent | null;
     mode: "verify" | "inspect";
     templateId: string | null;
     templateVersion: string | null;
     hashSource: HashSource;
-    /** Every blocking check EXCEPT `body.hash` passes — the bytes are a well-formed, canonical
+    /** See `VerifyOpts.rederivedBodyHash`'s doc — `'absent'` when that opt wasn't supplied,
+     *  otherwise whether it agreed with this report's own computed body hash. A `'disagrees'` value
+     *  co-occurs with `authentic:false` and `failureCode:'PRODUCER_HASH_DIVERGED'` by construction. */
+    rederivation: Rederivation;
+    /** Every blocking `kind:'shape'` check passes — the bytes are a well-formed, canonical
      *  `(tokens, minOut, recipient) || body[165]` wire program. Says NOTHING about whose program it
      *  is or what tokens/recipient it names. */
     structurallyValid: boolean;
-    /** `body.hash` passes — the body matches an accepted (non-revoked) template entry. Independent
-     *  of `structurallyValid` (a malformed prologue can front an otherwise-authentic body suffix,
-     *  and vice versa) and, like it, says NOTHING about tokens/recipient/minOut intent. */
+    /** `body.hash` matches an entry in `SETTLE_TEMPLATES` — this package's OWN pinned constant,
+     *  never a caller-supplied table or hash (see `HashSource`'s doc) — whose `status` is on the
+     *  accept allow-list, AND (when supplied) `opts.rederivedBodyHash` agreed. Independent of
+     *  `structurallyValid` (a malformed prologue can front an otherwise-authentic body suffix, and
+     *  vice versa) and, like it, says NOTHING about tokens/recipient/minOut intent. */
     authentic: boolean;
     failureCode: SettleFailureCode | null;
     decoded: DecodedSettleProgram | null;
@@ -263,22 +307,29 @@ export type SettleReport = SettleReportEnvelope & {
 };
 /**
  * SEE — never throws, requires no expectations. This is the "show me the validation phase" call:
- * renders EVERY check `verifySettleProgram` would (shape/body/template/serverEcho AND the four
- * `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever. Because
- * of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`, which
- * makes `intentReconciled` PERMANENTLY `null` and `verdict` PERMANENTLY `INTENT_UNCHECKED` (unless
- * the bytes are malformed or inauthentic, which take priority) — this is correct, not a defect:
- * this function never has an independent expectation to reconcile against. Use
+ * renders EVERY check `verifySettleProgram` would (shape/body/template/producer/serverEcho AND the
+ * four `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever.
+ * Because of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`,
+ * which makes `intentReconciled` PERMANENTLY `null` and `verdict` PERMANENTLY `INTENT_UNCHECKED`
+ * (unless the bytes are malformed or inauthentic, which take priority) — this is correct, not a
+ * defect: this function never has an independent expectation to reconcile against. Use
  * `structurallyValid`/`authentic` for "is this genuinely our template, well-formed" instead.
+ *
+ * `opts.declaredIntent`, if supplied, is echoed VERBATIM into the returned `declaredIntent` — a
+ * pure echo, never reconciled: `intentSource` stays `'none'` and `verdict` stays capped at
+ * `INTENT_UNCHECKED` regardless, exactly as if it had been omitted. This lets a server with no
+ * independent expectation of its own still hand a downstream consumer the request-derived intent
+ * it compiled against, for that consumer's OWN reconciliation — see `VerifyOpts.declaredIntent`.
  */
-export declare function inspectSettleProgram(program: Hex, opts?: VerifyOpts): SettleInspection;
+export declare function inspectSettleProgram(program: Hex, optsIn?: VerifyOpts): SettleInspection;
 /**
  * GATE — never throws. `expect.recipient` is REQUIRED (see `SettleExpectation`). Calls
  * `pushIntentChecks` with the REAL expectation (real pass/fail comparisons, not permanently-
  * unchecked placeholders) and derives `verdict`/`intentReconciled` over the full check set.
  * `intentSource` is `'caller'` by default — pass `opts.intentSourceLabel:'server-echo'` to
  * disclose that `expect` is itself derived from the same request/data that produced `program`
- * (see `VerifyOpts.intentSourceLabel`'s doc).
+ * (see `VerifyOpts.intentSourceLabel`'s doc). Under `'server-echo'`, `verdict` is CAPPED at
+ * `INTENT_UNCHECKED` even on a full field match — see `deriveVerdict`.
  */
 export declare function verifySettleProgram(program: Hex, expect: SettleExpectation, optsIn?: VerifyOpts): SettleReport;
 /** B3: `formatSettleReport` is documented (see `jsonSafe`'s doc above) to never throw, but that
@@ -288,6 +339,6 @@ export declare function verifySettleProgram(program: Hex, expect: SettleExpectat
  *  line was even built, `for (const c of r.checks)` on a value with no `checks` array at all. Every
  *  field this function reads is now read DEFENSIVELY — a missing/garbage container renders a
  *  placeholder instead of throwing, exactly the "guard the elements, don't just guard the
- *  container" fix `matchTemplate` above needed for the same reason. */
+ *  container" fix `internal/root-testing.ts`'s `matchInRoot` needed for the same reason. */
 export declare function formatSettleReport(r: SettleReport | SettleInspection): string;
 //# sourceMappingURL=report.d.ts.map

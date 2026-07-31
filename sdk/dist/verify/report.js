@@ -1,6 +1,7 @@
 import { getAddress } from "viem";
 import { parseSettleProgram, bestEffortDecode } from "./decode.js";
 import { SETTLE_TEMPLATES, CURRENT_SETTLE_TEMPLATE } from "./template.js";
+import { authenticateBodyAgainstRoot } from "./internal/root-testing.js";
 // ── Disclosures — ALWAYS present, on success as well as failure. Stable ids so a UI can render
 // them as a permanent banner rather than an error state. ────────────────────────────────────────
 const DISCLOSURES = [
@@ -57,18 +58,12 @@ function safeBigInt(v) {
         return null;
     }
 }
-/** B3: `opts.templates` is validated as an ARRAY (`Array.isArray`) before this is ever called — but
- *  a runtime caller bypassing the type system can still populate that array with garbage ELEMENTS
- *  (`null`, `undefined`, `{}`, `{bodyHash: 1}`, `{bodyHash: null}`) that are not `TemplateEntry`
- *  values at all. `t.bodyHash.toLowerCase()` used to assume every element was a well-formed entry
- *  and crashed on the first one that wasn't — the "never throws" guarantee this module documents
- *  everywhere else only ever guarded the CONTAINER (the array itself), never its elements. Each
- *  element is now type-checked before its `bodyHash` is read; a malformed element simply never
- *  matches (the same "unrecognized input treated as no match" rule every other garbage-input path
- *  in this module already follows) rather than throwing. */
-function matchTemplate(hash, templates) {
-    const norm = hash.toLowerCase();
-    return templates.find((t) => t !== null && typeof t === "object" && typeof t.bodyHash === "string" && t.bodyHash.toLowerCase() === norm);
+/** Wraps `authenticateBodyAgainstRoot` with `SETTLE_TEMPLATES` as the root — see this function's
+ *  own doc AND `internal/root-testing.ts`'s header for why THIS is the one and only production
+ *  call site of that function, and why no parameter anywhere on this module's public surface can
+ *  change which table it's called with. */
+function authenticateBody(bodyHash, acceptSuperseded) {
+    return authenticateBodyAgainstRoot(bodyHash, acceptSuperseded, SETTLE_TEMPLATES);
 }
 function push(build, check, code) {
     build.checks.push(check);
@@ -79,14 +74,23 @@ function push(build, check, code) {
 /**
  * `verdict` derivation — the ONE place this mapping is made, so nobody re-derives it differently.
  * See `SettleReportEnvelope.verdict`'s doc for what each outcome does/does not prove.
+ *
+ * `intentSource === 'server-echo'` CAPS a would-be `MATCHES_DECLARED_INTENT` down to
+ * `INTENT_UNCHECKED` — never down to `INTENT_MISMATCH` (the values genuinely agree; what's missing
+ * is INDEPENDENCE, not agreement, so the "not yet proven safe" verdict is the honest one, same as
+ * an omitted expectation). This is the fix for the disclosed-but-unenforced half of the
+ * FULL_BALANCE_SWEEP safety sentence: that text names `MATCHES_DECLARED_INTENT` from an
+ * "independently-formed (`intentSource:'caller'`)" expectation as the only safe read — but
+ * `intentSource:'server-echo'` used to still be able to REACH `MATCHES_DECLARED_INTENT` on a full
+ * field match, contradicting the sentence's own qualifier at the type level, not just in prose.
  */
-function deriveVerdict(structurallyValid, authentic, intentReconciled) {
+function deriveVerdict(structurallyValid, authentic, intentReconciled, intentSource) {
     if (!structurallyValid)
         return "MALFORMED";
     if (!authentic)
         return "NOT_OUR_TEMPLATE";
     if (intentReconciled === true)
-        return "MATCHES_DECLARED_INTENT";
+        return intentSource === "server-echo" ? "INTENT_UNCHECKED" : "MATCHES_DECLARED_INTENT";
     if (intentReconciled === false)
         return "INTENT_MISMATCH";
     return "INTENT_UNCHECKED";
@@ -131,21 +135,21 @@ function normalizeOpts(optsIn) {
     return optsIn && typeof optsIn === "object" ? optsIn : {};
 }
 /** Shared engine behind both `inspectSettleProgram` and `verifySettleProgram` — builds every
- *  check that does NOT depend on caller expectations (shape/body/template/serverEcho), plus the
- *  decoded value. Both entry points then call `pushIntentChecks` (with `null` or a real
+ *  check that does NOT depend on caller expectations (shape/body/template/producer/serverEcho),
+ *  plus the decoded value. Both entry points then call `pushIntentChecks` (with `null` or a real
  *  expectation respectively) and `buildEffects` on top of what this returns. */
 function buildBase(program, optsIn) {
     const opts = normalizeOpts(optsIn);
     const parse = parseSettleProgram(program);
     const decoded = bestEffortDecode(parse);
     const build = { checks: [], failureCode: null };
-    // `opts.templates`/`opts.expectedBodyHash`/`opts.serverEchoBodyHash` are all caller-controlled
-    // and only TYPED as array/`Hex` — a runtime caller bypassing the type system (a plain object
-    // instead of an array, a number instead of a hex string) must be treated as "not supplied"
-    // rather than crash `templates.find(...)`/`.toLowerCase()` on a value that has neither.
-    const templatesValid = Array.isArray(opts.templates);
-    const templates = templatesValid ? opts.templates : SETTLE_TEMPLATES;
-    const expectedBodyHash = typeof opts.expectedBodyHash === "string" ? opts.expectedBodyHash : undefined;
+    // `opts.rederivedBodyHash`/`opts.serverEchoBodyHash` are both caller-controlled and only TYPED
+    // as `Hex` — a runtime caller bypassing the type system (a number instead of a hex string) must
+    // be treated as "not supplied" rather than crash a `.toLowerCase()` call on a value that has
+    // neither. NOTE: there is deliberately no analogous `templates`/`expectedBodyHash` extraction
+    // here anymore — see `HashSource`'s doc and `internal/root-testing.ts`'s header for why no
+    // caller-reachable value can influence which table `authentic` is decided against.
+    const rederivedBodyHash = typeof opts.rederivedBodyHash === "string" ? opts.rederivedBodyHash : undefined;
     const serverEchoBodyHash = typeof opts.serverEchoBodyHash === "string" ? opts.serverEchoBodyHash : undefined;
     // shape.pushes — did the FULL leading prologue scan (at least one token push, TUPLE, arity,
     // minOut, recipient) complete AT ALL, regardless of whether an individual push was CANONICAL
@@ -166,6 +170,7 @@ function buildBase(program, optsIn) {
         title: "Leading minimal-length integer pushes found (the reversed token array, minOut, recipient).",
         status: pushesIncomplete ? "fail" : "pass",
         severity: "blocking",
+        kind: "shape",
         compared: "byte 0 onward against the PUSH opcode range 0x01..0x20, tracking width/offset per push",
         expected: "at least one well-formed, untruncated push run reaching a minOut push and a recipient push",
         actual: pushesIncomplete ? (parse.fatal?.message ?? "the leading push run did not complete") : `${parse.tokenPushes.length} token push(es) + minOut + recipient, all well-formed`,
@@ -192,6 +197,7 @@ function buildBase(program, optsIn) {
         title: "Every push is minimal-length; token/recipient pushes are ≤20 bytes.",
         status: canonUnchecked ? "unchecked" : canonError ? "fail" : "pass",
         severity: "blocking",
+        kind: "shape",
         compared: "each push's declared width against the minimal-length rule (no leading zero byte) and, for token/recipient slots, a 20-byte cap",
         expected: "no leading-zero, non-minimal pushes; no token/recipient push wider than 20 bytes",
         actual: canonUnchecked ? "not evaluated — an earlier truncation prevented a full scan" : canonError ? canonError.message : "all pushes minimal and correctly sized",
@@ -205,6 +211,7 @@ function buildBase(program, optsIn) {
         title: "The byte after the token pushes is the TUPLE opcode (0x94).",
         status: tupleUnchecked ? "unchecked" : tupleFail ? "fail" : "pass",
         severity: "blocking",
+        kind: "shape",
         compared: `byte at offset ${parse.tupleOffset ?? "n/a"} against 0x94`,
         expected: "0x94",
         actual: tupleUnchecked ? "not reached" : tupleFail ? (parse.fatal?.message ?? "mismatch") : "0x94",
@@ -218,6 +225,7 @@ function buildBase(program, optsIn) {
         title: "The TUPLE arity byte equals the number of leading token pushes.",
         status: arityUnchecked ? "unchecked" : arityFail ? "fail" : "pass",
         severity: "blocking",
+        kind: "shape",
         compared: `arity byte (${parse.arityByte ?? "n/a"}) against the ${parse.tokenPushes.length} pushes scanned`,
         expected: `${parse.tokenPushes.length}`,
         actual: arityUnchecked ? "not reached" : String(parse.arityByte ?? "missing"),
@@ -231,115 +239,108 @@ function buildBase(program, optsIn) {
         title: "The recipient decodes to a nonzero address.",
         status: recipUnchecked ? "unchecked" : recipFail ? "fail" : "pass",
         severity: "blocking",
+        kind: "shape",
         compared: "decoded recipient word against 0",
         expected: "nonzero",
         actual: recipUnchecked ? "not reached" : recipFail ? "0x0000000000000000000000000000000000000000" : renderAddr(parse.recipientPush.value),
         proves: "every swept token has a real destination. A zero recipient is a program that (depending on the runtime's zero-address semantics) either reverts or burns the swept tokens — never intended.",
     }, recipFail ? "ZERO_RECIPIENT" : undefined);
-    // body.size
+    // body.size — wired to `CURRENT_SETTLE_TEMPLATE.bodySize` rather than a bare `165` literal: the
+    // template's byte size is a fact `template.ts` already owns, and duplicating it here as a second
+    // hand-maintained constant is exactly the kind of copy that can silently drift from the root.
     const bodyUnchecked = parse.body === null;
     const bodySize = parse.body?.length ?? null;
-    const bodySizeFail = !bodyUnchecked && bodySize !== 165;
+    const bodySizeFail = !bodyUnchecked && bodySize !== CURRENT_SETTLE_TEMPLATE.bodySize;
     push(build, {
         id: "body.size",
-        title: "The constant body suffix is exactly 165 bytes.",
+        title: `The constant body suffix is exactly ${CURRENT_SETTLE_TEMPLATE.bodySize} bytes.`,
         status: bodyUnchecked ? "unchecked" : bodySizeFail ? "fail" : "pass",
         severity: "blocking",
-        compared: "suffix byte length against 165",
-        expected: "165",
+        kind: "shape",
+        compared: `suffix byte length against ${CURRENT_SETTLE_TEMPLATE.bodySize}`,
+        expected: `${CURRENT_SETTLE_TEMPLATE.bodySize}`,
         actual: bodyUnchecked ? "not reached" : String(bodySize),
         proves: "a length mismatch alone (before even hashing) proves this is not our template body — cheaper and clearer than an opaque hash mismatch.",
     }, bodySizeFail ? "BODY_LENGTH" : undefined);
-    // body.hash / template.status / authenticity decision
+    // body.hash — THE authenticity decision. `authenticateBody` is the ONLY producer of `authentic`;
+    // there is no branch here reachable by any `opts.*` field, because there is no field left that
+    // can supply a table or a bypass hash — see `HashSource`'s doc.
     const actualHash = parse.bodyHash;
-    const tableMatch = actualHash ? matchTemplate(actualHash, templates) : undefined;
-    let hashSource = "pinned";
-    let authenticated = false;
-    let bodyHashStatus = "unchecked";
-    let bodyHashCode;
-    let bodyHashActual = "not reached";
-    let bodyHashExpected = "any accepted (non-revoked) template body hash";
-    if (actualHash) {
-        if (expectedBodyHash !== undefined) {
-            hashSource = opts.hashSourceLabel === "rederived" ? "rederived" : "caller";
-            const hashMatchesClaim = actualHash.toLowerCase() === expectedBodyHash.toLowerCase();
-            // B1: an expectedBodyHash pin — whether labelled 'caller' or 'rederived' — is, either way, a
-            // bare ASSERTION supplied in the SAME caller-controlled `opts` object as the program under
-            // test. A caller who controls both the program bytes and `expectedBodyHash` can trivially
-            // satisfy `hashMatchesClaim` with ARBITRARY, non-audited bytes regardless of which label they
-            // attach — 'rederived' used to be trusted at face value and skip this requirement entirely,
-            // which restored the exact self-referential tautology the deleted `ok` boolean used to hide,
-            // one string away. Both labels now require the SAME independent acceptance: the claimed hash
-            // must ALSO match a real, accepted (non-revoked, `acceptSuperseded`-respecting) entry in
-            // `templates` — never "authentic" with `templateId:null` at the same time, which would be an
-            // internally contradictory pair (claiming "this IS our audited template" for a body matching
-            // no known template at all). See `HashSource`'s doc: this never regresses a genuine
-            // 'rederived' caller — a hash actually obtained by recompiling the audited template already
-            // lives in the templates table by construction.
-            const claimAccepted = !!tableMatch && tableMatch.status !== "revoked" && (tableMatch.status !== "superseded" || opts.acceptSuperseded !== false);
-            authenticated = hashMatchesClaim && claimAccepted;
-            bodyHashStatus = authenticated ? "pass" : "fail";
-            bodyHashCode = authenticated ? undefined : "BODY_HASH";
-            bodyHashActual = actualHash;
-            bodyHashExpected = expectedBodyHash;
-        }
-        else {
-            // The trust root consulted here is `templates` (`opts.templates` when it validated as an
-            // array, else `SETTLE_TEMPLATES`) — when the CALLER supplied a valid override table, the
-            // table itself is caller-controlled even though no single `expectedBodyHash` was given, so
-            // the authenticity decision did NOT trust this package's own pinned table. Label it
-            // 'caller' — NOT 'pinned' — so a forwarded report never misattributes an override table's
-            // verdict to our own root.
-            hashSource = templatesValid ? "caller" : "pinned";
-            if (!tableMatch) {
-                authenticated = false;
-                bodyHashStatus = "fail";
-                bodyHashCode = "BODY_HASH";
-            }
-            else if (tableMatch.status === "revoked") {
-                authenticated = false;
-                bodyHashStatus = "fail";
-                bodyHashCode = "TEMPLATE_REVOKED";
-            }
-            else if (tableMatch.status === "superseded") {
-                authenticated = opts.acceptSuperseded !== false;
-                bodyHashStatus = authenticated ? "pass" : "fail";
-                bodyHashCode = authenticated ? undefined : "BODY_HASH";
-            }
-            else {
-                authenticated = true;
-                bodyHashStatus = "pass";
-            }
-            bodyHashActual = actualHash;
-            bodyHashExpected = tableMatch ? tableMatch.bodyHash : `${CURRENT_SETTLE_TEMPLATE.bodyHash} (or another accepted table entry)`;
-        }
-    }
+    const authResult = authenticateBody(actualHash, opts.acceptSuperseded !== false);
+    const hashSource = actualHash ? "pinned" : "none";
+    let authenticated = authResult.authentic;
+    const bodyHashStatus = !actualHash ? "unchecked" : authenticated ? "pass" : "fail";
+    const bodyHashActual = actualHash ?? "not reached";
+    const bodyHashExpected = authResult.entry ? authResult.entry.bodyHash : `${CURRENT_SETTLE_TEMPLATE.bodyHash} (or another accepted table entry)`;
     push(build, {
         id: "body.hash",
-        title: "keccak256 of the 165-byte body matches an accepted template — this is our audited program, verbatim.",
+        title: `keccak256 of the ${CURRENT_SETTLE_TEMPLATE.bodySize}-byte body matches an entry in SETTLE_TEMPLATES — this is our audited program, verbatim.`,
         status: bodyHashStatus,
         severity: "blocking",
-        compared: "keccak256 of the constant body suffix",
+        kind: "authenticity",
+        compared: "keccak256 of the constant body suffix against this package's own SETTLE_TEMPLATES (never a caller-supplied value)",
         expected: bodyHashExpected,
         actual: bodyHashActual,
         proves: "this is our audited template verbatim — nothing appended, no extra branch or call after the prologue. Does NOT constrain WHICH tokens are listed or WHOSE recipient is set — see the intent.* checks and the FULL_BALANCE_SWEEP disclosure.",
-    }, bodyHashCode);
+    }, authenticated ? undefined : authResult.code);
     // `templateId` is `null` — NEVER `CURRENT_SETTLE_TEMPLATE.id` — when no table entry matches this
     // body hash. The old fallback silently reported the CURRENT template's id for a program that
     // matched NO entry at all (a forged/foreign body), misrepresenting a `NOT_OUR_TEMPLATE` program
-    // as if it named a real (if outdated) template.
-    const templateId = tableMatch?.id ?? null;
-    const templateVersion = tableMatch?.version ?? null;
+    // as if it named a real (if outdated) template. `authenticated ⟹ templateId !== null` holds by
+    // construction: `authenticateBody` only ever returns `authentic:true` alongside a matched entry
+    // whose `id` is a real, non-empty string (see its fail-closed guard).
+    const templateId = authResult.entry?.id ?? null;
+    const templateVersion = authResult.entry?.version ?? null;
     push(build, {
         id: "template.status",
         title: "Which template version this body matches, and whether it is current.",
-        status: !actualHash ? "unchecked" : !tableMatch ? "unchecked" : tableMatch.status === "current" ? "pass" : "fail",
+        status: !actualHash ? "unchecked" : !authResult.entry ? "unchecked" : authResult.entry.status === "current" ? "pass" : "fail",
         severity: "advisory",
+        kind: "informational",
         compared: "matched table entry's status field",
         expected: `${CURRENT_SETTLE_TEMPLATE.id}@${CURRENT_SETTLE_TEMPLATE.version} (current)`,
-        actual: !actualHash ? "not reached" : !tableMatch ? "no table entry matches this body hash" : `${tableMatch.id}@${tableMatch.version} (${tableMatch.status})`,
+        actual: !actualHash ? "not reached" : !authResult.entry ? "no table entry matches this body hash" : `${authResult.entry.id}@${authResult.entry.version} (${authResult.entry.status})`,
         proves: "version skew between this program and the package's current template — informational; a superseded-but-accepted match is still authentic (see body.hash), this only flags that you're on an older audited version.",
     });
+    // producer.rederivedBodyHash — see `VerifyOpts.rederivedBodyHash`'s doc. A CROSS-CHECK against
+    // this report's OWN computed `actualHash` (R vs. P) — never against the templates table (P vs.
+    // the table is exactly what `body.hash` above already did; comparing R to the table too would be
+    // redundant given R-vs-P and P-vs-table). Absent entirely (rendered `'unchecked'`+`'advisory'`,
+    // never blocking) when the opt wasn't supplied — this check must never manufacture a failure out
+    // of silence. Present and mismatching FORCES `authenticated` false, with a code distinct from
+    // `BODY_HASH` so a reader can tell "the pinned table rejected this body" apart from "the
+    // producer's own recompiled hash disagrees with what it's reporting on".
+    let rederivation = "absent";
+    if (rederivedBodyHash !== undefined) {
+        rederivation = actualHash !== null && actualHash.toLowerCase() === rederivedBodyHash.toLowerCase() ? "agrees" : "disagrees";
+        const diverged = rederivation === "disagrees";
+        if (diverged)
+            authenticated = false;
+        push(build, {
+            id: "producer.rederivedBodyHash",
+            title: "The producer's own independently-recompiled body hash agrees with this report's computed body hash.",
+            status: actualHash === null ? "unchecked" : diverged ? "fail" : "pass",
+            severity: "blocking",
+            kind: "authenticity",
+            compared: "locally computed keccak256(body) vs. opts.rederivedBodyHash",
+            expected: rederivedBodyHash,
+            actual: actualHash ?? "not reached",
+            proves: "the caller's own recompile of the template it is reporting on matches what this program actually contains — a cross-check on the PRODUCER, never a substitute for (or a way to bypass) the body.hash match against SETTLE_TEMPLATES above.",
+        }, diverged ? "PRODUCER_HASH_DIVERGED" : undefined);
+    }
+    else {
+        push(build, {
+            id: "producer.rederivedBodyHash",
+            title: "The producer's own independently-recompiled body hash agrees with this report's computed body hash.",
+            status: "unchecked",
+            severity: "advisory",
+            kind: "authenticity",
+            compared: "locally computed keccak256(body) vs. opts.rederivedBodyHash",
+            expected: "(not supplied)",
+            actual: "not compared",
+            proves: "nothing yet — opts.rederivedBodyHash was not supplied; see its doc.",
+        });
+    }
     // NOTE: `intent.floorToken` (and `intent.recipient`/`intent.tokens`/`intent.minOut`) are pushed
     // by `pushIntentChecks` below — NOT here. `buildBase` is expectation-blind (it has no `expect`
     // parameter — `inspectSettleProgram` never has one to give it), so every check that depends on
@@ -353,6 +354,7 @@ function buildBase(program, optsIn) {
             title: "Locally computed body hash vs. the hash a server echoed alongside this same program.",
             status: actualHash ? (match ? "pass" : "fail") : "unchecked",
             severity: "advisory",
+            kind: "informational",
             compared: "locally computed keccak256(body) vs. opts.serverEchoBodyHash",
             expected: serverEchoBodyHash,
             actual: actualHash ?? "not reached",
@@ -365,19 +367,23 @@ function buildBase(program, optsIn) {
             title: "Locally computed body hash vs. the hash a server echoed alongside this same program.",
             status: "unchecked",
             severity: "advisory",
+            kind: "informational",
             compared: "locally computed keccak256(body) vs. opts.serverEchoBodyHash",
             expected: "(not supplied)",
             actual: "not compared",
             proves: "NOT a security check — informational only; see above.",
         });
     }
-    // `structurallyValid`: every blocking check EXCEPT body.hash passes — i.e. the bytes are a
-    // well-formed, canonical `(tokens, minOut, recipient) || body[165]` wire program, independent of
-    // WHOSE program it is or whether the body matches our template. `authentic` (== the `authenticated`
-    // local above) is body.hash ALONE — the body matches an accepted template entry. Neither says
+    // `structurallyValid`: every blocking check whose `kind` is `'shape'` passes — i.e. the bytes are
+    // a well-formed, canonical `(tokens, minOut, recipient) || body[165]` wire program, independent
+    // of WHOSE program it is or whether the body matches our template. This is an ALLOW-LIST over
+    // `kind`, not a hand-maintained id-exclusion-list — a new blocking non-shape check (like
+    // `producer.rederivedBodyHash` above) is automatically excluded by construction, rather than
+    // needing its id added to a list by hand (and silently sinking `structurallyValid` until someone
+    // remembers to). `authentic` (== `authenticated`) is decided separately, above. Neither says
     // anything about intent (tokens/recipient/minOut) — see `pushIntentChecks`' doc for that half.
-    const structurallyValid = build.checks.every((c) => c.severity !== "blocking" || c.id === "body.hash" || c.status === "pass");
-    return { build, decoded, templateId, templateVersion, hashSource, authenticated, structurallyValid };
+    const structurallyValid = build.checks.every((c) => !(c.kind === "shape" && c.severity === "blocking") || c.status === "pass");
+    return { build, decoded, templateId, templateVersion, hashSource, rederivation, authenticated, structurallyValid };
 }
 /** Build `effects[]` — a BEHAVIORAL claim ("this program, if cooked, moves these tokens"), so it
  *  is gated on `structurallyValid && authentic` (this IS our audited template, well-formed,
@@ -487,6 +493,7 @@ function pushIntentChecks(build, decoded, expect) {
             title: "Decoded recipient matches the expected recipient.",
             status: "unchecked",
             severity: "blocking",
+            kind: "intent",
             compared: "decoded recipient vs. expect.recipient",
             expected: "(inspectSettleProgram takes no expectation — call verifySettleProgram with expect.recipient to check this)",
             actual: decoded ? renderAddr(decoded.recipient) : "not reached",
@@ -501,6 +508,7 @@ function pushIntentChecks(build, decoded, expect) {
             title: "Decoded recipient matches the expected recipient.",
             status: decoded === null ? "unchecked" : recipMatch ? "pass" : "fail",
             severity: "blocking",
+            kind: "intent",
             compared: "decoded recipient vs. expect.recipient",
             expected: renderAddr(e.recipient),
             actual: decoded ? renderAddr(decoded.recipient) : "not reached",
@@ -591,6 +599,7 @@ function pushIntentChecks(build, decoded, expect) {
         title: "Decoded token list matches the expected list (or stays within the allowed set).",
         status: tokensStatus,
         severity: "blocking",
+        kind: "intent",
         compared: "decoded token list vs. expect.tokens / expect.allowTokens",
         expected: tokensExpected,
         actual: tokensActual,
@@ -639,6 +648,7 @@ function pushIntentChecks(build, decoded, expect) {
         title: "Decoded minOut matches (or clears) the expected floor.",
         status: minOutStatus,
         severity: minOutSupplied ? "blocking" : "advisory",
+        kind: "intent",
         compared: "decoded minOut vs. expect.minOut (exact) or expect.minMinOut (floor)",
         expected: minOutExpected,
         actual: minOutActual,
@@ -683,6 +693,7 @@ function pushIntentChecks(build, decoded, expect) {
         title: "tokens[0] is the floor token — checked before any transfer runs.",
         status: floorStatus,
         severity: floorSeverity,
+        kind: "intent",
         compared: "position 0 of the decoded token list vs. expect.floorToken",
         expected: floorExpected,
         actual: decoded ? renderAddr(decoded.floorToken) : "not reached",
@@ -715,18 +726,25 @@ function pushIntentChecks(build, decoded, expect) {
 }
 /**
  * SEE — never throws, requires no expectations. This is the "show me the validation phase" call:
- * renders EVERY check `verifySettleProgram` would (shape/body/template/serverEcho AND the four
- * `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever. Because
- * of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`, which
- * makes `intentReconciled` PERMANENTLY `null` and `verdict` PERMANENTLY `INTENT_UNCHECKED` (unless
- * the bytes are malformed or inauthentic, which take priority) — this is correct, not a defect:
- * this function never has an independent expectation to reconcile against. Use
+ * renders EVERY check `verifySettleProgram` would (shape/body/template/producer/serverEcho AND the
+ * four `intent.*` rows — see `pushIntentChecks`), with no expectation to compare against, ever.
+ * Because of that, `intent.recipient`/`intent.tokens` are PERMANENTLY `'unchecked'`+`'blocking'`,
+ * which makes `intentReconciled` PERMANENTLY `null` and `verdict` PERMANENTLY `INTENT_UNCHECKED`
+ * (unless the bytes are malformed or inauthentic, which take priority) — this is correct, not a
+ * defect: this function never has an independent expectation to reconcile against. Use
  * `structurallyValid`/`authentic` for "is this genuinely our template, well-formed" instead.
+ *
+ * `opts.declaredIntent`, if supplied, is echoed VERBATIM into the returned `declaredIntent` — a
+ * pure echo, never reconciled: `intentSource` stays `'none'` and `verdict` stays capped at
+ * `INTENT_UNCHECKED` regardless, exactly as if it had been omitted. This lets a server with no
+ * independent expectation of its own still hand a downstream consumer the request-derived intent
+ * it compiled against, for that consumer's OWN reconciliation — see `VerifyOpts.declaredIntent`.
  */
-export function inspectSettleProgram(program, opts = {}) {
-    const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
+export function inspectSettleProgram(program, optsIn = {}) {
+    const opts = normalizeOpts(optsIn);
+    const { build, decoded, templateId, templateVersion, hashSource, rederivation, structurallyValid, authenticated } = buildBase(program, opts);
     const rawIntentReconciled = pushIntentChecks(build, decoded, null);
-    const verdict = deriveVerdict(structurallyValid, authenticated, rawIntentReconciled);
+    const verdict = deriveVerdict(structurallyValid, authenticated, rawIntentReconciled, "none");
     // B2: NEVER expose `rawIntentReconciled` directly — see `gateIntentReconciled`'s doc. The public
     // field is derived FROM `verdict`, so it cannot leak `true`/`false` past a MALFORMED/
     // NOT_OUR_TEMPLATE verdict even when the raw (best-effort-decode-based) comparison would.
@@ -736,11 +754,12 @@ export function inspectSettleProgram(program, opts = {}) {
         verdict,
         intentReconciled,
         intentSource: "none",
-        declaredIntent: null,
+        declaredIntent: opts.declaredIntent ?? null,
         mode: "inspect",
         templateId,
         templateVersion,
         hashSource,
+        rederivation,
         structurallyValid,
         authentic: authenticated,
         failureCode: build.failureCode,
@@ -758,7 +777,8 @@ export function inspectSettleProgram(program, opts = {}) {
  * unchecked placeholders) and derives `verdict`/`intentReconciled` over the full check set.
  * `intentSource` is `'caller'` by default — pass `opts.intentSourceLabel:'server-echo'` to
  * disclose that `expect` is itself derived from the same request/data that produced `program`
- * (see `VerifyOpts.intentSourceLabel`'s doc).
+ * (see `VerifyOpts.intentSourceLabel`'s doc). Under `'server-echo'`, `verdict` is CAPPED at
+ * `INTENT_UNCHECKED` even on a full field match — see `deriveVerdict`.
  */
 export function verifySettleProgram(program, expect, optsIn = {}) {
     if (!expect || expect.recipient === undefined || expect.recipient === null) {
@@ -769,13 +789,15 @@ export function verifySettleProgram(program, expect, optsIn = {}) {
     // `opts.intentSourceLabel` below, which used to crash on an explicit `null` (a runtime caller
     // bypassing the type system, the exact scenario this same guard already anticipates elsewhere).
     const opts = normalizeOpts(optsIn);
-    const { build, decoded, templateId, templateVersion, hashSource, structurallyValid, authenticated } = buildBase(program, opts);
+    const { build, decoded, templateId, templateVersion, hashSource, rederivation, structurallyValid, authenticated } = buildBase(program, opts);
     const rawIntentReconciled = pushIntentChecks(build, decoded, expect);
-    const verdict = deriveVerdict(structurallyValid, authenticated, rawIntentReconciled);
-    // B2: see `gateIntentReconciled`'s doc — the public field is derived FROM `verdict`, never the
-    // raw comparison, so it cannot leak past a MALFORMED/NOT_OUR_TEMPLATE verdict.
-    const intentReconciled = gateIntentReconciled(verdict);
     const intentSource = opts.intentSourceLabel === "server-echo" ? "server-echo" : "caller";
+    const verdict = deriveVerdict(structurallyValid, authenticated, rawIntentReconciled, intentSource);
+    // B2: see `gateIntentReconciled`'s doc — the public field is derived FROM `verdict`, never the
+    // raw comparison, so it cannot leak past a MALFORMED/NOT_OUR_TEMPLATE verdict — and, since
+    // `verdict` already folds in the `intentSource:'server-echo'` cap, `intentReconciled` cannot
+    // leak `true` past that cap either (it reads `null`, matching an omitted expectation).
+    const intentReconciled = gateIntentReconciled(verdict);
     const effects = buildEffects(decoded, structurallyValid, authenticated);
     return {
         verdict,
@@ -786,6 +808,7 @@ export function verifySettleProgram(program, expect, optsIn = {}) {
         templateId,
         templateVersion,
         hashSource,
+        rederivation,
         structurallyValid,
         authentic: authenticated,
         failureCode: build.failureCode,
@@ -815,7 +838,7 @@ function jsonSafe(v) {
  *  line was even built, `for (const c of r.checks)` on a value with no `checks` array at all. Every
  *  field this function reads is now read DEFENSIVELY — a missing/garbage container renders a
  *  placeholder instead of throwing, exactly the "guard the elements, don't just guard the
- *  container" fix `matchTemplate` above needed for the same reason. */
+ *  container" fix `internal/root-testing.ts`'s `matchInRoot` needed for the same reason. */
 export function formatSettleReport(r) {
     if (r === null || r === undefined || typeof r !== "object") {
         return "SETTLE PROGRAM REPORT — INVALID: formatSettleReport was called with a non-report value (a runtime caller bypassed the type system). Nothing to render.";
@@ -824,7 +847,7 @@ export function formatSettleReport(r) {
     const lines = [];
     lines.push(`SETTLE PROGRAM REPORT — mode=${report.mode ?? "?"} verdict=${report.verdict ?? "?"} intentReconciled=${report.intentReconciled === null || report.intentReconciled === undefined ? "null" : report.intentReconciled} ` +
         `intentSource=${report.intentSource ?? "?"} structurallyValid=${report.structurallyValid ?? "?"} authentic=${report.authentic ?? "?"} ` +
-        `template=${report.templateId ?? "?"}@${report.templateVersion ?? "?"} hashSource=${report.hashSource ?? "?"}`);
+        `template=${report.templateId ?? "?"}@${report.templateVersion ?? "?"} hashSource=${report.hashSource ?? "?"} rederivation=${report.rederivation ?? "?"}`);
     if (report.mode === "inspect") {
         lines.push("  (inspect mode supplies NO expectation — intentReconciled is always null; read structurallyValid/authentic and checks[] for what IS proven)");
     }

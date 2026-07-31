@@ -9,7 +9,10 @@ import {
   inspectSettleProgram,
   verifySettleProgram,
   formatSettleReport,
+  type SettleExpectation,
+  type VerifyOpts,
 } from '../src/verify/index';
+import { authenticateBodyAgainstRoot } from '../src/verify/internal/root-testing';
 import type { Hex } from 'viem';
 
 describe('@eco-incorp/sauce-sdk/verify', () => {
@@ -113,6 +116,8 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(r.mode).toBe('inspect');
       expect(r.structurallyValid).toBe(true);
       expect(r.authentic).toBe(true);
+      expect(r.hashSource).toBe('pinned');
+      expect(r.rederivation).toBe('absent');
       expect(r.failureCode).toBe('INTENT_UNCHECKED');
       expect(r.decoded).not.toBeNull();
       const ids = r.checks.map((c) => c.id);
@@ -126,6 +131,7 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
           'body.size',
           'body.hash',
           'template.status',
+          'producer.rederivedBodyHash',
           'intent.recipient',
           'intent.tokens',
           'intent.minOut',
@@ -139,6 +145,7 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       const recip = r.checks.find((c) => c.id === 'intent.recipient')!;
       expect(recip.status).toBe('unchecked');
       expect(recip.severity).toBe('blocking');
+      expect(recip.kind).toBe('intent');
       const tokens = r.checks.find((c) => c.id === 'intent.tokens')!;
       expect(tokens.status).toBe('unchecked');
       expect(tokens.severity).toBe('blocking');
@@ -147,6 +154,10 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       // supplied, exactly like every other check.
       const floorToken = r.checks.find((c) => c.id === 'intent.floorToken')!;
       expect(floorToken.status).toBe('unchecked');
+      const bodyHashCheck = r.checks.find((c) => c.id === 'body.hash')!;
+      expect(bodyHashCheck.kind).toBe('authenticity');
+      const shapeCheck = r.checks.find((c) => c.id === 'shape.pushes')!;
+      expect(shapeCheck.kind).toBe('shape');
       expect(r.disclosures.map((d) => d.id)).toEqual(expect.arrayContaining(['FULL_BALANCE_SWEEP', 'FLOOR_IS_LEVEL_NOT_DELTA']));
       // effects[]/sweepScope.tokens are a BEHAVIORAL claim gated on structurallyValid && authentic,
       // NOT on verdict (a caller's absent expectation doesn't change what the program actually
@@ -159,6 +170,19 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(r.sweepScope.tokens[0]!.token.toLowerCase()).toBe(v1.tokens[0]!.toLowerCase());
       expect(r.floorClaim.basis).toBe('BALANCE_LEVEL');
       expect(r.floorClaim.comparableToUnsplitFloor).toBe(false);
+    });
+
+    it('inspectSettleProgram(program, {declaredIntent}) is a PURE ECHO — populates declaredIntent but stays intentSource:none/verdict:INTENT_UNCHECKED, exactly as if omitted', () => {
+      const echoedIntent: SettleExpectation = { recipient: v1.recipient, tokens: v1.tokens, minOut: v1.minOut };
+      const r = inspectSettleProgram(v1.program, { declaredIntent: echoedIntent });
+      expect(r.declaredIntent).toEqual(echoedIntent);
+      expect(r.intentSource).toBe('none');
+      expect(r.intentReconciled).toBeNull();
+      expect(r.verdict).toBe('INTENT_UNCHECKED');
+      // Identical to the no-opts case in every OTHER respect — the echo changes nothing else.
+      const bare = inspectSettleProgram(v1.program);
+      expect(r.authentic).toBe(bare.authentic);
+      expect(r.structurallyValid).toBe(bare.structurallyValid);
     });
 
     it('verifySettleProgram requires recipient at runtime even if the type system is bypassed', () => {
@@ -315,10 +339,11 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
         expect(r.checks.find((c) => c.id === 'intent.tokens')!.status).toBe('fail');
       });
 
-      it('opts.expectedBodyHash as a non-string', () => {
-        expect(() => inspectSettleProgram(v1.program, { expectedBodyHash: 12345 as unknown as Hex })).not.toThrow();
-        const r = inspectSettleProgram(v1.program, { expectedBodyHash: 12345 as unknown as Hex });
-        expect(['MATCHES_DECLARED_INTENT', 'INTENT_UNCHECKED', 'NOT_OUR_TEMPLATE', 'MALFORMED']).toContain(r.verdict);
+      it('opts.rederivedBodyHash as a non-string', () => {
+        expect(() => inspectSettleProgram(v1.program, { rederivedBodyHash: 12345 as unknown as Hex })).not.toThrow();
+        const r = inspectSettleProgram(v1.program, { rederivedBodyHash: 12345 as unknown as Hex });
+        expect(r.rederivation).toBe('absent'); // non-string is treated as "not supplied"
+        expect(r.authentic).toBe(true); // never regresses the genuine program's own authenticity
       });
 
       it('opts.serverEchoBodyHash as a non-string', () => {
@@ -327,17 +352,27 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
         expect(r.checks.find((c) => c.id === 'serverEcho.bodyHash')!.status).toBe('unchecked');
       });
 
-      it('opts.templates as a non-array', () => {
-        expect(() => inspectSettleProgram(v1.program, { templates: { not: 'an array' } as unknown as never })).not.toThrow();
-        const r = inspectSettleProgram(v1.program, { templates: { not: 'an array' } as unknown as never });
-        expect(r.hashSource).toBe('pinned'); // falls back to the pinned table, honestly labeled
+      it('opts.declaredIntent as garbage (a bare string, bypassing the type system) never throws — a pure echo, whatever its shape', () => {
+        expect(() => inspectSettleProgram(v1.program, { declaredIntent: 'not-an-expectation' as unknown as SettleExpectation })).not.toThrow();
+        const r = inspectSettleProgram(v1.program, { declaredIntent: 'not-an-expectation' as unknown as SettleExpectation });
+        expect(r.intentSource).toBe('none');
+        expect(r.verdict).toBe('INTENT_UNCHECKED');
       });
-    });
 
-    it('hashSource is "caller" (not "pinned") when opts.templates overrides the trust root, even without expectedBodyHash', () => {
-      const overrideTable = SETTLE_TEMPLATES.map((t) => ({ ...t }));
-      const r = inspectSettleProgram(v1.program, { templates: overrideTable });
-      expect(r.hashSource).toBe('caller');
+      it('a caller passing the OLD, deleted opts keys (templates/expectedBodyHash/hashSourceLabel) at runtime, bypassing the type system entirely — they must be COMPLETELY INERT, not merely rejected', () => {
+        const legacyOpts = {
+          templates: [{ id: 'ecoswap-settle', version: 'forged', bodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash, bodySize: 165, compilerSha: 'x', status: 'current', since: '2026', notes: 'x' }],
+          expectedBodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash,
+          hashSourceLabel: 'rederived',
+        } as unknown as VerifyOpts;
+        const withLegacy = inspectSettleProgram(v1.program, legacyOpts);
+        const bare = inspectSettleProgram(v1.program);
+        // Identical in every respect — the legacy keys are read nowhere anymore.
+        expect(withLegacy.authentic).toBe(bare.authentic);
+        expect(withLegacy.verdict).toBe(bare.verdict);
+        expect(withLegacy.hashSource).toBe(bare.hashSource);
+        expect(withLegacy.templateId).toBe(bare.templateId);
+      });
     });
 
     it('effects[]/sweepScope.tokens are empty for a structurally-rejected program (zero recipient), even though the body still parses', () => {
@@ -360,11 +395,12 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(text).toContain('FULL_BALANCE_SWEEP');
       expect(text).toContain('FLOOR_IS_LEVEL_NOT_DELTA');
       expect(text).toContain('verdict=');
+      expect(text).toContain('rederivation=');
       expect(text).not.toMatch(/\bok=/);
     });
   });
 
-  describe('R1-R4 fixes — the second adversarial pass', () => {
+  describe('R1, R3 fixes — the second adversarial pass (R2 — the expectedBodyHash self-referential-hash escape — is SUPERSEDED: that opt no longer exists at all, see the TRUST MODEL FIX suite\'s T1/T3 below for its replacement coverage)', () => {
     const v1 = SETTLE_VECTORS[0]!; // tokens=[U], minOut=0n, recipient=W
     const v2 = SETTLE_VECTORS.find((v) => v.name.startsWith('v2'))!; // tokens=[U, W]
 
@@ -392,33 +428,6 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(violated.verdict).toBe('INTENT_MISMATCH');
     });
 
-    // R2: a caller-pinned `expectedBodyHash` that merely equals the hash of the SAME arbitrary
-    // bytes being checked is self-certification — the identical tautology the deleted `ok`
-    // boolean used to hide, relocated to the authenticity check. `authentic:true` alongside
-    // `templateId:null` is an internal contradiction: it claims "this IS our audited template"
-    // for a body that matches NO entry in the templates table at all.
-    it('R2 — a caller-pinned expectedBodyHash must not authenticate arbitrary non-audited bytes as "our audited template" merely because it equals that same body\'s own hash', () => {
-      const goodBody = decodeSettleProgram(v1.program).body;
-      const bodyHexChars = 165 * 2;
-      const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
-      const forgedBody = '00' + goodBody.slice(4); // flip one byte — matches no table entry
-      const forged = (prologueHex + forgedBody) as Hex;
-      const forgedHash = decodeSettleProgram(forged).bodyHash;
-
-      // Default label ('caller') — a bare, self-referential assertion. Must NOT authenticate.
-      const r = inspectSettleProgram(forged, { expectedBodyHash: forgedHash });
-      expect(r.authentic).toBe(false);
-      expect(r.templateId).toBeNull(); // no longer a contradiction: authentic is also false
-      expect(r.hashSource).toBe('caller');
-      expect(r.checks.find((c) => c.id === 'body.hash')!.status).toBe('fail');
-      expect(r.verdict).not.toBe('MATCHES_DECLARED_INTENT');
-
-      // A genuinely accepted table hash, caller-pinned, still authenticates (non-regression).
-      const realPin = inspectSettleProgram(v1.program, { expectedBodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash });
-      expect(realPin.authentic).toBe(true);
-      expect(realPin.templateId).not.toBeNull();
-    });
-
     // R3: `verifySettleProgram`'s own null-`opts` guard lives in `buildBase` — but this function
     // reads `opts.intentSourceLabel` ITSELF, outside that guard, so an explicit `null` (a runtime
     // caller bypassing the type system, exactly the scenario this same commit's guard elsewhere
@@ -431,53 +440,60 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
     });
   });
 
-  describe('B1 — the "rederived" hashSourceLabel must not restore the self-referential authenticity tautology', () => {
+  describe('opts.rederivedBodyHash — the producer cross-check that REPLACES the deleted expectedBodyHash/hashSourceLabel escape', () => {
     const v1 = SETTLE_VECTORS[0]!;
-    const goodBody = decodeSettleProgram(v1.program).body;
-    const bodyHexChars = 165 * 2;
-    const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
-    const forgedBodyHex = '00' + goodBody.slice(4); // flip one byte — matches no table entry
-    const forged = (prologueHex + forgedBodyHex) as Hex;
-    const forgedHash = decodeSettleProgram(forged).bodyHash;
 
-    it('ROUTE 1 — expectedBodyHash: keccak256(forgedBody), hashSourceLabel: "rederived" must NOT authenticate arbitrary bytes just because the caller labels their self-referential hash "rederived"', () => {
+    it('a genuine rederived hash (actually recompiled from the audited template) agrees and changes nothing about authenticity — the LEGITIMATE producer case this fix must not regress', () => {
+      const r = inspectSettleProgram(v1.program, { rederivedBodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash });
+      expect(r.rederivation).toBe('agrees');
+      expect(r.authentic).toBe(true);
+      expect(r.templateId).not.toBeNull();
+      expect(r.hashSource).toBe('pinned'); // NEVER 'rederived' — that HashSource member is deleted
+      expect(r.checks.find((c) => c.id === 'producer.rederivedBodyHash')!.status).toBe('pass');
+    });
+
+    it('THE FORMER ROUTE 1 EXPLOIT, restated against the new field: a caller who controls both a forged body and rederivedBodyHash cannot self-authenticate — rederivedBodyHash can only ever narrow authentic toward false, never establish it', () => {
+      const goodBody = decodeSettleProgram(v1.program).body;
+      const bodyHexChars = 165 * 2;
+      const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
+      const forgedBodyHex = '00' + goodBody.slice(4);
+      const forged = (prologueHex + forgedBodyHex) as Hex;
+      const forgedHash = decodeSettleProgram(forged).bodyHash;
       const ATTACKER = '0x000000000000000000000000000000000000dEaD' as Hex;
       const VICTIM = v1.tokens[0]!;
-      const r = verifySettleProgram(forged, { recipient: ATTACKER, tokens: [VICTIM] }, { expectedBodyHash: forgedHash, hashSourceLabel: 'rederived' });
-      expect(r.hashSource).toBe('rederived');
-      // The exploit: this must NOT read authentic:true / verdict:MATCHES_DECLARED_INTENT — a
-      // caller who controls both the forged bytes AND the hash checked against them can trivially
-      // satisfy hashMatchesClaim regardless of the label attached to it.
+
+      // The self-referential hash AGREES with the forged body (it's the same bytes) — but that
+      // agreement can never establish authenticity: authenticateBody already rejected this body
+      // against SETTLE_TEMPLATES, and rederivedBodyHash is compared against the PROGRAM (R vs P),
+      // never against the table.
+      const r = verifySettleProgram(forged, { recipient: ATTACKER, tokens: [VICTIM] }, { rederivedBodyHash: forgedHash });
+      expect(r.rederivation).toBe('agrees'); // agrees with itself, as expected — and still doesn't help
       expect(r.authentic).toBe(false);
       expect(r.templateId).toBeNull();
-      expect(r.checks.find((c) => c.id === 'body.hash')!.status).toBe('fail');
-      expect(r.verdict).not.toBe('MATCHES_DECLARED_INTENT');
       expect(r.verdict).toBe('NOT_OUR_TEMPLATE');
-      // sweepScope/effects must be empty — no behavioral claim about an unauthenticated program.
       expect(r.sweepScope.tokens.length).toBe(0);
       expect(r.effects.length).toBe(0);
     });
 
-    it('a GENUINE "rederived" pin (the recipes package\'s real reportOwnSettleProgram use case — a hash independently recompiled from the audited template) still authenticates — this fix must not regress the legitimate case', () => {
-      const r = inspectSettleProgram(v1.program, { expectedBodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash, hashSourceLabel: 'rederived' });
-      expect(r.hashSource).toBe('rederived');
-      expect(r.authentic).toBe(true);
-      expect(r.templateId).not.toBeNull();
+    it('a DIVERGENT rederivedBodyHash forces authentic:false with failureCode PRODUCER_HASH_DIVERGED, even against a genuinely authentic body — a producer whose own recompile disagrees with what it is reporting on is telling the report something is wrong with ITSELF', () => {
+      const r = inspectSettleProgram(v1.program, { rederivedBodyHash: '0x' + 'ab'.repeat(32) as Hex });
+      expect(r.rederivation).toBe('disagrees');
+      expect(r.authentic).toBe(false);
+      expect(r.verdict).toBe('NOT_OUR_TEMPLATE');
+      expect(r.failureCode).toBe('PRODUCER_HASH_DIVERGED');
+      expect(r.checks.find((c) => c.id === 'producer.rederivedBodyHash')!.status).toBe('fail');
+      // body.hash itself still reads 'pass' — the table genuinely matched; this distinguishes
+      // "the pinned table rejected this body" (body.hash fails) from "the producer's own compile
+      // disagrees with what it's reporting on" (producer.rederivedBodyHash fails, body.hash pass).
       expect(r.checks.find((c) => c.id === 'body.hash')!.status).toBe('pass');
     });
 
-    it('ROUTE 2 — a caller-controlled opts.templates override does not, by itself, let templateId!==null be mistaken for a security gate; hashSource still names it "caller"', () => {
-      // Demonstrates why "assert templateId !== null" would be the WRONG mitigation: a caller who
-      // controls their own templates table can make an arbitrary forged body match a "current"
-      // entry trivially. hashSource:'caller' is the honest signal here, not templateId.
-      const forgedTable = [{ id: 'ecoswap-settle', version: 'forged', bodyHash: forgedHash, bodySize: 165, compilerSha: 'forged', status: 'current' as const, since: '2026', notes: 'forged' }];
-      const r = inspectSettleProgram(forged, { templates: forgedTable });
-      expect(r.templateId).not.toBeNull();
-      expect(r.hashSource).toBe('caller');
-      // authentic:true here is the DOCUMENTED consequence of a caller overriding their OWN trust
-      // root (see VerifyOpts.templates) — not the tautology this fix closes. A consumer that wants
-      // ONLY the SDK's own pinned root must additionally check hashSource==='pinned'.
-      expect(r.authentic).toBe(true);
+    it('rederivedBodyHash is absent by default — rederivation:"absent", and the producer.rederivedBodyHash check renders unchecked+advisory (never manufactures a failure out of silence)', () => {
+      const r = inspectSettleProgram(v1.program);
+      expect(r.rederivation).toBe('absent');
+      const check = r.checks.find((c) => c.id === 'producer.rederivedBodyHash')!;
+      expect(check.status).toBe('unchecked');
+      expect(check.severity).toBe('advisory');
     });
   });
 
@@ -529,12 +545,14 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
     // Enumerated invariant: every gateable field's value must be EXACTLY what its own verdict
     // permits — never merely "not obviously wrong". This is written so a NEW field added to the
     // envelope in the future that fails to consult `verdict` is caught by extending the ONE
-    // per-verdict expectation table below, not by writing a new ad-hoc test.
-    const EXPECTED_BY_VERDICT: Record<string, { structurallyValid: boolean; authentic: boolean | null; intentReconciled: boolean | null }> = {
-      MALFORMED: { structurallyValid: false, authentic: null /* not constrained by verdict */, intentReconciled: null },
-      NOT_OUR_TEMPLATE: { structurallyValid: true, authentic: false, intentReconciled: null },
-      INTENT_MISMATCH: { structurallyValid: true, authentic: true, intentReconciled: false },
-      INTENT_UNCHECKED: { structurallyValid: true, authentic: true, intentReconciled: null },
+    // per-verdict expectation table below, not by writing a new ad-hoc test. EXTENDED (not
+    // flattened) with `hashSource`/`rederivation`, which every one of these four fixtures shares
+    // regardless of verdict — proving they are orthogonal facts, not verdict-derived ones.
+    const EXPECTED_BY_VERDICT: Record<string, { structurallyValid: boolean; authentic: boolean | null; intentReconciled: boolean | null; hashSource: string; rederivation: string }> = {
+      MALFORMED: { structurallyValid: false, authentic: null /* not constrained by verdict */, intentReconciled: null, hashSource: 'pinned', rederivation: 'absent' },
+      NOT_OUR_TEMPLATE: { structurallyValid: true, authentic: false, intentReconciled: null, hashSource: 'pinned', rederivation: 'absent' },
+      INTENT_MISMATCH: { structurallyValid: true, authentic: true, intentReconciled: false, hashSource: 'pinned', rederivation: 'absent' },
+      INTENT_UNCHECKED: { structurallyValid: true, authentic: true, intentReconciled: null, hashSource: 'pinned', rederivation: 'absent' },
     };
 
     it('enumerated per-field invariant over every gateable boolean/nullable field, across all four non-affirmative verdicts', () => {
@@ -543,6 +561,8 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
         expect(report.structurallyValid).toBe(expected.structurallyValid);
         if (expected.authentic !== null) expect(report.authentic).toBe(expected.authentic);
         expect(report.intentReconciled).toBe(expected.intentReconciled);
+        expect(report.hashSource).toBe(expected.hashSource);
+        expect(report.rederivation).toBe(expected.rederivation);
         // effects[]/sweepScope stay empty whenever the program is not both structurally valid AND
         // authentic — the ONE place a behavioral claim is allowed to render regardless of intent.
         if (!(report.structurallyValid && report.authentic)) {
@@ -554,18 +574,6 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
   });
 
   describe('B3 — never-throws must hold on CONTAINER ELEMENTS, not just the container array', () => {
-    const v1 = SETTLE_VECTORS[0]!;
-    const garbageElements = [null, undefined, {}, { bodyHash: 1 }, { bodyHash: null }] as unknown as Array<{ bodyHash: string }>;
-
-    it('inspectSettleProgram(program, {templates:[<garbage>]}) never throws, for every garbage element shape', () => {
-      for (const el of garbageElements) {
-        expect(() => inspectSettleProgram(v1.program, { templates: [el] as unknown as never })).not.toThrow();
-        const r = inspectSettleProgram(v1.program, { templates: [el] as unknown as never });
-        // A templates table with no real entry can never authenticate.
-        expect(r.authentic).toBe(false);
-      }
-    });
-
     it('formatSettleReport(null) never throws', () => {
       expect(() => formatSettleReport(null as unknown as ReturnType<typeof inspectSettleProgram>)).not.toThrow();
     });
@@ -585,6 +593,244 @@ describe('@eco-incorp/sauce-sdk/verify', () => {
       expect(SETTLE_WIRE.PUSH_MIN).toBe(0x01);
       expect(SETTLE_WIRE.PUSH_MAX).toBe(0x20);
       expect(SETTLE_WIRE.ADDRESS_BYTES).toBe(20);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────────────────────
+  // TRUST MODEL FIX — root cause: `authentic` used to be derived from a CALLER-CONTROLLED table
+  // (`opts.templates ?? SETTLE_TEMPLATES`). Fix: `authentic` is now establishable ONLY against
+  // `SETTLE_TEMPLATES` (`internal/root-testing.ts`'s `authenticateBodyAgainstRoot`, always called
+  // with that constant as `root` — see `report.ts`'s `authenticateBody`) — there is no parameter
+  // anywhere on the public surface through which a caller can reach that table. T1–T8 below are
+  // the acceptance tests for that fix, each shown red by re-injecting its own defect in a comment.
+  // ───────────────────────────────────────────────────────────────────────────────────────────
+  describe('TRUST MODEL FIX', () => {
+    const v1 = SETTLE_VECTORS[0]!;
+    const goodBody = decodeSettleProgram(v1.program).body;
+    const bodyHexChars = 165 * 2;
+    const prologueHex = v1.program.slice(0, v1.program.length - bodyHexChars);
+    const forgedBodyHex = '00' + goodBody.slice(4); // flip one byte — matches no table entry
+    const forged = (prologueHex + forgedBodyHex) as Hex;
+    const forgedHash = decodeSettleProgram(forged).bodyHash;
+    const ATTACKER = '0x000000000000000000000000000000000000dEaD' as Hex;
+    const VICTIM = v1.tokens[0]!;
+    const forgedTableEntry = { id: 'ecoswap-settle', version: 'forged', bodyHash: forgedHash, bodySize: 165, compilerSha: 'forged', status: 'current' as const, since: '2026', notes: 'forged' };
+
+    // T1 — the opts-route matrix against the forged body, BOTH entry points. Every route is
+    // constructed the way a real caller (or a legacy caller bypassing the type system with `as
+    // any`, exactly what a caller who never recompiled against the new types could still attempt
+    // at runtime) would reach it. Every cell must be non-affirmative. This is the mechanical fix
+    // for the coverage defect too: unlike the old suite (which asserted the templates-override
+    // route benign via `inspectSettleProgram` ONLY — an entry point structurally incapable of an
+    // affirmative verdict, so it could never have observed the affirmative it blessed), every
+    // route here runs through BOTH `inspectSettleProgram` and `verifySettleProgram`.
+    const ROUTES: Array<{ label: string; opts: VerifyOpts }> = [
+      { label: 'no opts', opts: {} },
+      { label: 'templates: [forged same-hash, well-formed entry]', opts: { templates: [forgedTableEntry] } as unknown as VerifyOpts },
+      { label: 'templates: [forged entry], acceptSuperseded:false', opts: { templates: [forgedTableEntry], acceptSuperseded: false } as unknown as VerifyOpts },
+      { label: "expectedBodyHash: forgedHash (default label 'caller')", opts: { expectedBodyHash: forgedHash } as unknown as VerifyOpts },
+      { label: "expectedBodyHash: forgedHash, hashSourceLabel:'caller'", opts: { expectedBodyHash: forgedHash, hashSourceLabel: 'caller' } as unknown as VerifyOpts },
+      { label: "expectedBodyHash: forgedHash, hashSourceLabel:'rederived' — THE ORIGINAL ROUTE 1", opts: { expectedBodyHash: forgedHash, hashSourceLabel: 'rederived' } as unknown as VerifyOpts },
+      { label: "expectedBodyHash: forgedHash, hashSourceLabel:'REDERIVED' (mis-cased label)", opts: { expectedBodyHash: forgedHash, hashSourceLabel: 'REDERIVED' } as unknown as VerifyOpts },
+      { label: 'templates:[{bodyHash:forgedHash}] — no id/version/status at all — THE ORIGINAL ROUTE 2', opts: { templates: [{ bodyHash: forgedHash }] } as unknown as VerifyOpts },
+      { label: "templates:[{...,status:'REVOKED'}] — case-sensitivity escape", opts: { templates: [{ ...forgedTableEntry, status: 'REVOKED' }] } as unknown as VerifyOpts },
+      { label: "templates:[{...,status:'revoked'}]", opts: { templates: [{ ...forgedTableEntry, status: 'revoked' }] } as unknown as VerifyOpts },
+      { label: 'templates:[{...,status:undefined}]', opts: { templates: [{ ...forgedTableEntry, status: undefined }] } as unknown as VerifyOpts },
+      { label: "templates:[{...,status:'bogus'}]", opts: { templates: [{ ...forgedTableEntry, status: 'bogus' }] } as unknown as VerifyOpts },
+      { label: 'templates + expectedBodyHash BOTH forged-consistent, acceptSuperseded:true', opts: { templates: [forgedTableEntry], expectedBodyHash: forgedHash, hashSourceLabel: 'rederived', acceptSuperseded: true } as unknown as VerifyOpts },
+      { label: 'templates: [] (empty override table)', opts: { templates: [] } as unknown as VerifyOpts },
+      { label: 'rederivedBodyHash: forgedHash (agrees with itself — the ONE real replacement field)', opts: { rederivedBodyHash: forgedHash } },
+      { label: 'serverEchoBodyHash: forgedHash', opts: { serverEchoBodyHash: forgedHash } },
+      { label: 'acceptSuperseded: true (alone, no table/hash override)', opts: { acceptSuperseded: true } },
+      { label: 'acceptSuperseded: false (alone)', opts: { acceptSuperseded: false } },
+      { label: "intentSourceLabel: 'server-echo' (verify only — inert here since the body itself never authenticates)", opts: { intentSourceLabel: 'server-echo' } },
+      { label: 'declaredIntent echo (inspect only)', opts: { declaredIntent: { recipient: ATTACKER, tokens: [VICTIM] } } },
+    ];
+
+    it(`T1 — enumerates ${ROUTES.length} routes (${ROUTES.length * 2} cells across both entry points) against the forged body: EVERY cell is non-affirmative`, () => {
+      let inspectCells = 0;
+      let verifyCells = 0;
+      for (const route of ROUTES) {
+        const insp = inspectSettleProgram(forged, route.opts);
+        inspectCells++;
+        expect(insp.verdict).toBe('NOT_OUR_TEMPLATE');
+        expect(insp.authentic).toBe(false);
+        expect(insp.templateId).toBeNull();
+        expect(insp.templateVersion).toBeNull();
+        expect(insp.sweepScope.tokens.length).toBe(0);
+        expect(insp.effects.length).toBe(0);
+        expect(insp.checks.find((c) => c.id === 'body.hash')!.status).toBe('fail');
+        expect(insp.verdict).not.toBe('MATCHES_DECLARED_INTENT');
+
+        const ver = verifySettleProgram(forged, { recipient: ATTACKER, tokens: [VICTIM] }, route.opts);
+        verifyCells++;
+        expect(ver.verdict).toBe('NOT_OUR_TEMPLATE');
+        expect(ver.authentic).toBe(false);
+        expect(ver.templateId).toBeNull();
+        expect(ver.templateVersion).toBeNull();
+        expect(ver.sweepScope.tokens.length).toBe(0);
+        expect(ver.effects.length).toBe(0);
+        expect(ver.verdict).not.toBe('MATCHES_DECLARED_INTENT');
+      }
+      // Coverage cannot silently shrink — pin the actual count of cells this test ran.
+      expect(inspectCells).toBe(ROUTES.length);
+      expect(verifyCells).toBe(ROUTES.length);
+      expect(ROUTES.length).toBeGreaterThanOrEqual(19);
+    });
+
+    // T2 — MONOTONICITY: no opts key may turn `authentic` false→true, or a non-affirmative
+    // `verdict` affirmative, relative to the no-opts baseline, on either program.
+    it('T2 — every route in the T1 matrix is monotone-restricting on BOTH a genuine and a forged program, both entry points', () => {
+      for (const program of [v1.program, forged]) {
+        const baseInsp = inspectSettleProgram(program);
+        const baseVer = verifySettleProgram(program, { recipient: v1.recipient, tokens: v1.tokens });
+        for (const route of ROUTES) {
+          const insp = inspectSettleProgram(program, route.opts);
+          if (insp.authentic) expect(baseInsp.authentic).toBe(true);
+          if (insp.verdict === 'MATCHES_DECLARED_INTENT') expect(baseInsp.verdict).toBe('MATCHES_DECLARED_INTENT');
+
+          const ver = verifySettleProgram(program, { recipient: v1.recipient, tokens: v1.tokens }, route.opts);
+          if (ver.authentic) expect(baseVer.authentic).toBe(true);
+          if (ver.verdict === 'MATCHES_DECLARED_INTENT') expect(baseVer.verdict).toBe('MATCHES_DECLARED_INTENT');
+        }
+      }
+    });
+
+    // T3 — the surface cannot quietly return: runtime AND compile-time.
+    describe('T3 — the surface cannot quietly return', () => {
+      it('hashSource is always one of the two closed values, across every T1 cell', () => {
+        for (const route of ROUTES) {
+          const insp = inspectSettleProgram(forged, route.opts);
+          expect(['pinned', 'none']).toContain(insp.hashSource);
+        }
+      });
+
+      it('COMPILE-TIME GUARD: the deleted opts keys are rejected by the type system — if this test file fails to compile, the escape has been reintroduced', () => {
+        // @ts-expect-error — `templates` no longer exists on VerifyOpts
+        const _r1: VerifyOpts = { templates: [] };
+        // @ts-expect-error — `expectedBodyHash` no longer exists on VerifyOpts
+        const _r2: VerifyOpts = { expectedBodyHash: forgedHash };
+        // @ts-expect-error — `hashSourceLabel` no longer exists on VerifyOpts
+        const _r3: VerifyOpts = { hashSourceLabel: 'rederived' };
+        expect([_r1, _r2, _r3].length).toBe(3); // silence unused-var lint; the assertions above are the test
+      });
+    });
+
+    // T4 — the authentic ⟹ templateId≠null contradiction is impossible, even through the
+    // internal test-only root hook (which CAN inject a malformed entry — the public surface never
+    // can, by construction: `SETTLE_TEMPLATES` is well-formed).
+    describe('T4 — the authentic⇒templateId contradiction is impossible', () => {
+      it('every T1 cell: authentic ⟹ templateId !== null && templateVersion !== null (vacuously true here since every cell is non-affirmative — see T1)', () => {
+        for (const route of ROUTES) {
+          const insp = inspectSettleProgram(forged, route.opts);
+          if (insp.authentic) {
+            expect(insp.templateId).not.toBeNull();
+            expect(insp.templateVersion).not.toBeNull();
+          }
+        }
+      });
+
+      it('a genuine, authentic program: authentic⟹templateId!==null holds affirmatively (not just vacuously)', () => {
+        const r = inspectSettleProgram(v1.program);
+        expect(r.authentic).toBe(true);
+        expect(r.templateId).not.toBeNull();
+        expect(r.templateVersion).not.toBeNull();
+      });
+
+      it('DIRECT UNIT on the fail-closed guard: a root row whose bodyHash matches but whose id is absent must NOT authenticate — code INTERNAL_INCONSISTENT', () => {
+        const malformedRoot = [{ bodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash, status: 'current' } as any];
+        const result = authenticateBodyAgainstRoot(CURRENT_SETTLE_TEMPLATE.bodyHash, true, malformedRoot);
+        expect(result.authentic).toBe(false);
+        expect(result.code).toBe('INTERNAL_INCONSISTENT');
+        expect(result.entry).not.toBeNull(); // the row WAS matched — entry is populated even though authentic is false
+      });
+
+      it('re-injecting the defect (a hook that skips the id guard) would fail this test — sanity: a well-formed root row DOES authenticate', () => {
+        const wellFormedRoot = [{ id: 'x', version: '1', bodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash, bodySize: 165, compilerSha: 'x', status: 'current' as const, since: '2026', notes: '' }];
+        const result = authenticateBodyAgainstRoot(CURRENT_SETTLE_TEMPLATE.bodyHash, true, wellFormedRoot);
+        expect(result.authentic).toBe(true);
+        expect(result.code).toBeUndefined();
+      });
+    });
+
+    // T5 — the status ALLOW-LIST (via the internal hook, which can inject arbitrary statuses;
+    // SETTLE_TEMPLATES itself only ever carries real TemplateStatus values).
+    describe('T5 — the status allow-list', () => {
+      const STATUSES = ['current', 'superseded', 'revoked', 'REVOKED', 'Revoked', undefined, '', 'bogus'] as const;
+      const ACCEPT_SUPERSEDED = [undefined, true, false] as const;
+
+      function rootWithStatus(status: unknown) {
+        return [{ id: 'x', version: '1', bodyHash: CURRENT_SETTLE_TEMPLATE.bodyHash, bodySize: 165, compilerSha: 'x', status, since: '2026', notes: '' } as any];
+      }
+
+      it('authentic===true for EXACTLY (current, *) and (superseded, undefined|true) — every other cell is false', () => {
+        for (const status of STATUSES) {
+          for (const accept of ACCEPT_SUPERSEDED) {
+            const acceptSuperseded = accept ?? true; // mirrors report.ts's `opts.acceptSuperseded !== false` default
+            const result = authenticateBodyAgainstRoot(CURRENT_SETTLE_TEMPLATE.bodyHash, acceptSuperseded, rootWithStatus(status));
+            const shouldAuthenticate = status === 'current' || (status === 'superseded' && acceptSuperseded !== false);
+            expect(result.authentic).toBe(shouldAuthenticate);
+          }
+        }
+      });
+
+      it('a mis-cased or unrecognized status NEVER authenticates, regardless of acceptSuperseded — the case-sensitivity escape is closed', () => {
+        for (const status of ['REVOKED', 'Revoked', undefined, '', 'bogus']) {
+          for (const acceptSuperseded of [true, false]) {
+            const result = authenticateBodyAgainstRoot(CURRENT_SETTLE_TEMPLATE.bodyHash, acceptSuperseded, rootWithStatus(status));
+            expect(result.authentic).toBe(false);
+          }
+        }
+      });
+    });
+
+    // T6 — the safety sentence is enforced, not decorative.
+    describe('T6 — the safety sentence is enforced', () => {
+      it('no route in the T1 matrix reaches the state FULL_BALANCE_SWEEP blesses (a non-empty sweepScope alongside an affirmative verdict) on the forged body', () => {
+        for (const route of ROUTES) {
+          const ver = verifySettleProgram(forged, { recipient: ATTACKER, tokens: [VICTIM] }, route.opts);
+          const blessed = ver.verdict === 'MATCHES_DECLARED_INTENT' && ver.sweepScope.tokens.length > 0;
+          expect(blessed).toBe(false);
+        }
+      });
+
+      it("intentSource:'server-echo' can NEVER reach verdict:MATCHES_DECLARED_INTENT, even on a full field match against a genuine, authentic program", () => {
+        const r = verifySettleProgram(v1.program, { recipient: v1.recipient, tokens: v1.tokens, minOut: v1.minOut }, { intentSourceLabel: 'server-echo' });
+        expect(r.intentSource).toBe('server-echo');
+        expect(r.verdict).not.toBe('MATCHES_DECLARED_INTENT');
+        expect(r.verdict).toBe('INTENT_UNCHECKED'); // capped, not flipped to a mismatch — the fields DO agree
+        expect(r.intentReconciled).toBeNull();
+        // Sanity: the SAME expectation under the default 'caller' label DOES reach the affirmative verdict.
+        const caller = verifySettleProgram(v1.program, { recipient: v1.recipient, tokens: v1.tokens, minOut: v1.minOut });
+        expect(caller.verdict).toBe('MATCHES_DECLARED_INTENT');
+      });
+    });
+
+    // T7 — the coverage invariant, as an invariant: inspect is structurally incapable of the
+    // affirmative verdict, over the SAME matrix + a genuine program, so a test that (like the old
+    // suite) exercised only inspectSettleProgram could never have observed T1's headline.
+    describe('T7 — inspect never returns MATCHES_DECLARED_INTENT, and the two entry points run the SAME case count', () => {
+      it('inspectSettleProgram never returns MATCHES_DECLARED_INTENT for any input in the T1 matrix, nor for a genuine program with no opts', () => {
+        for (const route of ROUTES) {
+          expect(inspectSettleProgram(forged, route.opts).verdict).not.toBe('MATCHES_DECLARED_INTENT');
+          expect(inspectSettleProgram(v1.program, route.opts).verdict).not.toBe('MATCHES_DECLARED_INTENT');
+        }
+      });
+
+      it('a shared case list run through BOTH entry points sees the SAME case count on each side (the coverage defect this fixes: a prior test blessed the templates override via inspectSettleProgram ONLY)', () => {
+        const cases = ROUTES;
+        let ranByInspect = 0;
+        let ranByVerify = 0;
+        for (const route of cases) {
+          inspectSettleProgram(forged, route.opts);
+          ranByInspect++;
+          verifySettleProgram(forged, { recipient: ATTACKER, tokens: [VICTIM] }, route.opts);
+          ranByVerify++;
+        }
+        expect(ranByInspect).toBe(cases.length);
+        expect(ranByVerify).toBe(cases.length);
+        expect(ranByInspect).toBe(ranByVerify);
+      });
     });
   });
 });
