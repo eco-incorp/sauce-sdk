@@ -35,4 +35,6 @@ export * from './quantum/index.js';
 export * from './quantum/ladder.js';
 export * from './solfi-v2/index.js';
 export * from './solfi-v2/ladder.js';
+export * from './tesserav/index.js';
+export * from './tesserav/ladder.js';
 //# sourceMappingURL=index.js.map
