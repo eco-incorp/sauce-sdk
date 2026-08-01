@@ -45,10 +45,22 @@ jobs:
           ECO_INCORP_TOKEN: ${{ secrets.ECO_INCORP_TOKEN }}
         run: |
           if [ -z "${ECO_INCORP_TOKEN:-}" ]; then
-            echo "Missing repo secret: ECO_INCORP_TOKEN"
+            echo "::error::Missing repo secret ECO_INCORP_TOKEN — required to clone the private eco-incorp/sauce git dep. Add a PAT with read access on eco-incorp/sauce under Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          git config --global url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
+          # Kept identical to ci.yml's block. This workflow previously rewrote ONLY the
+          # https:// form, which is not the form the lockfile pins: pnpm-lock.yaml records
+          # `git+https://git@github.com:eco-incorp/sauce.git#<sha>` (the SSH spelling) when
+          # regenerated on a machine that has an `insteadOf` for git@github.com:, so the
+          # fetch fell through to SSH on a runner with no SSH key and `pnpm install` failed
+          # before anything could be published — every publish attempt died at step 7.
+          # Any rewrite added here must be added to ci.yml too, and vice versa.
+          #
+          # Use --add: insteadOf is multi-valued, so plain `git config` would
+          # overwrite each prior value and only the last rule would survive.
+          git config --global --add url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global --add url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "git@github.com:"
+          git config --global --add url."https://x-access-token:${ECO_INCORP_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
 
       # Foundry builds the sauce engine (compiler postinstall `forge build`) so the
       # `prepack` step can copy engine artifacts into dev-tools/artifacts/ for the tarball.
