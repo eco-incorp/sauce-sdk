@@ -8,6 +8,21 @@ importers:
 
   .:
     dependencies:
+      '@solana-program/address-lookup-table':
+        specifier: ^0.12.1
+        version: 0.12.1(@solana/kit@6.10.0(typescript@5.9.3))
+      '@solana-program/compute-budget':
+        specifier: ^0.16.0
+        version: 0.16.0(@solana/kit@6.10.0(typescript@5.9.3))
+      '@solana-program/system':
+        specifier: ^0.12.2
+        version: 0.12.2(@solana/kit@6.10.0(typescript@5.9.3))
+      '@solana-program/token':
+        specifier: ^0.14.0
+        version: 0.14.0(@solana/kit@6.10.0(typescript@5.9.3))
+      '@solana/kit':
+        specifier: ^6.10.0
+        version: 6.10.0(typescript@5.9.3)
       acorn:
         specifier: ^8.15.0
         version: 8.16.0
