@@ -71,12 +71,16 @@ jobs:
       # are not build output, so a repin would otherwise leave them stale
       # silently. Re-sync from the freshly-installed engine build (foundry v1.5.1
       # + solc 0.8.27 → byte-reproducible) and fail if the committed copies drift.
+      # sdk/src/deployments/v12.generated.ts is covered by the same check: it is
+      # generated from the pinned dep's deployments/v12.json (the deployed
+      # router/kitchen/runtime addresses + SVM program id that the package now
+      # exports), so a repin that moves the deploy record must be committed too.
       - name: Verify engine artifacts are in sync with the pinned engine
         run: |
           pnpm --filter './sdk' sync-engine-artifacts
-          if [ -n "$(git status --porcelain -- sdk/dist/artifacts)" ]; then
-            echo "::error::sdk/dist/artifacts is stale vs the pinned sauce engine. Run 'pnpm --filter ./sdk sync-engine-artifacts' and commit the result.";
-            git --no-pager diff --stat -- sdk/dist/artifacts;
+          if [ -n "$(git status --porcelain -- sdk/dist/artifacts sdk/src/deployments)" ]; then
+            echo "::error::sdk/dist/artifacts or sdk/src/deployments is stale vs the pinned sauce engine. Run 'pnpm --filter ./sdk sync-engine-artifacts' and commit the result.";
+            git --no-pager diff --stat -- sdk/dist/artifacts sdk/src/deployments;
             exit 1;
           fi
       # -----------------------------------------------------------------------
