@@ -82,10 +82,28 @@ Actions and dev-tools use the **node test runner**, not jest → `pnpm --filter 
   they must track the pinned `sauce` engine. Unlike `compiler/dist`, they are **not** build
   output — `tsc` never emits them — so a `sauce` repin would silently leave them stale. **After
   any repin run `pnpm --filter './sdk' sync-engine-artifacts`** (copies the 8 forge artifacts
-  from the pinned dep's `engine/out/` + the `V12RuntimeBytecode` snapshot from
-  `engine-v12/snapshots/`) **and commit the result**. CI enforces this: it re-syncs from the
-  freshly-installed engine (foundry v1.5.1 + solc 0.8.27 → byte-reproducible) and fails on any
-  drift, so a forgotten re-sync can't merge.
+  from the pinned dep's `engine/out/`) **and commit the result**. CI enforces this: it re-syncs
+  from the freshly-installed engine (foundry v1.5.1 + solc 0.8.27 → byte-reproducible) and fails
+  on any drift, so a forgotten re-sync can't merge.
+- **`V12RuntimeBytecode.json` is the one artifact the sync script does NOT re-derive** (it is
+  listed in `OPTIONAL_SOURCES`, not `SOURCES`). It used to be a snapshot committed inside the
+  dep at `engine-v12/snapshots/`, so syncing was a plain copy. The engine **deleted that
+  committed copy** (`chore(v12): compile the runtime at deploy time`) because it was a second
+  source of truth that rotted — a change to six `.huff` handlers shipped with a snapshot built
+  from the pre-change source, through green CI, and the deploy script would have pushed those
+  stale bytes to eleven live chains. The engine now compiles `v12/Runtime.huff` with `hnc` at
+  deploy time, where `hnc` is a first-class dep. **It is not one here** — this repo's CI installs
+  Foundry only, and that same CI re-runs the sync and fails on drift, so requiring the snapshot
+  would make the drift check unsatisfiable. The engine keeps its generator
+  (`engine-v12/script/V12RuntimeBytecode.s.sol`) precisely for this consumer; its doc comment
+  names "the sauce-sdk viem test harness" as the reason. **When the v12 runtime changes, refresh
+  it by hand** from a checkout of the pinned commit, with `hnc` on `PATH`:
+  `cd engine-v12 && git submodule update --init --recursive --depth 1 && forge script
+  script/V12RuntimeBytecode.s.sol --sig "run()" --ffi`, then copy
+  `snapshots/V12RuntimeBytecode.json` over `sdk/src/artifacts/` + `sdk/dist/artifacts/` and
+  commit. The generator sanity-deploys the creation code before writing, so a broken snapshot
+  fails there rather than in a downstream consumer. Nothing in this repo re-derives or verifies
+  it, so a v12 runtime change without this step silently ships stale creation code to consumers.
 
 ## Architecture
 
@@ -1374,6 +1392,19 @@ NOT done here: identifying the exact upstream commit that fixed it needs its own
 repin changes engine artifacts widely enough (affecting far more than this branch's own scope) that
 it belongs in its own dedicated change, not bundled into a compiler-focused fix. Left as an open
 follow-up; the pinned-vs-live split itself is the only evidence needed that this is engine-side.
+
+**RESOLVED by the repin.** The dep now pins **`release/beta`** (was `feat/router-flash-callback`),
+which carries the upstream v12 fixes — `fix(v12): port 10 Octane audit findings`, `fix(v12-saucer):
+one stack model for REF/SET/DROP`, INDEX bounds checks across the v12 interpreter and SVM engine,
+and the ABI_DECODE static-array operand-order fix. With that pin, the FULL compiler suite passes
+with **nothing skipped** — 64/64 suites, 1622/1622 tests, including both `SAUCE_ENGINE_V12`-gated
+suites (`v12-execution`, `v12-solidity-parity`) run against a `release/beta` `engine-v12` checkout.
+Note the repin target: `main` is **not** a valid pin — it diverged from the engine line on
+2026-06-18 onto a `compiler-rs` (Rust rewrite) track and does **not** contain `CAST_BE`/`CAST_LE`
+(0x54/0x55), which this compiler emits for the svm `uint()`/`accountUint` lowering and for scalar
+destructuring slot reads, so pinning `main` would break the svm target outright. `release/beta`
+contains the previous pin as an ancestor, so a repin to it is a strict superset — no engine feature
+is lost.
 
 **Adversarial-audit fixes (this branch), three more instances of the same failure families:**
 
