@@ -35,6 +35,10 @@
       "types": "./sdk/dist/chains/index.d.ts",
       "default": "./sdk/dist/chains/index.js"
     },
+    "./deployments": {
+      "types": "./sdk/dist/deployments/index.d.ts",
+      "default": "./sdk/dist/deployments/index.js"
+    },
     "./skills": {
       "types": "./sdk/dist/skills/loader.d.ts",
       "default": "./sdk/dist/skills/loader.js"

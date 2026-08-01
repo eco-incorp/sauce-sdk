@@ -46,7 +46,7 @@
 // Run: `pnpm --filter './sdk' sync-engine-artifacts` (after `pnpm install`).
 // NOTE: a `rm -rf sdk/dist` clean build drops these (tsc emits no JSON) — re-run
 // this after such a build. The normal `tsc` build leaves them in place.
-import { existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -130,7 +130,95 @@ for (const [name, rel] of Object.entries(OPTIONAL_SOURCES)) {
   for (const dest of DESTS) copyFileSync(src, resolve(dest, `${name}.json`));
 }
 
+// ---------------------------------------------------------------------------
+// Deployed-address record -> a typed TS module.
+//
+// The engine records where its stack actually lives in `deployments/v12.json`
+// (written by its own dev-tools/scripts/deploy-v12.ts). Without this, the npm
+// package shipped ABIs and runtime creation code but no way to discover the
+// ADDRESSES of the deployed router/kitchen/runtime, or the SVM engine's program
+// id — consumers had to hardcode them out of band. `createSauceSvmClient` in
+// particular takes a required `programId` with no default.
+//
+// Generated as TypeScript rather than copied as JSON on purpose: a runtime JSON
+// import needs ESM import attributes (`with { type: 'json' }`) to work in Node,
+// which is a portability trap for consumers. Emitting literals sidesteps it
+// entirely and keeps the values fully typed and tree-shakeable.
+//
+// Generated, not hand-written, so it cannot drift from the pinned engine across
+// a repin — the same reason the artifacts above are synced rather than
+// maintained by hand. CI re-runs this and fails on drift.
+const DEPLOYMENTS_SRC = resolve(sauce, 'deployments', 'v12.json');
+const GENERATED = resolve(SDK_DIR, 'src', 'deployments', 'v12.generated.ts');
+
+if (!existsSync(DEPLOYMENTS_SRC)) {
+  console.error(
+    '[sync-engine-artifacts] deployments/v12.json missing from the pinned engine. Pin a commit that ' +
+      'records a deploy (release/beta does); `main` carries no deployments/ directory.',
+  );
+  process.exit(1);
+}
+
+const dep = JSON.parse(readFileSync(DEPLOYMENTS_SRC, 'utf8'));
+const q = (s) => `'${String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+// Numeric chain-id order, so regeneration is byte-stable regardless of JSON key order.
+const chainIds = Object.keys(dep.evm?.chains ?? {}).sort((a, b) => Number(a) - Number(b));
+const clusters = Object.keys(dep.svm?.clusters ?? {}).sort();
+
+const generated = `// GENERATED FILE — do not edit by hand.
+//
+// Written by sdk/scripts/sync-engine-artifacts.mjs from the pinned \`sauce\` dep's
+// deployments/v12.json (produced there by dev-tools/scripts/deploy-v12.ts). Run
+// \`pnpm --filter './sdk' sync-engine-artifacts\` after a repin; CI fails on drift.
+//
+// The EVM addresses are CREATE2-deterministic (factory + salt + initcode only),
+// so they are the SAME on every chain — hence one flat address set plus per-chain
+// liveness, rather than the same three addresses repeated per chain.
+
+/** CREATE2 salt the stack was deployed with. */
+export const V12_SALT = ${q(dep.salt)} as const;
+
+/** Which tool in the engine repo produced the underlying record. */
+export const V12_GENERATED_BY = ${q(dep.generatedBy)} as const;
+
+/** Chain-invariant EVM addresses (identical on every chain — see the note above). */
+export const V12_EVM_CONTRACTS = {
+  router: ${q(dep.evm.contracts.router)},
+  v12Runtime: ${q(dep.evm.contracts.v12Runtime)},
+  v12Kitchen: ${q(dep.evm.contracts.v12Kitchen)},
+} as const;
+
+/** Per-chain deploy outcome. \`live\` is the only field callers should gate on. */
+export const V12_EVM_CHAINS = {
+${chainIds
+  .map((id) => {
+    const c = dep.evm.chains[id];
+    const err = c.error === undefined ? '' : `, error: ${q(c.error)}`;
+    return `  ${id}: { name: ${q(c.name)}, live: ${c.live === true}, status: ${q(c.status)}${err} },`;
+  })
+  .join('\n')}
+} as const;
+
+/** The SVM engine program (non-upgradeable when \`upgradeable\` is false). */
+export const V12_SVM = {
+  programId: ${q(dep.svm.programId)},
+  upgradeable: ${dep.svm.upgradeable === true},
+  clusters: {
+${clusters.map((k) => `    ${q(k)}: { cluster: ${q(dep.svm.clusters[k].cluster)}, status: ${q(dep.svm.clusters[k].status)} },`).join('\n')}
+  },
+} as const;
+`;
+
+mkdirSync(dirname(GENERATED), { recursive: true });
+writeFileSync(GENERATED, generated);
+
+const liveCount = chainIds.filter((id) => dep.evm.chains[id].live === true).length;
+
 console.log(`[sync-engine-artifacts] synced ${Object.keys(SOURCES).length} artifacts from ${sauce}`);
+console.log(
+  `[sync-engine-artifacts] generated src/deployments/v12.generated.ts — ${liveCount} live of ` +
+    `${chainIds.length} EVM chains, svm programId ${dep.svm.programId}`,
+);
 
 if (skipped.length) {
   console.log(
