@@ -386,16 +386,23 @@ const FAMILIES: Family[] = [
       ];
     },
     declaredCliffs: {
-      // Same disclosed shape as orca-whirlpool/raydium-clmm/meteora-dlmm/
-      // solfi-v2: the ladder-chain path (referenceLadderQuotes +
-      // capacityInputVar/referenceCapacities) is capacity-safe (the
-      // MERGE-ALTITUDE sweep below proves it never yields a negative dIn or
-      // dOut), but the standalone cold referenceQuote asked directly for an
-      // x past this boundary still collapses to 0 (ladder.ts's module doc).
-      // Each (x, peak) pair is the exact geometric cliff/peak of the
-      // STANDALONE cold quote — the TRUE boundary, not the analytic clamp's
-      // own (deliberately more conservative) reported value; see the
-      // CAPACITY DENSITY block below for the clamp side of this story.
+      // The remaining disclosed gap of this shape (orca-whirlpool/
+      // raydium-clmm/meteora-dlmm/solfi-v2/goonfi-v2 all had the identical
+      // pattern -- fixed in the SDK's five-family correctness batch: their
+      // standalone cold referenceQuote now saturates instead of collapsing,
+      // via coldWalkClamped/emitFinalQuote no longer gating on full
+      // absorption -- see each family's ladder.ts for the fix). This
+      // family's own boundary is a STRICT idle-float bound behind a
+      // vault-share transform (needs an inverse-Newton derivation, not
+      // attempted here) rather than an exhausted window or a closed-form
+      // spline/tier ceiling, so it is not part of that batch. The
+      // ladder-chain path (referenceLadderQuotes + capacityInputVar/
+      // referenceCapacities) is capacity-safe regardless (the MERGE-ALTITUDE
+      // sweep below proves it never yields a negative dIn or dOut). Each
+      // (x, peak) pair is the exact geometric cliff/peak of the STANDALONE
+      // cold quote — the TRUE boundary, not the analytic clamp's own
+      // (deliberately more conservative) reported value; see the CAPACITY
+      // DENSITY block below for the clamp side of this story.
       lowIdle: { x: 499_992_225_659n, peak: 499_999_999_998n },
       idle1e9: { x: 999_395_010n, peak: 999_999_999n },
       idle100e9: { x: 99_968_830_253n, peak: 99_999_999_999n },
@@ -486,15 +493,11 @@ const FAMILIES: Family[] = [
         { label: 'yToX', cfg: cfgYtoX, state },
       ];
     },
-    declaredCliffs: {
-      // Closed-form (not window-walking): the size-tier ceiling (the venue's OWN configured
-      // capacity, empirically confirmed against a real Jupiter "No routes found" at exactly this
-      // size — see index.ts's module doc). referenceLadderQuotes/referenceCapacities already
-      // FREEZE at the last productive rung (capacityInputVar wired above), so the merge-relevant
-      // path is safe; the standalone cold referenceQuote still collapses past the ceiling.
-      xToY: { x: 10_000_000_000_000n, peak: 989_000_000_000n },
-      yToX: { x: 1_000_000_000_000n, peak: 9_890_000_000_000n },
-    },
+    // FIXED (five-family SDK correctness batch): the size-tier ceiling and
+    // vault clamp both used to collapse the standalone cold referenceQuote
+    // to 0 -- goonfi-v2's ladder.ts now bumps to the setup-computed
+    // tierCeilOut/rout instead (see emitLadderQuote's "THE TIER-CEILING +
+    // VAULT-CLAMP COLLAPSE" doc), so there is no longer a declared cliff.
   },
   {
     slug: 'raydium-clmm',
@@ -509,10 +512,10 @@ const FAMILIES: Family[] = [
         { label: '1to0', cfg: { ...cfg, direction: '1to0' }, state },
       ];
     },
-    declaredCliffs: {
-      '0to1': { x: 95_185_556_484n, peak: 7_780_360_867n },
-      '1to0': { x: 11_011_525_605n, peak: 134_527_424_614n },
-    },
+    // FIXED (five-family SDK correctness batch): the cold referenceQuote
+    // used to collapse to 0 past the tick-array window's capacity --
+    // referenceQuote now uses coldWalkClamped (never null) instead of
+    // coldWalk(...) ?? 0n, so there is no longer a declared cliff.
   },
   {
     slug: 'meteora-dlmm',
@@ -527,10 +530,10 @@ const FAMILIES: Family[] = [
         { label: 'yToX', cfg: { ...cfg, direction: 'yToX' }, state, now: CLOCK_DLMM },
       ];
     },
-    declaredCliffs: {
-      xToY: { x: 2_518_898_410_454n, peak: 205_617_877_803n },
-      yToX: { x: 210_552_340_323n, peak: 2_569_384_657_300n },
-    },
+    // FIXED (five-family SDK correctness batch): the cold referenceQuote
+    // used to collapse to 0 past the shipped bin window's capacity --
+    // referenceQuote now uses coldWalkClamped (never null) instead of
+    // coldWalk(...) ?? 0n, so there is no longer a declared cliff.
   },
   {
     slug: 'orca-whirlpool',
@@ -545,10 +548,10 @@ const FAMILIES: Family[] = [
         { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
       ];
     },
-    declaredCliffs: {
-      aToB: { x: 1_818_415_775_132n, peak: 146_829_069_683n },
-      bToA: { x: 184_416_747_348n, peak: 2_278_904_950_099n },
-    },
+    // FIXED (five-family SDK correctness batch): the cold referenceQuote
+    // used to collapse to 0 past the tick-array window's capacity --
+    // referenceQuote now uses coldWalkClamped (never null) instead of
+    // coldWalk(...) ?? 0n, so there is no longer a declared cliff.
   },
   {
     slug: 'manifest',
@@ -591,18 +594,21 @@ const FAMILIES: Family[] = [
         { label: 'dir1', cfg: cfg1, state: fixtureBytesMap(dir1), now: 436_250_365n },
       ];
     },
-    declaredCliffs: {
-      // solfi-v2 is CLOSED-FORM (not window-walking), so this is a DIFFERENT
-      // mechanism than the three families above (a spline-depth impact/110%-
-      // of-vault revert boundary, not an exhausted tick/bin window) — but the
-      // SAME disclosed shape: referenceLadderQuotes/referenceCapacities
-      // already FREEZE at the last productive rung (see ladder.ts's
-      // capacityInputVar doc), so the merge-relevant path is safe; the
-      // standalone cold referenceQuote still collapses past the boundary
-      // (not fixed in this pass — see ladder.ts's module doc for why).
-      dir0: { x: 24_687_369_393_499n, peak: 1_655_097_325_788n },
-      dir1: { x: 1_895_911_984_180n, peak: 22_778_841_047_543n },
-    },
+    // FIXED (five-family SDK correctness batch): the standalone cold
+    // referenceQuote used to collapse to 0 past the impact/110%-of-vault
+    // revert boundary. Fixed via satCap = preInv(outVault), a closed-form
+    // (linear, ignoring only the fee/impact haircut) inversion computed once
+    // in setup, so referenceQuote/emitFinalQuote now plateau at satOut
+    // instead of collapsing (see ladder.ts's module doc). NOTE a narrow,
+    // BOUNDED residual remains, documented on solfiColdQuote: because this
+    // function has no running state to bump-then-latch against (unlike
+    // referenceLadderQuotes/referenceCapacities, whose accumulator can only
+    // ever increase), the exact one-wei transition from "organic" to
+    // "fallback" can dip by the haircut margin -- categorically smaller than
+    // the pre-fix unbounded collapse to 0, and not what this registry's
+    // coarse absoluteProbePoints lattice is built to catch (it does not
+    // specifically target that one-wei window), so no declaredCliffs entry
+    // is needed here either.
   },
   {
     slug: 'quantum',
@@ -887,15 +893,8 @@ describe.each(FAMILIES)('$slug', (family) => {
 describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses past a boundary the LADDER-CHAIN path already saturates at (LATENT: the merge never reaches this; NOT a safety property)', () => {
   const withGaps = FAMILIES.filter((f) => f.declaredCliffs !== undefined);
 
-  it('exactly six families carry a disclosed gap: the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm, an exhausted tick/bin window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert boundary) plus meteora-damm-v1-stable (closed-form, a strict idle-float bound) plus goonfi-v2 (closed-form, its own configured size-tier ceiling) — obric-v2 does NOT (fixed alongside this guard)', () => {
-    expect(withGaps.map((f) => f.slug).sort()).toEqual([
-      'goonfi-v2',
-      'meteora-damm-v1-stable',
-      'meteora-dlmm',
-      'orca-whirlpool',
-      'raydium-clmm',
-      'solfi-v2',
-    ]);
+  it('exactly ONE family still carries a disclosed gap: meteora-damm-v1-stable (closed-form, a strict idle-float bound behind a vault-share transform, needing an inverse-Newton derivation not attempted here) — the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm) plus solfi-v2 plus goonfi-v2 were FIXED in the five-family SDK correctness batch (each now saturates instead of collapsing — see their own ladder.ts), and obric-v2 never had one (fixed alongside this guard)', () => {
+    expect(withGaps.map((f) => f.slug).sort()).toEqual(['meteora-damm-v1-stable']);
   });
 
   it.each(withGaps.flatMap((f) => Object.entries(f.declaredCliffs!).map(([label, gap]) => ({ family: f, label, gap }))))(

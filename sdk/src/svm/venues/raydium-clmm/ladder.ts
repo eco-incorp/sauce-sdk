@@ -604,6 +604,14 @@ export const raydiumClmmLadder = {
     return `s${slot}lx`;
   },
 
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED (on-chain fragment twin of
+   * referenceQuote's own fix — see orca-whirlpool's emitFinalQuote doc for
+   * the full mechanism). Used to gate the walk's own output behind full
+   * absorption, leaving outVar at 0 for any x past the window's capacity
+   * even though `fo` already holds the correct saturated output. Assigning
+   * outVar = fo unconditionally reproduces coldWalkClamped's semantics.
+   */
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
     const cfg = rayConfig(base);
     const zeroForOne = cfg.direction === '0to1';
@@ -619,7 +627,7 @@ export const raydiumClmmLadder = {
       `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
       ...emitWalkStep(p, zeroForOne, v, '        '),
       `      }`,
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+      `      ${outVar} = ${p}fo;`,
       `    }`,
       `  }`,
     ].join('\n');
@@ -670,12 +678,25 @@ export const raydiumClmmLadder = {
     };
   },
 
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED. Same defect and same fix as
+   * orca-whirlpool's referenceQuote (see its doc for the full mechanism):
+   * `coldWalk(...) ?? 0n` required full absorption to return non-null, so
+   * any x past the shipped window's capacity collapsed to 0 forever instead
+   * of the window's own true saturated output (measured, both directions:
+   * 0to1 last-nonzero 5,617,442,468 at 2^36 -> 0 at 2^37 while
+   * referenceCapacities correctly saturates at 95,185,556,484; 1to0
+   * last-nonzero 104,951,027,622 at 2^33 -> 0 at 2^34 while
+   * referenceCapacities saturates at 11,011,525,605). coldWalkClamped runs
+   * the identical walk but never returns null — exact, no approximation
+   * needed, same as orca-whirlpool.
+   */
   referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint {
     const cfg = rayConfig(base);
     const zeroForOne = cfg.direction === '0to1';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live, params);
-    return (x: bigint): bigint => coldWalk(win, live, zeroForOne, x) ?? 0n;
+    return (x: bigint): bigint => coldWalkClamped(win, live, zeroForOne, x).out;
   },
 
   referenceLadderQuotes(

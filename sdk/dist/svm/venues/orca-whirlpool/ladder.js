@@ -535,6 +535,18 @@ export const orcaWhirlpoolLadder = {
     capacityInputVar(slot) {
         return `s${slot}lx`;
     },
+    /**
+     * THE COLD-QUOTE COLLAPSE — FIXED (on-chain fragment twin of
+     * referenceQuote's own fix). Used to gate the walk's own output behind
+     * full absorption (`if (fex===0 && frm===0) { outVar = fo }`), leaving
+     * outVar at 0 for any x past the window's capacity — even though `fo`
+     * already holds the correct, fully-saturated output by the time the walk
+     * loop exits (each fully-consumed tick range's contribution is added to
+     * `fo` unconditionally as the walk proceeds; a partial/final range's
+     * contribution is added the same way before `frm` is zeroed). The gate was
+     * never necessary: assigning `outVar = fo` unconditionally reproduces the
+     * exact coldWalkClamped semantics the JS mirror now uses.
+     */
     emitFinalQuote(base, slot, x, outVar) {
         const cfg = whirlConfig(base);
         const aToB = cfg.direction === 'aToB';
@@ -554,7 +566,7 @@ export const orcaWhirlpoolLadder = {
             `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
             ...emitWalkStep(p, aToB, v, '        '),
             `      }`,
-            `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+            `      ${outVar} = ${p}fo;`,
             `    }`,
             `  }`,
         ].join('\n');
@@ -600,12 +612,31 @@ export const orcaWhirlpoolLadder = {
      * the params, so callers mirroring a drifted execution must pass the
      * prepare-time cfg/params (as the orchestrator and the e2e suites do).
      */
+    /**
+     * THE COLD-QUOTE COLLAPSE — FIXED. Used to be `coldWalk(...) ?? 0n`:
+     * coldWalk requires x to be FULLY absorbed (rm reaches exactly 0) to
+     * return non-null, so any x exceeding the shipped window's capacity
+     * collapsed straight to 0 instead of the window's own true saturated
+     * output — violating "nondecreasing in x, quote(0)=0" (measured:
+     * referenceQuote = 88,802,545,193 at x = 2^40, then 0 at x = 2^41 and
+     * beyond, on a real mainnet fixture whose referenceCapacities correctly
+     * saturates at 1,818,415,775,132 — only the cold quote was wrong).
+     * coldWalkClamped runs the IDENTICAL walk but never returns null (it
+     * reports whatever the window actually delivers, capping gracefully
+     * instead of demanding full absorption) — for any x already within
+     * capacity it returns the exact same `.out` coldWalk would have, and for
+     * x beyond capacity it returns the window's true saturated output instead
+     * of nothing. No approximation/haircut needed here (unlike solfi-v2's
+     * spline-based satCap/satOut): the walk itself IS the closed form, and
+     * coldWalkClamped is already the exact, no-compromise saturating version
+     * of it -- referenceLadderQuotes/referenceCapacities already use it below.
+     */
     referenceQuote(base, state, params) {
         const cfg = whirlConfig(base);
         const aToB = cfg.direction === 'aToB';
         const live = liveFromState(cfg, state);
         const win = effectiveWindow(cfg, state, live, params);
-        return (x) => coldWalk(win, live, aToB, x) ?? 0n;
+        return (x) => coldWalkClamped(win, live, aToB, x).out;
     },
     referenceLadderQuotes(base, state, params) {
         const cfg = whirlConfig(base);

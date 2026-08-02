@@ -28,6 +28,18 @@ export declare const orcaWhirlpoolLadder: {
     emitSetup(base: PoolConfig, slot: number, params: readonly string[], enableVar?: string): string;
     emitLadderQuote(base: PoolConfig, slot: number, rung: number, x: string, outVar: string): string;
     capacityInputVar(slot: number): string;
+    /**
+     * THE COLD-QUOTE COLLAPSE — FIXED (on-chain fragment twin of
+     * referenceQuote's own fix). Used to gate the walk's own output behind
+     * full absorption (`if (fex===0 && frm===0) { outVar = fo }`), leaving
+     * outVar at 0 for any x past the window's capacity — even though `fo`
+     * already holds the correct, fully-saturated output by the time the walk
+     * loop exits (each fully-consumed tick range's contribution is added to
+     * `fo` unconditionally as the walk proceeds; a partial/final range's
+     * contribution is added the same way before `frm` is zeroed). The gate was
+     * never necessary: assigning `outVar = fo` unconditionally reproduces the
+     * exact coldWalkClamped semantics the JS mirror now uses.
+     */
     emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string;
     buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
     /**
@@ -35,6 +47,25 @@ export declare const orcaWhirlpoolLadder: {
      * blob was prepared with, over live account bytes — the boundary set rides
      * the params, so callers mirroring a drifted execution must pass the
      * prepare-time cfg/params (as the orchestrator and the e2e suites do).
+     */
+    /**
+     * THE COLD-QUOTE COLLAPSE — FIXED. Used to be `coldWalk(...) ?? 0n`:
+     * coldWalk requires x to be FULLY absorbed (rm reaches exactly 0) to
+     * return non-null, so any x exceeding the shipped window's capacity
+     * collapsed straight to 0 instead of the window's own true saturated
+     * output — violating "nondecreasing in x, quote(0)=0" (measured:
+     * referenceQuote = 88,802,545,193 at x = 2^40, then 0 at x = 2^41 and
+     * beyond, on a real mainnet fixture whose referenceCapacities correctly
+     * saturates at 1,818,415,775,132 — only the cold quote was wrong).
+     * coldWalkClamped runs the IDENTICAL walk but never returns null (it
+     * reports whatever the window actually delivers, capping gracefully
+     * instead of demanding full absorption) — for any x already within
+     * capacity it returns the exact same `.out` coldWalk would have, and for
+     * x beyond capacity it returns the window's true saturated output instead
+     * of nothing. No approximation/haircut needed here (unlike solfi-v2's
+     * spline-based satCap/satOut): the walk itself IS the closed form, and
+     * coldWalkClamped is already the exact, no-compromise saturating version
+     * of it -- referenceLadderQuotes/referenceCapacities already use it below.
      */
     referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint;
     referenceLadderQuotes(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (grid: readonly bigint[]) => bigint[];

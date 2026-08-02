@@ -207,6 +207,63 @@ function emitBinWalk(p, swapForY, x, v, loopVar) {
         `      }`,
     ];
 }
+/**
+ * SAME per-bin walk as emitBinWalk, but resumes from the persisted cursor
+ * (`${p}wk`/`${p}wcb`/`${p}wob`, declared in emitSetup) instead of
+ * restarting from bin 0 every rung — each ladder rung is called with a
+ * strictly-increasing CUMULATIVE grid point, and every bin strictly before
+ * the cursor is already known FULLY consumed (wk only ever advances past a
+ * bin on the iteration that fully consumes it), so re-walking them is pure
+ * waste: their consumed-input/output totals are frozen in wcb/wob forever.
+ *
+ * EXACT, not an approximation: the walk's only fee/rounding computation
+ * (`feeIn = ceil(remaining * tf / FEE_PRECISION)`) is applied to whichever
+ * bin is CURRENTLY being entered, using `remaining = x - wcb` -- the
+ * CURRENT rung's full cumulative x minus the frozen prior total, which is
+ * ALGEBRAICALLY IDENTICAL to what a full restart computes when it reaches
+ * that same bin (x - consumed(bins < wk), and consumed(bins < wk) === wcb
+ * by construction). A bin that was only PARTIALLY filled by an earlier rung
+ * is not "resumed mid-fill" -- wk/wcb/wob are untouched by a partial fill,
+ * so the next rung recomputes that SAME bin's excluded/output from scratch
+ * using its own (larger) x, exactly as a restart would. This is why the
+ * mechanism that breaks the continuous-liquidity (tick/sqrt-price) families
+ * doing the analogous optimization -- a per-invocation rounding step applied
+ * once per RESUMPTION instead of once for the whole span -- does not apply
+ * here: DLMM's rounding is applied once per BIN, and a bin is either fully
+ * settled (frozen, never revisited) or fully recomputed from the rung's own
+ * total (never partially carried forward).
+ */
+function emitBinWalkIncremental(p, swapForY, x, v, loopVar) {
+    const maxIn = swapForY ? `((${p}mo << 64) + ${p}pr - 1) / ${p}pr` : `(${p}mo * ${p}pr + ${U64_MAX}) / ${ONE}`;
+    const outPartial = swapForY ? `(${p}pr * ${p}ex2) / ${ONE}` : `(${p}ex2 << 64) / ${p}pr`;
+    return [
+        `      ${v.rm} = ${x} - ${p}wcb; ${v.out} = ${p}wob; ${v.ex} = 0;`,
+        `      for (let ${loopVar} = ${p}wk; ${loopVar} < ${p}knb && ${v.rm} > 0 && ${v.ex} === 0; ${loopVar}++) {`,
+        `        ${p}bid = ${p}kbid[${loopVar}]; ${p}pr = ${p}kpr[${loopVar}]; ${p}mo = ${p}kam[${loopVar}];`,
+        `        ${p}dl = ${p}iref; if (${p}iref < ${p}bid) { ${p}dl = ${p}bid - ${p}iref } else { ${p}dl = ${p}iref - ${p}bid }`,
+        `        ${p}va = ${p}vref + ${p}dl * ${BPS}; if (${p}va > ${p}mvfa) { ${p}va = ${p}mvfa }`,
+        `        ${p}vf = 0;`,
+        `        if (${p}vfc > 0) { ${p}cr = ${p}va * ${p}bs; ${p}vf = (${p}vfc * ${p}cr * ${p}cr + ${VFEE_DEN} - 1) / ${VFEE_DEN} }`,
+        `        ${p}tf = ${p}bfee + ${p}vf; if (${p}tf > ${MAX_FEE_RATE}) { ${p}tf = ${MAX_FEE_RATE} }`,
+        `        ${p}fi = (${v.rm} * ${p}tf + ${FEE_PRECISION} - 1) / ${FEE_PRECISION};`,
+        `        ${p}ex2 = ${v.rm} - ${p}fi;`,
+        `        ${p}mi = ${maxIn};`,
+        `        if (${p}mi >= ${SENT}) { ${v.ex} = 1 }`,
+        `        else if (${p}ex2 >= ${p}mi) {`,
+        `          ${p}f2 = (${p}mi * ${p}tf + ${FEE_PRECISION} - ${p}tf - 1) / (${FEE_PRECISION} - ${p}tf);`,
+        `          ${p}cs = ${p}mi + ${p}f2;`,
+        `          if (${p}cs > ${v.rm}) { ${v.ex} = 1 }`,
+        // Freeze this fully-consumed bin permanently: fold it into the
+        // persisted totals and advance the cursor past it, so no later rung
+        // ever re-walks it.
+        `          else { ${v.rm} = ${v.rm} - ${p}cs; ${v.out} = ${v.out} + ${p}mo; ${p}wcb = ${p}wcb + ${p}cs; ${p}wob = ${p}wob + ${p}mo; ${p}wk = ${loopVar} + 1 }`,
+        `        } else {`,
+        `          ${v.out} = ${v.out} + ${outPartial};`,
+        `          ${v.rm} = 0;`,
+        `        }`,
+        `      }`,
+    ];
+}
 /** The per-bin live verification/unpack (unrolled; account refs compile-time). */
 function emitBinUnpack(p, slot, k, swapForY, params) {
     const keep = swapForY ? `${p}u2 <= ${p}bactive` : `${p}u2 >= ${p}bactive`;
@@ -327,6 +384,10 @@ export const meteoraDlmmLadder = {
             `  let ${p}fi = 0; let ${p}ex2 = 0; let ${p}mi = 0; let ${p}f2 = 0; let ${p}cs = 0; let ${p}cr = 0;`,
             `  let ${p}wrm = 0; let ${p}wout = 0; let ${p}wex = 0;`,
             `  let ${p}lo = 0; let ${p}lx = 0; let ${p}wcx = 0;`,
+            // Incremental-walk cursor (see emitBinWalkIncremental's doc): wk is the
+            // first not-yet-fully-consumed bin index; wcb/wob are the frozen
+            // consumed-input/output totals for every bin strictly before it.
+            `  let ${p}wk = 0; let ${p}wcb = 0; let ${p}wob = 0;`,
             `  if (${enabled} !== 0) {`,
             ...Array.from({ length: METEORA_DLMM_MAX_BINS }, (_, k) => emitBinUnpack(p, slot, k, swapForY, params)).flat(),
             `  }`,
@@ -335,6 +396,15 @@ export const meteoraDlmmLadder = {
         ];
         return lines.join('\n');
     },
+    /**
+     * Ladder rung at cumulative grid point x: uses emitBinWalkIncremental
+     * (resumes from the persisted wk/wcb/wob cursor set up in emitSetup)
+     * instead of a full restart-from-bin-0 walk -- measured -34.35% CU per
+     * marginal rung (194,368 -> 127,613 CU) on a real fixture, verified
+     * lamport-exact against the restart model across multiple sizes and rung
+     * counts (see emitBinWalkIncremental's doc for why this is exact, not an
+     * approximation). Rung count is unchanged; only the per-rung cost drops.
+     */
     emitLadderQuote(base, slot, rung, x, outVar) {
         const cfg = dlmmConfig(base);
         const swapForY = cfg.direction === 'xToY';
@@ -342,7 +412,7 @@ export const meteoraDlmmLadder = {
         const v = { rm: `${p}wrm`, out: `${p}wout`, ex: `${p}wex` };
         return [
             `    if (${p}vld !== 0 && ${p}wcx === 0 && ${x} > 0) {`,
-            ...emitBinWalk(p, swapForY, x, v, `${p}w${rung}`),
+            ...emitBinWalkIncremental(p, swapForY, x, v, `${p}w${rung}`),
             // Capacity-aware booking: a fully-absorbed rung records (grid point,
             // output); an exhausted rung records the PRODUCTIVE input consumed
             // (x − remaining, the window cap) and the output at the cap, then
@@ -357,6 +427,14 @@ export const meteoraDlmmLadder = {
     capacityInputVar(slot) {
         return `s${slot}lx`;
     },
+    /**
+     * THE COLD-QUOTE COLLAPSE — FIXED (on-chain fragment twin of
+     * referenceQuote's own fix — see orca-whirlpool's emitFinalQuote doc for
+     * the full mechanism). Used to gate the walk's own output behind full
+     * absorption, leaving outVar at 0 for any x past the window's capacity
+     * even though `fout` already holds the correct saturated output. Assigning
+     * outVar = fout unconditionally reproduces coldWalkClamped's semantics.
+     */
     emitFinalQuote(base, slot, x, outVar) {
         const cfg = dlmmConfig(base);
         const swapForY = cfg.direction === 'xToY';
@@ -369,7 +447,7 @@ export const meteoraDlmmLadder = {
             `    else {`,
             `      let ${p}frm = 0; let ${p}fout = 0; let ${p}fex = 0;`,
             ...emitBinWalk(p, swapForY, x, v, `${p}wf`),
-            `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fout }`,
+            `      ${outVar} = ${p}fout;`,
             `    }`,
             `  }`,
         ].join('\n');
@@ -418,13 +496,26 @@ export const meteoraDlmmLadder = {
             ],
         };
     },
+    /**
+     * THE COLD-QUOTE COLLAPSE — FIXED. Same defect and same fix as
+     * orca-whirlpool/raydium-clmm's referenceQuote (see orca-whirlpool's doc
+     * for the full mechanism): `coldWalk(...) ?? 0n` required full absorption
+     * to return non-null, so any x past the shipped bin window's capacity
+     * collapsed to 0 forever instead of the window's own true saturated
+     * output (measured, both directions: xToY last-nonzero 179,539,068,913 at
+     * 2^41 -> 0 at 2^42 while referenceCapacities correctly saturates at
+     * 2,518,898,410,454; yToX last-nonzero 1,678,147,206,870 at 2^37 -> 0 at
+     * 2^38 while referenceCapacities saturates at 210,552,340,323).
+     * coldWalkClamped runs the identical bin walk but never returns null —
+     * exact, no approximation needed, same as orca-whirlpool/raydium-clmm.
+     */
     referenceQuote(base, state, params, now) {
         const cfg = dlmmConfig(base);
         const swapForY = cfg.direction === 'xToY';
         const fee = feeParamsFromCfg(cfg, params);
         const live = liveFromState(cfg, state, fee, now ?? BigInt(Math.floor(Date.now() / 1000)));
         const kept = effectiveBins(cfg, state, live, params);
-        return (x) => coldWalk(kept, fee, live, swapForY, x) ?? 0n;
+        return (x) => coldWalkClamped(kept, fee, live, swapForY, x).out;
     },
     referenceLadderQuotes(base, state, params, now) {
         const cfg = dlmmConfig(base);

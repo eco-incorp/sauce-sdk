@@ -238,20 +238,21 @@ describe('solfi-v2 referenceQuote — pinned mainnet worked examples', () => {
 });
 
 describe('solfi-v2 capacityInputVar / referenceLadderQuotes — saturates, never collapses', () => {
+  const cfg: SolfiV2PoolConfig = {
+    venue: 'solfi-v2',
+    pool: POOL,
+    direction: 0,
+    mintA: address(MINT_A),
+    mintB: address(MINT_B),
+    vaultA: address(VAULT_A),
+    vaultB: address(VAULT_B),
+    oracle: address(ORACLE),
+    registry: address(REGISTRY),
+    tokenProgram: address(TOKEN_PROGRAM),
+    additiveK: 1932n,
+  };
+
   it('is nondecreasing, quote(0) = 0, and never negative/huge-wrapped across an escalating grid', () => {
-    const cfg: SolfiV2PoolConfig = {
-      venue: 'solfi-v2',
-      pool: POOL,
-      direction: 0,
-      mintA: address(MINT_A),
-      mintB: address(MINT_B),
-      vaultA: address(VAULT_A),
-      vaultB: address(VAULT_B),
-      oracle: address(ORACLE),
-      registry: address(REGISTRY),
-      tokenProgram: address(TOKEN_PROGRAM),
-      additiveK: 1932n,
-    };
     const state = stateFor('dir0');
     const grid = [0n, 1_000_000_000n, 10_000_000_000n, 100_000_000_000n, 10_000_000_000_000n, 1_000_000_000_000_000n];
     const quotes = solfiV2Ladder.referenceLadderQuotes!(cfg, state, [1932n], 436_250_364n)(grid);
@@ -263,6 +264,71 @@ describe('solfi-v2 capacityInputVar / referenceLadderQuotes — saturates, never
       expect(caps[i]).toBeGreaterThanOrEqual(caps[i - 1]);
       expect(caps[i]).toBeLessThanOrEqual(grid[i]);
     }
+  });
+
+  // REGRESSION (fails pre-fix): the previous grid topped out at 1e15, well
+  // below this pool's ~1.65e12*~15 = ~2.5e13 impact/110% revert boundary --
+  // vacuously "monotone" because it never actually reached the collapse.
+  // This grid (powers of 2 to 2^60, matching the audit's own methodology)
+  // crosses that boundary: pre-fix, referenceLadderQuotes/referenceCapacities
+  // latched on `solfiRawQuote(...) === null` and recorded NOTHING, so both
+  // arrays dropped straight to a frozen value well below the true cap the
+  // moment the grid stepped past it (measured pre-fix: quotes/caps at 2^45
+  // and beyond all sat at whatever the LAST sub-2^44 grid point achieved,
+  // never reflecting the venue's real ~1.64e12-output capacity). Post-fix,
+  // both bump-then-latch to (satOut, satCap) and STAY there.
+  it('REGRESSION: referenceLadderQuotes/referenceCapacities do not freeze below the true saturation point once the grid crosses the 110%-of-vault boundary', () => {
+    const state = stateFor('dir0');
+    const grid = Array.from({ length: 31 }, (_, i) => 1n << BigInt(30 + i)); // 2^30 .. 2^60
+    const quotes = solfiV2Ladder.referenceLadderQuotes!(cfg, state, [1932n], 436_250_364n)(grid);
+    const caps = solfiV2Ladder.referenceCapacities!(cfg, state, [1932n], 436_250_364n)(grid);
+    for (let i = 1; i < quotes.length; i++) {
+      expect(quotes[i]).toBeGreaterThanOrEqual(quotes[i - 1]);
+      expect(caps[i]).toBeGreaterThanOrEqual(caps[i - 1]);
+    }
+    // The tail must plateau at the setup-computed satOut/satCap, not freeze
+    // at some earlier, smaller sub-boundary grid point (the exact collapse
+    // this regression guards).
+    const last = quotes.length - 1;
+    expect(quotes[last]).toBe(1_639_878_705_876n);
+    expect(quotes[last]).toBe(quotes[last - 1]); // plateaued, not still climbing
+    expect(quotes[last]).toBeGreaterThan(0n);
+    expect(caps[last]).toBeGreaterThan(0n);
+  });
+});
+
+describe('solfi-v2 referenceQuote — no longer collapses to 0 past the 110%-of-vault boundary', () => {
+  const cfg: SolfiV2PoolConfig = {
+    venue: 'solfi-v2',
+    pool: POOL,
+    direction: 0,
+    mintA: address(MINT_A),
+    mintB: address(MINT_B),
+    vaultA: address(VAULT_A),
+    vaultB: address(VAULT_B),
+    oracle: address(ORACLE),
+    registry: address(REGISTRY),
+    tokenProgram: address(TOKEN_PROGRAM),
+    additiveK: 1932n,
+  };
+
+  // REGRESSION (fails pre-fix): solfiColdQuote used to map `solfiRawQuote(...)
+  // === null` straight to 0n (`r ?? 0n`) -- an unbounded collapse for EVERY x
+  // past the venue's 110%-of-vault boundary, violating solver-reference.ts's
+  // "nondecreasing in x" contract outright (q(2^45) = 0 while q(2^44) =
+  // 1,300,298,808,776 on the real mainnet fixture below). Post-fix it plateaus
+  // at satOut (a closed-form, provably-safe UNDER-estimate of the vault's
+  // true balance -- see ladder.ts's module doc; NOT the vault balance itself).
+  it('plateaus at satOut instead of collapsing, for x arbitrarily far past the boundary', () => {
+    const state = stateFor('dir0');
+    const q = solfiV2Ladder.referenceQuote(cfg, state, [1932n], 436_250_364n);
+    const SAT_OUT = 1_639_878_705_876n;
+    expect(q(1n << 45n)).toBe(SAT_OUT);
+    expect(q(1n << 60n)).toBe(SAT_OUT);
+    expect(q((1n << 100n) + 12345n)).toBe(SAT_OUT);
+    // 2^44 is still organically below the boundary (the real closed-form
+    // output, not yet needing the satOut fallback at all) -- pinned exact.
+    expect(q(1n << 44n)).toBe(1_300_298_808_776n);
   });
 });
 

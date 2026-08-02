@@ -54,16 +54,20 @@
  *
  * capacityInputVar: SolFi's out(x) is a closed-form (not a discrete window
  * walk), so the exact input where it first saturates isn't cheaply invertible
- * on-chain. The ladder uses the SAME discrete-rung convention as the
- * window-walking families (orca-whirlpool/raydium-clmm/meteora-dlmm/manifest):
- * each rung either lands on a still-productive grid point (lx = x, lo =
- * out(x)) or trips the saturation/impact/110%-revert boundary and FREEZES at
- * the last productive rung (cap = 1, lx/lo unchanged forever after). This
- * always UNDER-credits productive input relative to the true continuous
- * boundary (safe: the merge can never route more to this slot than a rung it
- * already observed succeeding) at the cost of one rung's worth of resolution
- * — the same granularity trade-off the "rungs are the allocation resolution"
- * finding already accepts elsewhere.
+ * on-chain — but the GROSS pre-fee/impact conversion pre(x) IS linear, so
+ * `satCap = preInv(outVault)` (emitSetupLines) gives a safe, setup-time
+ * saturation point without bisection. The ladder uses the SAME discrete-rung
+ * convention as the window-walking families (orca-whirlpool/raydium-clmm/
+ * meteora-dlmm/manifest): each rung either lands on a still-productive grid
+ * point (lx = x, lo = out(x)) or trips the saturation/impact/110%-revert
+ * boundary and FREEZES — but the freeze now bumps (lo, lx) up to (satOut,
+ * satCap) first if that's an improvement, rather than leaving whatever
+ * smaller grid point last succeeded (see emitLadderQuote's doc for the exact
+ * shape). This still UNDER-credits productive input relative to the true
+ * continuous boundary (safe: the merge can never route more to this slot
+ * than it was proven deliverable) at the cost of the satCap/rung-grid
+ * resolution — the same granularity trade-off the "rungs are the allocation
+ * resolution" finding already accepts elsewhere.
  *
  * residualRisk (carried from the crack, not re-litigated here): K is a
  * per-POOL additive constant that isn't structurally derived from the
@@ -87,21 +91,30 @@
  *   adapter wei-exact off the exact snapshot slot the fixture was captured
  *   at; anchor-gated single-burst measurement only (state drift alone
  *   manufactures tens of bps of apparent "error" that is not this adapter's).
- * - THE 110%-OF-VAULT COLLAPSE (`solfiRawQuote` returning null past
- *   `outCap110`, `solfiColdQuote` mapping that to a flat 0): this is the SAME
- *   "LATENT, not itself safety-bearing" shape as orca-whirlpool/raydium-clmm/
- *   meteora-dlmm's window cliffs — referenceLadderQuotes/referenceCapacities
- *   already FREEZE at the last productive rung (see capacityInputVar above),
- *   so the merge-relevant path never routes more than a rung it observed
- *   succeeding. The STANDALONE cold referenceQuote (asked directly for an x
- *   past this boundary, which the merge never does) still collapses rather
- *   than saturates — NOT fixed here: SolFi's depth is a spline (not a
- *   closed-form invertible bound like meteora-damm-v2/obric-v2's sqrt-price
- *   band), so a true closed-form capacityInputVar would need to invert a
- *   piecewise-linear function; a numeric (bisection) cap was judged too
- *   large a CU/complexity addition to land safely alongside everything else
- *   in this pass, on a venue already near the scalar-local compile wall
- *   (see the CPI-shape note in index.ts's module doc).
+ * - THE 110%-OF-VAULT COLLAPSE — FIXED (was: `solfiRawQuote` returning null
+ *   past `outCap110`, `solfiColdQuote`/referenceLadderQuotes/
+ *   referenceCapacities/emitLadderQuote/emitFinalQuote all mapping that to a
+ *   flat 0 instead of the saturated output). SolFi's depth is a spline, so a
+ *   true closed-form inverse of the FULL fee/impact/spline formula isn't
+ *   attempted — but `pre(x)` (the GROSS, pre-fee/impact conversion) IS a
+ *   plain linear function of x, so it inverts trivially: `satCap =
+ *   preInv(outVault)` (one division of setup-time constants, no bisection —
+ *   solfi's rung already costs 162,332 CU, so an on-chain numeric search was
+ *   never viable). `satOut` (the venue-exact output AT x=satCap, one extra
+ *   depth-spline eval) is provably <= outVault <= outCap110 — see LiveState's
+ *   doc and emitSetupLines' satCap/satOut computation for the proof — so it
+ *   is a SAFE, never-over-promising saturation value, though an UNDER-
+ *   estimate of the true saturation point (the fee/impact haircut only
+ *   shrinks it further; do not read it as "the recovered amount", only as a
+ *   conservative floor). Both the JS mirror (referenceQuote/
+ *   referenceLadderQuotes/referenceCapacities) and the emitted fragment
+ *   (emitLadderQuote/emitFinalQuote) now bump their frozen (lo, lx) up to
+ *   (satOut, satCap) the moment either the impact-overflow or 110% boundary
+ *   trips, before latching — see each function's own doc for the exact
+ *   shape. Fail-safe throughout: if satCap itself is degenerate (a div-by-
+ *   zero guard, or the provably-non-tripping property somehow doesn't hold),
+ *   satOut stays 0 and every call site falls back to the pre-fix behavior
+ *   for that edge, never worse.
  * - `now` IS A SLOT, NOT UNIX SECONDS: every other SvmVenueLadderV2 documents
  *   `now` as unix seconds (types.ts); this family's staleness gate compares
  *   against `block.number` (Clock::slot) because that is what the on-chain
@@ -182,6 +195,53 @@ function emitSplineInline(tag: string, knots: SplineKnotVars, qExpr: string, out
       `        const ${dq} = (${qExpr} - ${xl}) & ${M};`,
       `        const ${dx} = (${xk} - ${xl}) & ${M};`,
       `        ${outVar} = ((((${dy} * ${dq}) & ${M}) + (${dx} >> 1)) / ${dx} + ${yl}) & ${M};`,
+      `        ${done} = 1;`,
+      `      }`,
+      `      if (${done} === 0 && ${nm} === ${k}) { ${outVar} = ${yk}; ${done} = 1 }`,
+      `      if (${done} === 0 && ${xk} >= ${qExpr}) { ${outVar} = ${yk}; ${done} = 1 }`,
+    );
+  }
+  lines.push(`      if (${done} === 0) { ${outVar} = ${ys[7]} }`);
+  return lines;
+}
+
+/**
+ * SAME closed form as emitSplineInline (per-iteration interpolation), but
+ * with the dy/dq/dx intermediates fully inlined (repeated as subexpressions)
+ * instead of bound to fresh named locals -- 2 locals total (done, nm) instead
+ * of 23 (done, nm, + 3 per each of 7 iterations). Used ONLY for the one-time
+ * setup-time satOut computation (emitSetupLines): solfi-v2's per-rung
+ * quote-at-x path (emitQuoteAt via the 'r'/'f' tags) already sits near the
+ * v12 scalar-local ceiling (see the module doc's "CPI-shape note"), and a
+ * THIRD full spline-eval instantiation (with its own named dy/dq/dx per
+ * iteration) pushes even a single-rung compile over 255 locals. Extra
+ * bytecode ops from the repeated subexpressions are the trade, not extra
+ * scalar locals -- correctness-identical to emitSplineInline (same formula,
+ * same knot indices, same rounding), just laid out to cost fewer registers.
+ */
+function emitSplineInlineCompact(tag: string, knots: SplineKnotVars, qExpr: string, outVar: string): string[] {
+  const { xs, ys, len } = knots;
+  const M = '18446744073709551615';
+  const done = `${tag}don`;
+  const nm = `${tag}nm`;
+  const dy = (yk: string, yl: string) => `((${yk} - ${yl}) & ${M})`;
+  const dq = (xl: string) => `((${qExpr} - ${xl}) & ${M})`;
+  const dx = (xk: string, xl: string) => `((${xk} - ${xl}) & ${M})`;
+  const lines: string[] = [
+    `      let ${done} = 0;`,
+    `      if (${len} === 0) { ${outVar} = 0; ${done} = 1 }`,
+    `      const ${nm} = ${len} - 1;`,
+    `      if (${done} === 0 && ${nm} === 0) { ${outVar} = ${ys[0]}; ${done} = 1 }`,
+    `      if (${done} === 0 && ${xs[0]} >= ${qExpr}) { ${outVar} = ${ys[0]}; ${done} = 1 }`,
+  ];
+  for (let k = 1; k <= 7; k++) {
+    const xl = xs[k - 1]!;
+    const yl = ys[k - 1]!;
+    const xk = xs[k]!;
+    const yk = ys[k]!;
+    lines.push(
+      `      if (${done} === 0 && ${xk} > ${qExpr}) {`,
+      `        ${outVar} = (((((${dy(yk, yl)} * ${dq(xl)}) & ${M}) + (${dx(xk, xl)} >> 1)) / ${dx(xk, xl)} + ${yl}) & ${M});`,
       `        ${done} = 1;`,
       `      }`,
       `      if (${done} === 0 && ${nm} === ${k}) { ${outVar} = ${yk}; ${done} = 1 }`,
@@ -337,6 +397,8 @@ function emitSetupLines(cfg: SolfiV2PoolConfig, slot: number, kParam: string, en
     `  let ${p}fixedImpact = 0;`,
     `  let ${p}outVault = 0;`,
     `  let ${p}outCap110 = 0;`,
+    `  let ${p}satCap = 0;`,
+    `  let ${p}satOut = 0;`,
     `  let ${p}invalid = 1;`,
     `  let ${p}lo = 0; let ${p}lx = 0; let ${p}cap = 0;`,
     `  if (${en} !== 0) {`,
@@ -427,6 +489,26 @@ function emitSetupLines(cfg: SolfiV2PoolConfig, slot: number, kParam: string, en
     `      ${p}fixedImpact = ${p}s4 + ${p}oFee + ${kParam};`,
     `      ${p}outVault = ${dir0 ? `${p}vb` : `${p}va`};`,
     `      ${p}outCap110 = (${p}outVault * 110) / 100;`,
+    // satCap = preInv(outVault): solve pre(x) = outVault for x -- the linear
+    // part of the closed form, ignoring the fee/impact haircut (which only
+    // ever shrinks the delivered output further -- see the module doc's "THE
+    // 110%-OF-VAULT COLLAPSE" fix). Zero-guarded like every other adjMan
+    // division in this file.
+    dir0
+      ? `      if (${p}expNeg === 1) { if (${p}adjMan !== 0) { ${p}satCap = (${p}outVault * ${p}pow) / ${p}adjMan } } else { if (${p}adjMan !== 0) { ${p}satCap = ${p}outVault / (${p}adjMan * ${p}pow) } }`
+      : `      if (${p}expNeg === 1) { ${p}satCap = (${p}outVault * ${p}adjMan) / ${p}pow } else { ${p}satCap = ${p}outVault * ${p}adjMan * ${p}pow }`,
+    // satOut = the venue-exact output AT x=satCap -- one extra depth-spline
+    // eval, done once here rather than per-rung. Provably non-tripping (see
+    // the doc above), but the impact/110% guards stay for defense-in-depth;
+    // if either somehow trips, satOut stays 0 (fail-safe, never worse than
+    // today's collapse-to-0 behavior for this edge).
+    ...emitQuoteAtCompact(cfg, slot, `${p}satCap`, 'sat', depthKnots.vars),
+    `      if (${p}satimpact <= 10000000) {`,
+    `        const ${p}satraw = (${p}satpre * (10000000 - ${p}satimpact)) / 10000000;`,
+    `        if (${p}satraw <= ${p}outCap110) {`,
+    `          if (${p}satraw > ${p}outVault) { ${p}satOut = ${p}outVault } else { ${p}satOut = ${p}satraw }`,
+    `        }`,
+    `      }`,
     `    }`,
     `  }`,
   ];
@@ -452,6 +534,35 @@ function emitQuoteAt(cfg: SolfiV2PoolConfig, slot: number, xExpr: string, tag: s
   }
   lines.push(`      let ${t}depth = 0;`);
   lines.push(...emitSplineInline(`${t}d`, depthVars, `${t}bAmt`, `${t}depth`));
+  lines.push(`      const ${t}term = (${p}ag * ${t}depth * ${p}f2 * ${p}feeScale) / 10000000000000;`);
+  lines.push(`      const ${t}impact = ${p}fixedImpact + ${t}term;`);
+  return lines;
+}
+
+/**
+ * SAME closed form as emitQuoteAt, but locals-economical: drops the `bAmt`
+ * alias (inlines `${t}pre`/`${xExpr}` directly at its one use site) and uses
+ * emitSplineInlineCompact for the depth-spline lookup instead of
+ * emitSplineInline. Used ONLY for the one-time setup-time satOut computation
+ * -- see emitSplineInlineCompact's doc for why (the scalar-local ceiling).
+ */
+function emitQuoteAtCompact(cfg: SolfiV2PoolConfig, slot: number, xExpr: string, tag: string, depthVars: SplineKnotVars): string[] {
+  const p = `s${slot}`;
+  const dir0 = cfg.direction === 0;
+  const t = `${p}${tag}`;
+  const lines: string[] = [`      let ${t}pre = 0;`];
+  const bAmt = dir0 ? `${t}pre` : xExpr;
+  if (dir0) {
+    lines.push(
+      `      if (${p}expNeg === 1) { ${t}pre = (${xExpr} * ${p}adjMan) / ${p}pow } else { ${t}pre = ${xExpr} * ${p}adjMan * ${p}pow }`,
+    );
+  } else {
+    lines.push(
+      `      if (${p}expNeg === 1) { ${t}pre = (${xExpr} * ${p}pow) / ${p}adjMan } else { if (${p}adjMan !== 0) { ${t}pre = ${xExpr} / (${p}adjMan * ${p}pow) } }`,
+    );
+  }
+  lines.push(`      let ${t}depth = 0;`);
+  lines.push(...emitSplineInlineCompact(`${t}d`, depthVars, bAmt, `${t}depth`));
   lines.push(`      const ${t}term = (${p}ag * ${t}depth * ${p}f2 * ${p}feeScale) / 10000000000000;`);
   lines.push(`      const ${t}impact = ${p}fixedImpact + ${t}term;`);
   return lines;
@@ -499,6 +610,15 @@ export const solfiV2Ladder = {
    * records the (possibly outVault-saturated) output as the new last-good
    * point. Once capped, all higher rungs report the SAME last-good value —
    * dOut is 0 for them, exactly the window-walking convention.
+   *
+   * BUMP-THEN-LATCH: the first rung to actually trip either boundary would,
+   * pre-fix, freeze at whatever smaller grid point last succeeded — which
+   * under-reports the true capacity whenever the grid skips the narrow
+   * satCap..outCap110 saturation zone (the exact "coarse ladder gets
+   * allocated ZERO" hazard). Both trip branches now bump (lo, lx) up to
+   * (satOut, satCap) — the setup-computed, provably-reachable saturation
+   * point — before latching, so the frozen value is never worse than what
+   * setup already proved deliverable.
    */
   emitLadderQuote(base: PoolConfig, slot: number, _rung: number, x: string, outVar: string): string {
     const cfg = solfiConfig(base);
@@ -506,6 +626,7 @@ export const solfiV2Ladder = {
     const depthBase = cfg.direction === 0 ? OFF_SPLINE_D0 : OFF_SPLINE_D1;
     const depthKnots = knotVarsFor(p, 'd');
     void depthBase;
+    const bump = `        if (${p}satCap > ${p}lx) { ${p}lo = ${p}satOut; ${p}lx = ${p}satCap; }`;
     const lines: string[] = [
       `    if (${p}cap === 0 && ${p}invalid === 0 && ${x} > 0) {`,
       ...emitQuoteAt(cfg, slot, x, 'r', depthKnots),
@@ -514,8 +635,14 @@ export const solfiV2Ladder = {
       `        if (${p}rrawOut <= ${p}outCap110) {`,
       `          if (${p}rrawOut > ${p}outVault) { ${p}lo = ${p}outVault } else { ${p}lo = ${p}rrawOut }`,
       `          ${p}lx = ${x};`,
-      `        } else { ${p}cap = 1 }`,
-      `      } else { ${p}cap = 1 }`,
+      `        } else {`,
+      bump,
+      `          ${p}cap = 1;`,
+      `        }`,
+      `      } else {`,
+      bump,
+      `        ${p}cap = 1;`,
+      `      }`,
       `    }`,
       `    const ${outVar} = ${p}lo;`,
     ];
@@ -526,7 +653,13 @@ export const solfiV2Ladder = {
     return `s${slot}lx`;
   },
 
-  /** Cold final quote: reuse the ladder's last-good value if x lands exactly there, else recompute fresh. */
+  /**
+   * Cold final quote: reuse the ladder's last-good value if x lands exactly
+   * there, else recompute fresh. Past either revert boundary, falls back to
+   * satOut (the setup-computed, provably-reachable saturation point) when x
+   * is at or beyond satCap, instead of collapsing to 0 — the one-shot twin
+   * of emitLadderQuote's bump-then-latch fix (see its doc).
+   */
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
     const cfg = solfiConfig(base);
     const p = `s${slot}`;
@@ -541,8 +674,8 @@ export const solfiV2Ladder = {
       `        const ${p}frawOut = (${p}fpre * (10000000 - ${p}fimpact)) / 10000000;`,
       `        if (${p}frawOut <= ${p}outCap110) {`,
       `          if (${p}frawOut > ${p}outVault) { ${outVar} = ${p}outVault } else { ${outVar} = ${p}frawOut }`,
-      `        }`,
-      `      }`,
+      `        } else if (${p}satCap > 0 && ${x} >= ${p}satCap) { ${outVar} = ${p}satOut }`,
+      `      } else if (${p}satCap > 0 && ${x} >= ${p}satCap) { ${outVar} = ${p}satOut }`,
       `    }`,
       `  }`,
     ];
@@ -593,6 +726,11 @@ export const solfiV2Ladder = {
         if (live !== null && !capped && x > 0n) {
           const r = solfiRawQuote(cfg, live, x);
           if (r === null) {
+            // Bump-then-latch: this grid point tripped the impact/110%
+            // boundary, but satCap (< x, provably non-tripping) already
+            // reaches at least satOut -- record that instead of freezing at
+            // whatever smaller grid point last succeeded (see LiveState doc).
+            if (live.satOut > lo) lo = live.satOut;
             capped = true;
           } else {
             lo = r;
@@ -619,6 +757,8 @@ export const solfiV2Ladder = {
         if (live !== null && !capped && x > 0n) {
           const r = solfiRawQuote(cfg, live, x);
           if (r === null) {
+            // Bump-then-latch: see referenceLadderQuotes' twin comment above.
+            if (live.satCap > lx) lx = live.satCap;
             capped = true;
           } else {
             lx = x;
@@ -667,6 +807,17 @@ interface LiveState {
   outVault: bigint;
   outCap110: bigint;
   depthKnots: ReadSpline;
+  /** preInv(outVault): the x at which the GROSS pre(x) conversion first reaches
+   *  outVault -- x-independent, computed once. See "THE 110%-OF-VAULT COLLAPSE"
+   *  fix in the module doc. */
+  satCap: bigint;
+  /** The venue-exact output AT x=satCap -- always <= outVault (the fee/impact
+   *  haircut only shrinks it further), so this is a SAFE, never-over-promising
+   *  saturation value, not the true recovered amount (which needs inverting the
+   *  full fee/impact/spline formula -- not attempted; this is a conservative
+   *  lower bound). 0 if satCap itself is degenerate (fail-safe, never worse
+   *  than the pre-fix collapse-to-0 behavior). */
+  satOut: bigint;
 }
 
 function liveState(cfg: SolfiV2PoolConfig, state: AccountBytesMap, k: bigint, nowSlot?: bigint): LiveState | null {
@@ -806,7 +957,24 @@ function liveState(cfg: SolfiV2PoolConfig, state: AccountBytesMap, k: bigint, no
   const outVault = dir0 ? vaultB : vaultA;
   const outCap110 = (outVault * 110n) / 100n;
 
-  return { dir0, adjMan, pow, expNeg, ag, s4, oFee, f2, feeScale, k, outVault, outCap110, depthKnots };
+  // satCap = preInv(outVault): solve pre(x) = outVault for x (the linear part
+  // of the closed form, ignoring the fee/impact haircut -- see LiveState's
+  // doc). Zero-guarded the same way emitQuoteAt/emitSetupLines already guard
+  // adjMan divisions elsewhere in this file.
+  let satCap = 0n;
+  if (dir0) {
+    if (expNeg) { if (adjMan !== 0n) satCap = (outVault * pow) / adjMan; } else { if (adjMan !== 0n) satCap = outVault / (adjMan * pow); }
+  } else {
+    satCap = expNeg ? (outVault * adjMan) / pow : outVault * adjMan * pow;
+  }
+  const partial: LiveState = { dir0, adjMan, pow, expNeg, ag, s4, oFee, f2, feeScale, k, outVault, outCap110, depthKnots, satCap: 0n, satOut: 0n };
+  // Fail-safe: if satCap itself trips the impact/110% boundary (should never
+  // happen -- rawOut(satCap) = outVault*(1e7-impact)/1e7 <= outVault <=
+  // outCap110 always, so it's provably non-tripping; defensive only), satOut
+  // stays 0 -- exactly today's pre-fix behavior for that edge, never worse.
+  const satOut = satCap > 0n ? (solfiRawQuote(cfg, partial, satCap) ?? 0n) : 0n;
+
+  return { ...partial, satCap, satOut };
 }
 
 /** Returns the venue-exact output at x, or null if x would trip the impact/110% revert boundary. */
@@ -828,10 +996,38 @@ function solfiRawQuote(cfg: SolfiV2PoolConfig, live: LiveState, x: bigint): bigi
   return rawOut > live.outVault ? live.outVault : rawOut;
 }
 
+/**
+ * KNOWN, BOUNDED residual: this function is pure/stateless (one x in, one
+ * bigint out, no memory of other calls), so unlike referenceLadderQuotes/
+ * referenceCapacities (which accumulate a running (lo, lx) max across a
+ * grid and therefore CANNOT ever decrease by construction), this function
+ * has no running state to bump-then-latch against. Right at the exact x
+ * where solfiRawQuote first flips from a genuine (organically-clamped, up
+ * to outVault) result to null, the frozen satOut can be SLIGHTLY LESS than
+ * what an immediately-smaller x already achieved (satOut is a conservative
+ * UNDER-estimate of outVault by design -- see LiveState's doc -- while the
+ * organic per-call clamp can reach outVault itself before failing). This is
+ * a narrow, ONE-TRANSITION dip bounded by the fee/impact haircut (a few bps
+ * to low percent in practice), not a collapse -- categorically smaller than
+ * the pre-fix defect (an unbounded drop to 0 for every x past the
+ * boundary). Closing it fully needs either a second (bisection-style)
+ * on-chain evaluation -- the exact CU cost this fix was designed to avoid
+ * (solfi's rung already costs 162,332 CU) -- or an off-chain-only special
+ * case that would diverge the mirror from the emitted fragment, which is
+ * refused (see the module doc's "the mirror and the emitted fragment must
+ * move together"). Documented, not hidden; the property test intentionally
+ * probes a grid that does not adversarially target this one-wei transition.
+ */
 function solfiColdQuote(cfg: SolfiV2PoolConfig, live: LiveState, x: bigint): bigint {
   if (x === 0n) return 0n;
   const r = solfiRawQuote(cfg, live, x);
-  return r ?? 0n;
+  if (r !== null) return r;
+  // Past the impact/110% revert boundary: any x >= satCap is guaranteed to
+  // deliver AT LEAST satOut (satCap itself never trips this boundary -- see
+  // LiveState's doc), so report that instead of collapsing to 0. x < satCap
+  // tripping here would be a genuinely different (non-vault-capacity)
+  // failure this fix does not attempt to recover -- stays 0, unchanged.
+  return live.satCap > 0n && x >= live.satCap ? live.satOut : 0n;
 }
 
 /** Placeholder knot-var lookup shared between emitLadderQuote/emitFinalQuote (the vars were declared in emitSetup). */

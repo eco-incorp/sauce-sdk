@@ -17,6 +17,18 @@ export declare const stabbleWeightedSwapLadder: {
     emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string;
     buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
     referenceQuote(base: PoolConfig, state: AccountBytesMap): (x: bigint) => bigint;
+    /**
+     * THE CAPACITY COLLAPSE — FIXED. Unlike emitLadderQuote/emitFinalQuote/
+     * referenceQuote (which all clamp `wrapped` to `xcap` BEFORE computing the
+     * output, so they already saturate correctly and never collapse), this
+     * function used to freeze `lx` at whatever smaller grid point last
+     * succeeded the moment a grid point's wrapped input first exceeded `xcap`
+     * — under-reporting the true capacity whenever the grid skips the narrow
+     * boundary. Fixed: bump `lx` up to `calcUnwrappedAmount(xcap, tokenIn)` —
+     * the exact inverse of calcWrappedAmount, so re-wrapping it is guaranteed
+     * <= xcap (safe, never over-promising; exact when NOT scalingUp, floor-
+     * safe when scalingUp) — before latching.
+     */
     referenceCapacities(base: PoolConfig, state: AccountBytesMap): (grid: readonly bigint[]) => bigint[];
     depthReserves(base: PoolConfig, state: AccountBytesMap): {
         reserveIn: bigint;

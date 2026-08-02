@@ -24,10 +24,25 @@ export declare const solfiV2Ladder: {
      * records the (possibly outVault-saturated) output as the new last-good
      * point. Once capped, all higher rungs report the SAME last-good value —
      * dOut is 0 for them, exactly the window-walking convention.
+     *
+     * BUMP-THEN-LATCH: the first rung to actually trip either boundary would,
+     * pre-fix, freeze at whatever smaller grid point last succeeded — which
+     * under-reports the true capacity whenever the grid skips the narrow
+     * satCap..outCap110 saturation zone (the exact "coarse ladder gets
+     * allocated ZERO" hazard). Both trip branches now bump (lo, lx) up to
+     * (satOut, satCap) — the setup-computed, provably-reachable saturation
+     * point — before latching, so the frozen value is never worse than what
+     * setup already proved deliverable.
      */
     emitLadderQuote(base: PoolConfig, slot: number, _rung: number, x: string, outVar: string): string;
     capacityInputVar(slot: number): string;
-    /** Cold final quote: reuse the ladder's last-good value if x lands exactly there, else recompute fresh. */
+    /**
+     * Cold final quote: reuse the ladder's last-good value if x lands exactly
+     * there, else recompute fresh. Past either revert boundary, falls back to
+     * satOut (the setup-computed, provably-reachable saturation point) when x
+     * is at or beyond satCap, instead of collapsing to 0 — the one-shot twin
+     * of emitLadderQuote's bump-then-latch fix (see its doc).
+     */
     emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string;
     buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
     /** Exact TS mirror of the emitted fragment. `now`, if given, overrides the live slot (else state must carry it — see below). */

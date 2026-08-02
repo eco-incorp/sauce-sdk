@@ -156,6 +156,18 @@ export const stabbleWeightedSwapLadder = {
             return calcUnwrappedAmount(netOut, tokenOut);
         };
     },
+    /**
+     * THE CAPACITY COLLAPSE — FIXED. Unlike emitLadderQuote/emitFinalQuote/
+     * referenceQuote (which all clamp `wrapped` to `xcap` BEFORE computing the
+     * output, so they already saturate correctly and never collapse), this
+     * function used to freeze `lx` at whatever smaller grid point last
+     * succeeded the moment a grid point's wrapped input first exceeded `xcap`
+     * — under-reporting the true capacity whenever the grid skips the narrow
+     * boundary. Fixed: bump `lx` up to `calcUnwrappedAmount(xcap, tokenIn)` —
+     * the exact inverse of calcWrappedAmount, so re-wrapping it is guaranteed
+     * <= xcap (safe, never over-promising; exact when NOT scalingUp, floor-
+     * safe when scalingUp) — before latching.
+     */
     referenceCapacities(base, state) {
         const cfg = weightedCfg(base);
         const poolData = state[cfg.pool];
@@ -164,6 +176,7 @@ export const stabbleWeightedSwapLadder = {
         const bal0 = readUintLE(poolData, balanceOffset(0), 8);
         const tokenIn = cfg.tokens[0];
         const xcap = mulDown(bal0, WEIGHTED_MAX_IN_RATIO);
+        const unwrappedCap = calcUnwrappedAmount(xcap, tokenIn);
         return (grid) => {
             let capped = false;
             let lx = 0n;
@@ -171,8 +184,11 @@ export const stabbleWeightedSwapLadder = {
             for (const g of grid) {
                 if (!capped && g > 0n) {
                     const wrapped = calcWrappedAmount(g, tokenIn);
-                    if (wrapped > xcap)
+                    if (wrapped > xcap) {
+                        if (unwrappedCap > lx)
+                            lx = unwrappedCap;
                         capped = true;
+                    }
                     else
                         lx = g;
                 }
