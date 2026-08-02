@@ -250,6 +250,55 @@ function emitBinWalk(p: string, swapForY: boolean, x: string, v: { rm: string; o
   ];
 }
 
+/**
+ * SAME per-bin walk as emitBinWalk, but resumes from the persisted cursor
+ * (`${p}wk`/`${p}wcb`/`${p}wob`, declared in emitSetup) instead of restarting
+ * from bin 0 every rung — each ladder rung is called with a
+ * strictly-increasing CUMULATIVE grid point, and every bin strictly before
+ * the cursor is already known FULLY consumed (wk only ever advances past a
+ * bin on the iteration that fully consumes it), so re-walking them is pure
+ * waste: their consumed-input/output totals are frozen in wcb/wob forever.
+ *
+ * EXACT, not an approximation, for the identical reason meteora-dlmm's own
+ * emitBinWalkIncremental is exact (see that function's doc for the full
+ * argument — the fee/rounding computation re-derives fresh from
+ * `remaining = x - wcb` at whatever bin is currently being entered, which is
+ * algebraically identical to what a restart computes there): saros-dlmm's
+ * `emitBinWalk` above is line-for-line identical to meteora-dlmm's own (same
+ * mulShr/shlDiv maxIn, same branch order, same per-bin rounding), so the same
+ * exactness argument transfers unchanged.
+ */
+function emitBinWalkIncremental(p: string, swapForY: boolean, x: string, v: { rm: string; out: string; ex: string }, loopVar: string): string[] {
+  const maxIn = swapForY ? `((${p}mo << 64) + ${p}pr - 1) / ${p}pr` : `(${p}mo * ${p}pr + ${U64_MAX}) / ${ONE}`;
+  const outPartial = swapForY ? `(${p}pr * ${p}ex2) / ${ONE}` : `(${p}ex2 << 64) / ${p}pr`;
+  return [
+    `      ${v.rm} = ${x} - ${p}wcb; ${v.out} = ${p}wob; ${v.ex} = 0;`,
+    `      for (let ${loopVar} = ${p}wk; ${loopVar} < ${p}knb && ${v.rm} > 0 && ${v.ex} === 0; ${loopVar}++) {`,
+    `        ${p}bid = ${p}kbid[${loopVar}]; ${p}pr = ${p}kpr[${loopVar}]; ${p}mo = ${p}kam[${loopVar}];`,
+    `        ${p}dl = ${p}iref; if (${p}iref < ${p}bid) { ${p}dl = ${p}bid - ${p}iref } else { ${p}dl = ${p}iref - ${p}bid }`,
+    `        ${p}va = ${p}vref + ${p}dl * ${BPS}; if (${p}va > ${p}mvfa) { ${p}va = ${p}mvfa }`,
+    `        ${p}vf = 0;`,
+    `        if (${p}vfc > 0) { ${p}cr = ${p}va * ${p}bs; ${p}vf = (${p}vfc * ${p}cr * ${p}cr + ${VFEE_DEN} - 1) / ${VFEE_DEN} }`,
+    `        ${p}tf = ${p}bfee + ${p}vf; if (${p}tf > ${MAX_FEE_RATE}) { ${p}tf = ${MAX_FEE_RATE} }`,
+    `        ${p}fi = (${v.rm} * ${p}tf + ${FEE_PRECISION} - 1) / ${FEE_PRECISION};`,
+    `        ${p}ex2 = ${v.rm} - ${p}fi;`,
+    `        ${p}mi = ${maxIn};`,
+    `        if (${p}mi >= ${SENT}) { ${v.ex} = 1 }`,
+    `        else if (${p}ex2 >= ${p}mi) {`,
+    `          ${p}f2 = (${p}mi * ${p}tf + ${FEE_PRECISION} - ${p}tf - 1) / (${FEE_PRECISION} - ${p}tf);`,
+    `          ${p}cs = ${p}mi + ${p}f2;`,
+    `          if (${p}cs > ${v.rm}) { ${v.ex} = 1 }`,
+    // Freeze this fully-consumed bin permanently: fold it into the persisted
+    // totals and advance the cursor past it, so no later rung ever re-walks it.
+    `          else { ${v.rm} = ${v.rm} - ${p}cs; ${v.out} = ${v.out} + ${p}mo; ${p}wcb = ${p}wcb + ${p}cs; ${p}wob = ${p}wob + ${p}mo; ${p}wk = ${loopVar} + 1 }`,
+    `        } else {`,
+    `          ${v.out} = ${v.out} + ${outPartial};`,
+    `          ${v.rm} = 0;`,
+    `        }`,
+    `      }`,
+  ];
+}
+
 /** The per-bin live verification/unpack (unrolled; account refs compile-time). */
 function emitBinUnpack(p: string, slot: number, k: number, swapForY: boolean, params: readonly string[]): string[] {
   const keep = swapForY ? `${p}u2 <= ${p}bactive` : `${p}u2 >= ${p}bactive`;
@@ -359,6 +408,10 @@ export const sarosDlmmLadder: SvmVenueLadderV2 = {
       `  let ${p}fi = 0; let ${p}ex2 = 0; let ${p}mi = 0; let ${p}f2 = 0; let ${p}cs = 0; let ${p}cr = 0;`,
       `  let ${p}wrm = 0; let ${p}wout = 0; let ${p}wex = 0;`,
       `  let ${p}lo = 0; let ${p}lx = 0; let ${p}wcx = 0;`,
+      // Incremental-walk cursor (see emitBinWalkIncremental's doc): wk is the
+      // first not-yet-fully-consumed bin index; wcb/wob are the frozen
+      // consumed-input/output totals for every bin strictly before it.
+      `  let ${p}wk = 0; let ${p}wcb = 0; let ${p}wob = 0;`,
       `  if (${enabled} !== 0) {`,
       ...Array.from({ length: SAROS_DLMM_MAX_BINS }, (_, k) => emitBinUnpack(p, slot, k, swapForY, params)).flat(),
       `  }`,
@@ -367,6 +420,16 @@ export const sarosDlmmLadder: SvmVenueLadderV2 = {
     ];
     return lines.join('\n');
   },
+  /**
+   * Ladder rung at cumulative grid point x: uses emitBinWalkIncremental
+   * (resumes from the persisted wk/wcb/wob cursor set up in emitSetup)
+   * instead of a full restart-from-bin-0 walk -- measured -46.5%/-46.6% CU on
+   * the marginal (last-rung) cost and -21.1% on the whole 2-rung program at
+   * two realistic amountIn/rung0=amountIn>>1 splits on the real vendored
+   * engine (see saros-dlmm.incremental-cu.e2e.test.ts). Rung count is
+   * unchanged; only the per-rung cost drops. emitFinalQuote is untouched
+   * (runs once, no incremental savings to have).
+   */
   emitLadderQuote(base, slot, rung, x, outVar) {
     const cfg = sarosConfig(base);
     const swapForY = cfg.direction === 'xToY';
@@ -374,7 +437,7 @@ export const sarosDlmmLadder: SvmVenueLadderV2 = {
     const v = { rm: `${p}wrm`, out: `${p}wout`, ex: `${p}wex` };
     return [
       `    if (${p}vld !== 0 && ${p}wcx === 0 && ${x} > 0) {`,
-      ...emitBinWalk(p, swapForY, x, v, `${p}w${rung}`),
+      ...emitBinWalkIncremental(p, swapForY, x, v, `${p}w${rung}`),
       `      if (${p}wex === 0 && ${p}wrm === 0) { ${p}lo = ${p}wout; ${p}lx = ${x} }`,
       `      else { ${p}lo = ${p}wout; ${p}lx = ${x} - ${p}wrm; ${p}wcx = 1 }`,
       `    }`,
