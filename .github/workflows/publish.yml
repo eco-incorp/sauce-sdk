@@ -7,16 +7,22 @@ name: Publish
 #   git tag v1.2.3 && git push origin v1.2.3
 #   — or manual workflow_dispatch with `version` input.
 #
-# Publishes to BOTH registries:
-#   - npmjs.com                  (auth: NPM_TOKEN)
-#   - npm.pkg.github.com         (auth: GITHUB_TOKEN, scoped to this repo's org)
+# Publishes to PUBLIC npmjs.com ONLY (auth: NPM_TOKEN).
+#
+# GitHub Packages was dropped deliberately: it is not a distribution channel
+# anyone consumes here, and its step was the only failing part of the v0.2.0
+# release — it appended a token line for npm.pkg.github.com to ~/.npmrc, but
+# setup-node had already written a `registry-url` for npmjs, so pnpm resolved
+# auth against the CONFIGURED registry and ignored the one passed via
+# `--registry`, failing with ENEEDAUTH after npmjs had already published. That
+# left the run red on a release that had in fact succeeded, which is worse than
+# not publishing there at all.
 #
 # Required repo secrets:
 #   ECO_INCORP_TOKEN   PAT with read on eco-incorp/sauce (for pnpm install
 #                      of the private git dep `sauce`)
 #   NPM_TOKEN          npmjs.com automation token with publish rights on
 #                      the @eco-incorp scope
-#   GITHUB_TOKEN       auto-injected by Actions; no setup needed
 
 on:
   workflow_dispatch:
@@ -36,7 +42,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -110,12 +115,3 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: pnpm publish --access public --no-git-checks
-
-      - name: Publish to GitHub Packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # GH Packages auth: line per registry. Add auth for npm.pkg.github.com
-          # without disturbing the npmjs.org line setup-node already wrote.
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> ~/.npmrc
-          pnpm publish --access public --no-git-checks --registry https://npm.pkg.github.com
