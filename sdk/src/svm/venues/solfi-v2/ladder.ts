@@ -209,15 +209,29 @@ function emitSplineInline(tag: string, knots: SplineKnotVars, qExpr: string, out
  * SAME closed form as emitSplineInline (per-iteration interpolation), but
  * with the dy/dq/dx intermediates fully inlined (repeated as subexpressions)
  * instead of bound to fresh named locals -- 2 locals total (done, nm) instead
- * of 23 (done, nm, + 3 per each of 7 iterations). Used ONLY for the one-time
- * setup-time satOut computation (emitSetupLines): solfi-v2's per-rung
- * quote-at-x path (emitQuoteAt via the 'r'/'f' tags) already sits near the
- * v12 scalar-local ceiling (see the module doc's "CPI-shape note"), and a
- * THIRD full spline-eval instantiation (with its own named dy/dq/dx per
- * iteration) pushes even a single-rung compile over 255 locals. Extra
- * bytecode ops from the repeated subexpressions are the trade, not extra
- * scalar locals -- correctness-identical to emitSplineInline (same formula,
- * same knot indices, same rounding), just laid out to cost fewer registers.
+ * of 23 (done, nm, + 3 per each of 7 iterations). Used for the THREE one-time
+ * setup-time spline evals in emitSetupLines -- ag (clamp(spline(age)...)), sf
+ * (the spread spline), and satOut's depth-spline eval -- all called exactly
+ * once per slot, unlike solfi-v2's per-rung quote-at-x path (emitQuoteAt via
+ * the 'r'/'f' tags, called once per rung PLUS once for the final quote, each
+ * occurrence re-declaring its own copy of every named local it uses since
+ * v12 does not deduplicate same-named `let`/`const` declarations across
+ * repeated emitted blocks).
+ *
+ * Originally added (SDK PR 60) ONLY for satOut: solfi-v2's per-rung path
+ * already sat near the v12 255-scalar-local ceiling, and a third full
+ * spline-eval instantiation (with its own named dy/dq/dx per iteration) for
+ * satOut alone pushed even a single-rung, MIN_RUNGS=2-floor compile OVER
+ * that ceiling -- a real production regression (a single-slot solfi-v2
+ * shape could no longer compile at all, needing 262 locals against the 255
+ * cap; see this venue's compile-ceiling doc note below). ag and sf are
+ * setup-time-only exactly like satOut and carried no correctness reason to
+ * stay on the verbose emitSplineInline -- switching both to this compact
+ * form frees another (23-2)*2 = 42 locals, landing the floor shape well
+ * clear of the ceiling with real headroom rather than at it. Extra bytecode
+ * ops from the repeated subexpressions are the trade, not extra scalar
+ * locals -- correctness-identical to emitSplineInline (same formula, same
+ * knot indices, same rounding), just laid out to cost fewer registers.
  */
 function emitSplineInlineCompact(tag: string, knots: SplineKnotVars, qExpr: string, outVar: string): string[] {
   const { xs, ys, len } = knots;
@@ -472,7 +486,7 @@ function emitSetupLines(cfg: SolfiV2PoolConfig, slot: number, kParam: string, en
     // given every spline's x[0] is a non-negative knot).
     `      let ${p}sAge = 0;`,
     `      if (${p}slot >= ${p}oSlot) { ${p}sAge = ${p}slot - ${p}oSlot }`,
-    ...emitSplineInline(`${p}ag`, ageKnots.vars, `${p}sAge`, `${p}ag`),
+    ...emitSplineInlineCompact(`${p}ag`, ageKnots.vars, `${p}sAge`, `${p}ag`),
     `      if (${p}ag < 1000) { ${p}ag = 1000 }`,
     `      if (${p}ag > 100000) { ${p}ag = 100000 }`,
     // sf / f2 / s4
@@ -485,7 +499,7 @@ function emitSetupLines(cfg: SolfiV2PoolConfig, slot: number, kParam: string, en
     `        if (${p}confClamped > 100000) { ${p}confClamped = 100000 }`,
     `        ${p}f2 = ${p}confClamped;`,
     `      }`,
-    ...emitSplineInline(`${p}sf`, sfKnots.vars, `${p}sf`, `${p}s4`),
+    ...emitSplineInlineCompact(`${p}sf`, sfKnots.vars, `${p}sf`, `${p}s4`),
     `      ${p}fixedImpact = ${p}s4 + ${p}oFee + ${kParam};`,
     `      ${p}outVault = ${dir0 ? `${p}vb` : `${p}va`};`,
     `      ${p}outCap110 = (${p}outVault * 110) / 100;`,
