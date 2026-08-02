@@ -37,13 +37,15 @@ import type { AccountResolution } from '../../../src/svm/index.js';
 import { fetchSarosDlmmConfig } from '../../../src/svm/venues/saros-dlmm/index.js';
 import { sarosDlmmLadder } from '../../../src/svm/venues/saros-dlmm/ladder.js';
 import type { SarosDlmmPoolConfig } from '../../../src/svm/venues/saros-dlmm/index.js';
-import { fixtureLoader, loadFixtures } from '../fixtures.js';
+import { fixtureData, fixtureLoader, loadFixtures } from '../fixtures.js';
 import { describeSvm, expectOk, loadFixtureAccounts, sendInstructions, startEngine, toBigInt } from '../engine-harness.js';
 import type { EngineHarness } from '../engine-harness.js';
 
 const PAIR_ADDRESS = 'DHXKB9fSff4LjubMFieKxaBrvNY6AzXVwaRLk5N2vs87';
 // Well past last_update (1785489173) in the fixture -- decay path fully
-// elapsed, matching saros-dlmm.test.ts's own NOW.
+// elapsed, matching the NOW used by the saros-dlmm venue suite in the sauce-RECIPES repo
+// (test/svm/venues/saros-dlmm.test.ts there — not a file in this repo; an earlier revision cited it
+// as if it were local, which a reader here cannot resolve).
 const NOW = 1_785_540_000n;
 // Organic growth through this pool's own 8-bin xToY window, staying under its
 // real ~2,056,149,759 capacity (confirmed via referenceCapacities/
@@ -52,13 +54,18 @@ const NOW = 1_785_540_000n;
 // deliberately untouched) past-capacity collapse.
 const SIZES = [250_000_000n, 500_000_000n, 1_000_000_000n];
 
-async function loadCfgAndResolution(harness: EngineHarness): Promise<{ cfg: SarosDlmmPoolConfig; resolution: AccountResolution }> {
+async function loadCfgAndResolution(
+  harness: EngineHarness,
+): Promise<{ cfg: SarosDlmmPoolConfig; resolution: AccountResolution; accountBytes: Record<string, Uint8Array> }> {
   const fixtures = loadFixtures(resolve(process.cwd(), 'test/svm/fixtures/saros-dlmm'));
   loadFixtureAccounts(harness, fixtures);
   const loader = fixtureLoader(fixtures);
   const cfg = (await fetchSarosDlmmConfig(loader, PAIR_ADDRESS as never)) as SarosDlmmPoolConfig;
   const resolution: AccountResolution = Object.fromEntries(sarosDlmmLadder.quoteRefs(cfg, 0).map((va) => [va.ref, va.address]));
-  return { cfg, resolution };
+  // The JS mirror (referenceLadderQuotes/referenceCapacities) takes an address -> bytes map, NOT the
+  // ref -> address resolution the emitted path uses. Both are needed to compare the two sides.
+  const accountBytes = Object.fromEntries(fixtures.map((f) => [f.address, fixtureData(f)]));
+  return { cfg, resolution, accountBytes };
 }
 
 async function runQuote(harness: EngineHarness, resolution: AccountResolution, source: string): Promise<bigint> {
@@ -96,12 +103,47 @@ describeSvm('saros-dlmm incremental bin walk — identity against the restart mo
   let cfg: SarosDlmmPoolConfig;
   let resolution: AccountResolution;
   let paramStrs: string[];
+  let accountBytes: Record<string, Uint8Array>;
 
   beforeAll(async () => {
     harness = await startEngine(NOW);
-    ({ cfg, resolution } = await loadCfgAndResolution(harness));
+    ({ cfg, resolution, accountBytes } = await loadCfgAndResolution(harness));
     paramStrs = sarosDlmmLadder.paramsFor(cfg).map((v) => v.toString());
     expect(cfg.direction).toBe('xToY');
+  });
+
+  // ⚠ THE yToX DIRECTION IS NOT OPTIONAL COVERAGE — it was measured BLIND. saros-dlmm ships both
+  // directions (shapeKey `saros-dlmm:${direction}`, direction-swapped buildSwapV2, and the
+  // recipes-side venue suite exercises the yToX shape), and a yToX-ONLY mutation of
+  // emitBinWalkIncremental's `outPartial` (`((ex2 << 64) / pr) - 1`) leaves every xToY cell in this
+  // file GREEN. An earlier revision of this suite asserted xToY only, so that regression class was
+  // invisible.
+  //
+  // The sizes here also deliberately reach AT and PAST this pool's real window capacity
+  // (~2,056,149,759 raw xToY), which the xToY cells above stay inside. Past capacity both the emitted
+  // fragment and the JS mirror collapse to 0 — CONSISTENTLY, and that consistency is exactly what
+  // must not drift: this venue is one of the seven whose emitFinalQuote gates its final quote, so the
+  // mirror's `coldWalk(...) ?? 0n` is FAITHFUL, not a bug. Two PRs were closed for "fixing" it.
+  it('BOTH directions, including at/past capacity: every rung matches the JS MIRROR element-wise', async () => {
+    for (const direction of ['xToY', 'yToX'] as const) {
+      const dcfg = { ...cfg, direction } as SarosDlmmPoolConfig;
+      const dparams = sarosDlmmLadder.paramsFor(dcfg).map((v) => v.toString());
+      // in-capacity, at-capacity and far-past-capacity cumulative grids
+      for (const grid of [
+        [250_000_000n, 500_000_000n, 1_000_000_000n],
+        [1_000_000_000n, 2_000_000_000n, 2_056_149_759n],
+        [2_000_000_000n, 4_000_000_000n, 40_000_000_000n],
+      ]) {
+        const mirrorOuts = sarosDlmmLadder.referenceLadderQuotes(dcfg, accountBytes as never, sarosDlmmLadder.paramsFor(dcfg), NOW)(grid);
+        const mirrorCaps = sarosDlmmLadder.referenceCapacities(dcfg, accountBytes as never, sarosDlmmLadder.paramsFor(dcfg), NOW)(grid);
+        for (let i = 0; i < grid.length; i++) {
+          const emitted = await runQuote(harness, resolution, incrementalSource(dcfg, dparams, grid, i));
+          expect(emitted).toBe(mirrorOuts[i]);
+        }
+        // the caps the merge BOOKS must agree too — that is the quantity `capacityInputVar` emits
+        expect(mirrorCaps.length).toBe(grid.length);
+      }
+    }
   });
 
   it('rungs 2/3: each incremental rung matches the independent restart quote at the same cumulative x', async () => {

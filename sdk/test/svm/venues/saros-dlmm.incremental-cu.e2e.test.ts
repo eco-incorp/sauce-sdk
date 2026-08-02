@@ -28,14 +28,31 @@
  * untouched by, this PR (see saros-dlmm.incremental-identity.e2e.test.ts's
  * header).
  *
- * MEASURED on this fixture (probe SHA cited in the PR body): marginal
- * (rung1-only) CU drops 28.68% / 46.51% / 46.59% across the three amountIns
- * below; whole-2-rung-program CU drops 9.18% / 21.09% / 21.12%. Materially
- * smaller than meteora-dlmm's own -34.35% at the smallest (unrepresentative,
- * rung0 far below amountIn>>1) split, comparable-to-larger at the
- * amountIn>>1-realistic splits -- see the PR body for the full step-1
- * measurement record, including the non-representative split that
- * understated this.
+ * MEASURED on this fixture, all three cells reproduced independently: marginal
+ * (rung1-only) CU drops 28.99% / 46.60% / 46.67% across the three amountIns
+ * below; whole-2-rung-program CU drops 9.69% / 21.32% / 21.35%. (An earlier
+ * revision of this header carried 28.68/46.51/46.59 and 9.18/21.09/21.12 --
+ * all six were wrong; these are the figures the assertions below actually
+ * measure.)
+ *
+ * ⭐ THE STRONGEST RESULT IS NOT A PERCENTAGE, and an earlier revision buried it
+ * as a test-harness footnote: at 4 rungs with amountIn=1.8e9 the PRE-PORT
+ * restart shape CANNOT LAND AT ALL -- it exceeds Solana's 1,400,000 CU
+ * per-transaction cap (ProgramFailedToComplete, "exceeded CUs meter") -- while
+ * the incremental shape costs 1,041,758 CU. That is a capability gain: a slot
+ * shape that was unschedulable becomes schedulable. The percentages below are
+ * the secondary, continuous version of the same effect.
+ *
+ * ⚠ NO COMPARISON TO meteora-dlmm's "-34.35%" IS MADE HERE, deliberately. That
+ * figure is not pinned by any instrument in this repo (it exists only in a
+ * commit body), so it cannot be confirmed to be the same quantity. When
+ * meteora IS re-measured with the instrument below -- same engine, same
+ * emitFinalQuote-restart baseline, same rung0=amountIn>>1 split -- it reports
+ * marginal -46.27% / -46.64% / -58.22% and whole-program -16.53% / -21.26% /
+ * -25.21%, i.e. saros is comparable-to-WEAKER, not stronger; and the smallest
+ * saros cell (-28.99%) does not clear -34.35% at all. An earlier revision of
+ * this header claimed "comparable-to-larger" and cited only the two strongest
+ * splits. The port stands on its own numbers above, not on beating meteora.
  */
 import { resolve } from 'path';
 import { compile } from '@eco-incorp/sauce-compiler';

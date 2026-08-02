@@ -267,6 +267,17 @@ function emitBinWalk(p: string, swapForY: boolean, x: string, v: { rm: string; o
  * `emitBinWalk` above is line-for-line identical to meteora-dlmm's own (same
  * mulShr/shlDiv maxIn, same branch order, same per-bin rounding), so the same
  * exactness argument transfers unchanged.
+ *
+ * ⚠ PRECONDITION, NAMED RATHER THAN ASSUMED: the exactness argument requires the
+ * cumulative grid to be NON-DECREASING across rungs, or `remaining = x - wcb`
+ * underflows. That is genuinely enforced, not merely conventional — the consumer
+ * validates its shift schedule and rejects any increasing shift entry
+ * (`validateShiftSchedule`, sauce-recipes `ecoswap/svm/solver-reference.ts`,
+ * the schedule validator; grep the symbol, line numbers move). An earlier
+ * revision of this doc asserted monotonicity as self-evident, which left the
+ * whole argument resting on an unnamed guarantee. EQUAL consecutive grid points
+ * are fine and are covered by the identity suite (5-rung tiny cells with grids
+ * 0,0,0,1,3 and 0,0,1,3,7 in both directions, bit-exact against the JS mirror).
  */
 function emitBinWalkIncremental(p: string, swapForY: boolean, x: string, v: { rm: string; out: string; ex: string }, loopVar: string): string[] {
   const maxIn = swapForY ? `((${p}mo << 64) + ${p}pr - 1) / ${p}pr` : `(${p}mo * ${p}pr + ${U64_MAX}) / ${ONE}`;
@@ -423,12 +434,16 @@ export const sarosDlmmLadder: SvmVenueLadderV2 = {
   /**
    * Ladder rung at cumulative grid point x: uses emitBinWalkIncremental
    * (resumes from the persisted wk/wcb/wob cursor set up in emitSetup)
-   * instead of a full restart-from-bin-0 walk -- measured -46.5%/-46.6% CU on
-   * the marginal (last-rung) cost and -21.1% on the whole 2-rung program at
-   * two realistic amountIn/rung0=amountIn>>1 splits on the real vendored
-   * engine (see saros-dlmm.incremental-cu.e2e.test.ts). Rung count is
-   * unchanged; only the per-rung cost drops. emitFinalQuote is untouched
-   * (runs once, no incremental savings to have).
+   * instead of a full restart-from-bin-0 walk. MEASURED on the real vendored
+   * engine at all THREE realistic amountIn/rung0=amountIn>>1 splits (an earlier
+   * revision of this doc cited only the two strongest and dropped the weakest):
+   * marginal (last-rung) CU -28.99% / -46.60% / -46.67%, whole-2-rung-program
+   * -9.69% / -21.32% / -21.35%. See saros-dlmm.incremental-cu.e2e.test.ts, which
+   * also records the result that matters more than any percentage: at 4 rungs a
+   * pre-port restart shape EXCEEDS Solana's 1,400,000 CU cap and cannot land at
+   * all, where the incremental shape costs 1,041,758 CU. Rung count is unchanged;
+   * only the per-rung cost drops. emitFinalQuote is untouched (runs once, no
+   * incremental savings to have).
    */
   emitLadderQuote(base, slot, rung, x, outVar) {
     const cfg = sarosConfig(base);
