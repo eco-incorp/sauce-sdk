@@ -13,10 +13,25 @@
  * clean here and only surface as a missing symbol one repo away, in
  * sauce-recipes' eventual re-pin. This test is a MECHANICAL, VALUE-LEVEL
  * re-check (not a re-derivation of the migration's own alias logic) that
- * every one of the 476 value-level names the migration actually emits is
+ * every one of the 474 value-level names the migration actually emits is
  * genuinely reachable from `@eco-incorp/sauce-sdk/svm` today — the exact
  * regression an ambiguous star-export, a typo'd alias, or a future edit to
  * `venues/index.ts` that clobbers one of these lines would cause.
+ *
+ * IMPORTANT — what this test CANNOT catch, and why it isn't a substitute for
+ * one: this list is hand-derived FROM the migration's own `venues/index.ts`
+ * — it asserts the barrel against itself. A name the migration never thought
+ * to export at all (an OMISSION, not a clobbered alias) is invisible to this
+ * test by construction, because it was never a candidate for the list in the
+ * first place — that is exactly how `SvmHyloDriftError`'s earlier absence
+ * from the barrel survived this test unnoticed. The real check for an
+ * omission is `sdk/test/svm/venues/consumer-union-surface.test.ts`, which
+ * asserts against an INDEPENDENTLY-sourced list (every symbol name the
+ * downstream sauce-recipes package actually consumes) rather than a list
+ * read off this file. Keep both: this test still catches a future edit that
+ * clobbers or typos one of the 474 already-known-good lines; the
+ * consumer-union test catches the omission class this one structurally
+ * cannot.
  *
  * Type-only exports (interfaces/type aliases) are NOT covered here — they
  * have no runtime presence to probe, and `pnpm --filter ./sdk typecheck`
@@ -72,7 +87,6 @@ const MIGRATED_VALUE_EXPORTS: readonly string[] = [
   'CREMA_TICK_ARRAY_DISCRIMINATOR',
   'CREMA_TICK_ARRAY_SIZE',
   'CREMA_TICK_LEN',
-  'CROPPER_CROPPER_MAX_BOUNDARIES',
   'CROPPER_MAX_BOUNDARIES',
   'CROPPER_MAX_SQRT_PRICE',
   'CROPPER_MIN_SQRT_PRICE',
@@ -183,7 +197,6 @@ const MIGRATED_VALUE_EXPORTS: readonly string[] = [
   'PANCAKESWAP_CLMM_OFF_TA_TICKS',
   'PANCAKESWAP_CLMM_OFF_TICK_CURRENT',
   'PANCAKESWAP_CLMM_OFF_TICK_SPACING',
-  'PANCAKESWAP_CLMM_PANCAKESWAP_CLMM_MAX_BOUNDARIES',
   'PANCAKESWAP_CLMM_POOL_ACCOUNT_SIZE',
   'PANCAKESWAP_CLMM_PROGRAM_ID',
   'PANCAKESWAP_CLMM_TICK_ARRAY_ACCOUNT_SIZE',
@@ -263,7 +276,6 @@ const MIGRATED_VALUE_EXPORTS: readonly string[] = [
   'STABBLE_CLMM_OFF_TOKEN_VAULT_1',
   'STABBLE_CLMM_POOL_ACCOUNT_SIZE',
   'STABBLE_CLMM_PROGRAM_ID',
-  'STABBLE_CLMM_STABBLE_CLMM_MAX_BOUNDARIES',
   'STABBLE_CLMM_TICK_ARRAY_ACCOUNT_SIZE',
   'STABBLE_CLMM_TICK_ARRAY_SIZE',
   'STABBLE_CLMM_TICK_LEN',
@@ -271,6 +283,7 @@ const MIGRATED_VALUE_EXPORTS: readonly string[] = [
   'STABLE_POOL_DISCRIMINATOR',
   'STATE_ESCROWED_OFFSET',
   'STEPN_PROGRAM_ID',
+  'SvmHyloDriftError',
   'SWAP_GLOBAL_ID',
   'SWAP_M_ACCOUNT',
   'SYSTEM_PROGRAM',
@@ -513,8 +526,8 @@ const MIGRATED_VALUE_EXPORTS: readonly string[] = [
 ];
 
 describe('migrated venue barrel surface', () => {
-  it('pins the expected count (476) so a future edit is a deliberate, reviewed change', () => {
-    expect(MIGRATED_VALUE_EXPORTS.length).toBe(476);
+  it('pins the expected count (474) so a future edit is a deliberate, reviewed change', () => {
+    expect(MIGRATED_VALUE_EXPORTS.length).toBe(474);
   });
 
   it('every migrated value-level export actually resolves through the @eco-incorp/sauce-sdk/svm barrel', () => {
