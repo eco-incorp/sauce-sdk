@@ -47,16 +47,29 @@ function liveState(cfg, state, params) {
     const [da, ...rest] = params;
     const thresholds = rest.slice(0, TIER_COUNT);
     const fees = rest.slice(TIER_COUNT, 2 * TIER_COUNT);
-    return { pr, da: da, rout, active, thresholds, fees };
+    const tierCeilX = thresholds[8];
+    const tierCeilRaw = cfg.direction === 'xToY' ? (tierCeilX * pr) / da : (tierCeilX * da) / pr;
+    const tierCeilNetRaw = tierCeilRaw - (tierCeilRaw * fees[8]) / FEE_DEN;
+    const tierCeilOut = tierCeilNetRaw > rout ? rout : tierCeilNetRaw;
+    return { pr, da: da, rout, active, thresholds, fees, tierCeilOut };
 }
-/** The COLD (final, venue-approximating) quote: price+fee model for gross input x, 0 past either
- *  deactivation edge (the size ceiling or the live vaultOut clamp) — the lamport-exact target for
- *  emitFinalQuote. */
+/**
+ * The COLD (final, venue-approximating) quote: price+fee model for gross
+ * input x -- the lamport-exact target for emitFinalQuote.
+ *
+ * THE TIER-CEILING + VAULT-CLAMP COLLAPSE -- FIXED (was: 0 past either
+ * deactivation edge, violating "nondecreasing in x, quote(0)=0"). x beyond
+ * the tier ceiling now reports tierCeilOut (the setup-computed output AT the
+ * ceiling itself -- the fee schedule has no tier past it, so nothing larger
+ * is ever deliverable); the vault clamp now saturates at rout (this venue's
+ * live balance) instead of collapsing, mirroring the on-chain fragment's own
+ * per-call behavior (see emitLadderQuote's doc for the on-chain twin).
+ */
 export function goonfiColdQuote(cfg, x, live) {
     if (x === 0n || !live.active)
         return 0n;
     if (x > live.thresholds[8])
-        return 0n;
+        return live.tierCeilOut;
     let fee = live.fees[0];
     for (let i = 0; i < TIER_COUNT - 1; i++) {
         if (x > live.thresholds[i])
@@ -64,12 +77,15 @@ export function goonfiColdQuote(cfg, x, live) {
     }
     const raw = cfg.direction === 'xToY' ? (x * live.pr) / live.da : (x * live.da) / live.pr;
     const net = raw - (raw * fee) / FEE_DEN;
-    if (net > live.rout)
-        return 0n;
-    return net;
+    return net > live.rout ? live.rout : net;
 }
-/** Shared walk backing both referenceLadderQuotes and referenceCapacities — mirrors
- *  emitLadderQuote exactly (monotone, flat past either deactivation edge). */
+/**
+ * Shared walk backing both referenceLadderQuotes and referenceCapacities —
+ * mirrors emitLadderQuote exactly (monotone, flat past either deactivation
+ * edge). Both edges bump-then-latch instead of freezing at whatever smaller
+ * grid point last succeeded — see emitLadderQuote's "THE TIER-CEILING +
+ * VAULT-CLAMP COLLAPSE" doc for the fix shape.
+ */
 function referenceWalk(cfg, live, grid) {
     let lo = 0n;
     let lx = 0n;
@@ -79,6 +95,10 @@ function referenceWalk(cfg, live, grid) {
     for (const x of grid) {
         if (!capped && x > 0n && live.active) {
             if (x > live.thresholds[8]) {
+                if (live.tierCeilOut > lo)
+                    lo = live.tierCeilOut;
+                if (live.thresholds[8] > lx)
+                    lx = live.thresholds[8];
                 capped = true;
             }
             else {
@@ -89,8 +109,11 @@ function referenceWalk(cfg, live, grid) {
                 }
                 const raw = cfg.direction === 'xToY' ? (x * live.pr) / live.da : (x * live.da) / live.pr;
                 const net = raw - (raw * fee) / FEE_DEN;
-                if (net > live.rout)
+                if (net > live.rout) {
+                    lo = live.rout;
+                    lx = x;
                     capped = true;
+                }
                 else {
                     lo = net;
                     lx = x;
@@ -157,6 +180,13 @@ export const goonfiV2Ladder = {
             `  const ${p}f6 = ${f6}; const ${p}f7 = ${f7}; const ${p}f8 = ${f8}; const ${p}f9 = ${f9};`,
             `  let ${p}raw = 0; let ${p}fee = 0; let ${p}net = 0;`,
             `  let ${p}lo = 0; let ${p}lx = 0; let ${p}cap = 0;`,
+            // tierCeilOut = the price+fee-tier output AT x=t9 (the tier ceiling
+            // itself, using the LAST/f9 tier -- always the applicable fee there),
+            // vault-clamped -- x-independent, computed once. See "THE TIER-CEILING
+            // + VAULT-CLAMP COLLAPSE" fix in emitLadderQuote's doc.
+            `  const ${p}tcRaw = ${rawExpr(c, p, `${p}t9`)};`,
+            `  let ${p}tierCeilOut = ${p}tcRaw - Math.mulDiv(${p}tcRaw, ${p}f9, ${FEE_DEN});`,
+            `  if (${p}tierCeilOut > ${p}rout) { ${p}tierCeilOut = ${p}rout }`,
         ].join('\n');
     },
     /**
@@ -168,18 +198,33 @@ export const goonfiV2Ladder = {
      * cumulative input, so a rung past either edge reports zero PRODUCTIVE input too (not the raw,
      * over-capacity grid point) — the merge-reachable half of the ladder-contract guard's required
      * capacityInputVar/referenceCapacities pair. Mirrored by referenceLadderQuotes/referenceCapacities.
+     *
+     * THE TIER-CEILING + VAULT-CLAMP COLLAPSE — FIXED. Both edges used to
+     * latch WITHOUT recording anything, collapsing to whatever smaller grid
+     * point last succeeded (measured non-monotone: maxCap/maxOut both flip to
+     * 0 once the grid steps past either edge). Fixed distinctly per edge:
+     * (a) the tier-ceiling edge (`x > t9`) bumps (lo, lx) up to the
+     * setup-computed (tierCeilOut, t9) -- the price+fee-tier output AT the
+     * ceiling itself, vault-clamped -- since ANY x beyond t9 can never exceed
+     * what the ceiling itself delivers (the fee schedule has no tier past t9).
+     * (b) the vault-clamp edge (`net > rout`) saturates net AT THIS x directly
+     * (no inversion needed -- raw/fee are already computed for x) and records
+     * (rout, x), mirroring solfi-v2/the window-walking families' own
+     * saturate-in-place convention.
      */
     emitLadderQuote(base, slot, _rung, x, outVar) {
         const c = goonfiConfig(base);
         const p = `s${slot}`;
         return [
             `    if (${p}cap === 0 && ${x} > 0 && ${p}kq !== 0) {`,
-            `      if (${x} > ${p}t9) { ${p}cap = 1 }`,
-            `      else {`,
+            `      if (${x} > ${p}t9) {`,
+            `        if (${p}tierCeilOut > ${p}lo) { ${p}lo = ${p}tierCeilOut; ${p}lx = ${p}t9 }`,
+            `        ${p}cap = 1;`,
+            `      } else {`,
             `        ${p}raw = ${rawExpr(c, p, x)};`,
             ...feeAssignLines(p, x).map((l) => '  ' + l),
             `        ${p}net = ${p}raw - Math.mulDiv(${p}raw, ${p}fee, ${FEE_DEN});`,
-            `        if (${p}net > ${p}rout) { ${p}cap = 1 } else { ${p}lo = ${p}net; ${p}lx = ${x} }`,
+            `        if (${p}net > ${p}rout) { ${p}lo = ${p}rout; ${p}lx = ${x}; ${p}cap = 1 } else { ${p}lo = ${p}net; ${p}lx = ${x} }`,
             `      }`,
             `    }`,
             `    const ${outVar} = ${p}lo;`,
@@ -189,18 +234,24 @@ export const goonfiV2Ladder = {
     capacityInputVar(slot) {
         return `s${slot}lx`;
     },
-    /** Cold final quote at the elected slice: price+fee model, or 0 past either deactivation edge
-     *  (skip the CPI). */
+    /**
+     * Cold final quote at the elected slice: price+fee model, or the same
+     * tier-ceiling/vault-clamp fallback emitLadderQuote uses (see its doc) --
+     * never collapses to 0 past either edge.
+     */
     emitFinalQuote(base, slot, x, outVar) {
         const c = goonfiConfig(base);
         const p = `s${slot}`;
         return [
             `  let ${outVar} = 0;`,
-            `  if (${x} > 0 && ${p}kq !== 0 && ${x} <= ${p}t9) {`,
-            `    ${p}raw = ${rawExpr(c, p, x)};`,
-            ...feeAssignLines(p, x),
-            `    ${p}net = ${p}raw - Math.mulDiv(${p}raw, ${p}fee, ${FEE_DEN});`,
-            `    if (${p}net <= ${p}rout) { ${outVar} = ${p}net }`,
+            `  if (${x} > 0 && ${p}kq !== 0) {`,
+            `    if (${x} > ${p}t9) { ${outVar} = ${p}tierCeilOut }`,
+            `    else {`,
+            `      ${p}raw = ${rawExpr(c, p, x)};`,
+            ...feeAssignLines(p, x).map((l) => '  ' + l),
+            `      ${p}net = ${p}raw - Math.mulDiv(${p}raw, ${p}fee, ${FEE_DEN});`,
+            `      if (${p}net <= ${p}rout) { ${outVar} = ${p}net } else { ${outVar} = ${p}rout }`,
+            `    }`,
             `  }`,
         ].join('\n');
     },
