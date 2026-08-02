@@ -541,13 +541,26 @@ export const meteoraDlmmLadder = {
     };
   },
 
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED. Same defect and same fix as
+   * orca-whirlpool/raydium-clmm's referenceQuote (see orca-whirlpool's doc
+   * for the full mechanism): `coldWalk(...) ?? 0n` required full absorption
+   * to return non-null, so any x past the shipped bin window's capacity
+   * collapsed to 0 forever instead of the window's own true saturated
+   * output (measured, both directions: xToY last-nonzero 179,539,068,913 at
+   * 2^41 -> 0 at 2^42 while referenceCapacities correctly saturates at
+   * 2,518,898,410,454; yToX last-nonzero 1,678,147,206,870 at 2^37 -> 0 at
+   * 2^38 while referenceCapacities saturates at 210,552,340,323).
+   * coldWalkClamped runs the identical bin walk but never returns null —
+   * exact, no approximation needed, same as orca-whirlpool/raydium-clmm.
+   */
   referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[], now?: bigint): (x: bigint) => bigint {
     const cfg = dlmmConfig(base);
     const swapForY = cfg.direction === 'xToY';
     const fee = feeParamsFromCfg(cfg, params);
     const live = liveFromState(cfg, state, fee, now ?? BigInt(Math.floor(Date.now() / 1000)));
     const kept = effectiveBins(cfg, state, live, params);
-    return (x: bigint): bigint => coldWalk(kept, fee, live, swapForY, x) ?? 0n;
+    return (x: bigint): bigint => coldWalkClamped(kept, fee, live, swapForY, x).out;
   },
 
   referenceLadderQuotes(
