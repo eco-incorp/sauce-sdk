@@ -809,12 +809,25 @@ export const invariantLadder: SvmVenueLadderV2 = {
       ],
     };
   },
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED. Used to be `coldWalk(...) ?? 0n`:
+   * coldWalk requires x to be FULLY absorbed by the shipped boundary window
+   * to return non-null, so any x exceeding the window's capacity collapsed
+   * straight to 0 instead of the window's own true saturated output —
+   * violating "nondecreasing in x, quote(0)=0" (see
+   * test/svm/venues/invariant.test.ts for the real-fixture measurement).
+   * coldWalkClamped runs the identical walk but never returns null — for any
+   * x already within capacity it returns the exact same `.out` coldWalk
+   * would have, and for x beyond capacity it returns the window's true
+   * saturated output instead of nothing. referenceLadderQuotes/
+   * referenceCapacities below already use it.
+   */
   referenceQuote(base, state, params) {
     const cfg = invariantConfig(base);
     const xToY = cfg.direction === 'xToY';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live);
-    return (x: bigint) => coldWalk(win, live, xToY, x) ?? 0n;
+    return (x: bigint) => coldWalkClamped(win, live, xToY, x).out;
   },
   referenceLadderQuotes(base, state, params) {
     const cfg = invariantConfig(base);

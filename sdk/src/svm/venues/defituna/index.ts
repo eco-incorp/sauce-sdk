@@ -808,12 +808,21 @@ export const defitunaLadder: SvmVenueLadderV2 = {
       ],
     };
   },
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED (same mechanism as orca-whirlpool's
+   * referenceQuote): coldWalk requires x to be FULLY absorbed by the
+   * shipped window to return non-null, so any x exceeding the window's
+   * capacity collapsed straight to 0 instead of the window's own true
+   * saturated output. coldWalkClamped runs the identical walk but never
+   * returns null; referenceLadderQuotes/referenceCapacities below already
+   * use it.
+   */
   referenceQuote(base, state, params) {
     const cfg = defitunaConfig(base);
     const aToB = cfg.direction === 'aToB';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live, params);
-    return (x: bigint) => coldWalk(win, live, aToB, x) ?? 0n;
+    return (x: bigint) => coldWalkClamped(win, live, aToB, x).out;
   },
   referenceLadderQuotes(base, state, params) {
     const cfg = defitunaConfig(base);

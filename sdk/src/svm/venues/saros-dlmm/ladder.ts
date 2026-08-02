@@ -447,13 +447,22 @@ export const sarosDlmmLadder: SvmVenueLadderV2 = {
       ],
     };
   },
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED (same mechanism as orca-whirlpool's
+   * referenceQuote/invariant's referenceQuote): coldWalk requires x to be
+   * FULLY absorbed by the shipped bin window to return non-null, so any x
+   * exceeding the window's capacity collapsed straight to 0 instead of the
+   * window's own true saturated output. coldWalkClamped runs the identical
+   * walk but never returns null; referenceLadderQuotes/referenceCapacities
+   * below already use it.
+   */
   referenceQuote(base, state, params, now) {
     const cfg = sarosConfig(base);
     const swapForY = cfg.direction === 'xToY';
     const fee = feeParamsFromCfg(params);
     const live = liveFromState(cfg, state, fee, now ?? BigInt(Math.floor(Date.now() / 1000)));
     const kept = effectiveBins(cfg, state, live, params);
-    return (x) => coldWalk(kept, fee, live, swapForY, x) ?? 0n;
+    return (x) => coldWalkClamped(kept, fee, live, swapForY, x).out;
   },
   referenceLadderQuotes(base, state, params, now) {
     const cfg = sarosConfig(base);

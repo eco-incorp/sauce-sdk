@@ -961,13 +961,22 @@ export const cremaLadder: SvmVenueLadderV2 = {
    * blob was prepared with, over live account bytes — VALIDATED bit-exact
    * against the real crema.so binary at 4 sizes each direction (module
    * header).
+   *
+   * THE COLD-QUOTE COLLAPSE — FIXED (same mechanism as orca-whirlpool's
+   * referenceQuote): coldWalk requires x to be FULLY absorbed by the
+   * shipped window to return non-null, so any x exceeding the window's
+   * capacity collapsed straight to 0 instead of the window's own true
+   * saturated output. coldWalkClamped runs the identical walk but never
+   * returns null (unaffected for any x within capacity, which is all the
+   * bit-exact sizes above exercise); referenceLadderQuotes/
+   * referenceCapacities below already use it.
    */
   referenceQuote(base, state, params) {
     const cfg = cremaConfig(base);
     const aToB = cfg.direction === 'aToB';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live, params);
-    return (x) => coldWalk(win, live, aToB, x) ?? 0n;
+    return (x) => coldWalkClamped(win, live, aToB, x).out;
   },
   referenceLadderQuotes(base, state, params) {
     const cfg = cremaConfig(base);
