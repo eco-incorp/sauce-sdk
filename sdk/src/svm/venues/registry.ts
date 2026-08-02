@@ -74,6 +74,22 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * SUBSET — 10 of these 22 families also implement the v1 surface; manifest/
  * orca-whirlpool/raydium-clmm/meteora-dlmm/obric-v2/goonfi-v2/solfi-v2/
  * quantum/tesserav/woofi/deriverse/perps-jlp are ladder-only).
+ *
+ * DELIBERATELY NOT YET EXTENDED: 54 more ladder families were migrated in
+ * from sauce-recipes' `ecoswap/svm/venues/**` in the same pass that added
+ * this comment (see `sdk/src/svm/venues/index.ts`'s "migrated venue
+ * adapters" barrel section for the full list) and are reachable from
+ * `@eco-incorp/sauce-sdk/svm` today, but are INTENTIONALLY not added to
+ * `ladderAdapters` here, and `sdk/test/svm/venues/ladder-contract.test.ts`'s
+ * `FAMILIES`/count-assertion guard is UNCHANGED (still 22) — registering a
+ * family there requires a real fixture, a `variants()` closure, and (per
+ * that file's strong structural check) a harvested `declaredCliffs` entry
+ * for any family whose cold `referenceQuote` has a finite cliff; doing that
+ * correctly for 54 families in one pass risks fabricated/undertested
+ * coverage more than it's worth, so it is left as NAMED, SEQUENCED
+ * follow-up work rather than rushed here. This is the one hazard this
+ * migration does not close — every other registration point (barrel
+ * exports, self-import rewrite, dedup, dist) is complete and typechecks.
  */
 const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
