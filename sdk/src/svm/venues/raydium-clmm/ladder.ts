@@ -604,6 +604,14 @@ export const raydiumClmmLadder = {
     return `s${slot}lx`;
   },
 
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED (on-chain fragment twin of
+   * referenceQuote's own fix — see orca-whirlpool's emitFinalQuote doc for
+   * the full mechanism). Used to gate the walk's own output behind full
+   * absorption, leaving outVar at 0 for any x past the window's capacity
+   * even though `fo` already holds the correct saturated output. Assigning
+   * outVar = fo unconditionally reproduces coldWalkClamped's semantics.
+   */
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
     const cfg = rayConfig(base);
     const zeroForOne = cfg.direction === '0to1';
@@ -619,7 +627,7 @@ export const raydiumClmmLadder = {
       `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
       ...emitWalkStep(p, zeroForOne, v, '        '),
       `      }`,
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+      `      ${outVar} = ${p}fo;`,
       `    }`,
       `  }`,
     ].join('\n');

@@ -683,6 +683,18 @@ export const orcaWhirlpoolLadder = {
     return `s${slot}lx`;
   },
 
+  /**
+   * THE COLD-QUOTE COLLAPSE — FIXED (on-chain fragment twin of
+   * referenceQuote's own fix). Used to gate the walk's own output behind
+   * full absorption (`if (fex===0 && frm===0) { outVar = fo }`), leaving
+   * outVar at 0 for any x past the window's capacity — even though `fo`
+   * already holds the correct, fully-saturated output by the time the walk
+   * loop exits (each fully-consumed tick range's contribution is added to
+   * `fo` unconditionally as the walk proceeds; a partial/final range's
+   * contribution is added the same way before `frm` is zeroed). The gate was
+   * never necessary: assigning `outVar = fo` unconditionally reproduces the
+   * exact coldWalkClamped semantics the JS mirror now uses.
+   */
   emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string {
     const cfg = whirlConfig(base);
     const aToB = cfg.direction === 'aToB';
@@ -702,7 +714,7 @@ export const orcaWhirlpoolLadder = {
       `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
       ...emitWalkStep(p, aToB, v, '        '),
       `      }`,
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+      `      ${outVar} = ${p}fo;`,
       `    }`,
       `  }`,
     ].join('\n');
