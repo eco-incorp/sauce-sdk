@@ -1,5 +1,5 @@
 /**
- * SAUCE SWEEP PROGRAM WIRE FORMAT v1 — `programs/token-sweep.sauce.ts` on engine target v12.
+ * SAUCE SWEEP PROGRAM WIRE FORMAT v1 — `recipes/settle.sauce.ts` on engine target v12.
  *
  * `program := PROLOGUE || BODY`. Byte 0 is the first prologue byte — there is NO header, magic,
  * version byte, or length prefix.
@@ -21,11 +21,11 @@
  * prologue-shaped program may do anything in its body.
  *
  * If you need "this is the program I audited", compile that program from source and byte-compare:
- * `@eco-incorp/sauce-sdk/programs` ships the source and the one `baseDirs` entry, and the ordinary
+ * `@eco-incorp/sauce-sdk/recipes` ships the source and the one `baseDirs` entry, and the ordinary
  * compiler reproduces the exact bytes. That is a check against source you can read, which is
  * strictly better evidence than a hash constant shipped in the same package as the claim.
  *
- * Useful property when you do compare: the body of `token-sweep.sauce.ts` is byte-identical for
+ * Useful property when you do compare: the body of `recipes/settle.sauce.ts` is byte-identical for
  * every token count, every minOut and every recipient (the program is helper-free, so no jump-table
  * offsets shift with arg count) — so one body comparison covers every argument set.
  *
@@ -135,7 +135,7 @@ export declare function bestEffortDecode(parse: SettleParse): DecodedSettleProgr
  *
  * This is a STRUCTURAL decode only — it proves the program STARTS with the sweep shape and has a
  * non-empty suffix. It does NOT prove that suffix is a program you audited: compile the source and
- * byte-compare for that (`@eco-incorp/sauce-sdk/programs`), and compare `decoded.bodyHash` against
+ * byte-compare for that (`@eco-incorp/sauce-sdk/recipes`), and compare `decoded.bodyHash` against
  * the body you get, before treating the decoded values as "this is my sweep program".
  */
 export declare function decodeSettleProgram(program: Hex): DecodedSettleProgram;

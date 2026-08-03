@@ -11,99 +11,28 @@
  * the other engine-bound suites).
  */
 import { createHash } from 'node:crypto';
-import type { Address, Instruction } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import {
   buildCloseBufferInstruction,
-  buildComputeBudgetPrepend,
   buildExecuteFromAccountInstruction,
   buildExecuteInstruction,
-  buildFinalizeBufferInstruction,
   buildHeapFramePrepend,
-  buildInitBufferInstructions,
   buildStagingPlan,
-  buildWriteBufferInstruction,
-  deriveBufferPda,
-  encodePayloadArgs,
-  getTransactionSize,
   resolveAccounts,
 } from '../../src/svm/index.js';
-import type { StagedArgs } from '../../src/svm/index.js';
 import {
-  buildExecuteTransactionForHarness,
   describeSvm,
+  executeStaged,
   expectFail,
   expectOk,
   sendInstructions,
+  stageBytecode,
   startEngine,
   toBigInt,
 } from './engine-harness.js';
-import type { EngineHarness, RunResult } from './engine-harness.js';
+import type { EngineHarness } from './engine-harness.js';
 
 const sha256 = (bytes: Uint8Array): Uint8Array => new Uint8Array(createHash('sha256').update(bytes).digest());
-
-/** Stages `bytecode` into buffer `index` through the real staging protocol; returns its address. */
-const stageBytecode = async (harness: EngineHarness, index: number, bytecode: Uint8Array): Promise<Address> => {
-  const plan = buildStagingPlan(bytecode.length);
-  const { address: buffer } = await deriveBufferPda(harness.programId, harness.payer.address, index);
-  const shared = { programId: harness.programId, authority: harness.payer.address, buffer };
-
-  // init tx (all growth steps pack into one), then one tx per chunk, then the
-  // DEDICATED finalize tx — every tx must clear the 1232-byte wire cap. None
-  // of these carry the heap-frame request: staging never touches interpreter
-  // memory.
-  const initInstructions = buildInitBufferInstructions({
-    programId: harness.programId,
-    payer: harness.payer.address,
-    buffer,
-    index,
-    capacity: bytecode.length,
-  });
-  expect(initInstructions).toHaveLength(plan.initInstructionCount);
-  expectOk(await sendInstructions(harness, initInstructions));
-
-  for (const chunk of plan.chunks) {
-    const write = buildWriteBufferInstruction({
-      ...shared,
-      offset: chunk.offset,
-      chunk: bytecode.subarray(chunk.offset, chunk.offset + chunk.length),
-    });
-    const transaction = await buildExecuteTransactionForHarness(harness, [write]);
-    expect(getTransactionSize(transaction)).toBeLessThanOrEqual(1232);
-    expectOk(await sendInstructions(harness, [write]));
-  }
-
-  expectOk(await sendInstructions(harness, [buildFinalizeBufferInstruction({ ...shared, length: bytecode.length, sha256: sha256(bytecode) })]));
-
-  return buffer;
-};
-
-/**
- * ONE-instruction staged execute: [CU limit, RequestHeapFrame, execute_from_account]
- * — the payload args ride the execute instruction's own data (no writer
- * instruction exists on the Wave D surface).
- */
-const executeStaged = async (
-  harness: EngineHarness,
-  buffer: Address,
-  accounts: ReturnType<typeof resolveAccounts>,
-  opts: { pin?: Uint8Array; args?: StagedArgs } = {},
-): Promise<RunResult> => {
-  // Generous CU limit — the default 200K/tx starves multi-KB staged programs.
-  const instructions: Instruction[] = [
-    ...buildComputeBudgetPrepend({ unitLimit: 1_400_000 }),
-    buildHeapFramePrepend(),
-    buildExecuteFromAccountInstruction({
-      programId: harness.programId,
-      buffer,
-      accounts,
-      expectedSha256: opts.pin,
-      args: opts.args ? encodePayloadArgs(opts.args.layout, opts.args.values) : undefined,
-    }),
-  ];
-
-  return sendInstructions(harness, instructions);
-};
 
 describeSvm('staged e2e: buffer lifecycle (stage 4 KB → execute_from_account → close)', () => {
   let harness: EngineHarness;

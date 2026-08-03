@@ -121,6 +121,15 @@ export { GAVEL_PROGRAM_ID, GAVEL_POOL_DISCRIMINANT, GAVEL_POOL_SIZE, GAVEL_LEADE
 export type { GavelPoolConfig } from './gavel/index.js';
 export { HEAVEN_PROGRAM_ID, heaven, heavenLadder, heavenMints, heavenApplyDirection } from './heaven/index.js';
 export type { HeavenPoolConfig } from './heaven/index.js';
+export {
+  HELIUM_TREASURY_PROGRAM_ID,
+  HELIUM_CIRCUIT_BREAKER_PROGRAM_ID,
+  U64_MAX as HELIUM_TREASURY_U64_MAX,
+  heliumTreasury,
+  heliumTreasuryLadder,
+  fetchHeliumTreasuryPoolConfig,
+} from './helium-treasury/index.js';
+export type { HeliumTreasuryPoolConfig } from './helium-treasury/index.js';
 export { HUMIDIFI_PROGRAM_ID, HUMIDIFI_XOR_KEY, HUMIDIFI_AMOUNT_XOR_MASK, HUMIDIFI_POOL_REGISTRY, HUMIDIFI_SAFETY_FEE_PPM, humidifiLadder, humidifiKeystream, humidifiDeobfuscate, fetchHumidifiConfig } from './humidifi/index.js';
 export type { HumidiFiRegistryEntry, HumidiFiPoolConfig } from './humidifi/index.js';
 export { HYLO_PROGRAM_ID, USDC_MINT, HYUSD_MINT, HYLO_ACCOUNT, USDC_PAIR_ACCOUNT, USDC_COLLATERAL_VAULT, USDC_USD_PYTH_FEED, HYLO_ACCOUNT_SIZE, HYLO_DISCRIMINATOR, USDC_PAIR_ACCOUNT_SIZE, USDC_PAIR_DISCRIMINATOR, hylo, hyloLadder, hyloGate, hyloMintOut, hyloRedeemCapacity, hyloRedeemOut, SvmHyloDriftError } from './hylo/index.js';
@@ -171,6 +180,8 @@ export type { SolayerDirection, SolayerPoolConfig } from './solayer/index.js';
 // generic constants/helpers; aliased with a `solfiV1`/`SOLFI_V1` prefix.
 export { SOLFI_V1_PROGRAM_ID, POOL_ACCOUNT_SIZE as SOLFI_V1_POOL_ACCOUNT_SIZE, OFF_MINT_A as SOLFI_V1_OFF_MINT_A, OFF_MINT_B as SOLFI_V1_OFF_MINT_B, OFF_VAULT_A as SOLFI_V1_OFF_VAULT_A, OFF_VAULT_B as SOLFI_V1_OFF_VAULT_B, SOLFI_V1_POOL_RATES, solfiV1Ladder, fetchSolfiV1Config } from './solfi-v1/index.js';
 export type { SolfiV1FloorRate, SolfiV1PoolConfig } from './solfi-v1/index.js';
+export { TAURUSFI_PROGRAM_ID, TAURUSFI_PRICE_SCALE, TAURUSFI_POOL_REGISTRY, taurusfi, taurusFiLadder, decodeTaurusFiPriceScaled, fetchTaurusFiConfig } from './taurusfi/index.js';
+export type { TaurusFiRegistryEntry, TaurusFiPoolConfig } from './taurusfi/index.js';
 // trends: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `trends`/`TRENDS` prefix.
 export { TRENDS_PROGRAM_ID, WSOL_MINT as TRENDS_WSOL_MINT, TRENDS_CONFIG_PDA, TRENDS_POOL_AUTHORITY, TRENDS_EVENT_AUTHORITY, POOL_ACCOUNT_SIZE as TRENDS_POOL_ACCOUNT_SIZE, POOL_DISCRIMINATOR as TRENDS_POOL_DISCRIMINATOR, trends, trendsLadder, fetchTrendsPoolConfig } from './trends/index.js';
