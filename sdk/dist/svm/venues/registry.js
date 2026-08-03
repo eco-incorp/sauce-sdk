@@ -1,4 +1,6 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { taurusFiLadder } from './taurusfi/index.js';
+import { flintLadder } from './flint/index.js';
 import { runnerRodeoLadder } from './runner-rodeo/index.js';
 import { hadronLadder } from './hadron/ladder.js';
 import { whalestreetLadder } from './whalestreet/index.js';
@@ -157,6 +159,8 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [taurusFiLadder.slug]: taurusFiLadder,
+    [flintLadder.slug]: flintLadder,
     [runnerRodeoLadder.slug]: runnerRodeoLadder,
     [hadronLadder.slug]: hadronLadder,
     [whalestreetLadder.slug]: whalestreetLadder,
