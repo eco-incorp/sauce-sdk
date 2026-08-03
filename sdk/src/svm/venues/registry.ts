@@ -1,5 +1,15 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { aldrinLadder } from './aldrin/index.js';
+import { xorcaLadder } from './xorca/index.js';
+import { voltrLadder } from './voltr/index.js';
+import { virtualsLadder } from './virtuals/index.js';
+import { vaultLiquidUnstakeLadder } from './vault-liquid-unstake/index.js';
+import { trendsLadder } from './trends/index.js';
+import { boopFunLadder } from './boop-fun/index.js';
+import { alphaqLadder } from './alphaq/index.js';
+import { gavelLadder } from './gavel/index.js';
+import { gammaLadder } from './gamma/index.js';
+import { fluxbeamLadder } from './fluxbeam/index.js';
 import { deriverseLadder } from './deriverse/ladder.js';
 import { meteoraDammV1Stable } from './meteora-damm-v1-stable/index.js';
 import { meteoraDammV1StableLadder } from './meteora-damm-v1-stable/ladder.js';
@@ -105,6 +115,16 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
   [aldrinLadder.slug]: aldrinLadder,
+  [xorcaLadder.slug]: xorcaLadder,
+  [voltrLadder.slug]: voltrLadder,
+  [virtualsLadder.slug]: virtualsLadder,
+  [vaultLiquidUnstakeLadder.slug]: vaultLiquidUnstakeLadder,
+  [trendsLadder.slug]: trendsLadder,
+  [boopFunLadder.slug]: boopFunLadder,
+  [alphaqLadder.slug]: alphaqLadder,
+  [gavelLadder.slug]: gavelLadder,
+  [gammaLadder.slug]: gammaLadder,
+  [fluxbeamLadder.slug]: fluxbeamLadder,
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
   [raydiumAmmV4Ladder.slug]: raydiumAmmV4Ladder,
   [pumpswapLadder.slug]: pumpswapLadder,

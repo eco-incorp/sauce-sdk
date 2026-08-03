@@ -117,6 +117,26 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  fetchXorcaConfig,
+  xorcaLadder,
+  fetchVoltrConfig,
+  voltrLadder,
+  virtualsLadder,
+  virtuals,
+  vaultLiquidUnstakeLadder,
+  vaultLiquidUnstake,
+  trendsLadder,
+  trends,
+  boopFunLadder,
+  boopFun,
+  fetchAlphaqPoolConfig,
+  alphaqLadder,
+  fetchGavelConfig,
+  gavelLadder,
+  gammaLadder,
+  gamma,
+  fetchFluxBeamPoolConfig,
+  fluxbeamLadder,
 } from '../../../src/svm/index.js';
 import type { JuplendAmmPoolConfig } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadder } from '../../../src/svm/index.js';
@@ -305,6 +325,137 @@ const FAMILIES: Family[] = [
       const POOL = address('4GUniSDrCAZR3sKtLa1AWC8oyYubZeKJQ8KraQmy3Wt5');
       const fixtures = fixturesFor('aldrin');
       const cfg = await aldrin.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'fluxbeam',
+    ladder: fluxbeamLadder,
+    async variants() {
+      const POOL = address('CZEZDGDkzsn4zTfdw6XRm4U1o6GatotMhhRmVEzdwGS3');
+      const fixtures = fixturesFor('fluxbeam');
+      const cfg = await fetchFluxBeamPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'gamma',
+    ladder: gammaLadder,
+    async variants() {
+      const POOL = address('CM681mP5GjxrzFWg452RfJ2W4zEnshR9kkgg34NdAthi');
+      const fixtures = fixturesFor('gamma');
+      const cfg = await gamma.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: '0to1', cfg, state },
+        { label: '1to0', cfg: { ...cfg, inputIsToken0: false }, state },
+      ];
+    },
+  },
+  {
+    slug: 'gavel',
+    ladder: gavelLadder,
+    async variants() {
+      const POOL = address('CcWf5D6BhUTv2tD4ebFFcmCdTUgBWMc8CqqoJvFHGGXi');
+      const fixtures = fixturesFor('gavel');
+      const cfg = await fetchGavelConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'baseIn', cfg, state },
+        { label: 'quoteIn', cfg: { ...cfg, direction: 'quoteIn' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'alphaq',
+    ladder: alphaqLadder,
+    async variants() {
+      const POOL = address('Pi9nzTjPxD8DsRfRBGfKYzmefJoJM8TcXu2jyaQjSHm');
+      const fixtures = fixturesFor('alphaq');
+      const cfg = await fetchAlphaqPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'boop-fun',
+    ladder: boopFunLadder,
+    async variants() {
+      const POOL = address('8uwipGAmbqzLFt6hky77C9YWEJzycLf9vgceEJyN1M7e');
+      const fixtures = fixturesFor('boop-fun');
+      const cfg = await boopFun.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'trends',
+    ladder: trendsLadder,
+    async variants() {
+      const POOL = address('8najX6BzqVwEwNXfJWZhP4TMYGmGvf1Mn6BpzfkpFpBG');
+      const fixtures = fixturesFor('trends');
+      const cfg = await trends.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'quoteToBase', cfg: { ...cfg, direction: 'quoteToBase' }, state },
+        { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'vault-liquid-unstake',
+    ladder: vaultLiquidUnstakeLadder,
+    async variants() {
+      // POOL is the LstInfo account (this family's "pool"); the global Pool
+      // singleton (pool.json) and the stake pool (stakepool.json) are loaded
+      // internally by fetchPoolConfig and read by referenceQuote — all three
+      // fixture accounts are in fixtureBytesMap(fixtures).
+      const POOL = address('5U6DciyzRQoCHFr8PxiokVLcA1ADZ9U34AeVHqWSa7N');
+      const fixtures = fixturesFor('vault-liquid-unstake');
+      const cfg = await vaultLiquidUnstake.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'virtuals',
+    ladder: virtualsLadder,
+    async variants() {
+      const POOL = address('135Q44ShcCmWzaHZDJY25GejVQ4xwcgX9MzAEqE1eaFY');
+      const fixtures = fixturesFor('virtuals');
+      const cfg = await virtuals.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'quoteToBase', cfg, state },
+        { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'voltr',
+    ladder: voltrLadder,
+    async variants() {
+      // POOL is the Voltr vault account. referenceQuote reads the vault + lp
+      // mint (assetToLp) and additionally the idle ATA (lpToAsset) — all three
+      // are in the fixture. `now` is omitted (defaults to Date.now()), mirroring
+      // recipes voltr.test.ts; monotonicity holds for any `now`.
+      const VAULT = address('Gj8kURFs8fK3GhiX5Yc6H1HQKSpEvLHeDRZsP6Y2D1je');
+      const fixtures = fixturesFor('voltr');
+      const cfg = await fetchVoltrConfig(fixtureLoader(fixtures), VAULT);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'assetToLp', cfg, state },
+        { label: 'lpToAsset', cfg: { ...cfg, direction: 'lpToAsset' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'xorca',
+    ladder: xorcaLadder,
+    async variants() {
+      // Singleton venue: POOL must equal XORCA_STATE_PDA (fetchXorcaConfig
+      // rejects anything else). referenceQuote reads the vault ATA, state PDA,
+      // and xORCA mint — all three are in the fixture.
+      const POOL = address('CSqKhyW1cpdyjheAx5HXx4ibcnYrzpL5JywEMAkZixBK');
+      const fixtures = fixturesFor('xorca');
+      const cfg = await fetchXorcaConfig(fixtureLoader(fixtures), POOL);
       return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
     },
   },
@@ -899,8 +1050,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(24);
-    expect(FAMILIES).toHaveLength(24);
+    expect(registered).toHaveLength(34);
+    expect(FAMILIES).toHaveLength(34);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
