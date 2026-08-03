@@ -7,7 +7,7 @@
  * token (CRT, Token-2022). This adapter serves SIX directed pairs off that
  * one account — `issue:<assetId>` (asset -> CRT) and `redeem:<assetId>`
  * (CRT -> asset) for each basket asset — via `carrotAllDirections` (see
- * `ecoswap/svm/index.ts`'s FAMILIES dispatch generalization it requires).
+ * `the consuming app SVM solver entry`'s FAMILIES dispatch generalization it requires).
  *
  * GROUND TRUTH: no official IDL/program source is public. Layout, instruction
  * discriminators, and the account list are taken from the reverse-engineered
@@ -113,7 +113,7 @@
  * `SVM_FAMILY_FILTERS`' generic getProgramAccounts memcmp shape (there is
  * nothing to scan for, and the second mint of any pair lives at a
  * per-asset-index offset inside a Vec, not one fixed offset). It is wired as
- * a bespoke, zero-RPC candidate emission in `ecoswap/svm/discovery.ts`
+ * a bespoke, zero-RPC candidate emission in `the consuming app SVM discovery module`
  * instead — see that file's `carrotCandidatesFor`.
  */
 import { address, getAddressDecoder } from '@solana/kit';
@@ -235,7 +235,7 @@ function requireAsset(cfg: CarrotPoolConfig, assetId: number): CarrotAssetSnapsh
   return asset;
 }
 
-/** Every `issue:<id>` / `redeem:<id>` direction the fetched vault currently offers, in asset order — the multi-direction dispatch `resolveSvmPoolSpec` tries (see `ecoswap/svm/index.ts`). */
+/** Every `issue:<id>` / `redeem:<id>` direction the fetched vault currently offers, in asset order — the multi-direction dispatch `resolveSvmPoolSpec` tries (see `the consuming app SVM solver entry`). */
 export function carrotAllDirections(cfg: PoolConfig): string[] {
   const c = carrotConfig(cfg);
   const dirs: string[] = [];

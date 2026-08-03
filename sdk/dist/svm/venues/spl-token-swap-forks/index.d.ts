@@ -107,7 +107,7 @@ export declare const dexlab: SplTokenSwapForkAdapter;
  * deployed binary in LiteSVM at 2 and 4 rungs plus three additional sizes
  * (`predicted <= realized` at every sampled size, never `===`, unlike the
  * `orca-legacy-token-swap`/`token-swap-v1`/etc. siblings this fork's math was
- * cloned from) — see test/svm/ecoswap-svm.realcpi.e2e.test.ts's `saros`
+ * cloned from) — see the consuming app realcpi e2e test's `saros`
  * describeWith block in sauce-recipes.
  */
 export declare const SAROS_PROGRAM_ID: Address;

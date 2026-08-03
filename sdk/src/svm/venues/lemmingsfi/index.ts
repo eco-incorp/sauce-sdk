@@ -95,7 +95,7 @@
  * it and reaches its OWN logic, not an accounts/data-shape rejection) AND
  * that a cook including this venue TODAY would revert the CPI. Since an SVM
  * CPI failure aborts the whole transaction (no per-venue catch/re-route at
- * execution time), `gate` (wired in ecoswap/svm/index.ts's `FAMILIES.
+ * execution time), `gate` (wired in the consuming app SVM solver entry's `FAMILIES.
  * lemmingsfi.gate`) self-drops any candidate whose `lastUpdateTs` is more
  * than `STALE_AFTER_SECONDS` old — a SEQUENCING condition, not a permanent
  * disable: the instant the keeper posts a fresh tick, `lastUpdateTs`

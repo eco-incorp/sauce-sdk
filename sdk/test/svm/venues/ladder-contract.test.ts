@@ -1,7 +1,7 @@
 /**
  * THE LADDER-ADAPTER CONTRACT GUARD (no engine, no RPC).
  *
- * ecoswap/svm/solver-reference.ts (the recipes-side SvmRoute merge mirror)
+ * the consuming app SVM reference solver (the recipes-side SvmRoute merge mirror)
  * asserts one premise as the load-bearing licence for its entire design:
  * "every quote closure is nondecreasing in x with quote(0) == 0 ... so rung
  * dOut values are non-negative and all products stay far below 2^256 for u64
@@ -131,7 +131,7 @@ const SWEEP_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // buildLadder / ladderGrid — a faithful, standalone transcription of
-// ecoswap/svm/solver-reference.ts's grid + rung construction (the recipes
+// the consuming app SVM reference solver's grid + rung construction (the recipes
 // repo, not importable from here — this is the SDK side of the mirror). Any
 // change to that geometric grid or dIn/dOut derivation must be mirrored here.
 // ---------------------------------------------------------------------------

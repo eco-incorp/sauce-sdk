@@ -96,7 +96,7 @@ const U64_MAX = (1n << 64n) - 1n;
 // mainnet (there is no single on-chain account carrying both the underlying
 // mint AND a mode's share mint together, so this venue cannot be discovered
 // via a generic getProgramAccounts memcmp scan — see
-// ecoswap/svm/discovery.ts's SVM_FAMILY_FILTERS doc for why it is deliberately
+// the consuming app SVM discovery module's SVM_FAMILY_FILTERS doc for why it is deliberately
 // NOT in that table). Keyed by ModeConfig account address (base58) -> the
 // pool's PoolConfig account; everything else (PoolState, ModeMint,
 // PoolAuthority, PoolUnderlyingToken, ...) is PDA-derived or read live off

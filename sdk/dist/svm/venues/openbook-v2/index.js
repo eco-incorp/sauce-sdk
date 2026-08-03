@@ -429,7 +429,7 @@ function emitWalk(cfg, p, slot, xExpr, outVar, decl, tag, indent, isFinal) {
 export const openbookV2Ladder = {
     slug: SLUG,
     /** Heavy fixed setup (MAX_ORDERS unrolled live reads + key verification over a 90KB BookSide
-     * account) — 'stable'/degrade-first class, same as manifest/whirlpool (recipes/ecoswap/svm/budget.ts). */
+     * account) — 'stable'/degrade-first class, same as manifest/whirlpool (the consuming app SVM CU-budget module). */
     defaultRungs: 2,
     shapeKey(base) {
         return `${SLUG}:${openbookV2Config(base).direction}`;

@@ -1,7 +1,7 @@
 import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
 export declare const meteoraDammV1StableLadder: {
     slug: string;
-    /** Stable slots default to 2 rungs (cap 4) — see recipes/ecoswap/svm/budget.ts. */
+    /** Stable slots default to 2 rungs (cap 4) — see the consuming app SVM CU-budget module. */
     defaultRungs: number;
     shapeKey(): string;
     helpers(): {

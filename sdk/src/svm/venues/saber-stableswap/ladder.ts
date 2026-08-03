@@ -14,7 +14,7 @@
  *   larger cumulative input means a smaller y, so the previous rung's y
  *   still approaches the fixed point from above and converges in ~1-2
  *   iterations instead of the cold ~15+ — the difference between a stable
- *   slot fitting the CU budget or not (see recipes/ecoswap/svm/budget.ts);
+ *   slot fitting the CU budget or not (see the consuming app SVM CU-budget module);
  * - the FINAL predicted output is always COLD (y0 = D), byte-identical to
  *   the venue program's swap_to — what the real-binary quadrilateral pins.
  *

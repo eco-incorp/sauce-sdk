@@ -78,7 +78,7 @@
  *     no-crossing math).
  * See test/svm/venues/invariant.test.ts for the fixture-driven regression of
  * this exact quadrilateral (offline) and the SAUCE_VENUE_PROGRAMS-gated
- * real-CPI cell in ecoswap-svm.realcpi.e2e.test.ts.
+ * real-CPI cell in the consuming app realcpi e2e test.
  *
  * Volume is thin (~$0.04M/7d per the integration brief) — this ladder is
  * wired unconditionally; the existing relative-depth survivorship filter

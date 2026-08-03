@@ -65,7 +65,7 @@
  * ("Program FUTARELB...consumed 40708 of..." on the flagship META/USDC dao,
  * "...consumed 39309 of..." on the SoLo/USDC dao — both PoolState::Spot,
  * both already including the nested `emit_cpi` self-log's own ~3634 CU) —
- * see `ecoswap/svm/budget.ts`'s `CU_FAMILIES.metadao-futarchy` for how that
+ * see `the consuming app SVM CU-budget module`'s `CU_FAMILIES.metadao-futarchy` for how that
  * folds into the pin.
  */
 import { address, getAddressCodec } from '@solana/kit';
@@ -140,7 +140,7 @@ export async function fetchMetaDaoFutarchySpotConfig(load, pool) {
     const stateTag = data[STATE_TAG_OFFSET];
     if (stateTag !== STATE_SPOT) {
         throw new Error(`${SLUG} dao ${pool} has an active proposal (PoolState::Futarchy, tag ${stateTag}) — conditional markets are ` +
-            'not yet served by this adapter, only PoolState::Spot (see ecoswap/svm/venues/metadao-futarchy.ts)');
+            'not yet served by this adapter, only PoolState::Spot (see the consuming app metadao-futarchy venue module)');
     }
     const quoteReserves = readUintLE(data, QUOTE_RESERVES_OFFSET, 8);
     const baseReserves = readUintLE(data, BASE_RESERVES_OFFSET, 8);
@@ -170,7 +170,7 @@ export async function fetchMetaDaoFutarchySpotConfig(load, pool) {
  * `self.quote_reserves` exclusively — using the vault balance instead would
  * over-quote by exactly the retained fee, which is precisely what the first
  * cut of this adapter did wrong (caught by the real-CPI lamport-exact gate:
- * `ecoswap-svm.realcpi.e2e.test.ts`'s metadao-futarchy quadrilateral).
+ * `the consuming app realcpi e2e test`'s metadao-futarchy quadrilateral).
  */
 function liveReserves(cfg, state) {
     const data = state[cfg.pool];

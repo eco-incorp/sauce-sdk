@@ -118,9 +118,9 @@
  * all — the account'S OWN ADDRESS is the mint's PDA (`["bonding-curve", mint]`),
  * a ONE-WAY derivation. So `fetchPoolConfig` here needs the mint as an EXPLICIT
  * third argument (`FamilyEntry.fetch`'s `mint` parameter, `SvmRoutePoolSpec.mint`
- * — see ecoswap/svm/index.ts) that every other family ignores; the discovery-side
+ * — see the consuming app SVM solver entry) that every other family ignores; the discovery-side
  * fix (deriving the PDA forward from a candidate mint, never scanning by mint
- * offset) lives in `withPumpfunBondingCurveDiscovery` (ecoswap/svm/discovery.ts).
+ * offset) lives in `withPumpfunBondingCurveDiscovery` (the consuming app SVM discovery module).
  */
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
@@ -297,7 +297,7 @@ export const pumpfunBondingCurve = {
    * `pool` is the bonding-curve PDA (owner-verified against
    * PUMPFUN_BONDING_CURVE_PROGRAM_ID by the generic discovery/compile-path safety
    * net); `mint` is REQUIRED (see the module header on why the account can't embed
-   * it) — `ecoswap/svm/index.ts`'s FAMILIES entry enforces its presence and throws
+   * it) — `the consuming app SVM solver entry`'s FAMILIES entry enforces its presence and throws
    * a named error if a caller omits it.
    */
   async fetchPoolConfig(load: AccountLoader, pool: Address, mint: Address): Promise<PumpfunBondingCurvePoolConfig> {

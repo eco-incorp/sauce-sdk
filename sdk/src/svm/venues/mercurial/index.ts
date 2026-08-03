@@ -88,7 +88,7 @@
  *    1/10/30 stSOL, bit-exact at all three.
  * See `test/svm/venues/mercurial.test.ts` for the pinned worked examples.
  *
- * NO `ecoswap-svm.realcpi.e2e.test.ts` CELL (unlike every other SAUCE_VENUE_PROGRAMS-gated
+ * NO `the consuming app realcpi e2e test` CELL (unlike every other SAUCE_VENUE_PROGRAMS-gated
  * venue): driving the real dumped `mercurial.so` through a raw single Exchange
  * CPI in LiteSVM (same pool/accounts/encoding the real-network probe above
  * validates) reproducibly fails a RUNTIME-LEVEL "sum of account balances

@@ -110,7 +110,7 @@
  * `(1000, 12345)` — `block.number` is exactly the Solana slot, `block.timestamp`
  * exactly the Clock's unix_timestamp, independently steerable (the SAME
  * mechanism `solfi-v2` already established for its own live-slot read — see
- * `ecoswap-svm.cu.e2e.test.ts`'s `SOLFI_SLOT` comment). So `referenceQuote`'s
+ * `the consuming app cu e2e test`'s `SOLFI_SLOT` comment). So `referenceQuote`'s
  * `now` parameter, for THIS family, is the CURRENT SLOT (not a unix
  * timestamp) — the same convention solfi-v2 set; `now` absent defaults to 0n
  * (same as solfi-v2), which — since a real `slot_snapshot` is always > 0
@@ -145,7 +145,7 @@
  * u64 LE = 1]` — venue-level min_out is 1, the recipe's own terminal outAta
  * delta check is the real floor (the solswap/manifest/phoenix discipline).
  * PROVEN against the real dumped mainnet binary, not just this transcription
- * — see `test/svm/ecoswap-svm.realcpi.e2e.test.ts`'s `gavel` quadrilateral.
+ * — see `the consuming app realcpi e2e test`'s `gavel` quadrilateral.
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';

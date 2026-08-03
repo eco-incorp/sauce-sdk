@@ -14,14 +14,14 @@
  * repo. A name omitted here fails in the SDK, at PR time -- not one repo
  * away, after a re-pin.
  *
- * DERIVATION. In the `sauce-recipes` repo, over `ecoswap/svm/**`,
+ * DERIVATION. In the `sauce-recipes` repo, over `the consuming app SVM code**`,
  * `solswap/**`, and `test/svm/**`: take the union of every named import (a)
  * sourced directly from `'@eco-incorp/sauce-sdk/svm'` today (names already
  * satisfied by pre-existing venues, e.g. `raydium-clmm`, `orca-whirlpool`,
  * `woofi`, `quantum`, `deriverse`, `goonfi-v2` -- all merged to this SDK
  * before this migration and unaffected by it), UNION (b) every named import
  * sourced from one of the 44 LOCAL venue module files THIS migration deletes
- * (`ecoswap/svm/venues/<key>.ts` or `<key>/{index,ladder}.ts`, for each of
+ * (`the consuming app SVM venues<key>.ts` or `<key>/{index,ladder}.ts`, for each of
  * the 44 keys this PR adds under `sdk/src/svm/venues/`) -- because once the
  * sauce-recipes-side companion re-pin lands, every such import becomes a
  * barrel import instead, and (a) alone would miss every migrated name that

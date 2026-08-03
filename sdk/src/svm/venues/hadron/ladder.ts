@@ -89,7 +89,7 @@
  * different internal accounting branch touched only on that side; both
  * directions engage the SAME 16 accounts. Recipe-side `CU_FAMILIES` is
  * calibrated generously above the WORSE-direction ceiling — see
- * `ecoswap/svm/budget.ts` in the sauce-recipes repo — no native quote arm
+ * `the consuming app SVM CU-budget module` in the sauce-recipes repo — no native quote arm
  * needed (the native merge program only does the k-way merge, never a
  * per-venue quote).
  */

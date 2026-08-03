@@ -6,7 +6,7 @@
  * orders SHIPPED by `fetchPhoenixConfig` off-chain and verified LIVE in the
  * fragment. The SDK ships no `phoenix` ladder — this module is new, added
  * directly in this recipe (the established pattern for a venue the SDK
- * doesn't carry, see `ecoswap/svm/venues/humidifi.ts`/`tesserav.ts` on their
+ * doesn't carry, see `the consuming app humidifi venue module`/`tesserav.ts` on their
  * own branches).
  *
  * Phoenix has NO on-chain IDL registry entry, but its market layout is the
@@ -200,7 +200,7 @@
  * `codegen.ts`'s new `SvmRouteSlot.patchDivisorIn` hook (additive, unset
  * for every other family) floor-divides the patched value by the pool's
  * `direction`-appropriate lot size before it is written into the
- * instruction bytes — `ecoswap/svm/index.ts` sets it only for `phoenix`
+ * instruction bytes — `the consuming app SVM solver entry` sets it only for `phoenix`
  * slots.
  */
 import { address } from '@solana/kit';
@@ -255,7 +255,7 @@ const U64_MAX = (1n << 64n) - 1n;
  * heavier per-level walk: two budget checks plus the fee-adjusted-budget
  * setup) — MEASURED (not guessed): 588,522 CU @2 rungs / 831,135 CU @4
  * rungs on the real engine against the checked-in real SOL/USDC fixture
- * (`ecoswap-svm.cu.e2e.test.ts`, `CU_FAMILIES.phoenix` in budget.ts), both
+ * (`the consuming app cu e2e test`, `CU_FAMILIES.phoenix` in budget.ts), both
  * comfortably under the ~1.19M admission budget with room for a companion
  * slot. At this depth the shipped bid window alone absorbs ~713 SOL before
  * exhausting (see `docs/phoenix-evidence.md`) — far beyond a typical trade

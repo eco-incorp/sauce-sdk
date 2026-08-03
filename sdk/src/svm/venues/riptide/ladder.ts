@@ -87,7 +87,7 @@
  * raw-unit-scaled and up to ~2.2 SOL) — dramatically heavier than most
  * other wired families (the next heaviest single-CPI cost, solfi-v2's whole
  * slot, is 585,136 including its OWN setup/quote/merge). The CU_FAMILIES
- * pin in ecoswap/svm/budget.ts (sauce-recipes) is calibrated generously
+ * pin in the consuming app SVM CU-budget module (sauce-recipes) is calibrated generously
  * above the observed ceiling rather than off a LiteSVM slot/rung split — no
  * local engine.so was available at the time this was measured; re-pin with
  * ECO_SVM_CU_PRINT=1 once one is.

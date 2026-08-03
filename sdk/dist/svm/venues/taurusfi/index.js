@@ -6,7 +6,7 @@
  * (`getSignaturesForAddress` + `getTransaction` + `getAccountInfo` against
  * mainnet, plus a real Jupiter-routed swap CPI found in the sample), the same
  * method that produced bisonfi/humidifi/obric-v2/solfi-v2. Ported verbatim
- * (relocation, not a rewrite) from sauce-recipes' `ecoswap/svm/venues/
+ * (relocation, not a rewrite) from sauce-recipes' `the consuming app SVM venues
  * taurusfi.ts` — the same non-gPA shape humidifi uses (static pool-registry
  * discovery, since neither is gPA-discoverable by a mint-pair memcmp).
  *

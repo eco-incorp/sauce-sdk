@@ -12,7 +12,7 @@
  * Hand-built synthetic accounts (no fixture directory exists for this
  * family at the SDK level yet — the CU/e2e harness that already exercises a
  * synthesized goonfi-v2 pool lives one repo away, in sauce-recipes'
- * test/svm/ecoswap-svm.cu.e2e.test.ts). Only the oracle (32 bytes: p1@0,
+ * the consuming app cu e2e test). Only the oracle (32 bytes: p1@0,
  * p2@8 u64 LE, denom@20 u32 LE) and the output vault (a plain u64 LE
  * `amount` at the standard SPL token offset 64) are read by liveState/
  * emitSetup at quote time — thresholds/fees are baked as compile-time

@@ -78,7 +78,7 @@
  * - non-Tokenkeg mints (the swap accounts below are classic-SPL only);
  * - a direction with NO shipped boundaries and no edge (readable === 0),
  *   wired the same way as orca-whirlpool/raydium-clmm/byreal via the
- *   recipe's SvmWindowDriftError in ecoswap/svm/index.ts's FAMILIES entry;
+ *   recipe's SvmWindowDriftError in the consuming app SVM solver entry's FAMILIES entry;
  * - a shipped boundary carrying an ACTIVE resting limit order
  *   (open_orders_input > 0 or part_filled_orders_remaining_input > 0) —
  *   FusionAMM's hybrid CLMM+orderbook model may fill resting orders at a

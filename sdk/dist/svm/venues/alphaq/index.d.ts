@@ -27,7 +27,7 @@ export interface AlphaqStatsRpc {
  * beyond "no new markets discovered this run" — the static table still
  * serves every market known at integration time.
  *
- * NOT auto-wired into `ecoswap/svm/discovery.ts`'s gPA sweep (deliberately —
+ * NOT auto-wired into `the consuming app SVM discovery module`'s gPA sweep (deliberately —
  * it would add one extra getProgramAccounts call to EVERY discovery sweep for
  * a table that is already complete for every market that exists today). A
  * caller with its own boot sequence (the api, a CLI, a future cron) should

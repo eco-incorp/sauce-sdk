@@ -128,7 +128,7 @@ describe('tesserav ladder', () => {
   });
 
   test('the real per-CPI CU this pass measured stays under the CU_FAMILIES budget the recipe wires (documentation pin, not a live measurement)', () => {
-    // See recipes/ecoswap/svm/budget.ts's tesserav entry — it must exceed this.
+    // See the consuming app SVM CU-budget module's tesserav entry — it must exceed this.
     expect(MEASURED_CU_MAX).toBeLessThan(70_000);
   });
 });

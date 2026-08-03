@@ -44,7 +44,7 @@ export declare const pumpfunBondingCurve: {
      * `pool` is the bonding-curve PDA (owner-verified against
      * PUMPFUN_BONDING_CURVE_PROGRAM_ID by the generic discovery/compile-path safety
      * net); `mint` is REQUIRED (see the module header on why the account can't embed
-     * it) — `ecoswap/svm/index.ts`'s FAMILIES entry enforces its presence and throws
+     * it) — `the consuming app SVM solver entry`'s FAMILIES entry enforces its presence and throws
      * a named error if a caller omits it.
      */
     fetchPoolConfig(load: AccountLoader, pool: Address, mint: Address): Promise<PumpfunBondingCurvePoolConfig>;

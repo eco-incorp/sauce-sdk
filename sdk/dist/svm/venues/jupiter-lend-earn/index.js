@@ -120,7 +120,7 @@
  * at ~4.7x the vault's real USDC balance reverted with
  * `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`'s `Error: insufficient
  * funds`, custom program error 0x1) — and a launched CPI failure aborts the
- * WHOLE cook on SVM (no execution-time catch, see ecoswap/svm/README.md's
+ * WHOLE cook on SVM (no execution-time catch, see the consuming app SVM README's
  * settled parity verdicts), so this MUST be a quote-time clamp, not a
  * runtime guard. `emitQuoteCall`'s redeem branch reads `vault`'s LIVE SPL
  * balance (the same `accountUint` pattern as every other family's reserve

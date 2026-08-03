@@ -604,7 +604,7 @@ const POW_FOUR = 4n * STABBLE_ONE;
 // in weighted_math.rs that DOES special-case to an exact integer power
 // (ONE/TWO/THREE/FOUR), and measured (not merely reasoned about) against the
 // general path at REALISTIC trade sizes via a real cook against the deployed
-// program (see ecoswap-svm.stabble-weighted.e2e.test.ts) — Stabble's own
+// program (see the consuming app stabble-weighted e2e test) — Stabble's own
 // fixed-point powf loses most of its 30 fractional bits to leading nines
 // when a trade is a tiny fraction of the pool, so at THAT (unrealistic,
 // sub-0.0001%) extreme it can occasionally exceed the true value by low

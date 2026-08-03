@@ -201,12 +201,12 @@ export const scorch = {
     const assetConfigBStr = SCORCH_ASSET_CONFIGS[mintB];
     if (assetConfigAStr === undefined) {
       throw new Error(
-        `scorch pool ${pool}: no known AssetConfig for mint ${mintA} — refresh ecoswap/svm/venues/scorch-asset-configs.ts`,
+        `scorch pool ${pool}: no known AssetConfig for mint ${mintA} — refresh the consuming app scorch-asset-configs venue module`,
       );
     }
     if (assetConfigBStr === undefined) {
       throw new Error(
-        `scorch pool ${pool}: no known AssetConfig for mint ${mintB} — refresh ecoswap/svm/venues/scorch-asset-configs.ts`,
+        `scorch pool ${pool}: no known AssetConfig for mint ${mintB} — refresh the consuming app scorch-asset-configs venue module`,
       );
     }
 

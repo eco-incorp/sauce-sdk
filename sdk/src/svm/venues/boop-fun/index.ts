@@ -28,7 +28,7 @@
  * plumbing is needed for `fetchPoolConfig` itself; only DISCOVERY (finding a candidate pool
  * address for a requested mint pair) needs the forward PDA derivation, because the account has no
  * second stored mint to memcmp against (the quote side is always native SOL) — see
- * `withBoopFunDiscovery` in the recipes repo's `ecoswap/svm/discovery.ts`.
+ * `withBoopFunDiscovery` in the recipes repo's `the consuming app SVM discovery module`.
  *
  * TWO CURVE FORMULAS SHARE ONE ACCOUNT SHAPE — `damping_term` SELECTS WHICH (the IDL's own doc
  * comment on `virtual_token_reserves`: "virtual token reserves is deprecated, we now use the xyk

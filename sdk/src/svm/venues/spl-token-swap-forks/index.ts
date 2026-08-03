@@ -32,7 +32,7 @@
  *
  * FIVE of the six are FULLY WIRED and real-CPI proven at 3+ sizes each
  * against their own real mainnet fixture pool and their own real dumped
- * binary (see test/svm/ecoswap-svm.realcpi.e2e.test.ts): token-swap-v1,
+ * binary (see the consuming app realcpi e2e test): token-swap-v1,
  * orca-v1, penguin, stepn, and (2026-08-03, see `saros`'s own doc comment
  * below for the conservative-margin resolution) saros. The remaining ONE —
  * dexlab — is WIRED (program id, discovery filter, CU entry, all exercised
@@ -353,7 +353,7 @@ export const dexlab = makeSplTokenSwapForkAdapter(
  * deployed binary in LiteSVM at 2 and 4 rungs plus three additional sizes
  * (`predicted <= realized` at every sampled size, never `===`, unlike the
  * `orca-legacy-token-swap`/`token-swap-v1`/etc. siblings this fork's math was
- * cloned from) — see test/svm/ecoswap-svm.realcpi.e2e.test.ts's `saros`
+ * cloned from) — see the consuming app realcpi e2e test's `saros`
  * describeWith block in sauce-recipes.
  */
 export const SAROS_PROGRAM_ID = 'SSwapUtytfBdBn1b9NUGG6foMVPtcWgpRU32HToDUZr' as Address;

@@ -272,7 +272,7 @@ function emitBinWalk(p: string, swapForY: boolean, x: string, v: { rm: string; o
  * cumulative grid to be NON-DECREASING across rungs, or `remaining = x - wcb`
  * underflows. That is genuinely enforced, not merely conventional — the consumer
  * validates its shift schedule and rejects any increasing shift entry
- * (`validateShiftSchedule`, sauce-recipes `ecoswap/svm/solver-reference.ts`,
+ * (`validateShiftSchedule`, sauce-recipes `the consuming app SVM reference solver`,
  * the schedule validator; grep the symbol, line numbers move). An earlier
  * revision of this doc asserted monotonicity as self-evident, which left the
  * whole argument resting on an unnamed guarantee. EQUAL consecutive grid points

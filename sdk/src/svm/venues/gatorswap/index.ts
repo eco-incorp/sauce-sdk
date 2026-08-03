@@ -43,7 +43,7 @@
  *                   sampled pool) — plausibly flags/version, NOT confirmed
  *                   stable across pools (only one pool sampled), so this
  *                   adapter's discovery filter does NOT key on it (see
- *                   ecoswap/svm/discovery.ts's SVM_FAMILY_FILTERS entry).
+ *                   the consuming app SVM discovery module's SVM_FAMILY_FILTERS entry).
  *   MINT_A_OFFSET (8, 32 bytes)  : the pool's first mint (the non-SOL side
  *                   on the sampled pool, e.g. a pump.fun-launched token).
  *   MINT_B_OFFSET (40, 32 bytes) : the pool's second mint (wSOL on the
@@ -92,7 +92,7 @@
  * 50 bps is comfortably inside the safe region while staying far below the
  * ~100 bps+ margin that would materially under-quote a venue whose real
  * fee is empirically close to PumpSwap's own (typically 25-30 bps total).
- * See recipes' test/svm/ecoswap-svm.gatorswap.oracles.test.ts for the exact
+ * See the consuming app gatorswap oracles test for the exact
  * fixture-backed assertion (modeled <= real at every probed size/direction,
  * with a floor on the safety margin so this never regresses to a hair's
  * width). depthReserves uses the pool's OWN vault balances (the true
@@ -157,7 +157,7 @@
  * unresolved named refs rather than guessed addresses.
  *
  * ── CU (measured 2026-07-31 on LiteSVM against the real engine.so, SPL-
- * transfer stand-in per the recipe's ecoswap-svm.cu.e2e.test.ts's method —
+ * transfer stand-in per the consuming app cu e2e test's method —
  * see the consuming recipe's budget.ts's CU_FAMILIES entry for the fitted
  * slot/rung coefficients) ──
  */

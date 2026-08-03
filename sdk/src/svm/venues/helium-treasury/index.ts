@@ -14,7 +14,7 @@
  * 2026-07-31) to receive a proportional share of the subDAO's HNT treasury, on a
  * deterministic bonding curve. There is NO reverse instruction on this program (minting
  * a subDAO token is a completely different program/flow) — `applyDirection` (recipe
- * side, `ecoswap/svm/index.ts`'s `FAMILIES['helium-treasury']`) rejects anything but the
+ * side, `the consuming app SVM solver entry`'s `FAMILIES['helium-treasury']`) rejects anything but the
  * one real direction.
  *
  * ── The curve (`programs/treasury-management/src/curve.rs`) ──
@@ -112,7 +112,7 @@
  * here. MEASURED (real `simulateTransaction`, `sigVerify:false`, against the deployed
  * programs, 2026-07-31 — 6 real probes, 3 sizes on EACH pool): 117,051-122,704 CU for
  * the WHOLE top-level `treaf4wWBBty3fHdyBpo35Mz84M8k3heKXmjmi9vFt5` invocation (which
- * subsumes both nested CPI programs) — see the recipes repo's `ecoswap/svm/budget.ts`'s
+ * subsumes both nested CPI programs) — see the recipes repo's `the consuming app SVM CU-budget module`'s
  * `CU_FAMILIES['helium-treasury']` for how that measurement becomes the CU pin.
  */
 import { address, getAddressCodec, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';

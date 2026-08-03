@@ -127,7 +127,7 @@ export interface SvmVenueLadder {
    * Default quote-ladder rungs for a slot of this family (the codegen input;
    * the CU budgeter may override per slot). Absent = 4 (the CP default);
    * stable families declare 2 — a Newton quote costs ~2 orders of magnitude
-   * more CU than a CP quote, see recipes/ecoswap/svm/budget.ts.
+   * more CU than a CP quote, see the consuming app SVM CU-budget module.
    */
   defaultRungs?: number;
   /**

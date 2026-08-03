@@ -139,7 +139,7 @@
  * reference this integration does not have, not more reserve-reading.
  *
  * KNOWN OPEN ISSUE: the real-CPI LiteSVM cell for this family
- * (test/svm/ecoswap-svm.realcpi.e2e.test.ts's `alphaq quadrilateral`)
+ * (the consuming app realcpi e2e test's `alphaq quadrilateral`)
  * currently fails `InvalidAccountOwner` at ~5,010 CU inside AlphaQ's own
  * execution, DESPITE the identical account list/instruction format being
  * independently proven correct on REAL mainnet via two separate methods (a
@@ -253,7 +253,7 @@ let primePromise = null;
  * beyond "no new markets discovered this run" — the static table still
  * serves every market known at integration time.
  *
- * NOT auto-wired into `ecoswap/svm/discovery.ts`'s gPA sweep (deliberately —
+ * NOT auto-wired into `the consuming app SVM discovery module`'s gPA sweep (deliberately —
  * it would add one extra getProgramAccounts call to EVERY discovery sweep for
  * a table that is already complete for every market that exists today). A
  * caller with its own boot sequence (the api, a CLI, a future cron) should

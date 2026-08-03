@@ -382,7 +382,7 @@ function ladderWalk(live: D1sLive, grid: readonly bigint[]): LadderWalkResult {
 export const meteoraDammV1StableLadder = {
   slug: SLUG,
 
-  /** Stable slots default to 2 rungs (cap 4) — see recipes/ecoswap/svm/budget.ts. */
+  /** Stable slots default to 2 rungs (cap 4) — see the consuming app SVM CU-budget module. */
   defaultRungs: 2,
 
   shapeKey(): string {

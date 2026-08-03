@@ -39,7 +39,7 @@
  * SIGNED ARITHMETIC: the engine has no native signed divide/compare (the
  * 'svm' target shares v12's postfix opcode table — see svm-profile.ts — and
  * v12 numbers are plain unsigned words; existing signed deltas elsewhere in
- * this codebase, e.g. ecoswap.lens.sauce.ts's int128 liquidityNet, are
+ * this codebase, e.g. the consuming app.lens.sauce.ts's int128 liquidityNet, are
  * handled the same way: sign-extend a raw two's-complement read into an
  * explicit (magnitude, negFlag) pair, then do the down-stream add/sub/mul/div
  * on magnitudes with the negFlag combined by hand). The five signed i64 cfg

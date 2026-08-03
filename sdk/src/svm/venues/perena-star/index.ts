@@ -112,7 +112,7 @@
  * ALREADY-halted pool (protocol-wide `is_halted`) so a permanently-dead
  * tranche never enters the universe at all; the direction-specific flags are
  * snapshotted onto the config and re-checked in the family's `gate` hook
- * (ecoswap/svm/index.ts) as the same belt-and-suspenders prepare-time
+ * (the consuming app SVM solver entry) as the same belt-and-suspenders prepare-time
  * shortcut every other family's activation gate uses.
  *
  * ACCOUNTS — both instructions take a SINGLE `u64` arg (`amount`/`shares`)

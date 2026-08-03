@@ -24,7 +24,7 @@
  * band still holds) and then FALLS to 0 for any x > C, instead of staying at
  * `qRaw(C)`. Differencing that pointwise curve across a ladder rung that
  * straddles `C` manufactures a NEGATIVE `dOut` — a real, engine-measured
- * defect (see ecoswap/svm test suite): the off-chain plain-bigint mirror and
+ * defect (see the consuming app SVM code test suite): the off-chain plain-bigint mirror and
  * the on-chain u256-wrapping merge read that negative delta differently (a
  * negative bigint vs. a huge wrapped unsigned word), so the two elect
  * DIFFERENT rungs from the SAME ladder — the reference quote promises an

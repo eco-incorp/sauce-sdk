@@ -36,7 +36,7 @@ function ampRampLines(cfg, slot) {
 }
 export const stabbleStableSwapLadder = {
     slug: SLUG,
-    /** 2-rung default (stable-kind pools budget for a heavier per-rung Newton) — see recipes/ecoswap/svm/budget.ts. */
+    /** 2-rung default (stable-kind pools budget for a heavier per-rung Newton) — see the consuming app SVM CU-budget module. */
     defaultRungs: 2,
     shapeKey(base) {
         const cfg = stableCfg(base);

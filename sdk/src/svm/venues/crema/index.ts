@@ -109,7 +109,7 @@
  * A genuinely venue-specific-FEELING but actually general mechanism worth
  * recording for whoever next builds a synthetic-state CLMM harness (found
  * while validating bToA above, off the committed test path — this repo's
- * shipped real-CPI lane, ecoswap-svm.realcpi.e2e.test.ts, only exercises this
+ * shipped real-CPI lane, the consuming app realcpi e2e test, only exercises this
  * venue's aToB direction, matching every sibling venue cell there): crediting
  * a native-mint (wSOL) OUTPUT account during a real swap CPI moves REAL
  * LAMPORTS out of the vault (not just the SPL "amount" data field the way a

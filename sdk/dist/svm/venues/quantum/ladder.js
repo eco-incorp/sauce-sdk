@@ -221,7 +221,7 @@ export const quantumLadder = {
      * 2 rungs. The setup is a bounded 16-level live read and each rung's walk
      * carries one 64-step partial inversion, so a quantum slot is a
      * degrade-first family like manifest/whirlpool (see
-     * recipes/ecoswap/svm/budget.ts). The walk is exact at every point, so a
+     * the consuming app SVM CU-budget module). The walk is exact at every point, so a
      * coarser rung grid costs split quantization, never correctness.
      */
     defaultRungs: 2,

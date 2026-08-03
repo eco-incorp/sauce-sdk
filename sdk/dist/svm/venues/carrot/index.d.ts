@@ -48,7 +48,7 @@ export interface CarrotDirection {
     assetId: number;
 }
 export declare function parseCarrotDirection(direction: string): CarrotDirection;
-/** Every `issue:<id>` / `redeem:<id>` direction the fetched vault currently offers, in asset order — the multi-direction dispatch `resolveSvmPoolSpec` tries (see `ecoswap/svm/index.ts`). */
+/** Every `issue:<id>` / `redeem:<id>` direction the fetched vault currently offers, in asset order — the multi-direction dispatch `resolveSvmPoolSpec` tries (see `the consuming app SVM solver entry`). */
 export declare function carrotAllDirections(cfg: PoolConfig): string[];
 export declare const carrot: {
     slug: "carrot";

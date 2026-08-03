@@ -78,7 +78,7 @@
  * the merge simply doesn't over-elect this slot's share past what the real
  * CPI would actually pay out.
  *
- * ── CU ── see `../../../../ecoswap/svm/budget.ts`'s (sauce-recipes)
+ * ── CU ── see `../../../../the consuming app SVM CU-budget module`'s (sauce-recipes)
  * `CU_FAMILIES['saber-decimals-wrapper']` for the measured coefficients —
  * this SDK package carries the adapter only, not the recipe's own CU model.
  */

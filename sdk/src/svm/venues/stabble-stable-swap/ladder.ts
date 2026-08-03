@@ -20,7 +20,7 @@
  * MEASURED, NOT GUESSED: an earlier COLD-every-rung version of this file (no
  * warm-start — every rung and the final quote re-ran BOTH Newton loops from
  * scratch) measured OVER Solana's 1.4M-CU transaction cap at just 2 rungs on
- * LiteSVM (test/svm/ecoswap-svm.cu.e2e.test.ts in sauce-recipes) — a correct
+ * LiteSVM (the consuming app cu e2e test in sauce-recipes) — a correct
  * but unusably expensive design. Warm-starting is REQUIRED here, not merely
  * an optimization.
  *
@@ -101,7 +101,7 @@ function ampRampLines(cfg: StabbleStableSwapPoolConfig, slot: number): string[] 
 export const stabbleStableSwapLadder = {
   slug: SLUG,
 
-  /** 2-rung default (stable-kind pools budget for a heavier per-rung Newton) — see recipes/ecoswap/svm/budget.ts. */
+  /** 2-rung default (stable-kind pools budget for a heavier per-rung Newton) — see the consuming app SVM CU-budget module. */
   defaultRungs: 2,
 
   shapeKey(base: PoolConfig): string {

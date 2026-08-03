@@ -316,9 +316,9 @@ export function hyloGate(cfg, now) {
 }
 /**
  * Recoverable live-state drift (pause / stale-or-low-confidence oracle) between discovery and
- * prepare — the SAME class `ecoswap/svm/index.ts`'s own `SvmWindowDriftError` names (that class
+ * prepare — the SAME class `the consuming app SVM solver entry`'s own `SvmWindowDriftError` names (that class
  * is private to index.ts, so this venue module carries an identically-treated local marker;
- * `ecoswap/svm/index.ts`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
+ * `the consuming app SVM solver entry`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
  * self-drop classification stays centralized there).
  */
 export class SvmHyloDriftError extends Error {
