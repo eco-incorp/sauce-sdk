@@ -1,21 +1,22 @@
 # SVM venue facts
 
-Normative reference for the **12 venue adapters** in `sdk/src/svm/venues/` — **seven v1 (solswap)
-adapters** (raydium-cp-swap, raydium-amm-v4, pumpswap, orca-legacy-token-swap, meteora-damm-v2,
-saber-stableswap, meteora-damm-v1-stable) plus **five ladder-only EcoSwapSVM v2 families**: the
-tick-walk CLMMs orca-whirlpool and raydium-clmm, the bin-walk meteora-dlmm, the CLOB manifest, and
-the oracle-anchored prop-AMM obric-v2. Every byte offset, quote formula, rounding rule, gate and
-pinned constant that the adapters and their test suites cite lives here. The adapters were written
-against the venues' published sources and deployed mainnet binaries; this document is regenerated
-from that code and its fixtures and is the companion the adapter doc comments point at. The
-EcoSwapSVM recipe that composes these adapters into one atomic multi-venue split is documented in
-`sdk/src/recipes/ecoswap/svm/README.md`.
+Normative reference for the SVM venue adapters in `sdk/src/svm/venues/`. Two registries live in
+`registry.ts`: the **swap adapters** (`SvmVenueAdapter`, looked up by `venueAdapter(slug)`), which
+build a single pool's swap instruction and its pointwise quote; and the larger, contract-guarded
+**quote-ladder registry** (`SvmVenueLadder`, looked up by `ladderVenueAdapter(slug)`) — the families
+the multi-venue split routes and quotes through, each proven against a real mainnet fixture by
+`test/svm/venues/ladder-contract.test.ts`. Most families implement only the quote-ladder surface;
+the simple constant-product/stable ones implement both. Every byte offset, quote formula, rounding
+rule, gate and pinned constant that the adapters and their test suites cite lives here. The adapters
+were written against the venues' published sources and deployed mainnet binaries; this document is
+the companion the adapter doc comments point at. The multi-venue split recipe that composes these
+adapters into one atomic transaction lives in the consuming application, not in this SDK.
 
 ## How quoting works
 
 Solana has no view functions, so the recipe quotes **inside the VM**: each venue's pool
 state accounts are attached to the execute instruction **read-only**, and the adapter's
-`emitQuote` fragment (v1) / `emitQuoteCall` + `emitLadderQuote` (the ladder-only v2 families) reads
+`emitQuote` fragment (swap adapters) / `emitQuoteCall` + `emitLadderQuote` (quote-ladder families) reads
 live fields with `accountUint(ref, offset, width)` — a little-endian unsigned read, mirrored
 off-chain by `readUintLE` in `sdk/src/svm/venues/math.ts`. All venues are pure little-endian;
 big-endian never occurs. Anything that is a compile-time constant
@@ -42,13 +43,13 @@ under `sdk/test/svm/fixtures/<slug>/` as `{ address, owner, base64Data }`.
 ## Exclusions
 
 - **CLMM / BIN venues**: quoting requires a tick/bin walk across a data-dependent account set, which
-  does not fit the one-adapter-one-pool v1 shape — no v1 adapter for any of them. **Orca Whirlpools
-  and Raydium CLMM (tick walks) and Meteora DLMM (bin walk) are covered as LADDER-ONLY families**
-  (adapter contract v2, EcoSwapSVM — see their sections below).
+  does not fit the one-pool swap-adapter shape — no swap adapter for any of them. **Orca Whirlpools
+  and Raydium CLMM (tick walks) and Meteora DLMM (bin walk) are covered as quote-ladder families**
+  (see their sections below).
 - **CLOB venues**: an order-book quote is a best-first tree walk over resting orders, likewise
-  data-dependent and unfit for the v1 shape. **Manifest is covered as a LADDER-ONLY family**
-  (adapter contract v2 — see its section below); other CLOBs (Phoenix, OpenBook) are future
-  candidates on the same order-window pattern.
+  data-dependent and unfit for the swap-adapter shape. **Manifest, OpenBook v2 and Phoenix are
+  covered as quote-ladder families** (see their sections below), each a monotone, saturating
+  order-book walk.
 - **Proprietary AMMs** (SolFi, HumidiFi, BisonFi, ZeroFi, Tessera, AlphaQ, GoonFi, Aquifer, ...):
   ~50% of SOL–stable volume, mostly closed-source. Their integrability is NOT uniform — the barrier
   is layout/CPI-acceptance, not READING (reads are permissionless). A prepare-time CPI-acceptance
@@ -506,8 +507,8 @@ authority `JU8kmKzDHF9sXWsnoznaFDFezLsE5uomX2JkRMbmsQP` (derivation verified:
 
 ## orca-whirlpool (ladder-only)
 
-Orca Whirlpools CLMM — the first tick-walk family, EcoSwapSVM adapter contract v2 ONLY (no v1
-adapter, not in the v1 registry: the account set depends on the price path). Program
+Orca Whirlpools CLMM — the first tick-walk family, a quote-ladder family only (no swap
+adapter, not in the swap registry: the account set depends on the price path). Program
 `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc`; source-verified against
 `github.com/orca-so/whirlpools` `programs/whirlpool/src` (state/{whirlpool,tick,
 fixed_tick_array}.rs, math/{tick_math,token_math,bit_math,swap_math}.rs,
@@ -643,8 +644,8 @@ direct port of the whirlpool sources (`test/svm/venues/orca-whirlpool.test.ts` h
 
 ## manifest (ladder-only)
 
-Manifest CLOB — the first order-book family, EcoSwapSVM adapter contract v2 ONLY (no v1
-adapter, not in the v1 registry: the account set is one market, but the quote is a tree walk).
+Manifest CLOB — the first order-book family, a quote-ladder family only (no swap
+adapter, not in the swap registry: the account set is one market, but the quote is a tree walk).
 Program `MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms`; source-verified against
 `github.com/CKS-Systems/manifest` `programs/manifest/src` (state/{market,resting_order}.rs,
 program/{instruction,processor/swap}.rs, quantities.rs) + `lib/src/red_black_tree.rs`, and a
@@ -776,7 +777,7 @@ venue's taker math (`test/svm/venues/manifest.test.ts` header), K = 16 shipped l
 
 ## raydium-clmm (ladder-only)
 
-Raydium concentrated liquidity — the second tick-walk family, EcoSwapSVM adapter contract v2 ONLY
+Raydium concentrated liquidity — the second tick-walk family, a quote-ladder family only
 (no v1 adapter). Program `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`; source-verified against
 `github.com/raydium-io/raydium-clmm` `programs/amm/src` (states/{pool,tick_array,config,pool_fee}.rs,
 libraries/{tick_math,sqrt_price_math,liquidity_math,swap_math}.rs, instructions/swap.rs) and a
@@ -861,7 +862,7 @@ the lamport-exact engine gate:
 
 ## meteora-dlmm (ladder-only)
 
-Meteora DLMM / Liquidity Book — the first BIN family, EcoSwapSVM adapter contract v2 ONLY. Program
+Meteora DLMM / Liquidity Book — the first BIN family, a quote-ladder family only. Program
 `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`; source-verified against `github.com/MeteoraAg/dlmm-sdk`
 (idls/dlmm.json + commons/src/{quote,extensions/{bin,lb_pair},math/*}.rs) and a mainnet dump
 (`sdk/test/svm/fixtures/meteora-dlmm/`, SOL/USDC bin_step=4 pair
@@ -1029,8 +1030,8 @@ overflow bound unconditional: sqrt prices < 2^97, so `L · sqrt_price < 2^225`,
 `amount_in << 128 < 2^192` — all below the engine's 2^256 wrap, no `Math.mulDiv` needed (a
 band-violating bToA `sp · next` may wrap, but every such quote is clamped to 0 before use).
 
-**v1 (`emitQuote`/`referenceQuote`, the best-of-N solswap surface) vs v2 (the EcoSwapSVM ladder
-fragment, `ladder.ts`)** quote the SAME formula above but differ past the band: v1 stays
+**The swap-adapter surface (`emitQuote`/`referenceQuote`) vs the quote-ladder
+fragment (`ladder.ts`)** quote the SAME formula above but differ past the band: v1 stays
 clamped-to-0 (correct there — solswap compares ONE quote per venue at a fixed amount, never
 differences a grid, and a full-amount CPI past the band would revert anyway, so losing the
 election is the right outcome). The v2 ladder instead SATURATES: `emitLadderQuote`/
@@ -1041,7 +1042,7 @@ directly, bToA inverts `next(din) <= sqrt_max_price` in fee-adjusted `din`-space
 `referenceCapacities` fold each ladder rung's `dIn` to `min(x, C)` too. A raw pointwise
 clamp-to-0 differenced across a rung that straddles `C` manufactures a negative `dOut`, which the
 plain-bigint mirror and the on-chain u256-wrapping merge read differently — a real, engine-measured
-gate divergence (see `ecoswap/svm` in the recipes repo). Saturating instead keeps the ladder
+gate divergence (see the consuming app's SVM merge logic). Saturating instead keeps the ladder
 non-decreasing, matching the adapter contract every other capacity-aware ladder family
 (orca-whirlpool/raydium-clmm/meteora-dlmm/manifest) already implements.
 
@@ -1430,14 +1431,14 @@ drops out of the relative-depth filter (vault-balance depth = 0).
 ### Pinned worked example
 
 Mainnet 27G8/USDC pool `AJ5HfGY32igLgUbDtfNRdrkjTSYkCVKdhmnFFfcZMJ1E`
-(`sdk/test/svm/ecoswap-svm.fixtures.ts` `OBRIC_FIXTURES`, real dump) — decoded layout: `bigK`
+(the obric-v2 fixture `OBRIC_FIXTURES`, real dump) — decoded layout: `bigK`
 6_725_685_088_743_750_000_000_000_000, `targetX` 0, `feeMillionth` 150 (1.5 bps), classified P-A
 (12-account swap, no Instructions sysvar). The oracle scaling reproduces from the real feeds: both
 mints are 6-decimal at expo −8, so `getPrice` scales to expo −3 (`÷1e5`, decimalMult 1) → the USDC
 feed's `1e10` gives **multY = 100000**, EXACTLY the pool's stored multY (the live-derived 27G8 mult
 is 330596). Because Obric bakes the shape and reads the mid live, the quote is a closed-form
 re-anchor; on symmetric reserves `reserveX = reserveY = 1e12` (the `referenceQuote` cell in
-`ecoswap-svm.obric.oracles.test.ts`, matching the independently-transcribed `sdkQuoteXToY`):
+the obric-v2 oracle test, matching the independently-transcribed `sdkQuoteXToY`):
 
 - `targetXK = isqrt(bigK · 100000 / 330596)` = 45_104_457_861_101; `currentXK = targetXK + reserveX`
   = 46_104_457_861_101.
