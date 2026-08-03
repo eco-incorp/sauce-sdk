@@ -131,6 +131,8 @@ export { INVARIANT_PROGRAM_ID, POOL_ACCOUNT_SIZE, POOL_DISCRIMINATOR, TICK_DISCR
 export type { InvariantSwapStep, InvariantBoundary, InvariantWindow, InvariantPoolConfig } from './invariant/index.js';
 export { JUPITER_LEND_EARN_PROGRAM_ID, JUPITER_LEND_LIQUIDITY_PROGRAM_ID, LENDING_ACCOUNT_SIZE, jupiterLendEarn, jupiterLendEarnLadder } from './jupiter-lend-earn/index.js';
 export type { JupiterLendEarnPoolConfig } from './jupiter-lend-earn/index.js';
+export { LEMMINGSFI_PROGRAM_ID, LEMMINGSFI_CONFIG, STALE_AFTER_SECONDS as LEMMINGSFI_STALE_AFTER_SECONDS, lemmingsfi, lemmingsfiLadder, fetchLemmingsFiPoolConfig } from './lemmingsfi/index.js';
+export type { LemmingsFiPoolConfig } from './lemmingsfi/index.js';
 export { MERCURIAL_PROGRAM_ID, mercurial, mercurialLadder, fetchMercurialPoolConfig } from './mercurial/index.js';
 export type { MercurialPoolConfig } from './mercurial/index.js';
 export { METADAO_FUTARCHY_PROGRAM_ID, METADAO_FUTARCHY_EVENT_AUTHORITY, metadaoFutarchySpotLadder, fetchMetaDaoFutarchySpotConfig, metadaoFutarchySpotQuote } from './metadao-futarchy/index.js';

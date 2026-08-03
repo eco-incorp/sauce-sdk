@@ -79,6 +79,7 @@ export { HYLO_PROGRAM_ID, USDC_MINT, HYUSD_MINT, HYLO_ACCOUNT, USDC_PAIR_ACCOUNT
 export { HYLO_STABILITY_POOL_PROGRAM_ID, HYLO_STABILITY_POOL_CONFIG, HYLO_STABILITY_POOL_STABLECOIN_MINT, HYLO_STABILITY_POOL_LP_TOKEN_MINT, hyloStabilityPool, hyloStabilityPoolLadder } from './hylo-stability-pool/index.js';
 export { INVARIANT_PROGRAM_ID, POOL_ACCOUNT_SIZE, POOL_DISCRIMINATOR, TICK_DISCRIMINATOR, TICK_ACCOUNT_SIZE, TICKMAP_ACCOUNT_SIZE, INVARIANT_MAX_BOUNDARIES, invariant, invariantLadder, invariantSqrtPriceAtTick, invariantDeltaX, invariantDeltaY, invariantNextSqrtXUp, invariantNextSqrtYDown, invariantComputeSwapStepIn, invariantWindowFor, fetchInvariantPoolConfig } from './invariant/index.js';
 export { JUPITER_LEND_EARN_PROGRAM_ID, JUPITER_LEND_LIQUIDITY_PROGRAM_ID, LENDING_ACCOUNT_SIZE, jupiterLendEarn, jupiterLendEarnLadder } from './jupiter-lend-earn/index.js';
+export { LEMMINGSFI_PROGRAM_ID, LEMMINGSFI_CONFIG, STALE_AFTER_SECONDS as LEMMINGSFI_STALE_AFTER_SECONDS, lemmingsfi, lemmingsfiLadder, fetchLemmingsFiPoolConfig } from './lemmingsfi/index.js';
 export { MERCURIAL_PROGRAM_ID, mercurial, mercurialLadder, fetchMercurialPoolConfig } from './mercurial/index.js';
 export { METADAO_FUTARCHY_PROGRAM_ID, METADAO_FUTARCHY_EVENT_AUTHORITY, metadaoFutarchySpotLadder, fetchMetaDaoFutarchySpotConfig, metadaoFutarchySpotQuote } from './metadao-futarchy/index.js';
 export { MOONIT_PROGRAM_ID, moonit, moonitLadder, _referenceBuyForTest, _referenceSellForTest, _bakeCoefficientsForTest, _isqrtForTest } from './moonit/index.js';
