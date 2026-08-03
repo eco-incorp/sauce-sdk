@@ -119,6 +119,8 @@ export { scaleVmm, scaleVmmLadder } from './scale-vmm/index.js';
 export type { ScaleVmmPoolConfig } from './scale-vmm/index.js';
 export { SCORCH_CORE_PROGRAM_ID, SCORCH_ROUTER_PROGRAM_ID, SCORCH_HAIRCUT_PPM, scorch, scorchLadder } from './scorch/index.js';
 export type { ScorchPoolConfig } from './scorch/index.js';
+export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi, binaryfiLadder } from './binaryfi/index.js';
+export type { BinaryFiPoolConfig } from './binaryfi/index.js';
 export { SOLAYER_PROGRAM_ID, SOLAYER_SSOL_MINT, ENDO_AVS_ACCOUNT_SIZE, ENDO_AVS_DISCRIMINATOR, DELEGATE_NO_INIT_DISCRIMINATOR, UNDELEGATE_NO_INIT_DISCRIMINATOR, solayer, solayerLadder, fetchSolayerPoolConfig } from './solayer/index.js';
 export type { SolayerDirection, SolayerPoolConfig } from './solayer/index.js';
 export { SOLFI_V1_PROGRAM_ID, POOL_ACCOUNT_SIZE as SOLFI_V1_POOL_ACCOUNT_SIZE, OFF_MINT_A as SOLFI_V1_OFF_MINT_A, OFF_MINT_B as SOLFI_V1_OFF_MINT_B, OFF_VAULT_A as SOLFI_V1_OFF_VAULT_A, OFF_VAULT_B as SOLFI_V1_OFF_VAULT_B, SOLFI_V1_POOL_RATES, solfiV1Ladder, fetchSolfiV1Config } from './solfi-v1/index.js';

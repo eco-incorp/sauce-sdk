@@ -165,6 +165,8 @@ export { scaleVmm, scaleVmmLadder } from './scale-vmm/index.js';
 export type { ScaleVmmPoolConfig } from './scale-vmm/index.js';
 export { SCORCH_CORE_PROGRAM_ID, SCORCH_ROUTER_PROGRAM_ID, SCORCH_HAIRCUT_PPM, scorch, scorchLadder } from './scorch/index.js';
 export type { ScorchPoolConfig } from './scorch/index.js';
+export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi, binaryfiLadder } from './binaryfi/index.js';
+export type { BinaryFiPoolConfig } from './binaryfi/index.js';
 export { SOLAYER_PROGRAM_ID, SOLAYER_SSOL_MINT, ENDO_AVS_ACCOUNT_SIZE, ENDO_AVS_DISCRIMINATOR, DELEGATE_NO_INIT_DISCRIMINATOR, UNDELEGATE_NO_INIT_DISCRIMINATOR, solayer, solayerLadder, fetchSolayerPoolConfig } from './solayer/index.js';
 export type { SolayerDirection, SolayerPoolConfig } from './solayer/index.js';
 // solfi-v1: explicit re-export — some names collide with an existing venue's
