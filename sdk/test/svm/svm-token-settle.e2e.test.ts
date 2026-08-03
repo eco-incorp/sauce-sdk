@@ -25,7 +25,7 @@ import {
   toBigInt,
 } from './engine-harness.js';
 import type { EngineHarness } from './engine-harness.js';
-import { encodeSvmSettleCfg, svmTokenSettleSource } from '../../src/programs/index.js';
+import { svmTokenSettleSource } from '../../src/programs/index.js';
 
 const sha256 = (bytes: Uint8Array): Uint8Array => new Uint8Array(createHash('sha256').update(bytes).digest());
 
@@ -44,11 +44,11 @@ describeSvm('svm-token-settle e2e: one staged blob, every escrow/beneficiary/flo
   beforeAll(async () => {
     harness = await startEngine(1_700_000_000n);
 
-    const compiled = compile(svmTokenSettleSource(), {
+    const compiled = compile(svmTokenSettleSource(1), {
       target: 'svm',
       staged: true,
       treeshake: true,
-      args: [encodeSvmSettleCfg(0n), 0n],
+      args: [0n, 0n],
     });
     accountPlan = compiled.accountPlan;
     argsLayout = compiled.argsLayout;
@@ -72,16 +72,16 @@ describeSvm('svm-token-settle e2e: one staged blob, every escrow/beneficiary/flo
     const accounts = resolveAccounts(
       accountPlan!,
       {
-        tokenProgram: params.tokenProgramAccount,
-        escrow: params.escrow,
-        beneficiary: params.beneficiary,
+        tokenProgram0: params.tokenProgramAccount,
+        escrow0: params.escrow,
+        beneficiary0: params.beneficiary,
         owner: { address: params.owner, signer: harness.payer },
       },
       harness.payer.address,
     );
     return executeStaged(harness, buffer, accounts, {
       pin,
-      args: { layout: argsLayout!, values: [encodeSvmSettleCfg(params.minOut), params.tokenProgramScalar] },
+      args: { layout: argsLayout!, values: [params.minOut, params.tokenProgramScalar] },
     });
   };
 
@@ -112,7 +112,7 @@ describeSvm('svm-token-settle e2e: one staged blob, every escrow/beneficiary/flo
       await run({ escrow, beneficiary, owner, minOut: 1_000_001n, tokenProgramScalar: TOKENKEG, tokenProgramAccount: TOKENKEG_ADDR }),
     );
 
-    expect(Buffer.from(result.revertData).toString('utf8')).toBe('settle: balance below minOut');
+    expect(Buffer.from(result.revertData).toString('utf8')).toBe('sweep: balance below minOut');
     expect(tokenAmount(harness, escrow)).toBe(1_000_000n);
     expect(tokenAmount(harness, beneficiary)).toBe(0n);
   });

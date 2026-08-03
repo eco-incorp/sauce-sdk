@@ -20,11 +20,9 @@ import { readFileSync } from 'fs';
 import { basename, resolve } from 'path';
 import { compile } from '../../compiler/dist/index.js';
 import {
-  SVM_SETTLE_CFG_BYTES,
-  SVM_TOKEN_SETTLE_REFS,
+  SVM_MAX_ESCROWS,
+  svmTokenSettleRefs,
   SVM_TOKEN_SETTLE_SOURCE_PATH,
-  decodeSvmSettleCfg,
-  encodeSvmSettleCfg,
   svmTokenSettleSource,
 } from '../src/programs/index.js';
 
@@ -32,52 +30,75 @@ const TOKENKEG = 0x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff0
 const TOKEN_2022 = 0x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfcn;
 
 /** THE SNIPPET — kept verbatim-equivalent to the one in `programs/index.ts`'s docstring. */
-function partnerCompile(minOut: bigint, tokenProgram: bigint) {
-  return compile(svmTokenSettleSource(), {
+function partnerCompile(minOut: bigint, tokenPrograms: bigint[] = [TOKENKEG]) {
+  return compile(svmTokenSettleSource(tokenPrograms.length), {
     target: 'svm',
     staged: true,
     treeshake: true,
-    args: [encodeSvmSettleCfg(minOut), tokenProgram],
+    args: [minOut, ...tokenPrograms],
   });
 }
 
 describe('svm settle — partner reproducibility', () => {
   it('the documented snippet compiles: real bytecode, accountPlan, and argsLayout', () => {
-    const { bytecode, accountPlan, argsLayout } = partnerCompile(0n, TOKENKEG);
+    const { bytecode, accountPlan, argsLayout } = partnerCompile(0n);
     expect(bytecode[0]!.length).toBeGreaterThan(0);
     expect(accountPlan).toBeDefined();
     expect(argsLayout).toBeDefined();
   });
 
-  it('the account plan is exactly the four documented refs, in order, with no raw indices', () => {
-    const { accountPlan } = partnerCompile(0n, TOKENKEG);
+  it('N=1: the account plan is exactly the four documented refs, in order, with no raw indices', () => {
+    const { accountPlan } = partnerCompile(0n);
     expect(accountPlan!.usesRawIndices).toBeFalsy();
     expect(accountPlan!.metas.map((m) => [m.ref, !!m.writable, !!m.signer])).toEqual([
-      ['tokenProgram', false, false],
-      ['escrow', true, false],
-      ['beneficiary', true, false],
+      ['tokenProgram0', false, false],
+      ['escrow0', true, false],
+      ['beneficiary0', true, false],
       ['owner', false, true],
     ]);
-    expect(Object.values(SVM_TOKEN_SETTLE_REFS)).toEqual(['tokenProgram', 'escrow', 'beneficiary', 'owner']);
   });
 
-  it('the args layout is exactly [cfg: 8 bytes @0, tokenProgram: scalar @8], programLength matching the bytecode', () => {
-    const { bytecode, argsLayout } = partnerCompile(0n, TOKENKEG);
+  it('★ svmTokenSettleRefs(n) matches the compiled AccountPlan order for every n', () => {
+    // Refs intern on FIRST USE, so `owner` sits after escrow0/beneficiary0 rather than last. A
+    // caller builds its AccountResolution from svmTokenSettleRefs, so a wrong order here would land
+    // accounts in the wrong slots — pinned against a real compile rather than asserted by eye.
+    for (const n of [1, 2, 3, 5]) {
+      const { accountPlan } = partnerCompile(0n, Array.from({ length: n }, () => TOKENKEG));
+      expect(accountPlan!.metas.map((m) => m.ref)).toEqual(svmTokenSettleRefs(n));
+    }
+  });
+
+  it('each escrow sweeps via its OWN token program — mixed classic/Token-2022 is expressible', () => {
+    const { accountPlan } = partnerCompile(0n, [TOKENKEG, TOKEN_2022]);
+    expect(accountPlan!.metas.map((m) => m.ref)).toEqual(svmTokenSettleRefs(2));
+    // two distinct program refs, so the two escrows can CPI into different token programs
+    expect(svmTokenSettleSource(2)).toContain('contract.call(tokenProgram0');
+    expect(svmTokenSettleSource(2)).toContain('contract.call(tokenProgram1');
+  });
+
+  it('escrowCount is validated', () => {
+    for (const bad of [0, -1, 1.5, SVM_MAX_ESCROWS + 1]) {
+      expect(() => svmTokenSettleSource(bad)).toThrow();
+      expect(() => svmTokenSettleRefs(bad)).toThrow();
+    }
+  });
+
+  it('minOut is a plain SCALAR arg — no packed cfg blob, mirroring the EVM twin`s minOut parameter', () => {
+    const { bytecode, argsLayout } = partnerCompile(0n);
     expect(argsLayout!.mode).toBe('calldata');
     expect(argsLayout!.programLength).toBe(bytecode[0]!.length);
-    expect(argsLayout!.byteLength).toBe(8 + 32);
     expect(argsLayout!.slots).toEqual([
-      { arg: 0, kind: 'bytes', offset: 0, length: SVM_SETTLE_CFG_BYTES },
-      { arg: 1, kind: 'scalar', offset: 8, length: 32 },
+      { arg: 0, kind: 'scalar', offset: 0, length: 32 },
+      { arg: 1, kind: 'scalar', offset: 32, length: 32 },
     ]);
   });
 
   it('★ ONE canonical blob for every floor / token program — the genericity claim, asserted', () => {
     const variants = [
-      partnerCompile(0n, 0n),
-      partnerCompile(12345n, 0n),
-      partnerCompile(0n, TOKENKEG),
-      partnerCompile(0n, TOKEN_2022),
+      partnerCompile(0n, [0n]),
+      partnerCompile(12345n, [0n]),
+      partnerCompile(0n, [TOKENKEG]),
+      partnerCompile(0n, [TOKEN_2022]),
     ];
     const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
     const bodies = new Set(variants.map((v) => hex(v.bytecode[0]!)));
@@ -88,40 +109,11 @@ describe('svm settle — partner reproducibility', () => {
 describe('svm settle — the shipped program source', () => {
   it('svmTokenSettleSource() returns the exact on-disk svm-token-settle.sauce.ts', () => {
     const onDisk = readFileSync(resolve(process.cwd(), 'src/programs/svm-token-settle.sauce.ts'), 'utf-8');
-    expect(svmTokenSettleSource()).toBe(onDisk);
+    expect(svmTokenSettleSource(1)).toBe(onDisk);
   });
 
   it('SVM_TOKEN_SETTLE_SOURCE_PATH names the right file and it exists', () => {
     expect(basename(SVM_TOKEN_SETTLE_SOURCE_PATH)).toBe('svm-token-settle.sauce.ts');
     expect(readFileSync(SVM_TOKEN_SETTLE_SOURCE_PATH, 'utf-8').length).toBeGreaterThan(0);
-  });
-});
-
-describe('svm settle — cfg codec', () => {
-  it('round-trips u64 values', () => {
-    for (const v of [0n, 1n, 12345n, 2n ** 64n - 1n]) {
-      expect(decodeSvmSettleCfg(encodeSvmSettleCfg(v)).minOut).toBe(v);
-    }
-  });
-
-  it('rejects out-of-u64-range minOut on encode', () => {
-    expect(() => encodeSvmSettleCfg(-1n)).toThrow();
-    expect(() => encodeSvmSettleCfg(2n ** 64n)).toThrow();
-  });
-
-  it('rejects malformed-length cfg on decode', () => {
-    expect(() => decodeSvmSettleCfg(new Uint8Array(7))).toThrow();
-    expect(() => decodeSvmSettleCfg(new Uint8Array(9))).toThrow();
-    expect(() => decodeSvmSettleCfg(('0x' + '00'.repeat(7)) as `0x${string}`)).toThrow();
-  });
-
-  it('pins the byte order independently of the encoder: LE fixture 0x3930000000000000 -> 12345n', () => {
-    expect(decodeSvmSettleCfg('0x3930000000000000').minOut).toBe(12345n);
-  });
-
-  it('accepts raw Uint8Array input identically to 0x-hex', () => {
-    const encoded = encodeSvmSettleCfg(999n);
-    const bytes = new Uint8Array(Buffer.from(encoded.slice(2), 'hex'));
-    expect(decodeSvmSettleCfg(bytes)).toEqual(decodeSvmSettleCfg(encoded));
   });
 });
