@@ -770,7 +770,7 @@ export const invariantLadder: SvmVenueLadder = {
     for (let k = 0; k < window.boundaries.length; k++) {
       lines.push(`      if (${v.ex} === 0 && ${v.rm} > 0 && ${p}ok${k} !== 0) {`, ...emitWalkStep(p, xToY, k, v, '        '), `      }`);
     }
-    lines.push(`      if (${v.ex} === 0 && ${v.rm} === 0) { ${outVar} = ${v.out}; }`, `    }`, `  }`);
+    lines.push(`      ${outVar} = ${v.out};`, `    }`, `  }`);
     return lines.join('\n');
   },
   buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
@@ -814,7 +814,7 @@ export const invariantLadder: SvmVenueLadder = {
     const xToY = cfg.direction === 'xToY';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live);
-    return (x: bigint) => coldWalk(win, live, xToY, x) ?? 0n;
+    return (x: bigint) => coldWalkClamped(win, live, xToY, x).out;
   },
   referenceLadderQuotes(base, state, params) {
     const cfg = invariantConfig(base);
@@ -845,7 +845,12 @@ export const invariantLadder: SvmVenueLadder = {
       return grid.map((g) => {
         if (win.valid && !capped && g > 0n) {
           const clamped = coldWalkClamped(win, live, xToY, g);
-          cap = clamped.cap;
+          // Never let the reported capacity DECREASE: coldWalkClamped's `cap` can dip by a
+          // rounding unit for a larger input (walking further re-rounds), which would make the
+          // cumulative capacity non-monotonic (a negative dIn at the organic->cap boundary). The
+          // running max keeps the boundary-correct value; the residual is a single unit, always
+          // in the safe (non-negative dIn) direction.
+          cap = clamped.cap > cap ? clamped.cap : cap;
           if (clamped.cap < g) capped = true;
         }
         return cap;

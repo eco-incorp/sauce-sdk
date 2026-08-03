@@ -117,6 +117,8 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  invariantLadder,
+  fetchInvariantPoolConfig,
   USDC_PAIR_ACCOUNT,
   hyloLadder,
   hylo,
@@ -1203,6 +1205,20 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'invariant',
+    ladder: invariantLadder,
+    async variants() {
+      const POOL = address('5dX3tkVDmbHBWMCQMerAHTmd9wsRvmtKLoQt6qv9fHy7');
+      const fixtures = fixturesFor('invariant');
+      const cfg = await fetchInvariantPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'xToY', cfg, state },
+        { label: 'yToX', cfg: { ...cfg, direction: 'yToX' }, state },
+      ];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1793,8 +1809,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(76);
-    expect(FAMILIES).toHaveLength(76);
+    expect(registered).toHaveLength(77);
+    expect(FAMILIES).toHaveLength(77);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });

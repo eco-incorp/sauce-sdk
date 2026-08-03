@@ -1,4 +1,5 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { invariantLadder } from './invariant/index.js';
 import { hyloLadder } from './hylo/index.js';
 import { cropperLadder } from './cropper/ladder.js';
 import { sarosDlmmLadder } from './saros-dlmm/ladder.js';
@@ -152,6 +153,7 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [invariantLadder.slug]: invariantLadder,
     [hyloLadder.slug]: hyloLadder,
     [cropperLadder.slug]: cropperLadder,
     [sarosDlmmLadder.slug]: sarosDlmmLadder,
