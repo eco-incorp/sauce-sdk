@@ -74,6 +74,8 @@ export { CREMA_PROGRAM_ID, CLMMPOOL_ACCOUNT_SIZE, CLMMPOOL_DISCRIMINATOR, TICK_A
 export type { CremaBoundary, CremaWindow, CremaPoolConfig } from './crema/index.js';
 export { DEFITUNA_PROGRAM_ID, FUSION_POOL_ACCOUNT_SIZE, FUSION_POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR as DEFITUNA_TICK_ARRAY_DISCRIMINATOR, TICK_ARRAY_SIZE as DEFITUNA_TICK_ARRAY_SIZE, TICK_LEN_INITIALIZED, TICK_ARRAY_MIN_LEN, DEFITUNA_MAX_BOUNDARIES, defituna, defitunaLadder, defitunaWindowFor, fetchDefiTunaPoolConfig } from './defituna/index.js';
 export type { DefiTunaBoundary, DefiTunaWindow, DefiTunaPoolConfig } from './defituna/index.js';
+export { DENALI_PROGRAM_ID, DENALI_ORACLE_PROGRAM_ID, DENALI_GLOBAL_CONFIG, OFF_MINT_A as DENALI_OFF_MINT_A, OFF_MINT_B as DENALI_OFF_MINT_B, OFF_VAULT_A as DENALI_OFF_VAULT_A, OFF_VAULT_B as DENALI_OFF_VAULT_B, denali, denaliLadder, fetchDenaliPoolConfig } from './denali/index.js';
+export type { DenaliPoolConfig } from './denali/index.js';
 export { FLINT_PROGRAM_ID, FLINT_PAIR_REGISTRY, FLINT_HAIRCUT_USDT_USDC_PPM, FLINT_HAIRCUT_PUMPCMXQ_TO_USDT_PPM, FLINT_HAIRCUT_USDT_TO_PUMPCMXQ_PPM, flint, flintLadder, } from './flint/index.js';
 export type { FlintPairEntry, FlintPoolConfig } from './flint/index.js';
 export { FLUXBEAM_PROGRAM_ID, FLUXBEAM_POOL_SIZE, fluxbeam, fluxbeamLadder, fetchFluxBeamPoolConfig } from './fluxbeam/index.js';
