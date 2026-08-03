@@ -79,7 +79,7 @@ function main(minOut, splCount, tokenProgram0, tokenProgram1) {
   const floorBal = accountUint("escrow0", 64, 8);
   if (minOut > 0) {
     if (floorBal < minOut) {
-      throw "sweep: balance below minOut";
+      throw "settle: balance below minOut";
     }
   }
 

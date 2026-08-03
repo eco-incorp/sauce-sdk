@@ -85,7 +85,7 @@ function main(tokens: Address[], minOut: Uint256, recipient: Address): Uint256 {
   const floorBal: Uint256 = floorToken.balanceOf(address.self);
   if (minOut > 0) {
     if (floorBal < minOut) {
-      throw "sweep: balance below minOut";
+      throw "settle: balance below minOut";
     }
   }
   for (let i = 0; i < tokens.length; i = i + 1) {

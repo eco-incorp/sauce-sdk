@@ -126,7 +126,7 @@ describeSvm('svm settle e2e: TransferChecked sweeps, classic + Token-2022, one s
     const { escrow, dest } = mkEscrow(mint, owner, 1_000_000n, TOKEN_PROGRAM);
 
     const r = expectFail(await runOne({ escrow, mint, dest, owner, minOut: 1_000_001n, tp: TOKEN_PROGRAM }));
-    expect(Buffer.from(r.revertData).toString('utf8')).toBe('sweep: balance below minOut');
+    expect(Buffer.from(r.revertData).toString('utf8')).toBe('settle: balance below minOut');
     expect(amountOf(harness, escrow)).toBe(1_000_000n);
   });
 

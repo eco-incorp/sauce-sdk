@@ -131,7 +131,7 @@ function main(minOut, splCount, tokenProgram0, tokenProgram1) {
   const floorBal = accountUint("escrow0", ${SPL_AMOUNT_OFFSET}, 8);
   if (minOut > 0) {
     if (floorBal < minOut) {
-      throw "sweep: balance below minOut";
+      throw "settle: balance below minOut";
     }
   }
 ${Array.from({ length: escrowCount }, (_, i) => sweep(i)).join("\n")}
