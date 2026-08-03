@@ -35,12 +35,11 @@
       "types": "./sdk/dist/chains/index.d.ts",
       "default": "./sdk/dist/chains/index.js"
     },
-    "./programs": {
-      "types": "./sdk/dist/programs/index.d.ts",
-      "default": "./sdk/dist/programs/index.js"
+    "./recipes": {
+      "types": "./sdk/dist/recipes/index.d.ts",
+      "default": "./sdk/dist/recipes/index.js"
     },
-    "./programs/token-sweep.sauce.ts": "./sdk/dist/programs/token-sweep.sauce.ts",
-    "./programs/svm-token-settle.sauce.ts": "./sdk/dist/programs/svm-token-settle.sauce.ts",
+    "./recipes/settle.sauce.ts": "./sdk/dist/recipes/settle.sauce.ts",
     "./deployments": {
       "types": "./sdk/dist/deployments/index.d.ts",
       "default": "./sdk/dist/deployments/index.js"
@@ -53,6 +52,7 @@
       "types": "./sdk/dist/svm/index.d.ts",
       "default": "./sdk/dist/svm/index.js"
     },
+    "./svm/recipes/settle.sauce.ts": "./sdk/dist/svm/recipes/settle.sauce.ts",
     "./verify": {
       "types": "./sdk/dist/verify/index.d.ts",
       "default": "./sdk/dist/verify/index.js"

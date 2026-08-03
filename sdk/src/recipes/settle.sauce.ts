@@ -1,6 +1,6 @@
 import { IERC20 } from "./artifacts/IERC20.json";
 
-// token-sweep.sauce.ts — a STANDALONE, reusable Sauce program: sweep the Pot's balance of a list of
+// settle.sauce.ts — a STANDALONE, reusable Sauce program: sweep the Pot's balance of a list of
 // tokens to one recipient, with a minimum-output floor enforced on the first token.
 //
 // It is deliberately NOT tied to any recipe, protocol or product. Nothing in the program below
@@ -25,7 +25,7 @@ import { IERC20 } from "./artifacts/IERC20.json";
 // IS owning the Pot. The operator's batcher must be owner-controlled (see OwnerMulticall.sol,
 // this repo's test-only reference fixture for the shape a real deployment needs).
 //
-// COMPILED BY THE ORDINARY COMPILER — see `sdk/src/programs/index.ts` for the exact snippet and
+// COMPILED BY THE ORDINARY COMPILER — see `sdk/src/recipes/index.ts` for the exact snippet and
 // options. This file is the ONE source of truth for the program text; consumers compile it rather
 // than keeping a second copy. `sdk/src/verify/` itself is the DECODING /
 // authenticity surface (turn program bytes back into `(tokens, minOut, recipient)` and prove the

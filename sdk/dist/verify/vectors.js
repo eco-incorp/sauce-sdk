@@ -3,7 +3,7 @@ const W = "0x4200000000000000000000000000000000000006"; // Base WETH
 const Z = "0x0000000000000000000000000000000000ff00aa"; // leading-zero-byte address — THE TRAP
 /**
  * Golden wire-format vectors — the Go/Solidity/Python conformance corpus. Each `program` was
- * obtained by actually compiling `token-sweep.sauce.ts` with the given args (not hand-encoded),
+ * obtained by actually compiling `recipes/settle.sauce.ts` with the given args (not hand-encoded),
  * so it doubles as a regression pin on the compiler's emission shape. See decode.ts's module
  * docstring for the grammar these bytes instantiate.
  *

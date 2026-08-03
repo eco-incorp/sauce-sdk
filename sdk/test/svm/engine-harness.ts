@@ -47,6 +47,7 @@ export const ENGINE_SO = process.env.SAUCE_ENGINE_SO ?? resolve(process.cwd(), '
 export const describeSvm = existsSync(ENGINE_SO) ? describe : describe.skip;
 
 export const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' as Address;
+export const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' as Address;
 const ALT_PROGRAM = 'AddressLookupTab1e1111111111111111111111111' as Address;
 
 /** Slot every harness runs at (must be > the fabricated ALT's last_extended_slot 0). */
@@ -140,6 +141,41 @@ export const splTransferData = (amount: bigint): Uint8Array => {
   data[0] = 3;
   new DataView(data.buffer).setBigUint64(1, amount, true);
   return data;
+};
+
+/** SPL Token TransferChecked instruction data: u8 tag 12 + amount u64 LE + decimals u8. This is the
+ *  shape the `settle` recipe emits (via ix 12, not the legacy ix 3 above) so it is correct for
+ *  Token-2022 fee mints; the token program checks the passed decimals against the mint's own. */
+export const transferCheckedData = (amount: bigint, decimals: number): Uint8Array => {
+  const data = new Uint8Array(10);
+  data[0] = 12;
+  new DataView(data.buffer).setBigUint64(1, amount, true);
+  data[9] = decimals;
+  return data;
+};
+
+/** 82-byte SPL Mint image (identical base layout in classic SPL and Token-2022): decimals @44,
+ *  is_initialized=1 @45, authorities left as COption::None. Enough for TransferChecked, which reads
+ *  the decimals byte and requires an initialized mint. Pass `tokenProgram` = TOKEN_2022_PROGRAM to
+ *  etch a Token-2022 mint (a plain one, no extension TLV appended). */
+export const setMint = (
+  harness: EngineHarness,
+  address: Address,
+  decimals: number,
+  tokenProgram: Address = TOKEN_PROGRAM,
+): Address => {
+  const data = new Uint8Array(82);
+  data[44] = decimals;
+  data[45] = 1; // is_initialized
+  harness.svm.setAccount({
+    address,
+    data,
+    executable: false,
+    lamports: lamports(harness.svm.minimumBalanceForRentExemption(BigInt(data.length))),
+    programAddress: tokenProgram,
+    space: BigInt(data.length),
+  });
+  return address;
 };
 
 /**
