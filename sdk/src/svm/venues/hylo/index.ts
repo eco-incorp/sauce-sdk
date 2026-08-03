@@ -662,6 +662,17 @@ export const hyloLadder: SvmVenueLadder = {
     const cap = hyloRedeemCapacity(live, c.priceScale);
     return (x: bigint) => hyloRedeemOut(live, c.priceScale, x > cap ? cap : x);
   },
+  referenceCapacities(cfg, state) {
+    // Mirror of the emitted `if (cx > icap) cx = icap` clamp (emitSetup/emitLadderQuote/
+    // emitFinalQuote): icap is UNCAPPED for a mint (no cap) and the redeem capacity for a
+    // redeem, so per-grid effective input saturates at that cap. Without this, the merge
+    // would assume the raw grid input while the on-chain fragment clamps — this pairs
+    // capacityInputVar with the capacity the fragment actually consumes.
+    const c = asHyloConfig(cfg);
+    const live = liveStateFrom(state);
+    const cap = c.direction === 'aToB' ? UNCAPPED : hyloRedeemCapacity(live, c.priceScale);
+    return (grid: readonly bigint[]) => grid.map((g) => (g > cap ? cap : g));
+  },
   depthReserves(cfg, state) {
     const c = asHyloConfig(cfg);
     const live = liveStateFrom(state);

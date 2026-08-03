@@ -1,5 +1,6 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { aldrinLadder } from './aldrin/index.js';
+import { hyloLadder } from './hylo/index.js';
 import { cropperLadder } from './cropper/ladder.js';
 import { sarosDlmmLadder } from './saros-dlmm/ladder.js';
 import { pancakeswapClmmLadder } from './pancakeswap-clmm/ladder.js';
@@ -156,6 +157,7 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
   [aldrinLadder.slug]: aldrinLadder,
+  [hyloLadder.slug]: hyloLadder,
   [cropperLadder.slug]: cropperLadder,
   [sarosDlmmLadder.slug]: sarosDlmmLadder,
   [pancakeswapClmmLadder.slug]: pancakeswapClmmLadder,

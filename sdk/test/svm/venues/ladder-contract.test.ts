@@ -117,6 +117,9 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  USDC_PAIR_ACCOUNT,
+  hyloLadder,
+  hylo,
   fetchCropperConfig,
   cropperLadder,
   fetchSarosDlmmConfig,
@@ -1181,6 +1184,25 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'hylo',
+    ladder: hyloLadder,
+    async variants() {
+      // Singleton venue: POOL must be USDC_PAIR_ACCOUNT (fetchPoolConfig rejects
+      // anything else). referenceQuote/depthReserves read the UsdcPair, the
+      // USDC/USD Pyth feed, and the USDC collateral vault — all three are in the
+      // fixture. `now` is omitted: the cold quote reads no clock (pause/oracle
+      // staleness is a prepare-time-only self-drop via hyloGate).
+      const POOL = USDC_PAIR_ACCOUNT;
+      const fixtures = fixturesFor('hylo');
+      const cfg = await hylo.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1771,8 +1793,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(75);
-    expect(FAMILIES).toHaveLength(75);
+    expect(registered).toHaveLength(76);
+    expect(FAMILIES).toHaveLength(76);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
