@@ -410,7 +410,7 @@ function emitWalk(cfg, p, slot, xExpr, outVar, decl, tag, indent, isFinal) {
         `${indent}if (${p}vld !== 0 && ${xExpr} > 0) {`,
     ];
     if (baseIn) {
-        lines.push(`${indent}  let ${p}rm${tag} = ${xExpr} / ${p}bls;`, `${indent}  let ${p}out${tag} = 0; let ${p}k${tag} = 0;`, `${indent}  for (let ${p}w${tag} = 0; ${p}w${tag} < ${OPENBOOK_V2_MAX_ORDERS} && ${p}rm${tag} > 0 && ${p}k${tag} < ${p}nb; ${p}w${tag}++) {`, `${indent}    const ${p}mb${tag} = ${p}rm${tag} < ${p}sz[${p}k${tag}] ? ${p}rm${tag} : ${p}sz[${p}k${tag}];`, `${indent}    ${p}out${tag} = ${p}out${tag} + ${p}mb${tag} * ${p}pr[${p}k${tag}];`, `${indent}    ${p}rm${tag} = ${p}rm${tag} - ${p}mb${tag};`, `${indent}    ${p}k${tag} = ${p}k${tag} + 1;`, `${indent}  }`, `${indent}  const ${p}qtn${tag} = ${p}out${tag} * ${p}qls;`, `${indent}  const ${p}reb${tag} = (${p}qtn${tag} * ${p}mrp) / 1000000;`, `${indent}  ${outVar} = ${p}qtn${tag} - ${p}reb${tag};`, `${indent}  ${p}lo = ${outVar};`, `${indent}  ${p}lx = ${xExpr} - ${p}rm${tag} * ${p}bls;`);
+        lines.push(`${indent}  let ${p}rm${tag} = ${xExpr} / ${p}bls;`, `${indent}  let ${p}out${tag} = 0; let ${p}k${tag} = 0;`, `${indent}  for (let ${p}w${tag} = 0; ${p}w${tag} < ${OPENBOOK_V2_MAX_ORDERS} && ${p}rm${tag} > 0 && ${p}k${tag} < ${p}nb; ${p}w${tag}++) {`, `${indent}    const ${p}mb${tag} = ${p}rm${tag} < ${p}sz[${p}k${tag}] ? ${p}rm${tag} : ${p}sz[${p}k${tag}];`, `${indent}    ${p}out${tag} = ${p}out${tag} + ${p}mb${tag} * ${p}pr[${p}k${tag}];`, `${indent}    ${p}rm${tag} = ${p}rm${tag} - ${p}mb${tag};`, `${indent}    ${p}k${tag} = ${p}k${tag} + 1;`, `${indent}  }`, `${indent}  const ${p}qtn${tag} = ${p}out${tag} * ${p}qls;`, `${indent}  const ${p}reb${tag} = (${p}qtn${tag} * ${p}mrp) / 1000000;`, `${indent}  ${outVar} = ${p}qtn${tag} - ${p}reb${tag};`, `${indent}  ${p}lo = ${outVar};`, `${indent}  ${p}lx = (${xExpr} / ${p}bls - ${p}rm${tag}) * ${p}bls;`);
     }
     else {
         lines.push(`${indent}  const ${p}nql${tag} = ${xExpr} / ${p}qls;`, `${indent}  let ${p}rm${tag} = (${p}nql${tag} * 1000000) / (1000000 + ${p}tfp);`, `${indent}  let ${p}ob${tag} = 0; let ${p}oq${tag} = 0; let ${p}k${tag} = 0; let ${p}dn${tag} = 0;`, `${indent}  for (let ${p}w${tag} = 0; ${p}w${tag} < ${OPENBOOK_V2_MAX_ORDERS} && ${p}rm${tag} > 0 && ${p}k${tag} < ${p}nb && ${p}dn${tag} === 0; ${p}w${tag}++) {`, `${indent}    const ${p}mm${tag} = ${p}rm${tag} / ${p}pr[${p}k${tag}];`, `${indent}    if (${p}mm${tag} === 0) { ${p}dn${tag} = 1 }`, `${indent}    else {`, `${indent}      const ${p}mb${tag} = ${p}mm${tag} < ${p}sz[${p}k${tag}] ? ${p}mm${tag} : ${p}sz[${p}k${tag}];`, `${indent}      const ${p}mq${tag} = ${p}mb${tag} * ${p}pr[${p}k${tag}];`, `${indent}      ${p}rm${tag} = ${p}rm${tag} - ${p}mq${tag};`, `${indent}      ${p}ob${tag} = ${p}ob${tag} + ${p}mb${tag};`, `${indent}      ${p}oq${tag} = ${p}oq${tag} + ${p}mq${tag};`, `${indent}      ${p}k${tag} = ${p}k${tag} + 1;`, `${indent}    }`, `${indent}  }`, `${indent}  const ${p}qtn${tag} = ${p}oq${tag} * ${p}qls;`, `${indent}  const ${p}reb${tag} = (${p}qtn${tag} * ${p}mrp) / 1000000;`, `${indent}  ${outVar} = ${p}ob${tag} * ${p}bls;`, `${indent}  ${p}lo = ${outVar};`, `${indent}  ${p}lx = ${p}qtn${tag} + ${p}reb${tag};`);
@@ -653,7 +653,10 @@ export const openbookV2Ladder = {
                     const matchBase = remainingBaseLots < level.quantity ? remainingBaseLots : level.quantity;
                     remainingBaseLots -= matchBase;
                 }
-                return x - remainingBaseLots * baseLotSize;
+                // Productive input = FILLED whole lots only. `x - rm*baseLotSize` would re-add the
+                // sub-lot dust (x mod baseLotSize), a sawtooth that makes cumulative capacity
+                // non-monotonic (a negative dIn once the book is exhausted). Report consumed lots.
+                return (x / baseLotSize - remainingBaseLots) * baseLotSize;
             }
             const nominalQuoteLots = x / quoteLotSize;
             let remainingQuoteLots = (nominalQuoteLots * 1000000n) / (1000000n + takerFeePpm);

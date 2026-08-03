@@ -477,7 +477,7 @@ function emitWalk(cfg: OpenBookV2PoolConfig, p: string, slot: number, xExpr: str
       `${indent}  const ${p}reb${tag} = (${p}qtn${tag} * ${p}mrp) / 1000000;`,
       `${indent}  ${outVar} = ${p}qtn${tag} - ${p}reb${tag};`,
       `${indent}  ${p}lo = ${outVar};`,
-      `${indent}  ${p}lx = ${xExpr} - ${p}rm${tag} * ${p}bls;`,
+      `${indent}  ${p}lx = (${xExpr} / ${p}bls - ${p}rm${tag}) * ${p}bls;`,
     );
   } else {
     lines.push(
@@ -734,7 +734,10 @@ export const openbookV2Ladder: SvmVenueLadder = {
             const matchBase = remainingBaseLots < level.quantity ? remainingBaseLots : level.quantity;
             remainingBaseLots -= matchBase;
           }
-          return x - remainingBaseLots * baseLotSize;
+          // Productive input = FILLED whole lots only. `x - rm*baseLotSize` would re-add the
+          // sub-lot dust (x mod baseLotSize), a sawtooth that makes cumulative capacity
+          // non-monotonic (a negative dIn once the book is exhausted). Report consumed lots.
+          return (x / baseLotSize - remainingBaseLots) * baseLotSize;
         }
         const nominalQuoteLots = x / quoteLotSize;
         let remainingQuoteLots = (nominalQuoteLots * 1_000_000n) / (1_000_000n + takerFeePpm);

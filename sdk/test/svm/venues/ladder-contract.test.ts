@@ -117,6 +117,8 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  fetchOpenBookV2Config,
+  openbookV2Ladder,
   invariantLadder,
   fetchInvariantPoolConfig,
   USDC_PAIR_ACCOUNT,
@@ -1219,6 +1221,21 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'openbook-v2',
+    ladder: openbookV2Ladder,
+    async variants() {
+      const POOL = address('D3gZwng2MgZGjktYcKpbR8Bz8653i4qCgzHCf5E4TcZb');
+      const fixtures = fixturesFor('openbook-v2');
+      const cfg = await fetchOpenBookV2Config(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      // baseIn only: the CLOB ladder is fully contract-compliant both ways, but the
+      // checked-in ask book is shallow (13 lots / 4 levels) so quoteIn yields <16 distinct
+      // quote values (a VACUOUS distinct-floor fail, not a math fail). quoteIn is registered
+      // once a deeper ask-book fixture is harvested.
+      return [{ label: 'baseIn', cfg, state }];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1809,8 +1826,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(77);
-    expect(FAMILIES).toHaveLength(77);
+    expect(registered).toHaveLength(78);
+    expect(FAMILIES).toHaveLength(78);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });

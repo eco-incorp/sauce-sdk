@@ -1,4 +1,5 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { openbookV2Ladder } from './openbook-v2/index.js';
 import { invariantLadder } from './invariant/index.js';
 import { hyloLadder } from './hylo/index.js';
 import { cropperLadder } from './cropper/ladder.js';
@@ -153,6 +154,7 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [openbookV2Ladder.slug]: openbookV2Ladder,
     [invariantLadder.slug]: invariantLadder,
     [hyloLadder.slug]: hyloLadder,
     [cropperLadder.slug]: cropperLadder,
