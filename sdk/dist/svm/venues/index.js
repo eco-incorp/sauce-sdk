@@ -62,6 +62,7 @@ export * from './huma/ladder.js';
 export { TOKEN_PROGRAM as SCALE_COMMON_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, SCALE_AMM_PROGRAM_ID, SCALE_VMM_PROGRAM_ID, BUY_DISCRIMINATOR, SELL_DISCRIMINATOR, FEE_BENEFICIARY_SLOTS, CONFIG_SEED, POOL_SEED, CURVE_CONSTANT_PRODUCT, SCALE_CURVE_HELPER_NAME, SCALE_CURVE_HELPER_SOURCE, readUintLE as scaleCommonReadUintLE, pubkeyAt, readFeeBeneficiaries, ata, detectTokenProgram, computeScaleQuote, scaleDepthReserves, scaleContinuousFees, pda } from './scale-common.js';
 export { ALDRIN_V1_PROGRAM_ID, ALDRIN_V2_PROGRAM_ID, aldrin, aldrinV2, aldrinLadder, aldrinV2Ladder } from './aldrin/index.js';
 export { ALPHAQ_PROGRAM_ID, alphaqLadder, primeAlphaqStatsAccounts, __setAlphaqStatsAccountsForTest, __resetAlphaqStatsAccountsForTest, fetchAlphaqPoolConfig, __alphaqCpQuoteForTest, __alphaqDecodeSymbolForTest } from './alphaq/index.js';
+export { BOOP_FUN_PROGRAM_ID, boopFun, boopFunLadder } from './boop-fun/index.js';
 export { BYREAL_PROGRAM_ID, byreal, byrealLadder, byrealWindowFor, fetchByrealPoolConfig } from './byreal/index.js';
 export { CARROT_PROGRAM_ID, CRT_MINT, CARROT_VAULT_ADDRESS, CARROT_TOKEN_2022_MINTS, CARROT_MAX_ASSETS, carrot, carrotLadder, parseCarrotDirection, carrotAllDirections, carrotGate, carrotMints, carrotApplyDirection, PYTH_RECEIVER_PROGRAM_ID, CARROT_U64_MAX } from './carrot/index.js';
 // crema: explicit re-export — some names collide with an existing venue's
