@@ -1,19 +1,18 @@
 #!/usr/bin/env node
-// `tsc` only emits compiled .js/.d.ts — it does not copy the runtime asset
-// `sdk/src/programs/token-sweep.sauce.ts` that `tokenSweepSource()`
-// (sdk/dist/programs/index.js) reads from disk at RUN time via `readFileSync`.
-// `src/**/*.sauce.ts` is excluded from the tsconfig (it is SauceScript, not
-// TypeScript tsc can parse), so without this step a fresh `sdk/dist` would be
-// missing the one file a partner needs in order to reproduce our bytecode.
+// `tsc` only emits compiled .js/.d.ts — it does not copy the runtime `.sauce.ts`
+// program assets that the source getters read from disk at RUN time via
+// `readFileSync` (`settleSource()` → dist/recipes/, `svmSettleSource()`
+// → dist/svm/recipes/). `src/**/*.sauce.ts` is excluded from the tsconfig (it is
+// SauceScript, not TypeScript tsc can parse), so without this step a fresh
+// `sdk/dist` would be missing the files a partner needs to reproduce our bytecode.
 // Mirrors `@eco-incorp/sauce-recipes`'s `scripts/copy-dist-assets.mjs` (same
 // problem, same shape, different package).
 //
-// NOTE the dest directory is CREATED here rather than asserted. `tsc` does emit
-// `dist/programs/` today (for `src/programs/index.ts`), so the mkdir is belt and
-// braces — but the assert-only form this replaced would break the moment that
-// directory holds nothing but `.sauce.ts` files, since every one of those is
-// excluded from the tsconfig and tsc would emit no directory at all. Creating it
-// costs nothing and removes that coupling to what else happens to live here.
+// Each asset names its own SUBDIR (relative to sdk/) because the EVM and SVM
+// programs live in different trees — the SVM one under the svm/ subtree with the
+// rest of the SVM SDK. The dest directory is CREATED, not asserted: a directory
+// holding only `.sauce.ts` files gets no `tsc` output at all (all excluded), so
+// there may be no dist dir for the copy to land in.
 //
 // Run as part of `sdk`'s build: `tsc && node scripts/copy-verify-assets.mjs`.
 import { existsSync, copyFileSync, mkdirSync } from "node:fs";
@@ -23,15 +22,20 @@ import { fileURLToPath } from "node:url";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SDK_DIR = resolve(SCRIPT_DIR, "..");
 
-const ASSET = "token-sweep.sauce.ts";
-const SUBDIR = "programs";
-const src = join(SDK_DIR, "src", SUBDIR, ASSET);
-const dest = join(SDK_DIR, "dist", SUBDIR, ASSET);
+const ASSETS = [
+  { subdir: "recipes", file: "settle.sauce.ts" },
+  { subdir: join("svm", "recipes"), file: "settle.sauce.ts" },
+];
 
-if (!existsSync(src)) {
-  console.error(`copy-verify-assets: missing source asset ${src}`);
-  process.exit(1);
+for (const { subdir, file } of ASSETS) {
+  const src = join(SDK_DIR, "src", subdir, file);
+  const dest = join(SDK_DIR, "dist", subdir, file);
+
+  if (!existsSync(src)) {
+    console.error(`copy-verify-assets: missing source asset ${src}`);
+    process.exit(1);
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  console.log(`copy-verify-assets: copied ${file} -> dist/${subdir}/`);
 }
-mkdirSync(dirname(dest), { recursive: true });
-copyFileSync(src, dest);
-console.log(`copy-verify-assets: copied ${ASSET} -> dist/${SUBDIR}/`);
