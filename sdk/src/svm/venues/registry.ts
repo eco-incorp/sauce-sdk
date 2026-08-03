@@ -1,5 +1,8 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { aldrinLadder } from './aldrin/index.js';
+import { runnerRodeoLadder } from './runner-rodeo/index.js';
+import { hadronLadder } from './hadron/ladder.js';
+import { whalestreetLadder } from './whalestreet/index.js';
 import { openbookV2Ladder } from './openbook-v2/index.js';
 import { invariantLadder } from './invariant/index.js';
 import { hyloLadder } from './hylo/index.js';
@@ -159,6 +162,9 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
   [aldrinLadder.slug]: aldrinLadder,
+  [runnerRodeoLadder.slug]: runnerRodeoLadder,
+  [hadronLadder.slug]: hadronLadder,
+  [whalestreetLadder.slug]: whalestreetLadder,
   [openbookV2Ladder.slug]: openbookV2Ladder,
   [invariantLadder.slug]: invariantLadder,
   [hyloLadder.slug]: hyloLadder,

@@ -117,6 +117,12 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  runnerRodeoLadder,
+  runnerRodeo,
+  hadronLadder,
+  hadron,
+  whalestreetLadder,
+  whalestreet,
   fetchOpenBookV2Config,
   openbookV2Ladder,
   invariantLadder,
@@ -1236,6 +1242,40 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'whalestreet',
+    ladder: whalestreetLadder,
+    async variants() {
+      const POOL = address('Hhugr5Bw2NpmM4zKgDcQpypnVG7UPjcFFtHeaTbz764h');
+      const fixtures = fixturesFor('whalestreet');
+      const cfg = await whalestreet.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'hadron',
+    ladder: hadronLadder,
+    async variants() {
+      const POOL = address('6rK6f3zsp744uxhzA9n9rrzbpf4CvBy7oj3eaRrLogxL');
+      const fixtures = fixturesFor('hadron');
+      const cfg = await hadron.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'AtoB', cfg: { ...cfg, direction: 'AtoB' }, state },
+        { label: 'BtoA', cfg: { ...cfg, direction: 'BtoA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'runner-rodeo',
+    ladder: runnerRodeoLadder,
+    async variants() {
+      const POOL = address('5r3nkKeAduNYwUdizpX9VgdrFUWoH36Z1QosKdDPTb8M');
+      const fixtures = fixturesFor('runner-rodeo');
+      const cfg = await runnerRodeo.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1826,8 +1866,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(78);
-    expect(FAMILIES).toHaveLength(78);
+    expect(registered).toHaveLength(81);
+    expect(FAMILIES).toHaveLength(81);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
