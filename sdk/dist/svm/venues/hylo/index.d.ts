@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { PoolConfig, SvmVenueAdapter, SvmVenueLadderV2 } from '../types.js';
+import type { PoolConfig, SvmVenueAdapter, SvmVenueLadder } from '../types.js';
 declare const SLUG = "hylo";
 export declare const HYLO_PROGRAM_ID: Address<"HYEXCHtHkBagdStcJCp3xbbb9B7sdMdWXFNj6mdsG4hn">;
 export declare const USDC_MINT: Address<"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v">;
@@ -46,9 +46,9 @@ export interface HyloPoolConfig extends PoolConfig {
 export declare function hyloGate(cfg: PoolConfig, now: bigint): void;
 /**
  * Recoverable live-state drift (pause / stale-or-low-confidence oracle) between discovery and
- * prepare — the SAME class `ecoswap/svm/index.ts`'s own `SvmWindowDriftError` names (that class
+ * prepare — the SAME class `the consuming app SVM solver entry`'s own `SvmWindowDriftError` names (that class
  * is private to index.ts, so this venue module carries an identically-treated local marker;
- * `ecoswap/svm/index.ts`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
+ * `the consuming app SVM solver entry`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
  * self-drop classification stays centralized there).
  */
 export declare class SvmHyloDriftError extends Error {
@@ -68,6 +68,6 @@ export declare function hyloRedeemCapacity(live: HyloLiveState, priceScale: bigi
 /** TS mirror of the emitted redeem (bToA) fragment — `x` already clamped to the capacity above. */
 export declare function hyloRedeemOut(live: HyloLiveState, priceScale: bigint, x: bigint): bigint;
 export declare const hylo: SvmVenueAdapter;
-export declare const hyloLadder: SvmVenueLadderV2;
+export declare const hyloLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -1,5 +1,5 @@
 /**
- * M Swap (EcoSwapSVM venue, `mswap`) — m0-foundation's `ext_swap` router
+ * M Swap (SvmRoute venue, `mswap`) — m0-foundation's `ext_swap` router
  * (program `MSwapi3WhNKMUGm9YrxGhypgUEt7wYQH3ZgG32XoWzH`, labeled "M Swap" in
  * Jupiter's own `program-id-to-label` capture). Open source at
  * github.com/m0-foundation/solana-m-extensions (`programs/ext_swap`); the
@@ -21,7 +21,7 @@
  * ALL pairs, and any two whitelisted extensions can swap against each other.
  * This venue therefore does NOT use the generic `SVM_FAMILY_FILTERS`
  * getProgramAccounts sweep (there is no per-pair account to memcmp-scan for)
- * — see `ecoswap/svm/discovery.ts`'s `withMSwap` wrapper, which mints a
+ * — see `the consuming app SVM discovery module`'s `withMSwap` wrapper, which mints a
  * synthetic per-directed-pair discovery key the same way
  * `sanctumInfinityPoolKey` does.
  *
@@ -185,7 +185,7 @@
  * program (Token2022<->Tokenkeg) leg. The account order/roles above are
  * exactly what the real program accepted (a wrong order fails inside the
  * CPI'd `m_ext` program, not silently). See `CU_FAMILIES.mswap` in
- * `ecoswap/svm/budget.ts` for how this feeds the CU pin.
+ * `the consuming app SVM CU-budget module` for how this feeds the CU pin.
  *
  * CORRECTNESS NOTE (`swap_m_account`, the transient `$M` holding account):
  * never a capacity constraint. `unwrap` credits it with

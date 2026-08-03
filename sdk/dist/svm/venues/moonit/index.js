@@ -87,7 +87,7 @@
  *
  * TRADE ARGS — `TradeParams{token_amount, collateral_amount, fixed_side:u8
  * (IN=0/OUT=1), slippage_bps}`: this module ALWAYS uses `fixed_side=IN` (the
- * side matching the ecoswap ladder's own exact-input contract) and floors the
+ * side matching the the consuming app ladder's own exact-input contract) and floors the
  * OTHER (estimated) side at 1 with `slippage_bps=0` — the recipe's own
  * terminal outAta delta / minOut check is the real floor, mirroring every
  * other wired venue's "venue-level min_out is always 1" convention.

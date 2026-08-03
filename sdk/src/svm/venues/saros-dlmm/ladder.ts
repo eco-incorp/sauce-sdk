@@ -14,7 +14,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser } from '../types.js';
 import { readUintLE } from '../math.js';
 import {
   BIN_LEN,
@@ -272,7 +272,7 @@ function emitBinWalk(p: string, swapForY: boolean, x: string, v: { rm: string; o
  * cumulative grid to be NON-DECREASING across rungs, or `remaining = x - wcb`
  * underflows. That is genuinely enforced, not merely conventional — the consumer
  * validates its shift schedule and rejects any increasing shift entry
- * (`validateShiftSchedule`, sauce-recipes `ecoswap/svm/solver-reference.ts`,
+ * (`validateShiftSchedule`, sauce-recipes `the consuming app SVM reference solver`,
  * the schedule validator; grep the symbol, line numbers move). An earlier
  * revision of this doc asserted monotonicity as self-evident, which left the
  * whole argument resting on an unnamed guarantee. EQUAL consecutive grid points
@@ -335,7 +335,7 @@ function emitBinUnpack(p: string, slot: number, k: number, swapForY: boolean, pa
   ];
 }
 
-export const sarosDlmmLadder: SvmVenueLadderV2 = {
+export const sarosDlmmLadder: SvmVenueLadder = {
   slug: SLUG,
   /** 2 rungs by default: a rung is a full cold bin walk (degrade-first class, like the CLMMs). */
   defaultRungs: 2,

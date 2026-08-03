@@ -95,7 +95,7 @@
  * it and reaches its OWN logic, not an accounts/data-shape rejection) AND
  * that a cook including this venue TODAY would revert the CPI. Since an SVM
  * CPI failure aborts the whole transaction (no per-venue catch/re-route at
- * execution time), `gate` (wired in ecoswap/svm/index.ts's `FAMILIES.
+ * execution time), `gate` (wired in the consuming app SVM solver entry's `FAMILIES.
  * lemmingsfi.gate`) self-drops any candidate whose `lastUpdateTs` is more
  * than `STALE_AFTER_SECONDS` old — a SEQUENCING condition, not a permanent
  * disable: the instant the keeper posts a fresh tick, `lastUpdateTs`
@@ -128,7 +128,7 @@
  * real sample) are emitted as-is; the recipe's own terminal realized-delta
  * `minOut` check is the real floor. Reproducing this exact left-shifted
  * encoding needs a small, additive codegen extension
- * (`EcoSwapSvmSlot.patchMultiplierIn`) since the existing patch pipeline
+ * (`SvmRouteSlot.patchMultiplierIn`) since the existing patch pipeline
  * (XOR, then optional divide) had no multiply step; every other family
  * leaves it unset and is byte-for-byte unaffected.
  *
@@ -147,7 +147,7 @@
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { readUintLE } from '../math.js';
 
 const SLUG = 'lemmingsfi';
@@ -288,7 +288,7 @@ export const lemmingsfi = {
   quoteAccounts,
 };
 
-export const lemmingsfiLadder: SvmVenueLadderV2 = {
+export const lemmingsfiLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(base) {
@@ -403,7 +403,7 @@ export const lemmingsfiLadder: SvmVenueLadderV2 = {
     };
   },
   continuousFees() {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — this
+    // Measurement-only oracle (see the SvmVenueLadder doc comment) — this
     // ladder replicates the venue's real price tick exactly (see the file
     // header's PRICING MODEL), no denominator decay or output retention.
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };

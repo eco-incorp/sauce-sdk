@@ -1,5 +1,5 @@
 /**
- * VaultLiquidUnstake venue adapter + EcoSwapSVM v2 ladder — LST -> SOL only.
+ * VaultLiquidUnstake venue adapter + SvmRoute v2 ladder — LST -> SOL only.
  *
  * Program `2rU1oCHtQ7WJUvy15tKtFvxdYNNSc3id7AzUcjeFSddo` (Jupiter label
  * "VaultLiquidUnstake") ships NO on-chain IDL and is not open source. Its
@@ -90,7 +90,7 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { findAssociatedTokenPda } from '@solana-program/token';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'vault-liquid-unstake';
 const PROGRAM_ID = '2rU1oCHtQ7WJUvy15tKtFvxdYNNSc3id7AzUcjeFSddo';
@@ -224,7 +224,7 @@ export const vaultLiquidUnstake = {
   /**
    * Off-chain, once per pool. `pool` is the LstInfo account address (this
    * family's "pool", matching every other family's convention — see
-   * EcoSwapSvmPoolSpec). Rejects: a missing/undecodable LstInfo, the wrong
+   * SvmRoutePoolSpec). Rejects: a missing/undecodable LstInfo, the wrong
    * discriminator, the unsupported 225-byte extended layout (SCOPE, module
    * doc), a missing/malformed global Pool singleton, or a stake-pool
    * account whose shape doesn't match the canonical SPL Stake Pool struct.
@@ -274,7 +274,7 @@ export const vaultLiquidUnstake = {
   },
 };
 
-export const vaultLiquidUnstakeLadder: SvmVenueLadderV2 = {
+export const vaultLiquidUnstakeLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(): string {

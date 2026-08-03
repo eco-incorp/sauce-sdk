@@ -1,5 +1,5 @@
 /**
- * Orca legacy token-swap adapter v2 (EcoSwapSVM ladder fragment) — raw SPL
+ * Orca legacy token-swap adapter v2 (SvmRoute ladder fragment) — raw SPL
  * vault balances as constant-product reserves (read LIVE in-VM), the
  * SwapV1 fee fractions as per-trade PARAMS (they are immutable pool fields,
  * but shape-genericity means any orca pool must fit the slot without a
@@ -36,7 +36,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -205,4 +205,4 @@ export const orcaLegacyTokenSwapLadder = {
     if (on > 0n) gamma -= (on * 1_000_000n) / od;
     return { gammaPpm: gamma, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

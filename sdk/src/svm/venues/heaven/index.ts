@@ -89,7 +89,7 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 export const HEAVEN_PROGRAM_ID = address('HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o');
 
@@ -412,7 +412,7 @@ const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 const HELPER_BUY = 'qHeavenBuy';
 const HELPER_SELL = 'qHeavenSell';
 
-export const heavenLadder: SvmVenueLadderV2 = {
+export const heavenLadder: SvmVenueLadder = {
   slug: 'heaven',
   shapeKey(base) {
     return `heaven:${heavenConfig(base).direction}`;

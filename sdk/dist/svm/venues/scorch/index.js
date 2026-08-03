@@ -1,5 +1,5 @@
 /**
- * Scorch (EcoSwapSVM venue, closed-source-binary reverse-engineering — no on-chain IDL; the same
+ * Scorch (SvmRoute venue, closed-source-binary reverse-engineering — no on-chain IDL; the same
  * RE method used for the WITHDRAWN BisonFi integration attempt, see docs/bisonfi-evidence.md —
  * this file does not import from it, the shared lineage is methodology only).
  *
@@ -178,10 +178,10 @@ export const scorch = {
         const assetConfigAStr = SCORCH_ASSET_CONFIGS[mintA];
         const assetConfigBStr = SCORCH_ASSET_CONFIGS[mintB];
         if (assetConfigAStr === undefined) {
-            throw new Error(`scorch pool ${pool}: no known AssetConfig for mint ${mintA} — refresh ecoswap/svm/venues/scorch-asset-configs.ts`);
+            throw new Error(`scorch pool ${pool}: no known AssetConfig for mint ${mintA} — refresh the consuming app scorch-asset-configs venue module`);
         }
         if (assetConfigBStr === undefined) {
-            throw new Error(`scorch pool ${pool}: no known AssetConfig for mint ${mintB} — refresh ecoswap/svm/venues/scorch-asset-configs.ts`);
+            throw new Error(`scorch pool ${pool}: no known AssetConfig for mint ${mintB} — refresh the consuming app scorch-asset-configs venue module`);
         }
         for (const [role, vault] of [
             ['A', vaultA],

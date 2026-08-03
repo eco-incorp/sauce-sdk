@@ -1,7 +1,7 @@
 import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
 export declare const stabbleStableSwapLadder: {
     slug: string;
-    /** 2-rung default (stable-kind pools budget for a heavier per-rung Newton) — see recipes/ecoswap/svm/budget.ts. */
+    /** 2-rung default (stable-kind pools budget for a heavier per-rung Newton) — see the consuming app SVM CU-budget module. */
     defaultRungs: number;
     shapeKey(base: PoolConfig): string;
     helpers(base: PoolConfig): {

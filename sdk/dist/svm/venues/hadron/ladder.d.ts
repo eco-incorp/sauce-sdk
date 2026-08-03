@@ -1,4 +1,4 @@
-import type { PoolConfig, SvmVenueLadderV2, VenueAccount } from '../types.js';
+import type { PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
 export declare function hadronQuoteRefs(base: PoolConfig, slot: number): VenueAccount[];
-export declare const hadronLadder: SvmVenueLadderV2;
+export declare const hadronLadder: SvmVenueLadder;
 //# sourceMappingURL=ladder.d.ts.map

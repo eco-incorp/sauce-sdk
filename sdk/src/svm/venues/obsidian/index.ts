@@ -80,7 +80,7 @@
  *
  * This file is the off-chain decode + CPI-account layer (PoolConfig,
  * fetchPoolConfig, quoteAccounts). The on-chain quote fragment
- * (SvmVenueLadderV2) lives in ladder.ts.
+ * (SvmVenueLadder) lives in ladder.ts.
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';

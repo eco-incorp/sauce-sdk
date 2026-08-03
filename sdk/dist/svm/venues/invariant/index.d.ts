@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "invariant";
 export declare const INVARIANT_PROGRAM_ID: Address<"HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt">;
 export declare const POOL_ACCOUNT_SIZE = 400;
@@ -61,6 +61,6 @@ export declare const invariant: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchInvariantPoolConfig;
 };
-export declare const invariantLadder: SvmVenueLadderV2;
+export declare const invariantLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

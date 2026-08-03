@@ -72,7 +72,7 @@
  * pools sampled during validation hit exactly this revert; the three
  * majors (BNSOL/JitoSOL/jupSOL/dSOL) were current. Because a launched CPI
  * failure aborts the whole cook on SVM (no execution-time catch — see
- * ecoswap/svm/README.md's parity verdicts), this MUST be a prepare-time
+ * the consuming app SVM README's parity verdicts), this MUST be a prepare-time
  * self-drop, not an on-chain guard: `fetchPoolConfig` reads the Clock
  * sysvar via the SAME `load` (a second, ordinary account read — the same
  * multi-read pattern obric-v2's fetch already uses for its price feeds) and
@@ -107,7 +107,7 @@
  * vocabulary for "the user is trading SOL"), so the caveat that follows is
  * real and worth stating plainly rather than glossing over: in the
  * `amountIn=0` balance-input sentinel specifically, "amountIn" is derived
- * on-chain from `inAta`'s LIVE balance alone (see ecoswap/svm/README.md),
+ * on-chain from `inAta`'s LIVE balance alone (see the consuming app SVM README),
  * so this family's owner-wallet-sourced contribution is NOT reflected in
  * that derivation — a sized (`amountIn>0`) request has no such gap (the
  * merge never assigns any slot more than the trade's own declared budget,
@@ -144,7 +144,7 @@
 import { address, getAddressDecoder, getAddressEncoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { createHash } from 'node:crypto';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 export const SANCTUM_STAKE_POOL_PROGRAM_ID = address('SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy');
 export const SANCTUM_STAKE_POOL_2_PROGRAM_ID = address('SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY');
@@ -366,7 +366,7 @@ function sanctumConfig(slug: string, base: PoolConfig): SanctumStakePoolConfig {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], programId: Address): SvmVenueLadderV2 {
+function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], programId: Address): SvmVenueLadder {
   const helperName = 'qSanctumStake';
 
   return {
@@ -503,7 +503,7 @@ function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], progr
   };
 }
 
-export const sanctumStakePoolLadder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool', SANCTUM_STAKE_POOL_PROGRAM_ID);
-export const sanctumStakePool2Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-2', SANCTUM_STAKE_POOL_2_PROGRAM_ID);
-export const sanctumStakePool3Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-3', SANCTUM_STAKE_POOL_3_PROGRAM_ID);
-export const sanctumStakePool4Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-4', SANCTUM_STAKE_POOL_4_PROGRAM_ID);
+export const sanctumStakePoolLadder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool', SANCTUM_STAKE_POOL_PROGRAM_ID);
+export const sanctumStakePool2Ladder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool-2', SANCTUM_STAKE_POOL_2_PROGRAM_ID);
+export const sanctumStakePool3Ladder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool-3', SANCTUM_STAKE_POOL_3_PROGRAM_ID);
+export const sanctumStakePool4Ladder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool-4', SANCTUM_STAKE_POOL_4_PROGRAM_ID);

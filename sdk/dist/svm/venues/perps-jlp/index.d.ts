@@ -113,7 +113,7 @@ export declare function eventAuthorityPda(): Promise<Address>;
  * callers (the discovery resolver and the pre-codegen re-fetch) have it —
  * the former from the requested pair directly, the latter from the spec's
  * own `direction` string (this family stores `mintOut`'s base58 there, see
- * ecoswap/svm/index.ts's FAMILIES entry) — so `fetchPoolConfig` never needs
+ * the consuming app SVM solver entry's FAMILIES entry) — so `fetchPoolConfig` never needs
  * a signature wider than every other family's `(load, pool)` PLUS this one
  * extra, always-a-plain-string `direction` parameter already threads through
  * both call sites unchanged.

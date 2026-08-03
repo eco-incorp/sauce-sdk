@@ -1,5 +1,5 @@
 /**
- * Hadron (Solana) adapter v2 (EcoSwapSVM ladder fragment) — the oracle-
+ * Hadron (Solana) adapter v2 (SvmRoute ladder fragment) — the oracle-
  * anchored inventory (obric-style) family. See ./index.ts for the account
  * layout, the registry, and the discovery/SCOPE notes.
  *
@@ -89,13 +89,13 @@
  * different internal accounting branch touched only on that side; both
  * directions engage the SAME 16 accounts. Recipe-side `CU_FAMILIES` is
  * calibrated generously above the WORSE-direction ceiling — see
- * `ecoswap/svm/budget.ts` in the sauce-recipes repo — no native quote arm
+ * `the consuming app SVM CU-budget module` in the sauce-recipes repo — no native quote arm
  * needed (the native merge program only does the k-way merge, never a
  * per-venue quote).
  */
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import {
   HADRON_AMOUNT_OFF,
   HADRON_CLOCK_SYSVAR,
@@ -122,7 +122,7 @@ export function hadronQuoteRefs(base: PoolConfig, slot: number): VenueAccount[] 
   ];
 }
 
-export const hadronLadder: SvmVenueLadderV2 = {
+export const hadronLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Near-flat oracle-anchored rate, clamped by a hard capacity ceiling — 4 rungs. */
   defaultRungs: 4,

@@ -1,5 +1,5 @@
 /**
- * Meteora DAMM v1 stable adapter v2 (EcoSwapSVM ladder fragment) — the
+ * Meteora DAMM v1 stable adapter v2 (SvmRoute ladder fragment) — the
  * heaviest family: vault share math (locked-profit decay at the cluster
  * clock, LP-supply share floors) rebuilds the reserves live, input-token
  * fees carry the min-1 rule, the curve is 2-coin stableswap on
@@ -122,7 +122,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -382,7 +382,7 @@ function ladderWalk(live: D1sLive, grid: readonly bigint[]): LadderWalkResult {
 export const meteoraDammV1StableLadder = {
   slug: SLUG,
 
-  /** Stable slots default to 2 rungs (cap 4) — see recipes/ecoswap/svm/budget.ts. */
+  /** Stable slots default to 2 rungs (cap 4) — see the consuming app SVM CU-budget module. */
   defaultRungs: 2,
 
   shapeKey(): string {
@@ -689,6 +689,6 @@ export const meteoraDammV1StableLadder = {
     // curve's depth — measurement oracle only, never a gate.
     return { gammaPpm: fd === 0n ? 1_000_000n : 1_000_000n - (fn * 1_000_000n) / fd, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2 & {
+} satisfies SvmVenueLadder & {
   emitQuoteAt(slot: number, tag: string, x: string, y0: string, warm: boolean, coldOutVar?: string): string[];
 };

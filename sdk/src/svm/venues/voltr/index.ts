@@ -1,5 +1,5 @@
 /**
- * Voltr (EcoSwapSVM ladder fragment) — a permissionless vault-infrastructure
+ * Voltr (SvmRoute ladder fragment) — a permissionless vault-infrastructure
  * protocol (`voltrxyz`): depositors mint LP shares against a vault's live
  * NAV (`deposit_vault`) and can redeem them atomically for the underlying
  * asset out of the vault's un-invested ("idle") float (`instant_withdraw_vault`).
@@ -102,7 +102,7 @@
  * ── Two SELF-DROP-worthy hard caps, both handled as a SATURATING clamp
  *    (never a revert) so a program built against a stale/racy plan degrades
  *    to a smaller fill instead of aborting the whole cook (SVM execution-time
- *    CPI failure is unrecoverable — see ecoswap/svm/README.md) ──
+ *    CPI failure is unrecoverable — see the consuming app SVM README) ──
  *
  * 1. DEPOSIT vs `vault_configuration.max_cap`: a deposit that would push
  *    `total_value` past `max_cap` is documented ("The maximum total amount
@@ -150,7 +150,7 @@
  * confirming the idle-liquidity cliff empirically. The withdraw CPI measured
  * 35,517 / 35,517 / 35,633 CU on the three successful sizes.
  *
- * ── CU (`ecoswap/svm/budget.ts`'s `CU_FAMILIES.voltr`) ──
+ * ── CU (`the consuming app SVM CU-budget module`'s `CU_FAMILIES.voltr`) ──
  *
  * Per the standing "existing pins omit the venue CPI" gap, this pin takes
  * raydium-cp-swap's 183,187 as a same-complexity NON-CPI baseline (2 vault
@@ -182,7 +182,7 @@
 import { address, getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { findAssociatedTokenPda } from '@solana-program/token';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'voltr';
 
@@ -345,7 +345,7 @@ function pow10(n: number): bigint {
   return v;
 }
 
-export const voltrLadder: SvmVenueLadderV2 = {
+export const voltrLadder: SvmVenueLadder = {
   slug: SLUG,
   // Both directions are (at worst mildly) concave and near-linear — the CP
   // rung floor loses nothing meaningful to a coarser grid; see file header.

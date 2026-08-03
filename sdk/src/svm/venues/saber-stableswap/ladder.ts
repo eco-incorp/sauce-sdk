@@ -1,5 +1,5 @@
 /**
- * Saber StableSwap adapter v2 (EcoSwapSVM ladder fragment) — the stable
+ * Saber StableSwap adapter v2 (SvmRoute ladder fragment) — the stable
  * family archetype. Everything is a LIVE read (pause byte, both vault
  * balances, the four amp-ramp fields, the trade fee fraction); zero
  * per-trade params; the quote direction (A → B, like ./index.ts) is the
@@ -14,7 +14,7 @@
  *   larger cumulative input means a smaller y, so the previous rung's y
  *   still approaches the fixed point from above and converges in ~1-2
  *   iterations instead of the cold ~15+ — the difference between a stable
- *   slot fitting the CU budget or not (see recipes/ecoswap/svm/budget.ts);
+ *   slot fitting the CU budget or not (see the consuming app SVM CU-budget module);
  * - the FINAL predicted output is always COLD (y0 = D), byte-identical to
  *   the venue program's swap_to — what the real-binary quadrilateral pins.
  *
@@ -36,7 +36,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -273,4 +273,4 @@ export const saberStableswapLadder = {
     // curve's depth — measurement oracle only, never a gate.
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - (fn * 1_000_000n) / fd };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

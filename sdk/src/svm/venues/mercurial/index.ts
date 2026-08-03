@@ -88,7 +88,7 @@
  *    1/10/30 stSOL, bit-exact at all three.
  * See `test/svm/venues/mercurial.test.ts` for the pinned worked examples.
  *
- * NO `ecoswap-svm.realcpi.e2e.test.ts` CELL (unlike every other SAUCE_VENUE_PROGRAMS-gated
+ * NO `the consuming app realcpi e2e test` CELL (unlike every other SAUCE_VENUE_PROGRAMS-gated
  * venue): driving the real dumped `mercurial.so` through a raw single Exchange
  * CPI in LiteSVM (same pool/accounts/encoding the real-network probe above
  * validates) reproducibly fails a RUNTIME-LEVEL "sum of account balances
@@ -118,7 +118,7 @@ import { address, getAddressDecoder, getAddressEncoder, isOffCurveAddress } from
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
 import { STABLE_D_HELPER, STABLE_YW_HELPER, stableComputeD, stableComputeYWarm } from '../stable-helpers.js';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'mercurial';
 
@@ -463,4 +463,4 @@ export const mercurialLadder = {
     // curve's depth — measurement oracle only, never a gate (like saber).
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - (live.fn * 1_000_000n) / FEE_DENOMINATOR };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

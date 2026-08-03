@@ -1,5 +1,5 @@
 /**
- * Huma adapter v2 (EcoSwapSVM ladder fragment) — the amount-parametric
+ * Huma adapter v2 (SvmRoute ladder fragment) — the amount-parametric
  * sibling of ./index.ts's emitQuote. Everything mutable (ModeState.assets,
  * the mode mint's supply, the pool's idle underlying balance) is read LIVE
  * in-VM; the fee-tier schedule and the two caps (liquidity_cap,
@@ -20,7 +20,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -261,4 +261,4 @@ export const humaLadder = {
     const feeBps = humaFeeBpsFor(ratioBps, cfg.feeTiers);
     return { gammaPpm: 1_000_000n - feeBps * 100n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

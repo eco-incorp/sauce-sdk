@@ -1,5 +1,5 @@
 /**
- * SolFi V1 (EcoSwapSVM ladder fragment) — a from-scratch binary
+ * SolFi V1 (SvmRoute ladder fragment) — a from-scratch binary
  * reverse-engineering of the v1 sibling of `solfi-v2` (`sdk`'s
  * `svm/venues/solfi-v2`, imported here as `solfiV2`). The SDK ships no
  * `solfi-v1` ladder; this module is local, not a port.
@@ -81,7 +81,7 @@
  * `SOLFI_V1_POOL_RATES` below. Extend by repeating the LiteSVM sweep
  * documented in `docs/solfi-v1-evidence.md` against a new pool.
  *
- * ── CU (`ecoswap/svm/budget.ts`'s `CU_FAMILIES['solfi-v1']`) ──
+ * ── CU (`the consuming app SVM CU-budget module`'s `CU_FAMILIES['solfi-v1']`) ──
  *
  * MEASURED, not modeled: the REAL program invoked directly in LiteSVM
  * (program dumped from the deployed ProgramData, no engine wrapper)
@@ -95,7 +95,7 @@
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'solfi-v1';
 
@@ -183,7 +183,7 @@ export async function fetchSolfiV1Config(load: AccountLoader, pool: Address, dir
   if (rates === undefined) {
     throw new Error(
       `${SLUG}: pool ${pool} has no independently-verified floor rate (SOLFI_V1_POOL_RATES) — ` +
-        'a sibling pool\'s fit is never borrowed; see ecoswap/svm/venues/solfi-v1.ts for how to add one',
+        'a sibling pool\'s fit is never borrowed; see the consuming app solfi-v1 venue module for how to add one',
     );
   }
   const pubkeyAt = (offset: number): Address => ADDRESS_CODEC.decode(data.subarray(offset, offset + 32));
@@ -202,7 +202,7 @@ export async function fetchSolfiV1Config(load: AccountLoader, pool: Address, dir
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const solfiV1Ladder: SvmVenueLadderV2 = {
+export const solfiV1Ladder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(base: PoolConfig): string {

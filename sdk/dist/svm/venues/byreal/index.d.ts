@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, SvmVenueLadder } from '../types.js';
 import type { RaydiumClmmPoolConfig, RaydiumClmmWindow } from '../raydium-clmm/index.js';
 declare const SLUG: "byreal";
 /** Byreal's deployed program — a different program id than raydium-clmm's CAMMC... deployment. */
@@ -31,6 +31,6 @@ export declare const byreal: {
  * real raydium-clmm shapes) and `buildSwapV2` (CPI target program) are
  * genuinely different from upstream.
  */
-export declare const byrealLadder: SvmVenueLadderV2;
+export declare const byrealLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

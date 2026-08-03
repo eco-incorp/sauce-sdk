@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG: "moonit";
 export declare const MOONIT_PROGRAM_ID: Address;
 /** Floor integer square root (mirrors the engine's SQRT op — same algorithm as obric-v2's isqrt). */
@@ -37,6 +37,6 @@ export declare const moonit: {
 declare function referenceBuy(y: bigint, m: bigint, aw: bigint, bw: bigint, td: bigint, feeBps: bigint, curveAmount: bigint): bigint;
 /** SELL: exact tokens `x` in (fee taken off the output) -> collateral out. Saturates at the live sold position (never over-sells). */
 declare function referenceSell(x: bigint, m: bigint, aw: bigint, bw: bigint, td: bigint, feeBps: bigint): bigint;
-export declare const moonitLadder: SvmVenueLadderV2;
+export declare const moonitLadder: SvmVenueLadder;
 export { referenceBuy as _referenceBuyForTest, referenceSell as _referenceSellForTest, bakeCoefficients as _bakeCoefficientsForTest, isqrt as _isqrtForTest };
 //# sourceMappingURL=index.d.ts.map

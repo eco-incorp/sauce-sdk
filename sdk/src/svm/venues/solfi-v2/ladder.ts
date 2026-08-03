@@ -1,5 +1,5 @@
 /**
- * SolFi V2 adapter v2 (EcoSwapSVM ladder fragment) — a push-quote PMM whose
+ * SolFi V2 adapter v2 (SvmRoute ladder fragment) — a push-quote PMM whose
  * entire quote (inventory skew, a per-slot age/spread spline trio, and a
  * capacity cap) is read LIVE from the pool + a 168-byte XOR-obfuscated oracle
  * account the swap already passes. Nothing is baked as a drift-invariant
@@ -39,7 +39,7 @@
  * SIGNED ARITHMETIC: the engine has no native signed divide/compare (the
  * 'svm' target shares v12's postfix opcode table — see svm-profile.ts — and
  * v12 numbers are plain unsigned words; existing signed deltas elsewhere in
- * this codebase, e.g. ecoswap.lens.sauce.ts's int128 liquidityNet, are
+ * this codebase, e.g. the consuming app.lens.sauce.ts's int128 liquidityNet, are
  * handled the same way: sign-extend a raw two's-complement read into an
  * explicit (magnitude, negFlag) pair, then do the down-stream add/sub/mul/div
  * on magnitudes with the negFlag combined by hand). The five signed i64 cfg
@@ -115,7 +115,7 @@
  *   zero guard, or the provably-non-tripping property somehow doesn't hold),
  *   satOut stays 0 and every call site falls back to the pre-fix behavior
  *   for that edge, never worse.
- * - `now` IS A SLOT, NOT UNIX SECONDS: every other SvmVenueLadderV2 documents
+ * - `now` IS A SLOT, NOT UNIX SECONDS: every other SvmVenueLadder documents
  *   `now` as unix seconds (types.ts); this family's staleness gate compares
  *   against `block.number` (Clock::slot) because that is what the on-chain
  *   oracle's expirySlot actually is. A GENERIC caller following the
@@ -127,7 +127,7 @@
  */
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { CFG, OFF_CACHED_TS, OFF_DECAY_PPM, OFF_FEE_SCALE, OFF_LAST_SWAP_SLOT, OFF_MINT_A, OFF_MINT_B, OFF_SKEW_DEN, OFF_SKEW_HI, OFF_SKEW_LO_MAG, OFF_SKEW_NUM, OFF_SPLINE_AGE, OFF_SPLINE_D0, OFF_SPLINE_D1, OFF_SPLINE_SF, OFF_SPREAD_DIR0, OFF_SPREAD_DIR1, OFF_THRESHOLD, ORACLE_KEY_WORDS, ORACLE_OFF_CONF, ORACLE_OFF_EXP, ORACLE_OFF_EXPIRY_SLOT, ORACLE_OFF_FEE_WORD, ORACLE_OFF_MAN, ORACLE_OFF_SLOT, ORACLE_OFF_TS, SOLFI_V2_PROGRAM_ID, SPLINE_LEN_STRIDE, SPLINE_X_STRIDE, SPLINE_Y_STRIDE, solfiSwapAccounts } from './index.js';
 import type { SolfiV2PoolConfig } from './index.js';
 
@@ -799,7 +799,7 @@ export const solfiV2Ladder = {
     // itself, so this measurement-only oracle reports a neutral passthrough.
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;
 
 // ---------------------------------------------------------------------------
 // TS reference (independently derived from the same disassembly as the

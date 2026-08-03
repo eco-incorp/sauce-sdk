@@ -120,7 +120,7 @@
  *               -> 3_010_000_000 sSOL out. tx 5jRGKMb7simyMyYp3bbviMhc1pndgGEnSv2oRWsQd6fjkEEH1rM8g64fAcUoGmHf25WXLYQuSQv7FnxAjh9yMfcX
  *   undelegate, Hashkey Cloud AVS pool (via a Jupiter SharedAccountsRouteV2 leg): 12_450_000 hash4eT burned
  *               -> 12_450_000 sSOL out. tx 4bnVs3683krULUFbQc6sC7Yx5pJNaDbnxBu12uW2ikMrZq3qgSX3ZLgcPdRwsNr4KuwffwnbMNAqyZCKjXjGGNzf
- * `test/svm/ecoswap-svm.solayer.e2e.test.ts` replays real fixture dumps of
+ * `the consuming app solayer e2e test` replays real fixture dumps of
  * the Sonic and Hashkey Cloud AVS pools (`test/svm/fixtures/solayer{,-dir1}`,
  * captured at integration time) through `referenceQuote` AND through the
  * real committed engine, and separately drives the REAL dumped

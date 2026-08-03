@@ -1,5 +1,5 @@
 /**
- * Sanctum Infinity (`sanctum-infinity` EcoSwapSVM venue) — vendored per-LST
+ * Sanctum Infinity (`sanctum-infinity` SvmRoute venue) — vendored per-LST
  * registry: mint -> { family, stakePool }.
  *
  * WHY THIS EXISTS: Infinity's `LstState` (read live from `lst_state_list`,

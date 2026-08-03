@@ -1,6 +1,6 @@
 /**
  * Raydium CLMM (concentrated liquidity) venue — pool decoding, scope gates and
- * the prepare-declared tick-boundary WINDOW for the EcoSwapSVM ladder fragment
+ * the prepare-declared tick-boundary WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts). LADDER-ONLY (adapter contract v2): a CLMM quote is a tick walk
  * over a data-dependent account set, so there is no v1 SvmVenueAdapter and the
  * venue is not in the v1 registry. The design is the Orca-Whirlpools WINDOW

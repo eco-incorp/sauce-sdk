@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "trends";
 export declare const TRENDS_PROGRAM_ID: Address<"CURVEmPpijXDTNdqrA9PGP1io2rkgiVXH26xdXVGLLfz">;
 export declare const WSOL_MINT: Address<"So11111111111111111111111111111111111111112">;
@@ -30,6 +30,6 @@ export declare const trends: {
     programId: Address<"CURVEmPpijXDTNdqrA9PGP1io2rkgiVXH26xdXVGLLfz">;
     fetchPoolConfig: typeof fetchTrendsPoolConfig;
 };
-export declare const trendsLadder: SvmVenueLadderV2;
+export declare const trendsLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -310,7 +310,7 @@ export const byrealLadder = {
     // raydiumClmmLadder's concrete methods below are cfg-argument-only where
     // shown (no `now` / no `params` on a few) — raydium-clmm carries no
     // time-dependent state, so those parameters are simply absent upstream;
-    // matching their real arity here (rather than the SvmVenueLadderV2
+    // matching their real arity here (rather than the SvmVenueLadder
     // interface's most-general optional signature) is what lets us delegate
     // instead of transcribe.
     helpers: () => raydiumClmmLadder.helpers(),

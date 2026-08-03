@@ -3,7 +3,7 @@
  *
  * The venue adapters consume the one-address AccountLoader (fixture tests
  * feed it directly), but a naive RPC binding costs one round-trip per
- * account — an EcoSwapSVM prepare over k pools touches 3-8 accounts each.
+ * account — an SvmRoute prepare over k pools touches 3-8 accounts each.
  * `coalescingAccountLoader` keeps the adapter surface unchanged while
  * batching transport: every load() issued in the same microtask turn joins
  * ONE getMultipleAccounts sweep (deduped, chunked at the RPC's 100-account
@@ -15,7 +15,7 @@
  * each account's owner, and the loader hands (address, owner) to the
  * `expectOwner` hook before releasing the data — a per-account rejection
  * there fails that account's load() alone, exactly like a single-account
- * loader that verifies owners. quoteEcoSwapSvm/ecoSwapSvm wire the pool
+ * loader that verifies owners. quoteSvmRoute/svmRoute wire the pool
  * accounts' owner expectations to each family's program id.
  */
 import type { Address } from '@solana/kit';

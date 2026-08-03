@@ -12,7 +12,7 @@ export declare const BIDS_NODES_BASE: number;
  * heavier per-level walk: two budget checks plus the fee-adjusted-budget
  * setup) — MEASURED (not guessed): 588,522 CU @2 rungs / 831,135 CU @4
  * rungs on the real engine against the checked-in real SOL/USDC fixture
- * (`ecoswap-svm.cu.e2e.test.ts`, `CU_FAMILIES.phoenix` in budget.ts), both
+ * (`the consuming app cu e2e test`, `CU_FAMILIES.phoenix` in budget.ts), both
  * comfortably under the ~1.19M admission budget with room for a companion
  * slot. At this depth the shipped bid window alone absorbs ~713 SOL before
  * exhausting (see `docs/phoenix-evidence.md`) — far beyond a typical trade

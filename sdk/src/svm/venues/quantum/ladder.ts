@@ -1,5 +1,5 @@
 /**
- * Quantum adapter v2 (EcoSwapSVM ladder fragment) — the discrete-level PMM
+ * Quantum adapter v2 (SvmRoute ladder fragment) — the discrete-level PMM
  * walk. See ./index.ts for the layout, the reversed closed form and the
  * shipped-prefix rule; this file is the fragment + its lamport-exact mirror.
  *
@@ -40,7 +40,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -288,14 +288,14 @@ function emitWalk(p: string, xExpr: string, outVar: string, tag: string, indent:
   ];
 }
 
-export const quantumLadder: SvmVenueLadderV2 = {
+export const quantumLadder: SvmVenueLadder = {
   slug: SLUG,
 
   /**
    * 2 rungs. The setup is a bounded 16-level live read and each rung's walk
    * carries one 64-step partial inversion, so a quantum slot is a
    * degrade-first family like manifest/whirlpool (see
-   * recipes/ecoswap/svm/budget.ts). The walk is exact at every point, so a
+   * the consuming app SVM CU-budget module). The walk is exact at every point, so a
    * coarser rung grid costs split quantization, never correctness.
    */
   defaultRungs: 2,

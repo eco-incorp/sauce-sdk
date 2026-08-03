@@ -1,5 +1,5 @@
 /**
- * Saber Decimal Wrapper venue adapter (EcoSwapSVM ladder fragment, adapter
+ * Saber Decimal Wrapper venue adapter (SvmRoute ladder fragment, adapter
  * contract v2) — program `DecZY86MU5Gj7kppfUCEmd4LbXXuyZH1yHaP2NTqdiZB`
  * (`saber-hq/saber-periphery`'s `add-decimals` program, source verified —
  * see below). This is NOT a priced AMM: it is an EXACT, FIXED-RATE 1:multiplier
@@ -78,7 +78,7 @@
  * the merge simply doesn't over-elect this slot's share past what the real
  * CPI would actually pay out.
  *
- * ── CU ── see `../../../../ecoswap/svm/budget.ts`'s (sauce-recipes)
+ * ── CU ── see `../../../../the consuming app SVM CU-budget module`'s (sauce-recipes)
  * `CU_FAMILIES['saber-decimals-wrapper']` for the measured coefficients —
  * this SDK package carries the adapter only, not the recipe's own CU model.
  */
@@ -90,7 +90,7 @@ import type {
   AccountLoader,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -184,7 +184,7 @@ export const saberDecimalsWrapper = {
   quoteAccounts,
 };
 
-export const saberDecimalsWrapperLadder: SvmVenueLadderV2 = {
+export const saberDecimalsWrapperLadder: SvmVenueLadder = {
   slug: SLUG,
   /** A single multiply-or-floor-divide plus a clamp — cheaper than a typical 4-rung CP quote. */
   defaultRungs: 4,

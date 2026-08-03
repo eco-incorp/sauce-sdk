@@ -12,7 +12,7 @@
  * names and BYTE-IDENTICAL source as orca-whirlpool's — the codegen dedupes
  * helper functions by (name, source) across every family in a shape, so a
  * cook mixing this venue with orca-whirlpool shares one copy of each instead
- * of paying for two (SvmVenueLadderV2.helpers' contract: same name requires
+ * of paying for two (SvmVenueLadder.helpers' contract: same name requires
  * byte-identical source, enforced by the codegen).
  */
 import { address } from '@solana/kit';
@@ -20,7 +20,7 @@ import type { Address } from '@solana/kit';
 import { OFF_FEE_RATE, OFF_LIQUIDITY, OFF_SQRT_PRICE, OFF_TA_TICKS, OFF_TICK_CURRENT, TICK_LEN } from '../orca-whirlpool/index.js';
 import { readUintLE } from '../math.js';
 import { whirlpoolSqrtPriceAtTick } from '../orca-whirlpool/tick-math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { CROPPER_MAX_BOUNDARIES, CROPPER_MAX_SQRT_PRICE, CROPPER_MIN_SQRT_PRICE, CROPPER_PROGRAM_ID, windowFor } from './index.js';
 import type { CropperPoolConfig } from './index.js';
 
@@ -449,13 +449,13 @@ function emitBoundary(p: string, slot: number, k: number, aToB: boolean, params:
   ];
 }
 
-export const cropperLadder: SvmVenueLadderV2 = {
+export const cropperLadder: SvmVenueLadder = {
   slug: SLUG,
 
   /**
    * 2 rungs by default: a rung is a full cold walk (each crossed boundary
    * ~45k CU on the interpreter), the same economics that put orca-whirlpool
-   * and the other 'stable'-kind families at 2 (see recipes/ecoswap/svm/budget.ts).
+   * and the other 'stable'-kind families at 2 (see the consuming app SVM CU-budget module).
    */
   defaultRungs: 2,
 
@@ -601,7 +601,7 @@ export const cropperLadder: SvmVenueLadderV2 = {
     // UNLIKE orca-whirlpool (which special-cases sqrt_price_limit == 0 as
     // "no explicit limit, substitute the global MIN/MAX bound"), Cropper's
     // fork does NOT carry that convenience substitution — MEASURED live
-    // 2026-07-31 (test/svm/ecoswap-svm.realcpi.e2e.test.ts, real binary):
+    // 2026-07-31 (the consuming app realcpi e2e test, real binary):
     // a swap sent with sqrt_price_limit = 0 reverts AnchorError
     // SqrtPriceOutOfBounds (6011), where the byte-identical orca-whirlpool
     // call with the SAME 0 sentinel lands fine. So THIS venue must always
@@ -721,4 +721,4 @@ export const cropperLadder: SvmVenueLadderV2 = {
     const live = liveFromState(cfg, state);
     return { gammaPpm: FEE_MUL - live.fr, muPpm: FEE_MUL };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

@@ -112,7 +112,7 @@
  * ALREADY-halted pool (protocol-wide `is_halted`) so a permanently-dead
  * tranche never enters the universe at all; the direction-specific flags are
  * snapshotted onto the config and re-checked in the family's `gate` hook
- * (ecoswap/svm/index.ts) as the same belt-and-suspenders prepare-time
+ * (the consuming app SVM solver entry) as the same belt-and-suspenders prepare-time
  * shortcut every other family's activation gate uses.
  *
  * ACCOUNTS — both instructions take a SINGLE `u64` arg (`amount`/`shares`)
@@ -142,7 +142,7 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { findAssociatedTokenPda } from '@solana-program/token';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 export const PERENA_STAR_PROGRAM_ID = address('save8RQVPMWNTzU18t3GBvBkN9hT7jsGjiCQ28FpD9H');
 
@@ -341,7 +341,7 @@ function quoteAt(cfg: PerenaStarPoolConfig, s: LiveState, x: bigint): bigint {
   return (net * WAD) / s.bankPrice;
 }
 
-export const perenaStarLadder: SvmVenueLadderV2 = {
+export const perenaStarLadder: SvmVenueLadder = {
   slug: 'perena-star',
   // Exactly affine in x for a fixed live state (no curvature) up to the
   // capacity clamp — a straight line loses nothing to the framework floor.

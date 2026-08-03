@@ -1,5 +1,5 @@
 /**
- * Sanctum Infinity (EcoSwapSVM venue, `sanctum-infinity`) — the multi-LST
+ * Sanctum Infinity (SvmRoute venue, `sanctum-infinity`) — the multi-LST
  * liquidity pool run by the S-controller program ("INF"), open source at
  * github.com/igneous-labs/inf-1.5 (the successor to the archived
  * github.com/igneous-labs/S; this pool's on-chain `PoolState.version == 2`,
@@ -14,7 +14,7 @@
  * family relies on, so this venue does NOT use the generic
  * `SVM_FAMILY_FILTERS` getProgramAccounts sweep (there is no per-pair
  * account to memcmp-scan for) — see the discovery-wiring note below and in
- * `ecoswap/svm/discovery.ts`'s `withSanctumInfinity`.
+ * `the consuming app SVM discovery module`'s `withSanctumInfinity`.
  *
  * QUOTE (ground-truthed against inf-1.5's actual on-chain math, not the
  * archived repo's older `s_controller` IDL — the two agree on every formula
@@ -103,7 +103,7 @@
  * PACKET-SIZE RISK (flagged in the venue brief): a two-non-wsol-leg swap
  * attaches 23 accounts (11 + 5 + 5 + 2) for THIS ONE VENUE alone — several
  * times a typical 2-asset venue's footprint. `estimatePacket`
- * (`ecoswap/svm/index.ts`) already sizes the whole compiled program against
+ * (`the consuming app SVM solver entry`) already sizes the whole compiled program against
  * the 1,232-byte no-ALT ceiling across every attached venue; a route or
  * multi-slot shape that would overflow it is rejected/falls back the same
  * way an oversized route already does elsewhere (see `route.ts`'s ALT-fit
@@ -199,7 +199,7 @@ function readStakeWithdrawalFee(data) {
     off += 16; // stake_deposit_fee: Fee
     return readFee(data, off);
 }
-// ── directed-pair discovery key (see ecoswap/svm/discovery.ts's
+// ── directed-pair discovery key (see the consuming app SVM discovery module's
 // `withSanctumInfinity`) ──────────────────────────────────────────────────
 //
 // Infinity has no per-pair on-chain account, so there is no real address to

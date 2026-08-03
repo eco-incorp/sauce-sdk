@@ -1,5 +1,5 @@
 /**
- * Jupiter Perpetuals (JLP) `swap2` adapter v2 (EcoSwapSVM ladder fragment).
+ * Jupiter Perpetuals (JLP) `swap2` adapter v2 (SvmRoute ladder fragment).
  *
  * QUOTE (transcribed from the community swap-fee reference — see index.ts's
  * module doc for the three-way sourcing on why this is the swap2 fee model,
@@ -58,7 +58,7 @@
  */
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import {
   bakedDecimalScale,
   DOVES_PRICE_OFFSET,
@@ -475,4 +475,4 @@ export const perpsJlpLadder = {
     const feePpm = c.baseFeeBps * 100n > 1_000_000n ? 1_000_000n : c.baseFeeBps * 100n;
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

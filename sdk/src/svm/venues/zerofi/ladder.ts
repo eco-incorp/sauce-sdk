@@ -1,5 +1,5 @@
 /**
- * ZeroFi adapter v2 (EcoSwapSVM ladder fragment) — the amount-parametric
+ * ZeroFi adapter v2 (SvmRoute ladder fragment) — the amount-parametric
  * sibling of ./index.ts's buildSwap: the oracle price is read LIVE in-VM
  * (pure integer ops — no float unit assumed in the target VM), the gross
  * input arrives at runtime, and the pool's live output-vault balance sizes
@@ -219,7 +219,7 @@ export const zerofiLadder = {
   },
 
   /**
-   * Measurement only (see the SvmVenueLadderV2 doc) — this venue's realized
+   * Measurement only (see the SvmVenueLadder doc) — this venue's realized
    * curve is FLAT (no measured curvature across a ~1000x range, see
    * index.ts's module doc), so gamma is the identity and mu is the
    * measured fee retention, mirroring obric-v2's own P-A convention.

@@ -120,7 +120,7 @@
  * at ~4.7x the vault's real USDC balance reverted with
  * `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`'s `Error: insufficient
  * funds`, custom program error 0x1) — and a launched CPI failure aborts the
- * WHOLE cook on SVM (no execution-time catch, see ecoswap/svm/README.md's
+ * WHOLE cook on SVM (no execution-time catch, see the consuming app SVM README's
  * settled parity verdicts), so this MUST be a quote-time clamp, not a
  * runtime guard. `emitQuoteCall`'s redeem branch reads `vault`'s LIVE SPL
  * balance (the same `accountUint` pattern as every other family's reserve
@@ -153,7 +153,7 @@
  */
 import { address, getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'jupiter-lend-earn';
 
@@ -310,7 +310,7 @@ const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 const DEPOSIT_HELPER = 'qJupLendEarnDeposit';
 const REDEEM_HELPER = 'qJupLendEarnRedeem';
 
-export const jupiterLendEarnLadder: SvmVenueLadderV2 = {
+export const jupiterLendEarnLadder: SvmVenueLadder = {
   slug: SLUG,
   // Exactly affine (see module header) — a straight line loses nothing to a
   // coarser grid, so this pins the framework floor instead of the CP default

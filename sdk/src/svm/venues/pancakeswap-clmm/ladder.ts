@@ -10,13 +10,13 @@
  * names and BYTE-IDENTICAL source as raydium-clmm's — the codegen dedupes
  * helper functions by (name, source) across every family in a shape, so a
  * cook mixing this venue with raydium-clmm shares one copy of each instead
- * of paying for two (SvmVenueLadderV2.helpers' contract: same name requires
+ * of paying for two (SvmVenueLadder.helpers' contract: same name requires
  * byte-identical source, enforced by the codegen).
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { MAX_SQRT_PRICE_X64, MIN_SQRT_PRICE_X64 } from '../raydium-clmm/tick-math.js';
 import { raydiumDelta0, raydiumDelta1, raydiumNextSqrt0, raydiumSqrtPriceAtTick } from '../raydium-clmm/ladder.js';
 import {
@@ -397,7 +397,7 @@ function emitBoundary(p: string, slot: number, k: number, zeroForOne: boolean, p
   ];
 }
 
-export const pancakeswapClmmLadder: SvmVenueLadderV2 = {
+export const pancakeswapClmmLadder: SvmVenueLadder = {
   slug: SLUG,
   /** 2 rungs by default — a CLMM rung is a full cold walk, same class as raydium-clmm/whirlpool. */
   defaultRungs: 2,

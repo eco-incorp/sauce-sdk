@@ -60,8 +60,8 @@ export function venueAdapter(slug) {
     return adapter;
 }
 /**
- * The FULL adapter-contract v2 (EcoSwapSVM ladder) registry — every family
- * that implements SvmVenueLadderV2, keyed by slug. This is the single source
+ * The FULL adapter-contract v2 (SvmRoute ladder) registry — every family
+ * that implements SvmVenueLadder, keyed by slug. This is the single source
  * of truth the ladder-contract guard (test/svm/venues/ladder-contract.test.ts)
  * enumerates with a COUNT ASSERTION: a new family added to sdk/src/svm/venues/
  * without a corresponding entry here gets ZERO contract coverage, silently —
@@ -72,7 +72,7 @@ export function venueAdapter(slug) {
  * quantum/tesserav/woofi/deriverse/perps-jlp/juplend-amm are ladder-only).
  *
  * DELIBERATELY NOT YET EXTENDED: 54 more ladder families were migrated in
- * from sauce-recipes' `ecoswap/svm/venues/**` in the same pass that added
+ * from sauce-recipes' `its SVM venue modules` in the same pass that added
  * this comment (see `sdk/src/svm/venues/index.ts`'s "migrated venue
  * adapters" barrel section for the full list) and are reachable from
  * `@eco-incorp/sauce-sdk/svm` today, but are INTENTIONALLY not added to

@@ -1,5 +1,5 @@
 /**
- * JupLend AMM adapter v2 (EcoSwapSVM ladder fragment).
+ * JupLend AMM adapter v2 (SvmRoute ladder fragment).
  *
  * QUOTE MODEL (see index.ts's module doc for the full derivation + the
  * scope note on what is and isn't reproduced): a FLAT rate at the Dex's own

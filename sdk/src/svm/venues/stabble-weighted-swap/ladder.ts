@@ -1,5 +1,5 @@
 /**
- * Stabble Weighted Swap adapter v2 (EcoSwapSVM ladder fragment).
+ * Stabble Weighted Swap adapter v2 (SvmRoute ladder fragment).
  *
  * CAPACITY-AWARE: `weightedCalcOutGivenIn`'s real, on-chain MAX_IN_RATIO
  * (30%-of-balance) hard cap means an oversized rung must be CLAMPED to the
@@ -48,7 +48,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -280,4 +280,4 @@ export const stabbleWeightedSwapLadder = {
     const swapFee = readUintLE(poolData, SWAP_FEE_OFFSET, 8);
     return { gammaPpm: 1_000_000n - swapFee / 1_000n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

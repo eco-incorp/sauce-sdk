@@ -160,7 +160,7 @@
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'raydium-launchlab' as const;
 
@@ -320,7 +320,7 @@ export const raydiumLaunchlab = {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const raydiumLaunchlabLadder: SvmVenueLadderV2 = {
+export const raydiumLaunchlabLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = asCfg(base);

@@ -1,5 +1,5 @@
 /**
- * GoonFi V2 adapter v2 (EcoSwapSVM ladder fragment). See ./index.ts for the
+ * GoonFi V2 adapter v2 (SvmRoute ladder fragment). See ./index.ts for the
  * full reverse-engineering provenance (program id, instruction format,
  * account order/writability, oracle-relay layout, fee-tier table — all from
  * real mainnet transactions, not documentation).
@@ -52,7 +52,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -421,4 +421,4 @@ export const goonfiV2Ladder = {
     const feePpm = fee0 > FEE_DEN ? FEE_DEN : fee0;
     return { gammaPpm: FEE_DEN, muPpm: FEE_DEN - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

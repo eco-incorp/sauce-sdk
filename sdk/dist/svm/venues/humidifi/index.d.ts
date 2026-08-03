@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "humidifi";
 /** The swap-settlement program (NOT the `AubCGUt9...` route/setup program). */
 export declare const HUMIDIFI_PROGRAM_ID: Address<'9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp'>;
@@ -59,6 +59,6 @@ export declare function fetchHumidifiConfig(load: AccountLoader, pool: Address):
  * calibrated against the worst pool sampled, not the best-sampled one.
  */
 export declare const HUMIDIFI_SAFETY_FEE_PPM = 300000n;
-export declare const humidifiLadder: SvmVenueLadderV2;
+export declare const humidifiLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

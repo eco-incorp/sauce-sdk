@@ -1,6 +1,6 @@
 /**
  * Barrel-surface pin for the 48 SVM venue modules migrated in from
- * sauce-recipes' `ecoswap/svm/venues/**` (see `sdk/src/svm/venues/index.ts`'s
+ * sauce-recipes' `its SVM venue modules` (see `sdk/src/svm/venues/index.ts`'s
  * "migrated venue adapters" section and `registry.ts`'s matching doc
  * comment).
  *

@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "defituna";
 export declare const DEFITUNA_PROGRAM_ID: Address<"fUSioN9YKKSa3CUC2YUc4tPkHJ5Y6XW1yz8y6F7qWz9">;
 export declare const FUSION_POOL_ACCOUNT_SIZE = 423;
@@ -65,6 +65,6 @@ export declare const defituna: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchDefiTunaPoolConfig;
 };
-export declare const defitunaLadder: SvmVenueLadderV2;
+export declare const defitunaLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

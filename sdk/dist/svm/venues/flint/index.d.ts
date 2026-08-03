@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
 declare const SLUG = "flint";
 export declare const FLINT_PROGRAM_ID: Address<"FLiNTXPwppyoJabCoxc2uiiRygAHpmMXajiDXo2Ub1z">;
 /**
@@ -57,6 +57,6 @@ export declare const flint: {
     fetchPoolConfig: typeof fetchPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const flintLadder: SvmVenueLadderV2;
+export declare const flintLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

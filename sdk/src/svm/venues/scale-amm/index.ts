@@ -29,7 +29,7 @@
  * different active-beneficiary count cannot share a compiled slot fragment.
  */
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadder } from '../types.js';
 import {
   ata,
   BUY_DISCRIMINATOR,
@@ -206,7 +206,7 @@ function directionOfParam(dirParam: bigint): ScaleDirection {
   return dirParam === 0n ? 'aToB' : 'bToA';
 }
 
-export const scaleAmmLadder: SvmVenueLadderV2 = {
+export const scaleAmmLadder: SvmVenueLadder = {
   slug: SLUG,
 
   shapeKey(base: PoolConfig): string {

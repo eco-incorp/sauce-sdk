@@ -21,7 +21,7 @@ export declare const zerofiLadder: {
         reserveOut: bigint;
     };
     /**
-     * Measurement only (see the SvmVenueLadderV2 doc) — this venue's realized
+     * Measurement only (see the SvmVenueLadder doc) — this venue's realized
      * curve is FLAT (no measured curvature across a ~1000x range, see
      * index.ts's module doc), so gamma is the identity and mu is the
      * measured fee retention, mirroring obric-v2's own P-A convention.

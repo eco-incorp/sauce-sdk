@@ -1,5 +1,5 @@
 /**
- * XOrca (EcoSwapSVM ladder fragment) — Orca's liquid-staking wrapper: stake
+ * XOrca (SvmRoute ladder fragment) — Orca's liquid-staking wrapper: stake
  * ORCA into a single global vault and mint xORCA shares at the vault's live
  * ratio. No on-chain IDL is published, but the program (`orca-so/xorca` on
  * GitHub, Pinocchio + shank-generated) is open source; this adapter is a
@@ -20,7 +20,7 @@
  * later. This is a STRUCTURAL fact about the program, not a permission or
  * whitelist gap — `xorcaLadder` only ever implements the `Stake` direction
  * (ORCA -> xORCA); there is no `direction` field to flip (unlike every other
- * family in `FAMILIES`, which is why `ecoswap/svm/index.ts`'s `xorca` entry
+ * family in `FAMILIES`, which is why `the consuming app SVM solver entry`'s `xorca` entry
  * carries no `REVERSE_DIRECTION` entry, the same shape as `saber-stableswap`
  * and `orca-legacy-token-swap`, which are also single-direction-only).
  *
@@ -35,7 +35,7 @@
  * `XORCA_STATE_PDA` and there is no `getProgramAccounts` geometry to publish
  * (mints are hardcoded program constants, `cpi/token/mod.rs`'s `ORCA_MINT_ID`/
  * `XORCA_MINT_ID`, never stored as pool-account bytes at any offset — see
- * `ecoswap/svm/discovery.ts`'s `withXorcaStaticCandidates` for how this venue
+ * `the consuming app SVM discovery module`'s `withXorcaStaticCandidates` for how this venue
  * is discovered instead of via `SVM_FAMILY_FILTERS`).
  *
  * `solana-program/src/instructions/mod.rs`'s `Instruction` enum (Borsh,
@@ -122,7 +122,7 @@
  * historical-state replay (public RPC does not serve arbitrary historical
  * account snapshots).
  *
- * ── CU (`ecoswap/svm/budget.ts`'s `CU_FAMILIES.xorca`) ──
+ * ── CU (`the consuming app SVM CU-budget module`'s `CU_FAMILIES.xorca`) ──
  *
  * MEASURED from 3 real mainnet `Stake` transactions' own compute logs
  * (`getTransaction`, 2026-07-31) — "Program StaKE6XN...consumed N of ...
@@ -149,7 +149,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'xorca';
 
@@ -237,7 +237,7 @@ function readU64LE(data: Uint8Array, offset: number): bigint {
   return v;
 }
 
-export const xorcaLadder: SvmVenueLadderV2 = {
+export const xorcaLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(base: PoolConfig): string {
@@ -325,7 +325,7 @@ export const xorcaLadder: SvmVenueLadderV2 = {
     return { reserveIn: vaultAmount - escrowed, reserveOut: supply };
   },
   continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
-    // Measurement-only oracle input (never a gate — see the SvmVenueLadderV2
+    // Measurement-only oracle input (never a gate — see the SvmVenueLadder
     // doc). The real curve is exactly LINEAR (no price impact at all — see
     // file header), strictly MORE depth than any CP curve models; reporting
     // a plain no-fee CP shape (gamma=mu=1) over the real reserves is a

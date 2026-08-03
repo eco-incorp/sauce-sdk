@@ -1,5 +1,5 @@
 /**
- * Raydium CP-Swap adapter v2 (EcoSwapSVM ladder fragment) — the
+ * Raydium CP-Swap adapter v2 (SvmRoute ladder fragment) — the
  * amount-parametric sibling of ./index.ts's emitQuote: reserves (vault
  * balances minus the PoolState protocol/fund/creator fee accumulators) and
  * the admin-mutable AmmConfig fee rates are read LIVE in-VM, and the gross

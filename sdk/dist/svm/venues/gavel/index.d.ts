@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "gavel";
 export declare const GAVEL_PROGRAM_ID: Address<"srAMMzfVHVAtgSJc8iH6CfKzuWuUTzLHVCE81QU1rgi">;
 /** u64 LE @0 — accounts.rs POOL_ACCOUNT_DISCRIMINATOR ([116,210,187,119,196,196,52,137]). */
@@ -35,6 +35,6 @@ export declare const gavel: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchGavelConfig;
 };
-export declare const gavelLadder: SvmVenueLadderV2;
+export declare const gavelLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

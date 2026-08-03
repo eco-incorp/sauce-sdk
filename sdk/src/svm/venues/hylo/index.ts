@@ -135,7 +135,7 @@
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadderV2, SwapUser, VenueAccount, VenueSwap } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadder, SwapUser, VenueAccount, VenueSwap } from '../types.js';
 
 const SLUG = 'hylo';
 export const HYLO_PROGRAM_ID = address('HYEXCHtHkBagdStcJCp3xbbb9B7sdMdWXFNj6mdsG4hn');
@@ -340,9 +340,9 @@ export function hyloGate(cfg: PoolConfig, now: bigint): void {
 
 /**
  * Recoverable live-state drift (pause / stale-or-low-confidence oracle) between discovery and
- * prepare — the SAME class `ecoswap/svm/index.ts`'s own `SvmWindowDriftError` names (that class
+ * prepare — the SAME class `the consuming app SVM solver entry`'s own `SvmWindowDriftError` names (that class
  * is private to index.ts, so this venue module carries an identically-treated local marker;
- * `ecoswap/svm/index.ts`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
+ * `the consuming app SVM solver entry`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
  * self-drop classification stays centralized there).
  */
 export class SvmHyloDriftError extends Error {}
@@ -566,11 +566,11 @@ export const hylo: SvmVenueAdapter = {
   referenceQuote,
 };
 
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const hyloLadder: SvmVenueLadderV2 = {
+export const hyloLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(cfg) {

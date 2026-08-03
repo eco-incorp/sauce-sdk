@@ -313,7 +313,7 @@ export const whalestreetLadder = {
         return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
     },
     continuousFees() {
-        // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — no additional
+        // Measurement-only oracle (see the SvmVenueLadder doc comment) — no additional
         // denominator decay (gammaPpm at par), muPpm folds the OUT_HAIRCUT_NUM/DEN conservative
         // haircut so the efficiency oracle reads the same conservative curve the ladder quotes.
         return { gammaPpm: 1000000n, muPpm: (1000000n * OUT_HAIRCUT_NUM) / OUT_HAIRCUT_DEN };

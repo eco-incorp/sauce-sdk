@@ -1,5 +1,5 @@
 /**
- * Bonkswap / Guacswap LADDER fragments (EcoSwapSVM adapter contract v2) — see
+ * Bonkswap / Guacswap LADDER fragments (SvmRoute adapter contract v2) — see
  * ./index.ts's module header for the shared account layout / swap-ix / fee
  * rationale. One factory instantiated per deployed fork; only the swap CPI's
  * `programId` (buildSwapV2) and the fork's own `programAuthority`/`state`
@@ -49,7 +49,7 @@
  * same way.
  */
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import {
   bonkswapForkConfig,
   bonkswapReadUintLE,
@@ -78,7 +78,7 @@ function ceilDiv(a: bigint, b: bigint): bigint {
  * One ladder per deployed Bonkswap fork — same math/CPI shape (see module
  * header), parameterized by the fork's own program id + PDAs.
  */
-export function makeBonkswapForkLadder(slug: string, programId: Address, programAuthority: Address, state: Address): SvmVenueLadderV2 {
+export function makeBonkswapForkLadder(slug: string, programId: Address, programAuthority: Address, state: Address): SvmVenueLadder {
   return {
     slug,
     shapeKey(base) {

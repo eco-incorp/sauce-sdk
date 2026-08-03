@@ -173,7 +173,7 @@
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'openbook-v2';
 export const OPENBOOK_V2_PROGRAM_ID = address('opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb');
@@ -421,9 +421,9 @@ function openbookV2Config(cfg: PoolConfig): OpenBookV2PoolConfig {
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
 /** 2^64 — every per-trade payload arg is encoded as ONE u64 word
- * (`encodeEcoSwapSvmTrade`/codegen.ts's `abi.encode(le8(...))` path), so the order's full 128-bit
+ * (`encodeSvmRouteTrade`/codegen.ts's `abi.encode(le8(...))` path), so the order's full 128-bit
  * tree key can NOT ride as a single param (it can exceed u64::MAX — measured directly: a real
- * fixture key failed encodeEcoSwapSvmTrade's own u64-range check). Ship it as two u64 halves
+ * fixture key failed encodeSvmRouteTrade's own u64-range check). Ship it as two u64 halves
  * instead — `keyLow` (params) + `priceLots` (already shipped, and IS the key's top 64 bits by
  * construction, see `walkFixedTree`) — and RECONSTRUCT the full key on both sides (the fragment via
  * plain `*`+`+`, proven supported at this magnitude by manifest's own u128 arithmetic; the TS
@@ -515,10 +515,10 @@ function emitWalk(cfg: OpenBookV2PoolConfig, p: string, slot: number, xExpr: str
   return lines;
 }
 
-export const openbookV2Ladder: SvmVenueLadderV2 = {
+export const openbookV2Ladder: SvmVenueLadder = {
   slug: SLUG,
   /** Heavy fixed setup (MAX_ORDERS unrolled live reads + key verification over a 90KB BookSide
-   * account) — 'stable'/degrade-first class, same as manifest/whirlpool (recipes/ecoswap/svm/budget.ts). */
+   * account) — 'stable'/degrade-first class, same as manifest/whirlpool (the consuming app SVM CU-budget module). */
   defaultRungs: 2,
   shapeKey(base) {
     return `${SLUG}:${openbookV2Config(base).direction}`;

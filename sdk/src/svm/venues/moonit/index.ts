@@ -87,7 +87,7 @@
  *
  * TRADE ARGS — `TradeParams{token_amount, collateral_amount, fixed_side:u8
  * (IN=0/OUT=1), slippage_bps}`: this module ALWAYS uses `fixed_side=IN` (the
- * side matching the ecoswap ladder's own exact-input contract) and floors the
+ * side matching the the consuming app ladder's own exact-input contract) and floors the
  * OTHER (estimated) side at 1 with `slippage_bps=0` — the recipe's own
  * terminal outAta delta / minOut check is the real floor, mirroring every
  * other wired venue's "venue-level min_out is always 1" convention.
@@ -116,7 +116,7 @@
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'moonit' as const;
 
@@ -331,7 +331,7 @@ function referenceSell(x: bigint, m: bigint, aw: bigint, bw: bigint, td: bigint,
   return gross - fee;
 }
 
-export const moonitLadder: SvmVenueLadderV2 = {
+export const moonitLadder: SvmVenueLadder = {
   slug: SLUG,
   /** CP-class: a closed-form quote (a quadratic + isqrt for buy, a polynomial for sell), 4 rungs. */
   defaultRungs: 4,

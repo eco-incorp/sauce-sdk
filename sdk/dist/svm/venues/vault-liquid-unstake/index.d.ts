@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
 declare const SLUG = "vault-liquid-unstake";
 export interface VaultLiquidUnstakePoolConfig extends PoolConfig {
     venue: typeof SLUG;
@@ -24,7 +24,7 @@ export declare const vaultLiquidUnstake: {
     /**
      * Off-chain, once per pool. `pool` is the LstInfo account address (this
      * family's "pool", matching every other family's convention — see
-     * EcoSwapSvmPoolSpec). Rejects: a missing/undecodable LstInfo, the wrong
+     * SvmRoutePoolSpec). Rejects: a missing/undecodable LstInfo, the wrong
      * discriminator, the unsupported 225-byte extended layout (SCOPE, module
      * doc), a missing/malformed global Pool singleton, or a stake-pool
      * account whose shape doesn't match the canonical SPL Stake Pool struct.
@@ -32,6 +32,6 @@ export declare const vaultLiquidUnstake: {
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<VaultLiquidUnstakePoolConfig>;
     quoteAccounts(cfg: PoolConfig): VenueAccount[];
 };
-export declare const vaultLiquidUnstakeLadder: SvmVenueLadderV2;
+export declare const vaultLiquidUnstakeLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

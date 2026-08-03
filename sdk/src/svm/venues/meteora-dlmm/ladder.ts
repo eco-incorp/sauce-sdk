@@ -1,5 +1,5 @@
 /**
- * Meteora DLMM adapter v2 (EcoSwapSVM ladder fragment) — the first BIN family.
+ * Meteora DLMM adapter v2 (SvmRoute ladder fragment) — the first BIN family.
  * The quote walks the pool's discrete price bins over the PREPARE-DECLARED bin
  * window (./index.ts): prepare ships up to METEORA_DLMM_MAX_BINS liquid bins
  * (biased id, array cell, Q64.64 price) as per-trade cfg params plus the
@@ -31,7 +31,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -717,4 +717,4 @@ export const meteoraDlmmLadder = {
     const tfee = totalFeeForBin(fee, live, live.bActive);
     return { gammaPpm: 1_000_000n - tfee / 1000n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

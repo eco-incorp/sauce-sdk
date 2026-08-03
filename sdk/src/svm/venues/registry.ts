@@ -1,4 +1,4 @@
-import type { SvmVenueAdapter, SvmVenueLadderV2 } from './types.js';
+import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { deriverseLadder } from './deriverse/ladder.js';
 import { meteoraDammV1Stable } from './meteora-damm-v1-stable/index.js';
 import { meteoraDammV1StableLadder } from './meteora-damm-v1-stable/ladder.js';
@@ -65,8 +65,8 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
 }
 
 /**
- * The FULL adapter-contract v2 (EcoSwapSVM ladder) registry — every family
- * that implements SvmVenueLadderV2, keyed by slug. This is the single source
+ * The FULL adapter-contract v2 (SvmRoute ladder) registry — every family
+ * that implements SvmVenueLadder, keyed by slug. This is the single source
  * of truth the ladder-contract guard (test/svm/venues/ladder-contract.test.ts)
  * enumerates with a COUNT ASSERTION: a new family added to sdk/src/svm/venues/
  * without a corresponding entry here gets ZERO contract coverage, silently —
@@ -77,7 +77,7 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * quantum/tesserav/woofi/deriverse/perps-jlp/juplend-amm are ladder-only).
  *
  * DELIBERATELY NOT YET EXTENDED: 54 more ladder families were migrated in
- * from sauce-recipes' `ecoswap/svm/venues/**` in the same pass that added
+ * from sauce-recipes' `its SVM venue modules` in the same pass that added
  * this comment (see `sdk/src/svm/venues/index.ts`'s "migrated venue
  * adapters" barrel section for the full list) and are reachable from
  * `@eco-incorp/sauce-sdk/svm` today, but are INTENTIONALLY not added to
@@ -102,7 +102,7 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * `declaredCliffs` harvesting has been done for it here. Follow-up, not a
  * gap this salvage pass closes.
  */
-const ladderAdapters: Record<string, SvmVenueLadderV2> = {
+const ladderAdapters: Record<string, SvmVenueLadder> = {
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
   [raydiumAmmV4Ladder.slug]: raydiumAmmV4Ladder,
   [pumpswapLadder.slug]: pumpswapLadder,
@@ -134,7 +134,7 @@ export function listLadderVenues(): string[] {
 }
 
 /** Looks up a ladder-adapter (v2) by slug; throws listing the known slugs. */
-export function ladderVenueAdapter(slug: string): SvmVenueLadderV2 {
+export function ladderVenueAdapter(slug: string): SvmVenueLadder {
   const adapter = ladderAdapters[slug];
   if (adapter === undefined) {
     const known = listLadderVenues();

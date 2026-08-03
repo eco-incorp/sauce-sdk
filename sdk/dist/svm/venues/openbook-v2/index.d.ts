@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "openbook-v2";
 export declare const OPENBOOK_V2_PROGRAM_ID: Address<"opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb">;
 export declare const MARKET_ACCOUNT_SIZE = 848;
@@ -54,6 +54,6 @@ export interface OpenBookV2PoolConfig extends PoolConfig {
 /** The direction's shipped window (the ladder fragment and the orchestrator gate read through this). */
 export declare function openbookV2WindowFor(cfg: OpenBookV2PoolConfig): OpenBookV2Window;
 export declare function fetchOpenBookV2Config(load: AccountLoader, pool: Address): Promise<OpenBookV2PoolConfig>;
-export declare const openbookV2Ladder: SvmVenueLadderV2;
+export declare const openbookV2Ladder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

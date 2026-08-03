@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "alphaq";
 export declare const ALPHAQ_PROGRAM_ID: Address<"ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA">;
 /** Minimal getProgramAccounts transport for the stats-account join (data included, unlike the
@@ -27,7 +27,7 @@ export interface AlphaqStatsRpc {
  * beyond "no new markets discovered this run" — the static table still
  * serves every market known at integration time.
  *
- * NOT auto-wired into `ecoswap/svm/discovery.ts`'s gPA sweep (deliberately —
+ * NOT auto-wired into `the consuming app SVM discovery module`'s gPA sweep (deliberately —
  * it would add one extra getProgramAccounts call to EVERY discovery sweep for
  * a table that is already complete for every market that exists today). A
  * caller with its own boot sequence (the api, a CLI, a future cron) should
@@ -83,6 +83,6 @@ declare function cpQuote(x: bigint, rawA: bigint, rawB: bigint): bigint;
  * reserveIn/reserveOut pair) — no per-trade params, the haircut is a
  * compiled constant, not pool state.
  */
-export declare const alphaqLadder: SvmVenueLadderV2;
+export declare const alphaqLadder: SvmVenueLadder;
 export { cpQuote as __alphaqCpQuoteForTest, decodeSymbol as __alphaqDecodeSymbolForTest };
 //# sourceMappingURL=index.d.ts.map

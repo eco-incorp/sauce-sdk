@@ -1,5 +1,5 @@
 /**
- * Orca Whirlpools CLMM adapter v2 (EcoSwapSVM ladder fragment) — the first
+ * Orca Whirlpools CLMM adapter v2 (SvmRoute ladder fragment) — the first
  * tick-walk family. The quote walks the pool's concentrated liquidity over
  * the PREPARE-DECLARED boundary window (../orca-whirlpool/index.ts): prepare
  * ships up to WHIRLPOOL_MAX_BOUNDARIES initialized-tick boundaries (biased
@@ -62,7 +62,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -551,7 +551,7 @@ export const orcaWhirlpoolLadder = {
   /**
    * 2 rungs by default: a rung is a full cold walk (each crossed boundary
    * ~45k CU on the interpreter), the same economics that put the stable
-   * families at 2 (see recipes/ecoswap/svm/budget.ts).
+   * families at 2 (see the consuming app SVM CU-budget module).
    */
   defaultRungs: 2,
 
@@ -856,4 +856,4 @@ export const orcaWhirlpoolLadder = {
     // fee_rate is hundredths of a bp == ppm directly; charged on the INPUT.
     return { gammaPpm: FEE_MUL - live.fr, muPpm: FEE_MUL };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

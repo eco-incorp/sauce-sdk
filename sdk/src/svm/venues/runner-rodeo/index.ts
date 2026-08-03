@@ -18,7 +18,7 @@
  *    raw units (both directions) — every one matched the program's real output BIT-EXACT
  *    (see VALIDATION below). The program's own binary was additionally dumped
  *    (`solana program dump`, ELF loader-owned, 946,792 bytes) to measure the real CPI's CU
- *    cost (see sauce-recipes' `ecoswap/svm/budget.ts`'s `CU_FAMILIES['runner-rodeo']` comment).
+ *    cost (see sauce-recipes' `the consuming app SVM CU-budget module`'s `CU_FAMILIES['runner-rodeo']` comment).
  *
  * POOL-STATE ACCOUNT (313 bytes, Anchor-discriminated, disc = d5d2e3bf30aade72 — gated at
  * fetch time):
@@ -119,7 +119,7 @@ import type {
   AccountLoader,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -328,7 +328,7 @@ export const runnerRodeo = {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const runnerRodeoLadder: SvmVenueLadderV2 = {
+export const runnerRodeoLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = asCfg(base);

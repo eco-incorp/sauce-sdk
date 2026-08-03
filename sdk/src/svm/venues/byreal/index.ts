@@ -64,7 +64,7 @@ import type { Address } from '@solana/kit';
 import { AMM_CONFIG_DISCRIMINATOR, RAYDIUM_CLMM_MAX_BOUNDARIES, POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR, windowStartTicks } from '../raydium-clmm/index.js';
 import { MAX_TICK, MIN_TICK } from '../raydium-clmm/tick-math.js';
 import { raydiumClmmLadder, raydiumSqrtPriceAtTick } from '../raydium-clmm/ladder.js';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 import type { RaydiumClmmBoundary, RaydiumClmmPoolConfig, RaydiumClmmWindow } from '../raydium-clmm/index.js';
 
 const SLUG = 'byreal' as const;
@@ -340,14 +340,14 @@ function asRay(cfg: PoolConfig): PoolConfig {
  * real raydium-clmm shapes) and `buildSwapV2` (CPI target program) are
  * genuinely different from upstream.
  */
-export const byrealLadder: SvmVenueLadderV2 = {
+export const byrealLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: raydiumClmmLadder.defaultRungs,
   shapeKey: (base) => `${SLUG}:${(base as ByrealPoolConfig).direction}`,
   // raydiumClmmLadder's concrete methods below are cfg-argument-only where
   // shown (no `now` / no `params` on a few) — raydium-clmm carries no
   // time-dependent state, so those parameters are simply absent upstream;
-  // matching their real arity here (rather than the SvmVenueLadderV2
+  // matching their real arity here (rather than the SvmVenueLadder
   // interface's most-general optional signature) is what lets us delegate
   // instead of transcribe.
   helpers: () => raydiumClmmLadder.helpers(),

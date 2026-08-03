@@ -1,3 +1,3 @@
-import type { SvmVenueLadderV2 } from '../types.js';
-export declare const oneIntroSwapLadder: SvmVenueLadderV2;
+import type { SvmVenueLadder } from '../types.js';
+export declare const oneIntroSwapLadder: SvmVenueLadder;
 //# sourceMappingURL=ladder.d.ts.map

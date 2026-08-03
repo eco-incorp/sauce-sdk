@@ -1,5 +1,5 @@
 /**
- * Riptide adapter v2 (EcoSwapSVM ladder fragment).
+ * Riptide adapter v2 (SvmRoute ladder fragment).
  *
  * ── Swap instruction (disc 0x02 "SwapExactIn", 12 bytes total) —
  * reverse-engineered from 15 real landed swaps (both direct calls and
@@ -87,7 +87,7 @@
  * raw-unit-scaled and up to ~2.2 SOL) — dramatically heavier than most
  * other wired families (the next heaviest single-CPI cost, solfi-v2's whole
  * slot, is 585,136 including its OWN setup/quote/merge). The CU_FAMILIES
- * pin in ecoswap/svm/budget.ts (sauce-recipes) is calibrated generously
+ * pin in the consuming app SVM CU-budget module (sauce-recipes) is calibrated generously
  * above the observed ceiling rather than off a LiteSVM slot/rung split — no
  * local engine.so was available at the time this was measured; re-pin with
  * ECO_SVM_CU_PRINT=1 once one is.
@@ -96,7 +96,7 @@ import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
 import type {
   AccountBytesMap,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -115,7 +115,7 @@ const OUT_DISCOUNT_DEN = 2n;
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const riptideLadder: SvmVenueLadderV2 = {
+export const riptideLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
   defaultRungs: 4,
@@ -217,7 +217,7 @@ export const riptideLadder: SvmVenueLadderV2 = {
     return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
   },
   continuousFees() {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — no
+    // Measurement-only oracle (see the SvmVenueLadder doc comment) — no
     // additional denominator decay (gammaPpm at par), muPpm folds the
     // OUT_DISCOUNT_NUM/DEN conservative haircut so the efficiency oracle
     // reads the same conservative curve the ladder actually quotes.

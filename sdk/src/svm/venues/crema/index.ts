@@ -109,7 +109,7 @@
  * A genuinely venue-specific-FEELING but actually general mechanism worth
  * recording for whoever next builds a synthetic-state CLMM harness (found
  * while validating bToA above, off the committed test path — this repo's
- * shipped real-CPI lane, ecoswap-svm.realcpi.e2e.test.ts, only exercises this
+ * shipped real-CPI lane, the consuming app realcpi e2e test, only exercises this
  * venue's aToB direction, matching every sibling venue cell there): crediting
  * a native-mint (wSOL) OUTPUT account during a real swap CPI moves REAL
  * LAMPORTS out of the vault (not just the SPL "amount" data field the way a
@@ -137,7 +137,7 @@ import type { Address } from '@solana/kit';
 import { MAX_TICK_INDEX, MIN_TICK_INDEX, whirlpoolSqrtPriceAtTick } from '../orca-whirlpool/tick-math.js';
 import { orcaWhirlpoolLadder, whirlpoolDeltaA, whirlpoolDeltaB, whirlpoolNextSqrtA } from '../orca-whirlpool/ladder.js';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'crema';
 export const CREMA_PROGRAM_ID = address('CLMM9tUoggJu2wagPkkqs9eFG4BWhVBZWkP1qv3Sp7tR');
@@ -771,7 +771,7 @@ function emitBoundary(p: string, slot: number, k: number, aToB: boolean, params:
   ];
 }
 
-export const cremaLadder: SvmVenueLadderV2 = {
+export const cremaLadder: SvmVenueLadder = {
   slug: SLUG,
   /** 2 rungs by default: same walk/CU economics as orca-whirlpool/raydium-clmm. */
   defaultRungs: 2,

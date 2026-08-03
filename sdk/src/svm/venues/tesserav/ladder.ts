@@ -1,5 +1,5 @@
 /**
- * TesseraV adapter v2 (EcoSwapSVM ladder fragment) — see ./index.ts for the
+ * TesseraV adapter v2 (SvmRoute ladder fragment) — see ./index.ts for the
  * account layout and the swap-CPI evidence. This file is the quote fragment
  * + its lamport-mirror + the swap-CPI builder.
  *
@@ -93,7 +93,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -191,11 +191,11 @@ export const tesseravLadder = {
 
   // No defaultRungs override: the flat-rate level-0 model is exact at any
   // rung count (every grid point below capacity samples the SAME linear
-  // rate), so this rides the CP default (4, recipes/ecoswap/svm/budget.ts's
+  // rate), so this rides the CP default (4, the consuming app SVM CU-budget module's
   // FamilyCuCoefficients doc) like the other simple CP families
   // (raydium-cp-swap, raydium-amm-v4, pumpswap, orca-legacy-token-swap,
   // meteora-damm-v2) rather than inventing a rung count below MIN_RUNGS=2
-  // (recipes/ecoswap/svm/solver-reference.ts) that nothing else in the
+  // (the consuming app SVM reference solver) that nothing else in the
   // ladder/budget pipeline expects.
 
   shapeKey(base: PoolConfig): string {
@@ -341,4 +341,4 @@ export const tesseravLadder = {
     const price0 = readUintLE(pool, level0PriceOffset(cfg.direction), 8);
     return { gammaPpm: 0n, muPpm: (price0 * SAFETY_NUM) / SAFETY_DEN };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

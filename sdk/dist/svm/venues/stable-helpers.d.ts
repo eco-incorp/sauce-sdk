@@ -1,7 +1,7 @@
 /**
  * Shared stable-curve Newton helpers for the LADDER (adapter v2) families —
  * saber-stableswap and meteora-damm-v1-stable declare these through their
- * `helpers()` and the EcoSwapSVM codegen dedupes them by name.
+ * `helpers()` and the SvmRoute codegen dedupes them by name.
  *
  * stableD is byte-identical math to the solswap generator's helper (ann =
  * amp·2 inside, ≤ 256 iterations, converged when successive estimates differ
@@ -18,7 +18,7 @@
  * is approached from above either way (larger cumulative input ⇒ smaller y,
  * so y_prev ≥ y*), which cuts the Newton iterations to ~1-2 per rung — the
  * difference between a stable slot fitting the CU budget or not (see
- * recipes/ecoswap/svm/budget.ts). The warm-vs-cold oracle unit asserts the
+ * the consuming app SVM CU-budget module). The warm-vs-cold oracle unit asserts the
  * chain reproduces the cold values on the fixture universe; even where an
  * exotic pool might wobble a rung by a lamport, both sides of the
  * lamport-exact gate (fragment and TS mirror) compute the SAME chain, so

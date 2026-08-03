@@ -1,5 +1,5 @@
 /**
- * HumidiFi (EcoSwapSVM ladder fragment) — a top-10 chain-wide venue
+ * HumidiFi (SvmRoute ladder fragment) — a top-10 chain-wide venue
  * (201.9M/7d, 40.3M/24h per the benchmark's Jupiter-label capture) with NO
  * on-chain IDL. This module is a from-scratch binary reverse-engineering,
  * not a port of any published adapter — the SDK ships no `humidifi` ladder.
@@ -47,7 +47,7 @@
  *      so `buildSwapV2` below cannot fill in a header/pair of accounts that
  *      the deployed program will accept for a NEW trade it never
  *      pre-negotiated. This is the documented, evidenced basis for the
- *      `humidifi` family's prepare-time gate in `ecoswap/svm/index.ts`
+ *      `humidifi` family's prepare-time gate in `the consuming app SVM solver entry`
  *      (`FAMILIES.humidifi.gate`) — not a permission/whitelist gate, and not
  *      env-flagged; see that file for exactly what is gated and why lifting
  *      it needs an off-chain RFQ-participation slice, not a code tweak here.
@@ -60,7 +60,7 @@
  *    use `getProgramAccounts` + memcmp like every other family (see
  *    `SVM_FAMILY_FILTERS`'s `Partial<>` widening in discovery.ts) — pools
  *    are served from `HUMIDIFI_POOL_REGISTRY` below, a small hand-verified
- *    seed (curated the same way the EcoSwapSVM route lane already curates
+ *    seed (curated the same way the SvmRoute route lane already curates
  *    hub mints instead of running an unbounded search).
  * 6. The realized price is NOT a function of the vault reserve ratio.
  *    Constant-product-over-reserves diverges from 21 real trades (2 pools,
@@ -93,7 +93,7 @@
  * input (a haircut constant-product IS a constant-product, just steeper),
  * so it cannot trigger the "coarse ladder gets allocated ZERO" failure mode.
  *
- * ── CU (`ecoswap/svm/budget.ts`'s `CU_FAMILIES.humidifi`) ──
+ * ── CU (`the consuming app SVM CU-budget module`'s `CU_FAMILIES.humidifi`) ──
  *
  * MEASURED, not modeled: two real mainnet CPI costs were read directly off
  * transaction logs — "Program 9H6tua7...consumed 40326 of ... compute
@@ -108,7 +108,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'humidifi';
 
@@ -251,7 +251,7 @@ export async function fetchHumidifiConfig(load: AccountLoader, pool: Address): P
     throw new Error(
       `${SLUG}: pool ${pool} is not in HUMIDIFI_POOL_REGISTRY — this venue's pool state has no ` +
         'decodable plaintext layout (verified by exhaustive offset scan), so unregistered pools ' +
-        'cannot be resolved at all; see ecoswap/svm/venues/humidifi.ts for how to add one',
+        'cannot be resolved at all; see the consuming app humidifi venue module for how to add one',
     );
   }
   const raw = await load(pool);
@@ -275,7 +275,7 @@ const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 export const HUMIDIFI_SAFETY_FEE_PPM = 300_000n;
 const FEE_PPM_DENOM = 1_000_000n;
 
-export const humidifiLadder: SvmVenueLadderV2 = {
+export const humidifiLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(base: PoolConfig): string {
@@ -322,7 +322,7 @@ export const humidifiLadder: SvmVenueLadderV2 = {
   /**
    * Builds the swap CPI's KNOWN-CORRECT surface (program id, the two vaults,
    * token program, SysvarClock, and the amountIn XOR-patched via
-   * `patchXorMaskIn` — see ecoswap/svm/codegen.ts) — but see file header item
+   * `patchXorMaskIn` — see the consuming app SVM codegen) — but see file header item
    * 4: two accounts (a per-transaction pair this recipe cannot derive) and
    * the 8-byte header (a per-transaction commitment this recipe cannot
    * produce) have NO correct value here. Both are filled with a
@@ -330,7 +330,7 @@ export const humidifiLadder: SvmVenueLadderV2 = {
    * BYTES this emits match what a real all-zero-header trade would look
    * like) rather than garbage, but the deployed program is expected to
    * reject a not-pre-negotiated trade at this point — this is why
-   * `FAMILIES.humidifi.gate` in ecoswap/svm/index.ts drops every candidate
+   * `FAMILIES.humidifi.gate` in the consuming app SVM solver entry drops every candidate
    * before compile today. Kept real (not stubbed) so the encoding itself —
    * the part that IS fully solved — stays tested against the exact bytes
    * captured on mainnet.

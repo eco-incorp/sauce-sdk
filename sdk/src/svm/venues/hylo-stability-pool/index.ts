@@ -95,7 +95,7 @@
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 /** The Earn Pool program — this family's discovered-pool owner. */
 export const HYLO_STABILITY_POOL_PROGRAM_ID = address('HysTabVUfmQBFcmzu1ctRd1Y1fxd66RBpboy1bmtDSQQ');
@@ -288,7 +288,7 @@ const HYLO_WITHDRAW_HELPER = {
   ].join('\n'),
 };
 
-export const hyloStabilityPoolLadder: SvmVenueLadderV2 = {
+export const hyloStabilityPoolLadder: SvmVenueLadder = {
   slug: 'hylo-stability-pool',
   shapeKey(base) {
     const cfg = hyloConfig(base);

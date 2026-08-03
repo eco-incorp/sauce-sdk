@@ -79,11 +79,11 @@ export const tesseravLadder = {
     slug: SLUG,
     // No defaultRungs override: the flat-rate level-0 model is exact at any
     // rung count (every grid point below capacity samples the SAME linear
-    // rate), so this rides the CP default (4, recipes/ecoswap/svm/budget.ts's
+    // rate), so this rides the CP default (4, the consuming app SVM CU-budget module's
     // FamilyCuCoefficients doc) like the other simple CP families
     // (raydium-cp-swap, raydium-amm-v4, pumpswap, orca-legacy-token-swap,
     // meteora-damm-v2) rather than inventing a rung count below MIN_RUNGS=2
-    // (recipes/ecoswap/svm/solver-reference.ts) that nothing else in the
+    // (the consuming app SVM reference solver) that nothing else in the
     // ladder/budget pipeline expects.
     shapeKey(base) {
         return `${SLUG}:${tvConfig(base).direction}`;

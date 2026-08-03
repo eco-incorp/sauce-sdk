@@ -9,7 +9,7 @@
  * fixture plus the explicit compiler-API check is what makes the type half of
  * the union load-bearing rather than decorative.
  *
- * The list below is every TYPE name sauce-recipes' `ecoswap/svm/**`,
+ * The list below is every TYPE name sauce-recipes' `the consuming app SVM code**`,
  * `solswap/**`, and `test/svm/**` need from `@eco-incorp/sauce-sdk/svm` — see
  * consumer-union-surface.test.ts's header for the full derivation.
  */
@@ -86,7 +86,7 @@ import type {
   StabbleStableSwapPoolConfig,
   StabbleWeightedSwapPoolConfig,
   StagedBuffer,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   TesseraVPoolConfig,
   TrendsPoolConfig,
@@ -177,7 +177,7 @@ export type _ConsumerUnionTypeCheck = [
   StabbleStableSwapPoolConfig,
   StabbleWeightedSwapPoolConfig,
   StagedBuffer,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   TesseraVPoolConfig,
   TrendsPoolConfig,

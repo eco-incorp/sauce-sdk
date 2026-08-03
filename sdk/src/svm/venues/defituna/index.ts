@@ -78,7 +78,7 @@
  * - non-Tokenkeg mints (the swap accounts below are classic-SPL only);
  * - a direction with NO shipped boundaries and no edge (readable === 0),
  *   wired the same way as orca-whirlpool/raydium-clmm/byreal via the
- *   recipe's SvmWindowDriftError in ecoswap/svm/index.ts's FAMILIES entry;
+ *   recipe's SvmWindowDriftError in the consuming app SVM solver entry's FAMILIES entry;
  * - a shipped boundary carrying an ACTIVE resting limit order
  *   (open_orders_input > 0 or part_filled_orders_remaining_input > 0) —
  *   FusionAMM's hybrid CLMM+orderbook model may fill resting orders at a
@@ -95,7 +95,7 @@ import { MAX_TICK_INDEX, MIN_TICK_INDEX, whirlpoolSqrtPriceAtTick } from '../orc
 import { orcaWhirlpoolLadder, whirlpoolDeltaA, whirlpoolDeltaB, whirlpoolNextSqrtA } from '../orca-whirlpool/ladder.js';
 import { readUintLE } from '../math.js';
 import { windowStartTicks } from '../orca-whirlpool/index.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'defituna';
 export const DEFITUNA_PROGRAM_ID = address('fUSioN9YKKSa3CUC2YUc4tPkHJ5Y6XW1yz8y6F7qWz9');
@@ -642,7 +642,7 @@ function emitBoundary(p: string, slot: number, k: number, aToB: boolean, params:
   ];
 }
 
-export const defitunaLadder: SvmVenueLadderV2 = {
+export const defitunaLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 2,
   shapeKey(base) {

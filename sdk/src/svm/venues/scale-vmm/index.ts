@@ -41,7 +41,7 @@
  * writable account per ACTIVE fee_beneficiary, ata(mint_a) of that beneficiary's wallet.
  * A first pass at this file (going only off a live transaction's account COUNT) concluded
  * VMM carries none; that was wrong, and the real-CPI lane
- * (ecoswap-svm.scale.realcpi.e2e.test.ts) caught it immediately: omitting the remaining
+ * (the consuming app scale real-CPI e2e test) caught it immediately: omitting the remaining
  * account reverts on-chain with AnchorError MissingBeneficiaryAccount (6013). The
  * confusion: that reference transaction's beneficiary wallet happened to be the SAME
  * wallet as the trader (its 19th account, the beneficiary's mint_a ATA, is therefore
@@ -50,7 +50,7 @@
  * every address is what it claims to be.
  */
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadder } from '../types.js';
 import {
   ata,
   BUY_DISCRIMINATOR,
@@ -228,7 +228,7 @@ function directionOfParam(dirParam: bigint): ScaleDirection {
   return dirParam === 0n ? 'aToB' : 'bToA';
 }
 
-export const scaleVmmLadder: SvmVenueLadderV2 = {
+export const scaleVmmLadder: SvmVenueLadder = {
   slug: SLUG,
 
   shapeKey(base: PoolConfig): string {

@@ -1,6 +1,6 @@
 /**
  * Stabble CLMM venue — pool decoding, scope gates and the prepare-declared
- * tick-boundary WINDOW for the EcoSwapSVM ladder fragment (./ladder.ts).
+ * tick-boundary WINDOW for the SvmRoute ladder fragment (./ladder.ts).
  *
  * It is, byte-for-byte, the same PoolState/AmmConfig/
  * TickArrayState account layout as the sibling
@@ -37,7 +37,7 @@
  *     instruction the same — this module's ladder (./ladder.ts) drives a
  *     REAL `swap_v2` CPI into the mainnet-dumped `stabble-clmm.so` binary
  *     against this exact pool's real account state
- *     (test/svm/ecoswap-svm.realcpi.e2e.test.ts's 'stabble-clmm' cell) and
+ *     (the consuming app realcpi e2e test's 'stabble-clmm' cell) and
  *     the resulting realized output matches this ladder's predicted quote
  *     exactly at three sizes — proving the account order/writability and
  *     instruction layout, not just the struct offsets.

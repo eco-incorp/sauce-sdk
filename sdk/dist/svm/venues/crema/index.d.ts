@@ -1,6 +1,6 @@
 import type { Address } from '@solana/kit';
 import { MAX_TICK_INDEX, MIN_TICK_INDEX } from '../orca-whirlpool/tick-math.js';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "crema";
 export declare const CREMA_PROGRAM_ID: Address<"CLMM9tUoggJu2wagPkkqs9eFG4BWhVBZWkP1qv3Sp7tR">;
 export declare const CLMMPOOL_ACCOUNT_SIZE = 748;
@@ -75,5 +75,5 @@ export declare const crema: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchCremaPoolConfig;
 };
-export declare const cremaLadder: SvmVenueLadderV2;
+export declare const cremaLadder: SvmVenueLadder;
 //# sourceMappingURL=index.d.ts.map
