@@ -1,7 +1,7 @@
 /**
  * THE LADDER-ADAPTER CONTRACT GUARD (no engine, no RPC).
  *
- * ecoswap/svm/solver-reference.ts (the recipes-side EcoSwapSVM merge mirror)
+ * ecoswap/svm/solver-reference.ts (the recipes-side SvmRoute merge mirror)
  * asserts one premise as the load-bearing licence for its entire design:
  * "every quote closure is nondecreasing in x with quote(0) == 0 ... so rung
  * dOut values are non-negative and all products stay far below 2^256 for u64
@@ -117,7 +117,7 @@ import {
   juplendAmmLadder,
 } from '../../../src/svm/index.js';
 import type { JuplendAmmPoolConfig } from '../../../src/svm/index.js';
-import type { AccountBytesMap, PoolConfig, SvmVenueLadderV2 } from '../../../src/svm/index.js';
+import type { AccountBytesMap, PoolConfig, SvmVenueLadder } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 import { evaluateQuoteContract, mergeAltitudeAmounts, U64_MAX, type DeclaredCliff } from './ladder-probe.js';
 
@@ -188,7 +188,7 @@ interface Variant {
 
 interface Family {
   slug: string;
-  ladder: SvmVenueLadderV2;
+  ladder: SvmVenueLadder;
   variants(): Promise<Variant[]>;
   /**
    * A REQUIRED declaration (evaluateQuoteContract's strong structural form,

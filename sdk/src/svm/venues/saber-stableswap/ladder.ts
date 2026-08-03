@@ -1,5 +1,5 @@
 /**
- * Saber StableSwap adapter v2 (EcoSwapSVM ladder fragment) — the stable
+ * Saber StableSwap adapter v2 (SvmRoute ladder fragment) — the stable
  * family archetype. Everything is a LIVE read (pause byte, both vault
  * balances, the four amp-ramp fields, the trade fee fraction); zero
  * per-trade params; the quote direction (A → B, like ./index.ts) is the
@@ -36,7 +36,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -273,4 +273,4 @@ export const saberStableswapLadder = {
     // curve's depth — measurement oracle only, never a gate.
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - (fn * 1_000_000n) / fd };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

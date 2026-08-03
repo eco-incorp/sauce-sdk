@@ -24,7 +24,7 @@
  *
  * REAL-CPI PROOF (test/svm/ecoswap-svm.realcpi.e2e.test.ts's `fluxbeam` cells, SAUCE_VENUE_PROGRAMS-
  * gated): the actual mainnet `fluxbeam.so` binary, executed via LiteSVM on the two real pools above
- * through the full production `ecoSwapSvm` compile path, realizes OUTPUT bit-exact to this ladder's
+ * through the full production `svmRoute` compile path, realizes OUTPUT bit-exact to this ladder's
  * predicted quote on BOTH pools (71_656_795 at 1 SOL classic; 197 at ~1.95e9 raw wire-fee-mint
  * input) — the load-bearing invariant `minOut` enforces. DISCLOSED, MEASURED, and NOT a quoting
  * error: the real binary's own internal transfer sizing pulls a few raw units LESS than the
@@ -107,7 +107,7 @@ import { createHash } from 'node:crypto';
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'fluxbeam';
 export const FLUXBEAM_PROGRAM_ID = address('FLUXubRmkEi2q6K3Y9kBPg9248ggaZVsoSFhtJHSrm1X');
@@ -333,7 +333,7 @@ function fluxbeamConfig(cfg: PoolConfig): FluxBeamPoolConfig {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const fluxbeamLadder: SvmVenueLadderV2 = {
+export const fluxbeamLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey() {
     return `${SLUG}:AtoB`;

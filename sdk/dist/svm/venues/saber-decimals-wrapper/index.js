@@ -1,5 +1,5 @@
 /**
- * Saber Decimal Wrapper venue adapter (EcoSwapSVM ladder fragment, adapter
+ * Saber Decimal Wrapper venue adapter (SvmRoute ladder fragment, adapter
  * contract v2) — program `DecZY86MU5Gj7kppfUCEmd4LbXXuyZH1yHaP2NTqdiZB`
  * (`saber-hq/saber-periphery`'s `add-decimals` program, source verified —
  * see below). This is NOT a priced AMM: it is an EXACT, FIXED-RATE 1:multiplier

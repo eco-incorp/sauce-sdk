@@ -1,5 +1,5 @@
 /**
- * PumpSwap adapter v2 (EcoSwapSVM ladder fragment) — constant product over
+ * PumpSwap adapter v2 (SvmRoute ladder fragment) — constant product over
  * raw SPL vault balances, read LIVE in-VM; the gross input arrives at
  * runtime. The fee bps (lp/protocol/creator, flat or the market-cap tier
  * selected at fetch time) ride as per-trade PARAMS, not compile-time
@@ -21,7 +21,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -246,4 +246,4 @@ export const pumpswapLadder = {
     // sell: fees come off the output.
     return { gammaPpm: 1_000_000n, muPpm: ((BPS - lp - prot - cr) * 1_000_000n) / BPS };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

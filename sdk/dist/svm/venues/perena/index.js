@@ -501,7 +501,7 @@ export const perena = {
     buildSwap,
     referenceQuote,
 };
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 const ref = (slot, role) => `s${slot}:${role}`;
 export const perenaLadder = {
     slug: SLUG,

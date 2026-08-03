@@ -1,6 +1,6 @@
 /**
  * Cropper (Solana CLMM) venue — pool decoding, scope gates and the
- * prepare-declared tick-boundary WINDOW for the EcoSwapSVM ladder fragment
+ * prepare-declared tick-boundary WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts).
  *
  * It is, byte-for-byte, the same Whirlpool/TickArray

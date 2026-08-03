@@ -1,5 +1,5 @@
 /**
- * Scorch (EcoSwapSVM venue, closed-source-binary reverse-engineering — no on-chain IDL; the same
+ * Scorch (SvmRoute venue, closed-source-binary reverse-engineering — no on-chain IDL; the same
  * RE method used for the WITHDRAWN BisonFi integration attempt, see docs/bisonfi-evidence.md —
  * this file does not import from it, the shared lineage is methodology only).
  *

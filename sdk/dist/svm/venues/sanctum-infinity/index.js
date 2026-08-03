@@ -1,5 +1,5 @@
 /**
- * Sanctum Infinity (EcoSwapSVM venue, `sanctum-infinity`) — the multi-LST
+ * Sanctum Infinity (SvmRoute venue, `sanctum-infinity`) — the multi-LST
  * liquidity pool run by the S-controller program ("INF"), open source at
  * github.com/igneous-labs/inf-1.5 (the successor to the archived
  * github.com/igneous-labs/S; this pool's on-chain `PoolState.version == 2`,

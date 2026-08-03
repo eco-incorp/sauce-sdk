@@ -515,7 +515,7 @@ export const alphaqLadder = {
         // the directed (reserveIn, reserveOut) `depthReserves` reports, but the
         // gamma/mu SLOPE is the same either way — only the depth term differs,
         // and this oracle is measurement-only (never a gate, see
-        // SvmVenueLadderV2's doc), so the approximation is acceptable here.
+        // SvmVenueLadder's doc), so the approximation is acceptable here.
         const gammaPpm = ((HAIRCUT_DENOM - HAIRCUT_BPS) * 1000000n) / HAIRCUT_DENOM;
         return { gammaPpm, muPpm: 1000000n };
     },

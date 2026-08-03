@@ -140,7 +140,7 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadderV2, SwapUser, VenueAccount, VenueSwap } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadder, SwapUser, VenueAccount, VenueSwap } from '../types.js';
 
 const SLUG = 'perena';
 export const PERENA_PROGRAM_ID = address('NUMERUNsFCP3kuNmWZuXtm1AaQCPj9uw6Guv2Ekoi5P');
@@ -557,11 +557,11 @@ export const perena: SvmVenueAdapter = {
   referenceQuote,
 };
 
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const perenaLadder: SvmVenueLadderV2 = {
+export const perenaLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 2,
   shapeKey(cfg) {

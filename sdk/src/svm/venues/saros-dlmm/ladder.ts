@@ -14,7 +14,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser } from '../types.js';
 import { readUintLE } from '../math.js';
 import {
   BIN_LEN,
@@ -335,7 +335,7 @@ function emitBinUnpack(p: string, slot: number, k: number, swapForY: boolean, pa
   ];
 }
 
-export const sarosDlmmLadder: SvmVenueLadderV2 = {
+export const sarosDlmmLadder: SvmVenueLadder = {
   slug: SLUG,
   /** 2 rungs by default: a rung is a full cold bin walk (degrade-first class, like the CLMMs). */
   defaultRungs: 2,

@@ -1,5 +1,5 @@
 /**
- * 1DEX (`one-intro-swap`) LADDER fragment (EcoSwapSVM adapter contract v2) —
+ * 1DEX (`one-intro-swap`) LADDER fragment (SvmRoute adapter contract v2) —
  * see ./index.ts's module header for the account-model / instruction-shape
  * rationale. This file owns the swap MATH, fully reverse-engineered and
  * BIT-EXACT-proven against the real deployed binary (LiteSVM, `solana
@@ -69,7 +69,7 @@
  */
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { oneIntroSwapConfig, ONE_INTRO_SWAP_METADATA_STATE, ONE_INTRO_SWAP_PROGRAM_ID, OFF_VIRTUAL_RESERVE0, OFF_VIRTUAL_RESERVE1, TOKEN_ACCOUNT_AMOUNT_OFFSET } from './index.js';
 
 const SLUG = 'one-intro-swap';
@@ -106,7 +106,7 @@ function quoteOut(biV: bigint, boV: bigint, grossIn: bigint, vaultOutBal: bigint
   return out < vaultOutBal ? out : vaultOutBal;
 }
 
-export const oneIntroSwapLadder: SvmVenueLadderV2 = {
+export const oneIntroSwapLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base: PoolConfig) {
     const cfg = oneIntroSwapConfig(base);

@@ -370,9 +370,9 @@ function openbookV2Config(cfg) {
 // ---------------------------------------------------------------------------
 const ref = (slot, role) => `s${slot}:${role}`;
 /** 2^64 — every per-trade payload arg is encoded as ONE u64 word
- * (`encodeEcoSwapSvmTrade`/codegen.ts's `abi.encode(le8(...))` path), so the order's full 128-bit
+ * (`encodeSvmRouteTrade`/codegen.ts's `abi.encode(le8(...))` path), so the order's full 128-bit
  * tree key can NOT ride as a single param (it can exceed u64::MAX — measured directly: a real
- * fixture key failed encodeEcoSwapSvmTrade's own u64-range check). Ship it as two u64 halves
+ * fixture key failed encodeSvmRouteTrade's own u64-range check). Ship it as two u64 halves
  * instead — `keyLow` (params) + `priceLots` (already shipped, and IS the key's top 64 bits by
  * construction, see `walkFixedTree`) — and RECONSTRUCT the full key on both sides (the fragment via
  * plain `*`+`+`, proven supported at this magnitude by manifest's own u128 arithmetic; the TS

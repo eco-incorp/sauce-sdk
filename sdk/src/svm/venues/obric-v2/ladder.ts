@@ -1,5 +1,5 @@
 /**
- * Obric V2 adapter v2 (EcoSwapSVM ladder fragment) — the prop-AMM
+ * Obric V2 adapter v2 (SvmRoute ladder fragment) — the prop-AMM
  * oracle-anchored family. "Bake the shape, read the level": prepare ships the
  * drift-invariant curve SHAPE (bigK hi/lo, targetX, feeMillionth, the oracle
  * scaling) as cfg params; the fragment reads the fast-moving oracle MID LIVE
@@ -72,7 +72,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -436,4 +436,4 @@ export const obricV2Ladder = {
     const feePpm = c.feeMillionth > FEE_DEN ? FEE_DEN : c.feeMillionth;
     return { gammaPpm: FEE_DEN, muPpm: FEE_DEN - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

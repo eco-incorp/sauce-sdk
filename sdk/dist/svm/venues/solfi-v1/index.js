@@ -1,5 +1,5 @@
 /**
- * SolFi V1 (EcoSwapSVM ladder fragment) — a from-scratch binary
+ * SolFi V1 (SvmRoute ladder fragment) — a from-scratch binary
  * reverse-engineering of the v1 sibling of `solfi-v2` (`sdk`'s
  * `svm/venues/solfi-v2`, imported here as `solfiV2`). The SDK ships no
  * `solfi-v1` ladder; this module is local, not a port.

@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG = "solfi-v1";
 export declare const SOLFI_V1_PROGRAM_ID: Address<'SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe'>;
 export declare const POOL_ACCOUNT_SIZE = 2800;
@@ -50,6 +50,6 @@ export interface SolfiV1PoolConfig extends PoolConfig {
  * independently verified throws rather than guessing).
  */
 export declare function fetchSolfiV1Config(load: AccountLoader, pool: Address, direction?: 0 | 1): Promise<SolfiV1PoolConfig>;
-export declare const solfiV1Ladder: SvmVenueLadderV2;
+export declare const solfiV1Ladder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
 declare const SLUG: "pumpfun-bonding-curve";
 export declare const PUMPFUN_BONDING_CURVE_PROGRAM_ID: Address;
 export interface PumpfunBondingCurvePoolConfig extends PoolConfig {
@@ -49,6 +49,6 @@ export declare const pumpfunBondingCurve: {
      */
     fetchPoolConfig(load: AccountLoader, pool: Address, mint: Address): Promise<PumpfunBondingCurvePoolConfig>;
 };
-export declare const pumpfunBondingCurveLadder: SvmVenueLadderV2;
+export declare const pumpfunBondingCurveLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -71,7 +71,7 @@ export const randomAddress = (): Address => getAddressCodec().decode(crypto.getR
 export const startEngine = async (unixTimestamp: bigint): Promise<EngineHarness> => {
   // The default constructor's program runtime misses the
   // sol_remaining_compute_units syscall (the engine's GasLeft, 0x62 — the
-  // EcoSwapSVM CU-floor guard); rebuilding the runtime with every feature
+  // SvmRoute CU-floor guard); rebuilding the runtime with every feature
   // enabled registers it, matching mainnet where the feature is long active.
   const svm = new LiteSVM()
     .withFeatureSet(FeatureSet.allEnabled())

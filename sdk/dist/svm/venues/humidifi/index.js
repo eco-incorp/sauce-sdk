@@ -1,5 +1,5 @@
 /**
- * HumidiFi (EcoSwapSVM ladder fragment) — a top-10 chain-wide venue
+ * HumidiFi (SvmRoute ladder fragment) — a top-10 chain-wide venue
  * (201.9M/7d, 40.3M/24h per the benchmark's Jupiter-label capture) with NO
  * on-chain IDL. This module is a from-scratch binary reverse-engineering,
  * not a port of any published adapter — the SDK ships no `humidifi` ladder.
@@ -60,7 +60,7 @@
  *    use `getProgramAccounts` + memcmp like every other family (see
  *    `SVM_FAMILY_FILTERS`'s `Partial<>` widening in discovery.ts) — pools
  *    are served from `HUMIDIFI_POOL_REGISTRY` below, a small hand-verified
- *    seed (curated the same way the EcoSwapSVM route lane already curates
+ *    seed (curated the same way the SvmRoute route lane already curates
  *    hub mints instead of running an unbounded search).
  * 6. The realized price is NOT a function of the vault reserve ratio.
  *    Constant-product-over-reserves diverges from 21 real trades (2 pools,

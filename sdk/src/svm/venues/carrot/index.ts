@@ -119,7 +119,7 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 export const CARROT_PROGRAM_ID = address('CarrotwivhMpDnm27EHmRLeQ683Z1PufuqEmBZvD282s');
 export const CRT_MINT = address('CRTx1JouZhzSU6XytsE42UQraoGqiHgxabocVfARTy2s');
@@ -367,7 +367,7 @@ export const carrot = {
   fetchPoolConfig: (load: AccountLoader, pool: Address): Promise<CarrotPoolConfig> => fetchCarrotPoolConfig(load, pool),
 };
 
-export const carrotLadder: SvmVenueLadderV2 = {
+export const carrotLadder: SvmVenueLadder = {
   slug: 'carrot',
   // CP-class: closed-form, no Newton iteration — but see the module header's
   // CAPACITY note for why this stays at the CP default (4) rather than

@@ -1,6 +1,6 @@
 /**
  * Meteora DLMM (Liquidity Book / bin) venue — pool decoding, scope gates and
- * the prepare-declared BIN WINDOW for the EcoSwapSVM ladder fragment
+ * the prepare-declared BIN WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts). LADDER-ONLY (adapter contract v2): a DLMM quote is a bin walk
  * over a data-dependent bin-array set, so there is no v1 SvmVenueAdapter and
  * the venue is not in the v1 registry. This is the whirlpool WINDOW thesis

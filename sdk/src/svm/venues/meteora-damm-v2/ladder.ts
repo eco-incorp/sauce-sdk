@@ -1,5 +1,5 @@
 /**
- * Meteora DAMM v2 (cp-amm) adapter v2 (EcoSwapSVM ladder fragment) —
+ * Meteora DAMM v2 (cp-amm) adapter v2 (SvmRoute ladder fragment) —
  * sqrt-price single-step quoting with EVERYTHING read LIVE from the Pool
  * account: liquidity, sqrt_price, the base fee numerator, the dynamic-fee
  * volatility term (initialized flag, bin_step, variable_fee_control,
@@ -55,7 +55,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -444,4 +444,4 @@ export const meteoraDammV2Ladder = {
       ? { gammaPpm: 1_000_000n - feePpm, muPpm: 1_000_000n }
       : { gammaPpm: 1_000_000n, muPpm: 1_000_000n - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

@@ -150,7 +150,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'alphaq';
 export const ALPHAQ_PROGRAM_ID = address('ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA');
@@ -459,7 +459,7 @@ function cpQuote(x: bigint, rawA: bigint, rawB: bigint): bigint {
  * reserveIn/reserveOut pair) — no per-trade params, the haircut is a
  * compiled constant, not pool state.
  */
-export const alphaqLadder: SvmVenueLadderV2 = {
+export const alphaqLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = alphaqConfig(base);
@@ -554,7 +554,7 @@ export const alphaqLadder: SvmVenueLadderV2 = {
     // the directed (reserveIn, reserveOut) `depthReserves` reports, but the
     // gamma/mu SLOPE is the same either way — only the depth term differs,
     // and this oracle is measurement-only (never a gate, see
-    // SvmVenueLadderV2's doc), so the approximation is acceptable here.
+    // SvmVenueLadder's doc), so the approximation is acceptable here.
     const gammaPpm = ((HAIRCUT_DENOM - HAIRCUT_BPS) * 1_000_000n) / HAIRCUT_DENOM;
     return { gammaPpm, muPpm: 1_000_000n };
   },

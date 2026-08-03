@@ -117,7 +117,7 @@
  * family's pool account): `BondingCurve`'s 115 fixed bytes have no mint field at
  * all — the account'S OWN ADDRESS is the mint's PDA (`["bonding-curve", mint]`),
  * a ONE-WAY derivation. So `fetchPoolConfig` here needs the mint as an EXPLICIT
- * third argument (`FamilyEntry.fetch`'s `mint` parameter, `EcoSwapSvmPoolSpec.mint`
+ * third argument (`FamilyEntry.fetch`'s `mint` parameter, `SvmRoutePoolSpec.mint`
  * — see ecoswap/svm/index.ts) that every other family ignores; the discovery-side
  * fix (deriving the PDA forward from a candidate mint, never scanning by mint
  * offset) lives in `withPumpfunBondingCurveDiscovery` (ecoswap/svm/discovery.ts).
@@ -125,7 +125,7 @@
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'pumpfun-bonding-curve' as const;
 
@@ -414,7 +414,7 @@ export const pumpfunBondingCurve = {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const pumpfunBondingCurveLadder: SvmVenueLadderV2 = {
+export const pumpfunBondingCurveLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = asCfg(base);

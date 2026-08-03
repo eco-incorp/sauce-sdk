@@ -153,7 +153,7 @@
  */
 import { address, getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'jupiter-lend-earn';
 
@@ -310,7 +310,7 @@ const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 const DEPOSIT_HELPER = 'qJupLendEarnDeposit';
 const REDEEM_HELPER = 'qJupLendEarnRedeem';
 
-export const jupiterLendEarnLadder: SvmVenueLadderV2 = {
+export const jupiterLendEarnLadder: SvmVenueLadder = {
   slug: SLUG,
   // Exactly affine (see module header) — a straight line loses nothing to a
   // coarser grid, so this pins the framework floor instead of the CP default

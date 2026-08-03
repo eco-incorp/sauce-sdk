@@ -117,7 +117,7 @@
  * family's pool account): `BondingCurve`'s 115 fixed bytes have no mint field at
  * all — the account'S OWN ADDRESS is the mint's PDA (`["bonding-curve", mint]`),
  * a ONE-WAY derivation. So `fetchPoolConfig` here needs the mint as an EXPLICIT
- * third argument (`FamilyEntry.fetch`'s `mint` parameter, `EcoSwapSvmPoolSpec.mint`
+ * third argument (`FamilyEntry.fetch`'s `mint` parameter, `SvmRoutePoolSpec.mint`
  * — see ecoswap/svm/index.ts) that every other family ignores; the discovery-side
  * fix (deriving the PDA forward from a candidate mint, never scanning by mint
  * offset) lives in `withPumpfunBondingCurveDiscovery` (ecoswap/svm/discovery.ts).

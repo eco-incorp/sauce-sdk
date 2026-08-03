@@ -118,7 +118,7 @@ import { address, getAddressDecoder, getAddressEncoder, isOffCurveAddress } from
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
 import { STABLE_D_HELPER, STABLE_YW_HELPER, stableComputeD, stableComputeYWarm } from '../stable-helpers.js';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'mercurial';
 
@@ -463,4 +463,4 @@ export const mercurialLadder = {
     // curve's depth — measurement oracle only, never a gate (like saber).
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - (live.fn * 1_000_000n) / FEE_DENOMINATOR };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

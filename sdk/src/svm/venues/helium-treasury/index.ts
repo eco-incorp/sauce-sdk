@@ -1,5 +1,5 @@
 /**
- * Helium Network Treasury (EcoSwapSVM venue) — the on-chain `TreasuryManagementV0`
+ * Helium Network Treasury (SvmRoute venue) — the on-chain `TreasuryManagementV0`
  * program (`treaf4wWBBty3fHdyBpo35Mz84M8k3heKXmjmi9vFt5`, Jupiter's own label
  * "Helium Network" — `benchmark/adapters/fixtures/jupiter-program-id-to-label.json`
  * in the recipes repo), a REAL Anchor program with a PUBLISHED IDL/source
@@ -118,7 +118,7 @@
 import { address, getAddressCodec, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'helium-treasury';
 
@@ -273,7 +273,7 @@ export const heliumTreasury = {
   fetchPoolConfig: fetchHeliumTreasuryPoolConfig,
 };
 
-export const heliumTreasuryLadder: SvmVenueLadderV2 = {
+export const heliumTreasuryLadder: SvmVenueLadder = {
   slug: SLUG,
   // Plain constant-formula quote (one mulDiv + a cap clamp), no window walk — CP default.
   shapeKey() {

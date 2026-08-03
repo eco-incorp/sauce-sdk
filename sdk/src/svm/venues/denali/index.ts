@@ -139,7 +139,7 @@
 import { address, getAddressCodec, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'denali';
 export const DENALI_PROGRAM_ID = address('DNL1tgEj3nJovHw9jtyCCQD3arssCJzkmpDizknwzey4');
@@ -230,7 +230,7 @@ export const denali = {
   quoteAccounts,
 };
 
-export const denaliLadder: SvmVenueLadderV2 = {
+export const denaliLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
   defaultRungs: 4,
@@ -334,7 +334,7 @@ export const denaliLadder: SvmVenueLadderV2 = {
     return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
   },
   continuousFees() {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — no
+    // Measurement-only oracle (see the SvmVenueLadder doc comment) — no
     // additional denominator decay (gammaPpm at par), muPpm folds the
     // OUT_DISCOUNT_NUM/DEN conservative haircut so the efficiency oracle
     // reads the same conservative curve the ladder actually quotes.

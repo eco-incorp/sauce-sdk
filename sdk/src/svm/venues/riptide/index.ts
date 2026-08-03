@@ -13,7 +13,7 @@
  *
  * This file is the off-chain decode + CPI-account layer (PoolConfig,
  * fetchPoolConfig, quoteAccounts). The on-chain quote fragment
- * (SvmVenueLadderV2) lives in ladder.ts.
+ * (SvmVenueLadder) lives in ladder.ts.
  *
  * ── Account layout (pool account, 1024 bytes, gated at fetch) ──
  * Recovered the same way obric-v2/solfi-v2 do: decode candidate offsets,

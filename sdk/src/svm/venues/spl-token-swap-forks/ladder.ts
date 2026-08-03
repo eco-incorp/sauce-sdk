@@ -1,5 +1,5 @@
 /**
- * spl-token-swap fork LADDER fragments (EcoSwapSVM adapter contract v2) — see
+ * spl-token-swap fork LADDER fragments (SvmRoute adapter contract v2) — see
  * ./index.ts's module header for the shared math/layout rationale. One
  * factory instantiated per deployed fork; only the swap CPI's `programId`
  * (buildSwapV2) and the swap-authority PDA domain (folded into fetchPoolConfig,
@@ -12,7 +12,7 @@
  * change to either family's math can never silently violate that contract).
  */
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { TOKEN_SWAP_V1_PROGRAM_ID, DEXLAB_PROGRAM_ID, SAROS_PROGRAM_ID, ORCA_V1_PROGRAM_ID, PENGUIN_PROGRAM_ID, STEPN_PROGRAM_ID } from './index.js';
 import type { SplTokenSwapForkPoolConfig } from './index.js';
 
@@ -36,7 +36,7 @@ const ref = (slug: string, slot: number, role: string): string => `${slug}:s${sl
  * orca-legacy-token-swap's ladder (see ./index.ts), parameterized by the
  * fork's own program id.
  */
-export function makeSplTokenSwapForkLadder(slug: string, programId: Address): SvmVenueLadderV2 {
+export function makeSplTokenSwapForkLadder(slug: string, programId: Address): SvmVenueLadder {
   return {
     slug,
     shapeKey() {

@@ -1,5 +1,5 @@
 /**
- * MetaDAO Futarchy AMM — spot leg (EcoSwapSVM ladder fragment).
+ * MetaDAO Futarchy AMM — spot leg (SvmRoute ladder fragment).
  *
  * MetaDAO's `futarchy` program (fully open source,
  * github.com/metaDAOproject/programs, `programs/futarchy/src/`) embeds a
@@ -71,7 +71,7 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'metadao-futarchy';
 
@@ -214,7 +214,7 @@ export function metadaoFutarchySpotQuote(x: bigint, rin: bigint, rout: bigint): 
   return (netIn * rout) / (rin + netIn);
 }
 
-export const metadaoFutarchySpotLadder: SvmVenueLadderV2 = {
+export const metadaoFutarchySpotLadder: SvmVenueLadder = {
   slug: SLUG,
 
   /** CP-class: a closed-form quote (one multiply-divide per rung), 4 rungs. */
@@ -312,4 +312,4 @@ export const metadaoFutarchySpotLadder: SvmVenueLadderV2 = {
     // reduction; LP_TAKER_FEE_BPS is 0 today).
     return { gammaPpm: (NET_FEE_NUM * 1_000_000n) / MAX_BPS, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

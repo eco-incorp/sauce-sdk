@@ -135,7 +135,7 @@
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadderV2, SwapUser, VenueAccount, VenueSwap } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadder, SwapUser, VenueAccount, VenueSwap } from '../types.js';
 
 const SLUG = 'hylo';
 export const HYLO_PROGRAM_ID = address('HYEXCHtHkBagdStcJCp3xbbb9B7sdMdWXFNj6mdsG4hn');
@@ -566,11 +566,11 @@ export const hylo: SvmVenueAdapter = {
   referenceQuote,
 };
 
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const hyloLadder: SvmVenueLadderV2 = {
+export const hyloLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(cfg) {

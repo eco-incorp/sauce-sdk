@@ -120,7 +120,7 @@
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'boop-fun' as const;
 
@@ -267,7 +267,7 @@ export const boopFun = {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const boopFunLadder: SvmVenueLadderV2 = {
+export const boopFunLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = asCfg(base);

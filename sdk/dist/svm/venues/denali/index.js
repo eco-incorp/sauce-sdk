@@ -314,7 +314,7 @@ export const denaliLadder = {
         return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
     },
     continuousFees() {
-        // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — no
+        // Measurement-only oracle (see the SvmVenueLadder doc comment) — no
         // additional denominator decay (gammaPpm at par), muPpm folds the
         // OUT_DISCOUNT_NUM/DEN conservative haircut so the efficiency oracle
         // reads the same conservative curve the ladder actually quotes.

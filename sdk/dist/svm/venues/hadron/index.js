@@ -1,5 +1,5 @@
 /**
- * Hadron (EcoSwapSVM venue — no on-chain IDL, no public docs). Program
+ * Hadron (SvmRoute venue — no on-chain IDL, no public docs). Program
  * `HADRoNbLovyqhCsocfYQYB7QdfCAAinN9HTePvBCVDQ8` (Jupiter's own label-map
  * program id -> label, "Hadron"). Recovered entirely via live account reads
  * + real-transaction archaeology (`getSignaturesForAddress` +

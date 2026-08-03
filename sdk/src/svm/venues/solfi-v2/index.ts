@@ -10,7 +10,7 @@
  *
  * This file is the off-chain decode + CPI-account layer (PoolConfig,
  * fetchPoolConfig, quoteAccounts, the shared solfiSwapAccounts builder). The
- * on-chain quote fragment (SvmVenueLadderV2) lives in ladder.ts.
+ * on-chain quote fragment (SvmVenueLadder) lives in ladder.ts.
  *
  * ACCOUNT LIST is POSITIONAL BY MINT, not by direction (same trap as Quantum):
  * the swap ix always takes [userMintA, userMintB] in that fixed order,

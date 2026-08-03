@@ -1,5 +1,5 @@
 /**
- * Manifest CLOB adapter v2 (EcoSwapSVM ladder fragment) — the second Phase 2
+ * Manifest CLOB adapter v2 (SvmRoute ladder fragment) — the second Phase 2
  * family and the first order-book venue. The quote is the venue's own taker
  * match: a best-first walk over the resting orders shipped by prepare
  * (../manifest/index.ts). Prepare walks the market's red-black tree OFF-CHAIN

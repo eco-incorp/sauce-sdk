@@ -180,7 +180,7 @@ import type {
   AccountLoader,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -357,7 +357,7 @@ export const flint = {
   quoteAccounts,
 };
 
-export const flintLadder: SvmVenueLadderV2 = {
+export const flintLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
   defaultRungs: 4,
@@ -463,7 +463,7 @@ export const flintLadder: SvmVenueLadderV2 = {
     };
   },
   continuousFees(base) {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — folds
+    // Measurement-only oracle (see the SvmVenueLadder doc comment) — folds
     // this config's OWN direction-specific haircut margin into muPpm so the
     // efficiency oracle reads the same conservative curve the ladder
     // actually quotes.

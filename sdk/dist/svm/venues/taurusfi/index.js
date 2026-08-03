@@ -1,5 +1,5 @@
 /**
- * TaurusFi (EcoSwapSVM ladder fragment) — program `9VX8EKBg6vM6tA68xaDsPkbrx26
+ * TaurusFi (SvmRoute ladder fragment) — program `9VX8EKBg6vM6tA68xaDsPkbrx26
  * XConZjkQmhVApUptc`, Jupiter's own label per `benchmark/adapters/fixtures/
  * jupiter-program-id-to-label.json`. No on-chain IDL ships for this program;
  * everything below is recovered by live transaction/account archaeology
@@ -404,7 +404,7 @@ export const taurusFiLadder = {
         return cfg.direction === '1to0' ? { reserveIn: r1, reserveOut: r0 } : { reserveIn: r0, reserveOut: r1 };
     },
     continuousFees() {
-        // Measurement-only oracle (see the SvmVenueLadderV2 doc comment): out(x) ~= mu*(gamma*x*rOut) /
+        // Measurement-only oracle (see the SvmVenueLadder doc comment): out(x) ~= mu*(gamma*x*rOut) /
         // (rIn + gamma*x) over depthReserves' REAL (undiscounted) rIn/rOut. Our actual curve is
         // x*rout/(rin*(DEN/NUM) + x) = (gamma*x*rout) / (rin + gamma*x) with gamma = NUM/DEN — algebraic
         // rearrangement of the SAME formula emitSetup/referenceQuote compute, not a separate model — so

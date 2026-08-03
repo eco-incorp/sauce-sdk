@@ -106,7 +106,7 @@
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'omnipair';
 export const OMNIPAIR_PROGRAM_ID = address('omnixgS8fnqHfCcTGKWj6JtKjzpJZ1Y5y9pyFkQDkYE');
@@ -466,4 +466,4 @@ export const omnipairLadder = {
     // fee is entirely on INPUT (no output-side fee for this venue) — bps -> ppm (x100).
     return { gammaPpm: 1_000_000n - fb * 100n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

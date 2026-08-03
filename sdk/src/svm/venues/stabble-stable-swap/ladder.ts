@@ -1,5 +1,5 @@
 /**
- * Stabble Stable Swap adapter v2 (EcoSwapSVM ladder fragment).
+ * Stabble Stable Swap adapter v2 (SvmRoute ladder fragment).
  *
  * WARM-STARTED, following this repo's stable-family archetype
  * (saber-stableswap/ladder.ts): the invariant D depends only on the live
@@ -53,7 +53,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -310,4 +310,4 @@ export const stabbleStableSwapLadder = {
     // only, never a gate (same caveat as every other stable-kind family).
     return { gammaPpm: 1_000_000n - swapFee / 1_000n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

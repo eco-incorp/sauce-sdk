@@ -1,5 +1,5 @@
 /**
- * Raydium CLMM adapter v2 (EcoSwapSVM ladder fragment) — the second tick-walk
+ * Raydium CLMM adapter v2 (SvmRoute ladder fragment) — the second tick-walk
  * family, the Orca-Whirlpools WINDOW pattern retargeted to Raydium's layout +
  * math. The quote walks concentrated liquidity over the PREPARE-DECLARED
  * boundary window (./index.ts): prepare ships up to RAYDIUM_CLMM_MAX_BOUNDARIES
@@ -42,7 +42,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -759,4 +759,4 @@ export const raydiumClmmLadder = {
     const live = liveFromState(cfg, state);
     return { gammaPpm: FEE_MUL - live.fr, muPpm: FEE_MUL };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

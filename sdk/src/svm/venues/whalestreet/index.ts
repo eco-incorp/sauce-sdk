@@ -149,7 +149,7 @@ import type {
   AccountBytesMap,
   AccountLoader,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -233,7 +233,7 @@ export const whalestreet = {
   quoteAccounts,
 };
 
-export const whalestreetLadder: SvmVenueLadderV2 = {
+export const whalestreetLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
   defaultRungs: 4,
@@ -337,9 +337,9 @@ export const whalestreetLadder: SvmVenueLadderV2 = {
     return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
   },
   continuousFees() {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — no additional
+    // Measurement-only oracle (see the SvmVenueLadder doc comment) — no additional
     // denominator decay (gammaPpm at par), muPpm folds the OUT_HAIRCUT_NUM/DEN conservative
     // haircut so the efficiency oracle reads the same conservative curve the ladder quotes.
     return { gammaPpm: 1_000_000n, muPpm: (1_000_000n * OUT_HAIRCUT_NUM) / OUT_HAIRCUT_DEN };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

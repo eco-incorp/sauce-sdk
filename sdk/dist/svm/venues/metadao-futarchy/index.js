@@ -1,5 +1,5 @@
 /**
- * MetaDAO Futarchy AMM — spot leg (EcoSwapSVM ladder fragment).
+ * MetaDAO Futarchy AMM — spot leg (SvmRoute ladder fragment).
  *
  * MetaDAO's `futarchy` program (fully open source,
  * github.com/metaDAOproject/programs, `programs/futarchy/src/`) embeds a

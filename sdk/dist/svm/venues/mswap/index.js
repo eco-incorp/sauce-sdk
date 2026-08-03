@@ -1,5 +1,5 @@
 /**
- * M Swap (EcoSwapSVM venue, `mswap`) — m0-foundation's `ext_swap` router
+ * M Swap (SvmRoute venue, `mswap`) — m0-foundation's `ext_swap` router
  * (program `MSwapi3WhNKMUGm9YrxGhypgUEt7wYQH3ZgG32XoWzH`, labeled "M Swap" in
  * Jupiter's own `program-id-to-label` capture). Open source at
  * github.com/m0-foundation/solana-m-extensions (`programs/ext_swap`); the

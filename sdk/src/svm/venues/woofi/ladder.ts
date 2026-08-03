@@ -1,5 +1,5 @@
 /**
- * WooFi (Solana) adapter v2 (EcoSwapSVM ladder fragment) — the sPMM family.
+ * WooFi (Solana) adapter v2 (SvmRoute ladder fragment) — the sPMM family.
  * See ./index.ts for the account layout, the swap.rs-verified account list,
  * and the full math citation. This file is the fragment + its lamport-exact
  * TS mirror, for the two QUOTE-PAIRED single-leg directions only (sellBase:
@@ -61,7 +61,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -384,7 +384,7 @@ function paramExprs(params: readonly string[]): ParamExprs {
   };
 }
 
-export const woofiLadder: SvmVenueLadderV2 = {
+export const woofiLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
 
@@ -639,7 +639,7 @@ export const woofiLadder: SvmVenueLadderV2 = {
     if (feePpm > 1_000_000n) feePpm = 1_000_000n;
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;
 
 /**
  * Shared per-rung/final quote statement lines, over the already-clamped local

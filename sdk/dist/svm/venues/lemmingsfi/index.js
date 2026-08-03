@@ -128,7 +128,7 @@
  * real sample) are emitted as-is; the recipe's own terminal realized-delta
  * `minOut` check is the real floor. Reproducing this exact left-shifted
  * encoding needs a small, additive codegen extension
- * (`EcoSwapSvmSlot.patchMultiplierIn`) since the existing patch pipeline
+ * (`SvmRouteSlot.patchMultiplierIn`) since the existing patch pipeline
  * (XOR, then optional divide) had no multiply step; every other family
  * leaves it unset and is byte-for-byte unaffected.
  *
@@ -375,7 +375,7 @@ export const lemmingsfiLadder = {
         };
     },
     continuousFees() {
-        // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — this
+        // Measurement-only oracle (see the SvmVenueLadder doc comment) — this
         // ladder replicates the venue's real price tick exactly (see the file
         // header's PRICING MODEL), no denominator decay or output retention.
         return { gammaPpm: 1000000n, muPpm: 1000000n };

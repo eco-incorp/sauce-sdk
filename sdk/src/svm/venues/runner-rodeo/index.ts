@@ -119,7 +119,7 @@ import type {
   AccountLoader,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -328,7 +328,7 @@ export const runnerRodeo = {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const runnerRodeoLadder: SvmVenueLadderV2 = {
+export const runnerRodeoLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = asCfg(base);

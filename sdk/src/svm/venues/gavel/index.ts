@@ -150,7 +150,7 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'gavel';
 
@@ -327,7 +327,7 @@ function effectiveSnapshot(
   return snapSlot > storedSlot ? { bs: br, qs: qr } : { bs: storedBs, qs: storedQs };
 }
 
-export const gavelLadder: SvmVenueLadderV2 = {
+export const gavelLadder: SvmVenueLadder = {
   slug: SLUG,
 
   shapeKey(base: PoolConfig): string {
@@ -504,4 +504,4 @@ export const gavelLadder: SvmVenueLadderV2 = {
     const feeInBps = params[0]!;
     return { gammaPpm: 1_000_000n - feeInBps * 100n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

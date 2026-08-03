@@ -1,5 +1,5 @@
 /**
- * Phoenix CLOB adapter (EcoSwapSVM ladder fragment v2) — an order-book venue,
+ * Phoenix CLOB adapter (SvmRoute ladder fragment v2) — an order-book venue,
  * the SAME integration shape as the `manifest` family the SDK barrel already
  * ships (see `manifest`'s ladder for the sibling this file mirrors): the
  * quote is the venue's own taker IOC match, a best-first walk over resting
@@ -197,7 +197,7 @@
  * (`base_lot_size`/`quote_lot_size` atoms per lot — NOT 1:1, e.g. the real
  * SOL/USDC market has `base_lot_size = 1_000_000` — unlike every existing
  * family, none of which has a coarser native accounting unit than atoms).
- * `codegen.ts`'s new `EcoSwapSvmSlot.patchDivisorIn` hook (additive, unset
+ * `codegen.ts`'s new `SvmRouteSlot.patchDivisorIn` hook (additive, unset
  * for every other family) floor-divides the patched value by the pool's
  * `direction`-appropriate lot size before it is written into the
  * instruction bytes — `ecoswap/svm/index.ts` sets it only for `phoenix`
@@ -205,7 +205,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'phoenix';
 
@@ -897,7 +897,7 @@ export const phoenixLadder = {
   continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;
 
 /** The lot-size divisor `codegen.ts`'s `patchDivisorIn` hook needs for this pool's direction. */
 export function phoenixPatchDivisor(base: PoolConfig): bigint {

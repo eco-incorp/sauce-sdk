@@ -1,5 +1,5 @@
 /**
- * Quantum adapter v2 (EcoSwapSVM ladder fragment) — the discrete-level PMM
+ * Quantum adapter v2 (SvmRoute ladder fragment) — the discrete-level PMM
  * walk. See ./index.ts for the layout, the reversed closed form and the
  * shipped-prefix rule; this file is the fragment + its lamport-exact mirror.
  *
@@ -40,7 +40,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -288,7 +288,7 @@ function emitWalk(p: string, xExpr: string, outVar: string, tag: string, indent:
   ];
 }
 
-export const quantumLadder: SvmVenueLadderV2 = {
+export const quantumLadder: SvmVenueLadder = {
   slug: SLUG,
 
   /**

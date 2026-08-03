@@ -1,7 +1,7 @@
 /**
- * Obsidian adapter v2 (EcoSwapSVM ladder fragment) — see index.ts's module
+ * Obsidian adapter v2 (SvmRoute ladder fragment) — see index.ts's module
  * doc for the account layout / method / live-state honesty notes. This file
- * is the on-chain quote fragment (SvmVenueLadderV2) + the swap CPI builder.
+ * is the on-chain quote fragment (SvmVenueLadder) + the swap CPI builder.
  *
  * ── Quote model — fit against the 18 real fills ──
  * The RAW vault-balance ratio is NOT the price (it swings from ~1:1 to
@@ -40,7 +40,7 @@
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { OBSIDIAN_PROGRAM_ID, OFF_PRICE } from './index.js';
 import type { ObsidianPoolConfig } from './index.js';
 
@@ -89,7 +89,7 @@ function priceScaleFraction(decimalsA: number, decimalsB: number): { num: bigint
   return { num: upScale / g, den: downScale / g };
 }
 
-export const obsidianLadder: SvmVenueLadderV2 = {
+export const obsidianLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Flat price (no curvature) — 4 rungs matches the family CP default; every rung shares one marginal rate. */
   defaultRungs: 4,
@@ -207,9 +207,9 @@ export const obsidianLadder: SvmVenueLadderV2 = {
     return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
   },
   continuousFees() {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment). No curvature (gammaPpm at
+    // Measurement-only oracle (see the SvmVenueLadder doc comment). No curvature (gammaPpm at
     // par); muPpm folds the OUT_DISCOUNT_BPS conservative haircut so the efficiency oracle reads
     // the same conservative rate the ladder actually quotes.
     return { gammaPpm: 1_000_000n, muPpm: (BPS_DEN - OUT_DISCOUNT_BPS) * 100n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

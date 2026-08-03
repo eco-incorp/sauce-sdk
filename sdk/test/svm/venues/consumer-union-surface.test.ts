@@ -483,7 +483,7 @@ const CONSUMER_UNION_TYPES: readonly string[] = [
   'StabbleStableSwapPoolConfig',
   'StabbleWeightedSwapPoolConfig',
   'StagedBuffer',
-  'SvmVenueLadderV2',
+  'SvmVenueLadder',
   'SwapUser',
   'TesseraVPoolConfig',
   'TrendsPoolConfig',

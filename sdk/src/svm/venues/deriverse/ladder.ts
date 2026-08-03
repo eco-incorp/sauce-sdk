@@ -1,5 +1,5 @@
 /**
- * Deriverse adapter v2 (EcoSwapSVM ladder fragment) — the embedded
+ * Deriverse adapter v2 (SvmRoute ladder fragment) — the embedded
  * constant-product leg of a hybrid CLOB+AMM instrument, everything read LIVE
  * from the ONE instrument account (no separate vault reads needed: reserves,
  * dec_factor and last_px all live in the same header). See index.ts's module
@@ -73,7 +73,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -402,7 +402,7 @@ export const deriverseLadder = {
     const feePpm = c.feePpm > FEE_DEN ? FEE_DEN : c.feePpm;
     return { gammaPpm: FEE_DEN, muPpm: FEE_DEN - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;
 
 /** referenceQuote/referenceLadderQuotes/referenceCapacities all need the SAME live curve + baked feePpm. */
 function liveCurveWithParams(cfg: DeriversePoolConfig, state: AccountBytesMap, params: readonly bigint[]): LiveCurve {

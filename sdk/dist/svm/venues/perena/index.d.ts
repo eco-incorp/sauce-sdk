@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { PoolConfig, SvmVenueAdapter, SvmVenueLadderV2 } from '../types.js';
+import type { PoolConfig, SvmVenueAdapter, SvmVenueLadder } from '../types.js';
 declare const SLUG = "perena";
 export declare const PERENA_PROGRAM_ID: Address<"NUMERUNsFCP3kuNmWZuXtm1AaQCPj9uw6Guv2Ekoi5P">;
 export declare const STABLE_POOL_ACCOUNT_SIZE = 4024;
@@ -46,6 +46,6 @@ export interface PerenaLiveState {
  */
 export declare function perenaSwapOut(live: PerenaLiveState, x: bigint): bigint;
 export declare const perena: SvmVenueAdapter;
-export declare const perenaLadder: SvmVenueLadderV2;
+export declare const perenaLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

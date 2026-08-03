@@ -157,7 +157,7 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'trends';
 export const TRENDS_PROGRAM_ID = address('CURVEmPpijXDTNdqrA9PGP1io2rkgiVXH26xdXVGLLfz');
@@ -338,7 +338,7 @@ function coldQuote(sell: boolean, live: LiveReserves, icap: bigint, x: bigint): 
   return (live.vbr * effIn) / (live.vqr + effIn);
 }
 
-export const trendsLadder: SvmVenueLadderV2 = {
+export const trendsLadder: SvmVenueLadder = {
   slug: SLUG,
   /** CP-class (a closed-form quote, one mul+div plus a fee mul+div per rung): 4 rungs, like
    *  obric-v2/pumpswap/raydium-cp-swap. */

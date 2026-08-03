@@ -95,7 +95,7 @@ import { MAX_TICK_INDEX, MIN_TICK_INDEX, whirlpoolSqrtPriceAtTick } from '../orc
 import { orcaWhirlpoolLadder, whirlpoolDeltaA, whirlpoolDeltaB, whirlpoolNextSqrtA } from '../orca-whirlpool/ladder.js';
 import { readUintLE } from '../math.js';
 import { windowStartTicks } from '../orca-whirlpool/index.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'defituna';
 export const DEFITUNA_PROGRAM_ID = address('fUSioN9YKKSa3CUC2YUc4tPkHJ5Y6XW1yz8y6F7qWz9');
@@ -642,7 +642,7 @@ function emitBoundary(p: string, slot: number, k: number, aToB: boolean, params:
   ];
 }
 
-export const defitunaLadder: SvmVenueLadderV2 = {
+export const defitunaLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 2,
   shapeKey(base) {

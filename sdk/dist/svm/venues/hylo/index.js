@@ -530,7 +530,7 @@ export const hylo = {
     buildSwap,
     referenceQuote,
 };
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 const ref = (slot, role) => `s${slot}:${role}`;
 export const hyloLadder = {
     slug: SLUG,

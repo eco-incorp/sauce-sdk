@@ -24,7 +24,7 @@
  *
  * REAL-CPI PROOF (test/svm/ecoswap-svm.realcpi.e2e.test.ts's `fluxbeam` cells, SAUCE_VENUE_PROGRAMS-
  * gated): the actual mainnet `fluxbeam.so` binary, executed via LiteSVM on the two real pools above
- * through the full production `ecoSwapSvm` compile path, realizes OUTPUT bit-exact to this ladder's
+ * through the full production `svmRoute` compile path, realizes OUTPUT bit-exact to this ladder's
  * predicted quote on BOTH pools (71_656_795 at 1 SOL classic; 197 at ~1.95e9 raw wire-fee-mint
  * input) — the load-bearing invariant `minOut` enforces. DISCLOSED, MEASURED, and NOT a quoting
  * error: the real binary's own internal transfer sizing pulls a few raw units LESS than the

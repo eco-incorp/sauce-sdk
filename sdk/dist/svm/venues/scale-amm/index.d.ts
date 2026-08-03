@@ -29,7 +29,7 @@
  * different active-beneficiary count cannot share a compiled slot fragment.
  */
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, AccountBytesMap, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, AccountBytesMap, SvmVenueLadder } from '../types.js';
 import { type FeeBeneficiary, type ScaleDirection } from '../scale-common.js';
 declare const SLUG = "scale-amm";
 export interface ScaleAmmPoolConfig extends PoolConfig {
@@ -61,6 +61,6 @@ export declare const scaleAmm: {
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<ScaleAmmPoolConfig>;
     referenceQuote(base: PoolConfig, state: AccountBytesMap, amountIn: bigint): bigint;
 };
-export declare const scaleAmmLadder: SvmVenueLadderV2;
+export declare const scaleAmmLadder: SvmVenueLadder;
 export type { ScaleDirection } from '../scale-common.js';
 //# sourceMappingURL=index.d.ts.map

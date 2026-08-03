@@ -1,5 +1,5 @@
 /**
- * Helium Network Treasury (EcoSwapSVM venue) — the on-chain `TreasuryManagementV0`
+ * Helium Network Treasury (SvmRoute venue) — the on-chain `TreasuryManagementV0`
  * program (`treaf4wWBBty3fHdyBpo35Mz84M8k3heKXmjmi9vFt5`, Jupiter's own label
  * "Helium Network" — `benchmark/adapters/fixtures/jupiter-program-id-to-label.json`
  * in the recipes repo), a REAL Anchor program with a PUBLISHED IDL/source

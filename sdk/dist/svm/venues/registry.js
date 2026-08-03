@@ -60,8 +60,8 @@ export function venueAdapter(slug) {
     return adapter;
 }
 /**
- * The FULL adapter-contract v2 (EcoSwapSVM ladder) registry — every family
- * that implements SvmVenueLadderV2, keyed by slug. This is the single source
+ * The FULL adapter-contract v2 (SvmRoute ladder) registry — every family
+ * that implements SvmVenueLadder, keyed by slug. This is the single source
  * of truth the ladder-contract guard (test/svm/venues/ladder-contract.test.ts)
  * enumerates with a COUNT ASSERTION: a new family added to sdk/src/svm/venues/
  * without a corresponding entry here gets ZERO contract coverage, silently —

@@ -95,7 +95,7 @@
  * multi-billion-unit reserves cannot move the floored CP quote — confirmed:
  * the realized output matched the prediction exactly at every size tested)
  * and is economically identical to the ordinary "partial fill" case
- * EcoSwapSvm already handles structurally on SVM (the un-entered input
+ * SvmRoute already handles structurally on SVM (the un-entered input
  * simply never leaves the user's own `inAta` — there is no pot to
  * reconcile). `test/svm/ecoswap-svm.realcpi.e2e.test.ts`'s `aldrin`/
  * `aldrin-v2` cells assert this bound explicitly (`runQuad`'s `inputSlack`
@@ -104,7 +104,7 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 export const ALDRIN_V1_PROGRAM_ID = address('AMM55ShdkoGRB5jVYPjWziwk8m5MpwyDgsMWHaMSQWH6');
 export const ALDRIN_V2_PROGRAM_ID = address('CURVGoZn8zycx6FXwwevgBTB2gVvdbGTEpvMJDbgs2t4');
@@ -247,7 +247,7 @@ function reserveVaults(cfg: AldrinPoolConfig): { vin: Address; vout: Address } {
     : { vin: cfg.baseTokenVault, vout: cfg.quoteTokenVault };
 }
 
-function makeAldrinLadder(slug: 'aldrin' | 'aldrin-v2', version: 1 | 2, programId: Address): SvmVenueLadderV2 {
+function makeAldrinLadder(slug: 'aldrin' | 'aldrin-v2', version: 1 | 2, programId: Address): SvmVenueLadder {
   const helperName = version === 1 ? 'qAldrinCp' : 'qAldrinV2Cp';
 
   return {
@@ -402,5 +402,5 @@ function makeAldrinLadder(slug: 'aldrin' | 'aldrin-v2', version: 1 | 2, programI
   };
 }
 
-export const aldrinLadder: SvmVenueLadderV2 = makeAldrinLadder('aldrin', 1, ALDRIN_V1_PROGRAM_ID);
-export const aldrinV2Ladder: SvmVenueLadderV2 = makeAldrinLadder('aldrin-v2', 2, ALDRIN_V2_PROGRAM_ID);
+export const aldrinLadder: SvmVenueLadder = makeAldrinLadder('aldrin', 1, ALDRIN_V1_PROGRAM_ID);
+export const aldrinV2Ladder: SvmVenueLadder = makeAldrinLadder('aldrin-v2', 2, ALDRIN_V2_PROGRAM_ID);

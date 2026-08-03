@@ -1,6 +1,6 @@
 /**
  * Orca Whirlpools (CLMM) venue — pool decoding, scope gates and the
- * prepare-declared tick-boundary WINDOW for the EcoSwapSVM ladder fragment
+ * prepare-declared tick-boundary WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts). This family is LADDER-ONLY (adapter contract v2): a CLMM
  * quote is a tick walk over a data-dependent account set, which does not fit
  * the one-adapter-one-pool v1 shape — so there is no SvmVenueAdapter here and

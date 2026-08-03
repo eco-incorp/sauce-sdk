@@ -1,5 +1,5 @@
 /**
- * XOrca (EcoSwapSVM ladder fragment) — Orca's liquid-staking wrapper: stake
+ * XOrca (SvmRoute ladder fragment) — Orca's liquid-staking wrapper: stake
  * ORCA into a single global vault and mint xORCA shares at the vault's live
  * ratio. No on-chain IDL is published, but the program (`orca-so/xorca` on
  * GitHub, Pinocchio + shank-generated) is open source; this adapter is a
@@ -302,7 +302,7 @@ export const xorcaLadder = {
         return { reserveIn: vaultAmount - escrowed, reserveOut: supply };
     },
     continuousFees() {
-        // Measurement-only oracle input (never a gate — see the SvmVenueLadderV2
+        // Measurement-only oracle input (never a gate — see the SvmVenueLadder
         // doc). The real curve is exactly LINEAR (no price impact at all — see
         // file header), strictly MORE depth than any CP curve models; reporting
         // a plain no-fee CP shape (gamma=mu=1) over the real reserves is a

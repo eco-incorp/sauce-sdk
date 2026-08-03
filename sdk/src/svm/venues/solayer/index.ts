@@ -137,7 +137,7 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'solayer';
 export const SOLAYER_PROGRAM_ID = address('endoLNCKTqDn8gSVnN2hDdpgACUPWHZTwoYnnMybpAT');
@@ -260,7 +260,7 @@ function capAccountRef(cfg: SolayerPoolConfig, slot: number): { ref: string; add
   return cfg.direction === 'delegate' ? { ref: ref(slot, 'receiptMint'), address: cfg.receiptMint } : { ref: ref(slot, 'vault'), address: cfg.vault };
 }
 
-export const solayerLadder: SvmVenueLadderV2 = {
+export const solayerLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = solayerConfig(base);

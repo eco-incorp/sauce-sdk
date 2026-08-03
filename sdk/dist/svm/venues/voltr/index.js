@@ -1,5 +1,5 @@
 /**
- * Voltr (EcoSwapSVM ladder fragment) — a permissionless vault-infrastructure
+ * Voltr (SvmRoute ladder fragment) — a permissionless vault-infrastructure
  * protocol (`voltrxyz`): depositors mint LP shares against a vault's live
  * NAV (`deposit_vault`) and can redeem them atomically for the underlying
  * asset out of the vault's un-invested ("idle") float (`instant_withdraw_vault`).

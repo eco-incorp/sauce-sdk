@@ -163,7 +163,7 @@
  */
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { readUintLE } from '../math.js';
 
 const SLUG = 'gatorswap';
@@ -343,7 +343,7 @@ function refVaultsForDirection(cfg: GatorswapPoolConfig): { vin: Address; vout: 
     : { vin: cfg.refQuoteVault, vout: cfg.refBaseVault };
 }
 
-export const gatorswapLadder: SvmVenueLadderV2 = {
+export const gatorswapLadder: SvmVenueLadder = {
   slug: SLUG,
   /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
   defaultRungs: 4,
@@ -488,7 +488,7 @@ export const gatorswapLadder: SvmVenueLadderV2 = {
     return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
   },
   continuousFees() {
-    // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) —
+    // Measurement-only oracle (see the SvmVenueLadder doc comment) —
     // gammaPpm folds the REF_HAIRCUT_BPS input-side haircut, muPpm at par.
     return { gammaPpm: ((BPS_DEN - REF_HAIRCUT_BPS) * 1_000_000n) / BPS_DEN, muPpm: 1_000_000n };
   },

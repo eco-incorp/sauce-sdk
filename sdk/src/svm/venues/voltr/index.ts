@@ -1,5 +1,5 @@
 /**
- * Voltr (EcoSwapSVM ladder fragment) — a permissionless vault-infrastructure
+ * Voltr (SvmRoute ladder fragment) — a permissionless vault-infrastructure
  * protocol (`voltrxyz`): depositors mint LP shares against a vault's live
  * NAV (`deposit_vault`) and can redeem them atomically for the underlying
  * asset out of the vault's un-invested ("idle") float (`instant_withdraw_vault`).
@@ -182,7 +182,7 @@
 import { address, getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { findAssociatedTokenPda } from '@solana-program/token';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'voltr';
 
@@ -345,7 +345,7 @@ function pow10(n: number): bigint {
   return v;
 }
 
-export const voltrLadder: SvmVenueLadderV2 = {
+export const voltrLadder: SvmVenueLadder = {
   slug: SLUG,
   // Both directions are (at worst mildly) concave and near-linear — the CP
   // rung floor loses nothing meaningful to a coarser grid; see file header.

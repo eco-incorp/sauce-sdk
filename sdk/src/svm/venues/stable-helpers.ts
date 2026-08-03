@@ -1,7 +1,7 @@
 /**
  * Shared stable-curve Newton helpers for the LADDER (adapter v2) families —
  * saber-stableswap and meteora-damm-v1-stable declare these through their
- * `helpers()` and the EcoSwapSVM codegen dedupes them by name.
+ * `helpers()` and the SvmRoute codegen dedupes them by name.
  *
  * stableD is byte-identical math to the solswap generator's helper (ann =
  * amp·2 inside, ≤ 256 iterations, converged when successive estimates differ

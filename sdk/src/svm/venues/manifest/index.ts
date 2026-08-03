@@ -1,6 +1,6 @@
 /**
  * Manifest CLOB venue — market decoding, scope gates and the prepare-declared
- * TOP-OF-BOOK ORDER WINDOW for the EcoSwapSVM ladder fragment (./ladder.ts).
+ * TOP-OF-BOOK ORDER WINDOW for the SvmRoute ladder fragment (./ladder.ts).
  * Like orca-whirlpool this family is LADDER-ONLY (adapter contract v2): a CLOB
  * quote is a best-first walk over a red-black tree of resting orders that lives
  * inside ONE market account, which does not fit the one-adapter-one-pool v1

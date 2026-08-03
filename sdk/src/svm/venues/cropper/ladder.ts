@@ -12,7 +12,7 @@
  * names and BYTE-IDENTICAL source as orca-whirlpool's — the codegen dedupes
  * helper functions by (name, source) across every family in a shape, so a
  * cook mixing this venue with orca-whirlpool shares one copy of each instead
- * of paying for two (SvmVenueLadderV2.helpers' contract: same name requires
+ * of paying for two (SvmVenueLadder.helpers' contract: same name requires
  * byte-identical source, enforced by the codegen).
  */
 import { address } from '@solana/kit';
@@ -20,7 +20,7 @@ import type { Address } from '@solana/kit';
 import { OFF_FEE_RATE, OFF_LIQUIDITY, OFF_SQRT_PRICE, OFF_TA_TICKS, OFF_TICK_CURRENT, TICK_LEN } from '../orca-whirlpool/index.js';
 import { readUintLE } from '../math.js';
 import { whirlpoolSqrtPriceAtTick } from '../orca-whirlpool/tick-math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import { CROPPER_MAX_BOUNDARIES, CROPPER_MAX_SQRT_PRICE, CROPPER_MIN_SQRT_PRICE, CROPPER_PROGRAM_ID, windowFor } from './index.js';
 import type { CropperPoolConfig } from './index.js';
 
@@ -449,7 +449,7 @@ function emitBoundary(p: string, slot: number, k: number, aToB: boolean, params:
   ];
 }
 
-export const cropperLadder: SvmVenueLadderV2 = {
+export const cropperLadder: SvmVenueLadder = {
   slug: SLUG,
 
   /**
@@ -721,4 +721,4 @@ export const cropperLadder: SvmVenueLadderV2 = {
     const live = liveFromState(cfg, state);
     return { gammaPpm: FEE_MUL - live.fr, muPpm: FEE_MUL };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

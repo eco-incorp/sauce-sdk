@@ -116,7 +116,7 @@
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'moonit' as const;
 
@@ -331,7 +331,7 @@ function referenceSell(x: bigint, m: bigint, aw: bigint, bw: bigint, td: bigint,
   return gross - fee;
 }
 
-export const moonitLadder: SvmVenueLadderV2 = {
+export const moonitLadder: SvmVenueLadder = {
   slug: SLUG,
   /** CP-class: a closed-form quote (a quadratic + isqrt for buy, a polynomial for sell), 4 rungs. */
   defaultRungs: 4,

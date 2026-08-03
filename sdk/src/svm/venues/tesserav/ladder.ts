@@ -1,5 +1,5 @@
 /**
- * TesseraV adapter v2 (EcoSwapSVM ladder fragment) — see ./index.ts for the
+ * TesseraV adapter v2 (SvmRoute ladder fragment) — see ./index.ts for the
  * account layout and the swap-CPI evidence. This file is the quote fragment
  * + its lamport-mirror + the swap-CPI builder.
  *
@@ -93,7 +93,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -341,4 +341,4 @@ export const tesseravLadder = {
     const price0 = readUintLE(pool, level0PriceOffset(cfg.direction), 8);
     return { gammaPpm: 0n, muPpm: (price0 * SAFETY_NUM) / SAFETY_DEN };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

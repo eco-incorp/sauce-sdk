@@ -144,7 +144,7 @@
 import { address, getAddressDecoder, getAddressEncoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { createHash } from 'node:crypto';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 export const SANCTUM_STAKE_POOL_PROGRAM_ID = address('SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy');
 export const SANCTUM_STAKE_POOL_2_PROGRAM_ID = address('SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY');
@@ -366,7 +366,7 @@ function sanctumConfig(slug: string, base: PoolConfig): SanctumStakePoolConfig {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], programId: Address): SvmVenueLadderV2 {
+function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], programId: Address): SvmVenueLadder {
   const helperName = 'qSanctumStake';
 
   return {
@@ -503,7 +503,7 @@ function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], progr
   };
 }
 
-export const sanctumStakePoolLadder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool', SANCTUM_STAKE_POOL_PROGRAM_ID);
-export const sanctumStakePool2Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-2', SANCTUM_STAKE_POOL_2_PROGRAM_ID);
-export const sanctumStakePool3Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-3', SANCTUM_STAKE_POOL_3_PROGRAM_ID);
-export const sanctumStakePool4Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-4', SANCTUM_STAKE_POOL_4_PROGRAM_ID);
+export const sanctumStakePoolLadder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool', SANCTUM_STAKE_POOL_PROGRAM_ID);
+export const sanctumStakePool2Ladder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool-2', SANCTUM_STAKE_POOL_2_PROGRAM_ID);
+export const sanctumStakePool3Ladder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool-3', SANCTUM_STAKE_POOL_3_PROGRAM_ID);
+export const sanctumStakePool4Ladder: SvmVenueLadder = makeSanctumStakePoolLadder('sanctum-stake-pool-4', SANCTUM_STAKE_POOL_4_PROGRAM_ID);

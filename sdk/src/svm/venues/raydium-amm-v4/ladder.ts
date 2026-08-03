@@ -1,5 +1,5 @@
 /**
- * Raydium AMM v4 adapter v2 (EcoSwapSVM ladder fragment) — the
+ * Raydium AMM v4 adapter v2 (SvmRoute ladder fragment) — the
  * amount-parametric sibling of ./index.ts's emitQuote: reserves (vault
  * balances minus the AmmInfo need_take_pnl accumulators, the
  * calc_total_without_take_pnl_no_orderbook path) and the admin-mutable swap
@@ -26,7 +26,7 @@ import type {
   AccountBytesMap,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -187,4 +187,4 @@ export const raydiumAmmV4Ladder = {
     const fd = readUintLE(pool, OFF_SWAP_FEE_DENOMINATOR, 8);
     return { gammaPpm: 1_000_000n - (fn * 1_000_000n) / fd, muPpm: 1_000_000n };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;

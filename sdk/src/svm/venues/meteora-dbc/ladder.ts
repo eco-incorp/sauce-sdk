@@ -1,5 +1,5 @@
 /**
- * Meteora Dynamic Bonding Curve (DBC) adapter v2 (EcoSwapSVM ladder fragment)
+ * Meteora Dynamic Bonding Curve (DBC) adapter v2 (SvmRoute ladder fragment)
  * — single-active-segment sqrt-price quoting with EVERYTHING read LIVE from
  * the pool's two accounts (VirtualPool + PoolConfig): the live sqrt_price and
  * volatility accumulator (pool), and the ACTIVE curve segment's bounds +
@@ -44,7 +44,7 @@
  */
 import type { Address } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 import {
   dbcCapacity,
   dbcFeeNumerator,
@@ -366,7 +366,7 @@ export const meteoraDbcLadder = {
       ? { gammaPpm: 1_000_000n - feePpm, muPpm: 1_000_000n }
       : { gammaPpm: 1_000_000n, muPpm: 1_000_000n - feePpm };
   },
-} satisfies SvmVenueLadderV2;
+} satisfies SvmVenueLadder;
 
 /** Wall-clock unix seconds — the fragment's `block.timestamp` reads the REAL Clock sysvar; a stale `now` here only staleness-shifts the off-chain quote (covered by minOut like any other drift), matching every other time-dependent family's referenceQuote/referenceCapacities default. */
 function liveNow(): bigint {

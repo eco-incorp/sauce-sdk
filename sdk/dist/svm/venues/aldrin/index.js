@@ -95,7 +95,7 @@
  * multi-billion-unit reserves cannot move the floored CP quote — confirmed:
  * the realized output matched the prediction exactly at every size tested)
  * and is economically identical to the ordinary "partial fill" case
- * EcoSwapSvm already handles structurally on SVM (the un-entered input
+ * SvmRoute already handles structurally on SVM (the un-entered input
  * simply never leaves the user's own `inAta` — there is no pot to
  * reconcile). `test/svm/ecoswap-svm.realcpi.e2e.test.ts`'s `aldrin`/
  * `aldrin-v2` cells assert this bound explicitly (`runQuad`'s `inputSlack`

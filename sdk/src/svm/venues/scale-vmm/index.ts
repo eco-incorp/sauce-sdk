@@ -50,7 +50,7 @@
  * every address is what it claims to be.
  */
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadder } from '../types.js';
 import {
   ata,
   BUY_DISCRIMINATOR,
@@ -228,7 +228,7 @@ function directionOfParam(dirParam: bigint): ScaleDirection {
   return dirParam === 0n ? 'aToB' : 'bToA';
 }
 
-export const scaleVmmLadder: SvmVenueLadderV2 = {
+export const scaleVmmLadder: SvmVenueLadder = {
   slug: SLUG,
 
   shapeKey(base: PoolConfig): string {

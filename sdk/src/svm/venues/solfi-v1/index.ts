@@ -1,5 +1,5 @@
 /**
- * SolFi V1 (EcoSwapSVM ladder fragment) — a from-scratch binary
+ * SolFi V1 (SvmRoute ladder fragment) — a from-scratch binary
  * reverse-engineering of the v1 sibling of `solfi-v2` (`sdk`'s
  * `svm/venues/solfi-v2`, imported here as `solfiV2`). The SDK ships no
  * `solfi-v1` ladder; this module is local, not a port.
@@ -95,7 +95,7 @@
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'solfi-v1';
 
@@ -202,7 +202,7 @@ export async function fetchSolfiV1Config(load: AccountLoader, pool: Address, dir
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const solfiV1Ladder: SvmVenueLadderV2 = {
+export const solfiV1Ladder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 4,
   shapeKey(base: PoolConfig): string {

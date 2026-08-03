@@ -91,7 +91,7 @@
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'invariant';
 export const INVARIANT_PROGRAM_ID = address('HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt');
@@ -599,7 +599,7 @@ function emitWalkStep(p: string, xToY: boolean, k: number, v: { sp: string; l: s
   ];
 }
 
-export const invariantLadder: SvmVenueLadderV2 = {
+export const invariantLadder: SvmVenueLadder = {
   slug: SLUG,
   defaultRungs: 2,
   shapeKey(base) {

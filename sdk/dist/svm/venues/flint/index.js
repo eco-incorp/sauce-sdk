@@ -414,7 +414,7 @@ export const flintLadder = {
         };
     },
     continuousFees(base) {
-        // Measurement-only oracle (see the SvmVenueLadderV2 doc comment) — folds
+        // Measurement-only oracle (see the SvmVenueLadder doc comment) — folds
         // this config's OWN direction-specific haircut margin into muPpm so the
         // efficiency oracle reads the same conservative curve the ladder
         // actually quotes.

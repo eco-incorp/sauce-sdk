@@ -102,7 +102,7 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
 
 const SLUG = 'gamma';
 export const GAMMA_PROGRAM_ID = address('GAMMA7meSFWaBXF25oSUgmGRwaW6sCMFLmBNiMSdbHVT');
@@ -290,7 +290,7 @@ export const gamma = {
 // ---------------------------------------------------------------------------
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const gammaLadder: SvmVenueLadderV2 = {
+export const gammaLadder: SvmVenueLadder = {
   slug: SLUG,
   shapeKey(base) {
     const cfg = gammaConfig(base);
