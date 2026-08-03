@@ -155,6 +155,8 @@ export { PUMPFUN_BONDING_CURVE_PROGRAM_ID, PUMPFUN_BONDING_CURVE_USER_VOLUME_ACC
 export type { PumpfunBondingCurvePoolConfig } from './pumpfun-bonding-curve/index.js';
 export { RAYDIUM_LAUNCHLAB_PROGRAM_ID, raydiumLaunchlab, raydiumLaunchlabLadder } from './raydium-launchlab/index.js';
 export type { RaydiumLaunchlabPoolConfig } from './raydium-launchlab/index.js';
+export { RUNNER_RODEO_PROGRAM_ID, runnerRodeo, runnerRodeoLadder } from './runner-rodeo/index.js';
+export type { RunnerRodeoPoolConfig } from './runner-rodeo/index.js';
 export { SANCTUM_INFINITY_PROGRAM_ID, POOL_STATE_ID, LST_STATE_LIST_ID, FLAT_SLAB_PROGRAM_ID, SLAB_ID, WSOL_CALC_PROGRAM_ID, sanctumInfinity, sanctumInfinityLadder, sanctumInfinityPoolKey, __resetSanctumInfinityKeysForTest, sanctumInfinityLookupPair } from './sanctum-infinity/index.js';
 export type { SanctumInfinityLegConfig, SanctumInfinityPoolConfig } from './sanctum-infinity/index.js';
 export { SANCTUM_STAKE_POOL_PROGRAM_ID, SANCTUM_STAKE_POOL_2_PROGRAM_ID, SANCTUM_STAKE_POOL_3_PROGRAM_ID, SANCTUM_STAKE_POOL_4_PROGRAM_ID, WSOL_MINT, sanctumStakePool, sanctumStakePool2, sanctumStakePool3, sanctumStakePool4, sanctumStakePoolLadder, sanctumStakePool2Ladder, sanctumStakePool3Ladder, sanctumStakePool4Ladder } from './sanctum-stake-pool/index.js';
