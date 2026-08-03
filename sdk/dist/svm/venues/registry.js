@@ -1,4 +1,6 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { binaryfiLadder } from './binaryfi/index.js';
+import { kipseliLadder } from './kipseli/index.js';
 import { gatorswapLadder } from './gatorswap/index.js';
 import { humidifiLadder } from './humidifi/index.js';
 import { taurusFiLadder } from './taurusfi/index.js';
@@ -161,6 +163,8 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [binaryfiLadder.slug]: binaryfiLadder,
+    [kipseliLadder.slug]: kipseliLadder,
     [gatorswapLadder.slug]: gatorswapLadder,
     [humidifiLadder.slug]: humidifiLadder,
     [taurusFiLadder.slug]: taurusFiLadder,

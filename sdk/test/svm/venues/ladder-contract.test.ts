@@ -117,6 +117,10 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  binaryfiLadder,
+  binaryfi,
+  kipseliLadder,
+  kipseli,
   gatorswapLadder,
   gatorswap,
   fetchHumidifiConfig,
@@ -1324,6 +1328,26 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'kipseli',
+    ladder: kipseliLadder,
+    async variants() {
+      const POOL = address('89dvMturcS87kYgrwyeWqqsaFZUi5dQQpBHs6pvfUu3v');
+      const fixtures = fixturesFor('kipseli');
+      const cfg = await kipseli.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'binaryfi',
+    ladder: binaryfiLadder,
+    async variants() {
+      const POOL = address('GWqUcqoZtjq8K6H48YvcHJMEGq8CahNDGMuz3iqU4ESA');
+      const fixtures = fixturesFor('binaryfi');
+      const cfg = await binaryfi.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1914,8 +1938,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(85);
-    expect(FAMILIES).toHaveLength(85);
+    expect(registered).toHaveLength(87);
+    expect(FAMILIES).toHaveLength(87);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
