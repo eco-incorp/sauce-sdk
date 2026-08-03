@@ -1,13 +1,18 @@
-// @eco-incorp/sauce-sdk/verify — the partner-consumable settle-program authenticity + intent
-// surface. Dependency closure is `viem` ONLY (no node:fs, no ./compiler, no @solana/*, no
-// artifact resolution, no template on disk) — see this package's docs for why that closure is
-// load-bearing across BOTH install modes (registry and git-URL pin).
+// @eco-incorp/sauce-sdk/verify — turn a compiled Sauce program's bytes back into the input params it
+// was compiled with: `(tokens, minOut, recipient)`.
+//
+// That is the whole job. Dependency closure is `viem` ONLY (no node:fs, no ./compiler, no
+// @solana/*, no artifact resolution, no program source on disk), so this surface is safe to import
+// anywhere — including a browser or an edge runtime.
+//
+// SCOPE, stated plainly: this decodes the PROLOGUE. It tells you which tokens, floor and recipient a
+// program carries, and it is strict about the encoding (every push minimal-length, addresses capped
+// at 20 bytes, a zero recipient rejected), so an accepted program is the UNIQUE byte encoding of the
+// values it decodes to. It does NOT tell you the trailing body is a program you have audited — a
+// prologue-shaped program can carry anything after it. If you need that guarantee, compile the
+// program from source yourself and byte-compare (see `@eco-incorp/sauce-sdk/programs`), which is a
+// direct check against source you can read rather than a hash pinned in a table.
 export { SETTLE_WIRE, scanMinimalPush, encodeMinimalPush } from "./wire.js";
 export { decodeSettleProgram, encodeSettleProgram, parseSettleProgram, bestEffortDecode, SettleDecodeError, } from "./decode.js";
-export { SETTLE_TEMPLATES, CURRENT_SETTLE_TEMPLATE } from "./template.js";
 export { SETTLE_VECTORS } from "./vectors.js";
-export { inspectSettleProgram, verifySettleProgram, formatSettleReport, } from "./report.js";
-// NOTE: `./internal/root-testing.js` is deliberately NOT re-exported here — see its own header
-// doc. The only way to reach `authenticateBodyAgainstRoot` is a relative import of that file
-// itself (as `sdk/test/verify.test.ts` does), never a package subpath.
 //# sourceMappingURL=index.js.map

@@ -1,4 +1,4 @@
-/** Wire-format constants for the `ecoswap-settle` v12 program shape. All values measured against
+/** Wire-format constants for the sweep-program v12 wire shape. All values measured against
  *  the compiler's actual emission (`@eco-incorp/sauce-sdk/compiler` at this package's pin) —
  *  none of these are arbitrary choices. */
 export declare const SETTLE_WIRE: {

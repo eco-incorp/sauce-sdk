@@ -4,13 +4,15 @@ export interface ConformanceVector {
     tokens: Hex[];
     minOut: bigint;
     recipient: Hex;
-    /** The exact compiled program these args produce — measured against this package's compiler
-     *  pin (`CURRENT_SETTLE_TEMPLATE.compilerSha`), not hand-assembled. */
+    /** The exact compiled program these args produce — measured by actually compiling
+     *  `programs/token-sweep.sauce.ts` at this package's compiler pin, not hand-assembled.
+     *  `sdk/test/verify.compile.test.ts` recompiles and re-checks these, so a compiler re-pin or a
+     *  program edit that changes the emission turns red here rather than drifting silently. */
     program: Hex;
 }
 /**
  * Golden wire-format vectors — the Go/Solidity/Python conformance corpus. Each `program` was
- * obtained by actually compiling `ecoswap.settle.sauce.ts` with the given args (not hand-encoded),
+ * obtained by actually compiling `token-sweep.sauce.ts` with the given args (not hand-encoded),
  * so it doubles as a regression pin on the compiler's emission shape. See decode.ts's module
  * docstring for the grammar these bytes instantiate.
  *

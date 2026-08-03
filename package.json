@@ -1,6 +1,6 @@
 {
   "name": "@eco-incorp/sauce-sdk",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Sauce protocol tooling: compiler, SDK, action primitives, and a local dev environment.",
   "type": "module",
   "repository": {
@@ -35,6 +35,11 @@
       "types": "./sdk/dist/chains/index.d.ts",
       "default": "./sdk/dist/chains/index.js"
     },
+    "./programs": {
+      "types": "./sdk/dist/programs/index.d.ts",
+      "default": "./sdk/dist/programs/index.js"
+    },
+    "./programs/token-sweep.sauce.ts": "./sdk/dist/programs/token-sweep.sauce.ts",
     "./deployments": {
       "types": "./sdk/dist/deployments/index.d.ts",
       "default": "./sdk/dist/deployments/index.js"
@@ -50,10 +55,6 @@
     "./verify": {
       "types": "./sdk/dist/verify/index.d.ts",
       "default": "./sdk/dist/verify/index.js"
-    },
-    "./verify/compile": {
-      "types": "./sdk/dist/verify/compile.d.ts",
-      "default": "./sdk/dist/verify/compile.js"
     }
   },
   "bin": {

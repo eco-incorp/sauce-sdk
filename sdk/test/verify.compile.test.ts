@@ -1,73 +1,103 @@
 /**
- * The (B) partner capability — compile-from-source — and the deliberate CLOSURE SPLIT that keeps
- * it off the `./verify` barrel. See `sdk/src/verify/compile.ts`'s module doc for why (A) (decode/
- * authenticity) and (B) (compile/provenance) are separate, non-substitutable checks.
+ * THE PARTNER REPRODUCIBILITY GUARD.
+ *
+ * We hand partners a code snippet (see `sdk/src/programs/index.ts`'s module doc) that compiles
+ * `token-sweep.sauce.ts` with the ORDINARY compiler and tells them the result will be byte-identical
+ * to the program we hand them. This test IS that snippet, run for real: if the snippet stops
+ * reproducing our bytes — a changed program, a compiler re-pin, a moved artifact, a different
+ * default — this goes red instead of a partner discovering it.
+ *
+ * There is deliberately no `compileSettleProgram` wrapper any more. A bespoke compile helper hid
+ * the four options that actually determine the output (`target`, `treeshake`, `tsSource`, and the
+ * `args` order) behind a function signature, so a partner reproducing the bytes could not see what
+ * they had to match. The options are literal below for exactly that reason — this file must keep
+ * spelling them out rather than importing them from a constant.
  */
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { compileSettleProgram, settleSourceText } from '../src/verify/compile';
-import { SETTLE_VECTORS, CURRENT_SETTLE_TEMPLATE } from '../src/verify/index';
+import { readFileSync } from 'fs';
+import { dirname, join, resolve } from 'path';
+import { keccak256 } from 'viem';
+import { compile } from '../../compiler/dist/index.js';
+import { tokenSweepSource, SAUCE_BASE_DIRS, TOKEN_SWEEP_SOURCE_PATH } from '../src/programs/index.js';
+import { decodeSettleProgram, SETTLE_VECTORS, SETTLE_WIRE, scanMinimalPush } from '../src/verify/index.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const TOKENS = ['0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb'] as const;
+const MIN_OUT = 12345n;
+const RECIPIENT = '0x0000000000000000000000000000000000000022';
 
-describe('@eco-incorp/sauce-sdk/verify/compile — compile-from-source', () => {
-  for (const v of SETTLE_VECTORS) {
-    it(`compiles ${v.name} byte-for-byte identical to the pinned vector`, () => {
-      const out = compileSettleProgram(v.tokens, v.minOut, v.recipient);
-      expect(out.bytecodes[0]!.toLowerCase()).toBe(v.program.toLowerCase());
-      expect(out.bodyHash).toBe(CURRENT_SETTLE_TEMPLATE.bodyHash);
-    });
+/** THE SNIPPET — kept verbatim-equivalent to the one in `programs/index.ts`'s docstring. */
+function partnerCompile(tokens: readonly string[], minOut: bigint, recipient: string): `0x${string}` {
+  const { bytecode } = compile(tokenSweepSource(), {
+    baseDirs: [...SAUCE_BASE_DIRS],
+    target: 'v12',
+    treeshake: true,
+    tsSource: true,
+    args: [tokens.map((t) => BigInt(t)), minOut, BigInt(recipient)],
+  });
+  return ('0x' + Buffer.from(bytecode[0]!).toString('hex')) as `0x${string}`;
+}
+
+/** Skip the (tokens, minOut, recipient) prologue, returning the constant body. Uses the package's
+ *  OWN wire scanner (`scanMinimalPush` takes bytes, not hex) rather than a private re-implementation,
+ *  so this guard exercises the same primitive a partner would. */
+function bodyOf(program: `0x${string}`): `0x${string}` {
+  const bytes = Buffer.from(program.slice(2), 'hex');
+  let pos = 0;
+  for (;;) {
+    const scan = scanMinimalPush(bytes, pos);
+    if (!scan.ok) break;
+    pos = scan.next;
   }
+  expect(bytes[pos]).toBe(SETTLE_WIRE.TUPLE_OP);
+  pos += 2; // TUPLE opcode + arity
+  for (let i = 0; i < 2; i++) {
+    const scan = scanMinimalPush(bytes, pos);
+    expect(scan.ok).toBe(true);
+    if (scan.ok) pos = scan.next;
+  }
+  return ('0x' + bytes.subarray(pos).toString('hex')) as `0x${string}`;
+}
 
-  it('rejects an empty tokens list', () => {
-    expect(() => compileSettleProgram([], 0n, '0x1' as `0x${string}`)).toThrow(/tokens must list at least one/);
+describe('partner reproducibility — the ordinary compiler reproduces our program', () => {
+  it('the documented snippet reproduces the SHIPPED golden vectors byte-for-byte', () => {
+    // The vectors in vectors.ts are the committed record of what this program compiles to. Checking
+    // the snippet against THEM (rather than a hash constant) means the thing under test is the same
+    // artifact partners are handed, and a compiler re-pin or program edit shows up as a real diff.
+    for (const v of SETTLE_VECTORS) {
+      const produced = partnerCompile(v.tokens as unknown as string[], v.minOut, v.recipient);
+      expect(produced.toLowerCase()).toBe(v.program.toLowerCase());
+    }
   });
 
-  it('rejects a zero recipient', () => {
-    const [v] = SETTLE_VECTORS;
-    expect(() => compileSettleProgram(v!.tokens, v!.minOut, '0x0000000000000000000000000000000000000000')).toThrow(
-      /recipient is REQUIRED/,
-    );
+  it('the body is a function of the program and compiler pin ONLY — never of the arguments', () => {
+    const shapes: Array<[readonly string[], bigint, string]> = [
+      [[TOKENS[0]], 0n, RECIPIENT],
+      [TOKENS, MIN_OUT, RECIPIENT],
+      [[...TOKENS, '0x00000000000000000000000000000000000000cc'], 1n << 200n, '0x0000000000000000000000000000000000000033'],
+    ];
+    const hashes = new Set(shapes.map(([t, m, r]) => keccak256(bodyOf(partnerCompile(t, m, r)))));
+    expect(hashes.size).toBe(1);
+    // ...and it is the same body the shipped vectors carry.
+    expect([...hashes][0]).toBe(decodeSettleProgram(SETTLE_VECTORS[0]!.program).bodyHash);
   });
 
-  it('rejects a negative minOut', () => {
-    const [v] = SETTLE_VECTORS;
-    expect(() => compileSettleProgram(v!.tokens, -1n, v!.recipient)).toThrow(/non-negative/);
-  });
-
-  it('settleSourceText() returns the exact on-disk ecoswap.settle.sauce.ts', () => {
-    const onDisk = readFileSync(join(__dirname, '../src/verify/ecoswap.settle.sauce.ts'), 'utf-8');
-    expect(settleSourceText()).toBe(onDisk);
-    expect(settleSourceText()).toContain('function main(tokens: Address[], minOut: Uint256, recipient: Address)');
-  });
-
-  it('is memoized: repeat calls return equal-content results (byte-identity is a compile PROPERTY, not a cache accident)', () => {
-    const [v] = SETTLE_VECTORS;
-    const a = compileSettleProgram(v!.tokens, v!.minOut, v!.recipient);
-    const b = compileSettleProgram(v!.tokens, v!.minOut, v!.recipient);
-    expect(a.bytecodes[0]).toBe(b.bytecodes[0]);
-    expect(a.source).toBe(b.source);
+  it('round-trips: what we compiled in is what /verify decodes out', () => {
+    const decoded = decodeSettleProgram(partnerCompile(TOKENS, MIN_OUT, RECIPIENT));
+    expect(decoded.tokens.map((t) => t.toLowerCase())).toEqual(TOKENS.map((t) => t.toLowerCase()));
+    expect(decoded.minOut).toBe(MIN_OUT);
+    expect(decoded.recipient.toLowerCase()).toBe(RECIPIENT.toLowerCase());
   });
 });
 
-describe('the closure split: ./verify/compile must NEVER be reachable from the ./verify barrel', () => {
-  it('sdk/src/verify/index.ts does not re-export compile.ts (grep-verifiable, not just untested)', () => {
-    const barrel = readFileSync(join(__dirname, '../src/verify/index.ts'), 'utf-8');
-    expect(barrel).not.toMatch(/compile\.js|compile['"]/);
+describe('the shipped program source', () => {
+  it('tokenSweepSource() returns the exact on-disk token-sweep.sauce.ts', () => {
+    const onDisk = readFileSync(resolve(process.cwd(), 'src/programs/token-sweep.sauce.ts'), 'utf-8');
+    expect(tokenSweepSource()).toBe(onDisk);
   });
 
-  it("compile.ts's own bare-specifier closure is NOT {viem} — it needs the compiler and the filesystem, which is exactly why it must stay off the barrel", () => {
-    const src = readFileSync(join(__dirname, '../src/verify/compile.ts'), 'utf-8');
-    const bareSpecifiers = new Set<string>();
-    for (const m of src.matchAll(/from\s*["']([^"']+)["']/g)) {
-      const spec = m[1]!;
-      if (!spec.startsWith('.')) bareSpecifiers.add(spec);
-    }
-    // node:fs / node:path / node:url / typescript / viem are all expected here — none of them are
-    // {viem}-only, which is the point: this module's closure is intentionally NOT the barrel's.
-    expect(bareSpecifiers.has('node:fs')).toBe(true);
-    expect(bareSpecifiers.has('typescript')).toBe(true);
-    expect([...bareSpecifiers].sort()).not.toEqual(['viem']);
+  it('SAUCE_BASE_DIRS resolves the program\'s ./artifacts/IERC20.json import', () => {
+    // The one entry is the dist/src ROOT, not the programs dir — that is where `./artifacts/` lives.
+    expect(SAUCE_BASE_DIRS).toHaveLength(1);
+    expect(readFileSync(join(SAUCE_BASE_DIRS[0]!, 'artifacts', 'IERC20.json'), 'utf-8').length).toBeGreaterThan(0);
+    expect(dirname(TOKEN_SWEEP_SOURCE_PATH)).not.toBe(SAUCE_BASE_DIRS[0]);
   });
 });

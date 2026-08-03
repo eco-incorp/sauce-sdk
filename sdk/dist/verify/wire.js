@@ -2,7 +2,7 @@
 // the check in ANY language (Go/Solidity/Python), independent of this package. See decode.ts's
 // module docstring for the full grammar; this file carries only the numeric constants and the
 // minimal-length push primitive both decode.ts and report.ts build on.
-/** Wire-format constants for the `ecoswap-settle` v12 program shape. All values measured against
+/** Wire-format constants for the sweep-program v12 wire shape. All values measured against
  *  the compiler's actual emission (`@eco-incorp/sauce-sdk/compiler` at this package's pin) —
  *  none of these are arbitrary choices. */
 export const SETTLE_WIRE = {
