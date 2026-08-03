@@ -474,7 +474,7 @@ export const sarosDlmmLadder: SvmVenueLadder = {
       `    else {`,
       `      let ${p}frm = 0; let ${p}fout = 0; let ${p}fex = 0;`,
       ...emitBinWalk(p, swapForY, x, v, `${p}wf`),
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fout }`,
+      `      ${outVar} = ${p}fout;`,
       `    }`,
       `  }`,
     ].join('\n');
@@ -531,7 +531,7 @@ export const sarosDlmmLadder: SvmVenueLadder = {
     const fee = feeParamsFromCfg(params);
     const live = liveFromState(cfg, state, fee, now ?? BigInt(Math.floor(Date.now() / 1000)));
     const kept = effectiveBins(cfg, state, live, params);
-    return (x) => coldWalk(kept, fee, live, swapForY, x) ?? 0n;
+    return (x) => coldWalkClamped(kept, fee, live, swapForY, x).out;
   },
   referenceLadderQuotes(base, state, params, now) {
     const cfg = sarosConfig(base);

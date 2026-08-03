@@ -517,7 +517,7 @@ export const pancakeswapClmmLadder: SvmVenueLadder = {
       `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
       ...emitWalkStep(p, zeroForOne, v, '        '),
       `      }`,
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+      `      ${outVar} = ${p}fo;`,
       `    }`,
       `  }`,
     ].join('\n');
@@ -570,7 +570,7 @@ export const pancakeswapClmmLadder: SvmVenueLadder = {
     const zeroForOne = cfg.direction === '0to1';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live, params);
-    return (x: bigint) => coldWalk(win, live, zeroForOne, x) ?? 0n;
+    return (x: bigint) => coldWalkClamped(win, live, zeroForOne, x).out;
   },
   referenceLadderQuotes(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]) {
     const cfg = pcConfig(base);

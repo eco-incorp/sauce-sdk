@@ -584,7 +584,7 @@ export const cropperLadder: SvmVenueLadder = {
       `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
       ...emitWalkStep(p, aToB, v, '        '),
       `      }`,
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+      `      ${outVar} = ${p}fo;`,
       `    }`,
       `  }`,
     ].join('\n');
@@ -654,7 +654,7 @@ export const cropperLadder: SvmVenueLadder = {
     const aToB = cfg.direction === 'aToB';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live, params);
-    return (x: bigint): bigint => coldWalk(win, live, aToB, x) ?? 0n;
+    return (x: bigint): bigint => coldWalkClamped(win, live, aToB, x).out;
   },
 
   referenceLadderQuotes(

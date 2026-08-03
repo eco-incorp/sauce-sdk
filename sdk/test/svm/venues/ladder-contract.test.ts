@@ -117,6 +117,18 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  fetchCropperConfig,
+  cropperLadder,
+  fetchSarosDlmmConfig,
+  sarosDlmmLadder,
+  fetchPancakeswapClmmConfig,
+  pancakeswapClmmLadder,
+  fetchStabbleClmmConfig,
+  stabbleClmmLadder,
+  fetchDefiTunaPoolConfig,
+  defitunaLadder,
+  fetchCremaPoolConfig,
+  cremaLadder,
   ZEROFI_POOL_AUTHORITY,
   zerofiLadder,
   zerofi,
@@ -1085,6 +1097,90 @@ const FAMILIES: Family[] = [
     // declaredCliffs / capacity pair is needed.
   },
   {
+    slug: 'crema',
+    ladder: cremaLadder,
+    async variants() {
+      const POOL = address('DV569UDdnjkYWJDnpJfJZE4HyzYKYyRGowtdPQrFUZpm');
+      const fixtures = fixturesFor('crema');
+      const cfg = await fetchCremaPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'defituna',
+    ladder: defitunaLadder,
+    async variants() {
+      const POOL = address('7VuKeevbvbQQcxz6N4SNLmuq6PYy4AcGQRDssoqo4t65');
+      const fixtures = fixturesFor('defituna');
+      const cfg = await fetchDefiTunaPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'stabble-clmm',
+    ladder: stabbleClmmLadder,
+    async variants() {
+      const POOL = address('EK72FNtzoGJvXtq8r3bn7jB8ascHw1euFmnoemZ61D9g');
+      const fixtures = fixturesFor('stabble-clmm');
+      const cfg = await fetchStabbleClmmConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: '0to1', cfg, state },
+        { label: '1to0', cfg: { ...cfg, direction: '1to0' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'pancakeswap-clmm',
+    ladder: pancakeswapClmmLadder,
+    async variants() {
+      const POOL = address('DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ');
+      const fixtures = fixturesFor('pancakeswap-clmm');
+      const cfg = await fetchPancakeswapClmmConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: '0to1', cfg, state },
+        { label: '1to0', cfg: { ...cfg, direction: '1to0' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'saros-dlmm',
+    ladder: sarosDlmmLadder,
+    async variants() {
+      const POOL = address('DHXKB9fSff4LjubMFieKxaBrvNY6AzXVwaRLk5N2vs87');
+      const fixtures = fixturesFor('saros-dlmm');
+      const cfg = await fetchSarosDlmmConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'xToY', cfg, state },
+        { label: 'yToX', cfg: { ...cfg, direction: 'yToX' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'cropper',
+    ladder: cropperLadder,
+    async variants() {
+      const POOL = address('7vKAxPYgE3wcQS9TpUSqanyk1shWswt8bUCLKcNyiNYW');
+      const fixtures = fixturesFor('cropper');
+      const cfg = await fetchCropperConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1675,8 +1771,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(69);
-    expect(FAMILIES).toHaveLength(69);
+    expect(registered).toHaveLength(75);
+    expect(FAMILIES).toHaveLength(75);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });

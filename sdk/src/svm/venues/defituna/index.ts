@@ -763,7 +763,7 @@ export const defitunaLadder: SvmVenueLadder = {
       `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
       ...emitWalkStep(p, aToB, v, '        '),
       `      }`,
-      `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+      `      ${outVar} = ${p}fo;`,
       `    }`,
       `  }`,
     ].join('\n');
@@ -813,7 +813,7 @@ export const defitunaLadder: SvmVenueLadder = {
     const aToB = cfg.direction === 'aToB';
     const live = liveFromState(cfg, state);
     const win = effectiveWindow(cfg, state, live, params);
-    return (x: bigint) => coldWalk(win, live, aToB, x) ?? 0n;
+    return (x: bigint) => coldWalkClamped(win, live, aToB, x).out;
   },
   referenceLadderQuotes(base, state, params) {
     const cfg = defitunaConfig(base);

@@ -463,7 +463,7 @@ export const stabbleClmmLadder = {
             `      for (let ${p}wf = 0; ${p}wf < ${WALK_BOUND} && ${p}frm > 0 && ${p}fex === 0; ${p}wf++) {`,
             ...emitWalkStep(p, zeroForOne, v, '        '),
             `      }`,
-            `      if (${p}fex === 0 && ${p}frm === 0) { ${outVar} = ${p}fo }`,
+            `      ${outVar} = ${p}fo;`,
             `    }`,
             `  }`,
         ].join('\n');
@@ -515,7 +515,7 @@ export const stabbleClmmLadder = {
         const zeroForOne = cfg.direction === '0to1';
         const live = liveFromState(cfg, state);
         const win = effectiveWindow(cfg, state, live, params);
-        return (x) => coldWalk(win, live, zeroForOne, x) ?? 0n;
+        return (x) => coldWalkClamped(win, live, zeroForOne, x).out;
     },
     referenceLadderQuotes(base, state, params) {
         const cfg = sbConfig(base);

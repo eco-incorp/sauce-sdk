@@ -1,4 +1,10 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { cropperLadder } from './cropper/ladder.js';
+import { sarosDlmmLadder } from './saros-dlmm/ladder.js';
+import { pancakeswapClmmLadder } from './pancakeswap-clmm/ladder.js';
+import { stabbleClmmLadder } from './stabble-clmm/ladder.js';
+import { defitunaLadder } from './defituna/index.js';
+import { cremaLadder } from './crema/index.js';
 import { zerofiLadder } from './zerofi/ladder.js';
 import { obsidianLadder } from './obsidian/ladder.js';
 import { riptideLadder } from './riptide/ladder.js';
@@ -145,6 +151,12 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [cropperLadder.slug]: cropperLadder,
+    [sarosDlmmLadder.slug]: sarosDlmmLadder,
+    [pancakeswapClmmLadder.slug]: pancakeswapClmmLadder,
+    [stabbleClmmLadder.slug]: stabbleClmmLadder,
+    [defitunaLadder.slug]: defitunaLadder,
+    [cremaLadder.slug]: cremaLadder,
     [zerofiLadder.slug]: zerofiLadder,
     [obsidianLadder.slug]: obsidianLadder,
     [riptideLadder.slug]: riptideLadder,
