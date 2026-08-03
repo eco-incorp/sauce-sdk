@@ -56,6 +56,7 @@ export * from './juplend-amm/index.js';
 export * from './juplend-amm/ladder.js';
 export * from './huma/index.js';
 export * from './huma/ladder.js';
+export * from './saber-decimals-wrapper/index.js';
 // --- migrated venue adapters (formerly sauce-recipes ecoswap/svm/venues/**) ---
 // scale-common: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `scaleCommon`/`SCALE_COMMON` prefix.
