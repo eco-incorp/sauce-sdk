@@ -3,26 +3,22 @@ import { IERC20 } from "./artifacts/IERC20.json";
 // token-sweep.sauce.ts — a STANDALONE, reusable Sauce program: sweep the Pot's balance of a list of
 // tokens to one recipient, with a minimum-output floor enforced on the first token.
 //
-// It is deliberately NOT tied to any recipe. Nothing in the program below knows what produced the
-// balances it moves — a swap, a bridge, an airdrop, a manual transfer, or nothing at all. Its
-// contract is exactly "these tokens, this floor, this recipient", so any caller that needs a Pot
-// emptied to a destination can compile and run it. The one leftover coupling is cosmetic and
-// deliberate: the revert string still reads "ecoswap: ..." because that string is INSIDE the
-// compiled body, and the body's keccak256 is the pinned authenticity root
-// (sdk/src/verify/template.ts's CURRENT_SETTLE_TEMPLATE). Renaming it is a body change, so it
-// belongs in a deliberate template version bump, not in a file move — see that file's `status`
-// handling for how a new body is rolled out (new `current` entry, old one `superseded`).
+// It is deliberately NOT tied to any recipe, protocol or product. Nothing in the program below
+// knows what produced the balances it moves — a swap, a bridge, an airdrop, a manual transfer, or
+// nothing at all. Its contract is exactly "these tokens, this floor, this recipient", so any caller
+// that needs a Pot emptied to a destination can compile and run it. Keep it that way: no
+// caller-specific names, in the code OR in the revert string (the string is inside the compiled
+// body, so changing it rotates the pinned authenticity root — see sdk/src/verify/template.ts).
 //
-// ITS FIRST CONSUMER — the split-cook composition — is a CONSUMER, not this program's identity:
-// `@eco-incorp/sauce-recipes`'s ecoswap.sauce.ts SETTLE_SPLIT define pairs it with a swap program.
-// A V12Pot.cook executes ONLY ingredients[0] and silently ignores the rest, so a single cook cannot
-// run "swap then settle" — that composition is TWO TOP-LEVEL cook() calls joined by an
+// COMPOSING IT AFTER ANOTHER PROGRAM (the common case, and the reason the floor exists): a
+// V12Pot.cook executes ONLY ingredients[0] and silently ignores the rest, so ONE cook cannot run
+// "do the thing, then sweep". That composition is TWO TOP-LEVEL cook() calls joined by an
 // owner-authorised multicall in ONE transaction:
-//   multicall → [ Pot.cook([swapProgram]) , Pot.cook([sweepProgram]) ]
+//   multicall → [ Pot.cook([producerProgram]) , Pot.cook([sweepProgram]) ]
 // The multicall contract MUST be this Pot's `owner` (V12Pot.cook is
 // `msg.sender == owner || msg.sender == address(this)`-gated — there is no third path) and MUST
 // propagate a reverting call's revert data rather than swallow it (a non-reverting/tryAggregate
-// dispatch turns a sweep failure into "the swap landed, the recipient got nothing").
+// dispatch turns a sweep failure into "the first cook landed, the recipient got nothing").
 // SECURITY: the multicall must NEVER be a permissionless batcher. Multicall3's `aggregate3` CALLs
 // from its own address, so if it owned a Pot, any address could call
 // `aggregate3([{target: pot, callData: cook([drainProgram])}])` and drain it — owning the batcher
@@ -89,7 +85,7 @@ function main(tokens: Address[], minOut: Uint256, recipient: Address): Uint256 {
   const floorBal: Uint256 = floorToken.balanceOf(address.self);
   if (minOut > 0) {
     if (floorBal < minOut) {
-      throw "ecoswap: amountOut below minOut";
+      throw "sweep: balance below minOut";
     }
   }
   for (let i = 0; i < tokens.length; i = i + 1) {

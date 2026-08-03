@@ -1,5 +1,5 @@
 /**
- * SAUCE SETTLE PROGRAM WIRE FORMAT v1 — `ecoswap-settle` on engine target v12.
+ * SAUCE SWEEP PROGRAM WIRE FORMAT v1 — `programs/token-sweep.sauce.ts` on engine target v12.
  *
  * `program := PROLOGUE || BODY`. Byte 0 is the first prologue byte — there is NO header, magic,
  * version byte, or length prefix.
@@ -11,18 +11,23 @@
  * arity          := one RAW byte, unsigned, MUST equal N
  * minout_push    := PUSH, uint256, value = minOut          (0 = floor disabled)
  * recipient_push := PUSH, uint160,  value = recipient      (MUST be nonzero)
- * body           := remaining bytes; EXACTLY 165 bytes; keccak256(body) is template-pinned — see
- *                    template.ts
+ * body           := remaining bytes (must be non-empty); `keccak256(body)` is reported as
+ *                    `bodyHash` for the caller to compare against, but this file pins no value
  * ```
  *
- * The body is byte-identical for every N, every minOut, and every recipient — the template is
- * helper-free (no jump-table offsets that shift with arg count) — so byte/hash equality of the
- * SUFFIX is both necessary and sufficient to prove "this is our audited template, verbatim,
- * nothing appended". Decoding the prologue ALONE proves only that the program STARTS with that
- * shape; it cannot exclude an appended transfer, branch, or unbounded call — pair `decodeSettleProgram`
- * with a body-hash check (`inspectSettleProgram`/`verifySettleProgram`, or at minimum
- * `keccak256(decoded.body)` against `template.ts`'s pinned table) before trusting the decoded
- * values as "this is our settle program".
+ * WHAT THIS PROVES, AND WHAT IT DOES NOT. The prologue grammar is independent of the body, so
+ * decoding tells you which `(tokens, minOut, recipient)` a program carries and nothing more. It
+ * cannot exclude an appended transfer, branch, or unbounded call after the prologue — a
+ * prologue-shaped program may do anything in its body.
+ *
+ * If you need "this is the program I audited", compile that program from source and byte-compare:
+ * `@eco-incorp/sauce-sdk/programs` ships the source and the one `baseDirs` entry, and the ordinary
+ * compiler reproduces the exact bytes. That is a check against source you can read, which is
+ * strictly better evidence than a hash constant shipped in the same package as the claim.
+ *
+ * Useful property when you do compare: the body of `token-sweep.sauce.ts` is byte-identical for
+ * every token count, every minOut and every recipient (the program is helper-free, so no jump-table
+ * offsets shift with arg count) — so one body comparison covers every argument set.
  *
  * THIS decoder is CANONICAL/STRICT: unlike the recipes package's original in-repo decoder (which
  * predates this package and accepted three malformed shapes — see the `SettleFailureCode` docs
@@ -33,6 +38,12 @@
  */
 import { keccak256 } from "viem";
 import { SETTLE_WIRE, scanMinimalPush, encodeMinimalPush } from "./wire.js";
+/* NOTE: this union used to also carry BODY_HASH, TEMPLATE_REVOKED, INTERNAL_INCONSISTENT,
+ *  PRODUCER_HASH_DIVERGED, EXPECT_* and INTENT_UNCHECKED. Every one of those was produced by the
+ *  template/report layer that used to sit beside this file, never by the decoder — so with that
+ *  layer gone they would advertise rejections nothing here can make. Removed rather than kept as
+ *  dead vocabulary; the doc above ("every one of these is a REAL rejection this decoder makes") is
+ *  true again. */
 export class SettleDecodeError extends Error {
     code;
     constructor(code, message) {
@@ -66,8 +77,8 @@ function hexToBytesLocal(hex) {
     return out;
 }
 /** Best-effort single left-to-right pass — never throws. This is the shared engine both
- *  `decodeSettleProgram` (throws on `parse.fatal`) and the report builders (render every stage
- *  that DID succeed even when a later stage failed) run on top of. */
+ *  `decodeSettleProgram` (throws on `parse.fatal`) and `bestEffortDecode` (keeps
+ *  whatever DID parse even when a later stage failed) run on top of. */
 export function parseSettleProgram(program) {
     const decodedHex = hexToBytesLocal(program);
     const bytes = decodedHex ?? new Uint8Array(0);
@@ -181,8 +192,17 @@ export function parseSettleProgram(program) {
     result.bodyOffset = pos;
     result.body = bytes.subarray(pos);
     result.bodyHash = keccak256(bytesToHexLocal(result.body));
-    if (result.fatal === null && result.body.length !== 165) {
-        result.fatal = { code: "BODY_LENGTH", message: `body is ${result.body.length} bytes, expected 165` };
+    // A program must HAVE a body — a bare prologue with nothing after it is not a runnable program,
+    // and decoding params out of one would report intent for something that does nothing.
+    //
+    // The exact length is deliberately NOT pinned here. It used to be (a bare `165`), which coupled
+    // this decoder to one specific compiled body: the same params compiled from a program whose body
+    // legitimately differs in length — a different program, or the same one after an edit — was
+    // rejected on its length before its params were ever read, even though the prologue grammar this
+    // file implements is entirely independent of what follows it. Deciding WHOSE body it is belongs to
+    // whoever compiles the source and byte-compares (see `@eco-incorp/sauce-sdk/programs`), not here.
+    if (result.fatal === null && result.body.length === 0) {
+        result.fatal = { code: "BODY_LENGTH", message: "program has no body after the prologue" };
     }
     return result;
 }
@@ -208,8 +228,8 @@ function parseToDecoded(parse) {
 }
 /** Decode whenever the shape is well-formed enough to name a full `(tokens, minOut, recipient)`
  *  — even when a later, non-structural check (a nonzero-but-wrong-length body, a zero recipient)
- *  would make `decodeSettleProgram` throw. Used by the report builders so a rejected program's
- *  decoded intent is still visible to the caller debugging the rejection. */
+ *  would make `decodeSettleProgram` throw — so a rejected program's decoded intent is still
+ *  visible to a caller debugging the rejection. */
 export function bestEffortDecode(parse) {
     return parseToDecoded(parse);
 }
@@ -219,10 +239,10 @@ export function bestEffortDecode(parse) {
  * see this module's docstring for why. Throws `SettleDecodeError` (carrying a stable `.code`) on
  * any of the failures in `SettleFailureCode`.
  *
- * This is a STRUCTURAL decode only — it proves the program STARTS with the settle shape and ends
- * in a well-formed 165-byte suffix. It does NOT prove the suffix is OUR audited body — pair with
- * a `bodyHash` comparison against `template.ts`'s pinned table (or use `verifySettleProgram`,
- * which does both) before trusting the decoded values as "this is our settle program".
+ * This is a STRUCTURAL decode only — it proves the program STARTS with the sweep shape and has a
+ * non-empty suffix. It does NOT prove that suffix is a program you audited: compile the source and
+ * byte-compare for that (`@eco-incorp/sauce-sdk/programs`), and compare `decoded.bodyHash` against
+ * the body you get, before treating the decoded values as "this is my sweep program".
  */
 export function decodeSettleProgram(program) {
     const parse = parseSettleProgram(program);
@@ -247,8 +267,9 @@ export function decodeSettleProgram(program) {
  * recommended non-TypeScript (Solidity/Go/Python) implementation — see `onChainVerdict` guidance
  * in this package's docs for why an on-chain form should implement §5, not §4.
  *
- * `template` defaults to `CURRENT_SETTLE_TEMPLATE`; pass an explicit entry to encode against a
- * specific (e.g. superseded, for a rollback check) template body.
+ * `bodyHex` is supplied by the caller — pass the body of a program you compiled yourself (there is
+ * no pinned table here to default to, deliberately: the body you compare against should be one you
+ * derived, not one shipped alongside the claim).
  */
 export function encodeSettleProgram(tokens, minOut, recipient, bodyHex) {
     if (tokens.length === 0)

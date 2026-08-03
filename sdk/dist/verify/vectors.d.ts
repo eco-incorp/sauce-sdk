@@ -4,8 +4,10 @@ export interface ConformanceVector {
     tokens: Hex[];
     minOut: bigint;
     recipient: Hex;
-    /** The exact compiled program these args produce — measured against this package's compiler
-     *  pin (`CURRENT_SETTLE_TEMPLATE.compilerSha`), not hand-assembled. */
+    /** The exact compiled program these args produce — measured by actually compiling
+     *  `programs/token-sweep.sauce.ts` at this package's compiler pin, not hand-assembled.
+     *  `sdk/test/verify.compile.test.ts` recompiles and re-checks these, so a compiler re-pin or a
+     *  program edit that changes the emission turns red here rather than drifting silently. */
     program: Hex;
 }
 /**

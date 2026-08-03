@@ -18,7 +18,7 @@ import { dirname, join, resolve } from 'path';
 import { keccak256 } from 'viem';
 import { compile } from '../../compiler/dist/index.js';
 import { tokenSweepSource, SAUCE_BASE_DIRS, TOKEN_SWEEP_SOURCE_PATH } from '../src/programs/index.js';
-import { CURRENT_SETTLE_TEMPLATE, decodeSettleProgram, SETTLE_WIRE, scanMinimalPush } from '../src/verify/index.js';
+import { decodeSettleProgram, SETTLE_VECTORS, SETTLE_WIRE, scanMinimalPush } from '../src/verify/index.js';
 
 const TOKENS = ['0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb'] as const;
 const MIN_OUT = 12345n;
@@ -58,10 +58,14 @@ function bodyOf(program: `0x${string}`): `0x${string}` {
 }
 
 describe('partner reproducibility — the ordinary compiler reproduces our program', () => {
-  it('the documented snippet reproduces the PINNED body hash', () => {
-    const body = bodyOf(partnerCompile(TOKENS, MIN_OUT, RECIPIENT));
-    expect(body.length / 2 - 1).toBe(CURRENT_SETTLE_TEMPLATE.bodySize);
-    expect(keccak256(body)).toBe(CURRENT_SETTLE_TEMPLATE.bodyHash);
+  it('the documented snippet reproduces the SHIPPED golden vectors byte-for-byte', () => {
+    // The vectors in vectors.ts are the committed record of what this program compiles to. Checking
+    // the snippet against THEM (rather than a hash constant) means the thing under test is the same
+    // artifact partners are handed, and a compiler re-pin or program edit shows up as a real diff.
+    for (const v of SETTLE_VECTORS) {
+      const produced = partnerCompile(v.tokens as unknown as string[], v.minOut, v.recipient);
+      expect(produced.toLowerCase()).toBe(v.program.toLowerCase());
+    }
   });
 
   it('the body is a function of the program and compiler pin ONLY — never of the arguments', () => {
@@ -72,7 +76,8 @@ describe('partner reproducibility — the ordinary compiler reproduces our progr
     ];
     const hashes = new Set(shapes.map(([t, m, r]) => keccak256(bodyOf(partnerCompile(t, m, r)))));
     expect(hashes.size).toBe(1);
-    expect([...hashes][0]).toBe(CURRENT_SETTLE_TEMPLATE.bodyHash);
+    // ...and it is the same body the shipped vectors carry.
+    expect([...hashes][0]).toBe(decodeSettleProgram(SETTLE_VECTORS[0]!.program).bodyHash);
   });
 
   it('round-trips: what we compiled in is what /verify decodes out', () => {
