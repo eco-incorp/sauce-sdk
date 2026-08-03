@@ -76,21 +76,39 @@ export declare const tokenSwapV1: SplTokenSwapForkAdapter;
 export declare const DEXLAB_PROGRAM_ID: Address;
 export declare const dexlab: SplTokenSwapForkAdapter;
 /**
- * Saros — GATED (see `unresolvedGate` above): a real-CPI probe against the
- * live mainnet binary (a real SOL/USDC pool,
- * `Djxfn7zWFxFqYgwesXfq8BeAirfXwfhQmNcCousXh7G7`, dumped 2026-07-31) executes
- * successfully with the standard 10-account list, but its REALIZED output
- * implies an effective swap fee of a clean, reproducible 4 bps across five
- * independently-tested trade sizes (10 SOL, 100 SOL down to 0.1 SOL raw
- * equivalents) — NOT the 30 bps the pool's own on-chain `owner_trade_fee`
- * field states (`trade_fee` reads 0 bps). The account layout is confirmed
- * correct up through `pool_fee_account` (the swap only succeeds because that
- * key check passes), so this is a genuine fee-MODEL divergence, not a decode
- * bug — Saros's deployed program evidently does not compute the swap fee the
- * vanilla spl-token-swap way from the fields at these offsets, and no public
- * source was available to determine the real rule. Gated rather than
- * guessed at: shipping the wrong fee would silently misquote (and
- * mis-elect) a real, actively-traded venue by ~0.26% per trade.
+ * Saros — UN-GATED (2026-08-03; was gated, see git history for the original
+ * `unresolvedGate` text). The original real-CPI probe against the live
+ * mainnet binary (a real WSOL/USDC pool,
+ * `Djxfn7zWFxFqYgwesXfq8BeAirfXwfhQmNcCousXh7G7`, dumped 2026-07-31) found
+ * the same fee-MODEL divergence this comment used to describe: REALIZED
+ * output across 14 independently-sampled real trades (27,995 to 6,089,579
+ * raw units) implies an effective swap fee of a clean, reproducible ~4 bps —
+ * NOT the 30 bps the pool's own on-chain `owner_trade_fee` field states
+ * (`trade_fee` reads 0 bps). The account layout is confirmed correct up
+ * through `pool_fee_account` (the swap only succeeds because that key check
+ * passes) — this is a genuine fee-MODEL divergence, not a decode bug: Saros's
+ * deployed program evidently does not compute the swap fee the vanilla
+ * spl-token-swap way from the fields at these offsets, and no public source
+ * was available to determine the real rule (the likely explanation, not
+ * confirmed: the stored `owner_trade_fee` sizes how many LP tokens this fork
+ * mints to `pool_fee_account` — confirmed growing consistent with invariant
+ * growth on every sampled trade — while the amount actually deducted from
+ * the trader's output is governed by a separate, unrecovered constant).
+ *
+ * Rather than continue gating on an unresolved exact rule, this adapter
+ * deliberately keeps the generic `makeSplTokenSwapForkAdapter` formula
+ * (the STORED, higher trade+owner fee rates as the netIn deduction) as a
+ * MEASURED, DELIBERATE safety margin: across all 14 sampled trades this
+ * model's predicted output was strictly <= the real realized output every
+ * time (margins of ~0.05%-0.26% of the trade) — never an over-promise, so
+ * quoting it is safe for election (a worse model never wins a share it
+ * doesn't deserve), the same closed-source-fork trade-off `gamma`'s
+ * dynamic-fee ceiling already makes. Proven end-to-end against the real
+ * deployed binary in LiteSVM at 2 and 4 rungs plus three additional sizes
+ * (`predicted <= realized` at every sampled size, never `===`, unlike the
+ * `orca-legacy-token-swap`/`token-swap-v1`/etc. siblings this fork's math was
+ * cloned from) — see test/svm/ecoswap-svm.realcpi.e2e.test.ts's `saros`
+ * describeWith block in sauce-recipes.
  */
 export declare const SAROS_PROGRAM_ID: Address;
 export declare const saros: SplTokenSwapForkAdapter;

@@ -6,7 +6,7 @@
  * `inspectSettleProgram`/`verifySettleProgram`/`formatSettleReport` surface) that has been deleted:
  * `verify/` answers one question now — what `(tokens, minOut, recipient)` was a program compiled
  * with. "Is this body a program I audited" is answered by compiling the source and byte-comparing
- * (`@eco-incorp/sauce-sdk/programs`), which is evidence a partner derives rather than a hash
+ * (`@eco-incorp/sauce-sdk/recipes`), which is evidence a partner derives rather than a hash
  * constant shipped in the same package as the claim it supports.
  *
  * What survived is everything that tested the DECODER: golden-vector conformance, the encode
