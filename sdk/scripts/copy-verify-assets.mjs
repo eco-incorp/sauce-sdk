@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// `tsc` only emits compiled .js/.d.ts — it does not copy the runtime asset
-// `sdk/src/programs/token-sweep.sauce.ts` that `tokenSweepSource()`
-// (sdk/dist/programs/index.js) reads from disk at RUN time via `readFileSync`.
-// `src/**/*.sauce.ts` is excluded from the tsconfig (it is SauceScript, not
-// TypeScript tsc can parse), so without this step a fresh `sdk/dist` would be
-// missing the one file a partner needs in order to reproduce our bytecode.
-// Mirrors `@eco-incorp/sauce-recipes`'s `scripts/copy-dist-assets.mjs` (same
-// problem, same shape, different package).
+// `tsc` only emits compiled .js/.d.ts — it does not copy the runtime assets
+// `sdk/src/programs/token-sweep.sauce.ts` / `svm-token-settle.sauce.ts` that
+// `tokenSweepSource()` / `svmTokenSettleSource()` (sdk/dist/programs/index.js)
+// read from disk at RUN time via `readFileSync`. `src/**/*.sauce.ts` is
+// excluded from the tsconfig (it is SauceScript, not TypeScript tsc can
+// parse), so without this step a fresh `sdk/dist` would be missing the files
+// a partner needs in order to reproduce our bytecode. Mirrors
+// `@eco-incorp/sauce-recipes`'s `scripts/copy-dist-assets.mjs` (same problem,
+// same shape, different package).
 //
 // NOTE the dest directory is CREATED here rather than asserted. `tsc` does emit
 // `dist/programs/` today (for `src/programs/index.ts`), so the mkdir is belt and
@@ -23,15 +24,18 @@ import { fileURLToPath } from "node:url";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SDK_DIR = resolve(SCRIPT_DIR, "..");
 
-const ASSET = "token-sweep.sauce.ts";
+const ASSETS = ["token-sweep.sauce.ts", "svm-token-settle.sauce.ts"];
 const SUBDIR = "programs";
-const src = join(SDK_DIR, "src", SUBDIR, ASSET);
-const dest = join(SDK_DIR, "dist", SUBDIR, ASSET);
 
-if (!existsSync(src)) {
-  console.error(`copy-verify-assets: missing source asset ${src}`);
-  process.exit(1);
+for (const asset of ASSETS) {
+  const src = join(SDK_DIR, "src", SUBDIR, asset);
+  const dest = join(SDK_DIR, "dist", SUBDIR, asset);
+
+  if (!existsSync(src)) {
+    console.error(`copy-verify-assets: missing source asset ${src}`);
+    process.exit(1);
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  console.log(`copy-verify-assets: copied ${asset} -> dist/${SUBDIR}/`);
 }
-mkdirSync(dirname(dest), { recursive: true });
-copyFileSync(src, dest);
-console.log(`copy-verify-assets: copied ${ASSET} -> dist/${SUBDIR}/`);

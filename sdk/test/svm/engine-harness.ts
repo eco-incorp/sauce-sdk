@@ -9,6 +9,7 @@
  * accounts, no provisioning; every execute transaction carries the
  * RequestHeapFrame prepend.
  */
+import { createHash } from 'node:crypto';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
 import { getAddressCodec, generateKeyPairSigner, lamports } from '@solana/kit';
@@ -17,15 +18,24 @@ import { Clock, FailedTransactionMetadata, FeatureSet, LiteSVM } from 'litesvm';
 import type { AccountPlan } from '@eco-incorp/sauce-compiler';
 import {
   buildComputeBudgetPrepend,
+  buildExecuteFromAccountInstruction,
   buildExecuteInstruction,
   buildExecuteTransaction,
+  buildFinalizeBufferInstruction,
   buildHeapFramePrepend,
+  buildInitBufferInstructions,
+  buildStagingPlan,
+  buildWriteBufferInstruction,
+  deriveBufferPda,
+  encodePayloadArgs,
   getTransactionSize,
   resolveAccounts,
 } from '../../src/svm/index.js';
-import type { AccountResolution, SignedExecuteTransaction } from '../../src/svm/index.js';
+import type { AccountResolution, SignedExecuteTransaction, StagedArgs } from '../../src/svm/index.js';
 import { fixtureAccounts } from './fixtures.js';
 import type { AccountFixture } from './fixtures.js';
+
+const sha256 = (bytes: Uint8Array): Uint8Array => new Uint8Array(createHash('sha256').update(bytes).digest());
 
 // sdk jest cwd is sdk/; the vendored binary lives at the repo-root
 // artifacts/svm/, one level up (same resolution rule as the compiler's
@@ -273,5 +283,81 @@ export const expectFail = (result: RunResult): { revertData: Uint8Array; err: st
 
 export const toBigInt = (bytes: Uint8Array): bigint =>
   bytes.length === 0 ? 0n : BigInt('0x' + Buffer.from(bytes).toString('hex'));
+
+/**
+ * Stages `bytecode` into buffer `index` through the real staging protocol; returns its address.
+ * Hoisted out of `staged.e2e.test.ts` (was private there) so every suite needing the staged
+ * lifecycle drives the SAME real protocol rather than a copy that could silently diverge from it on
+ * the next engine change.
+ */
+export const stageBytecode = async (harness: EngineHarness, index: number, bytecode: Uint8Array): Promise<Address> => {
+  const plan = buildStagingPlan(bytecode.length);
+  const { address: buffer } = await deriveBufferPda(harness.programId, harness.payer.address, index);
+  const shared = { programId: harness.programId, authority: harness.payer.address, buffer };
+
+  // init tx (all growth steps pack into one), then one tx per chunk, then the
+  // DEDICATED finalize tx — every tx must clear the 1232-byte wire cap. None
+  // of these carry the heap-frame request: staging never touches interpreter
+  // memory.
+  const initInstructions = buildInitBufferInstructions({
+    programId: harness.programId,
+    payer: harness.payer.address,
+    buffer,
+    index,
+    capacity: bytecode.length,
+  });
+  if (initInstructions.length !== plan.initInstructionCount) {
+    throw new Error(`expected ${plan.initInstructionCount} init instructions, got ${initInstructions.length}`);
+  }
+  expectOk(await sendInstructions(harness, initInstructions));
+
+  for (const chunk of plan.chunks) {
+    const write = buildWriteBufferInstruction({
+      ...shared,
+      offset: chunk.offset,
+      chunk: bytecode.subarray(chunk.offset, chunk.offset + chunk.length),
+    });
+    const transaction = await buildExecuteTransactionForHarness(harness, [write]);
+    if (getTransactionSize(transaction) > 1232) {
+      throw new Error(`staged write transaction exceeds 1232 bytes (${getTransactionSize(transaction)})`);
+    }
+    expectOk(await sendInstructions(harness, [write]));
+  }
+
+  expectOk(
+    await sendInstructions(harness, [
+      buildFinalizeBufferInstruction({ ...shared, length: bytecode.length, sha256: sha256(bytecode) }),
+    ]),
+  );
+
+  return buffer;
+};
+
+/**
+ * ONE-instruction staged execute: [CU limit, RequestHeapFrame, execute_from_account]
+ * — the payload args ride the execute instruction's own data (no writer
+ * instruction exists on the Wave D surface). Hoisted alongside `stageBytecode` — see its doc.
+ */
+export const executeStaged = async (
+  harness: EngineHarness,
+  buffer: Address,
+  accounts: ReturnType<typeof resolveAccounts>,
+  opts: { pin?: Uint8Array; args?: StagedArgs } = {},
+): Promise<RunResult> => {
+  // Generous CU limit — the default 200K/tx starves multi-KB staged programs.
+  const instructions: Instruction[] = [
+    ...buildComputeBudgetPrepend({ unitLimit: 1_400_000 }),
+    buildHeapFramePrepend(),
+    buildExecuteFromAccountInstruction({
+      programId: harness.programId,
+      buffer,
+      accounts,
+      expectedSha256: opts.pin,
+      args: opts.args ? encodePayloadArgs(opts.args.layout, opts.args.values) : undefined,
+    }),
+  ];
+
+  return sendInstructions(harness, instructions);
+};
 
 export { getTransactionSize };

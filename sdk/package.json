@@ -30,6 +30,7 @@
       "default": "./dist/programs/index.js"
     },
     "./programs/token-sweep.sauce.ts": "./dist/programs/token-sweep.sauce.ts",
+    "./programs/svm-token-settle.sauce.ts": "./dist/programs/svm-token-settle.sauce.ts",
     "./skills": {
       "types": "./dist/skills/loader.d.ts",
       "default": "./dist/skills/loader.js"

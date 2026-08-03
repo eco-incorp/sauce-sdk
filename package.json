@@ -40,6 +40,7 @@
       "default": "./sdk/dist/programs/index.js"
     },
     "./programs/token-sweep.sauce.ts": "./sdk/dist/programs/token-sweep.sauce.ts",
+    "./programs/svm-token-settle.sauce.ts": "./sdk/dist/programs/svm-token-settle.sauce.ts",
     "./deployments": {
       "types": "./sdk/dist/deployments/index.d.ts",
       "default": "./sdk/dist/deployments/index.js"
