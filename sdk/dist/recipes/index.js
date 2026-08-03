@@ -1,5 +1,5 @@
 /**
- * @eco-incorp/sauce-sdk/programs — reusable Sauce programs shipped as SOURCE.
+ * @eco-incorp/sauce-sdk/recipes — reusable Sauce recipes shipped as SOURCE.
  *
  * WHAT THIS IS FOR: a partner reproduces our bytecode with the ORDINARY compiler
  * (`@eco-incorp/sauce-sdk/compiler`), not a bespoke helper. This module exists only to answer the
@@ -9,9 +9,9 @@
  *
  * ```ts
  * import { compile } from "@eco-incorp/sauce-sdk/compiler";
- * import { tokenSweepSource, SAUCE_BASE_DIRS } from "@eco-incorp/sauce-sdk/programs";
+ * import { settleSource, SAUCE_BASE_DIRS } from "@eco-incorp/sauce-sdk/recipes";
  *
- * const { bytecode } = compile(tokenSweepSource(), {
+ * const { bytecode } = compile(settleSource(), {
  *   baseDirs: SAUCE_BASE_DIRS,   // resolves the program's `./artifacts/IERC20.json` import
  *   target: "v12",               // the program is v12-only
  *   treeshake: true,
@@ -25,11 +25,11 @@
  * deliberately NOT exported as a pre-baked options object: a partner reproducing our output should
  * see the target and the arg order, not inherit them from a constant they never read.
  *
- * PREFER `tokenSweepSource()` OVER READING THE FILE YOURSELF, but both work — the raw asset is a
+ * PREFER `settleSource()` OVER READING THE FILE YOURSELF, but both work — the raw asset is a
  * real file inside the package and is reachable by subpath if you want to hash, diff, or vendor it:
  *
  * ```ts
- * const path = fileURLToPath(import.meta.resolve("@eco-incorp/sauce-sdk/programs/token-sweep.sauce.ts"));
+ * const path = fileURLToPath(import.meta.resolve("@eco-incorp/sauce-sdk/recipes/settle.sauce.ts"));
  * ```
  *
  * A bare `readFileSync("@eco-incorp/sauce-sdk/...")` does NOT work — `readFileSync` takes a
@@ -37,13 +37,18 @@
  *
  * To go the other direction — compiled bytecode back to `(tokens, minOut, recipient)` — use
  * `@eco-incorp/sauce-sdk/verify`'s `decodeSettleProgram`, whose dependency closure is `viem` only.
+ *
+ * THIS MODULE IS EVM/v12 ONLY. The SVM twin — the SVM `settle.sauce.ts`, same contract, adapted to
+ * SPL's account model — lives under the SVM subtree with the rest of the SVM SDK and is exported from
+ * `@eco-incorp/sauce-sdk/svm` (`svmSettleSource` / `svmSettleRefs`); see
+ * `sdk/src/svm/recipes/index.ts`.
  */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-/** Absolute path to the `token-sweep.sauce.ts` source inside THIS installed package. */
-export const TOKEN_SWEEP_SOURCE_PATH = join(__dirname, "token-sweep.sauce.ts");
+/** Absolute path to the `settle.sauce.ts` source inside THIS installed package. */
+export const SETTLE_SOURCE_PATH = join(__dirname, "settle.sauce.ts");
 /**
  * `baseDirs` for compiling any program in this directory.
  *
@@ -55,16 +60,16 @@ export const TOKEN_SWEEP_SOURCE_PATH = join(__dirname, "token-sweep.sauce.ts");
 export const SAUCE_BASE_DIRS = [join(__dirname, "..")];
 let cached = null;
 /**
- * The `token-sweep.sauce.ts` program text — sweep the Pot's balance of every listed token to one
+ * The `settle.sauce.ts` program text — sweep the Pot's balance of every listed token to one
  * recipient, with a minimum-output floor on `tokens[0]`. Read once and cached.
  *
  * Returned as the raw source (not pre-stripped, not pre-compiled) so a partner can read, hash, or
  * diff exactly what gets compiled. Pass `tsSource: true` so the compiler's own front-end handles
  * the TypeScript annotations.
  */
-export function tokenSweepSource() {
+export function settleSource() {
     if (cached === null)
-        cached = readFileSync(TOKEN_SWEEP_SOURCE_PATH, "utf-8");
+        cached = readFileSync(SETTLE_SOURCE_PATH, "utf-8");
     return cached;
 }
 //# sourceMappingURL=index.js.map
