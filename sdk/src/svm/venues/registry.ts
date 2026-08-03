@@ -1,4 +1,5 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
+import { aldrinLadder } from './aldrin/index.js';
 import { deriverseLadder } from './deriverse/ladder.js';
 import { meteoraDammV1Stable } from './meteora-damm-v1-stable/index.js';
 import { meteoraDammV1StableLadder } from './meteora-damm-v1-stable/ladder.js';
@@ -103,6 +104,7 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * gap this salvage pass closes.
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
+  [aldrinLadder.slug]: aldrinLadder,
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
   [raydiumAmmV4Ladder.slug]: raydiumAmmV4Ladder,
   [pumpswapLadder.slug]: pumpswapLadder,

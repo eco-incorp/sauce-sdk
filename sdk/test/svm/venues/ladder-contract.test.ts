@@ -115,6 +115,8 @@ import {
   woofiLadder,
   perpsJlpLadder,
   juplendAmmLadder,
+  aldrin,
+  aldrinLadder,
 } from '../../../src/svm/index.js';
 import type { JuplendAmmPoolConfig } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadder } from '../../../src/svm/index.js';
@@ -296,6 +298,16 @@ function juplendPositionBytes(amount: bigint, ceiling: bigint): Uint8Array {
 }
 
 const FAMILIES: Family[] = [
+  {
+    slug: 'aldrin',
+    ladder: aldrinLadder,
+    async variants() {
+      const POOL = address('4GUniSDrCAZR3sKtLa1AWC8oyYubZeKJQ8KraQmy3Wt5');
+      const fixtures = fixturesFor('aldrin');
+      const cfg = await aldrin.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
   {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
@@ -887,8 +899,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(23);
-    expect(FAMILIES).toHaveLength(23);
+    expect(registered).toHaveLength(24);
+    expect(FAMILIES).toHaveLength(24);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
