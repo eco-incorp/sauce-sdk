@@ -3,7 +3,7 @@
  *
  * This is a PINNED CONSTANT, not a re-derivation: a partner's verification is one `keccak256` and
  * a 32-byte compare against this table — no compiler, no filesystem, no recipes checkout. The
- * value below was obtained by compiling the real `ecoswap.settle.sauce.ts` template against this
+ * value below was obtained by compiling the real `token-sweep.sauce.ts` template against this
  * package's `compiler` pin and hashing the decoded body (arbitrary 1/2/3/9-token lists and
  * varying `minOut`/`recipient` all reproduce the identical 165-byte body and this identical
  * hash — the body is a function of the template and the compiler pin ONLY, never of the
@@ -45,7 +45,7 @@ export const SETTLE_TEMPLATES = Object.freeze([
         compilerSha: "f540ca693e89ea2327971d2ad7a356ba7d80df6a",
         status: "current",
         since: "2026-07",
-        notes: "ecoswap.settle.sauce.ts main(tokens, minOut, recipient) — sweeps the Pot's CURRENT balance of every " +
+        notes: "programs/token-sweep.sauce.ts main(tokens, minOut, recipient) — sweeps the Pot's CURRENT balance of every " +
             "listed token to recipient; tokens[0] is the floor token, checked BEFORE any transfer. Full-balance " +
             "sweep, level-not-delta floor — see the FULL_BALANCE_SWEEP and FLOOR_IS_LEVEL_NOT_DELTA disclosures " +
             "this package's verify report always surfaces.",

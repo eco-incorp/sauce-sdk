@@ -10,7 +10,7 @@ export interface ConformanceVector {
 }
 /**
  * Golden wire-format vectors — the Go/Solidity/Python conformance corpus. Each `program` was
- * obtained by actually compiling `ecoswap.settle.sauce.ts` with the given args (not hand-encoded),
+ * obtained by actually compiling `token-sweep.sauce.ts` with the given args (not hand-encoded),
  * so it doubles as a regression pin on the compiler's emission shape. See decode.ts's module
  * docstring for the grammar these bytes instantiate.
  *

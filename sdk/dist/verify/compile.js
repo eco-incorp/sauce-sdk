@@ -3,7 +3,7 @@
  * published?" Complements this package's `./verify` barrel (decode/authenticity/intent — "are the
  * values in this program the ones I agreed to?"): that surface reads whatever bytes a partner was
  * handed and can be run against a HOSTILE program with agreeable params; this one compiles the
- * REAL `ecoswap.settle.sauce.ts` template from source with this package's own compiler pin and
+ * REAL `token-sweep.sauce.ts` template from source with this package's own compiler pin and
  * lets a partner byte-compare the result — proving the program is OURS, which no amount of
  * decoding the bytes you were handed can prove on its own.
  *
@@ -30,12 +30,18 @@ function toHex(bytes) {
     return ("0x" + Buffer.from(bytes).toString("hex"));
 }
 let cachedSourceText = null;
-/** The real `ecoswap.settle.sauce.ts` template text, read once and cached — the same file
+/** Path to the program source, relative to this module. It lives in `programs/`, NOT beside this
+ *  file: the program is a standalone, reusable Sauce program, while `verify/` is the decoding /
+ *  authenticity surface. Resolves identically from `src` and `dist` — `sdk/{src,dist}/verify/` and
+ *  `sdk/{src,dist}/programs/` sit at the same depth, and `scripts/copy-verify-assets.mjs` copies
+ *  the asset to `dist/programs/` as part of the build. */
+const PROGRAM_SOURCE = join(__dirname, "..", "programs", "token-sweep.sauce.ts");
+/** The real `token-sweep.sauce.ts` template text, read once and cached — the same file
  *  `compileSettleProgram` compiles, exposed so a caller can display/diff/hash the SOURCE itself
  *  (full transparency), not just the compiled output. */
 export function settleSourceText() {
     if (cachedSourceText === null) {
-        cachedSourceText = readFileSync(join(__dirname, "ecoswap.settle.sauce.ts"), "utf-8");
+        cachedSourceText = readFileSync(PROGRAM_SOURCE, "utf-8");
     }
     return cachedSourceText;
 }
@@ -54,7 +60,7 @@ function stripTypes(source) {
 }
 /**
  * Compile the settle program from source — `main(tokens, minOut, recipient)` (see
- * `ecoswap.settle.sauce.ts`'s docstring): sweeps the Pot's CURRENT balance of every listed token
+ * `programs/token-sweep.sauce.ts`'s docstring): sweeps the Pot's CURRENT balance of every listed token
  * to `recipient`, enforcing `minOut` against `tokens[0]`'s balance before any transfer runs.
  * v12-only (the settle-split composition is never lowered to v1 — v1 is not the product engine).
  *
@@ -77,14 +83,15 @@ export function compileSettleProgram(tokens, minOut, recipient) {
     const tokenValues = tokens.map((t) => (typeof t === "bigint" ? t : BigInt(t)));
     const source = settleSourceText();
     const jsSource = stripTypes(source);
-    // baseDirs: this file's own directory (where ecoswap.settle.sauce.ts itself lives — not needed
-    // for its OWN resolution, but kept for parity with the recipes package's [REPO_ROOT, __dirname]
-    // shape) plus the package's `dist/artifacts/` parent, which is where the template's
-    // `./artifacts/IERC20.json` import actually resolves (`sdk/dist/artifacts/IERC20.json`, already
-    // vendored and shipped in this package's `files` whitelist).
+    // baseDirs: the program's own directory plus the package root (`sdk/dist`), which is where the
+    // template's `./artifacts/IERC20.json` import actually resolves
+    // (`sdk/dist/artifacts/IERC20.json`, already vendored and shipped in this package's `files`
+    // whitelist). The artifact resolution rides on the SECOND entry, so moving the program out of
+    // `verify/` does not change what it resolves to — but the first entry follows the program rather
+    // than this file, keeping the recipes package's [REPO_ROOT, <program dir>] shape.
     const sdkDist = join(__dirname, "..");
     const result = compileSauce(jsSource, {
-        baseDirs: [__dirname, sdkDist],
+        baseDirs: [dirname(PROGRAM_SOURCE), sdkDist],
         target: "v12",
         treeshake: true,
         args: [tokenValues, minOut, recipientValue],

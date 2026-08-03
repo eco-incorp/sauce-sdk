@@ -26,7 +26,7 @@ export interface TemplateEntry {
  *
  * This is a PINNED CONSTANT, not a re-derivation: a partner's verification is one `keccak256` and
  * a 32-byte compare against this table — no compiler, no filesystem, no recipes checkout. The
- * value below was obtained by compiling the real `ecoswap.settle.sauce.ts` template against this
+ * value below was obtained by compiling the real `token-sweep.sauce.ts` template against this
  * package's `compiler` pin and hashing the decoded body (arbitrary 1/2/3/9-token lists and
  * varying `minOut`/`recipient` all reproduce the identical 165-byte body and this identical
  * hash — the body is a function of the template and the compiler pin ONLY, never of the

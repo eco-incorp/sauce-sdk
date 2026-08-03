@@ -3,7 +3,7 @@
  * published?" Complements this package's `./verify` barrel (decode/authenticity/intent — "are the
  * values in this program the ones I agreed to?"): that surface reads whatever bytes a partner was
  * handed and can be run against a HOSTILE program with agreeable params; this one compiles the
- * REAL `ecoswap.settle.sauce.ts` template from source with this package's own compiler pin and
+ * REAL `token-sweep.sauce.ts` template from source with this package's own compiler pin and
  * lets a partner byte-compare the result — proving the program is OURS, which no amount of
  * decoding the bytes you were handed can prove on its own.
  *
@@ -14,7 +14,7 @@
  * when you need (B); the barrel alone still gives you all of (A).
  */
 import { type Hex } from "viem";
-/** The real `ecoswap.settle.sauce.ts` template text, read once and cached — the same file
+/** The real `token-sweep.sauce.ts` template text, read once and cached — the same file
  *  `compileSettleProgram` compiles, exposed so a caller can display/diff/hash the SOURCE itself
  *  (full transparency), not just the compiled output. */
 export declare function settleSourceText(): string;
@@ -27,7 +27,7 @@ export interface CompiledSettleProgram {
 }
 /**
  * Compile the settle program from source — `main(tokens, minOut, recipient)` (see
- * `ecoswap.settle.sauce.ts`'s docstring): sweeps the Pot's CURRENT balance of every listed token
+ * `programs/token-sweep.sauce.ts`'s docstring): sweeps the Pot's CURRENT balance of every listed token
  * to `recipient`, enforcing `minOut` against `tokens[0]`'s balance before any transfer runs.
  * v12-only (the settle-split composition is never lowered to v1 — v1 is not the product engine).
  *
