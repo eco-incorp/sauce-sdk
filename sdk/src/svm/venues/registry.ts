@@ -94,6 +94,13 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  * This is the one hazard the migration itself does not close — every other
  * registration point (barrel exports, self-import rewrite, dedup, dist) is
  * complete and typechecks.
+ *
+ * `hadron` (salvaged from a sauce-recipes venue PR, oracle-anchored
+ * inventory family — see `hadron/index.ts`/`hadron/ladder.ts`) is the SAME
+ * "reachable via the barrel, not yet contract-registered" shape as the 54
+ * above, for the identical reason: no LiteSVM fixture/`variants()`/
+ * `declaredCliffs` harvesting has been done for it here. Follow-up, not a
+ * gap this salvage pass closes.
  */
 const ladderAdapters: Record<string, SvmVenueLadderV2> = {
   [raydiumCpSwapLadder.slug]: raydiumCpSwapLadder,
