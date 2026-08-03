@@ -117,6 +117,39 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  raydiumLaunchlabLadder,
+  raydiumLaunchlab,
+  phoenixLadder,
+  fetchPhoenixConfig,
+  perenaStarLadder,
+  perenaStar,
+  fetchOneIntroSwapPoolConfig,
+  oneIntroSwapLadder,
+  omnipairLadder,
+  omnipair,
+  mswapPoolKey,
+  mswapLadder,
+  mswap,
+  moonitLadder,
+  moonit,
+  metadaoFutarchySpotLadder,
+  fetchMetaDaoFutarchySpotConfig,
+  mercurialLadder,
+  fetchMercurialPoolConfig,
+  lemmingsfiLadder,
+  fetchLemmingsFiPoolConfig,
+  jupiterLendEarnLadder,
+  jupiterLendEarn,
+  CARROT_VAULT_ADDRESS,
+  carrotApplyDirection,
+  carrotLadder,
+  carrot,
+  fetchByrealPoolConfig,
+  byrealLadder,
+  bonkswapLadder,
+  bonkswap,
+  fetchDenaliPoolConfig,
+  denaliLadder,
   fetchXorcaConfig,
   xorcaLadder,
   fetchVoltrConfig,
@@ -457,6 +490,216 @@ const FAMILIES: Family[] = [
       const fixtures = fixturesFor('xorca');
       const cfg = await fetchXorcaConfig(fixtureLoader(fixtures), POOL);
       return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'denali',
+    ladder: denaliLadder,
+    async variants() {
+      const POOL = address('8njE4Rq7nWX5XiQMH5sNcJy5GrHV2aFUFaZzuQUBFQZ8');
+      const fixtures = fixturesFor('denali');
+      const cfg = await fetchDenaliPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'bonkswap',
+    ladder: bonkswapLadder,
+    async variants() {
+      const POOL = address('5MMaArf3NgUjaDqYZiwYP2wbXLd8myKmmYzBzzqdfYSb');
+      const fixtures = fixturesFor('bonkswap-fork');
+      const cfg = await bonkswap.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'xToY', cfg: { ...cfg, direction: 'xToY' }, state },
+        { label: 'yToX', cfg: { ...cfg, direction: 'yToX' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'byreal',
+    ladder: byrealLadder,
+    async variants() {
+      const POOL = address('23XoPQqGw9WMsLoqTu8HMzJLD6RnXsufbKyWPLJywsCT');
+      const fixtures = fixturesFor('byreal');
+      const cfg = await fetchByrealPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: '0to1', cfg, state },
+        { label: '1to0', cfg: { ...cfg, direction: '1to0' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'carrot',
+    ladder: carrotLadder,
+    async variants() {
+      const POOL = CARROT_VAULT_ADDRESS;
+      const fixtures = fixturesFor('carrot');
+      const cfg = await carrot.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'issue:0', cfg, state },
+        { label: 'redeem:0', cfg: carrotApplyDirection(cfg, 'redeem:0'), state },
+      ];
+    },
+  },
+  {
+    slug: 'jupiter-lend-earn',
+    ladder: jupiterLendEarnLadder,
+    async variants() {
+      const POOL = address('2vVYHYM8VYnvZqQWpTJSj8o8DBf1wM8pVs3bsTgYZiqJ');
+      const fixtures = fixturesFor('jupiter-lend-earn');
+      const cfg = await jupiterLendEarn.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'deposit', cfg, state },
+        { label: 'redeem', cfg: { ...cfg, direction: 'redeem' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'lemmingsfi',
+    ladder: lemmingsfiLadder,
+    async variants() {
+      const POOL = address('AqWXTbzDG3qmAhtoSQoiVudaP5voVFcJSmCjvNS4hyzo');
+      const fixtures = fixturesFor('lemmingsfi');
+      const cfg = await fetchLemmingsFiPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'dir0', cfg, state },
+        { label: 'dir1', cfg: { ...cfg, direction: 1 }, state },
+      ];
+    },
+  },
+  {
+    slug: 'mercurial',
+    ladder: mercurialLadder,
+    async variants() {
+      const POOL = address('MAR1zHjHaQcniE2gXsDptkyKUnNfMEsLBVcfP7vLyv7');
+      const fixtures = fixturesFor('mercurial');
+      const cfg = await fetchMercurialPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'metadao-futarchy',
+    ladder: metadaoFutarchySpotLadder,
+    async variants() {
+      const POOL = address('CUPoiqkK4hxyCiJcLC4yE9AtJP1MoV1vFV2vx3jqwWeS');
+      const fixtures = fixturesFor('metadao-futarchy');
+      const cfg = await fetchMetaDaoFutarchySpotConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'buy', cfg, state },
+        { label: 'sell', cfg: { ...cfg, direction: 'sell' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'moonit',
+    ladder: moonitLadder,
+    async variants() {
+      const POOL = address('GnM6fY3hDnt6fUBrRK89xZQ5cdayvHnz6TWrnYan9Es6');
+      const fixtures = fixturesFor('moonit');
+      const cfg = await moonit.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'quoteToBase', cfg, state },
+        { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'mswap',
+    ladder: mswapLadder,
+    async variants() {
+      // mswap has no on-chain pool account — the "pool" is a synthetic
+      // discovery key registered by mswapPoolKey(inMint, outMint) (populates a
+      // module-scoped PAIR_BY_KEY the fetch then reads). This leg (WM_MINT ->
+      // EXT6_MINT, a Crank ExtGlobalV2) is the one the recipes e2e test
+      // exercises; its SwapGlobal + both ExtGlobalV2 globals + both m-vaults
+      // are all in test/svm/fixtures/mswap. min(x, cap) quote — one variant.
+      const WM_MINT = address('mzeroXDoBpRVhnEXBra27qzAMdxgpWVY3DzQW7xMVJp');
+      const EXT6_MINT = address('dawn7ZUF7h7anFuEsDdAU1Y3HYwikwqNMAENZsQJdNL');
+      const POOL = mswapPoolKey(WM_MINT, EXT6_MINT);
+      const fixtures = fixturesFor('mswap');
+      const cfg = await mswap.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'omnipair',
+    ladder: omnipairLadder,
+    async variants() {
+      const POOL = address('Cp2nGCWWfqkUmPR3pPKoR376Fti8wuYRFrSWJZq1a9SA');
+      const fixtures = fixturesFor('omnipair');
+      const cfg = await omnipair.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'one-intro-swap',
+    ladder: oneIntroSwapLadder,
+    async variants() {
+      const POOL = address('DbuvwPuLvH8uy2B1sKuu18aCd2QpCvfZdfDtdRZztBd2');
+      const fixtures = fixturesFor('one-intro-swap');
+      const cfg = await fetchOneIntroSwapPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: '0to1', cfg, state },
+        { label: '1to0', cfg: { ...cfg, direction: '1to0' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'perena-star',
+    ladder: perenaStarLadder,
+    async variants() {
+      const POOL = address('hXfEYpB5FB3ZWjGNc5C5JqLixmGdmZFyjXKJB2xFPgc');
+      const fixtures = fixturesFor('perena-star');
+      const cfg = await perenaStar.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'stake', cfg, state },
+        { label: 'unstake', cfg: { ...cfg, direction: 'unstake' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'phoenix',
+    ladder: phoenixLadder,
+    async variants() {
+      const POOL = address('4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg');
+      const fixtures = fixturesFor('phoenix');
+      const cfg = await fetchPhoenixConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'baseIn', cfg: { ...cfg, direction: 'baseIn' }, state },
+        { label: 'quoteIn', cfg: { ...cfg, direction: 'quoteIn' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'raydium-launchlab',
+    ladder: raydiumLaunchlabLadder,
+    async variants() {
+      const POOL = address('At3uPTXn5xpVfm4DehXCsm85Zzu1xktGV2vQo5TyBW2E');
+      const fixtures = fixturesFor('raydium-launchlab');
+      const cfg = await raydiumLaunchlab.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'quoteToBase', cfg, state },
+        { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state },
+      ];
     },
   },
   {
@@ -1050,8 +1293,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(34);
-    expect(FAMILIES).toHaveLength(34);
+    expect(registered).toHaveLength(49);
+    expect(FAMILIES).toHaveLength(49);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });

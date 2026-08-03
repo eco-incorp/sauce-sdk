@@ -1,5 +1,20 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { aldrinLadder } from './aldrin/index.js';
+import { raydiumLaunchlabLadder } from './raydium-launchlab/index.js';
+import { phoenixLadder } from './phoenix/index.js';
+import { perenaStarLadder } from './perena-star/index.js';
+import { oneIntroSwapLadder } from './one-intro-swap/ladder.js';
+import { omnipairLadder } from './omnipair/index.js';
+import { mswapLadder } from './mswap/index.js';
+import { moonitLadder } from './moonit/index.js';
+import { metadaoFutarchySpotLadder } from './metadao-futarchy/index.js';
+import { mercurialLadder } from './mercurial/index.js';
+import { lemmingsfiLadder } from './lemmingsfi/index.js';
+import { jupiterLendEarnLadder } from './jupiter-lend-earn/index.js';
+import { carrotLadder } from './carrot/index.js';
+import { byrealLadder } from './byreal/index.js';
+import { bonkswapLadder } from './bonkswap-fork/ladder.js';
+import { denaliLadder } from './denali/index.js';
 import { xorcaLadder } from './xorca/index.js';
 import { voltrLadder } from './voltr/index.js';
 import { virtualsLadder } from './virtuals/index.js';
@@ -115,6 +130,21 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
   [aldrinLadder.slug]: aldrinLadder,
+  [raydiumLaunchlabLadder.slug]: raydiumLaunchlabLadder,
+  [phoenixLadder.slug]: phoenixLadder,
+  [perenaStarLadder.slug]: perenaStarLadder,
+  [oneIntroSwapLadder.slug]: oneIntroSwapLadder,
+  [omnipairLadder.slug]: omnipairLadder,
+  [mswapLadder.slug]: mswapLadder,
+  [moonitLadder.slug]: moonitLadder,
+  [metadaoFutarchySpotLadder.slug]: metadaoFutarchySpotLadder,
+  [mercurialLadder.slug]: mercurialLadder,
+  [lemmingsfiLadder.slug]: lemmingsfiLadder,
+  [jupiterLendEarnLadder.slug]: jupiterLendEarnLadder,
+  [carrotLadder.slug]: carrotLadder,
+  [byrealLadder.slug]: byrealLadder,
+  [bonkswapLadder.slug]: bonkswapLadder,
+  [denaliLadder.slug]: denaliLadder,
   [xorcaLadder.slug]: xorcaLadder,
   [voltrLadder.slug]: voltrLadder,
   [virtualsLadder.slug]: virtualsLadder,
