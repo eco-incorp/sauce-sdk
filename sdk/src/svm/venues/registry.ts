@@ -1,5 +1,7 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { aldrinLadder } from './aldrin/index.js';
+import { gatorswapLadder } from './gatorswap/index.js';
+import { humidifiLadder } from './humidifi/index.js';
 import { taurusFiLadder } from './taurusfi/index.js';
 import { flintLadder } from './flint/index.js';
 import { runnerRodeoLadder } from './runner-rodeo/index.js';
@@ -164,6 +166,8 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
   [aldrinLadder.slug]: aldrinLadder,
+  [gatorswapLadder.slug]: gatorswapLadder,
+  [humidifiLadder.slug]: humidifiLadder,
   [taurusFiLadder.slug]: taurusFiLadder,
   [flintLadder.slug]: flintLadder,
   [runnerRodeoLadder.slug]: runnerRodeoLadder,

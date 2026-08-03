@@ -117,6 +117,10 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  gatorswapLadder,
+  gatorswap,
+  fetchHumidifiConfig,
+  humidifiLadder,
   taurusFiLadder,
   taurusfi,
   flintLadder,
@@ -1300,6 +1304,26 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'humidifi',
+    ladder: humidifiLadder,
+    async variants() {
+      const POOL = address('8sKQHfjNhvmAw94PhfvfMcytmqW6jmxvwieYyzXCCPu');
+      const fixtures = fixturesFor('humidifi');
+      const cfg = await fetchHumidifiConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'gatorswap',
+    ladder: gatorswapLadder,
+    async variants() {
+      const POOL = address('8RmCninssSiRZs1Do1Ug13t4toeT57hJVnvZc4EMZXMb');
+      const fixtures = fixturesFor('gatorswap');
+      const cfg = await gatorswap.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1890,8 +1914,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(83);
-    expect(FAMILIES).toHaveLength(83);
+    expect(registered).toHaveLength(85);
+    expect(FAMILIES).toHaveLength(85);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
