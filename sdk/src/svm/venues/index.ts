@@ -76,6 +76,8 @@ export * from './solfi-v2/index.js';
 export * from './solfi-v2/ladder.js';
 export * from './woofi/index.js';
 export * from './woofi/ladder.js';
+export * from './hadron/index.js';
+export * from './hadron/ladder.js';
 export * from './deriverse/index.js';
 export * from './deriverse/ladder.js';
 export * from './tesserav/index.js';
@@ -91,6 +93,7 @@ export * from './juplend-amm/index.js';
 export * from './juplend-amm/ladder.js';
 export * from './huma/index.js';
 export * from './huma/ladder.js';
+export * from './saber-decimals-wrapper/index.js';
 
 // --- migrated venue adapters (formerly sauce-recipes ecoswap/svm/venues/**) ---
 // scale-common: explicit re-export — some names collide with an existing venue's
@@ -113,6 +116,16 @@ export type { CremaBoundary, CremaWindow, CremaPoolConfig } from './crema/index.
 // generic constants/helpers; aliased with a `defituna`/`DEFITUNA` prefix.
 export { DEFITUNA_PROGRAM_ID, FUSION_POOL_ACCOUNT_SIZE, FUSION_POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR as DEFITUNA_TICK_ARRAY_DISCRIMINATOR, TICK_ARRAY_SIZE as DEFITUNA_TICK_ARRAY_SIZE, TICK_LEN_INITIALIZED, TICK_ARRAY_MIN_LEN, DEFITUNA_MAX_BOUNDARIES, defituna, defitunaLadder, defitunaWindowFor, fetchDefiTunaPoolConfig } from './defituna/index.js';
 export type { DefiTunaBoundary, DefiTunaWindow, DefiTunaPoolConfig } from './defituna/index.js';
+export {
+  FLINT_PROGRAM_ID,
+  FLINT_PAIR_REGISTRY,
+  FLINT_HAIRCUT_USDT_USDC_PPM,
+  FLINT_HAIRCUT_PUMPCMXQ_TO_USDT_PPM,
+  FLINT_HAIRCUT_USDT_TO_PUMPCMXQ_PPM,
+  flint,
+  flintLadder,
+} from './flint/index.js';
+export type { FlintPairEntry, FlintPoolConfig } from './flint/index.js';
 export { FLUXBEAM_PROGRAM_ID, FLUXBEAM_POOL_SIZE, fluxbeam, fluxbeamLadder, fetchFluxBeamPoolConfig } from './fluxbeam/index.js';
 export type { FluxBeamFeeTier, FluxBeamPoolConfig } from './fluxbeam/index.js';
 export { GAMMA_PROGRAM_ID, gamma, gammaLadder, fetchGammaPoolConfig } from './gamma/index.js';
@@ -121,6 +134,15 @@ export { GAVEL_PROGRAM_ID, GAVEL_POOL_DISCRIMINANT, GAVEL_POOL_SIZE, GAVEL_LEADE
 export type { GavelPoolConfig } from './gavel/index.js';
 export { HEAVEN_PROGRAM_ID, heaven, heavenLadder, heavenMints, heavenApplyDirection } from './heaven/index.js';
 export type { HeavenPoolConfig } from './heaven/index.js';
+export {
+  HELIUM_TREASURY_PROGRAM_ID,
+  HELIUM_CIRCUIT_BREAKER_PROGRAM_ID,
+  U64_MAX as HELIUM_TREASURY_U64_MAX,
+  heliumTreasury,
+  heliumTreasuryLadder,
+  fetchHeliumTreasuryPoolConfig,
+} from './helium-treasury/index.js';
+export type { HeliumTreasuryPoolConfig } from './helium-treasury/index.js';
 export { HUMIDIFI_PROGRAM_ID, HUMIDIFI_XOR_KEY, HUMIDIFI_AMOUNT_XOR_MASK, HUMIDIFI_POOL_REGISTRY, HUMIDIFI_SAFETY_FEE_PPM, humidifiLadder, humidifiKeystream, humidifiDeobfuscate, fetchHumidifiConfig } from './humidifi/index.js';
 export type { HumidiFiRegistryEntry, HumidiFiPoolConfig } from './humidifi/index.js';
 export { HYLO_PROGRAM_ID, USDC_MINT, HYUSD_MINT, HYLO_ACCOUNT, USDC_PAIR_ACCOUNT, USDC_COLLATERAL_VAULT, USDC_USD_PYTH_FEED, HYLO_ACCOUNT_SIZE, HYLO_DISCRIMINATOR, USDC_PAIR_ACCOUNT_SIZE, USDC_PAIR_DISCRIMINATOR, hylo, hyloLadder, hyloGate, hyloMintOut, hyloRedeemCapacity, hyloRedeemOut, SvmHyloDriftError } from './hylo/index.js';
@@ -157,6 +179,8 @@ export { PUMPFUN_BONDING_CURVE_PROGRAM_ID, PUMPFUN_BONDING_CURVE_USER_VOLUME_ACC
 export type { PumpfunBondingCurvePoolConfig } from './pumpfun-bonding-curve/index.js';
 export { RAYDIUM_LAUNCHLAB_PROGRAM_ID, raydiumLaunchlab, raydiumLaunchlabLadder } from './raydium-launchlab/index.js';
 export type { RaydiumLaunchlabPoolConfig } from './raydium-launchlab/index.js';
+export { RUNNER_RODEO_PROGRAM_ID, runnerRodeo, runnerRodeoLadder } from './runner-rodeo/index.js';
+export type { RunnerRodeoPoolConfig } from './runner-rodeo/index.js';
 export { SANCTUM_INFINITY_PROGRAM_ID, POOL_STATE_ID, LST_STATE_LIST_ID, FLAT_SLAB_PROGRAM_ID, SLAB_ID, WSOL_CALC_PROGRAM_ID, sanctumInfinity, sanctumInfinityLadder, sanctumInfinityPoolKey, __resetSanctumInfinityKeysForTest, sanctumInfinityLookupPair } from './sanctum-infinity/index.js';
 export type { SanctumInfinityLegConfig, SanctumInfinityPoolConfig } from './sanctum-infinity/index.js';
 export { SANCTUM_STAKE_POOL_PROGRAM_ID, SANCTUM_STAKE_POOL_2_PROGRAM_ID, SANCTUM_STAKE_POOL_3_PROGRAM_ID, SANCTUM_STAKE_POOL_4_PROGRAM_ID, WSOL_MINT, sanctumStakePool, sanctumStakePool2, sanctumStakePool3, sanctumStakePool4, sanctumStakePoolLadder, sanctumStakePool2Ladder, sanctumStakePool3Ladder, sanctumStakePool4Ladder } from './sanctum-stake-pool/index.js';
@@ -173,6 +197,8 @@ export type { SolayerDirection, SolayerPoolConfig } from './solayer/index.js';
 // generic constants/helpers; aliased with a `solfiV1`/`SOLFI_V1` prefix.
 export { SOLFI_V1_PROGRAM_ID, POOL_ACCOUNT_SIZE as SOLFI_V1_POOL_ACCOUNT_SIZE, OFF_MINT_A as SOLFI_V1_OFF_MINT_A, OFF_MINT_B as SOLFI_V1_OFF_MINT_B, OFF_VAULT_A as SOLFI_V1_OFF_VAULT_A, OFF_VAULT_B as SOLFI_V1_OFF_VAULT_B, SOLFI_V1_POOL_RATES, solfiV1Ladder, fetchSolfiV1Config } from './solfi-v1/index.js';
 export type { SolfiV1FloorRate, SolfiV1PoolConfig } from './solfi-v1/index.js';
+export { TAURUSFI_PROGRAM_ID, TAURUSFI_PRICE_SCALE, TAURUSFI_POOL_REGISTRY, taurusfi, taurusFiLadder, decodeTaurusFiPriceScaled, fetchTaurusFiConfig } from './taurusfi/index.js';
+export type { TaurusFiRegistryEntry, TaurusFiPoolConfig } from './taurusfi/index.js';
 // trends: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `trends`/`TRENDS` prefix.
 export { TRENDS_PROGRAM_ID, WSOL_MINT as TRENDS_WSOL_MINT, TRENDS_CONFIG_PDA, TRENDS_POOL_AUTHORITY, TRENDS_EVENT_AUTHORITY, POOL_ACCOUNT_SIZE as TRENDS_POOL_ACCOUNT_SIZE, POOL_DISCRIMINATOR as TRENDS_POOL_DISCRIMINATOR, trends, trendsLadder, fetchTrendsPoolConfig } from './trends/index.js';
@@ -223,3 +249,7 @@ export type { StabbleClmmBoundary, StabbleClmmWindow, StabbleClmmPoolConfig } fr
 // './stabble-clmm/index.js' above; not re-exported a second time here (that
 // used to double-prefix the collision alias).
 export { stabbleClmmLadder, raydiumSqrtPriceAtTick as stabbleClmmRaydiumSqrtPriceAtTick } from './stabble-clmm/ladder.js';
+export * from './one-intro-swap/index.js';
+export * from './one-intro-swap/ladder.js';
+export { WHALESTREET_PROGRAM_ID, WHALESTREET_OFF_MINT_A, WHALESTREET_OFF_VAULT_A, WHALESTREET_OFF_MINT_B, WHALESTREET_OFF_VAULT_B, WHALESTREET_IX_PREFIX, whalestreet, whalestreetLadder, fetchWhalestreetPoolConfig } from './whalestreet/index.js';
+export type { WhalestreetPoolConfig } from './whalestreet/index.js';

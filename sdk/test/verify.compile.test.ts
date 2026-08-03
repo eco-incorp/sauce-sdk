@@ -1,8 +1,8 @@
 /**
  * THE PARTNER REPRODUCIBILITY GUARD.
  *
- * We hand partners a code snippet (see `sdk/src/programs/index.ts`'s module doc) that compiles
- * `token-sweep.sauce.ts` with the ORDINARY compiler and tells them the result will be byte-identical
+ * We hand partners a code snippet (see `sdk/src/recipes/index.ts`'s module doc) that compiles
+ * `settle.sauce.ts` with the ORDINARY compiler and tells them the result will be byte-identical
  * to the program we hand them. This test IS that snippet, run for real: if the snippet stops
  * reproducing our bytes — a changed program, a compiler re-pin, a moved artifact, a different
  * default — this goes red instead of a partner discovering it.
@@ -17,16 +17,16 @@ import { readFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { keccak256 } from 'viem';
 import { compile } from '../../compiler/dist/index.js';
-import { tokenSweepSource, SAUCE_BASE_DIRS, TOKEN_SWEEP_SOURCE_PATH } from '../src/programs/index.js';
+import { settleSource, SAUCE_BASE_DIRS, SETTLE_SOURCE_PATH } from '../src/recipes/index.js';
 import { decodeSettleProgram, SETTLE_VECTORS, SETTLE_WIRE, scanMinimalPush } from '../src/verify/index.js';
 
 const TOKENS = ['0x00000000000000000000000000000000000000aa', '0x00000000000000000000000000000000000000bb'] as const;
 const MIN_OUT = 12345n;
 const RECIPIENT = '0x0000000000000000000000000000000000000022';
 
-/** THE SNIPPET — kept verbatim-equivalent to the one in `programs/index.ts`'s docstring. */
+/** THE SNIPPET — kept verbatim-equivalent to the one in `recipes/index.ts`'s docstring. */
 function partnerCompile(tokens: readonly string[], minOut: bigint, recipient: string): `0x${string}` {
-  const { bytecode } = compile(tokenSweepSource(), {
+  const { bytecode } = compile(settleSource(), {
     baseDirs: [...SAUCE_BASE_DIRS],
     target: 'v12',
     treeshake: true,
@@ -89,15 +89,15 @@ describe('partner reproducibility — the ordinary compiler reproduces our progr
 });
 
 describe('the shipped program source', () => {
-  it('tokenSweepSource() returns the exact on-disk token-sweep.sauce.ts', () => {
-    const onDisk = readFileSync(resolve(process.cwd(), 'src/programs/token-sweep.sauce.ts'), 'utf-8');
-    expect(tokenSweepSource()).toBe(onDisk);
+  it('settleSource() returns the exact on-disk settle.sauce.ts', () => {
+    const onDisk = readFileSync(resolve(process.cwd(), 'src/recipes/settle.sauce.ts'), 'utf-8');
+    expect(settleSource()).toBe(onDisk);
   });
 
   it('SAUCE_BASE_DIRS resolves the program\'s ./artifacts/IERC20.json import', () => {
     // The one entry is the dist/src ROOT, not the programs dir — that is where `./artifacts/` lives.
     expect(SAUCE_BASE_DIRS).toHaveLength(1);
     expect(readFileSync(join(SAUCE_BASE_DIRS[0]!, 'artifacts', 'IERC20.json'), 'utf-8').length).toBeGreaterThan(0);
-    expect(dirname(TOKEN_SWEEP_SOURCE_PATH)).not.toBe(SAUCE_BASE_DIRS[0]);
+    expect(dirname(SETTLE_SOURCE_PATH)).not.toBe(SAUCE_BASE_DIRS[0]);
   });
 });

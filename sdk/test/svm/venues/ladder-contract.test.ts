@@ -194,17 +194,19 @@ interface Family {
    * A REQUIRED declaration (evaluateQuoteContract's strong structural form,
    * see the file header) for any variant whose standalone cold
    * `referenceQuote` closure has a finite cliff — keyed by variant label,
-   * exact pinned (x, peak) pair. Three window-walking families
-   * (orca-whirlpool/raydium-clmm/meteora-dlmm — an exhausted tick/bin
-   * window) plus solfi-v2 (closed-form, an impact/110%-of-vault revert
-   * boundary) carry one: their LADDER-CHAIN path (referenceLadderQuotes +
+   * exact pinned (x, peak) pair. meteora-damm-v1-stable is the SOLE entry:
+   * its LADDER-CHAIN path (referenceLadderQuotes +
    * capacityInputVar/referenceCapacities — the ONLY path the merge actually
-   * evaluates a final-fill amount through) is fully capacity-safe, but the
+   * evaluates a final-fill amount through) is fully capacity-safe, but its
    * cold, standalone `referenceQuote` asked directly for an amount past the
-   * off-chain-shipped window (which the merge never does) still collapses —
+   * idle-float bound (which the merge never does) still collapses —
    * "LATENT, saved only by warm-chain saturation, not a safety property".
-   * Every other family's cold quote SATURATES (never collapses) and carries
-   * no entry.
+   * The three window-walking families (orca-whirlpool/raydium-clmm/
+   * meteora-dlmm — an exhausted tick/bin window) and solfi-v2 (closed-form,
+   * an impact/110%-of-vault revert boundary) each USED TO collapse the same
+   * way, but the five-family correctness batch fixed their cold
+   * `referenceQuote` to SATURATE, so none carries an entry now — as does
+   * every other family's cold quote.
    */
   declaredCliffs?: Record<string, DeclaredCliff>;
 }
