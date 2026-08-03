@@ -1,4 +1,20 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { scaleAmmLadder } from './scale-amm/index.js';
+import { sanctumStakePoolLadder } from './sanctum-stake-pool/index.js';
+import { sanctumInfinityLadder } from './sanctum-infinity/index.js';
+import { saberDecimalsWrapperLadder } from './saber-decimals-wrapper/index.js';
+import { stepnLadder } from './spl-token-swap-forks/ladder.js';
+import { penguinLadder } from './spl-token-swap-forks/ladder.js';
+import { orcaV1Ladder } from './spl-token-swap-forks/ladder.js';
+import { tokenSwapV1Ladder } from './spl-token-swap-forks/ladder.js';
+import { solfiV1Ladder } from './solfi-v1/index.js';
+import { solayerLadder } from './solayer/index.js';
+import { scorchLadder } from './scorch/index.js';
+import { scaleVmmLadder } from './scale-vmm/index.js';
+import { hyloStabilityPoolLadder } from './hylo-stability-pool/index.js';
+import { humaLadder } from './huma/ladder.js';
+import { heliumTreasuryLadder } from './helium-treasury/index.js';
+import { heavenLadder } from './heaven/index.js';
 import { raydiumLaunchlabLadder } from './raydium-launchlab/index.js';
 import { phoenixLadder } from './phoenix/index.js';
 import { perenaStarLadder } from './perena-star/index.js';
@@ -125,6 +141,22 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [scaleAmmLadder.slug]: scaleAmmLadder,
+    [sanctumStakePoolLadder.slug]: sanctumStakePoolLadder,
+    [sanctumInfinityLadder.slug]: sanctumInfinityLadder,
+    [saberDecimalsWrapperLadder.slug]: saberDecimalsWrapperLadder,
+    [stepnLadder.slug]: stepnLadder,
+    [penguinLadder.slug]: penguinLadder,
+    [orcaV1Ladder.slug]: orcaV1Ladder,
+    [tokenSwapV1Ladder.slug]: tokenSwapV1Ladder,
+    [solfiV1Ladder.slug]: solfiV1Ladder,
+    [solayerLadder.slug]: solayerLadder,
+    [scorchLadder.slug]: scorchLadder,
+    [scaleVmmLadder.slug]: scaleVmmLadder,
+    [hyloStabilityPoolLadder.slug]: hyloStabilityPoolLadder,
+    [humaLadder.slug]: humaLadder,
+    [heliumTreasuryLadder.slug]: heliumTreasuryLadder,
+    [heavenLadder.slug]: heavenLadder,
     [raydiumLaunchlabLadder.slug]: raydiumLaunchlabLadder,
     [phoenixLadder.slug]: phoenixLadder,
     [perenaStarLadder.slug]: perenaStarLadder,

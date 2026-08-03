@@ -117,6 +117,39 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  scaleAmmLadder,
+  scaleAmm,
+  sanctumStakePoolLadder,
+  sanctumStakePool,
+  sanctumInfinityPoolKey,
+  sanctumInfinityLadder,
+  sanctumInfinity,
+  saberDecimalsWrapperLadder,
+  saberDecimalsWrapper,
+  stepnLadder,
+  stepn,
+  penguinLadder,
+  penguin,
+  orcaV1Ladder,
+  orcaV1,
+  tokenSwapV1Ladder,
+  tokenSwapV1,
+  fetchSolfiV1Config,
+  solfiV1Ladder,
+  solayerLadder,
+  solayer,
+  scorchLadder,
+  scorch,
+  scaleVmmLadder,
+  scaleVmm,
+  hyloStabilityPoolLadder,
+  hyloStabilityPool,
+  humaLadder,
+  huma,
+  heliumTreasuryLadder,
+  heliumTreasury,
+  heavenLadder,
+  heaven,
   raydiumLaunchlabLadder,
   raydiumLaunchlab,
   phoenixLadder,
@@ -700,6 +733,211 @@ const FAMILIES: Family[] = [
         { label: 'quoteToBase', cfg, state },
         { label: 'baseToQuote', cfg: { ...cfg, direction: 'baseToQuote' }, state },
       ];
+    },
+  },
+  {
+    slug: 'heaven',
+    ladder: heavenLadder,
+    async variants() {
+      const POOL = address('EkU9zGSkUnVVK6nhmPSqnxqcKPzt1PicrCjdxSbWo9uA');
+      const fixtures = fixturesFor('heaven');
+      const cfg = await heaven.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'buy', cfg, state },
+        { label: 'sell', cfg: { ...cfg, direction: 'sell' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'helium-treasury',
+    ladder: heliumTreasuryLadder,
+    async variants() {
+      const POOL = address('Aon7sbdvCGuXQJW8BEiDDWzsSvoycTL9v3L1S4GWhxNK');
+      const fixtures = fixturesFor('helium-treasury');
+      const cfg = await heliumTreasury.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'huma',
+    ladder: humaLadder,
+    async variants() {
+      // POOL is the curated Classic-mode mode_config (NOT a fixture-file account
+      // itself). huma.fetchPoolConfig resolves the real pool_config (28hFhD21, via
+      // HUMA_CURATED_MODE_CONFIGS), pool_state, mode_mint and the underlying ATA —
+      // all present in the fixture dir. Same POOL the passing huma.test.ts uses.
+      const POOL = address('3FhoMDyKzQqxtGxnz9DfysfoGQKvgDnSFjoDGgguDCQN');
+      const fixtures = fixturesFor('huma');
+      const cfg = await huma.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'deposit', cfg, state },
+        { label: 'withdraw', cfg: { ...cfg, direction: 'withdraw' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'hylo-stability-pool',
+    ladder: hyloStabilityPoolLadder,
+    async variants() {
+      const POOL = address('2jk7miWrsTbt5hUSaCXPkEQPvuUMgbFLpgMzMQw3Z6ar');
+      const fixtures = fixturesFor('hylo-stability-pool');
+      const cfg = await hyloStabilityPool.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'deposit', cfg, state },
+        { label: 'withdraw', cfg: { ...cfg, direction: 'withdraw' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'scale-vmm',
+    ladder: scaleVmmLadder,
+    async variants() {
+      const POOL = address('9vrZeDD4MnmZyCv8hdWmYbjhYpx4nF9L5YLgHuNHvi7F');
+      const fixtures = fixturesFor('scale-vmm');
+      const cfg = await scaleVmm.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg: { ...cfg, direction: 'aToB' }, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'scorch',
+    ladder: scorchLadder,
+    async variants() {
+      const POOL = address('Ni1oTyrfCCfAF6dzK3R7BmJa1yDrracrDdPoiJXGzns');
+      const fixtures = fixturesFor('scorch');
+      const cfg = await scorch.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'AtoB', cfg, state },
+        { label: 'BtoA', cfg: { ...cfg, direction: 'BtoA' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'solayer',
+    ladder: solayerLadder,
+    async variants() {
+      const POOL = address('HBkJwH6rjUUBK1wNhBuYgo9Wnk1iCx2phduyxWCQj6uk');
+      const fixtures = fixturesFor('solayer');
+      const cfg = await solayer.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'delegate', cfg, state },
+        { label: 'undelegate', cfg: { ...cfg, direction: 'undelegate' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'solfi-v1',
+    ladder: solfiV1Ladder,
+    async variants() {
+      const POOL = address('rfynE6GWHaTkeYgXrZtF2FNMLg48VuKARogcDgeNpHX');
+      const fixtures = fixturesFor('solfi-v1');
+      const state = fixtureBytesMap(fixtures);
+      const cfg0 = await fetchSolfiV1Config(fixtureLoader(fixtures), POOL, 0);
+      const cfg1 = await fetchSolfiV1Config(fixtureLoader(fixtures), POOL, 1);
+      return [
+        { label: 'dir0', cfg: cfg0, state },
+        { label: 'dir1', cfg: cfg1, state },
+      ];
+    },
+  },
+  {
+    slug: 'token-swap-v1',
+    ladder: tokenSwapV1Ladder,
+    async variants() {
+      const POOL = address('AmHUjHKfSFP34D4VgPsviFNjWrvTN761Yazvv2eKAsSz');
+      const fixtures = fixturesFor('spl-token-swap-forks');
+      const cfg = await tokenSwapV1.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'orca-v1',
+    ladder: orcaV1Ladder,
+    async variants() {
+      const POOL = address('Hj45HZesMQD4ghdU7GuskiMyYBfxLnfibqKNgdaj8284');
+      const fixtures = fixturesFor('spl-token-swap-forks');
+      const cfg = await orcaV1.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'penguin',
+    ladder: penguinLadder,
+    async variants() {
+      const POOL = address('GfgZJgNycWxsc5K8xB6F75KDHKsR71gQXCtkhx7PPfQ5');
+      const fixtures = fixturesFor('spl-token-swap-forks');
+      const cfg = await penguin.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'stepn',
+    ladder: stepnLadder,
+    async variants() {
+      const POOL = address('5GGvkcqQ1554ibdc18JXiPqR8aJz6WV3JSNShoj32ufT');
+      const fixtures = fixturesFor('spl-token-swap-forks');
+      const cfg = await stepn.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'saber-decimals-wrapper',
+    ladder: saberDecimalsWrapperLadder,
+    async variants() {
+      const POOL = address('AnKLLfpMcceM6YXtJ9nGxYekVXqfWy8WNsMZXoQTCVQk');
+      const fixtures = fixturesFor('saber-decimals-wrapper');
+      const cfg = await saberDecimalsWrapper.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'sanctum-infinity',
+    ladder: sanctumInfinityLadder,
+    async variants() {
+      const JITOSOL = address('J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn');
+      const JUPSOL = address('jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v');
+      const WSOL = address('So11111111111111111111111111111111111111112');
+      const fixtures = fixturesFor('sanctum-infinity');
+      const load = fixtureLoader(fixtures);
+      const state = fixtureBytesMap(fixtures);
+      const [jitoToWsol, jitoToJup, wsolToJito] = await Promise.all([
+        sanctumInfinity.fetchPoolConfig(load, sanctumInfinityPoolKey(JITOSOL, WSOL)),
+        sanctumInfinity.fetchPoolConfig(load, sanctumInfinityPoolKey(JITOSOL, JUPSOL)),
+        sanctumInfinity.fetchPoolConfig(load, sanctumInfinityPoolKey(WSOL, JITOSOL)),
+      ]);
+      return [
+        { label: 'jitoToWsol', cfg: jitoToWsol, state },
+        { label: 'jitoToJup', cfg: jitoToJup, state },
+        { label: 'wsolToJito', cfg: wsolToJito, state },
+      ];
+    },
+  },
+  {
+    slug: 'sanctum-stake-pool',
+    ladder: sanctumStakePoolLadder,
+    async variants() {
+      const POOL = address('Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb');
+      const fixtures = fixturesFor('sanctum-stake-pool');
+      const cfg = await sanctumStakePool.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'scale-amm',
+    ladder: scaleAmmLadder,
+    async variants() {
+      const POOL = address('H8uPkiqryuZcs4sDiupxpy8wVvU2KqwknyeBimHmavsv');
+      const fixtures = fixturesFor('scale-amm');
+      const cfg = await scaleAmm.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
     },
   },
   {
@@ -1293,8 +1531,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(49);
-    expect(FAMILIES).toHaveLength(49);
+    expect(registered).toHaveLength(65);
+    expect(FAMILIES).toHaveLength(65);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
