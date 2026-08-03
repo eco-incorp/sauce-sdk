@@ -1,5 +1,5 @@
-/** Absolute path to the `token-sweep.sauce.ts` source inside THIS installed package. */
-export declare const TOKEN_SWEEP_SOURCE_PATH: string;
+/** Absolute path to the `settle.sauce.ts` source inside THIS installed package. */
+export declare const SETTLE_SOURCE_PATH: string;
 /**
  * `baseDirs` for compiling any program in this directory.
  *
@@ -10,12 +10,12 @@ export declare const TOKEN_SWEEP_SOURCE_PATH: string;
  */
 export declare const SAUCE_BASE_DIRS: readonly string[];
 /**
- * The `token-sweep.sauce.ts` program text — sweep the Pot's balance of every listed token to one
+ * The `settle.sauce.ts` program text — sweep the Pot's balance of every listed token to one
  * recipient, with a minimum-output floor on `tokens[0]`. Read once and cached.
  *
  * Returned as the raw source (not pre-stripped, not pre-compiled) so a partner can read, hash, or
  * diff exactly what gets compiled. Pass `tsSource: true` so the compiler's own front-end handles
  * the TypeScript annotations.
  */
-export declare function tokenSweepSource(): string;
+export declare function settleSource(): string;
 //# sourceMappingURL=index.d.ts.map
