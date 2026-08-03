@@ -39,6 +39,11 @@ export * from './quantum/index.js';
 export * from './quantum/ladder.js';
 export * from './solfi-v2/index.js';
 export * from './solfi-v2/ladder.js';
+// obsidian: explicit re-export — the pool-account offset constants collide
+// with an existing venue's generic OFF_MINT_A/OFF_MINT_B/OFF_VAULT_A/
+// OFF_VAULT_B names; aliased with an `OBSIDIAN_` prefix.
+export { OBSIDIAN_PROGRAM_ID, OFF_MINT_A as OBSIDIAN_OFF_MINT_A, OFF_MINT_B as OBSIDIAN_OFF_MINT_B, OFF_VAULT_A as OBSIDIAN_OFF_VAULT_A, OFF_VAULT_B as OBSIDIAN_OFF_VAULT_B, OFF_LAST_UPDATE_SLOT as OBSIDIAN_OFF_LAST_UPDATE_SLOT, OFF_PRICE as OBSIDIAN_OFF_PRICE, MINT_DECIMALS_OFF as OBSIDIAN_MINT_DECIMALS_OFF, MAX_STALE_SLOTS as OBSIDIAN_MAX_STALE_SLOTS, obsidian, } from './obsidian/index.js';
+export { obsidianLadder } from './obsidian/ladder.js';
 export * from './woofi/index.js';
 export * from './woofi/ladder.js';
 export * from './hadron/index.js';
