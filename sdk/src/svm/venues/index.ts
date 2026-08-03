@@ -249,6 +249,30 @@ export type { StabbleClmmBoundary, StabbleClmmWindow, StabbleClmmPoolConfig } fr
 // './stabble-clmm/index.js' above; not re-exported a second time here (that
 // used to double-prefix the collision alias).
 export { stabbleClmmLadder, raydiumSqrtPriceAtTick as stabbleClmmRaydiumSqrtPriceAtTick } from './stabble-clmm/ladder.js';
+// zerofi: explicit re-export — some names collide with an existing venue's
+// generic constants/helpers; aliased with a `ZEROFI_` prefix.
+export {
+  ZEROFI_PROGRAM_ID,
+  POOL_ACCOUNT_SIZE as ZEROFI_POOL_ACCOUNT_SIZE,
+  ORACLE_ACCOUNT_SIZE as ZEROFI_ORACLE_ACCOUNT_SIZE,
+  OFF_MINT_A as ZEROFI_OFF_MINT_A,
+  OFF_MINT_B as ZEROFI_OFF_MINT_B,
+  OFF_VAULT_A as ZEROFI_OFF_VAULT_A,
+  OFF_COMPANION_A as ZEROFI_OFF_COMPANION_A,
+  OFF_VAULT_B as ZEROFI_OFF_VAULT_B,
+  OFF_COMPANION_B as ZEROFI_OFF_COMPANION_B,
+  OFF_ORACLE as ZEROFI_OFF_ORACLE,
+  PRICE_OFFSET as ZEROFI_PRICE_OFFSET,
+  ZEROFI_SWAP_DISCRIMINATOR,
+  ZEROFI_POOL_FEE_PPM,
+  ZEROFI_POOL_AUTHORITY,
+  CAP_DIVISOR as ZEROFI_CAP_DIVISOR,
+  zerofi,
+  zerofiSwapAccounts,
+} from './zerofi/index.js';
+export type { ZeroFiPoolConfig } from './zerofi/index.js';
+export { zerofiLadder } from './zerofi/ladder.js';
+export { ieee754ScaleParams as zerofiIeee754ScaleParams } from './zerofi/ieee754.js';
 export * from './one-intro-swap/index.js';
 export * from './one-intro-swap/ladder.js';
 export { WHALESTREET_PROGRAM_ID, WHALESTREET_OFF_MINT_A, WHALESTREET_OFF_VAULT_A, WHALESTREET_OFF_MINT_B, WHALESTREET_OFF_VAULT_B, WHALESTREET_IX_PREFIX, whalestreet, whalestreetLadder, fetchWhalestreetPoolConfig } from './whalestreet/index.js';
