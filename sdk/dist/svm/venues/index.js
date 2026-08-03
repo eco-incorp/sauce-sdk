@@ -70,6 +70,7 @@ export { CREMA_PROGRAM_ID, CLMMPOOL_ACCOUNT_SIZE, CLMMPOOL_DISCRIMINATOR, TICK_A
 // defituna: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `defituna`/`DEFITUNA` prefix.
 export { DEFITUNA_PROGRAM_ID, FUSION_POOL_ACCOUNT_SIZE, FUSION_POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR as DEFITUNA_TICK_ARRAY_DISCRIMINATOR, TICK_ARRAY_SIZE as DEFITUNA_TICK_ARRAY_SIZE, TICK_LEN_INITIALIZED, TICK_ARRAY_MIN_LEN, DEFITUNA_MAX_BOUNDARIES, defituna, defitunaLadder, defitunaWindowFor, fetchDefiTunaPoolConfig } from './defituna/index.js';
+export { FLINT_PROGRAM_ID, FLINT_PAIR_REGISTRY, FLINT_HAIRCUT_USDT_USDC_PPM, FLINT_HAIRCUT_PUMPCMXQ_TO_USDT_PPM, FLINT_HAIRCUT_USDT_TO_PUMPCMXQ_PPM, flint, flintLadder, } from './flint/index.js';
 export { FLUXBEAM_PROGRAM_ID, FLUXBEAM_POOL_SIZE, fluxbeam, fluxbeamLadder, fetchFluxBeamPoolConfig } from './fluxbeam/index.js';
 export { GAMMA_PROGRAM_ID, gamma, gammaLadder, fetchGammaPoolConfig } from './gamma/index.js';
 export { GAVEL_PROGRAM_ID, GAVEL_POOL_DISCRIMINANT, GAVEL_POOL_SIZE, GAVEL_LEADER_SLOT_WINDOW, gavel, gavelLadder, fetchGavelConfig } from './gavel/index.js';
