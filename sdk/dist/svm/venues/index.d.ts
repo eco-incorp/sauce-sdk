@@ -77,6 +77,8 @@ export { GAVEL_PROGRAM_ID, GAVEL_POOL_DISCRIMINANT, GAVEL_POOL_SIZE, GAVEL_LEADE
 export type { GavelPoolConfig } from './gavel/index.js';
 export { HEAVEN_PROGRAM_ID, heaven, heavenLadder, heavenMints, heavenApplyDirection } from './heaven/index.js';
 export type { HeavenPoolConfig } from './heaven/index.js';
+export { HELIUM_TREASURY_PROGRAM_ID, HELIUM_CIRCUIT_BREAKER_PROGRAM_ID, U64_MAX as HELIUM_TREASURY_U64_MAX, heliumTreasury, heliumTreasuryLadder, fetchHeliumTreasuryPoolConfig, } from './helium-treasury/index.js';
+export type { HeliumTreasuryPoolConfig } from './helium-treasury/index.js';
 export { HUMIDIFI_PROGRAM_ID, HUMIDIFI_XOR_KEY, HUMIDIFI_AMOUNT_XOR_MASK, HUMIDIFI_POOL_REGISTRY, HUMIDIFI_SAFETY_FEE_PPM, humidifiLadder, humidifiKeystream, humidifiDeobfuscate, fetchHumidifiConfig } from './humidifi/index.js';
 export type { HumidiFiRegistryEntry, HumidiFiPoolConfig } from './humidifi/index.js';
 export { HYLO_PROGRAM_ID, USDC_MINT, HYUSD_MINT, HYLO_ACCOUNT, USDC_PAIR_ACCOUNT, USDC_COLLATERAL_VAULT, USDC_USD_PYTH_FEED, HYLO_ACCOUNT_SIZE, HYLO_DISCRIMINATOR, USDC_PAIR_ACCOUNT_SIZE, USDC_PAIR_DISCRIMINATOR, hylo, hyloLadder, hyloGate, hyloMintOut, hyloRedeemCapacity, hyloRedeemOut, SvmHyloDriftError } from './hylo/index.js';
