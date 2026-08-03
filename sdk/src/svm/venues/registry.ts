@@ -1,5 +1,9 @@
 import type { SvmVenueAdapter, SvmVenueLadder } from './types.js';
 import { aldrinLadder } from './aldrin/index.js';
+import { zerofiLadder } from './zerofi/ladder.js';
+import { obsidianLadder } from './obsidian/ladder.js';
+import { riptideLadder } from './riptide/ladder.js';
+import { pumpfunBondingCurveLadder } from './pumpfun-bonding-curve/index.js';
 import { scaleAmmLadder } from './scale-amm/index.js';
 import { sanctumStakePoolLadder } from './sanctum-stake-pool/index.js';
 import { sanctumInfinityLadder } from './sanctum-infinity/index.js';
@@ -146,6 +150,10 @@ export function venueAdapter(slug: string): SvmVenueAdapter {
  */
 const ladderAdapters: Record<string, SvmVenueLadder> = {
   [aldrinLadder.slug]: aldrinLadder,
+  [zerofiLadder.slug]: zerofiLadder,
+  [obsidianLadder.slug]: obsidianLadder,
+  [riptideLadder.slug]: riptideLadder,
+  [pumpfunBondingCurveLadder.slug]: pumpfunBondingCurveLadder,
   [scaleAmmLadder.slug]: scaleAmmLadder,
   [sanctumStakePoolLadder.slug]: sanctumStakePoolLadder,
   [sanctumInfinityLadder.slug]: sanctumInfinityLadder,

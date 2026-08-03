@@ -117,6 +117,15 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  ZEROFI_POOL_AUTHORITY,
+  zerofiLadder,
+  zerofi,
+  obsidianLadder,
+  obsidian,
+  RIPTIDE_AMOUNT_OFF,
+  fetchRiptidePoolConfig,
+  riptideLadder,
+  pumpfunBondingCurveLadder,
   scaleAmmLadder,
   scaleAmm,
   sanctumStakePoolLadder,
@@ -205,6 +214,7 @@ import {
   fluxbeamLadder,
 } from '../../../src/svm/index.js';
 import type { JuplendAmmPoolConfig } from '../../../src/svm/index.js';
+import type { PumpfunBondingCurvePoolConfig, ObsidianPoolConfig } from '../../../src/svm/index.js';
 import type { AccountBytesMap, PoolConfig, SvmVenueLadder } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 import { evaluateQuoteContract, mergeAltitudeAmounts, U64_MAX, type DeclaredCliff } from './ladder-probe.js';
@@ -941,6 +951,140 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'pumpfun-bonding-curve',
+    ladder: pumpfunBondingCurveLadder,
+    async variants() {
+      // Real, non-migrated (complete=0) mainnet bonding-curve pool.json (115
+      // bytes; virtualToken @8 / virtualQuote @16). The cfg is SYNTHETIC — the
+      // account cannot embed most fields (see the venue module header) — but the
+      // ONLY inputs referenceQuote reads are the pool bytes @8/@16 and the two
+      // fee-bps params (protocol=95 / creator=30, from the recipes golden test).
+      const POOL = address('2WvmuVq7HapKreBt9uM7ntEphk7bUCSngwA2x1bRoBpS');
+      const fixtures = fixturesFor('pumpfun-bonding-curve');
+      const state = fixtureBytesMap(fixtures);
+      const DUMMY = address('So11111111111111111111111111111111111111112');
+      const base: PumpfunBondingCurvePoolConfig = {
+        venue: 'pumpfun-bonding-curve',
+        pool: POOL,
+        direction: 'quoteToBase',
+        baseMint: DUMMY,
+        baseTokenProgram: DUMMY,
+        creator: DUMMY,
+        protocolFeeBps: 95n,
+        creatorFeeBps: 30n,
+        feeRecipient: DUMMY,
+        associatedQuoteFeeRecipient: DUMMY,
+        buybackFeeRecipient: DUMMY,
+        associatedQuoteBuybackFeeRecipient: DUMMY,
+        associatedBaseBondingCurve: DUMMY,
+        associatedQuoteBondingCurve: DUMMY,
+        creatorVault: DUMMY,
+        associatedCreatorVault: DUMMY,
+        sharingConfig: DUMMY,
+      };
+      return [
+        { label: 'quoteToBase', cfg: base, state },
+        { label: 'baseToQuote', cfg: { ...base, direction: 'baseToQuote' }, state },
+      ];
+    },
+  },
+  {
+    slug: 'riptide',
+    ladder: riptideLadder,
+    async variants() {
+      // pool.json is the real USDT/USDC pool (1024 bytes); mintA/mintB decode
+      // from it and both vaults are DERIVED ATAs (ATA(pool,mintA)/ATA(pool,mintB))
+      // with NO on-chain dump in the fixture (pool.json only), so their SPL
+      // token-account balances are synthesized (amount u64 LE @ RIPTIDE_AMOUNT_OFF)
+      // at a realistic ~0.7115 raw vault ratio (mintA->mintB) per the venue doc.
+      const POOL = address('6Vzx4ASRjUPW2yBxHdBT3hDam2zxB6UmhM2MYYM5k8ci');
+      const fixtures = fixturesFor('riptide');
+      const cfg0 = await fetchRiptidePoolConfig(fixtureLoader(fixtures), POOL, 0);
+      const cfg1 = await fetchRiptidePoolConfig(fixtureLoader(fixtures), POOL, 1);
+      const tokenAccountBytes = (amount: bigint): Uint8Array => {
+        const d = new Uint8Array(165);
+        new DataView(d.buffer).setBigUint64(RIPTIDE_AMOUNT_OFF, amount, true);
+        return d;
+      };
+      const state: AccountBytesMap = {
+        ...fixtureBytesMap(fixtures),
+        [cfg0.vaultA]: tokenAccountBytes(1_000_000_000_000n),
+        [cfg0.vaultB]: tokenAccountBytes(711_500_000_000n),
+      };
+      return [
+        { label: 'dir0', cfg: cfg0, state },
+        { label: 'dir1', cfg: cfg1, state },
+      ];
+    },
+  },
+  {
+    slug: 'obsidian',
+    ladder: obsidianLadder,
+    async variants() {
+      const POOL = address('2dyTwqYbDT2NwvCSZ55mep3Cnom1YzBqBA5Rdwn6yqTn');
+      const fixtures = fixturesFor('obsidian');
+      // The fixture clock (slot 420596659) sits 100 slots past the pool's
+      // last-update slot (420596559), inside MAX_STALE_SLOTS (600), so the
+      // freshness gate in fetchPoolConfig passes.
+      const cfg0 = await obsidian.fetchPoolConfig(fixtureLoader(fixtures), POOL, 0);
+      const cfg1: ObsidianPoolConfig = { ...cfg0, direction: 1 };
+      // Obsidian is an oracle/PMM: the mid price lives in the pool account
+      // (shipped in the fixture); the SPL vaults only cap output and report
+      // depth and are NOT shipped. Synthesize real observed mainnet balances
+      // (a real landed fill's pre-swap balances) — same approach as
+      // svm-obsidian-venue.test.ts. SPL token account: amount (u64 LE) @64.
+      const vaultBytes = (amount: bigint): Uint8Array => {
+        const d = new Uint8Array(165);
+        new DataView(d.buffer).setBigUint64(64, amount, true);
+        return d;
+      };
+      const state: AccountBytesMap = {
+        ...fixtureBytesMap(fixtures),
+        [cfg0.vaultA]: vaultBytes(29_672_685_364n), // WSOL
+        [cfg0.vaultB]: vaultBytes(1_396_639_198n), // USDC
+      };
+      return [
+        { label: 'aToB', cfg: cfg0, state },
+        { label: 'bToA', cfg: cfg1, state },
+      ];
+    },
+  },
+  {
+    slug: 'zerofi',
+    ladder: zerofiLadder,
+    async variants() {
+      const POOL = address('Et6HnPjetV8AzmxNAfzKJ6ax5VM82ZB7phY465Ns5iZW');
+      const fixtures = fixturesFor('zerofi');
+      const state = fixtureBytesMap(fixtures);
+      // This mainnet pool is not registered with ZeroFi (see the venue module
+      // doc's "ACCOUNT 8" note), so fetchPoolConfig REFUSES without a
+      // ZEROFI_POOL_AUTHORITY entry; the quote math itself is
+      // authority-independent, so seed a placeholder just to clear that gate and
+      // restore it after, exactly as zerofi.test.ts (sauce-recipes) does.
+      const FAKE_AUTHORITY = {
+        authority: address('So11111111111111111111111111111111111111112'),
+        authorityAtaA: address('So11111111111111111111111111111111111111112'),
+        authorityAtaB: address('So11111111111111111111111111111111111111112'),
+      };
+      const prior = (ZEROFI_POOL_AUTHORITY as Record<string, unknown>)[POOL];
+      (ZEROFI_POOL_AUTHORITY as Record<string, unknown>)[POOL] = FAKE_AUTHORITY;
+      try {
+        const cfg0 = await zerofi.fetchPoolConfig(fixtureLoader(fixtures), POOL, 0);
+        const cfg1 = await zerofi.fetchPoolConfig(fixtureLoader(fixtures), POOL, 1);
+        return [
+          { label: 'dir0', cfg: cfg0, state },
+          { label: 'dir1', cfg: cfg1, state },
+        ];
+      } finally {
+        if (prior === undefined) delete (ZEROFI_POOL_AUTHORITY as Record<string, unknown>)[POOL];
+        else (ZEROFI_POOL_AUTHORITY as Record<string, unknown>)[POOL] = prior;
+      }
+    },
+    // zerofi's cold referenceQuote is a saturating oracle-priced linear cap
+    // (out <= reserveOut/CAP_DIVISOR) -- shape=none, no cliff, so no
+    // declaredCliffs / capacity pair is needed.
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1531,8 +1675,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(65);
-    expect(FAMILIES).toHaveLength(65);
+    expect(registered).toHaveLength(69);
+    expect(FAMILIES).toHaveLength(69);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
