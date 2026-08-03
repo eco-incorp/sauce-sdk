@@ -64,6 +64,8 @@ export { ALDRIN_V1_PROGRAM_ID, ALDRIN_V2_PROGRAM_ID, aldrin, aldrinV2, aldrinLad
 export type { AldrinDirection, AldrinPoolConfig } from './aldrin/index.js';
 export { ALPHAQ_PROGRAM_ID, alphaqLadder, primeAlphaqStatsAccounts, __setAlphaqStatsAccountsForTest, __resetAlphaqStatsAccountsForTest, fetchAlphaqPoolConfig, __alphaqCpQuoteForTest, __alphaqDecodeSymbolForTest } from './alphaq/index.js';
 export type { AlphaqStatsRpc, AlphaqPoolConfig } from './alphaq/index.js';
+export { BOOP_FUN_PROGRAM_ID, boopFun, boopFunLadder } from './boop-fun/index.js';
+export type { BoopFunPoolConfig } from './boop-fun/index.js';
 export { BYREAL_PROGRAM_ID, byreal, byrealLadder, byrealWindowFor, fetchByrealPoolConfig } from './byreal/index.js';
 export type { ByrealPoolConfig } from './byreal/index.js';
 export { CARROT_PROGRAM_ID, CRT_MINT, CARROT_VAULT_ADDRESS, CARROT_TOKEN_2022_MINTS, CARROT_MAX_ASSETS, carrot, carrotLadder, parseCarrotDirection, carrotAllDirections, carrotGate, carrotMints, carrotApplyDirection, PYTH_RECEIVER_PROGRAM_ID, CARROT_U64_MAX } from './carrot/index.js';
