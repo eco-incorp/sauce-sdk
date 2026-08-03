@@ -55,6 +55,7 @@ export * from './juplend-amm/index.js';
 export * from './juplend-amm/ladder.js';
 export * from './huma/index.js';
 export * from './huma/ladder.js';
+export * from './saber-decimals-wrapper/index.js';
 export { TOKEN_PROGRAM as SCALE_COMMON_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, SCALE_AMM_PROGRAM_ID, SCALE_VMM_PROGRAM_ID, BUY_DISCRIMINATOR, SELL_DISCRIMINATOR, FEE_BENEFICIARY_SLOTS, CONFIG_SEED, POOL_SEED, CURVE_CONSTANT_PRODUCT, SCALE_CURVE_HELPER_NAME, SCALE_CURVE_HELPER_SOURCE, readUintLE as scaleCommonReadUintLE, pubkeyAt, readFeeBeneficiaries, ata, detectTokenProgram, computeScaleQuote, scaleDepthReserves, scaleContinuousFees, pda } from './scale-common.js';
 export type { FeeBeneficiary, ScaleDirection, ScaleCurveState } from './scale-common.js';
 export { ALDRIN_V1_PROGRAM_ID, ALDRIN_V2_PROGRAM_ID, aldrin, aldrinV2, aldrinLadder, aldrinV2Ladder } from './aldrin/index.js';
