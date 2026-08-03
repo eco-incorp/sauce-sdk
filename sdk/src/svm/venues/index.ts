@@ -270,6 +270,8 @@ export type { StabbleClmmBoundary, StabbleClmmWindow, StabbleClmmPoolConfig } fr
 // './stabble-clmm/index.js' above; not re-exported a second time here (that
 // used to double-prefix the collision alias).
 export { stabbleClmmLadder, raydiumSqrtPriceAtTick as stabbleClmmRaydiumSqrtPriceAtTick } from './stabble-clmm/ladder.js';
+export { GATORSWAP_PROGRAM_ID, gatorswap, gatorswapLadder, deriveGatorswapPool } from './gatorswap/index.js';
+export type { GatorswapPoolConfig } from './gatorswap/index.js';
 // riptide: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `riptide`/`RIPTIDE` prefix.
 export {
