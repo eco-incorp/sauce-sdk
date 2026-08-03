@@ -253,6 +253,27 @@ export type { StabbleClmmBoundary, StabbleClmmWindow, StabbleClmmPoolConfig } fr
 // './stabble-clmm/index.js' above; not re-exported a second time here (that
 // used to double-prefix the collision alias).
 export { stabbleClmmLadder, raydiumSqrtPriceAtTick as stabbleClmmRaydiumSqrtPriceAtTick } from './stabble-clmm/ladder.js';
+// riptide: explicit re-export — some names collide with an existing venue's
+// generic constants/helpers; aliased with a `riptide`/`RIPTIDE` prefix.
+export {
+  RIPTIDE_PROGRAM_ID,
+  TOKEN_PROGRAM as RIPTIDE_TOKEN_PROGRAM,
+  ATA_PROGRAM as RIPTIDE_ATA_PROGRAM,
+  MEMO_PROGRAM as RIPTIDE_MEMO_PROGRAM,
+  SYSVAR_INSTRUCTIONS as RIPTIDE_SYSVAR_INSTRUCTIONS,
+  JITODONTFRONT,
+  POOL_ACCOUNT_SIZE as RIPTIDE_POOL_ACCOUNT_SIZE,
+  OFF_MINT_A as RIPTIDE_OFF_MINT_A,
+  OFF_MINT_B as RIPTIDE_OFF_MINT_B,
+  AMOUNT_OFF as RIPTIDE_AMOUNT_OFF,
+  deriveAta as riptideDeriveAta,
+  riptideConfig,
+  fetchPoolConfig as fetchRiptidePoolConfig,
+  quoteAccounts as riptideQuoteAccounts,
+  riptide,
+} from './riptide/index.js';
+export type { RiptidePoolConfig } from './riptide/index.js';
+export { riptideLadder } from './riptide/ladder.js';
 // zerofi: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `ZEROFI_` prefix.
 export {

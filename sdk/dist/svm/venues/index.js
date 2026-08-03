@@ -150,6 +150,10 @@ export { STABBLE_CLMM_PROGRAM_ID, POOL_ACCOUNT_SIZE as STABBLE_CLMM_POOL_ACCOUNT
 // './stabble-clmm/index.js' above; not re-exported a second time here (that
 // used to double-prefix the collision alias).
 export { stabbleClmmLadder, raydiumSqrtPriceAtTick as stabbleClmmRaydiumSqrtPriceAtTick } from './stabble-clmm/ladder.js';
+// riptide: explicit re-export — some names collide with an existing venue's
+// generic constants/helpers; aliased with a `riptide`/`RIPTIDE` prefix.
+export { RIPTIDE_PROGRAM_ID, TOKEN_PROGRAM as RIPTIDE_TOKEN_PROGRAM, ATA_PROGRAM as RIPTIDE_ATA_PROGRAM, MEMO_PROGRAM as RIPTIDE_MEMO_PROGRAM, SYSVAR_INSTRUCTIONS as RIPTIDE_SYSVAR_INSTRUCTIONS, JITODONTFRONT, POOL_ACCOUNT_SIZE as RIPTIDE_POOL_ACCOUNT_SIZE, OFF_MINT_A as RIPTIDE_OFF_MINT_A, OFF_MINT_B as RIPTIDE_OFF_MINT_B, AMOUNT_OFF as RIPTIDE_AMOUNT_OFF, deriveAta as riptideDeriveAta, riptideConfig, fetchPoolConfig as fetchRiptidePoolConfig, quoteAccounts as riptideQuoteAccounts, riptide, } from './riptide/index.js';
+export { riptideLadder } from './riptide/ladder.js';
 // zerofi: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `ZEROFI_` prefix.
 export { ZEROFI_PROGRAM_ID, POOL_ACCOUNT_SIZE as ZEROFI_POOL_ACCOUNT_SIZE, ORACLE_ACCOUNT_SIZE as ZEROFI_ORACLE_ACCOUNT_SIZE, OFF_MINT_A as ZEROFI_OFF_MINT_A, OFF_MINT_B as ZEROFI_OFF_MINT_B, OFF_VAULT_A as ZEROFI_OFF_VAULT_A, OFF_COMPANION_A as ZEROFI_OFF_COMPANION_A, OFF_VAULT_B as ZEROFI_OFF_VAULT_B, OFF_COMPANION_B as ZEROFI_OFF_COMPANION_B, OFF_ORACLE as ZEROFI_OFF_ORACLE, PRICE_OFFSET as ZEROFI_PRICE_OFFSET, ZEROFI_SWAP_DISCRIMINATOR, ZEROFI_POOL_FEE_PPM, ZEROFI_POOL_AUTHORITY, CAP_DIVISOR as ZEROFI_CAP_DIVISOR, zerofi, zerofiSwapAccounts, } from './zerofi/index.js';
