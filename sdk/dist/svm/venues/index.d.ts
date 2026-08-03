@@ -73,6 +73,8 @@ export { FLUXBEAM_PROGRAM_ID, FLUXBEAM_POOL_SIZE, fluxbeam, fluxbeamLadder, fetc
 export type { FluxBeamFeeTier, FluxBeamPoolConfig } from './fluxbeam/index.js';
 export { GAMMA_PROGRAM_ID, gamma, gammaLadder, fetchGammaPoolConfig } from './gamma/index.js';
 export type { GammaPoolConfig } from './gamma/index.js';
+export { KIPSELI_PROGRAM_ID, kipseli, kipseliLadder, KIPSELI_BAN_ENTRY_REF, deriveKipseliBanEntry } from './kipseli/index.js';
+export type { KipseliPoolConfig } from './kipseli/index.js';
 export { GAVEL_PROGRAM_ID, GAVEL_POOL_DISCRIMINANT, GAVEL_POOL_SIZE, GAVEL_LEADER_SLOT_WINDOW, gavel, gavelLadder, fetchGavelConfig } from './gavel/index.js';
 export type { GavelPoolConfig } from './gavel/index.js';
 export { HEAVEN_PROGRAM_ID, heaven, heavenLadder, heavenMints, heavenApplyDirection } from './heaven/index.js';

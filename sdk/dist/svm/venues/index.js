@@ -72,6 +72,7 @@ export { CREMA_PROGRAM_ID, CLMMPOOL_ACCOUNT_SIZE, CLMMPOOL_DISCRIMINATOR, TICK_A
 export { DEFITUNA_PROGRAM_ID, FUSION_POOL_ACCOUNT_SIZE, FUSION_POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR as DEFITUNA_TICK_ARRAY_DISCRIMINATOR, TICK_ARRAY_SIZE as DEFITUNA_TICK_ARRAY_SIZE, TICK_LEN_INITIALIZED, TICK_ARRAY_MIN_LEN, DEFITUNA_MAX_BOUNDARIES, defituna, defitunaLadder, defitunaWindowFor, fetchDefiTunaPoolConfig } from './defituna/index.js';
 export { FLUXBEAM_PROGRAM_ID, FLUXBEAM_POOL_SIZE, fluxbeam, fluxbeamLadder, fetchFluxBeamPoolConfig } from './fluxbeam/index.js';
 export { GAMMA_PROGRAM_ID, gamma, gammaLadder, fetchGammaPoolConfig } from './gamma/index.js';
+export { KIPSELI_PROGRAM_ID, kipseli, kipseliLadder, KIPSELI_BAN_ENTRY_REF, deriveKipseliBanEntry } from './kipseli/index.js';
 export { GAVEL_PROGRAM_ID, GAVEL_POOL_DISCRIMINANT, GAVEL_POOL_SIZE, GAVEL_LEADER_SLOT_WINDOW, gavel, gavelLadder, fetchGavelConfig } from './gavel/index.js';
 export { HEAVEN_PROGRAM_ID, heaven, heavenLadder, heavenMints, heavenApplyDirection } from './heaven/index.js';
 export { HUMIDIFI_PROGRAM_ID, HUMIDIFI_XOR_KEY, HUMIDIFI_AMOUNT_XOR_MASK, HUMIDIFI_POOL_REGISTRY, HUMIDIFI_SAFETY_FEE_PPM, humidifiLadder, humidifiKeystream, humidifiDeobfuscate, fetchHumidifiConfig } from './humidifi/index.js';
