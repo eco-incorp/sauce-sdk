@@ -1,4 +1,8 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { sanctumStakePool3Ladder } from './sanctum-stake-pool/index.js';
+import { sanctumStakePool2Ladder } from './sanctum-stake-pool/index.js';
+import { guacswapLadder } from './bonkswap-fork/ladder.js';
+import { aldrinV2Ladder } from './aldrin/index.js';
 import { binaryfiLadder } from './binaryfi/index.js';
 import { kipseliLadder } from './kipseli/index.js';
 import { gatorswapLadder } from './gatorswap/index.js';
@@ -163,6 +167,10 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [sanctumStakePool3Ladder.slug]: sanctumStakePool3Ladder,
+    [sanctumStakePool2Ladder.slug]: sanctumStakePool2Ladder,
+    [guacswapLadder.slug]: guacswapLadder,
+    [aldrinV2Ladder.slug]: aldrinV2Ladder,
     [binaryfiLadder.slug]: binaryfiLadder,
     [kipseliLadder.slug]: kipseliLadder,
     [gatorswapLadder.slug]: gatorswapLadder,

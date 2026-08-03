@@ -117,6 +117,14 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  sanctumStakePool3Ladder,
+  sanctumStakePool3,
+  sanctumStakePool2Ladder,
+  sanctumStakePool2,
+  guacswapLadder,
+  guacswap,
+  aldrinV2Ladder,
+  aldrinV2,
   binaryfiLadder,
   binaryfi,
   kipseliLadder,
@@ -1348,6 +1356,46 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'aldrin-v2',
+    ladder: aldrinV2Ladder,
+    async variants() {
+      const POOL = address('5T5T3WHmXDZqM7E1Hi9PNCBFN33Baxvd64jdEPidmYPr');
+      const fixtures = fixturesFor('aldrin-v2');
+      const cfg = await aldrinV2.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'guacswap',
+    ladder: guacswapLadder,
+    async variants() {
+      const POOL = address('93tHLVugMrnoMaaHtvmXn8XnPR6eJhNpmCRE1KNdAVaE');
+      const fixtures = fixturesFor('guacswap');
+      const cfg = await guacswap.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'sanctum-stake-pool-2',
+    ladder: sanctumStakePool2Ladder,
+    async variants() {
+      const POOL = address('9mhGNSPArRMHpLDMSmxAvuoizBqtBGqYdT8WGuqgxNdn');
+      const fixtures = fixturesFor('sanctum-stake-pool-2');
+      const cfg = await sanctumStakePool2.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
+    slug: 'sanctum-stake-pool-3',
+    ladder: sanctumStakePool3Ladder,
+    async variants() {
+      const POOL = address('8VpRhuxa7sUUepdY3kQiTmX9rS5vx4WgaXiAnXq4KCtr');
+      const fixtures = fixturesFor('sanctum-stake-pool-3');
+      const cfg = await sanctumStakePool3.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      return [{ label: 'default', cfg, state: fixtureBytesMap(fixtures) }];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1938,8 +1986,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(87);
-    expect(FAMILIES).toHaveLength(87);
+    expect(registered).toHaveLength(91);
+    expect(FAMILIES).toHaveLength(91);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
