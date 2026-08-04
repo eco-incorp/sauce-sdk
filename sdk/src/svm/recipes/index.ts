@@ -43,9 +43,13 @@
  * `svmSettleRefs(n)` gives the AccountPlan order to resolve against. There is no
  * `decodeSvmSettleProgram` and there cannot be one: staged args are never baked into the blob, so
  * there is no prologue to parse back — `minOut`/`splCount` ride in the per-execution payload and the
- * account identities ride in the instruction's account list.
+ * account identities ride in the instruction's account list. The verification the EVM decoder does in
+ * one step is therefore split, in `@eco-incorp/sauce-sdk/svm/verify`: `verifySvmSettleProgram`
+ * recompiles this source and byte-compares the blob (proving the logic is genuine, the SVM analogue of
+ * the EVM body-hash check), and `decodeSvmSettleArgs` recovers `minOut`/`splCount`/`tokenProgram*` from
+ * the execute payload's calldata tail. The resolved account identities come from the executed
+ * instruction's account list, matched against these refs.
  */
-import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 

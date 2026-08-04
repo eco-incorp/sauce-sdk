@@ -1,3 +1,55 @@
+/**
+ * @eco-incorp/sauce-sdk/svm — the SVM `settle` recipe, shipped as SOURCE.
+ *
+ * This is the SVM twin of the EVM `settle.sauce.ts` (`@eco-incorp/sauce-sdk/recipes`): enforce a
+ * minimum-output floor on the FIRST escrow's balance, then sweep every listed escrow's whole balance
+ * to one recipient. Same contract as the EVM program, same "compiled by the ordinary compiler"
+ * delivery — a partner recompiles the exact source we ship and byte-compares. Only the VM mechanics
+ * differ: a balance is read out of an SPL token account's own data (no `balanceOf` call), and moved
+ * with an SPL `TransferChecked` CPI (no ERC20 `transfer`).
+ *
+ * ```ts
+ * import { compile } from "@eco-incorp/sauce-sdk/compiler";
+ * import { svmSettleSource } from "@eco-incorp/sauce-sdk/svm";
+ *
+ * const { bytecode, accountPlan, argsLayout } = compile(svmSettleSource(3), {
+ *   target: "svm",
+ *   staged: true,
+ *   treeshake: true,
+ *   // staged mode never bakes args into the blob; only their SHAPE matters at compile time.
+ *   args: [minOut, splCount, tokenProgram0, tokenProgram1],
+ * });
+ * // bytecode[0] is byte-identical for ANY arg values at a given escrow count.
+ * ```
+ *
+ * The shape, and why each piece differs from EVM's single loop:
+ *   - N IS A COMPILE-TIME PROPERTY. An SVM token account must be ATTACHED to the instruction and
+ *     addressed by a LITERAL index, so the source can't loop a runtime-length list the way the EVM
+ *     twin loops a heap array — the generator emits N unrolled sweeps. It returns the exact text
+ *     that gets compiled, so a partner still byte-compares source they can read.
+ *   - ONE RECIPIENT, N DESTINATIONS. The caller passes a single recipient WALLET; the SDK derives
+ *     that wallet's ATA per mint and fills the `dest_i` slots — an SPL token account holds one mint,
+ *     so N mints need N destination accounts even for one recipient. (A derivable address still has
+ *     to be attached: Solana requires every touched account in the instruction's account list.)
+ *   - `splCount` (a RUNTIME arg) groups escrows by token program: the first `splCount` sweep via
+ *     `tokenProgram0`, the rest via `tokenProgram1` — classic SPL and Token-2022 in one settle. One
+ *     staged blob per total-N serves every split. All-classic? pass `tokenProgram1 == tokenProgram0`
+ *     and Solana dedups the slot.
+ *   - `TransferChecked` (ix 12), so it is correct for Token-2022 fee mints (PYUSD et al.), not only
+ *     classic SPL. That is why each escrow also attaches its `mint_i` — TransferChecked reads
+ *     decimals from it (the program reads them on-chain, so decimals are never an argument).
+ *     Transfer-HOOK mints are out of scope; a resolver should reject one with a clear error.
+ *
+ * `svmSettleRefs(n)` gives the AccountPlan order to resolve against. There is no
+ * `decodeSvmSettleProgram` and there cannot be one: staged args are never baked into the blob, so
+ * there is no prologue to parse back — `minOut`/`splCount` ride in the per-execution payload and the
+ * account identities ride in the instruction's account list. The verification the EVM decoder does in
+ * one step is therefore split, in `@eco-incorp/sauce-sdk/svm/verify`: `verifySvmSettleProgram`
+ * recompiles this source and byte-compares the blob (proving the logic is genuine, the SVM analogue of
+ * the EVM body-hash check), and `decodeSvmSettleArgs` recovers `minOut`/`splCount`/`tokenProgram*` from
+ * the execute payload's calldata tail. The resolved account identities come from the executed
+ * instruction's account list, matched against these refs.
+ */
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));

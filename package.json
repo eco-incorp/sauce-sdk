@@ -52,6 +52,10 @@
       "types": "./sdk/dist/svm/index.d.ts",
       "default": "./sdk/dist/svm/index.js"
     },
+    "./svm/verify": {
+      "types": "./sdk/dist/svm/verify.d.ts",
+      "default": "./sdk/dist/svm/verify.js"
+    },
     "./svm/recipes/settle.sauce.ts": "./sdk/dist/svm/recipes/settle.sauce.ts",
     "./verify": {
       "types": "./sdk/dist/verify/index.d.ts",
