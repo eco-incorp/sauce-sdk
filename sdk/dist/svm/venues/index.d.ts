@@ -84,6 +84,8 @@ export { INVARIANT_PROGRAM_ID, POOL_ACCOUNT_SIZE, POOL_DISCRIMINATOR, TICK_DISCR
 export type { InvariantSwapStep, InvariantBoundary, InvariantWindow, InvariantPoolConfig } from './invariant/index.js';
 export { JUPITER_LEND_EARN_PROGRAM_ID, JUPITER_LEND_LIQUIDITY_PROGRAM_ID, LENDING_ACCOUNT_SIZE, jupiterLendEarn } from './jupiter-lend-earn/index.js';
 export type { JupiterLendEarnPoolConfig } from './jupiter-lend-earn/index.js';
+export { KIPSELI_PROGRAM_ID, kipseli, kipseliLadder, KIPSELI_BAN_ENTRY_REF, deriveKipseliBanEntry } from './kipseli/index.js';
+export type { KipseliPoolConfig } from './kipseli/index.js';
 export { LEMMINGSFI_PROGRAM_ID, LEMMINGSFI_CONFIG, STALE_AFTER_SECONDS as LEMMINGSFI_STALE_AFTER_SECONDS, lemmingsfi, lemmingsfiLadder, fetchLemmingsFiPoolConfig } from './lemmingsfi/index.js';
 export type { LemmingsFiPoolConfig } from './lemmingsfi/index.js';
 export { MERCURIAL_PROGRAM_ID, mercurial, fetchMercurialPoolConfig } from './mercurial/index.js';
