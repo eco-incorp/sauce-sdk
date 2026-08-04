@@ -1,6 +1,6 @@
 /**
  * Meteora DLMM (Liquidity Book / bin) venue — pool decoding, scope gates and
- * the prepare-declared BIN WINDOW for the EcoSwapSVM ladder fragment
+ * the prepare-declared BIN WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts). LADDER-ONLY (adapter contract v2): a DLMM quote is a bin walk
  * over a data-dependent bin-array set, so there is no v1 SvmVenueAdapter and
  * the venue is not in the v1 registry. This is the whirlpool WINDOW thesis
@@ -46,7 +46,16 @@
  * Undetermined/LiquidityMining are admitted — unmodeled orders only add output); non-classic
  * -SPL mints; a slot-typed activation with a nonzero point (no in-VM slot read);
  * a direction with no shippable liquid bins (gated by the orchestrator).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import { readUintLE } from '../math.js';
 import { MAX_BIN_ID, MIN_BIN_ID, binArrayIndex, priceFromId } from './bin-math.js';
@@ -102,10 +111,6 @@ export const OFF_BA_BINS = 56;
 export const BIN_LEN = 144;
 export const OFF_BIN_AMOUNT_X = 0;
 export const OFF_BIN_AMOUNT_Y = 8;
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function windowFor(cfg) {
-    return cfg.direction === 'xToY' ? cfg.windows.xToY : cfg.windows.yToX;
-}
 const readI32 = (data, offset) => {
     const u = Number(readUintLE(data, offset, 4));
     return u >= 0x8000_0000 ? u - 0x1_0000_0000 : u;

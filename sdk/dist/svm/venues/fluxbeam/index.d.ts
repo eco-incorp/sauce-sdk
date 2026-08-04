@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "fluxbeam";
 export declare const FLUXBEAM_PROGRAM_ID: Address<"FLUXubRmkEi2q6K3Y9kBPg9248ggaZVsoSFhtJHSrm1X">;
 /** `SwapVersion::pack` = 1-byte version tag + the 323-byte `SwapV1` body. */
@@ -43,6 +43,5 @@ export declare const fluxbeam: {
     programId: Address<"FLUXubRmkEi2q6K3Y9kBPg9248ggaZVsoSFhtJHSrm1X">;
     fetchPoolConfig: typeof fetchFluxBeamPoolConfig;
 };
-export declare const fluxbeamLadder: SvmVenueLadderV2;
 export {};
 //# sourceMappingURL=index.d.ts.map

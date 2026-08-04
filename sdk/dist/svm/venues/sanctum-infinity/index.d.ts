@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "sanctum-infinity";
 /** The S-controller ("INF") program — `SVM_VENUE_PROGRAM_IDS['sanctum-infinity']`. */
 export declare const SANCTUM_INFINITY_PROGRAM_ID: Address<"5ocnV1qiCgaQR8Jb8xWnVbApfaygJ8tNoZfgPwsgx9kx">;
@@ -50,49 +50,6 @@ export declare const sanctumInfinity: {
      */
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<SanctumInfinityPoolConfig>;
     quoteAccounts(base: PoolConfig): VenueAccount[];
-};
-export declare const sanctumInfinityLadder: {
-    slug: string;
-    /**
-     * Shape varies by which side (if either) is wSOL — a wsol leg attaches no
-     * stake-pool account and its setup emits a literal `1`/`1` sentinel pair
-     * instead of an `accountUint` read (see `emitSetup`); the shared helper
-     * (`qSanctumInfinity`) computes the plain identity from those sentinels
-     * with NO runtime branch (totalLamports==poolTokenSupply==1, feeNum==0 ⇒
-     * the general ratio math reduces to `x` exactly — see the helper source).
-     */
-    shapeKey(base: PoolConfig): string;
-    helpers(_base: PoolConfig): {
-        name: string;
-        source: string;
-    }[];
-    paramCount: number;
-    paramsFor(base: PoolConfig): bigint[];
-    quoteRefs(base: PoolConfig, slot: number): VenueAccount[];
-    emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string;
-    emitQuoteCall(_base: PoolConfig, slot: number, x: string): string;
-    /**
-     * `swapExactInV2` (disc 23) — see the module doc for the full account-
-     * order citation trail. `limit` (min_amount_out) is 1, matching every
-     * other adapter — the recipe's own outAta delta check is the real floor.
-     */
-    buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
-    /** TS mirror of `qSanctumInfinity` — see that helper for the line-for-line derivation. */
-    referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint;
-    depthReserves(base: PoolConfig, state: AccountBytesMap): {
-        reserveIn: bigint;
-        reserveOut: bigint;
-    };
-    /**
-     * Measurement-only approximation: `gammaPpm` folds the flat FlatSlab fee
-     * (nanos -> ppm) — there is no curve, so this is exact for THIS venue
-     * (unlike CP families, where the continuous-fee oracle is an
-     * approximation of a real curve).
-     */
-    continuousFees(_base: PoolConfig, _state: AccountBytesMap, params: readonly bigint[]): {
-        gammaPpm: bigint;
-        muPpm: bigint;
-    };
 };
 /** Test/tooling seam: clear the discovery-key registry between fixtures. */
 export declare function __resetSanctumInfinityKeysForTest(): void;

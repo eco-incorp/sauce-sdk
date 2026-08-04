@@ -85,7 +85,16 @@
  * MATH — see ./ladder.ts's header for the constant-product formula and the
  * ONE place it diverges from the reference SDK's own arithmetic (a rounding
  * direction, proven wrong via real-CPI at 12/12 cases).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import type { AccountLoader, PoolConfig } from '../types.js';

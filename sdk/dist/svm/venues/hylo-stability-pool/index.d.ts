@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 /** The Earn Pool program — this family's discovered-pool owner. */
 export declare const HYLO_STABILITY_POOL_PROGRAM_ID: Address<"HysTabVUfmQBFcmzu1ctRd1Y1fxd66RBpboy1bmtDSQQ">;
 /** PDA(["pool_config"], EARN_PROGRAM) — the single global pool config account. */
@@ -24,5 +24,4 @@ export declare const hyloStabilityPool: {
     programId: Address<"HysTabVUfmQBFcmzu1ctRd1Y1fxd66RBpboy1bmtDSQQ">;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<HyloStabilityPoolConfig>;
 };
-export declare const hyloStabilityPoolLadder: SvmVenueLadderV2;
 //# sourceMappingURL=index.d.ts.map

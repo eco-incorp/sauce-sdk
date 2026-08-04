@@ -1,5 +1,5 @@
 /**
- * XOrca (EcoSwapSVM ladder fragment) — Orca's liquid-staking wrapper: stake
+ * XOrca (SvmRoute ladder fragment) — Orca's liquid-staking wrapper: stake
  * ORCA into a single global vault and mint xORCA shares at the vault's live
  * ratio. No on-chain IDL is published, but the program (`orca-so/xorca` on
  * GitHub, Pinocchio + shank-generated) is open source; this adapter is a
@@ -18,9 +18,9 @@
  * `Unstake` therefore CANNOT be a Sauce venue leg: it does not deliver its
  * output atomically, only a claim redeemable in a separate transaction days
  * later. This is a STRUCTURAL fact about the program, not a permission or
- * whitelist gap — `xorcaLadder` only ever implements the `Stake` direction
+ * whitelist gap — this venue only ever supports the `Stake` direction
  * (ORCA -> xORCA); there is no `direction` field to flip (unlike every other
- * family in `FAMILIES`, which is why `ecoswap/svm/index.ts`'s `xorca` entry
+ * family in `FAMILIES`, which is why `the consuming app SVM solver entry`'s `xorca` entry
  * carries no `REVERSE_DIRECTION` entry, the same shape as `saber-stableswap`
  * and `orca-legacy-token-swap`, which are also single-direction-only).
  *
@@ -35,7 +35,7 @@
  * `XORCA_STATE_PDA` and there is no `getProgramAccounts` geometry to publish
  * (mints are hardcoded program constants, `cpi/token/mod.rs`'s `ORCA_MINT_ID`/
  * `XORCA_MINT_ID`, never stored as pool-account bytes at any offset — see
- * `ecoswap/svm/discovery.ts`'s `withXorcaStaticCandidates` for how this venue
+ * `the consuming app SVM discovery module`'s `withXorcaStaticCandidates` for how this venue
  * is discovered instead of via `SVM_FAMILY_FILTERS`).
  *
  * `solana-program/src/instructions/mod.rs`'s `Instruction` enum (Borsh,
@@ -122,7 +122,7 @@
  * historical-state replay (public RPC does not serve arbitrary historical
  * account snapshots).
  *
- * ── CU (`ecoswap/svm/budget.ts`'s `CU_FAMILIES.xorca`) ──
+ * ── CU (`the consuming app SVM CU-budget module`'s `CU_FAMILIES.xorca`) ──
  *
  * MEASURED from 3 real mainnet `Stake` transactions' own compute logs
  * (`getTransaction`, 2026-07-31) — "Program StaKE6XN...consumed N of ...
@@ -153,7 +153,6 @@ export const XORCA_PROGRAM_ID = address('StaKE6XNKVVhG8Qu9hDJBqCW3eRe7MDGLz17nJZ
 /** Hardcoded program constants (`cpi/token/mod.rs`) — never stored as pool-account bytes. */
 export const ORCA_MINT_ID = address('orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE');
 export const XORCA_MINT_ID = address('xorcaYqbXUNz3474ubUMJAdu2xgPsew3rUCe5ughT3N');
-const SPL_TOKEN_PROGRAM_ID = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 /**
  * The single global State PDA — seed `["state"]` under `XORCA_PROGRAM_ID`,
  * bump 250. The single vault ATA — seed `[statePda, tokenProgram, orcaMint]`
@@ -174,14 +173,6 @@ export const STATE_ESCROWED_OFFSET = 8;
 export const VAULT_AMOUNT_OFFSET = 64;
 /** SPL `Mint.supply`, u64 LE (4-byte COption tag + 32-byte pubkey precede it). */
 export const MINT_SUPPLY_OFFSET = 36;
-/** `util/math.rs`'s `VIRTUAL_XORCA_SUPPLY` / `VIRTUAL_NON_ESCROWED_ORCA_AMOUNT` — ported verbatim. */
-const VIRTUAL_XORCA_SUPPLY = 100n;
-const VIRTUAL_NON_ESCROWED_ORCA = 100n;
-function xorcaConfig(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-    return cfg;
-}
 /**
  * Singleton venue: `pool` must be `XORCA_STATE_PDA` (there is nothing else to
  * resolve it to). `load` re-reads the live account so a program
@@ -203,113 +194,4 @@ export async function fetchXorcaConfig(load, pool) {
     }
     return { venue: SLUG, pool, direction: 'orcaToXorca' };
 }
-const ref = (slot, role) => `s${slot}:${role}`;
-function readU64LE(data, offset) {
-    let v = 0n;
-    for (let i = 7; i >= 0; i--)
-        v = (v << 8n) | BigInt(data[offset + i]);
-    return v;
-}
-export const xorcaLadder = {
-    slug: SLUG,
-    defaultRungs: 4,
-    shapeKey(base) {
-        xorcaConfig(base); // validates venue; nothing else varies — one shape total
-        return SLUG;
-    },
-    helpers() {
-        return [
-            {
-                name: 'qXorca',
-                source: [
-                    'function qXorca(x, nonEscrowed, xorcaSupply) {',
-                    '  if (x === 0) { return 0 }',
-                    `  return Math.mulDiv(x, xorcaSupply + ${VIRTUAL_XORCA_SUPPLY}, nonEscrowed + ${VIRTUAL_NON_ESCROWED_ORCA});`,
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    paramCount: 0,
-    paramsFor() {
-        return [];
-    },
-    quoteRefs(_base, slot) {
-        return [
-            { ref: ref(slot, 'vault'), address: XORCA_VAULT_ATA },
-            { ref: ref(slot, 'xorcaMint'), address: XORCA_MINT_ID },
-            { ref: ref(slot, 'state'), address: XORCA_STATE_PDA },
-        ];
-    },
-    emitSetup(_base, slot) {
-        return [
-            `  const s${slot}vault = accountUint(${JSON.stringify(ref(slot, 'vault'))}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-            `  const s${slot}escrowed = accountUint(${JSON.stringify(ref(slot, 'state'))}, ${STATE_ESCROWED_OFFSET}, 8);`,
-            `  const s${slot}supply = accountUint(${JSON.stringify(ref(slot, 'xorcaMint'))}, ${MINT_SUPPLY_OFFSET}, 8);`,
-            `  const s${slot}rin = s${slot}vault - s${slot}escrowed;`,
-        ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-        return `qXorca(${x}, s${slot}rin, s${slot}supply)`;
-    },
-    buildSwapV2(_base, slot, user) {
-        return {
-            programId: XORCA_PROGRAM_ID,
-            prefix: Uint8Array.from([0]), // Instruction::Stake discriminator (Borsh enum tag, declaration order)
-            suffix: new Uint8Array(0), // Stake{orca_stake_amount:u64} carries nothing after the amount
-            patch: 'in',
-            accounts: [
-                { ref: user.owner, signer: true, writable: true }, // 0 staker_account
-                { ref: ref(slot, 'vault'), address: XORCA_VAULT_ATA, writable: true }, // 1 vault_account
-                { ref: user.inAta, writable: true }, // 2 staker_orca_ata
-                { ref: user.outAta, writable: true }, // 3 staker_xorca_ata
-                { ref: ref(slot, 'xorcaMint'), address: XORCA_MINT_ID, writable: true }, // 4 xorca_mint_account
-                { ref: ref(slot, 'state'), address: XORCA_STATE_PDA }, // 5 state_account (read-only)
-                { ref: ref(slot, 'orcaMint'), address: ORCA_MINT_ID }, // 6 orca_mint_account (read-only)
-                { ref: ref(slot, 'tokenProgram'), address: SPL_TOKEN_PROGRAM_ID }, // 7 token_program_account
-            ],
-        };
-    },
-    referenceQuote(_base, state) {
-        const bytes = (addr) => {
-            const data = state[addr];
-            if (data === undefined)
-                throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-            return data;
-        };
-        const vaultAmount = readU64LE(bytes(XORCA_VAULT_ATA), VAULT_AMOUNT_OFFSET);
-        const escrowed = readU64LE(bytes(XORCA_STATE_PDA), STATE_ESCROWED_OFFSET);
-        const supply = readU64LE(bytes(XORCA_MINT_ID), MINT_SUPPLY_OFFSET);
-        const nonEscrowed = vaultAmount - escrowed;
-        return (x) => {
-            if (x === 0n)
-                return 0n;
-            if (nonEscrowed === 0n || supply === 0n)
-                return x; // convert_orca_to_xorca's 1:1 bootstrap case
-            return (x * (supply + VIRTUAL_XORCA_SUPPLY)) / (nonEscrowed + VIRTUAL_NON_ESCROWED_ORCA);
-        };
-    },
-    depthReserves(_base, state) {
-        const bytes = (addr) => {
-            const data = state[addr];
-            if (data === undefined)
-                throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-            return data;
-        };
-        const vaultAmount = readU64LE(bytes(XORCA_VAULT_ATA), VAULT_AMOUNT_OFFSET);
-        const escrowed = readU64LE(bytes(XORCA_STATE_PDA), STATE_ESCROWED_OFFSET);
-        const supply = readU64LE(bytes(XORCA_MINT_ID), MINT_SUPPLY_OFFSET);
-        return { reserveIn: vaultAmount - escrowed, reserveOut: supply };
-    },
-    continuousFees() {
-        // Measurement-only oracle input (never a gate — see the SvmVenueLadderV2
-        // doc). The real curve is exactly LINEAR (no price impact at all — see
-        // file header), strictly MORE depth than any CP curve models; reporting
-        // a plain no-fee CP shape (gamma=mu=1) over the real reserves is a
-        // CONSERVATIVE stand-in (the CP form under-states this venue's depth,
-        // same documented caveat as every stable/oracle-anchored family's
-        // continuousFees), never an over-promise.
-        return { gammaPpm: 1000000n, muPpm: 1000000n };
-    },
-};
 //# sourceMappingURL=index.js.map

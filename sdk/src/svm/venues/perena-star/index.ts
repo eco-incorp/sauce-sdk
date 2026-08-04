@@ -112,7 +112,7 @@
  * ALREADY-halted pool (protocol-wide `is_halted`) so a permanently-dead
  * tranche never enters the universe at all; the direction-specific flags are
  * snapshotted onto the config and re-checked in the family's `gate` hook
- * (ecoswap/svm/index.ts) as the same belt-and-suspenders prepare-time
+ * (the consuming app SVM solver entry) as the same belt-and-suspenders prepare-time
  * shortcut every other family's activation gate uses.
  *
  * ACCOUNTS — both instructions take a SINGLE `u64` arg (`amount`/`shares`)
@@ -142,17 +142,11 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { findAssociatedTokenPda } from '@solana-program/token';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 export const PERENA_STAR_PROGRAM_ID = address('save8RQVPMWNTzU18t3GBvBkN9hT7jsGjiCQ28FpD9H');
 
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
-const ASSOCIATED_TOKEN_PROGRAM = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
-
-const STAKE_JUNIOR_DISCRIMINATOR = Uint8Array.from([6, 116, 147, 101, 38, 154, 179, 246]);
-const INSTANT_UNSTAKE_JUNIOR_DISCRIMINATOR = Uint8Array.from([187, 52, 186, 3, 166, 82, 14, 121]);
-
 const TRANCHE_STATE_DISCRIMINATOR = Uint8Array.from([212, 231, 254, 24, 238, 63, 92, 105]);
 const BANK_STATE_DISCRIMINATOR = Uint8Array.from([16, 169, 126, 99, 35, 169, 73, 200]);
 
@@ -163,26 +157,10 @@ const BANK_STATE_SIZE = 1560;
 const OFF_TRANCHE_BANK = 16; // pubkey
 const OFF_MINT = 48; // pubkey — TrancheConfig.mint (the bank mint, "senior" token)
 const OFF_SHARE_MINT = 80; // pubkey — TrancheConfig.share_mint (the junior share token)
-const OFF_EARLY_UNSTAKE_FEE_BPS = 120; // u16
-const OFF_LOW_STAKE_THRESHOLD_BPS = 124; // u16
-const OFF_LOW_STAKE_FEE_BPS = 126; // u16
-const OFF_LOW_STAKE_FEE_ENABLED = 142; // u8 (PodBool)
-const OFF_VIRTUAL_VALUE = 264; // u64 — TrancheAccounting.virtual_value
-const OFF_SHARE_PRICE = 288; // u64 — TrancheAccounting.share_price
-
 // BankState absolute byte offsets (8-byte Anchor discriminator included).
 const OFF_IS_HALTED = 152; // u8 (PodBool)
 const OFF_IS_HALTED_DEPOSIT = 153; // u8 (PodBool)
 const OFF_IS_HALTED_WITHDRAWAL = 154; // u8 (PodBool)
-const OFF_YIELDING_TVL = 192; // u64 — BankAccounting.yielding_tvl
-const OFF_BANK_MINT_PRICE = 352; // u64 — BankMint.price
-
-// SPL token account (Tokenkeg and Token-2022): amount u64 LE @64.
-const SPL_AMOUNT_OFFSET = 64;
-
-const U64_MAX = (1n << 64n) - 1n;
-const WAD = 1_000_000n; // both bankPrice and sharePrice are 6-decimal-normalized
-
 function readUintLE(data: Uint8Array, offset: number, width: number): bigint {
   if (offset + width > data.length) throw new Error('perena-star: truncated account data');
   let v = 0n;
@@ -202,11 +180,6 @@ export interface PerenaStarPoolConfig extends PoolConfig {
   isHaltedWithdrawal: boolean;
   /** 'stake' (default, bank mint in / junior shares out) | 'unstake' (junior shares in / bank mint out). */
   direction: 'stake' | 'unstake';
-}
-
-function perenaStarConfig(base: PoolConfig): PerenaStarPoolConfig {
-  if (base.venue !== 'perena-star') throw new Error(`perena-star adapter got a '${base.venue}' pool config`);
-  return base as PerenaStarPoolConfig;
 }
 
 async function fetchPerenaStarPoolConfig(load: AccountLoader, pool: Address): Promise<PerenaStarPoolConfig> {
@@ -272,280 +245,3 @@ export const perenaStar = {
   fetchPoolConfig: fetchPerenaStarPoolConfig,
 };
 
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror)
-// ---------------------------------------------------------------------------
-
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-interface LiveState {
-  sharePrice: bigint;
-  bankPrice: bigint;
-  feeBps: bigint;
-  cap: bigint;
-}
-
-function bytesOf(state: AccountBytesMap, addr: Address): Uint8Array {
-  const data = state[addr];
-  if (data === undefined) throw new Error(`perena-star ladder reference is missing account ${addr}`);
-  return data;
-}
-
-function liveState(cfg: PerenaStarPoolConfig, state: AccountBytesMap): LiveState {
-  const tranche = bytesOf(state, cfg.pool);
-  const bank = bytesOf(state, cfg.bank);
-  const sharePrice = readUintLE(tranche, OFF_SHARE_PRICE, 8);
-  const bankPrice = readUintLE(bank, OFF_BANK_MINT_PRICE, 8);
-  const isHalted = readUintLE(bank, OFF_IS_HALTED, 1) !== 0n;
-
-  if (cfg.direction === 'stake') {
-    const isHaltedDeposit = readUintLE(bank, OFF_IS_HALTED_DEPOSIT, 1) !== 0n;
-    const cap = isHalted || isHaltedDeposit || sharePrice === 0n || bankPrice === 0n ? 0n : U64_MAX;
-    return { sharePrice, bankPrice, feeBps: 0n, cap };
-  }
-
-  const isHaltedWithdrawal = readUintLE(bank, OFF_IS_HALTED_WITHDRAWAL, 1) !== 0n;
-  const virtualValue = readUintLE(tranche, OFF_VIRTUAL_VALUE, 8);
-  const yieldingTvl = readUintLE(bank, OFF_YIELDING_TVL, 8);
-  const earlyFeeBps = readUintLE(tranche, OFF_EARLY_UNSTAKE_FEE_BPS, 2);
-  const lowStakeFeeBps = readUintLE(tranche, OFF_LOW_STAKE_FEE_BPS, 2);
-  const lowStakeThresholdBps = readUintLE(tranche, OFF_LOW_STAKE_THRESHOLD_BPS, 2);
-  const lowStakeFeeEnabled = readUintLE(tranche, OFF_LOW_STAKE_FEE_ENABLED, 1) !== 0n;
-  let feeBps = earlyFeeBps;
-  if (lowStakeFeeEnabled && lowStakeThresholdBps > 0n && virtualValue * 10_000n < yieldingTvl * lowStakeThresholdBps) {
-    feeBps = lowStakeFeeBps;
-  }
-
-  if (isHalted || isHaltedWithdrawal || sharePrice === 0n || bankPrice === 0n) {
-    return { sharePrice, bankPrice, feeBps, cap: 0n };
-  }
-  const escrow = bytesOf(state, cfg.escrowAta);
-  const escrowBalance = readUintLE(escrow, SPL_AMOUNT_OFFSET, 8);
-  // Conservative capacity (see module header): fee-free upper bound on the
-  // shares the escrow can ever cover, so a fully-filled slot never asks for
-  // more than the escrow really holds.
-  const cap = (escrowBalance * bankPrice) / sharePrice;
-  return { sharePrice, bankPrice, feeBps, cap };
-}
-
-function quoteAt(cfg: PerenaStarPoolConfig, s: LiveState, x: bigint): bigint {
-  const cx = x > s.cap ? s.cap : x;
-  if (cx <= 0n) return 0n;
-  if (cfg.direction === 'stake') {
-    const value = (cx * s.bankPrice) / WAD;
-    return (value * WAD) / s.sharePrice;
-  }
-  const gross = (cx * s.sharePrice) / WAD;
-  const fee = (gross * s.feeBps) / 10_000n;
-  const net = gross - fee;
-  return (net * WAD) / s.bankPrice;
-}
-
-export const perenaStarLadder: SvmVenueLadderV2 = {
-  slug: 'perena-star',
-  // Exactly affine in x for a fixed live state (no curvature) up to the
-  // capacity clamp — a straight line loses nothing to the framework floor.
-  defaultRungs: 2,
-  shapeKey(base) {
-    return `perena-star:${perenaStarConfig(base).direction}`;
-  },
-  helpers() {
-    return [];
-  },
-  paramCount: 0,
-  paramsFor() {
-    return [];
-  },
-  quoteRefs(base, slot) {
-    const cfg = perenaStarConfig(base);
-    const refs: VenueAccount[] = [
-      { ref: ref(slot, 'tranche'), address: cfg.pool },
-      { ref: ref(slot, 'bank'), address: cfg.bank },
-    ];
-    if (cfg.direction === 'unstake') refs.push({ ref: ref(slot, 'escrow'), address: cfg.escrowAta });
-    return refs;
-  },
-  emitSetup(base, slot) {
-    const cfg = perenaStarConfig(base);
-    const p = `s${slot}`;
-    const tranche = JSON.stringify(ref(slot, 'tranche'));
-    const bank = JSON.stringify(ref(slot, 'bank'));
-    const lines = [
-      `  const ${p}sp = accountUint(${tranche}, ${OFF_SHARE_PRICE}, 8);`,
-      `  const ${p}bp = accountUint(${bank}, ${OFF_BANK_MINT_PRICE}, 8);`,
-      `  const ${p}ih = accountUint(${bank}, ${OFF_IS_HALTED}, 1);`,
-    ];
-    if (cfg.direction === 'stake') {
-      lines.push(
-        `  const ${p}ihd = accountUint(${bank}, ${OFF_IS_HALTED_DEPOSIT}, 1);`,
-        `  let ${p}cap = ${U64_MAX};`,
-        `  if (${p}sp === 0 || ${p}bp === 0) { ${p}cap = 0 }`,
-        `  if (${p}ih !== 0) { ${p}cap = 0 }`,
-        `  if (${p}ihd !== 0) { ${p}cap = 0 }`,
-      );
-    } else {
-      const escrow = JSON.stringify(ref(slot, 'escrow'));
-      lines.push(
-        `  const ${p}ihw = accountUint(${bank}, ${OFF_IS_HALTED_WITHDRAWAL}, 1);`,
-        `  const ${p}vv = accountUint(${tranche}, ${OFF_VIRTUAL_VALUE}, 8);`,
-        `  const ${p}tvl = accountUint(${bank}, ${OFF_YIELDING_TVL}, 8);`,
-        `  const ${p}efb = accountUint(${tranche}, ${OFF_EARLY_UNSTAKE_FEE_BPS}, 2);`,
-        `  const ${p}lsb = accountUint(${tranche}, ${OFF_LOW_STAKE_FEE_BPS}, 2);`,
-        `  const ${p}ltb = accountUint(${tranche}, ${OFF_LOW_STAKE_THRESHOLD_BPS}, 2);`,
-        `  const ${p}lse = accountUint(${tranche}, ${OFF_LOW_STAKE_FEE_ENABLED}, 1);`,
-        `  let ${p}fee = ${p}efb;`,
-        `  if (${p}lse !== 0 && ${p}ltb > 0) {`,
-        `    if (${p}vv * 10000 < ${p}tvl * ${p}ltb) { ${p}fee = ${p}lsb }`,
-        `  }`,
-        `  let ${p}cap = 0;`,
-        `  if (${p}sp !== 0 && ${p}bp !== 0 && ${p}ih === 0 && ${p}ihw === 0) {`,
-        `    const ${p}esc = accountUint(${escrow}, ${SPL_AMOUNT_OFFSET}, 8);`,
-        `    ${p}cap = Math.mulDiv(${p}esc, ${p}bp, ${p}sp);`,
-        `  }`,
-      );
-    }
-    lines.push(`  let ${p}cx = 0;`);
-    return lines.join('\n');
-  },
-  capacityInputVar(slot) {
-    return `s${slot}cx`;
-  },
-  emitLadderQuote(base, slot, _rung, x, outVar) {
-    const cfg = perenaStarConfig(base);
-    const p = `s${slot}`;
-    const lines = [`    ${p}cx = ${x};`, `    if (${p}cx > ${p}cap) { ${p}cx = ${p}cap }`, `    let ${outVar} = 0;`];
-    if (cfg.direction === 'stake') {
-      lines.push(
-        `    if (${p}cx > 0) {`,
-        `      const ${p}v = Math.mulDiv(${p}cx, ${p}bp, ${WAD});`,
-        `      ${outVar} = Math.mulDiv(${p}v, ${WAD}, ${p}sp);`,
-        `    }`,
-      );
-    } else {
-      lines.push(
-        `    if (${p}cx > 0) {`,
-        `      const ${p}g = Math.mulDiv(${p}cx, ${p}sp, ${WAD});`,
-        `      const ${p}f = Math.mulDiv(${p}g, ${p}fee, 10000);`,
-        `      ${outVar} = Math.mulDiv(${p}g - ${p}f, ${WAD}, ${p}bp);`,
-        `    }`,
-      );
-    }
-    return lines.join('\n');
-  },
-  emitFinalQuote(base, slot, x, outVar) {
-    const cfg = perenaStarConfig(base);
-    const p = `s${slot}`;
-    const lines = [`  let ${p}ffx = ${x};`, `  if (${p}ffx > ${p}cap) { ${p}ffx = ${p}cap }`, `  let ${outVar} = 0;`];
-    if (cfg.direction === 'stake') {
-      lines.push(
-        `  if (${p}ffx > 0) {`,
-        `    const ${p}fv = Math.mulDiv(${p}ffx, ${p}bp, ${WAD});`,
-        `    ${outVar} = Math.mulDiv(${p}fv, ${WAD}, ${p}sp);`,
-        `  }`,
-      );
-    } else {
-      lines.push(
-        `  if (${p}ffx > 0) {`,
-        `    const ${p}fg = Math.mulDiv(${p}ffx, ${p}sp, ${WAD});`,
-        `    const ${p}ff = Math.mulDiv(${p}fg, ${p}fee, 10000);`,
-        `    ${outVar} = Math.mulDiv(${p}fg - ${p}ff, ${WAD}, ${p}bp);`,
-        `  }`,
-      );
-    }
-    return lines.join('\n');
-  },
-  buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-    const cfg = perenaStarConfig(base);
-    const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-
-    if (cfg.direction === 'stake') {
-      const accounts: VenueAccount[] = [
-        { ref: user.owner, signer: true, writable: true },
-        roled('tranche', cfg.pool, true),
-        roled('bank', cfg.bank),
-        roled('bankMint', cfg.bankMint),
-        roled('juniorMint', cfg.juniorMint, true),
-        { ref: user.inAta, writable: true }, // user_bank_mint_ata
-        { ref: user.outAta, writable: true }, // user_junior_mint_ata
-        roled('escrow', cfg.escrowAta, true),
-        roled('systemProgram', SYSTEM_PROGRAM),
-        roled('tokenProgram', TOKEN_PROGRAM),
-        roled('associatedTokenProgram', ASSOCIATED_TOKEN_PROGRAM),
-      ];
-      return {
-        programId: PERENA_STAR_PROGRAM_ID,
-        prefix: STAKE_JUNIOR_DISCRIMINATOR,
-        suffix: Uint8Array.from([]),
-        patch: 'in',
-        accounts,
-      };
-    }
-
-    const accounts: VenueAccount[] = [
-      { ref: user.owner, signer: true },
-      roled('tranche', cfg.pool, true),
-      roled('bank', cfg.bank, true),
-      roled('bankMint', cfg.bankMint, true),
-      roled('targetMint', cfg.bankMint), // target_mint = bank_mint (the "plain" redemption case, no yielding-mint detour)
-      roled('juniorMint', cfg.juniorMint, true),
-      { ref: user.inAta, writable: true }, // user_junior_mint_ata
-      { ref: user.outAta, writable: true }, // owner_bank_mint_ata
-      roled('escrow', cfg.escrowAta, true),
-      roled('lockedShares', cfg.lockedSharesAta, true),
-      roled('tokenProgram', TOKEN_PROGRAM),
-      // 8 trailing optional accounts (yielding-mint conversion detour, unused
-      // here): the program's OWN id is Anchor's "None" sentinel for each —
-      // see module header's ACCOUNTS section for the live-simulated proof.
-      roled('optVaultState', PERENA_STAR_PROGRAM_ID),
-      roled('optVaultOracleState', PERENA_STAR_PROGRAM_ID),
-      roled('optVaultTeamState', PERENA_STAR_PROGRAM_ID),
-      roled('optYieldingMint', PERENA_STAR_PROGRAM_ID),
-      roled('optYieldingVaultAta', PERENA_STAR_PROGRAM_ID),
-      roled('optOwnerYieldingTa', PERENA_STAR_PROGRAM_ID),
-      roled('optVaultFeeTeamAta', PERENA_STAR_PROGRAM_ID),
-      roled('optYieldingMintProgram', PERENA_STAR_PROGRAM_ID),
-    ];
-    return {
-      programId: PERENA_STAR_PROGRAM_ID,
-      prefix: INSTANT_UNSTAKE_JUNIOR_DISCRIMINATOR,
-      suffix: Uint8Array.from([]),
-      patch: 'in',
-      accounts,
-    };
-  },
-  referenceQuote(base, state: AccountBytesMap) {
-    const cfg = perenaStarConfig(base);
-    const s = liveState(cfg, state);
-    return (x: bigint) => quoteAt(cfg, s, x);
-  },
-  referenceCapacities(base, state: AccountBytesMap) {
-    const cfg = perenaStarConfig(base);
-    const s = liveState(cfg, state);
-    return (grid: readonly bigint[]) => grid.map((g) => (g > s.cap ? s.cap : g));
-  },
-  depthReserves(base, state: AccountBytesMap) {
-    const cfg = perenaStarConfig(base);
-    const s = liveState(cfg, state);
-    if (cfg.direction === 'unstake') {
-      // Real, exact: the escrow's own live balance is the true payout capacity.
-      const escrow = bytesOf(state, cfg.escrowAta);
-      return { reserveIn: s.cap, reserveOut: readUintLE(escrow, SPL_AMOUNT_OFFSET, 8) };
-    }
-    // STAKE is genuinely uncapped pool-side — yieldingTvl (the bank's own
-    // scale) is a SIZE PROXY for relative-depth ranking, not a hard cap,
-    // same convention as sanctum-stake-pool's deposit-side depth.
-    const bank = bytesOf(state, cfg.bank);
-    const yieldingTvl = readUintLE(bank, OFF_YIELDING_TVL, 8);
-    const potentialShares = s.sharePrice > 0n ? (yieldingTvl * s.bankPrice) / s.sharePrice : 0n;
-    return { reserveIn: yieldingTvl, reserveOut: potentialShares };
-  },
-  continuousFees(base, state: AccountBytesMap) {
-    const cfg = perenaStarConfig(base);
-    const s = liveState(cfg, state);
-    if (cfg.direction === 'stake') return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };
-    let mu = 1_000_000n - s.feeBps * 100n;
-    if (mu < 0n) mu = 0n;
-    return { gammaPpm: 1_000_000n, muPpm: mu };
-  },
-};

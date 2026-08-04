@@ -102,27 +102,18 @@
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'gamma';
 export const GAMMA_PROGRAM_ID = address('GAMMA7meSFWaBXF25oSUgmGRwaW6sCMFLmBNiMSdbHVT');
-/** PDA ["vault_and_lp_mint_auth_seed"] equivalent — GAMMA's own AUTH_SEED PDA, one per program. Verified via getProgramDerivedAddress and against real swap tx account lists. */
-const AUTHORITY = address('ALfS4oPB5684XwTvCjWw7XddFfmyTNdcY7xHxbh2Ui8s');
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 
 // sha256("account:PoolState")[0..8] / sha256("account:AmmConfig")[0..8] — byte-identical to
 // raydium-cp-swap's (same Anchor account type names on the shared struct prefix).
 const POOL_STATE_DISCRIMINATOR = [0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46];
 const AMM_CONFIG_DISCRIMINATOR = [0xda, 0xf4, 0x21, 0x68, 0xcb, 0xcb, 0x2b, 0x6f];
-// sha256("global:oracle_based_swap_base_input")[0..8] — NOT swap_base_input, see module header.
-const ORACLE_SWAP_DISCRIMINATOR = [0xef, 0x52, 0xc0, 0xbb, 0xa0, 0x1a, 0xdf, 0xdf];
-
 const POOL_STATE_SIZE = 637;
 const AMM_CONFIG_SIZE = 236;
-const FEE_RATE_DENOMINATOR = 1_000_000n;
-/** DEFAULT_MAX_FEE in fees/dynamic_fee.rs — used when pool_state.max_trade_fee_rate reads 0. */
-const DEFAULT_MAX_TRADE_FEE_RATE = 100_000n;
-
 // PoolState offsets (repr(packed), declared field order — states/pool.rs).
 const POOL_OFFSETS = {
   ammConfig: 8,
@@ -160,11 +151,6 @@ export interface GammaPoolConfig extends PoolConfig {
   openTime: bigint;
   /** Swap direction: true = token_0 in, token_1 out. fetchPoolConfig defaults to true; flip for the reverse direction. */
   inputIsToken0: boolean;
-}
-
-function gammaConfig(cfg: PoolConfig): GammaPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} adapter got a '${cfg.venue}' pool config`);
-  return cfg as GammaPoolConfig;
 }
 
 /**
@@ -281,136 +267,3 @@ export const gamma = {
   fetchPoolConfig: fetchGammaPoolConfig,
 };
 
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror). Flat-fee constant-product,
-// same shape as raydium-amm-v4's ladder — the ONLY per-pool live reads are
-// the two cached vault-amount fields and the fee ceiling, all inside
-// PoolState itself (no separate vault/config account reads needed for the
-// quote — the config account is still attached for the CPI, see buildSwapV2).
-// ---------------------------------------------------------------------------
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-export const gammaLadder: SvmVenueLadderV2 = {
-  slug: SLUG,
-  shapeKey(base) {
-    const cfg = gammaConfig(base);
-    return `${SLUG}:${cfg.inputIsToken0 ? '0to1' : '1to0'}`;
-  },
-  // Fee is ceil-charged on the input (mirrors the program's ceil_div in
-  // fees/mod.rs), curve floors (constant_product.rs's checked_div). feeRate
-  // is the pool's max_trade_fee_rate ceiling — see module header for why
-  // this is a SAFE (never-favourable) stand-in for the true dynamic rate.
-  helpers() {
-    return [
-      {
-        name: 'qGamma',
-        source: [
-          'function qGamma(x, rin, rout, fee) {',
-          '  if (x === 0) { return 0 }',
-          `  const f = (x * fee + ${FEE_RATE_DENOMINATOR - 1n}) / ${FEE_RATE_DENOMINATOR};`,
-          '  if (f >= x) { return 0 }',
-          '  const net = x - f;',
-          '  return Math.mulDiv(net, rout, rin + net);',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  /** Everything is a live read — no per-trade params. */
-  paramCount: 0,
-  paramsFor(_base) {
-    return [];
-  },
-  quoteRefs(base, slot) {
-    const cfg = gammaConfig(base);
-    return [{ ref: ref(slot, 'pool'), address: cfg.pool }];
-  },
-  emitSetup(base, slot) {
-    const cfg = gammaConfig(base);
-    const pool = JSON.stringify(ref(slot, 'pool'));
-    const [inOff, outOff] = cfg.inputIsToken0
-      ? [POOL_OFFSETS.token0VaultAmount, POOL_OFFSETS.token1VaultAmount]
-      : [POOL_OFFSETS.token1VaultAmount, POOL_OFFSETS.token0VaultAmount];
-    return [
-      `  const s${slot}rin = accountUint(${pool}, ${inOff}, 8);`,
-      `  const s${slot}rout = accountUint(${pool}, ${outOff}, 8);`,
-      `  const s${slot}mfee = accountUint(${pool}, ${POOL_OFFSETS.maxTradeFeeRate}, 8);`,
-      `  let s${slot}fee = s${slot}mfee;`,
-      `  if (${`s${slot}mfee`} === 0) { s${slot}fee = ${DEFAULT_MAX_TRADE_FEE_RATE} }`,
-    ].join('\n');
-  },
-  emitQuoteCall(_base, slot, x) {
-    return `qGamma(${x}, s${slot}rin, s${slot}rout, s${slot}fee)`;
-  },
-  buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-    const cfg = gammaConfig(base);
-    const [inMint, outMint] = cfg.inputIsToken0 ? [cfg.token0Mint, cfg.token1Mint] : [cfg.token1Mint, cfg.token0Mint];
-    const [inProg, outProg] = cfg.inputIsToken0
-      ? [cfg.token0Program, cfg.token1Program]
-      : [cfg.token1Program, cfg.token0Program];
-    // oracle_based_swap_base_input: disc(8) ++ amount_in u64 LE (runtime-patched) ++
-    // minimum_amount_out u64 LE = 1 (the recipe's terminal delta check enforces the real bound).
-    const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-    return {
-      programId: GAMMA_PROGRAM_ID,
-      prefix: Uint8Array.from(ORACLE_SWAP_DISCRIMINATOR),
-      suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]),
-      patch: 'in',
-      accounts: [
-        { ref: user.owner, signer: true },
-        roled('auth', AUTHORITY),
-        roled('cfg', cfg.ammConfig),
-        roled('pool', cfg.pool, true),
-        { ref: user.inAta, writable: true },
-        { ref: user.outAta, writable: true },
-        roled('vin', cfg.inputIsToken0 ? cfg.token0Vault : cfg.token1Vault, true),
-        roled('vout', cfg.inputIsToken0 ? cfg.token1Vault : cfg.token0Vault, true),
-        roled('tpin', inProg),
-        roled('tpout', outProg),
-        roled('min', inMint),
-        roled('mout', outMint),
-        roled('obs', cfg.observation, true),
-      ],
-    };
-  },
-  referenceQuote(base, state: AccountBytesMap) {
-    const cfg = gammaConfig(base);
-    const bytes = (addr: string): Uint8Array => {
-      const data = state[addr];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const pool = bytes(cfg.pool);
-    const [inOff, outOff] = cfg.inputIsToken0
-      ? [POOL_OFFSETS.token0VaultAmount, POOL_OFFSETS.token1VaultAmount]
-      : [POOL_OFFSETS.token1VaultAmount, POOL_OFFSETS.token0VaultAmount];
-    const rin = readUintLE(pool, inOff, 8);
-    const rout = readUintLE(pool, outOff, 8);
-    const rawFee = readUintLE(pool, POOL_OFFSETS.maxTradeFeeRate, 8);
-    const feeRate = rawFee === 0n ? DEFAULT_MAX_TRADE_FEE_RATE : rawFee;
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      const fee = (x * feeRate + FEE_RATE_DENOMINATOR - 1n) / FEE_RATE_DENOMINATOR;
-      if (fee >= x) return 0n;
-      const net = x - fee;
-      return (net * rout) / (rin + net);
-    };
-  },
-  depthReserves(base, state: AccountBytesMap) {
-    const cfg = gammaConfig(base);
-    const pool = state[cfg.pool];
-    if (pool === undefined) throw new Error(`${SLUG} ladder depth is missing account ${cfg.pool}`);
-    const r0 = readUintLE(pool, POOL_OFFSETS.token0VaultAmount, 8);
-    const r1 = readUintLE(pool, POOL_OFFSETS.token1VaultAmount, 8);
-    return cfg.inputIsToken0 ? { reserveIn: r0, reserveOut: r1 } : { reserveIn: r1, reserveOut: r0 };
-  },
-  continuousFees(base, state: AccountBytesMap) {
-    const cfg = gammaConfig(base);
-    const pool = state[cfg.pool];
-    if (pool === undefined) throw new Error(`${SLUG} ladder fees are missing account ${cfg.pool}`);
-    const rawFee = readUintLE(pool, POOL_OFFSETS.maxTradeFeeRate, 8);
-    const feeRate = rawFee === 0n ? DEFAULT_MAX_TRADE_FEE_RATE : rawFee;
-    return { gammaPpm: FEE_RATE_DENOMINATOR - feeRate, muPpm: FEE_RATE_DENOMINATOR };
-  },
-};

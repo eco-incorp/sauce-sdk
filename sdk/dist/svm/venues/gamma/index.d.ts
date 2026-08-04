@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "gamma";
 export declare const GAMMA_PROGRAM_ID: Address<"GAMMA7meSFWaBXF25oSUgmGRwaW6sCMFLmBNiMSdbHVT">;
 export interface GammaPoolConfig extends PoolConfig {
@@ -27,6 +27,5 @@ export declare const gamma: {
     programId: Address<"GAMMA7meSFWaBXF25oSUgmGRwaW6sCMFLmBNiMSdbHVT">;
     fetchPoolConfig: typeof fetchGammaPoolConfig;
 };
-export declare const gammaLadder: SvmVenueLadderV2;
 export {};
 //# sourceMappingURL=index.d.ts.map

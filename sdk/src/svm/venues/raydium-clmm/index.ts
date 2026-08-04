@@ -1,6 +1,6 @@
 /**
  * Raydium CLMM (concentrated liquidity) venue — pool decoding, scope gates and
- * the prepare-declared tick-boundary WINDOW for the EcoSwapSVM ladder fragment
+ * the prepare-declared tick-boundary WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts). LADDER-ONLY (adapter contract v2): a CLMM quote is a tick walk
  * over a data-dependent account set, so there is no v1 SvmVenueAdapter and the
  * venue is not in the v1 registry. The design is the Orca-Whirlpools WINDOW
@@ -59,7 +59,16 @@
  *   but a transfer-fee mint would break the realized-delta bound);
  * - a direction with NO shipped boundaries and no edge (gated by the recipe
  *   orchestrator via windowFor).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
@@ -179,11 +188,6 @@ export interface RaydiumClmmPoolConfig extends PoolConfig {
   tickCurrentIndex: number;
   /** Direction-keyed prepare-declared windows (see the header). */
   windows: { '0to1': RaydiumClmmWindow; '1to0': RaydiumClmmWindow };
-}
-
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function windowFor(cfg: RaydiumClmmPoolConfig): RaydiumClmmWindow {
-  return cfg.direction === '0to1' ? cfg.windows['0to1'] : cfg.windows['1to0'];
 }
 
 const readI32 = (data: Uint8Array, offset: number): number => {

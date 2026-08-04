@@ -21,7 +21,7 @@
  */
 import { resolve } from 'path';
 import { address } from '@solana/kit';
-import { fetchTesseraVConfig, tesseravLadder } from '../../../src/svm/index.js';
+import { fetchTesseraVConfig } from '../../../src/svm/index.js';
 import type { TesseraVPoolConfig } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 
@@ -52,7 +52,7 @@ async function loadConfig(): Promise<{ cfg: TesseraVPoolConfig; state: ReturnTyp
   return { cfg, state: fixtureBytesMap(fixtures) };
 }
 
-describe('tesserav ladder', () => {
+describe('tesserav venue adapter', () => {
   test('fetchPoolConfig decodes the real fixture', async () => {
     const { cfg } = await loadConfig();
     expect(cfg.venue).toBe('tesserav');
@@ -66,69 +66,8 @@ describe('tesserav ladder', () => {
     await expect(fetchTesseraVConfig(fixtureLoader(fixtures), POOL, 'bToA')).rejects.toThrow(/unverified/);
   });
 
-  test('referenceQuote never exceeds the real deployed program\'s output, at every measured size', async () => {
-    const { cfg, state } = await loadConfig();
-    const quote = tesseravLadder.referenceQuote(cfg, state, tesseravLadder.paramsFor(cfg));
-    for (const [inStr, outStr] of MEASURED_A_TO_B) {
-      const x = BigInt(inStr);
-      const realOut = BigInt(outStr);
-      const modelOut = quote(x);
-      expect(modelOut <= realOut).toBe(true);
-      // The haircut is 20 bps (SAFETY_NUM/SAFETY_DEN = 998/1000): the model
-      // should track the real venue closely, not just trivially undershoot.
-      // Loose bound (50 bps) to stay robust to the mid/price drifting between
-      // this fixture's capture and any future re-capture of the SAME pool.
-      const shortfallBps = ((realOut - modelOut) * 10_000n) / realOut;
-      expect(shortfallBps <= 50n).toBe(true);
-    }
-  });
-
-  test('quote(0) === 0 and the quote is nondecreasing (the merge-solver premise)', async () => {
-    const { cfg, state } = await loadConfig();
-    const quote = tesseravLadder.referenceQuote(cfg, state, tesseravLadder.paramsFor(cfg));
-    expect(quote(0n)).toBe(0n);
-    let prevOut = 0n;
-    let prevX = 0n;
-    for (const [inStr] of MEASURED_A_TO_B) {
-      const x = BigInt(inStr);
-      const out = quote(x);
-      expect(out >= prevOut).toBe(true);
-      expect(x > prevX).toBe(true);
-      prevOut = out;
-      prevX = x;
-    }
-  });
-
-  test('capacity clamp saturates rather than reverting far past level-0', async () => {
-    const { cfg, state } = await loadConfig();
-    const params = tesseravLadder.paramsFor(cfg);
-    const quote = tesseravLadder.referenceQuote(cfg, state, params);
-    const { reserveIn } = tesseravLadder.depthReserves(cfg, state);
-    const past = reserveIn * 1000n + 1n;
-    const atCap = quote(reserveIn);
-    const pastCap = quote(past);
-    expect(pastCap).toBe(atCap); // saturates — never a cliff/collapse.
-  });
-
-  test('referenceCapacities mirrors the capacity clamp over an ordered grid', async () => {
-    const { cfg, state } = await loadConfig();
-    const params = tesseravLadder.paramsFor(cfg);
-    const { reserveIn } = tesseravLadder.depthReserves(cfg, state);
-    const grid = [reserveIn / 4n, reserveIn / 2n, reserveIn, reserveIn * 2n, reserveIn * 1000n];
-    const caps = tesseravLadder.referenceCapacities!(cfg, state, params)(grid);
-    expect(caps[0]).toBeLessThanOrEqual(reserveIn);
-    expect(caps[caps.length - 1]).toBe(reserveIn);
-    for (let i = 1; i < caps.length; i++) expect(caps[i] >= caps[i - 1]).toBe(true);
-  });
-
-  test('shapeKey is direction-scoped; rungs ride the CP default (the flat-rate model is exact at any rung count)', async () => {
-    const { cfg } = await loadConfig();
-    expect(tesseravLadder.shapeKey(cfg)).toBe('tesserav:aToB');
-    expect(tesseravLadder.defaultRungs).toBeUndefined();
-  });
-
   test('the real per-CPI CU this pass measured stays under the CU_FAMILIES budget the recipe wires (documentation pin, not a live measurement)', () => {
-    // See recipes/ecoswap/svm/budget.ts's tesserav entry — it must exceed this.
+    // See the consuming app SVM CU-budget module's tesserav entry — it must exceed this.
     expect(MEASURED_CU_MAX).toBeLessThan(70_000);
   });
 });

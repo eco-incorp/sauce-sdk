@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG: "pumpfun-bonding-curve";
 export declare const PUMPFUN_BONDING_CURVE_PROGRAM_ID: Address;
 export interface PumpfunBondingCurvePoolConfig extends PoolConfig {
@@ -44,11 +44,10 @@ export declare const pumpfunBondingCurve: {
      * `pool` is the bonding-curve PDA (owner-verified against
      * PUMPFUN_BONDING_CURVE_PROGRAM_ID by the generic discovery/compile-path safety
      * net); `mint` is REQUIRED (see the module header on why the account can't embed
-     * it) — `ecoswap/svm/index.ts`'s FAMILIES entry enforces its presence and throws
+     * it) — `the consuming app SVM solver entry`'s FAMILIES entry enforces its presence and throws
      * a named error if a caller omits it.
      */
     fetchPoolConfig(load: AccountLoader, pool: Address, mint: Address): Promise<PumpfunBondingCurvePoolConfig>;
 };
-export declare const pumpfunBondingCurveLadder: SvmVenueLadderV2;
 export {};
 //# sourceMappingURL=index.d.ts.map

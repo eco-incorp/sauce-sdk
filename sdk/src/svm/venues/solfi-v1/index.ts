@@ -1,5 +1,5 @@
 /**
- * SolFi V1 (EcoSwapSVM ladder fragment) — a from-scratch binary
+ * SolFi V1 (SvmRoute ladder fragment) — a from-scratch binary
  * reverse-engineering of the v1 sibling of `solfi-v2` (`sdk`'s
  * `svm/venues/solfi-v2`, imported here as `solfiV2`). The SDK ships no
  * `solfi-v1` ladder; this module is local, not a port.
@@ -81,7 +81,7 @@
  * `SOLFI_V1_POOL_RATES` below. Extend by repeating the LiteSVM sweep
  * documented in `docs/solfi-v1-evidence.md` against a new pool.
  *
- * ── CU (`ecoswap/svm/budget.ts`'s `CU_FAMILIES['solfi-v1']`) ──
+ * ── CU (`the consuming app SVM CU-budget module`'s `CU_FAMILIES['solfi-v1']`) ──
  *
  * MEASURED, not modeled: the REAL program invoked directly in LiteSVM
  * (program dumped from the deployed ProgramData, no engine wrapper)
@@ -95,16 +95,13 @@
  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'solfi-v1';
 
 export const SOLFI_V1_PROGRAM_ID: Address<'SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe'> = address(
   'SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe',
 );
-
-const TOKEN_PROGRAM: Address = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const INSTRUCTIONS_SYSVAR: Address = address('Sysvar1nstructions1111111111111111111111111');
 
 export const POOL_ACCOUNT_SIZE = 2800;
 
@@ -113,8 +110,6 @@ export const OFF_MINT_A = 2664;
 export const OFF_MINT_B = 2696;
 export const OFF_VAULT_A = 2736;
 export const OFF_VAULT_B = 2768;
-const VAULT_AMOUNT_OFFSET = 64;
-
 /**
  * The verified conservative floor rate for a pool + direction: real realized
  * output is >= (num/den)·amountIn at every sampled size (see the module doc
@@ -160,11 +155,6 @@ export interface SolfiV1PoolConfig extends PoolConfig {
   rate1: SolfiV1FloorRate;
 }
 
-function solfiV1Config(cfg: PoolConfig): SolfiV1PoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-  return cfg as SolfiV1PoolConfig;
-}
-
 const ADDRESS_CODEC = getAddressCodec();
 
 /**
@@ -183,7 +173,7 @@ export async function fetchSolfiV1Config(load: AccountLoader, pool: Address, dir
   if (rates === undefined) {
     throw new Error(
       `${SLUG}: pool ${pool} has no independently-verified floor rate (SOLFI_V1_POOL_RATES) — ` +
-        'a sibling pool\'s fit is never borrowed; see ecoswap/svm/venues/solfi-v1.ts for how to add one',
+        'a sibling pool\'s fit is never borrowed; see the consuming app solfi-v1 venue module for how to add one',
     );
   }
   const pubkeyAt = (offset: number): Address => ADDRESS_CODEC.decode(data.subarray(offset, offset + 32));
@@ -200,111 +190,3 @@ export async function fetchSolfiV1Config(load: AccountLoader, pool: Address, dir
   };
 }
 
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-export const solfiV1Ladder: SvmVenueLadderV2 = {
-  slug: SLUG,
-  defaultRungs: 4,
-  shapeKey(base: PoolConfig): string {
-    const cfg = solfiV1Config(base);
-    return `${SLUG}:${cfg.direction}`;
-  },
-  helpers() {
-    return [
-      {
-        name: 'qSolfiV1',
-        source: [
-          'function qSolfiV1(x, rateNum, rateDen, outBal) {',
-          '  if (x === 0) { return 0 }',
-          '  const raw = Math.mulDiv(x, rateNum, rateDen);',
-          '  let out = raw;',
-          '  if (raw > outBal) { out = outBal }',
-          '  return out;',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  paramCount: 2,
-  paramsFor(base: PoolConfig): bigint[] {
-    const cfg = solfiV1Config(base);
-    const rate = cfg.direction === 0 ? cfg.rate0 : cfg.rate1;
-    return [rate.num, rate.den];
-  },
-  quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = solfiV1Config(base);
-    const voutRef = cfg.direction === 0 ? ref(slot, 'vaultB') : ref(slot, 'vaultA');
-    const voutAddr = cfg.direction === 0 ? cfg.vaultB : cfg.vaultA;
-    return [{ ref: voutRef, address: voutAddr }];
-  },
-  emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string {
-    const cfg = solfiV1Config(base);
-    const voutRef = cfg.direction === 0 ? ref(slot, 'vaultB') : ref(slot, 'vaultA');
-    return [
-      `  const s${slot}rateNum = ${params[0]};`,
-      `  const s${slot}rateDen = ${params[1]};`,
-      `  const s${slot}outBal = accountUint(${JSON.stringify(voutRef)}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-    ].join('\n');
-  },
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    return `qSolfiV1(${x}, s${slot}rateNum, s${slot}rateDen, s${slot}outBal)`;
-  },
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    const cfg = solfiV1Config(base);
-    const aIsIn = cfg.direction === 0;
-    const userA = aIsIn ? user.inAta : user.outAta;
-    const userB = aIsIn ? user.outAta : user.inAta;
-    return {
-      programId: SOLFI_V1_PROGRAM_ID,
-      prefix: Uint8Array.from([0x07]),
-      // minOut u64 LE = 1 (dead weight — the recipe's terminal outAta delta
-      // owns the real bound, same convention as solfi-v2), then direction u8.
-      suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, cfg.direction]),
-      patch: 'in',
-      accounts: [
-        { ref: user.owner, signer: true },
-        { ref: ref(slot, 'pool'), address: cfg.pool, writable: true },
-        { ref: ref(slot, 'vaultA'), address: cfg.vaultA, writable: true },
-        { ref: ref(slot, 'vaultB'), address: cfg.vaultB, writable: true },
-        { ref: userA, writable: true },
-        { ref: userB, writable: true },
-        { ref: ref(slot, 'tokenProgram'), address: TOKEN_PROGRAM },
-        { ref: ref(slot, 'sysvarIx'), address: INSTRUCTIONS_SYSVAR },
-      ],
-    };
-  },
-  referenceQuote(base: PoolConfig, state: AccountBytesMap): (x: bigint) => bigint {
-    const cfg = solfiV1Config(base);
-    const rate = cfg.direction === 0 ? cfg.rate0 : cfg.rate1;
-    const voutAddr = cfg.direction === 0 ? cfg.vaultB : cfg.vaultA;
-    const voutData = state[voutAddr as unknown as string];
-    if (voutData === undefined) throw new Error(`${SLUG} ladder reference is missing account ${voutAddr}`);
-    let outBal = 0n;
-    for (let i = 7; i >= 0; i--) outBal = (outBal << 8n) | BigInt(voutData[VAULT_AMOUNT_OFFSET + i]!);
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      const raw = (x * rate.num) / rate.den;
-      return raw > outBal ? outBal : raw;
-    };
-  },
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const cfg = solfiV1Config(base);
-    const readAmount = (addr: Address): bigint => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-      let v = 0n;
-      for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(data[VAULT_AMOUNT_OFFSET + i]!);
-      return v;
-    };
-    const rA = readAmount(cfg.vaultA);
-    const rB = readAmount(cfg.vaultB);
-    return cfg.direction === 0 ? { reserveIn: rA, reserveOut: rB } : { reserveIn: rB, reserveOut: rA };
-  },
-  continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
-    // Measurement-only oracle input (never a gate, see the barrel's doc on
-    // this field) — the model is intentionally linear (no reserve-ratio
-    // curvature), so this degenerates to "no impact term"; not meaningful for
-    // this non-CP-class venue (same disclosure as humidifi's).
-    return { gammaPpm: 0n, muPpm: 1_000_000n };
-  },
-};

@@ -1,4 +1,4 @@
-import type { SvmVenueLadderV2 } from '../types.js';
+import type { SvmVenueLadder } from '../types.js';
 interface PriceOutInputs {
     now: bigint;
     wooraclePrice: bigint;
@@ -29,6 +29,6 @@ export declare function woofiApplyFee(quoteAmount: bigint, feeRate: bigint): big
 export declare function woofiSellBaseCapacity(priceOut: bigint, priceDec: bigint, quoteDec: bigint, baseDec: bigint, coeff: bigint, maxGamma: bigint, maxNotionalSwap: bigint, capBal: bigint, minSwapAmount: bigint, quoteVaultAvailable: bigint): bigint;
 /** sellQuote capacity: the largest x (quote units) that keeps every closed-form cap satisfied. */
 export declare function woofiSellQuoteCapacity(priceOut: bigint, priceDec: bigint, quoteDec: bigint, baseDec: bigint, coeff: bigint, maxGamma: bigint, maxNotionalSwap: bigint, capBal: bigint, baseVaultAvailable: bigint): bigint;
-export declare const woofiLadder: SvmVenueLadderV2;
+export declare const woofiLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=ladder.d.ts.map

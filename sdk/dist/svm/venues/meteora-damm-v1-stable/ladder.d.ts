@@ -1,7 +1,7 @@
 import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
 export declare const meteoraDammV1StableLadder: {
     slug: string;
-    /** Stable slots default to 2 rungs (cap 4) — see recipes/ecoswap/svm/budget.ts. */
+    /** Stable slots default to 2 rungs (cap 4) — see the consuming app SVM CU-budget module. */
     defaultRungs: number;
     shapeKey(): string;
     helpers(): {
@@ -38,9 +38,19 @@ export declare const meteoraDammV1StableLadder: {
      * (the caller already clamped `x` to the analytic capacity, so `<v>ov` is
      * PROVEN to clear the idle float — this guard only ever fails to fire,
      * see this file's module doc); cold declares a fresh `y` const and TAILS
-     * into the raw idle-float COLLAPSE, assigning `coldOutVar` (the declared,
-     * merge-unreachable, latent gap this family shares with
-     * orca-whirlpool/raydium-clmm/meteora-dlmm/solfi-v2).
+     * into the raw idle-float COLLAPSE, assigning `coldOutVar` — the declared,
+     * merge-unreachable, latent idle-float cliff (see this file's module doc and
+     * `emitFinalQuote`). It sits in the same GENERAL class of merge-unreachable
+     * cold-quote gap as orca-whirlpool/raydium-clmm/meteora-dlmm/solfi-v2 — a
+     * standalone cold `referenceQuote` that collapses past a bound the caller's
+     * analytic-capacity clamp keeps off the merge path — but NOT the same
+     * MECHANISM: the three CL families' cliff is a tick/bin cold-walk window
+     * exhaustion (their `coldWalkClamped` convention, see this file's module doc)
+     * and solfi-v2's is a closed-form output-vault saturation, whereas this
+     * family's is the idle-float / double-floor vault-withdraw collapse. And of
+     * the five, only THIS family's cold quote still collapses: the other four
+     * were saturated by the five-family correctness batch, leaving this the sole
+     * `declaredCliffs` entry (see sdk/test/svm/venues/ladder-contract.test.ts).
      */
     emitQuoteAt(slot: number, tag: string, x: string, y0: string, warm: boolean, coldOutVar?: string): string[];
     buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;

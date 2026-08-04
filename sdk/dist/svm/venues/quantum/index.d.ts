@@ -2,6 +2,12 @@ import type { Address } from '@solana/kit';
 import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "quantum";
 export declare const QUANTUM_PROGRAM_ID: Address<"QuaNtZsgYRe5Z9Bk4LZ4cTD9tbkVoyCNf1R2BN9bBDv">;
+/**
+ * The program's single global config account (one for every pool). Lived in
+ * this venue's ladder module until the merge-decomposition ladders moved out;
+ * it is a program address, not decomposition state, so it stays here.
+ */
+export declare const QUANTUM_GLOBAL: Address<"3JumrbigQRj9TqEuy5fKGPHsQ6zCTwqqfVGhFhyoEMqH">;
 /** Exact pool account size (all 27 live mainnet pools). */
 export declare const QUANTUM_POOL_SIZE = 2280;
 export declare const OFF_MINT0 = 0;
@@ -65,8 +71,6 @@ export declare function quantumOutVault(cfg: QuantumPoolConfig): Address;
 export declare function quantumInVault(cfg: QuantumPoolConfig): Address;
 /** Cached out-reserve offset for the direction (the second half of the out cap). */
 export declare function quantumOutReserveOffset(cfg: QuantumPoolConfig): number;
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function quantumWindowFor(cfg: QuantumPoolConfig): QuantumWindow;
 /**
  * Fetch + gate one Quantum pool and freeze both directions' walkable level
  * prefixes. Read-only against the loader.

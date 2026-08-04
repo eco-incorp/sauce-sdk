@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 export declare const SANCTUM_STAKE_POOL_PROGRAM_ID: Address<"SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy">;
 export declare const SANCTUM_STAKE_POOL_2_PROGRAM_ID: Address<"SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY">;
 export declare const SANCTUM_STAKE_POOL_3_PROGRAM_ID: Address<"SPMBzsVUuoHA4Jm6KunbsotaahvVikZs1JyTW6iJvbn">;
@@ -38,8 +38,4 @@ export declare const sanctumStakePool4: {
     programId: Address;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<SanctumStakePoolConfig>;
 };
-export declare const sanctumStakePoolLadder: SvmVenueLadderV2;
-export declare const sanctumStakePool2Ladder: SvmVenueLadderV2;
-export declare const sanctumStakePool3Ladder: SvmVenueLadderV2;
-export declare const sanctumStakePool4Ladder: SvmVenueLadderV2;
 //# sourceMappingURL=index.d.ts.map

@@ -120,7 +120,7 @@
  *               -> 3_010_000_000 sSOL out. tx 5jRGKMb7simyMyYp3bbviMhc1pndgGEnSv2oRWsQd6fjkEEH1rM8g64fAcUoGmHf25WXLYQuSQv7FnxAjh9yMfcX
  *   undelegate, Hashkey Cloud AVS pool (via a Jupiter SharedAccountsRouteV2 leg): 12_450_000 hash4eT burned
  *               -> 12_450_000 sSOL out. tx 4bnVs3683krULUFbQc6sC7Yx5pJNaDbnxBu12uW2ikMrZq3qgSX3ZLgcPdRwsNr4KuwffwnbMNAqyZCKjXjGGNzf
- * `test/svm/ecoswap-svm.solayer.e2e.test.ts` replays real fixture dumps of
+ * `the consuming app solayer e2e test` replays real fixture dumps of
  * the Sonic and Hashkey Cloud AVS pools (`test/svm/fixtures/solayer{,-dir1}`,
  * captured at integration time) through `referenceQuote` AND through the
  * real committed engine, and separately drives the REAL dumped
@@ -153,18 +153,8 @@ const OFF_LST_MINT = 73;
 const OFF_VAULT = 105;
 const OFF_NAME_LEN = 137;
 const OFF_NAME = 141;
-/** SPL mint `supply` (u64 LE) — standard program-pack Mint layout. */
-const OFF_MINT_SUPPLY = 36;
 const SPL_MINT_SIZE = 82;
-/** SPL token account `amount` (u64 LE) — standard program-pack Account layout. */
-const OFF_TOKEN_AMOUNT = 64;
 const SPL_TOKEN_ACCOUNT_SIZE = 165;
-const U64_MAX = (1n << 64n) - 1n;
-function asConfig(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
-    return cfg;
-}
 function hasDiscriminator(data, discriminator) {
     return discriminator.every((byte, i) => data[i] === byte);
 }
@@ -220,115 +210,5 @@ export const solayer = {
     programId: SOLAYER_PROGRAM_ID,
     tokenProgram: TOKEN_PROGRAM,
     fetchPoolConfig: fetchSolayerPoolConfig,
-};
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror). CP-kind — a plain
-// `min(x, cap)` quote is trivially pointwise (no warm-start / chain state
-// needed between rungs), so this needs none of the stable-family Newton
-// machinery.
-// ---------------------------------------------------------------------------
-const ref = (slot, role) => `s${slot}:${role}`;
-function solayerConfig(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-    return cfg;
-}
-/** The account whose live bytes bound this direction's capacity (receiptMint supply headroom on delegate, vault balance on undelegate). */
-function capAccountRef(cfg, slot) {
-    return cfg.direction === 'delegate' ? { ref: ref(slot, 'receiptMint'), address: cfg.receiptMint } : { ref: ref(slot, 'vault'), address: cfg.vault };
-}
-export const solayerLadder = {
-    slug: SLUG,
-    shapeKey(base) {
-        const cfg = solayerConfig(base);
-        return `${SLUG}:${cfg.direction}`;
-    },
-    helpers() {
-        return [
-            {
-                name: 'qSolayer',
-                source: ['function qSolayer(x, cap) {', '  if (x <= 0) { return 0 }', '  if (x < cap) { return x }', '  return cap;', '}'].join('\n'),
-            },
-        ];
-    },
-    /** Everything is a live read — no per-trade params. */
-    paramCount: 0,
-    paramsFor(_base) {
-        return [];
-    },
-    quoteRefs(base, slot) {
-        const cfg = solayerConfig(base);
-        return [capAccountRef(cfg, slot)];
-    },
-    emitSetup(base, slot) {
-        const cfg = solayerConfig(base);
-        const capAcct = JSON.stringify(capAccountRef(cfg, slot).ref);
-        const capExpr = cfg.direction === 'delegate' ? `${U64_MAX} - accountUint(${capAcct}, ${OFF_MINT_SUPPLY}, 8)` : `accountUint(${capAcct}, ${OFF_TOKEN_AMOUNT}, 8)`;
-        return `  const s${slot}cap = ${capExpr};`;
-    },
-    emitQuoteCall(_base, slot, x) {
-        return `qSolayer(${x}, s${slot}cap)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const cfg = solayerConfig(base);
-        const discriminator = cfg.direction === 'delegate' ? DELEGATE_NO_INIT_DISCRIMINATOR : UNDELEGATE_NO_INIT_DISCRIMINATOR;
-        // Fixed account order for BOTH directions (see module header) — only which
-        // physical account plays the "in" vs "out" role changes.
-        const lstAtaRef = cfg.direction === 'delegate' ? user.inAta : user.outAta;
-        const receiptAtaRef = cfg.direction === 'delegate' ? user.outAta : user.inAta;
-        const account = (role, addr, writable) => writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-        return {
-            programId: SOLAYER_PROGRAM_ID,
-            prefix: Uint8Array.from(discriminator),
-            suffix: new Uint8Array(0),
-            patch: 'in',
-            accounts: [
-                { ref: user.owner, signer: true },
-                account('pool', cfg.pool),
-                account('receiptMint', cfg.receiptMint, true),
-                account('vault', cfg.vault, true),
-                account('lstMint', cfg.lstMint),
-                { ref: lstAtaRef, writable: true },
-                { ref: receiptAtaRef, writable: true },
-                { ref: 'token-program', address: TOKEN_PROGRAM },
-            ],
-        };
-    },
-    referenceQuote(base, state) {
-        const cfg = solayerConfig(base);
-        const capAddr = cfg.direction === 'delegate' ? cfg.receiptMint : cfg.vault;
-        const capData = state[capAddr];
-        if (capData === undefined)
-            throw new Error(`${SLUG} ladder reference is missing account ${capAddr}`);
-        const cap = cfg.direction === 'delegate' ? U64_MAX - readUintLE(capData, OFF_MINT_SUPPLY, 8) : readUintLE(capData, OFF_TOKEN_AMOUNT, 8);
-        return (x) => {
-            if (x <= 0n)
-                return 0n;
-            return x < cap ? x : cap;
-        };
-    },
-    depthReserves(base, state) {
-        const cfg = solayerConfig(base);
-        // Depth reporting is decoupled from the (direction-asymmetric) execution
-        // cap: the delegate direction's TRUE ceiling is a u64 mint headroom
-        // (astronomically larger than any real reserve elsewhere in the universe),
-        // and reporting it verbatim here would dwarf every other venue's depth in
-        // the relative-depth Σ, starving them out of survivorship for a capacity
-        // that is never actually the binding constraint in practice. Both
-        // directions instead report the vault's real live sSOL balance — a
-        // bounded, comparable magnitude that still correctly favors a pool with
-        // more real backing over a near-empty one, and never OVER-states depth
-        // (the conservative side, matching the "a favourable error is worse than
-        // a crude one" rule for quote curves).
-        const vaultData = state[cfg.vault];
-        if (vaultData === undefined)
-            throw new Error(`${SLUG} ladder depth is missing vault account ${cfg.vault}`);
-        const balance = readUintLE(vaultData, OFF_TOKEN_AMOUNT, 8);
-        return { reserveIn: balance, reserveOut: balance };
-    },
-    continuousFees() {
-        // No fee anywhere in this family (see module header) — full pass-through.
-        return { gammaPpm: 1000000n, muPpm: 1000000n };
-    },
 };
 //# sourceMappingURL=index.js.map

@@ -1,5 +1,5 @@
 /**
- * PumpSwap adapter v2 (EcoSwapSVM ladder fragment) — constant product over
+ * PumpSwap adapter v2 (SvmRoute ladder fragment) — constant product over
  * raw SPL vault balances, read LIVE in-VM; the gross input arrives at
  * runtime. The fee bps (lp/protocol/creator, flat or the market-cap tier
  * selected at fetch time) ride as per-trade PARAMS, not compile-time

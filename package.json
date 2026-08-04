@@ -1,6 +1,6 @@
 {
   "name": "@eco-incorp/sauce-sdk",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Sauce protocol tooling: compiler, SDK, action primitives, and a local dev environment.",
   "type": "module",
   "repository": {
@@ -35,11 +35,11 @@
       "types": "./sdk/dist/chains/index.d.ts",
       "default": "./sdk/dist/chains/index.js"
     },
-    "./programs": {
-      "types": "./sdk/dist/programs/index.d.ts",
-      "default": "./sdk/dist/programs/index.js"
+    "./recipes": {
+      "types": "./sdk/dist/recipes/index.d.ts",
+      "default": "./sdk/dist/recipes/index.js"
     },
-    "./programs/token-sweep.sauce.ts": "./sdk/dist/programs/token-sweep.sauce.ts",
+    "./recipes/settle.sauce.ts": "./sdk/dist/recipes/settle.sauce.ts",
     "./deployments": {
       "types": "./sdk/dist/deployments/index.d.ts",
       "default": "./sdk/dist/deployments/index.js"
@@ -52,6 +52,7 @@
       "types": "./sdk/dist/svm/index.d.ts",
       "default": "./sdk/dist/svm/index.js"
     },
+    "./svm/recipes/settle.sauce.ts": "./sdk/dist/svm/recipes/settle.sauce.ts",
     "./verify": {
       "types": "./sdk/dist/verify/index.d.ts",
       "default": "./sdk/dist/verify/index.js"

@@ -211,11 +211,6 @@ export interface SarosDlmmPoolConfig extends PoolConfig {
   windows: { xToY: SarosDlmmWindow; yToX: SarosDlmmWindow };
 }
 
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function windowFor(cfg: SarosDlmmPoolConfig): SarosDlmmWindow {
-  return cfg.direction === 'xToY' ? cfg.windows.xToY : cfg.windows.yToX;
-}
-
 function hasDiscriminator(data: Uint8Array, discriminator: number[]): boolean {
   return discriminator.every((byte, i) => data[i] === byte);
 }

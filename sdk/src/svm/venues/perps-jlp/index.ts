@@ -17,7 +17,7 @@
  * (mintOut's base58) — not a struct — through `entry.fetch`'s existing
  * `(load, pool, direction?)` field type (an additive widening: the other 13
  * families' 2-arg fetchers stay assignable, ignoring the extra argument) —
- * see ecoswap/svm/index.ts's `directionForPair` hook and its perps-jlp
+ * see the consuming app SVM solver entry's `directionForPair` hook and its perps-jlp
  * FAMILIES entry for how both call sites (fresh discovery AND the
  * pre-codegen re-fetch, which only ever has `spec.direction` in scope, never
  * the original pair) supply it identically.
@@ -88,7 +88,16 @@
  * a real mainnet dump of the JLP pool + 6 custodies (SOL/ETH/BTC/USDC/USDT +
  * a 6th newer stable asset) — every custody's byte range past offset 1117 is
  * all-zero padding, confirming the field table below is the complete struct.
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getProgramDerivedAddress, getUtf8Encoder, getAddressEncoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
@@ -368,7 +377,7 @@ function decodePool(pool: Address, data: Uint8Array): DecodedPool {
  * callers (the discovery resolver and the pre-codegen re-fetch) have it —
  * the former from the requested pair directly, the latter from the spec's
  * own `direction` string (this family stores `mintOut`'s base58 there, see
- * ecoswap/svm/index.ts's FAMILIES entry) — so `fetchPoolConfig` never needs
+ * the consuming app SVM solver entry's FAMILIES entry) — so `fetchPoolConfig` never needs
  * a signature wider than every other family's `(load, pool)` PLUS this one
  * extra, always-a-plain-string `direction` parameter already threads through
  * both call sites unchanged.

@@ -10,7 +10,7 @@
 // at 20 bytes, a zero recipient rejected), so an accepted program is the UNIQUE byte encoding of the
 // values it decodes to. It does NOT tell you the trailing body is a program you have audited — a
 // prologue-shaped program can carry anything after it. If you need that guarantee, compile the
-// program from source yourself and byte-compare (see `@eco-incorp/sauce-sdk/programs`), which is a
+// program from source yourself and byte-compare (see `@eco-incorp/sauce-sdk/recipes`), which is a
 // direct check against source you can read rather than a hash pinned in a table.
 export { SETTLE_WIRE, scanMinimalPush, encodeMinimalPush, type PushScanResult } from "./wire.js";
 export {

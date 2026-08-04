@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "jupiter-lend-earn";
 export declare const JUPITER_LEND_EARN_PROGRAM_ID: Address<"jup3YeL8QhtSx1e253b2FDvsMNC87fDrgQZivbrndc9">;
 /** The Liquidity layer every deposit/redeem CPI delegates real token accounting to. */
@@ -23,6 +23,5 @@ export declare const jupiterLendEarn: {
     programId: Address;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<PoolConfig>;
 };
-export declare const jupiterLendEarnLadder: SvmVenueLadderV2;
 export {};
 //# sourceMappingURL=index.d.ts.map

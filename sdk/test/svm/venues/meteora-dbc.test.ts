@@ -26,10 +26,8 @@
  */
 import { resolve } from 'path';
 import { address } from '@solana/kit';
-import { compile } from '@eco-incorp/sauce-compiler';
 import { meteoraDbc } from '../../../src/svm/venues/meteora-dbc/index.js';
 import type { MeteoraDbcPoolConfig } from '../../../src/svm/venues/meteora-dbc/index.js';
-import { meteoraDbcLadder } from '../../../src/svm/venues/meteora-dbc/ladder.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 
 const FIXTURES = resolve(process.cwd(), 'test/svm/fixtures/meteora-dbc');
@@ -100,132 +98,5 @@ describe('meteora-dbc: v1 adapter referenceQuote matches the official SDK on rea
     for (const [amountIn, out] of expected) {
       expect(bi(meteoraDbc.referenceQuote(cfg, state, amountIn, NOW))).toBe(bi(out));
     }
-  });
-});
-
-describe('meteora-dbc ladder: matches the v1 adapter exactly (same math, live-read parametric form)', () => {
-  it('quoteToBase, static-fee pool', async () => {
-    const cfg = await fetch(STATIC_POOL);
-    const ladderQuote = meteoraDbcLadder.referenceQuote(cfg, state, [], NOW);
-    for (const amountIn of [1_000_000_000n, 5_000_000_000n, 20_000_000_000n]) {
-      expect(bi(ladderQuote(amountIn))).toBe(bi(meteoraDbc.referenceQuote(cfg, state, amountIn, NOW)));
-    }
-  });
-
-  it('baseToQuote, static-fee pool', async () => {
-    const cfg = await fetch(STATIC_POOL);
-    const sellCfg: MeteoraDbcPoolConfig = { ...cfg, direction: 'baseToQuote' };
-    const ladderQuote = meteoraDbcLadder.referenceQuote(sellCfg, state, [], NOW);
-    for (const amountIn of [100_000_000_000_000n, 500_000_000_000_000n, 2_000_000_000_000_000n]) {
-      expect(bi(ladderQuote(amountIn))).toBe(bi(meteoraDbc.referenceQuote(sellCfg, state, amountIn, NOW)));
-    }
-  });
-
-  it('scheduled+dynamic-fee pool', async () => {
-    const cfg = await fetch(SCHEDULED_POOL);
-    const ladderQuote = meteoraDbcLadder.referenceQuote(cfg, state, [], NOW);
-    for (const amountIn of [1_000_000_000n, 5_000_000_000n, 20_000_000_000n]) {
-      expect(bi(ladderQuote(amountIn))).toBe(bi(meteoraDbc.referenceQuote(cfg, state, amountIn, NOW)));
-    }
-  });
-});
-
-describe('meteora-dbc: capacity clamp SATURATES at the segment/migration boundary, never collapses to 0', () => {
-  it('quoteToBase: quote(0) == 0, nondecreasing, and saturates past the segment capacity instead of collapsing', async () => {
-    const cfg = await fetch(STATIC_POOL);
-    const quote = meteoraDbcLadder.referenceQuote(cfg, state, [], NOW);
-    const capacities = meteoraDbcLadder.referenceCapacities!(cfg, state, [], NOW);
-    // Two wildly different oversized grid points both clamp to the SAME true
-    // capacity — referenceCapacities is a pure min(g, C), not a running max.
-    const capBig = capacities([1_000_000_000_000n])[0]!;
-    expect(bi(capacities([1n << 62n])[0]!)).toBe(bi(capBig));
-    expect(bi(quote(0n))).toBe(bi(0n));
-
-    let prev = -1n;
-    const grid = [0n, 1n, 1_000n, 1_000_000_000n, 5_000_000_000n, 20_000_000_000n, capBig, capBig + 1n, 2n * capBig, 1_000_000_000_000n];
-    for (const x of grid) {
-      const q = quote(x);
-      expect(q).toBeGreaterThanOrEqual(prev);
-      prev = q;
-    }
-    // Never collapses to 0 for a huge x once the pool has ANY capacity.
-    expect(quote(1_000_000_000_000n)).toBeGreaterThan(0n);
-    expect(quote(1_000_000_000_000n)).toBe(quote(capBig));
-  });
-
-  it('baseToQuote: same saturating shape', async () => {
-    const cfg = await fetch(STATIC_POOL);
-    const sellCfg: MeteoraDbcPoolConfig = { ...cfg, direction: 'baseToQuote' };
-    const quote = meteoraDbcLadder.referenceQuote(sellCfg, state, [], NOW);
-    let prev = -1n;
-    const grid = [0n, 1n, 1_000_000n, 100_000_000_000_000n, 2_000_000_000_000_000n, 50_000_000_000_000_000n, 500_000_000_000_000_000n];
-    for (const x of grid) {
-      const q = quote(x);
-      expect(q).toBeGreaterThanOrEqual(prev);
-      prev = q;
-    }
-    expect(quote(500_000_000_000_000_000n)).toBeGreaterThan(0n);
-  });
-});
-
-describe('meteora-dbc: not-yet-activated fee scheduler zeroes the quote instead of promising a fill the real program would revert on', () => {
-  it('a synthetic pool whose activation_point is in the future quotes 0 at every size', async () => {
-    const cfg = await fetch(SCHEDULED_POOL);
-    // Force `now` BEFORE activation_point (real activation_point = 1_770_914_811).
-    const beforeActivation = 1n;
-    const quote = meteoraDbcLadder.referenceQuote(cfg, state, [], beforeActivation);
-    expect(bi(quote(1_000_000_000n))).toBe(bi(0n));
-    expect(bi(quote(1_000_000_000_000n))).toBe(bi(0n));
-  });
-});
-
-describe('meteora-dbc: the ladder fragment compiles as valid SauceScript', () => {
-  it.each(['quoteToBase', 'baseToQuote'] as const)('%s: helpers + emitSetup + two ladder rungs + emitFinalQuote', async (direction) => {
-    const base = await fetch(STATIC_POOL);
-    const cfg: MeteoraDbcPoolConfig = { ...base, direction };
-    const source = [
-      ...meteoraDbcLadder.helpers(cfg).map((h) => h.source),
-      'function main() {',
-      meteoraDbcLadder.emitSetup(cfg, 0),
-      meteoraDbcLadder.emitLadderQuote!(cfg, 0, 0, '1000000000', 's0o1'),
-      meteoraDbcLadder.emitLadderQuote!(cfg, 0, 1, '5000000000', 's0o2'),
-      meteoraDbcLadder.emitFinalQuote!(cfg, 0, '2000000000', 'qFinal'),
-      '  return qFinal;',
-      '}',
-    ].join('\n');
-    const { bytecode, accountPlan } = compile(source, { target: 'svm' });
-    expect(bytecode[0]!.length).toBeGreaterThan(0);
-    expect(accountPlan?.metas.map((m) => m.ref).sort()).toEqual(['s0:pool', 's0:config'].sort());
-  });
-});
-
-describe('meteora-dbc: buildSwapV2 account order + discriminator', () => {
-  it('emits the swap discriminator, patches "in", and attaches 15 accounts in the documented order', async () => {
-    const cfg = await fetch(STATIC_POOL);
-    const user = { inAta: 'user:in', outAta: 'user:out', owner: 'payer' };
-    const tpl = meteoraDbcLadder.buildSwapV2(cfg, 0, user);
-    expect(tpl.patch).toBe('in');
-    expect([...tpl.prefix]).toEqual([248, 198, 158, 145, 225, 117, 135, 200]);
-    expect([...tpl.suffix]).toEqual([1, 0, 0, 0, 0, 0, 0, 0]);
-    expect(tpl.accounts).toHaveLength(15);
-    expect(tpl.accounts.map((a) => a.ref)).toEqual([
-      's0:auth',
-      's0:cfg',
-      's0:pool',
-      'user:in',
-      'user:out',
-      's0:bv',
-      's0:qv',
-      's0:bm',
-      's0:qm',
-      'payer',
-      's0:tbp',
-      's0:tqp',
-      's0:prog',
-      's0:evt',
-      's0:prog',
-    ]);
-    expect(tpl.accounts[2]!.writable).toBe(true); // pool
-    expect(tpl.accounts[9]!.signer).toBe(true); // owner
   });
 });

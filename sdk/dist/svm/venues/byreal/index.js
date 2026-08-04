@@ -34,12 +34,11 @@
  * `resolveWindow`: identical offsets/gates/discriminators/tick-math,
  * differing ONLY in which program id seeds the PDA derivations.
  *
- * The quote/codegen MATH is *not* forked — it is IDL-identical, so every
- * ladder method below delegates straight to the verified upstream
- * `raydiumClmmLadder` (zero transcription risk for the tick-walk fixed-point
- * arithmetic) through a thin adapter-cfg shim (`asRay`) that exists ONLY to
- * satisfy the upstream ladder's internal `cfg.venue === 'raydium-clmm'`
- * identity assert (`rayConfig()` in the SDK's ladder.ts). Every EXTERNALLY
+ * The quote/codegen MATH is *not* forked — it is IDL-identical, so a
+ * consumer models this venue with raydium-clmm's own verified tick-walk
+ * arithmetic (this module reuses `raydiumSqrtPriceAtTick` directly for its
+ * own `resolveWindow`), with no transcription of that fixed-point
+ * arithmetic anywhere here. Every EXTERNALLY
  * visible identity — this module's own `slug`, `shapeKey`, and
  * `buildSwapV2`'s returned `programId` — is honestly `'byreal'` /
  * `BYREAL_PROGRAM_ID`, so a Byreal pool and a real raydium-clmm pool can
@@ -62,7 +61,7 @@
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import { AMM_CONFIG_DISCRIMINATOR, RAYDIUM_CLMM_MAX_BOUNDARIES, POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR, windowStartTicks } from '../raydium-clmm/index.js';
 import { MAX_TICK, MIN_TICK } from '../raydium-clmm/tick-math.js';
-import { raydiumClmmLadder, raydiumSqrtPriceAtTick } from '../raydium-clmm/ladder.js';
+import { raydiumSqrtPriceAtTick } from '../raydium-clmm/tick-math.js';
 const SLUG = 'byreal';
 /** Byreal's deployed program — a different program id than raydium-clmm's CAMMC... deployment. */
 export const BYREAL_PROGRAM_ID = address('REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2');
@@ -197,10 +196,6 @@ async function resolveWindow(load, pool, tickCurrentIndex, tickSpacing, zeroForO
     }
     return { tickArrays, startTicks, boundaries, edge, readable };
 }
-/** The direction's window (mirrors raydium-clmm's own windowFor). */
-export function byrealWindowFor(cfg) {
-    return cfg.direction === '0to1' ? cfg.windows['0to1'] : cfg.windows['1to0'];
-}
 /**
  * Fetch + gate one Byreal pool and freeze both directions' boundary windows.
  * A deliberate, minimal fork of fetchRaydiumClmmConfig — see the header for
@@ -286,49 +281,5 @@ export const byreal = {
     token2022Program: TOKEN_2022_PROGRAM,
     memoProgram: MEMO_PROGRAM,
     fetchPoolConfig: fetchByrealPoolConfig,
-};
-/**
- * The adapter-cfg shim: relabels a ByrealPoolConfig as `venue: 'raydium-clmm'`
- * ONLY for the duration of a call into the upstream ladder, whose internal
- * `rayConfig()` assert requires that exact literal. This never escapes this
- * module — every method below still returns/exposes 'byreal' externally
- * (shapeKey, buildSwapV2's programId). See the header for the full rationale.
- */
-function asRay(cfg) {
-    return { ...cfg, venue: 'raydium-clmm' };
-}
-/**
- * Byreal's ladder — IDL-identical math to raydium-clmm, delegated verbatim
- * (see the header). Only `shapeKey` (own family prefix, no collision with
- * real raydium-clmm shapes) and `buildSwapV2` (CPI target program) are
- * genuinely different from upstream.
- */
-export const byrealLadder = {
-    slug: SLUG,
-    defaultRungs: raydiumClmmLadder.defaultRungs,
-    shapeKey: (base) => `${SLUG}:${base.direction}`,
-    // raydiumClmmLadder's concrete methods below are cfg-argument-only where
-    // shown (no `now` / no `params` on a few) — raydium-clmm carries no
-    // time-dependent state, so those parameters are simply absent upstream;
-    // matching their real arity here (rather than the SvmVenueLadderV2
-    // interface's most-general optional signature) is what lets us delegate
-    // instead of transcribe.
-    helpers: () => raydiumClmmLadder.helpers(),
-    paramCount: raydiumClmmLadder.paramCount,
-    paramsFor: (base) => raydiumClmmLadder.paramsFor(asRay(base)),
-    quoteRefs: (base, slot) => raydiumClmmLadder.quoteRefs(asRay(base), slot),
-    emitSetup: (base, slot, params, enableVar) => raydiumClmmLadder.emitSetup(asRay(base), slot, params, enableVar),
-    emitLadderQuote: (base, slot, rung, x, outVar) => raydiumClmmLadder.emitLadderQuote(asRay(base), slot, rung, x, outVar),
-    emitFinalQuote: (base, slot, x, outVar) => raydiumClmmLadder.emitFinalQuote(asRay(base), slot, x, outVar),
-    capacityInputVar: (slot) => raydiumClmmLadder.capacityInputVar(slot),
-    buildSwapV2: (base, slot, user) => ({
-        ...raydiumClmmLadder.buildSwapV2(asRay(base), slot, user),
-        programId: BYREAL_PROGRAM_ID,
-    }),
-    referenceQuote: (base, state, params) => raydiumClmmLadder.referenceQuote(asRay(base), state, params),
-    referenceLadderQuotes: (base, state, params) => raydiumClmmLadder.referenceLadderQuotes(asRay(base), state, params),
-    referenceCapacities: (base, state, params) => raydiumClmmLadder.referenceCapacities(asRay(base), state, params),
-    depthReserves: (base, state) => raydiumClmmLadder.depthReserves(asRay(base), state),
-    continuousFees: (base, state) => raydiumClmmLadder.continuousFees(asRay(base), state),
 };
 //# sourceMappingURL=index.js.map

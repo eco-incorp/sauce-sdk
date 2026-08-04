@@ -423,7 +423,7 @@ export const orcaWhirlpoolLadder = {
     /**
      * 2 rungs by default: a rung is a full cold walk (each crossed boundary
      * ~45k CU on the interpreter), the same economics that put the stable
-     * families at 2 (see recipes/ecoswap/svm/budget.ts).
+     * families at 2 (see the consuming app SVM CU-budget module).
      */
     defaultRungs: 2,
     shapeKey(base) {
