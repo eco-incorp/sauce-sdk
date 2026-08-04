@@ -26,7 +26,8 @@ export interface ExecuteOpts extends SimulateOpts {
 /** A buffer staged by this client — carries the SDK-computed content hash (the execute pin). */
 export interface StagedBuffer {
     address: Address;
-    index: number;
+    /** The 32-byte PDA seed the buffer was derived + init'd under. */
+    seed: Uint8Array;
     /** sha256 of the staged bytecode, computed SDK-side and verified on-chain at finalize. */
     sha256: Uint8Array;
     /** Staging transaction signatures in send order: init, writes…, finalize. */
@@ -78,14 +79,15 @@ export interface SauceSvmClient {
     simulate(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateOpts): Promise<SimulateExecuteResult>;
     execute(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: ExecuteOpts): Promise<SendExecuteResult>;
     /**
-     * Stages bytecode into buffer `index` (init → chunked writes → a dedicated
-     * finalize sent only after every write confirmed, each tx on a fresh
-     * blockhash). The buffer at the index must not be finalized — close it first
-     * (closeBuffer) to recompile at the same address.
+     * Stages bytecode into the buffer at 32-byte `seed` (init → chunked writes → a
+     * dedicated finalize sent only after every write confirmed, each tx on a fresh
+     * blockhash). The buffer at that seed must not be finalized — close it first
+     * (closeBuffer) to recompile at the same address. The same seed is resumable:
+     * it always derives the same address.
      */
-    stageBuffer(index: number, bytecode: Uint8Array): Promise<StagedBuffer>;
-    /** Closes buffer `index`, refunding its rent to the payer (the recompile path). */
-    closeBuffer(index: number): Promise<SendExecuteResult>;
+    stageBuffer(seed: Uint8Array, bytecode: Uint8Array): Promise<StagedBuffer>;
+    /** Closes the buffer at 32-byte `seed`, refunding its rent to the payer (the recompile path). */
+    closeBuffer(seed: Uint8Array): Promise<SendExecuteResult>;
     simulateStaged(buffer: Address | StagedBuffer, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateStagedOpts): Promise<SimulateExecuteResult>;
     /**
      * Executes a finalized buffer, hash-pinned, in ONE instruction. With `args`,

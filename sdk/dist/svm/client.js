@@ -130,9 +130,9 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }) 
             const transaction = await buildTransaction(bytecode, plan, resolution, prepends, opts);
             return sendExecute({ rpc, rpcSubscriptions, transaction });
         },
-        async stageBuffer(index, bytecode) {
+        async stageBuffer(seed, bytecode) {
             const plan = buildStagingPlan(bytecode.length);
-            const { address } = await deriveBufferPda(programId, payer.address, index);
+            const { address } = await deriveBufferPda(programId, payer.address, seed);
             // Copy into a fresh ArrayBuffer-backed view (subtle.digest rejects
             // SharedArrayBuffer-backed views at the type level).
             const sha256 = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytecode)));
@@ -146,7 +146,7 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }) 
                 programId,
                 payer: payer.address,
                 buffer: address,
-                index,
+                seed,
                 capacity: bytecode.length,
                 currentBytes,
             });
@@ -172,10 +172,10 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }) 
             });
             signatures.push((await sendInstructions([finalize])).signature);
             stagedHashes.set(address, sha256);
-            return { address, index, sha256, signatures };
+            return { address, seed, sha256, signatures };
         },
-        async closeBuffer(index) {
-            const { address } = await deriveBufferPda(programId, payer.address, index);
+        async closeBuffer(seed) {
+            const { address } = await deriveBufferPda(programId, payer.address, seed);
             stagedHashes.delete(address);
             return sendInstructions([buildCloseBufferInstruction({ programId, authority: payer.address, buffer: address })]);
         },

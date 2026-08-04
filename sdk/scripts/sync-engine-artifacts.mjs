@@ -49,6 +49,7 @@
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { generateEngineAbi } from './gen-engine-abi.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SDK_DIR = resolve(SCRIPT_DIR, '..');
@@ -212,9 +213,21 @@ ${clusters.map((k) => `    ${q(k)}: { cluster: ${q(dep.svm.clusters[k].cluster)}
 mkdirSync(dirname(GENERATED), { recursive: true });
 writeFileSync(GENERATED, generated);
 
+// SVM wire ABI -> a generated TS module of the wire constants (discriminators,
+// header offsets/sizes, payload flags, seed scheme). Same rationale as the
+// deployments module above: generated so it cannot drift from the pinned engine,
+// CI git-diffs the result. OPTIONAL like V12RuntimeBytecode — older pins predate
+// svm/abi/engine-abi.json, so its absence keeps the committed copy, never fatal.
+const abiResult = generateEngineAbi();
+
 const liveCount = chainIds.filter((id) => dep.evm.chains[id].live === true).length;
 
 console.log(`[sync-engine-artifacts] synced ${Object.keys(SOURCES).length} artifacts from ${sauce}`);
+console.log(
+  abiResult.generated
+    ? '[sync-engine-artifacts] generated src/svm/engine-abi.generated.ts from svm/abi/engine-abi.json'
+    : '[sync-engine-artifacts] svm/abi/engine-abi.json absent from this pin — kept the committed engine-abi.generated.ts',
+);
 console.log(
   `[sync-engine-artifacts] generated src/deployments/v12.generated.ts — ${liveCount} live of ` +
     `${chainIds.length} EVM chains, svm programId ${dep.svm.programId}`,
