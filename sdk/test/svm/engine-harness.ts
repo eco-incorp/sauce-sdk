@@ -320,15 +320,22 @@ export const expectFail = (result: RunResult): { revertData: Uint8Array; err: st
 export const toBigInt = (bytes: Uint8Array): bigint =>
   bytes.length === 0 ? 0n : BigInt('0x' + Buffer.from(bytes).toString('hex'));
 
+/** Deterministic 32-byte PDA seed from a small integer — the test-side stand-in for the old u8 index. */
+export const seed32 = (n: number): Uint8Array => {
+  const s = new Uint8Array(32);
+  new DataView(s.buffer).setUint32(0, n, true);
+  return s;
+};
+
 /**
- * Stages `bytecode` into buffer `index` through the real staging protocol; returns its address.
- * Hoisted out of `staged.e2e.test.ts` (was private there) so every suite needing the staged
+ * Stages `bytecode` into the buffer at 32-byte `seed` through the real staging protocol; returns its
+ * address. Hoisted out of `staged.e2e.test.ts` (was private there) so every suite needing the staged
  * lifecycle drives the SAME real protocol rather than a copy that could silently diverge from it on
  * the next engine change.
  */
-export const stageBytecode = async (harness: EngineHarness, index: number, bytecode: Uint8Array): Promise<Address> => {
+export const stageBytecode = async (harness: EngineHarness, seed: Uint8Array, bytecode: Uint8Array): Promise<Address> => {
   const plan = buildStagingPlan(bytecode.length);
-  const { address: buffer } = await deriveBufferPda(harness.programId, harness.payer.address, index);
+  const { address: buffer } = await deriveBufferPda(harness.programId, harness.payer.address, seed);
   const shared = { programId: harness.programId, authority: harness.payer.address, buffer };
 
   // init tx (all growth steps pack into one), then one tx per chunk, then the
@@ -339,7 +346,7 @@ export const stageBytecode = async (harness: EngineHarness, index: number, bytec
     programId: harness.programId,
     payer: harness.payer.address,
     buffer,
-    index,
+    seed,
     capacity: bytecode.length,
   });
   if (initInstructions.length !== plan.initInstructionCount) {

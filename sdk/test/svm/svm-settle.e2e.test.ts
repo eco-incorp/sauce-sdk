@@ -25,6 +25,7 @@ import {
   randomAddress,
   setMint,
   setTokenAccount,
+  seed32,
   stageBytecode,
   startEngine,
   toBigInt,
@@ -60,7 +61,7 @@ describeSvm('svm settle e2e: TransferChecked sweeps, classic + Token-2022, one s
 
   const stage = async (index: number, escrowCount: number): Promise<Staged> => {
     const c = compile(svmSettleSource(escrowCount), { target: 'svm', staged: true, treeshake: true, args: [0n, 0n, 0n, 0n] });
-    const buffer = await stageBytecode(harness, index, c.bytecode[0]!);
+    const buffer = await stageBytecode(harness, seed32(index), c.bytecode[0]!);
     return { buffer, pin: sha256(c.bytecode[0]!), plan: c.accountPlan, args: c.argsLayout };
   };
 
