@@ -117,6 +117,8 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  metricLadder,
+  metric,
   perenaLadder,
   perena,
   sanctumStakePool3Ladder,
@@ -1419,6 +1421,37 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'metric',
+    ladder: metricLadder,
+    // ROUTING NOTE: metric's emitted fragment does a REAL oracle CPI that can revert post-invoke,
+    // and SVM CATCH is pre-flight only, so a revert aborts the WHOLE cook (no in-VM mitigation).
+    // The consuming solver MUST route metric SOLO (never co-engaged with other venues in one cook)
+    // to contain the blast radius. referenceQuote below is CPI-free (uses baked bid/ask params).
+    async variants() {
+      const POOL = address('G5B2Ws2DKattHTm75AoANWCpbQ48R9n8ZJur42RLYRYF');
+      const fixtures = fixturesFor('metric');
+      const REAL_BID = 18461132534087045066n;
+      const REAL_ASK = 18461317001527782162n;
+      const oracle = async (): Promise<Uint8Array> => {
+        const b = new Uint8Array(32);
+        const v = new DataView(b.buffer);
+        v.setBigUint64(0, REAL_BID & ((1n << 64n) - 1n), true);
+        v.setBigUint64(8, REAL_BID >> 64n, true);
+        v.setBigUint64(16, REAL_ASK & ((1n << 64n) - 1n), true);
+        v.setBigUint64(24, REAL_ASK >> 64n, true);
+        return b;
+      };
+      const load = fixtureLoader(fixtures);
+      const state = fixtureBytesMap(fixtures);
+      const cfg0 = await metric.fetchPoolConfig(load, POOL, 0, oracle);
+      const cfg1 = await metric.fetchPoolConfig(load, POOL, 1, oracle);
+      return [
+        { label: 'bid', cfg: cfg0, state },
+        { label: 'ask', cfg: cfg1, state },
+      ];
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -2009,8 +2042,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(92);
-    expect(FAMILIES).toHaveLength(92);
+    expect(registered).toHaveLength(93);
+    expect(FAMILIES).toHaveLength(93);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
