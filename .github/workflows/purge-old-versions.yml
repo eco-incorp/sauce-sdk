@@ -1,21 +1,17 @@
 # ONE-TIME, MANUAL retirement of the pre-0.5.0 versions that bundled the
 # merge-decomposition ladder-walking logic (relocated to the consuming app in 0.5.0).
 #
-# Chosen strategy (see PR that added this file):
-#   - HARD-UNPUBLISH 0.3.0 and 0.4.0 — still inside npm's 72-hour self-serve
-#     unpublish window at the time this was authored (irreversible; burns those
-#     version numbers permanently).
-#   - DEPRECATE 0.1.0 and 0.2.0 — past the 72h window, and the package is over
-#     npm's 300-downloads/week threshold, so the CLI refuses to unpublish them.
-#     Deprecation keeps them installable but warns and steers installs to 0.5.0.
+# This DEPRECATES 0.1.0–0.4.0 (steers installs to 0.5.0; keeps them installable
+# but warns; reversible). It does NOT hard-unpublish: npm's 2026 policy
+# (gh.io/npm-gat-bypass2fa-deprecation) forbids `unpublish` from a granular
+# access token that bypasses 2FA — which is exactly what NPM_TOKEN is — so the
+# registry returns 403 for unpublish in CI. A genuine hard-delete can only be done
+# by a maintainer locally with interactive 2FA, and only inside npm's 72h window.
 #
 # Trigger from the Actions tab (workflow_dispatch). Requires typing the exact
-# package name to confirm. Uses the same NPM_TOKEN the publish workflow uses
-# (a bypass-2FA automation token with unpublish/deprecate rights).
-#
-# This is a targeted one-shot: the versions are hardcoded so a re-run can never
-# touch 0.5.0 or any future release. Delete this file after it has run.
-name: Purge pre-0.5.0 ladder versions (one-time)
+# package name to confirm. Versions are hardcoded so a re-run can never touch
+# 0.5.0 or a future release. Delete this file after it has run.
+name: Deprecate pre-0.5.0 ladder versions (one-time)
 
 on:
   workflow_dispatch:
@@ -37,7 +33,7 @@ env:
   DEPRECATE_MSG: 'Retired: this pre-0.5.0 release bundled the merge-decomposition ladder-walking logic that was relocated to the consuming app. Upgrade to >=0.5.0.'
 
 jobs:
-  purge:
+  deprecate:
     runs-on: ubuntu-latest
     steps:
       - name: Verify confirmation input
@@ -58,22 +54,6 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm view "$PKG" versions
 
-      # --- Hard delete: 0.3.0 and 0.4.0 (still in the 72h self-serve window) ---
-      - name: Unpublish 0.3.0
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "Unpublishing $PKG@0.3.0 ..."
-          npm unpublish "$PKG@0.3.0" || echo "::warning::unpublish 0.3.0 failed (already gone, or outside the 72h window)"
-
-      - name: Unpublish 0.4.0
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "Unpublishing $PKG@0.4.0 ..."
-          npm unpublish "$PKG@0.4.0" || echo "::warning::unpublish 0.4.0 failed (already gone, or outside the 72h window)"
-
-      # --- Deprecate: 0.1.0 and 0.2.0 (cannot be CLI-unpublished; past 72h + >300 dl/wk) ---
       - name: Deprecate 0.1.0
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -84,11 +64,20 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm deprecate "$PKG@0.2.0" "$DEPRECATE_MSG"
 
-      - name: Show versions AFTER
+      - name: Deprecate 0.3.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm deprecate "$PKG@0.3.0" "$DEPRECATE_MSG"
+
+      - name: Deprecate 0.4.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm deprecate "$PKG@0.4.0" "$DEPRECATE_MSG"
+
+      - name: Show deprecation status AFTER
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "Remaining versions:"
-          npm view "$PKG" versions
-          echo "dist-tags:"
-          npm view "$PKG" dist-tags
+          for v in 0.1.0 0.2.0 0.3.0 0.4.0 0.5.0; do
+            echo "$v -> $(npm view "$PKG@$v" deprecated 2>/dev/null || echo '(not deprecated)')"
+          done
