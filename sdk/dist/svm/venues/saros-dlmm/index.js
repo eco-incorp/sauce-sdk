@@ -164,10 +164,6 @@ export const OFF_BA_BINS = 40;
 export const BIN_LEN = 32;
 export const OFF_BIN_RESERVE_X = 16;
 export const OFF_BIN_RESERVE_Y = 24;
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function windowFor(cfg) {
-    return cfg.direction === 'xToY' ? cfg.windows.xToY : cfg.windows.yToX;
-}
 function hasDiscriminator(data, discriminator) {
     return discriminator.every((byte, i) => data[i] === byte);
 }

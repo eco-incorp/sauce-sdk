@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 export declare const CARROT_PROGRAM_ID: Address<"CarrotwivhMpDnm27EHmRLeQ683Z1PufuqEmBZvD282s">;
 export declare const CRT_MINT: Address<"CRTx1JouZhzSU6XytsE42UQraoGqiHgxabocVfARTy2s">;
 /** The one deployed vault — a PDA of `["vault", CRT_MINT]`, singleton today. */
@@ -55,7 +55,6 @@ export declare const carrot: {
     programId: Address<"CarrotwivhMpDnm27EHmRLeQ683Z1PufuqEmBZvD282s">;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<CarrotPoolConfig>;
 };
-export declare const carrotLadder: SvmVenueLadder;
 /** Prepare-time direction gate: self-drops the SPECIFIC direction (not the whole vault) if its asset's oracle reading is stale. */
 export declare function carrotGate(base: PoolConfig, now: bigint): void;
 export declare function carrotMints(base: PoolConfig): {

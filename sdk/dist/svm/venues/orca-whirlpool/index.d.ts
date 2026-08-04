@@ -87,8 +87,6 @@ export interface OrcaWhirlpoolPoolConfig extends PoolConfig {
         bToA: WhirlpoolWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: OrcaWhirlpoolPoolConfig): WhirlpoolWindow;
 /**
  * The program's expected window start indexes for a direction
  * (sparse_swap.rs get_start_tick_indexes), unfiltered: exactly three,

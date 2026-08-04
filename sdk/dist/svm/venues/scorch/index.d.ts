@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "scorch";
 /** CORE — pool state owner + pricing engine. This is `SVM_VENUE_PROGRAM_IDS.scorch`. */
 export declare const SCORCH_CORE_PROGRAM_ID: Address<"ojh19ojaKduoJZuaJADhcVGp4xt1TcdAvZmpVsCorch">;
@@ -37,36 +37,6 @@ export declare const scorch: {
      */
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<ScorchPoolConfig>;
     quoteAccounts(base: PoolConfig): VenueAccount[];
-};
-export declare const scorchLadder: {
-    slug: string;
-    shapeKey(base: PoolConfig): string;
-    helpers(): {
-        name: string;
-        source: string;
-    }[];
-    /** One param: the conservative haircut-as-fee (ppm), constant today (see file header). */
-    paramCount: number;
-    paramsFor(_base: PoolConfig): bigint[];
-    quoteRefs(base: PoolConfig, slot: number): VenueAccount[];
-    emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string;
-    emitQuoteCall(_base: PoolConfig, slot: number, x: string): string;
-    /**
-     * ROUTER's real swap ix, ground-truthed live (see file header): disc(1)=0x02
-     * ++ subtag(1)=0x80 ++ commitment(16)=0 ++ amountIn(8, patched) ++
-     * minOut(8)=0 — the proven no-commitment encoding. Account order/roles
-     * match six real historical transactions plus six fresh simulate probes.
-     */
-    buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
-    referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint;
-    depthReserves(base: PoolConfig, state: AccountBytesMap): {
-        reserveIn: bigint;
-        reserveOut: bigint;
-    };
-    continuousFees(_base: PoolConfig, _state: AccountBytesMap, params: readonly bigint[]): {
-        gammaPpm: bigint;
-        muPpm: bigint;
-    };
 };
 export {};
 //# sourceMappingURL=index.d.ts.map

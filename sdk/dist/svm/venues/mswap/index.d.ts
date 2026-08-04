@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "mswap";
 /** m0-foundation's ext_swap router — `SVM_VENUE_PROGRAM_IDS['mswap']`. */
 export declare const MSWAP_PROGRAM_ID: Address<"MSwapi3WhNKMUGm9YrxGhypgUEt7wYQH3ZgG32XoWzH">;
@@ -45,29 +45,6 @@ export declare const mswap: {
     slug: string;
     programId: Address<"MSwapi3WhNKMUGm9YrxGhypgUEt7wYQH3ZgG32XoWzH">;
     fetchPoolConfig: typeof fetchMSwapPoolConfig;
-};
-export declare const mswapLadder: {
-    slug: string;
-    shapeKey(_base: PoolConfig): string;
-    helpers(_base: PoolConfig): {
-        name: string;
-        source: string;
-    }[];
-    paramCount: number;
-    paramsFor(_base: PoolConfig): bigint[];
-    quoteRefs(_base: PoolConfig, slot: number): VenueAccount[];
-    emitSetup(_base: PoolConfig, slot: number): string;
-    emitQuoteCall(_base: PoolConfig, slot: number, x: string): string;
-    buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
-    referenceQuote(base: PoolConfig, state: AccountBytesMap): (x: bigint) => bigint;
-    depthReserves(base: PoolConfig, state: AccountBytesMap): {
-        reserveIn: bigint;
-        reserveOut: bigint;
-    };
-    continuousFees(): {
-        gammaPpm: bigint;
-        muPpm: bigint;
-    };
 };
 export {};
 //# sourceMappingURL=index.d.ts.map

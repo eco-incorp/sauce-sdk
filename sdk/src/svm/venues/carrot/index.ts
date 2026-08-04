@@ -119,27 +119,18 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 export const CARROT_PROGRAM_ID = address('CarrotwivhMpDnm27EHmRLeQ683Z1PufuqEmBZvD282s');
 export const CRT_MINT = address('CRTx1JouZhzSU6XytsE42UQraoGqiHgxabocVfARTy2s');
 /** The one deployed vault — a PDA of `["vault", CRT_MINT]`, singleton today. */
 export const CARROT_VAULT_ADDRESS = address('FfCRL34rkJiMiX5emNDrYp3MdWH2mES3FvDQyFppqgpJ');
 
-const LOG_PROGRAM_ID = address('7Mc3vSdRWoThArpni6t5W4XjvQf4BuMny1uC8b6VBn48');
-const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const TOKEN_2022_PROGRAM = address('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
-const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
-
 /** See the module header's TOKEN PROGRAM note — CRT (shares) plus pyUSD are the only Token-2022 mints today. */
 export const CARROT_TOKEN_2022_MINTS: ReadonlySet<Address> = new Set([
   CRT_MINT,
   address('2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo'), // pyUSD
 ]);
-
-/** `sha256("global:issue")[..8]` / `sha256("global:redeem")[..8]` — Anchor discriminators, confirmed live (see module header). */
-const ISSUE_DISCRIMINATOR = Uint8Array.from([190, 1, 98, 214, 81, 99, 222, 247]);
-const REDEEM_DISCRIMINATOR = Uint8Array.from([184, 12, 86, 149, 70, 196, 97, 225]);
 
 const ATA_AMOUNT_OFFSET = 64;
 const MINT_SUPPLY_OFFSET = 36;
@@ -352,243 +343,10 @@ async function fetchCarrotPoolConfig(load: AccountLoader, pool: Address): Promis
   };
 }
 
-function tokenProgramFor(mint: Address): Address {
-  return CARROT_TOKEN_2022_MINTS.has(mint) ? TOKEN_2022_PROGRAM : TOKEN_PROGRAM;
-}
-
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-const HELPER_ISSUE = 'qCarrotIssue';
-const HELPER_REDEEM = 'qCarrotRedeem';
-
 export const carrot = {
   slug: 'carrot' as const,
   programId: CARROT_PROGRAM_ID,
   fetchPoolConfig: (load: AccountLoader, pool: Address): Promise<CarrotPoolConfig> => fetchCarrotPoolConfig(load, pool),
-};
-
-export const carrotLadder: SvmVenueLadder = {
-  slug: 'carrot',
-  // CP-class: closed-form, no Newton iteration — but see the module header's
-  // CAPACITY note for why this stays at the CP default (4) rather than
-  // sanctum-stake-pool's 2: `redeem`'s saturating clamp needs the extra
-  // resolution to be visible to the merge as a kink, not just two endpoints.
-  defaultRungs: 4,
-  shapeKey(base) {
-    return `carrot:${carrotConfig(base).direction}`;
-  },
-  helpers() {
-    return [
-      {
-        name: HELPER_ISSUE,
-        // Unbounded (see module header) — dust/zero-NAV inputs return 0, matching every other
-        // family's convention (a quote helper returns 0 for x == 0 and for rejected/degenerate inputs).
-        source: [
-          `function ${HELPER_ISSUE}(x, priceT, scaleT, nav, supply) {`,
-          '  if (x === 0) { return 0 }',
-          '  if (nav === 0) { return 0 }',
-          '  const depositValue = x * priceT * scaleT;',
-          '  return (depositValue * supply) / nav;',
-          '}',
-        ].join('\n'),
-      },
-      {
-        name: HELPER_REDEEM,
-        // SATURATING at ataT (the vault's live balance of the target asset) — never a cliff to
-        // zero; see module header's CAPACITY note.
-        source: [
-          `function ${HELPER_REDEEM}(x, priceT, scaleT, nav, supply, feeBps, ataT) {`,
-          '  if (x === 0) { return 0 }',
-          '  if (supply === 0) { return 0 }',
-          '  const denom = priceT * scaleT;',
-          '  if (denom === 0) { return 0 }',
-          '  const grossCommon = (x * nav) / supply;',
-          '  const grossOut = grossCommon / denom;',
-          '  const fee = (grossOut * feeBps) / 10000;',
-          '  let net = grossOut - fee;',
-          '  if (net < 0) { net = 0 }',
-          '  if (net > ataT) { net = ataT }',
-          '  return net;',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  // Uniform across every direction (see CARROT_MAX_ASSETS's fail-loud-not-silent note): 3 per-asset
-  // scale factors, 3 per-asset baked oracle price offsets, 1 vault-level redemption fee bps.
-  paramCount: CARROT_MAX_ASSETS * 2 + 1,
-  paramsFor(base) {
-    const c = carrotConfig(base);
-    const params: bigint[] = [];
-    for (let i = 0; i < CARROT_MAX_ASSETS; i++) params.push(c.assets[i]?.scale ?? 0n);
-    for (let i = 0; i < CARROT_MAX_ASSETS; i++) params.push(c.assets[i] === undefined ? 0n : BigInt(c.assets[i]!.priceOffset));
-    params.push(c.redemptionFeeBps);
-    return params;
-  },
-  quoteRefs(base, slot) {
-    const c = carrotConfig(base);
-    const refs: VenueAccount[] = [];
-    for (let i = 0; i < c.assets.length; i++) {
-      refs.push({ ref: ref(slot, `ata${i}`), address: c.assets[i]!.ata });
-      refs.push({ ref: ref(slot, `oracle${i}`), address: c.assets[i]!.oracle });
-    }
-    refs.push({ ref: ref(slot, 'crtMint'), address: c.sharesMint });
-    return refs;
-  },
-  emitSetup(base, slot, params) {
-    const c = carrotConfig(base);
-    const p = `s${slot}`;
-    const lines: string[] = [];
-    const balVars: string[] = [];
-    const priceVars: string[] = [];
-    const scaleVars: string[] = [];
-    for (let i = 0; i < c.assets.length; i++) {
-      const balVar = `${p}b${i}`;
-      // NOT `${p}p${i}` — the codegen prologue already reserves that exact naming pattern
-      // (`s<slot>p<paramIndex>`) for the raw cfg-param words it unpacks (paramsFor's 7 entries land
-      // as s0p0..s0p6 here) — colliding with it is a real duplicate-`const` compile error, not a
-      // style nit (caught by the staged-compile test below).
-      const priceVar = `${p}px${i}`;
-      const scaleVar = `${p}sc${i}`;
-      const scaleLiteral = params[i]!;
-      const priceOffLiteral = params[CARROT_MAX_ASSETS + i]!;
-      lines.push(`  const ${balVar} = accountUint(${JSON.stringify(ref(slot, `ata${i}`))}, ${ATA_AMOUNT_OFFSET}, 8);`);
-      lines.push(`  const ${priceVar} = accountUint(${JSON.stringify(ref(slot, `oracle${i}`))}, ${priceOffLiteral}, 8);`);
-      lines.push(`  const ${scaleVar} = ${scaleLiteral};`);
-      balVars.push(balVar);
-      priceVars.push(priceVar);
-      scaleVars.push(scaleVar);
-    }
-    lines.push(`  const ${p}supply = accountUint(${JSON.stringify(ref(slot, 'crtMint'))}, ${MINT_SUPPLY_OFFSET}, 8);`);
-    lines.push(`  const ${p}fee = ${params[CARROT_MAX_ASSETS * 2]!};`);
-    const navTerms = balVars.map((b, i) => `(${b} * ${priceVars[i]} * ${scaleVars[i]})`).join(' + ');
-    lines.push(`  const ${p}nav = ${navTerms};`);
-    return lines.join('\n');
-  },
-  emitQuoteCall(base, slot, x) {
-    const c = carrotConfig(base);
-    const { op, assetId } = parseCarrotDirection(c.direction);
-    const idx = c.assets.findIndex((a) => a.assetId === assetId);
-    if (idx === -1) throw new Error(`carrot vault ${c.pool}: asset id ${assetId} not present at emitQuoteCall time`);
-    const p = `s${slot}`;
-    if (op === 'issue') {
-      return `${HELPER_ISSUE}(${x}, ${p}px${idx}, ${p}sc${idx}, ${p}nav, ${p}supply)`;
-    }
-    return `${HELPER_REDEEM}(${x}, ${p}px${idx}, ${p}sc${idx}, ${p}nav, ${p}supply, ${p}fee, ${p}b${idx})`;
-  },
-  buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-    const c = carrotConfig(base);
-    const { op, assetId } = parseCarrotDirection(c.direction);
-    const target = requireAsset(c, assetId);
-    const idx = c.assets.findIndex((a) => a.assetId === assetId);
-    const assetTokenProgram = tokenProgramFor(target.mint);
-    const sharesAtaRef = op === 'issue' ? user.outAta : user.inAta;
-    const assetAtaRef = op === 'issue' ? user.inAta : user.outAta;
-
-    const accounts: VenueAccount[] = [
-      { ref: ref(slot, 'vault'), address: c.pool, writable: true },
-      { ref: ref(slot, 'crtMint'), address: c.sharesMint, writable: true },
-      { ref: sharesAtaRef, writable: true },
-      { ref: ref(slot, 'assetMint'), address: target.mint },
-      { ref: ref(slot, `ata${idx}`), address: target.ata, writable: true },
-      { ref: assetAtaRef, writable: true },
-      { ref: user.owner, signer: true, writable: true },
-      { ref: ref(slot, 'systemProgram'), address: SYSTEM_PROGRAM },
-      { ref: ref(slot, 'assetTokenProgram'), address: assetTokenProgram },
-      { ref: ref(slot, 'sharesTokenProgram'), address: TOKEN_2022_PROGRAM },
-      { ref: ref(slot, 'logProgram'), address: LOG_PROGRAM_ID },
-    ];
-    // remaining_accounts: [ata, oracle] for EVERY basket asset, in vault order — regardless of
-    // which one is the traded target (the real program needs the full set to compute NAV; see
-    // module header). The target's own [ata, oracle] pair legitimately appears TWICE (once as the
-    // dedicated vault_asset_ata slot above, once here) — confirmed against the six real dry-runs.
-    for (let i = 0; i < c.assets.length; i++) {
-      accounts.push({ ref: ref(slot, `ata${i}`), address: c.assets[i]!.ata, writable: true });
-      accounts.push({ ref: ref(slot, `oracle${i}`), address: c.assets[i]!.oracle });
-    }
-
-    return {
-      programId: CARROT_PROGRAM_ID,
-      prefix: op === 'issue' ? ISSUE_DISCRIMINATOR : REDEEM_DISCRIMINATOR,
-      suffix: Uint8Array.from([]),
-      patch: 'in',
-      accounts,
-    };
-  },
-  referenceQuote(base, state: AccountBytesMap, params: readonly bigint[]) {
-    const c = carrotConfig(base);
-    const { op, assetId } = parseCarrotDirection(c.direction);
-    const idx = c.assets.findIndex((a) => a.assetId === assetId);
-    if (idx === -1) throw new Error(`carrot vault ${c.pool}: asset id ${assetId} not present at referenceQuote time`);
-
-    let nav = 0n;
-    const balances: bigint[] = [];
-    const prices: bigint[] = [];
-    for (let i = 0; i < c.assets.length; i++) {
-      const a = c.assets[i]!;
-      const ataData = state[a.ata];
-      const oracleData = state[a.oracle];
-      if (ataData === undefined) throw new Error(`carrot ladder reference is missing ata ${a.ata}`);
-      if (oracleData === undefined) throw new Error(`carrot ladder reference is missing oracle ${a.oracle}`);
-      const bal = readUintLE(ataData, ATA_AMOUNT_OFFSET, 8);
-      const priceOffset = Number(params[CARROT_MAX_ASSETS + i]!);
-      const price = readUintLE(oracleData, priceOffset, 8);
-      const scale = params[i]!;
-      balances.push(bal);
-      prices.push(price);
-      nav += bal * price * scale;
-    }
-    const crtData = state[c.sharesMint];
-    if (crtData === undefined) throw new Error(`carrot ladder reference is missing shares mint ${c.sharesMint}`);
-    const supply = readUintLE(crtData, MINT_SUPPLY_OFFSET, 8);
-    const scaleT = params[idx]!;
-    const priceT = prices[idx]!;
-    const feeBps = params[CARROT_MAX_ASSETS * 2]!;
-    const ataT = balances[idx]!;
-
-    if (op === 'issue') {
-      return (x: bigint): bigint => {
-        if (x === 0n || nav === 0n) return 0n;
-        const depositValue = x * priceT * scaleT;
-        return (depositValue * supply) / nav;
-      };
-    }
-    return (x: bigint): bigint => {
-      if (x === 0n || supply === 0n) return 0n;
-      const denom = priceT * scaleT;
-      if (denom === 0n) return 0n;
-      const grossCommon = (x * nav) / supply;
-      const grossOut = grossCommon / denom;
-      const fee = (grossOut * feeBps) / 10000n;
-      let net = grossOut - fee;
-      if (net < 0n) net = 0n;
-      if (net > ataT) net = ataT;
-      return net;
-    };
-  },
-  depthReserves(base, state: AccountBytesMap) {
-    const c = carrotConfig(base);
-    const { op, assetId } = parseCarrotDirection(c.direction);
-    const target = requireAsset(c, assetId);
-    const ataData = state[target.ata];
-    if (ataData === undefined) throw new Error(`carrot ladder depth is missing ata ${target.ata}`);
-    const crtData = state[c.sharesMint];
-    if (crtData === undefined) throw new Error(`carrot ladder depth is missing shares mint ${c.sharesMint}`);
-    const assetBalance = readUintLE(ataData, ATA_AMOUNT_OFFSET, 8);
-    const supply = readUintLE(crtData, MINT_SUPPLY_OFFSET, 8);
-    // issue: unbounded pool-side — the asset's own vault balance and the CRT supply are SIZE
-    // PROXIES for relative-depth ranking (same convention as sanctum-stake-pool), not a hard cap.
-    // redeem: reserveOut is the TRUE hard cap (the saturating clamp above), not just a proxy.
-    return op === 'issue' ? { reserveIn: assetBalance, reserveOut: supply } : { reserveIn: supply, reserveOut: assetBalance };
-  },
-  continuousFees(base, _state, params: readonly bigint[]) {
-    const c = carrotConfig(base);
-    const { op } = parseCarrotDirection(c.direction);
-    if (op === 'issue') return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };
-    const feeBps = params[CARROT_MAX_ASSETS * 2]!;
-    const feePpm = feeBps > 10_000n ? 1_000_000n : feeBps * 100n;
-    return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - feePpm };
-  },
 };
 
 /** Prepare-time direction gate: self-drops the SPECIFIC direction (not the whole vault) if its asset's oracle reading is stale. */

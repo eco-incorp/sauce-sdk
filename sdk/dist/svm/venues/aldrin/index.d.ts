@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 export declare const ALDRIN_V1_PROGRAM_ID: Address<"AMM55ShdkoGRB5jVYPjWziwk8m5MpwyDgsMWHaMSQWH6">;
 export declare const ALDRIN_V2_PROGRAM_ID: Address<"CURVGoZn8zycx6FXwwevgBTB2gVvdbGTEpvMJDbgs2t4">;
 export type AldrinDirection = 'baseToQuote' | 'quoteToBase';
@@ -31,6 +31,4 @@ export declare const aldrinV2: {
     programId: Address<"CURVGoZn8zycx6FXwwevgBTB2gVvdbGTEpvMJDbgs2t4">;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<AldrinPoolConfig>;
 };
-export declare const aldrinLadder: SvmVenueLadder;
-export declare const aldrinV2Ladder: SvmVenueLadder;
 //# sourceMappingURL=index.d.ts.map

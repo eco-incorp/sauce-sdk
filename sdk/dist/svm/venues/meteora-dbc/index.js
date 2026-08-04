@@ -61,7 +61,16 @@
  * base_reserve@232, quote_reserve@240 on VirtualPool; quote_mint@8,
  * token_decimal@235 on PoolConfig --- land exactly where the const_assert
  * arithmetic predicts).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec } from '@solana/kit';
 import { ceilDiv, readUintLE } from '../math.js';
 const SLUG = 'meteora-dbc';

@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "xorca";
 export declare const XORCA_PROGRAM_ID: Address<'StaKE6XNKVVhG8Qu9hDJBqCW3eRe7MDGLz17nJZetLT'>;
 /** Hardcoded program constants (`cpi/token/mod.rs`) — never stored as pool-account bytes. */
@@ -35,6 +35,5 @@ export interface XorcaPoolConfig extends PoolConfig {
  * misquoted — rather than trusting the hardcoded address blindly.
  */
 export declare function fetchXorcaConfig(load: AccountLoader, pool: Address): Promise<XorcaPoolConfig>;
-export declare const xorcaLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

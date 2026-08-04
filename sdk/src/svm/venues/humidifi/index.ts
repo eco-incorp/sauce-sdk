@@ -108,7 +108,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'humidifi';
 
@@ -116,8 +116,6 @@ const SLUG = 'humidifi';
 export const HUMIDIFI_PROGRAM_ID: Address<'9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp'> = address(
   '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp',
 );
-
-const SYSVAR_CLOCK: Address = address('SysvarC1ock11111111111111111111111111111111');
 
 // ── obfuscation scheme (verified against >20 live mainnet transactions) ──
 
@@ -136,8 +134,6 @@ export function humidifiKeystream(pos: number): Uint8Array {
   return out;
 }
 
-/** chunk 0 (bytes 0-7, the "header") keystream — our own instructions carry a zero-plaintext header. */
-const HEADER_KEYSTREAM = humidifiKeystream(0);
 /** chunk 1 (bytes 8-15, amountIn) keystream, as a little-endian u64 — XORing a runtime LE value
  *  with this constant is byte-for-byte equivalent to XORing the two 8-byte arrays (see file header
  *  item 2 and `buildSwapV2` below), so this is exactly what `patchXorMaskIn` needs to be. */
@@ -147,11 +143,6 @@ export const HUMIDIFI_AMOUNT_XOR_MASK: bigint = (() => {
   for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(k[i]!);
   return v;
 })();
-/** chunk 2 (bytes 16-23: direction flag + 7 zero-plaintext trailer bytes) keystream. */
-const CHUNK2_KEYSTREAM = humidifiKeystream(2);
-/** chunk 3 (byte 24 only) keystream. */
-const CHUNK3_KEYSTREAM = humidifiKeystream(3);
-
 /** Deobfuscate a captured 25-byte HumidiFi swap instruction (test/verification use). */
 export function humidifiDeobfuscate(data: Uint8Array): Uint8Array {
   const out = new Uint8Array(data.length);
@@ -233,11 +224,6 @@ export interface HumidiFiPoolConfig extends PoolConfig {
   quoteDecimals: number;
 }
 
-function humidifiConfig(cfg: PoolConfig): HumidiFiPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-  return cfg as HumidiFiPoolConfig;
-}
-
 /**
  * Registry lookup + liveness check ONLY — this family's pool account carries
  * no plaintext structure we can decode (file header item 5), so there is
@@ -259,9 +245,6 @@ export async function fetchHumidifiConfig(load: AccountLoader, pool: Address): P
   return { venue: SLUG, pool, direction: 'baseToQuote', ...entry };
 }
 
-const VAULT_AMOUNT_OFFSET = 64;
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
 /**
  * Safety haircut on the INPUT before a plain constant-product curve — NOT a
  * claim about HumidiFi's real fee (unknown, see file header item 6). Only
@@ -273,147 +256,3 @@ const ref = (slot: number, role: string): string => `s${slot}:${role}`;
  * calibrated against the worst pool sampled, not the best-sampled one.
  */
 export const HUMIDIFI_SAFETY_FEE_PPM = 300_000n;
-const FEE_PPM_DENOM = 1_000_000n;
-
-export const humidifiLadder: SvmVenueLadder = {
-  slug: SLUG,
-  defaultRungs: 4,
-  shapeKey(base: PoolConfig): string {
-    const cfg = humidifiConfig(base);
-    return `${SLUG}:${cfg.direction}`;
-  },
-  helpers() {
-    return [
-      {
-        name: 'qHumidiFi',
-        source: [
-          'function qHumidiFi(x, rin, rout) {',
-          '  if (x === 0) { return 0 }',
-          `  const net = Math.mulDiv(x, ${HUMIDIFI_SAFETY_FEE_PPM}, ${FEE_PPM_DENOM});`,
-          '  return Math.mulDiv(net, rout, rin + net);',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  paramCount: 0,
-  paramsFor(): bigint[] {
-    return [];
-  },
-  quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = humidifiConfig(base);
-    return [
-      { ref: ref(slot, 'basevault'), address: cfg.baseVault },
-      { ref: ref(slot, 'quotevault'), address: cfg.quoteVault },
-    ];
-  },
-  emitSetup(base: PoolConfig, slot: number): string {
-    const cfg = humidifiConfig(base);
-    const [vinRef, voutRef] =
-      cfg.direction === 'quoteToBase' ? [ref(slot, 'quotevault'), ref(slot, 'basevault')] : [ref(slot, 'basevault'), ref(slot, 'quotevault')];
-    return [
-      `  const s${slot}rin = accountUint(${JSON.stringify(vinRef)}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-      `  const s${slot}rout = accountUint(${JSON.stringify(voutRef)}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-    ].join('\n');
-  },
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    return `qHumidiFi(${x}, s${slot}rin, s${slot}rout)`;
-  },
-  /**
-   * Builds the swap CPI's KNOWN-CORRECT surface (program id, the two vaults,
-   * token program, SysvarClock, and the amountIn XOR-patched via
-   * `patchXorMaskIn` — see the consuming app SVM codegen) — but see file header item
-   * 4: two accounts (a per-transaction pair this recipe cannot derive) and
-   * the 8-byte header (a per-transaction commitment this recipe cannot
-   * produce) have NO correct value here. Both are filled with a
-   * zero-plaintext placeholder (still correctly XOR-obfuscated, so the
-   * BYTES this emits match what a real all-zero-header trade would look
-   * like) rather than garbage, but the deployed program is expected to
-   * reject a not-pre-negotiated trade at this point — this is why
-   * `FAMILIES.humidifi.gate` in the consuming app SVM solver entry drops every candidate
-   * before compile today. Kept real (not stubbed) so the encoding itself —
-   * the part that IS fully solved — stays tested against the exact bytes
-   * captured on mainnet.
-   */
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    const cfg = humidifiConfig(base);
-    const directionFlag = cfg.direction === 'quoteToBase' ? 1 : 0;
-    const suffixByte0 = directionFlag ^ CHUNK2_KEYSTREAM[0]!;
-    const suffix = Uint8Array.from([
-      suffixByte0,
-      CHUNK2_KEYSTREAM[1]!,
-      CHUNK2_KEYSTREAM[2]!,
-      CHUNK2_KEYSTREAM[3]!,
-      CHUNK2_KEYSTREAM[4]!,
-      CHUNK2_KEYSTREAM[5]!,
-      CHUNK2_KEYSTREAM[6]!,
-      CHUNK2_KEYSTREAM[7]!,
-      CHUNK3_KEYSTREAM[0]!,
-    ]);
-    return {
-      programId: HUMIDIFI_PROGRAM_ID,
-      prefix: HEADER_KEYSTREAM.slice(),
-      suffix,
-      patch: 'in',
-      accounts: [
-        { ref: user.owner, signer: true },
-        { ref: ref(slot, 'pool'), address: cfg.pool },
-        { ref: ref(slot, 'basevault'), address: cfg.baseVault, writable: true },
-        { ref: ref(slot, 'quotevault'), address: cfg.quoteVault, writable: true },
-        // Per-transaction accounts this recipe cannot derive (file header item 4b) —
-        // placeholders so the account LIST SHAPE matches; never reachable (the family gate).
-        { ref: ref(slot, 'pool'), address: cfg.pool },
-        { ref: ref(slot, 'pool'), address: cfg.pool },
-        { ref: ref(slot, 'clock'), address: SYSVAR_CLOCK },
-        cfg.direction === 'quoteToBase'
-          ? { ref: user.inAta, writable: true }
-          : { ref: user.outAta, writable: true },
-        cfg.direction === 'quoteToBase'
-          ? { ref: user.outAta, writable: true }
-          : { ref: user.inAta, writable: true },
-      ],
-    };
-  },
-  referenceQuote(base: PoolConfig, state: AccountBytesMap): (x: bigint) => bigint {
-    const cfg = humidifiConfig(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const readAmount = (data: Uint8Array): bigint => {
-      let v = 0n;
-      for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(data[VAULT_AMOUNT_OFFSET + i]!);
-      return v;
-    };
-    const [rinAddr, routAddr] = cfg.direction === 'quoteToBase' ? [cfg.quoteVault, cfg.baseVault] : [cfg.baseVault, cfg.quoteVault];
-    const rin = readAmount(bytes(rinAddr));
-    const rout = readAmount(bytes(routAddr));
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      const net = (x * HUMIDIFI_SAFETY_FEE_PPM) / FEE_PPM_DENOM;
-      return (net * rout) / (rin + net);
-    };
-  },
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const cfg = humidifiConfig(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-      return data;
-    };
-    const readAmount = (data: Uint8Array): bigint => {
-      let v = 0n;
-      for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(data[VAULT_AMOUNT_OFFSET + i]!);
-      return v;
-    };
-    const rBase = readAmount(bytes(cfg.baseVault));
-    const rQuote = readAmount(bytes(cfg.quoteVault));
-    return cfg.direction === 'quoteToBase' ? { reserveIn: rQuote, reserveOut: rBase } : { reserveIn: rBase, reserveOut: rQuote };
-  },
-  continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
-    // Measurement-only oracle input (never a gate) — reuse the same conservative
-    // haircut as the real curve; there is no separate protocol-fee figure to report.
-    return { gammaPpm: HUMIDIFI_SAFETY_FEE_PPM, muPpm: FEE_PPM_DENOM };
-  },
-};

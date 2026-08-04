@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "defituna";
 export declare const DEFITUNA_PROGRAM_ID: Address<"fUSioN9YKKSa3CUC2YUc4tPkHJ5Y6XW1yz8y6F7qWz9">;
 export declare const FUSION_POOL_ACCOUNT_SIZE = 423;
@@ -54,8 +54,6 @@ export interface DefiTunaPoolConfig extends PoolConfig {
         bToA: DefiTunaWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function defitunaWindowFor(cfg: DefiTunaPoolConfig): DefiTunaWindow;
 /** Fetch + decode one FusionPool and freeze both directions' boundary windows. Read-only against the loader. */
 export declare function fetchDefiTunaPoolConfig(load: AccountLoader, pool: Address): Promise<DefiTunaPoolConfig>;
 /** Family facade for the recipe orchestrator (ladder-only, like orca-whirlpool/raydium-clmm/byreal). */
@@ -65,6 +63,5 @@ export declare const defituna: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchDefiTunaPoolConfig;
 };
-export declare const defitunaLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

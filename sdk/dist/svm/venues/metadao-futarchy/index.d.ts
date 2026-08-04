@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "metadao-futarchy";
 export declare const METADAO_FUTARCHY_PROGRAM_ID: Address<'FUTARELBfJfQ8RDGhg1wdhddq1odMAJUePHFuBYfUxKq'>;
 /**
@@ -30,6 +30,5 @@ export interface MetaDaoFutarchySpotPoolConfig extends PoolConfig {
 export declare function fetchMetaDaoFutarchySpotConfig(load: AccountLoader, pool: Address): Promise<MetaDaoFutarchySpotPoolConfig>;
 /** The COLD, venue-exact quote (see the file header's derivation). */
 export declare function metadaoFutarchySpotQuote(x: bigint, rin: bigint, rout: bigint): bigint;
-export declare const metadaoFutarchySpotLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

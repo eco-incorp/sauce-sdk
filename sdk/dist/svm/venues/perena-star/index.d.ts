@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 export declare const PERENA_STAR_PROGRAM_ID: Address<"save8RQVPMWNTzU18t3GBvBkN9hT7jsGjiCQ28FpD9H">;
 export interface PerenaStarPoolConfig extends PoolConfig {
     venue: 'perena-star';
@@ -20,6 +20,5 @@ export declare const perenaStar: {
     programId: Address<"save8RQVPMWNTzU18t3GBvBkN9hT7jsGjiCQ28FpD9H">;
     fetchPoolConfig: typeof fetchPerenaStarPoolConfig;
 };
-export declare const perenaStarLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

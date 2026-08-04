@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "vault-liquid-unstake";
 export interface VaultLiquidUnstakePoolConfig extends PoolConfig {
     venue: typeof SLUG;
@@ -32,6 +32,5 @@ export declare const vaultLiquidUnstake: {
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<VaultLiquidUnstakePoolConfig>;
     quoteAccounts(cfg: PoolConfig): VenueAccount[];
 };
-export declare const vaultLiquidUnstakeLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

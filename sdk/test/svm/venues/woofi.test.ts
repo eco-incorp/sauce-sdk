@@ -22,11 +22,8 @@
  */
 import { resolve } from 'path';
 import { address } from '@solana/kit';
-import { compile } from '@eco-incorp/sauce-compiler';
 import { fetchWoofiConfig, woofi } from '../../../src/svm/venues/woofi/index.js';
-import type { WoofiPoolConfig } from '../../../src/svm/venues/woofi/index.js';
-import { woofiLadder, woofiApplyFee, woofiCalcQuoteAmountSellBase, woofiCalcBaseAmountSellQuote } from '../../../src/svm/venues/woofi/ladder.js';
-import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
+import { fixtureLoader, loadFixtures } from '../fixtures.js';
 
 const REAL_FIXTURES = resolve(process.cwd(), 'test/svm/fixtures/woofi');
 const PATCHED_FIXTURES = resolve(process.cwd(), 'test/svm/fixtures/woofi-patched');
@@ -65,123 +62,6 @@ describe('fetchWoofiConfig: decodes the real WooAmmPool bundle + resolves the ba
     poolBuf.set(new Uint8Array(raw), 457);
     const load = async (addr: string) => (addr === POOL ? new Uint8Array(poolBuf) : (data.get(addr) ? new Uint8Array(data.get(addr)!) : null));
     await expect(fetchWoofiConfig(load as any, POOL)).rejects.toThrow(/base-to-base/);
-  });
-});
-
-describe('the real fixture: the venue’s OWN feasibility gate is genuinely tripped right now', () => {
-  it('self-drops to 0 at every size (stale keeper price, out of bound vs the live Pyth cross-price)', async () => {
-    const fixtures = loadFixtures(REAL_FIXTURES);
-    const load = fixtureLoader(fixtures);
-    const state = fixtureBytesMap(fixtures);
-    const cfg = await fetchWoofiConfig(load, POOL);
-    const params = woofiLadder.paramsFor(cfg);
-    // A "now" far enough from the dumped Pyth publishTime that staleness alone
-    // would also explain a 0 (belt-and-suspenders — the bound failure below is
-    // independent of this and would still fire even with a fresh clock).
-    const quote = woofiLadder.referenceQuote(cfg, state, params, 1_785_540_000n);
-    expect(quote(0n)).toBe(0n);
-    expect(quote(1_000_000n)).toBe(0n);
-    expect(quote(1_000_000_000n)).toBe(0n);
-    const caps = woofiLadder.referenceCapacities!(cfg, state, params, 1_785_540_000n);
-    expect(caps([1_000_000n, 1_000_000_000n])).toEqual([0n, 0n]);
-  });
-});
-
-describe('the patched (synthetic-but-decode-realistic) fixture: the sPMM math, both directions', () => {
-  let cfg: WoofiPoolConfig;
-  let state: ReturnType<typeof fixtureBytesMap>;
-
-  beforeAll(async () => {
-    const fixtures = loadFixtures(PATCHED_FIXTURES);
-    const load = fixtureLoader(fixtures);
-    state = fixtureBytesMap(fixtures);
-    cfg = (await fetchWoofiConfig(load, POOL)) as WoofiPoolConfig;
-  });
-
-  it('sellBase: quote(0) === 0, monotone nondecreasing, saturates at the real (thin) USDC vault balance', () => {
-    const params = woofiLadder.paramsFor(cfg);
-    const quote = woofiLadder.referenceQuote(cfg, state, params, PATCHED_CLOCK);
-    expect(quote(0n)).toBe(0n);
-    let prev = -1n;
-    let sawPlateau = false;
-    const sizes = Array.from({ length: 60 }, (_, i) => BigInt(Math.floor(2 ** (i / 3))));
-    for (const x of sizes) {
-      const out = quote(x);
-      expect(out >= prev).toBe(true);
-      if (out === prev && prev > 0n) sawPlateau = true;
-      prev = out;
-    }
-    expect(sawPlateau).toBe(true); // the real USDC vault (2.25 USDC) genuinely binds within this sweep
-
-    // Exact hand-check at a small, unclamped size (matches swap_math.rs's calc_quote_amount_sell_base
-    // + the once, rounding-UP fee — see the file header).
-    const priceOut = 8_459_153_000n; // the stored wooracle.price (unchanged by the patch)
-    const spread = 999_270_300_000_000n; // this pool's live spread (unchanged by the patch)
-    const raw = woofiCalcQuoteAmountSellBase(1_000_000n, priceOut, cfg.coeff, spread, cfg.priceDec, cfg.quoteDec, cfg.baseDec, cfg.maxGamma, cfg.maxNotionalSwap);
-    const net = woofiApplyFee(raw, cfg.feeRate);
-    expect(quote(1_000_000n)).toBe(net);
-    expect(net).toBeGreaterThan(0n);
-  });
-
-  it('sellQuote: quote(0) === 0, monotone, saturates at the real (thin) SOL vault balance', () => {
-    const rev: WoofiPoolConfig = { ...cfg, direction: 'sellQuote' };
-    const params = woofiLadder.paramsFor(rev);
-    const quote = woofiLadder.referenceQuote(rev, state, params, PATCHED_CLOCK);
-    expect(quote(0n)).toBe(0n);
-    let prev = -1n;
-    let sawPlateau = false;
-    const sizes = Array.from({ length: 60 }, (_, i) => BigInt(Math.floor(2 ** (i / 3))));
-    for (const x of sizes) {
-      const out = quote(x);
-      expect(out >= prev).toBe(true);
-      if (out === prev && prev > 0n) sawPlateau = true;
-      prev = out;
-    }
-    expect(sawPlateau).toBe(true);
-
-    const priceOut = 8_459_153_000n;
-    const spread = 999_270_300_000_000n;
-    const net = woofiApplyFee(1_000n, cfg.feeRate);
-    const expected = woofiCalcBaseAmountSellQuote(net, priceOut, cfg.coeff, spread, cfg.priceDec, cfg.quoteDec, cfg.baseDec, cfg.maxGamma, cfg.maxNotionalSwap);
-    expect(quote(1_000n)).toBe(expected);
-    expect(expected).toBeGreaterThan(0n);
-  });
-
-  it('capacityInputVar / referenceCapacities are wired and never exceed the grid point', () => {
-    expect(woofiLadder.capacityInputVar).toBeDefined();
-    expect(woofiLadder.referenceCapacities).toBeDefined();
-    expect(woofiLadder.capacityInputVar!(2)).toBe('s2cx');
-    const params = woofiLadder.paramsFor(cfg);
-    const caps = woofiLadder.referenceCapacities!(cfg, state, params, PATCHED_CLOCK);
-    const grid = [1_000n, 1_000_000n, 100_000_000n, 100_000_000_000n];
-    const out = caps(grid);
-    out.forEach((c, i) => expect(c).toBeLessThanOrEqual(grid[i]));
-    expect(out[0] <= out[1]).toBe(true);
-    expect(out[1] <= out[2]).toBe(true);
-    expect(out[2]).toBe(out[3]); // saturated well before the largest grid point
-  });
-});
-
-describe('the emitted fragment compiles as valid SauceScript', () => {
-  it.each(['sellBase', 'sellQuote'] as const)('%s: emitSetup + two ladder rungs + emitFinalQuote', async (direction) => {
-    const fixtures = loadFixtures(PATCHED_FIXTURES);
-    const load = fixtureLoader(fixtures);
-    const base = (await fetchWoofiConfig(load, POOL)) as WoofiPoolConfig;
-    const cfg: WoofiPoolConfig = { ...base, direction };
-    const params = woofiLadder.paramsFor(cfg).map((v) => v.toString());
-    const source = [
-      'function main() {',
-      '  let s0en = 1;',
-      woofiLadder.emitSetup(cfg, 0, params),
-      woofiLadder.emitLadderQuote!(cfg, 0, 0, '100000', 's0o1'),
-      woofiLadder.emitLadderQuote!(cfg, 0, 1, '500000', 's0o2'),
-      woofiLadder.emitFinalQuote!(cfg, 0, '250000', 'qFinal'),
-      '  return qFinal;',
-      '}',
-    ].join('\n');
-    const { bytecode, accountPlan } = compile(source, { target: 'svm' });
-    expect(bytecode[0].length).toBeGreaterThan(0);
-    expect(accountPlan?.metas.map((m) => m.ref).sort()).toEqual(['s0:wc', 's0:or', 's0:pb', 's0:pq', 's0:vc', 's0:wp'].sort());
   });
 });
 

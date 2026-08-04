@@ -159,8 +159,7 @@
  */
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'raydium-launchlab' as const;
 
@@ -171,20 +170,9 @@ function address_(s: string): Address {
 export const RAYDIUM_LAUNCHLAB_PROGRAM_ID = address_('LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj');
 const TOKEN_PROGRAM = address_('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const TOKEN_2022_PROGRAM = address_('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
-const SYSTEM_PROGRAM = address_('11111111111111111111111111111111');
-/** PDA(["vault_auth_seed"], PROGRAM) — fixed program-level authority, verified live. */
-const AUTH = address_('WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh');
-/** PDA(["__event_authority"], PROGRAM) — fixed program-level Anchor CPI-event authority, verified live. */
-const EVENT_AUTHORITY = address_('2DPAtwB8L12vrMRExbLuyGnC7n2J5LNoZQSejeQGpwkr');
-
 const POOL_STATE_DISCRIMINATOR = [247, 237, 227, 245, 215, 195, 222, 70];
 const GLOBAL_CONFIG_DISCRIMINATOR = [149, 8, 156, 202, 160, 252, 176, 217];
 const PLATFORM_CONFIG_DISCRIMINATOR = [160, 78, 128, 0, 248, 83, 230, 160];
-const BUY_EXACT_IN_DISCRIMINATOR = [250, 234, 13, 123, 213, 156, 19, 236];
-const SELL_EXACT_IN_DISCRIMINATOR = [149, 39, 222, 155, 211, 124, 152, 26];
-
-const FEE_RATE_DENOMINATOR = 1_000_000n;
-
 function hasDiscriminator(data: Uint8Array, discriminator: readonly number[]): boolean {
   return data.length >= 8 && discriminator.every((byte, i) => data[i] === byte);
 }
@@ -250,11 +238,6 @@ export interface RaydiumLaunchlabPoolConfig extends PoolConfig {
   creatorVault: Address;
 }
 
-function asCfg(cfg: PoolConfig): RaydiumLaunchlabPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config for pool ${cfg.pool}`);
-  return cfg as RaydiumLaunchlabPoolConfig;
-}
-
 export const raydiumLaunchlab = {
   slug: SLUG,
   kind: 'constant-product' as const,
@@ -318,186 +301,3 @@ export const raydiumLaunchlab = {
   },
 };
 
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-export const raydiumLaunchlabLadder: SvmVenueLadder = {
-  slug: SLUG,
-  shapeKey(base) {
-    const cfg = asCfg(base);
-    return `${SLUG}:${cfg.direction}`;
-  },
-  helpers(base) {
-    const cfg = asCfg(base);
-    if (cfg.direction === 'baseToQuote') {
-      // sell_exact_in: fee is a ceil-taken cut of the GROSS quote output —
-      // Curve.sellExactIn. No capacity clamp needed: the constant-product
-      // formula is asymptotically bounded under (virtual_quote + real_quote)
-      // for any finite input.
-      return [
-        {
-          name: 'qLaunchlabSell',
-          source: [
-            'function qLaunchlabSell(x, vb, vq, rb, rq, fr) {',
-            '  if (x === 0) { return 0 }',
-            '  const rin = vb - rb;',
-            '  const rout = vq + rq;',
-            '  const raw = Math.mulDiv(x, rout, rin + x);',
-            '  const fee = (raw * fr + 999999) / 1000000;',
-            '  if (fee > raw) { return 0 }',
-            '  return raw - fee;',
-            '}',
-          ].join('\n'),
-        },
-      ];
-    }
-    // buy_exact_in: fee is a ceil-taken cut of the INPUT — Curve.buyExactIn.
-    // `cap` (total_base_sell - real_base, from emitSetup) SATURATES the raw
-    // quote instead of letting it run past the pool's remaining sellable
-    // supply — see the module header's CAPACITY note.
-    return [
-      {
-        name: 'qLaunchlabBuy',
-        source: [
-          'function qLaunchlabBuy(x, vb, vq, rb, rq, cap, fr) {',
-          '  if (x === 0) { return 0 }',
-          '  const fee = (x * fr + 999999) / 1000000;',
-          '  const net = x - fee;',
-          '  const rin = vq + rq;',
-          '  const rout = vb - rb;',
-          '  const raw = Math.mulDiv(net, rout, rin + net);',
-          '  if (raw > cap) { return cap }',
-          '  return raw;',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  paramCount: 0,
-  paramsFor() {
-    return [];
-  },
-  quoteRefs(base, slot) {
-    const cfg = asCfg(base);
-    return [
-      { ref: ref(slot, 'pool'), address: cfg.pool },
-      { ref: ref(slot, 'gcfg'), address: cfg.globalConfig },
-      { ref: ref(slot, 'pcfg'), address: cfg.platformConfig },
-    ];
-  },
-  emitSetup(base, slot) {
-    const cfg = asCfg(base);
-    const pool = JSON.stringify(ref(slot, 'pool'));
-    const gcfg = JSON.stringify(ref(slot, 'gcfg'));
-    const pcfg = JSON.stringify(ref(slot, 'pcfg'));
-    const lines = [
-      `  const s${slot}vb = accountUint(${pool}, 37, 8);`,
-      `  const s${slot}vq = accountUint(${pool}, 45, 8);`,
-      `  const s${slot}rb = accountUint(${pool}, 53, 8);`,
-      `  const s${slot}rq = accountUint(${pool}, 61, 8);`,
-      `  const s${slot}fr = accountUint(${gcfg}, 27, 8) + accountUint(${pcfg}, 104, 8) + accountUint(${pcfg}, 720, 8);`,
-    ];
-    if (cfg.direction !== 'baseToQuote') {
-      lines.push(`  const s${slot}cap = accountUint(${pool}, 29, 8) - s${slot}rb;`);
-    }
-    return lines.join('\n');
-  },
-  emitQuoteCall(base, slot, x) {
-    const cfg = asCfg(base);
-    if (cfg.direction === 'baseToQuote') {
-      return `qLaunchlabSell(${x}, s${slot}vb, s${slot}vq, s${slot}rb, s${slot}rq, s${slot}fr)`;
-    }
-    return `qLaunchlabBuy(${x}, s${slot}vb, s${slot}vq, s${slot}rb, s${slot}rq, s${slot}cap, s${slot}fr)`;
-  },
-  buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-    const cfg = asCfg(base);
-    const sell = cfg.direction === 'baseToQuote';
-    const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-
-    const accounts: VenueAccount[] = [
-      { ref: user.owner, signer: true, writable: true },
-      roled('auth', AUTH),
-      roled('gcfg', cfg.globalConfig),
-      roled('pcfg', cfg.platformConfig),
-      roled('pool', cfg.pool, true),
-      { ref: sell ? user.inAta : user.outAta, writable: true },
-      { ref: sell ? user.outAta : user.inAta, writable: true },
-      roled('baseVault', cfg.baseVault, true),
-      roled('quoteVault', cfg.quoteVault, true),
-      roled('baseMint', cfg.baseMint),
-      roled('quoteMint', cfg.quoteMint),
-      roled('baseTokenProgram', cfg.baseTokenProgram),
-      roled('quoteTokenProgram', TOKEN_PROGRAM),
-      roled('eventAuthority', EVENT_AUTHORITY),
-      roled('program', RAYDIUM_LAUNCHLAB_PROGRAM_ID),
-      // Remaining accounts (see module header): not in the IDL's own account
-      // list, required regardless (share_fee_rate stays 0, so no
-      // shareFeeReceiver account rides this).
-      roled('systemProgram', SYSTEM_PROGRAM),
-      roled('platformVault', cfg.platformVault, true),
-      roled('creatorVault', cfg.creatorVault, true),
-    ];
-
-    // disc(8) ++ patched amount_in u64 LE ++ minimum_amount_out u64 LE=1 ++ share_fee_rate u64 LE=0.
-    const prefix = Uint8Array.from(sell ? SELL_EXACT_IN_DISCRIMINATOR : BUY_EXACT_IN_DISCRIMINATOR);
-    const suffix = new Uint8Array(16);
-    suffix[0] = 1;
-    return { programId: RAYDIUM_LAUNCHLAB_PROGRAM_ID, prefix, suffix, patch: 'in', accounts };
-  },
-  referenceQuote(base, state: AccountBytesMap) {
-    const cfg = asCfg(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const pool = bytes(cfg.pool);
-    const gcfg = bytes(cfg.globalConfig);
-    const pcfg = bytes(cfg.platformConfig);
-    const vb = readUintLE(pool, 37, 8);
-    const vq = readUintLE(pool, 45, 8);
-    const rb = readUintLE(pool, 53, 8);
-    const rq = readUintLE(pool, 61, 8);
-    const fr = readUintLE(gcfg, 27, 8) + readUintLE(pcfg, 104, 8) + readUintLE(pcfg, 720, 8);
-    if (cfg.direction === 'baseToQuote') {
-      return (x: bigint) => {
-        if (x === 0n) return 0n;
-        const rin = vb - rb;
-        const rout = vq + rq;
-        const raw = (x * rout) / (rin + x);
-        const fee = ceilDiv(raw * fr, FEE_RATE_DENOMINATOR);
-        return raw > fee ? raw - fee : 0n;
-      };
-    }
-    const cap = readUintLE(pool, 29, 8) - rb;
-    return (x: bigint) => {
-      if (x === 0n) return 0n;
-      const fee = ceilDiv(x * fr, FEE_RATE_DENOMINATOR);
-      const net = x - fee;
-      const rin = vq + rq;
-      const rout = vb - rb;
-      const raw = (net * rout) / (rin + net);
-      return raw > cap ? cap : raw;
-    };
-  },
-  depthReserves(base, state: AccountBytesMap) {
-    const cfg = asCfg(base);
-    const pool = state[cfg.pool];
-    if (pool === undefined) throw new Error(`${SLUG} ladder depth is missing account ${cfg.pool}`);
-    const vb = readUintLE(pool, 37, 8);
-    const vq = readUintLE(pool, 45, 8);
-    const rb = readUintLE(pool, 53, 8);
-    const rq = readUintLE(pool, 61, 8);
-    return cfg.direction === 'baseToQuote' ? { reserveIn: vb - rb, reserveOut: vq + rq } : { reserveIn: vq + rq, reserveOut: vb - rb };
-  },
-  continuousFees(base, state: AccountBytesMap) {
-    const cfg = asCfg(base);
-    const gcfg = state[cfg.globalConfig];
-    const pcfg = state[cfg.platformConfig];
-    if (gcfg === undefined) throw new Error(`${SLUG} ladder fees are missing account ${cfg.globalConfig}`);
-    if (pcfg === undefined) throw new Error(`${SLUG} ladder fees are missing account ${cfg.platformConfig}`);
-    const fr = readUintLE(gcfg, 27, 8) + readUintLE(pcfg, 104, 8) + readUintLE(pcfg, 720, 8);
-    const retention = FEE_RATE_DENOMINATOR - fr;
-    return cfg.direction === 'baseToQuote' ? { gammaPpm: FEE_RATE_DENOMINATOR, muPpm: retention } : { gammaPpm: retention, muPpm: FEE_RATE_DENOMINATOR };
-  },
-};

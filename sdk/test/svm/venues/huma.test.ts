@@ -16,7 +16,6 @@ import type { Address } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import { huma, humaFeeBpsFor } from '../../../src/svm/venues/huma/index.js';
 import type { HumaPoolConfig } from '../../../src/svm/venues/huma/index.js';
-import { humaLadder } from '../../../src/svm/venues/huma/ladder.js';
 import { fixtureBytesMap, fixtureData, fixtureLoader, loadFixtures } from '../fixtures.js';
 import type { AccountFixture } from '../fixtures.js';
 
@@ -206,59 +205,6 @@ describe('huma buildSwap', () => {
     expect(lenderState).toBeDefined();
     expect(lenderState!.address).toBeUndefined(); // owner-dependent PDA — the caller must resolve it
     expect(lenderState!.writable).toBe(true);
-  });
-});
-
-describe('huma ladder v2 — shape + monotonicity/concavity', () => {
-  it('shapeKey differs by direction and fee-tier count', async () => {
-    const dep = await fetchConfig('deposit');
-    const wd = await fetchConfig('withdraw');
-    expect(humaLadder.shapeKey(dep)).not.toBe(humaLadder.shapeKey(wd));
-  });
-
-  it('referenceQuote(x) is monotone non-decreasing and concave (weakly) over a size grid, both directions', async () => {
-    for (const direction of ['deposit', 'withdraw'] as const) {
-      const cfg = await fetchConfig(direction);
-      const quote = humaLadder.referenceQuote(cfg, fixtureBytesMap(fixtures));
-      const grid = [0n, 1_000_000n, 10_000_000n, 100_000_000n, 1_000_000_000n, 10_000_000_000n, 100_000_000_000n, 10_000_000_000_000n];
-      let prevOut = 0n;
-      let prevMarginal: bigint | undefined;
-      for (let i = 1; i < grid.length; i++) {
-        const out = quote(grid[i]);
-        expect(out).toBeGreaterThanOrEqual(prevOut); // monotone
-        const marginal = (out - prevOut) * 1_000_000n / (grid[i] - grid[i - 1]);
-        if (prevMarginal !== undefined) expect(marginal).toBeLessThanOrEqual(prevMarginal + 1n); // concave (+1 wei rounding slack)
-        prevOut = out;
-        prevMarginal = marginal;
-      }
-    }
-  });
-
-  it('withdraw ladder matches the same reserve-limit cap as the v1 adapter', async () => {
-    const cfg = await fetchConfig('withdraw');
-    const quote = humaLadder.referenceQuote(cfg, fixtureBytesMap(fixtures));
-    expect(quote(1_000_000_000_000n)).toBe(RESERVE_LIMIT);
-  });
-
-  it('the real emitSetup + emitLadderQuote (multiple rungs) + emitFinalQuote fragment compiles as target-svm SauceScript', async () => {
-    for (const direction of ['deposit', 'withdraw'] as const) {
-      const cfg = await fetchConfig(direction);
-      const slot = 0;
-      const setup = humaLadder.emitSetup(cfg, slot);
-      const rung0 = humaLadder.emitLadderQuote!(cfg, slot, 0, '1000000', 'q0r0');
-      const rung1 = humaLadder.emitLadderQuote!(cfg, slot, 1, '2000000', 'q0r1');
-      const final = humaLadder.emitFinalQuote!(cfg, slot, '1500000', 'q0final');
-      const source = [
-        'function main() {',
-        setup,
-        rung0,
-        rung1,
-        final,
-        '  return q0final;',
-        '}',
-      ].join('\n');
-      expect(() => compile(source, { target: 'svm' })).not.toThrow();
-    }
   });
 });
 

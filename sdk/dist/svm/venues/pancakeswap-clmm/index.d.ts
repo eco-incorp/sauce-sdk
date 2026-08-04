@@ -75,8 +75,6 @@ export interface PancakeswapClmmPoolConfig extends PoolConfig {
         '1to0': PancakeswapClmmWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: PancakeswapClmmPoolConfig): PancakeswapClmmWindow;
 /**
  * Fetch + gate one PancakeSwap CLMM pool (see the header for the gate list)
  * and freeze both directions' boundary windows. Read-only against the loader.
