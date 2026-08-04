@@ -1,0 +1,94 @@
+# ONE-TIME, MANUAL retirement of the pre-0.5.0 versions that bundled the
+# merge-decomposition ladder-walking logic (relocated to the consuming app in 0.5.0).
+#
+# Chosen strategy (see PR that added this file):
+#   - HARD-UNPUBLISH 0.3.0 and 0.4.0 — still inside npm's 72-hour self-serve
+#     unpublish window at the time this was authored (irreversible; burns those
+#     version numbers permanently).
+#   - DEPRECATE 0.1.0 and 0.2.0 — past the 72h window, and the package is over
+#     npm's 300-downloads/week threshold, so the CLI refuses to unpublish them.
+#     Deprecation keeps them installable but warns and steers installs to 0.5.0.
+#
+# Trigger from the Actions tab (workflow_dispatch). Requires typing the exact
+# package name to confirm. Uses the same NPM_TOKEN the publish workflow uses
+# (a bypass-2FA automation token with unpublish/deprecate rights).
+#
+# This is a targeted one-shot: the versions are hardcoded so a re-run can never
+# touch 0.5.0 or any future release. Delete this file after it has run.
+name: Purge pre-0.5.0 ladder versions (one-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_package:
+        description: 'Type the EXACT package name to confirm: @eco-incorp/sauce-sdk'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: purge-ladder-versions
+  cancel-in-progress: false
+
+env:
+  PKG: '@eco-incorp/sauce-sdk'
+  DEPRECATE_MSG: 'Retired: this pre-0.5.0 release bundled the merge-decomposition ladder-walking logic that was relocated to the consuming app. Upgrade to >=0.5.0.'
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation input
+        run: |
+          if [ "${{ inputs.confirm_package }}" != "$PKG" ]; then
+            echo "::error::Confirmation '${{ inputs.confirm_package }}' does not match '$PKG'. Aborting."
+            exit 1
+          fi
+          echo "Confirmed target package: $PKG"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Show versions BEFORE
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm view "$PKG" versions
+
+      # --- Hard delete: 0.3.0 and 0.4.0 (still in the 72h self-serve window) ---
+      - name: Unpublish 0.3.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "Unpublishing $PKG@0.3.0 ..."
+          npm unpublish "$PKG@0.3.0" || echo "::warning::unpublish 0.3.0 failed (already gone, or outside the 72h window)"
+
+      - name: Unpublish 0.4.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "Unpublishing $PKG@0.4.0 ..."
+          npm unpublish "$PKG@0.4.0" || echo "::warning::unpublish 0.4.0 failed (already gone, or outside the 72h window)"
+
+      # --- Deprecate: 0.1.0 and 0.2.0 (cannot be CLI-unpublished; past 72h + >300 dl/wk) ---
+      - name: Deprecate 0.1.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm deprecate "$PKG@0.1.0" "$DEPRECATE_MSG"
+
+      - name: Deprecate 0.2.0
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm deprecate "$PKG@0.2.0" "$DEPRECATE_MSG"
+
+      - name: Show versions AFTER
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "Remaining versions:"
+          npm view "$PKG" versions
+          echo "dist-tags:"
+          npm view "$PKG" dist-tags
