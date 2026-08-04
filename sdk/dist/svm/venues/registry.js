@@ -1,4 +1,5 @@
 import { aldrinLadder } from './aldrin/index.js';
+import { perenaLadder } from './perena/index.js';
 import { sanctumStakePool3Ladder } from './sanctum-stake-pool/index.js';
 import { sanctumStakePool2Ladder } from './sanctum-stake-pool/index.js';
 import { guacswapLadder } from './bonkswap-fork/ladder.js';
@@ -167,6 +168,7 @@ export function venueAdapter(slug) {
  */
 const ladderAdapters = {
     [aldrinLadder.slug]: aldrinLadder,
+    [perenaLadder.slug]: perenaLadder,
     [sanctumStakePool3Ladder.slug]: sanctumStakePool3Ladder,
     [sanctumStakePool2Ladder.slug]: sanctumStakePool2Ladder,
     [guacswapLadder.slug]: guacswapLadder,

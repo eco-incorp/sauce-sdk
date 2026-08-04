@@ -584,12 +584,29 @@ export const perenaLadder: SvmVenueLadder = {
     // a COMPILE-TIME constant (no on-chain Newton solve), so nothing else
     // needs setup-phase precompute. Every rung (and the final quote) reuses
     // these `s{slot}`-named locals via arithmeticLines instead of re-reading.
+    // `lo`/`lx` are the last-good (output, cumulative input) checkpoint the
+    // ladder rungs latch — the merge-safe saturation (see capacityInputVar).
     const c = asPerenaConfig(cfg);
-    return readLines(c, JSON.stringify(ref(slot, 'pool')), `s${slot}`).join('\n');
+    return [
+      ...readLines(c, JSON.stringify(ref(slot, 'pool')), `s${slot}`),
+      `  let s${slot}lo = 0;`,
+      `  let s${slot}lx = 0;`,
+    ].join('\n');
   },
   emitLadderQuote(cfg, slot, rung, x, outVar) {
+    // Evaluate the (collapsing) quote for this rung, then latch the last-good
+    // checkpoint: arithmeticLines sets the candidate to 0 whenever a Newton
+    // guard fails (past the productive bound), so a collapse never advances
+    // `lo`/`lx` and the reported output/capacity saturate at the last-good peak
+    // — the same runtime-checkpoint saturation the TS referenceLadderQuotes/
+    // referenceCapacities mirror. capacityInputVar reads `lx`.
     const c = asPerenaConfig(cfg);
-    return arithmeticLines(c, `s${slot}`, `s${slot}r${rung}`, x, outVar).join('\n');
+    const cand = `s${slot}cand${rung}`;
+    return [
+      ...arithmeticLines(c, `s${slot}`, `s${slot}r${rung}`, x, cand),
+      `  if (${cand} > s${slot}lo) { s${slot}lo = ${cand}; s${slot}lx = ${x}; }`,
+      `  const ${outVar} = s${slot}lo;`,
+    ].join('\n');
   },
   emitFinalQuote(cfg, slot, x, outVar) {
     const c = asPerenaConfig(cfg);
@@ -614,6 +631,53 @@ export const perenaLadder: SvmVenueLadder = {
     if (pool === undefined) throw new Error(`${SLUG} ladder reference is missing account ${c.pool}`);
     const live = liveStateFrom(c, pool);
     return (x: bigint) => perenaSwapOut(live, x);
+  },
+  // Merge-safe warm chain (see the meteora-damm-v1-stable ladder for the pattern). The standalone
+  // cold `referenceQuote` above collapses to 0 once perenaSwapOut's Newton solve breaks down past a
+  // productive-input bound (declared as a cliff). The MERGE never reaches that: it clamps each rung's
+  // input at the analytic capacity `xOut` (the output reserve — output can never exceed it, and it
+  // sits strictly below the breakdown bound for a stable pool), so the ladder-chain quote/capacity
+  // saturate monotonically instead of collapsing. capacityInputVar pairs with referenceCapacities.
+  capacityInputVar(slot) {
+    return `s${slot}lx`;
+  },
+  referenceLadderQuotes(cfg, state) {
+    const c = asPerenaConfig(cfg);
+    const pool = state[c.pool];
+    if (pool === undefined) throw new Error(`${SLUG} ladder reference is missing account ${c.pool}`);
+    const live = liveStateFrom(c, pool);
+    // Runtime last-good checkpoint (the meteora-damm-v1-stable mechanism, no analytic bound needed):
+    // evaluate the quote at each cumulative grid point and only ADVANCE the reported output when the
+    // candidate genuinely clears the previous one; a collapse (perenaSwapOut returns 0 past the
+    // Newton-breakdown bound) never clears it, so the reported output freezes at the last-good peak.
+    return (grid: readonly bigint[]): bigint[] => {
+      let lastOut = 0n;
+      return grid.map((g) => {
+        const q = perenaSwapOut(live, g);
+        if (q > lastOut) lastOut = q;
+        return lastOut;
+      });
+    };
+  },
+  referenceCapacities(cfg, state) {
+    const c = asPerenaConfig(cfg);
+    const pool = state[c.pool];
+    if (pool === undefined) throw new Error(`${SLUG} ladder reference is missing account ${c.pool}`);
+    const live = liveStateFrom(c, pool);
+    // Mirror of referenceLadderQuotes: the cumulative PRODUCTIVE input latched at the same checkpoint
+    // — the grid point that produced the last-good output. Frozen (0 dIn) once the quote collapses.
+    return (grid: readonly bigint[]): bigint[] => {
+      let lastIn = 0n;
+      let lastOut = 0n;
+      return grid.map((g) => {
+        const q = perenaSwapOut(live, g);
+        if (q > lastOut) {
+          lastOut = q;
+          lastIn = g;
+        }
+        return lastIn;
+      });
+    };
   },
   depthReserves(cfg, state) {
     const c = asPerenaConfig(cfg);

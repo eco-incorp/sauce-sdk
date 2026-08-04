@@ -117,6 +117,8 @@ import {
   juplendAmmLadder,
   aldrin,
   aldrinLadder,
+  perenaLadder,
+  perena,
   sanctumStakePool3Ladder,
   sanctumStakePool3,
   sanctumStakePool2Ladder,
@@ -1396,6 +1398,27 @@ const FAMILIES: Family[] = [
     },
   },
   {
+    slug: 'perena',
+    ladder: perenaLadder,
+    async variants() {
+      const POOL = address('2w4A1eGyjRutakyFdmVyBiLPf98qKxNTC2LpuwhaCruZ');
+      const fixtures = fixturesFor('perena');
+      const cfg = await perena.fetchPoolConfig(fixtureLoader(fixtures), POOL);
+      const state = fixtureBytesMap(fixtures);
+      return [
+        { label: 'aToB', cfg, state },
+        { label: 'bToA', cfg: { ...cfg, direction: 'bToA' }, state },
+      ];
+    },
+    // Stableswap: the standalone cold referenceQuote collapses past a Newton-breakdown
+    // productive-input bound (LATENT — the merge clamps at the output reserve, never reaching it),
+    // the same disclosed-gap class as meteora-damm-v1-stable. Pinned (x, peak) per direction.
+    declaredCliffs: {
+      aToB: { x: 130470369464n, peak: 129704020617n },
+      bToA: { x: 105279280774n, peak: 104570196064n },
+    },
+  },
+  {
     slug: 'raydium-cp-swap',
     ladder: raydiumCpSwapLadder,
     async variants() {
@@ -1986,8 +2009,8 @@ const FAMILIES: Family[] = [
 describe('LADDER_REGISTRY count assertion', () => {
   it('this file enumerates exactly the 23 families the SDK registers — adding one without wiring it here fails loudly', () => {
     const registered = listLadderVenues();
-    expect(registered).toHaveLength(91);
-    expect(FAMILIES).toHaveLength(91);
+    expect(registered).toHaveLength(92);
+    expect(FAMILIES).toHaveLength(92);
     expect(FAMILIES.map((f) => f.slug).sort()).toEqual([...registered].sort());
   });
 });
@@ -2057,8 +2080,8 @@ describe.each(FAMILIES)('$slug', (family) => {
 describe('KNOWN, DISCLOSED gaps — standalone cold referenceQuote collapses past a boundary the LADDER-CHAIN path already saturates at (LATENT: the merge never reaches this; NOT a safety property)', () => {
   const withGaps = FAMILIES.filter((f) => f.declaredCliffs !== undefined);
 
-  it('exactly ONE family still carries a disclosed gap: meteora-damm-v1-stable (closed-form, a strict idle-float bound behind a vault-share transform, needing an inverse-Newton derivation not attempted here) — the three window-walking families (orca-whirlpool, raydium-clmm, meteora-dlmm) plus solfi-v2 plus goonfi-v2 were FIXED in the five-family SDK correctness batch (each now saturates instead of collapsing — see their own ladder.ts), and obric-v2 never had one (fixed alongside this guard)', () => {
-    expect(withGaps.map((f) => f.slug).sort()).toEqual(['meteora-damm-v1-stable']);
+  it('exactly TWO families carry a disclosed gap: meteora-damm-v1-stable and perena — both stableswaps whose standalone cold referenceQuote collapses past a Newton-breakdown productive-input bound, saved on the merge path by a runtime last-good checkpoint (referenceLadderQuotes/referenceCapacities + capacityInputVar); the three window-walking families plus solfi-v2/goonfi-v2 were saturation-fixed, and obric-v2 never had one', () => {
+    expect(withGaps.map((f) => f.slug).sort()).toEqual(['meteora-damm-v1-stable', 'perena']);
   });
 
   it.each(withGaps.flatMap((f) => Object.entries(f.declaredCliffs!).map(([label, gap]) => ({ family: f, label, gap }))))(
