@@ -45,6 +45,8 @@ export { ALDRIN_V1_PROGRAM_ID, ALDRIN_V2_PROGRAM_ID, aldrin, aldrinV2 } from './
 export type { AldrinDirection, AldrinPoolConfig } from './aldrin/index.js';
 export { ALPHAQ_PROGRAM_ID, primeAlphaqStatsAccounts, __setAlphaqStatsAccountsForTest, __resetAlphaqStatsAccountsForTest, fetchAlphaqPoolConfig, __alphaqCpQuoteForTest, __alphaqDecodeSymbolForTest, } from './alphaq/index.js';
 export type { AlphaqStatsRpc, AlphaqPoolConfig } from './alphaq/index.js';
+export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi, binaryfiLadder } from './binaryfi/index.js';
+export type { BinaryFiPoolConfig } from './binaryfi/index.js';
 export { BOOP_FUN_PROGRAM_ID, boopFun, boopFunLadder } from './boop-fun/index.js';
 export type { BoopFunPoolConfig } from './boop-fun/index.js';
 export { BISONFI_PROGRAM_ID, POOL_ACCOUNT_SIZE as BISONFI_POOL_ACCOUNT_SIZE, OFF_VAULT_A as BISONFI_OFF_VAULT_A, OFF_VAULT_B as BISONFI_OFF_VAULT_B, OFF_MINT_A as BISONFI_OFF_MINT_A, OFF_MINT_B as BISONFI_OFF_MINT_B, PRICE_OFFSET as BISONFI_PRICE_OFFSET, TS_OFFSET as BISONFI_TS_OFFSET, FEE_BPS_OFF_A as BISONFI_FEE_BPS_OFF_A, FEE_BPS_OFF_B as BISONFI_FEE_BPS_OFF_B, PRICE_SCALE as BISONFI_PRICE_SCALE, STALE_SECONDS as BISONFI_STALE_SECONDS, CAP_DIVISOR as BISONFI_CAP_DIVISOR, bisonfi, bisonfiConfig, } from './bisonfi/index.js';

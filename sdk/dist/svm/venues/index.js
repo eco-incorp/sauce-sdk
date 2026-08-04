@@ -48,6 +48,7 @@ export * from './saber-decimals-wrapper/index.js';
 export { TOKEN_PROGRAM as SCALE_COMMON_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, SCALE_AMM_PROGRAM_ID, SCALE_VMM_PROGRAM_ID, BUY_DISCRIMINATOR, SELL_DISCRIMINATOR, FEE_BENEFICIARY_SLOTS, CONFIG_SEED, POOL_SEED, CURVE_CONSTANT_PRODUCT, SCALE_CURVE_HELPER_NAME, SCALE_CURVE_HELPER_SOURCE, readUintLE as scaleCommonReadUintLE, pubkeyAt, readFeeBeneficiaries, ata, detectTokenProgram, computeScaleQuote, scaleDepthReserves, scaleContinuousFees, pda } from './scale-common.js';
 export { ALDRIN_V1_PROGRAM_ID, ALDRIN_V2_PROGRAM_ID, aldrin, aldrinV2 } from './aldrin/index.js';
 export { ALPHAQ_PROGRAM_ID, primeAlphaqStatsAccounts, __setAlphaqStatsAccountsForTest, __resetAlphaqStatsAccountsForTest, fetchAlphaqPoolConfig, __alphaqCpQuoteForTest, __alphaqDecodeSymbolForTest, } from './alphaq/index.js';
+export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi, binaryfiLadder } from './binaryfi/index.js';
 export { BOOP_FUN_PROGRAM_ID, boopFun, boopFunLadder } from './boop-fun/index.js';
 // bisonfi: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `BISONFI_` prefix.
