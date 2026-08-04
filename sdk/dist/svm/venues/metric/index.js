@@ -79,16 +79,12 @@
  * note).
  */
 import { address, getAddressCodec } from '@solana/kit';
-import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, VenueSwap } from '../types.js';
-
 const SLUG = 'metric';
 export const METRIC_PROGRAM_ID = address('Bvs46DPFxiFE6YHxLDLD6QAUcmy51FyRVPZJusPxLk3j');
 export const METRIC_ORACLE_PROGRAM_ID = address('CvGnk4HouriGypBTZhYc76esyN5kWBepWueYVeSpR1L1');
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
-
 // Pool account layout (see module doc — ground-truthed against a live pool).
 export const OFF_MINT_A = 74;
 export const OFF_VAULT_A = 106;
@@ -96,14 +92,11 @@ export const OFF_MINT_B = 138;
 export const OFF_VAULT_B = 170;
 export const OFF_ORACLE_CONFIG = 234;
 const POOL_MIN_LENGTH = OFF_ORACLE_CONFIG + 32;
-
 /** Byte offset of the paired price account's pubkey inside the oracle config account. */
 export const PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG = 103;
 const ORACLE_CONFIG_MIN_LENGTH = PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG + 32;
-
 /** `swap`'s single-byte discriminator. */
 export const METRIC_SWAP_DISCRIMINATOR = 0x01;
-
 /**
  * Conservative quotable-capacity divisor (see module doc) — the ladder never quotes more than
  * `liveReserveOut / CAP_DIVISOR` output. Mirrors zerofi's own CAP_DIVISOR precedent and rationale:
@@ -112,7 +105,6 @@ export const METRIC_SWAP_DISCRIMINATOR = 0x01;
  * measured true capacity.
  */
 export const CAP_DIVISOR = 20n;
-
 /**
  * Conservative quote haircut, in parts-per-million, folded into the baked scale so the quote is a
  * lower bound on the realized fill (never an over-quote).
@@ -137,57 +129,26 @@ export const CAP_DIVISOR = 20n;
  * pre-flight-only, so an over-optimistic quote is a whole-cook-abort risk, not just a bad fill.
  */
 export const METRIC_QUOTE_HAIRCUT_PPM = 50n;
-
 /** SPL Mint `decimals` byte offset. */
 const MINT_DECIMALS_OFFSET = 44;
-
 const codec = getAddressCodec();
-const pubkeyAt = (data: Uint8Array, offset: number): Address => codec.decode(data.subarray(offset, offset + 32));
-
-export interface MetricPoolConfig extends PoolConfig {
-  venue: typeof SLUG;
-  /** 0 = mintA -> mintB (bid applies), 1 = mintB -> mintA (ask, reciprocal, applies). */
-  direction: 0 | 1;
-  mintA: Address;
-  mintB: Address;
-  vaultA: Address;
-  vaultB: Address;
-  oracleConfig: Address;
-  priceAccount: Address;
-  tokenProgramA: Address;
-  tokenProgramB: Address;
-  decimalsA: number;
-  decimalsB: number;
-  /** Baked oracle read (32-byte off-chain oracle-read return data, u128 LE halves) — see module doc. */
-  bidQ64: bigint;
-  askQ64: bigint;
-  /**
-   * This direction's baked scale, already decimals-adjusted, haircut-folded
-   * (`METRIC_QUOTE_HAIRCUT_PPM`, so `out` is a conservative lower bound) and gcd-reduced:
-   * `out = in * scaleNum / scaleDen`.
-   */
-  scaleNum: bigint;
-  scaleDen: bigint;
-  /** This direction's baked price (bidQ64 for dir 0, askQ64 for dir 1) — informational; the quote uses scaleNum/scaleDen. */
-  bakedPrice: bigint;
+const pubkeyAt = (data, offset) => codec.decode(data.subarray(offset, offset + 32));
+function metricConfig(cfg) {
+    if (cfg.venue !== SLUG)
+        throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
+    const c = cfg;
+    if (c.direction !== 0 && c.direction !== 1) {
+        throw new Error(`${SLUG} direction must be 0 or 1, got '${String(c.direction)}'`);
+    }
+    return c;
 }
-
-function metricConfig(cfg: PoolConfig): MetricPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
-  const c = cfg as MetricPoolConfig;
-  if (c.direction !== 0 && c.direction !== 1) {
-    throw new Error(`${SLUG} direction must be 0 or 1, got '${String(c.direction)}'`);
-  }
-  return c;
+function gcd(a, b) {
+    let x = a < 0n ? -a : a;
+    let y = b < 0n ? -b : b;
+    while (y !== 0n)
+        [x, y] = [y, x % y];
+    return x === 0n ? 1n : x;
 }
-
-function gcd(a: bigint, b: bigint): bigint {
-  let x = a < 0n ? -a : a;
-  let y = b < 0n ? -b : b;
-  while (y !== 0n) [x, y] = [y, x % y];
-  return x === 0n ? 1n : x;
-}
-
 /**
  * Fold a Q64.64 price (quote-per-base atoms-agnostic) plus the two mints' decimals into a
  * gcd-reduced (num, den) atoms-to-atoms scale: `outAtoms = inAtoms * num / den`.
@@ -200,194 +161,167 @@ function gcd(a: bigint, b: bigint): bigint {
  * that sized it. The haircut rides in the exact (num, den) pair, so `referenceQuote` stays lamport-
  * exact against the SAME params the emitted fragment uses.
  */
-export function metricScaleParams(
-  priceQ64: bigint,
-  decimalsIn: number,
-  decimalsOut: number,
-  reciprocal: boolean,
-): { num: bigint; den: bigint } {
-  if (priceQ64 <= 0n) throw new Error(`${SLUG} price must be positive, got ${priceQ64}`);
-  const d = decimalsOut - decimalsIn;
-  const decNum = d >= 0 ? 10n ** BigInt(d) : 1n;
-  const decDen = d >= 0 ? 1n : 10n ** BigInt(-d);
-  let num: bigint;
-  let den: bigint;
-  if (!reciprocal) {
-    // outAtoms = inAtoms * price / 2^64, decimals-adjusted.
-    num = priceQ64 * decNum;
-    den = (1n << 64n) * decDen;
-  } else {
-    // outAtoms = inAtoms * 2^64 / price, decimals-adjusted.
-    num = (1n << 64n) * decNum;
-    den = priceQ64 * decDen;
-  }
-  // Fold the conservative haircut into the exact ratio (never a rounded float): out is now a lower
-  // bound on the realized fill, so predicted <= realized on every measured cell.
-  num *= 1_000_000n - METRIC_QUOTE_HAIRCUT_PPM;
-  den *= 1_000_000n;
-  const g = gcd(num, den);
-  return { num: num / g, den: den / g };
+export function metricScaleParams(priceQ64, decimalsIn, decimalsOut, reciprocal) {
+    if (priceQ64 <= 0n)
+        throw new Error(`${SLUG} price must be positive, got ${priceQ64}`);
+    const d = decimalsOut - decimalsIn;
+    const decNum = d >= 0 ? 10n ** BigInt(d) : 1n;
+    const decDen = d >= 0 ? 1n : 10n ** BigInt(-d);
+    let num;
+    let den;
+    if (!reciprocal) {
+        // outAtoms = inAtoms * price / 2^64, decimals-adjusted.
+        num = priceQ64 * decNum;
+        den = (1n << 64n) * decDen;
+    }
+    else {
+        // outAtoms = inAtoms * 2^64 / price, decimals-adjusted.
+        num = (1n << 64n) * decNum;
+        den = priceQ64 * decDen;
+    }
+    // Fold the conservative haircut into the exact ratio (never a rounded float): out is now a lower
+    // bound on the realized fill, so predicted <= realized on every measured cell.
+    num *= 1000000n - METRIC_QUOTE_HAIRCUT_PPM;
+    den *= 1000000n;
+    const g = gcd(num, den);
+    return { num: num / g, den: den / g };
 }
-
 export const metric = {
-  slug: SLUG,
-  kind: 'constant-product' as const,
-  programId: METRIC_PROGRAM_ID,
-
-  /**
-   * Off-chain gate + decode. `pool` is the variable-length pool account (see module doc — only the
-   * fixed 266-byte prefix is read; the trailing bin tail is not decoded). `fetchOracleQuote` is
-   * REQUIRED in practice (throws when absent): it must run the oracle program's `[0x02, feedByte]`
-   * read (any feedByte — see module doc) against `(oracleConfig, priceAccount)` and return its raw
-   * 32-byte CPI return data — a capability plain `AccountLoader` byte reads cannot provide. The
-   * consuming app supplies this via a real `simulateTransaction` (or a LiteSVM execution in tests);
-   * this adapter stays free of any RPC/simulate dependency itself.
-   */
-  async fetchPoolConfig(
-    load: AccountLoader,
-    pool: Address,
-    direction: 0 | 1 = 0,
-    fetchOracleQuote?: (oracleProgram: Address, oracleConfig: Address, priceAccount: Address) => Promise<Uint8Array>,
-  ): Promise<MetricPoolConfig> {
-    const data = await load(pool);
-    if (data === null) throw new Error(`${SLUG} pool ${pool} account not found`);
-    if (data.length < POOL_MIN_LENGTH) {
-      throw new Error(`${SLUG} pool ${pool} account is ${data.length} bytes, too short for the fixed layout (need >= ${POOL_MIN_LENGTH})`);
-    }
-
-    const mintA = pubkeyAt(data, OFF_MINT_A);
-    const mintB = pubkeyAt(data, OFF_MINT_B);
-    const vaultA = pubkeyAt(data, OFF_VAULT_A);
-    const vaultB = pubkeyAt(data, OFF_VAULT_B);
-    const oracleConfig = pubkeyAt(data, OFF_ORACLE_CONFIG);
-
-    const oracleConfigData = await load(oracleConfig);
-    if (oracleConfigData === null) throw new Error(`${SLUG} pool ${pool} oracleConfig ${oracleConfig} account not found`);
-    if (oracleConfigData.length < ORACLE_CONFIG_MIN_LENGTH) {
-      throw new Error(
-        `${SLUG} pool ${pool} oracleConfig ${oracleConfig} is ${oracleConfigData.length} bytes, too short to hold the price account pubkey at offset ${PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG}`,
-      );
-    }
-    const priceAccount = pubkeyAt(oracleConfigData, PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG);
-
-    const [mintAData, mintBData] = await Promise.all([load(mintA), load(mintB)]);
-    if (mintAData === null || mintBData === null) {
-      throw new Error(`${SLUG} pool ${pool} mint account(s) not found`);
-    }
-    if (mintAData.length < MINT_DECIMALS_OFFSET + 1 || mintBData.length < MINT_DECIMALS_OFFSET + 1) {
-      throw new Error(`${SLUG} pool ${pool} mint account(s) too short to be an SPL mint`);
-    }
-    const decimalsA = mintAData[MINT_DECIMALS_OFFSET];
-    const decimalsB = mintBData[MINT_DECIMALS_OFFSET];
-
-    if (fetchOracleQuote === undefined) {
-      throw new Error(
-        `${SLUG} pool ${pool} has no fetchOracleQuote supplied — this venue's price cannot be derived from account ` +
-          `bytes alone (the oracle's transform is closed/unrecovered, see module doc); the caller must run the ` +
-          `oracle CPI (simulateTransaction / LiteSVM) and pass its 32-byte return data`,
-      );
-    }
-    const quoteBytes = await fetchOracleQuote(METRIC_ORACLE_PROGRAM_ID, oracleConfig, priceAccount);
-    if (quoteBytes.length !== 32) {
-      throw new Error(`${SLUG} pool ${pool} oracle CPI returned ${quoteBytes.length} bytes, expected 32 (bid:u128 LE ++ ask:u128 LE)`);
-    }
-    const bidQ64 = readUintLE(quoteBytes, 0, 16);
-    const askQ64 = readUintLE(quoteBytes, 16, 16);
-
-    const bakedPrice = direction === 0 ? bidQ64 : askQ64;
-    const { num: scaleNum, den: scaleDen } =
-      direction === 0
-        ? metricScaleParams(bidQ64, decimalsA, decimalsB, false)
-        : metricScaleParams(askQ64, decimalsB, decimalsA, true);
-
-    return {
-      venue: SLUG,
-      pool,
-      direction,
-      mintA,
-      mintB,
-      vaultA,
-      vaultB,
-      oracleConfig,
-      priceAccount,
-      tokenProgramA: TOKEN_PROGRAM,
-      tokenProgramB: TOKEN_PROGRAM,
-      decimalsA,
-      decimalsB,
-      bidQ64,
-      askQ64,
-      scaleNum,
-      scaleDen,
-      bakedPrice,
-    };
-  },
-
-  quoteAccounts(cfg: PoolConfig): VenueAccount[] {
-    const c = metricConfig(cfg);
-    const vaultOut = c.direction === 0 ? c.vaultB : c.vaultA;
-    return [
-      { ref: c.oracleConfig, address: c.oracleConfig },
-      { ref: c.priceAccount, address: c.priceAccount },
-      { ref: vaultOut, address: vaultOut },
-    ];
-  },
-
-  /**
-   * v1 swap CPI (amount baked). disc(1) ++ amountIn u64 LE ++ [1] ++ direction u8 ++ minOut u128 LE=1.
-   */
-  buildSwap(cfg: PoolConfig, user: SwapUser, amountIn: bigint): VenueSwap {
-    const c = metricConfig(cfg);
-    const U64_MAX = (1n << 64n) - 1n;
-    if (amountIn <= 0n || amountIn > U64_MAX) {
-      throw new Error(`${SLUG} buildSwap amountIn must be a positive u64, got ${amountIn}`);
-    }
-    const data = new Uint8Array(27);
-    data[0] = METRIC_SWAP_DISCRIMINATOR;
-    for (let b = 0; b < 8; b++) data[1 + b] = Number((amountIn >> BigInt(8 * b)) & 0xffn);
-    data[9] = 1;
-    data[10] = c.direction === 0 ? 1 : 0;
-    data[11] = 1; // minOut u128 LE = 1 (the consuming app's terminal delta owns the real bound)
-    return {
-      programId: METRIC_PROGRAM_ID,
-      data,
-      accounts: metricSwapAccounts(c, user, (ref, addr, w) => fixed(ref, addr, w)),
-    };
-  },
+    slug: SLUG,
+    kind: 'constant-product',
+    programId: METRIC_PROGRAM_ID,
+    /**
+     * Off-chain gate + decode. `pool` is the variable-length pool account (see module doc — only the
+     * fixed 266-byte prefix is read; the trailing bin tail is not decoded). `fetchOracleQuote` is
+     * REQUIRED in practice (throws when absent): it must run the oracle program's `[0x02, feedByte]`
+     * read (any feedByte — see module doc) against `(oracleConfig, priceAccount)` and return its raw
+     * 32-byte CPI return data — a capability plain `AccountLoader` byte reads cannot provide. The
+     * consuming app supplies this via a real `simulateTransaction` (or a LiteSVM execution in tests);
+     * this adapter stays free of any RPC/simulate dependency itself.
+     */
+    async fetchPoolConfig(load, pool, direction = 0, fetchOracleQuote) {
+        const data = await load(pool);
+        if (data === null)
+            throw new Error(`${SLUG} pool ${pool} account not found`);
+        if (data.length < POOL_MIN_LENGTH) {
+            throw new Error(`${SLUG} pool ${pool} account is ${data.length} bytes, too short for the fixed layout (need >= ${POOL_MIN_LENGTH})`);
+        }
+        const mintA = pubkeyAt(data, OFF_MINT_A);
+        const mintB = pubkeyAt(data, OFF_MINT_B);
+        const vaultA = pubkeyAt(data, OFF_VAULT_A);
+        const vaultB = pubkeyAt(data, OFF_VAULT_B);
+        const oracleConfig = pubkeyAt(data, OFF_ORACLE_CONFIG);
+        const oracleConfigData = await load(oracleConfig);
+        if (oracleConfigData === null)
+            throw new Error(`${SLUG} pool ${pool} oracleConfig ${oracleConfig} account not found`);
+        if (oracleConfigData.length < ORACLE_CONFIG_MIN_LENGTH) {
+            throw new Error(`${SLUG} pool ${pool} oracleConfig ${oracleConfig} is ${oracleConfigData.length} bytes, too short to hold the price account pubkey at offset ${PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG}`);
+        }
+        const priceAccount = pubkeyAt(oracleConfigData, PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG);
+        const [mintAData, mintBData] = await Promise.all([load(mintA), load(mintB)]);
+        if (mintAData === null || mintBData === null) {
+            throw new Error(`${SLUG} pool ${pool} mint account(s) not found`);
+        }
+        if (mintAData.length < MINT_DECIMALS_OFFSET + 1 || mintBData.length < MINT_DECIMALS_OFFSET + 1) {
+            throw new Error(`${SLUG} pool ${pool} mint account(s) too short to be an SPL mint`);
+        }
+        const decimalsA = mintAData[MINT_DECIMALS_OFFSET];
+        const decimalsB = mintBData[MINT_DECIMALS_OFFSET];
+        if (fetchOracleQuote === undefined) {
+            throw new Error(`${SLUG} pool ${pool} has no fetchOracleQuote supplied — this venue's price cannot be derived from account ` +
+                `bytes alone (the oracle's transform is closed/unrecovered, see module doc); the caller must run the ` +
+                `oracle CPI (simulateTransaction / LiteSVM) and pass its 32-byte return data`);
+        }
+        const quoteBytes = await fetchOracleQuote(METRIC_ORACLE_PROGRAM_ID, oracleConfig, priceAccount);
+        if (quoteBytes.length !== 32) {
+            throw new Error(`${SLUG} pool ${pool} oracle CPI returned ${quoteBytes.length} bytes, expected 32 (bid:u128 LE ++ ask:u128 LE)`);
+        }
+        const bidQ64 = readUintLE(quoteBytes, 0, 16);
+        const askQ64 = readUintLE(quoteBytes, 16, 16);
+        const bakedPrice = direction === 0 ? bidQ64 : askQ64;
+        const { num: scaleNum, den: scaleDen } = direction === 0
+            ? metricScaleParams(bidQ64, decimalsA, decimalsB, false)
+            : metricScaleParams(askQ64, decimalsB, decimalsA, true);
+        return {
+            venue: SLUG,
+            pool,
+            direction,
+            mintA,
+            mintB,
+            vaultA,
+            vaultB,
+            oracleConfig,
+            priceAccount,
+            tokenProgramA: TOKEN_PROGRAM,
+            tokenProgramB: TOKEN_PROGRAM,
+            decimalsA,
+            decimalsB,
+            bidQ64,
+            askQ64,
+            scaleNum,
+            scaleDen,
+            bakedPrice,
+        };
+    },
+    quoteAccounts(cfg) {
+        const c = metricConfig(cfg);
+        const vaultOut = c.direction === 0 ? c.vaultB : c.vaultA;
+        return [
+            { ref: c.oracleConfig, address: c.oracleConfig },
+            { ref: c.priceAccount, address: c.priceAccount },
+            { ref: vaultOut, address: vaultOut },
+        ];
+    },
+    /**
+     * v1 swap CPI (amount baked). disc(1) ++ amountIn u64 LE ++ [1] ++ direction u8 ++ minOut u128 LE=1.
+     */
+    buildSwap(cfg, user, amountIn) {
+        const c = metricConfig(cfg);
+        const U64_MAX = (1n << 64n) - 1n;
+        if (amountIn <= 0n || amountIn > U64_MAX) {
+            throw new Error(`${SLUG} buildSwap amountIn must be a positive u64, got ${amountIn}`);
+        }
+        const data = new Uint8Array(27);
+        data[0] = METRIC_SWAP_DISCRIMINATOR;
+        for (let b = 0; b < 8; b++)
+            data[1 + b] = Number((amountIn >> BigInt(8 * b)) & 0xffn);
+        data[9] = 1;
+        data[10] = c.direction === 0 ? 1 : 0;
+        data[11] = 1; // minOut u128 LE = 1 (the consuming app's terminal delta owns the real bound)
+        return {
+            programId: METRIC_PROGRAM_ID,
+            data,
+            accounts: metricSwapAccounts(c, user, (ref, addr, w) => fixed(ref, addr, w)),
+        };
+    },
 };
-
-const fixed = (ref: string, addr: Address, writable?: boolean): VenueAccount =>
-  writable ? { ref, address: addr, writable: true } : { ref, address: addr };
-
+const fixed = (ref, addr, writable) => writable ? { ref, address: addr, writable: true } : { ref, address: addr };
 /**
  * The 15-account order for Metric's `swap` (disc 0x01) — see module doc. `userAtaA`/`userAtaB`
  * ride FIXED slots 6/7 regardless of direction (always mintA's / mintB's side respectively); the
  * direction BYTE in the instruction data (not account order) tells the program which way to move
  * value.
  */
-export function metricSwapAccounts(
-  c: MetricPoolConfig,
-  user: SwapUser,
-  make: (ref: string, addr: Address, writable?: boolean) => VenueAccount,
-  refFor?: (role: string) => string,
-): VenueAccount[] {
-  const r = refFor ?? ((role: string) => role);
-  const userAtaA = c.direction === 0 ? user.inAta : user.outAta;
-  const userAtaB = c.direction === 0 ? user.outAta : user.inAta;
-  return [
-    { ref: user.owner, signer: true },
-    make(r('pool'), c.pool, true),
-    make(r('ma'), c.mintA),
-    make(r('mb'), c.mintB),
-    make(r('va'), c.vaultA, true),
-    make(r('vb'), c.vaultB, true),
-    { ref: userAtaA, writable: true },
-    { ref: userAtaB, writable: true },
-    make(r('tpa'), c.tokenProgramA),
-    make(r('tpb'), c.tokenProgramB),
-    make(r('sys'), SYSTEM_PROGRAM),
-    make(r('self'), METRIC_PROGRAM_ID),
-    make(r('oracleProg'), METRIC_ORACLE_PROGRAM_ID),
-    make(r('oracleConfig'), c.oracleConfig, true),
-    make(r('price'), c.priceAccount, true),
-  ];
+export function metricSwapAccounts(c, user, make, refFor) {
+    const r = refFor ?? ((role) => role);
+    const userAtaA = c.direction === 0 ? user.inAta : user.outAta;
+    const userAtaB = c.direction === 0 ? user.outAta : user.inAta;
+    return [
+        { ref: user.owner, signer: true },
+        make(r('pool'), c.pool, true),
+        make(r('ma'), c.mintA),
+        make(r('mb'), c.mintB),
+        make(r('va'), c.vaultA, true),
+        make(r('vb'), c.vaultB, true),
+        { ref: userAtaA, writable: true },
+        { ref: userAtaB, writable: true },
+        make(r('tpa'), c.tokenProgramA),
+        make(r('tpb'), c.tokenProgramB),
+        make(r('sys'), SYSTEM_PROGRAM),
+        make(r('self'), METRIC_PROGRAM_ID),
+        make(r('oracleProg'), METRIC_ORACLE_PROGRAM_ID),
+        make(r('oracleConfig'), c.oracleConfig, true),
+        make(r('price'), c.priceAccount, true),
+    ];
 }
+//# sourceMappingURL=index.js.map

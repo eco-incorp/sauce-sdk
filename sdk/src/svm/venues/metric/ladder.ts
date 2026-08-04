@@ -25,10 +25,16 @@
  *
  * CAPACITY: flat price, reserve-fraction capped (`liveReserveOut / CAP_DIVISOR`, see index.ts) —
  * stateless, closed-form; every rung (and the cold final quote) is an INDEPENDENT evaluation via
- * `emitQuoteCall`, mirroring zerofi's own "no warm-start chain needed" shape. The pool carries an
- * undecoded variable-length tail that may encode a real depth model, so the flat rung is held to the
- * conservative `CAP_DIVISOR` bound (output can never exceed reserveOut / CAP_DIVISOR) rather than
- * quoting an unmeasured curve — zerofi's own CAP_DIVISOR rationale, for the identical reason.
+ * `emitQuoteCall`, mirroring zerofi's own "no warm-start chain needed" shape. The flat (rather than
+ * capacity-aware bin-walk) rung is a MEASURED decision, not an assumption: a paired-differential
+ * simulation of the real swap on real pools (funded recent trader; sizes spanning 667x pinned to one
+ * slot) found the fill price size-INDEPENDENT — realized/predicted was flat at ~0.99999 across 3, 100
+ * and 2000 tokens — so there is no slippage curve for a bin-walk to track. The small (~3-4 ppm)
+ * constant over-quote that measurement DID find (oracle bid/ask micro-spread + bake-to-cook drift, not
+ * slippage) is folded out by `METRIC_QUOTE_HAIRCUT_PPM` in the baked scale, so predicted <= realized.
+ * The pool still carries an undecoded variable-length tail, so the flat rung remains held to the
+ * conservative `CAP_DIVISOR` bound (output can never exceed reserveOut / CAP_DIVISOR) as a second
+ * backstop — zerofi's own CAP_DIVISOR rationale, for the identical reason.
  *
  * `referenceQuote` is a pure, lamport-exact function of state + the baked `params` (state bytes
  * cannot reproduce the oracle's closed transform, so the price must ride in `params`).
@@ -171,10 +177,11 @@ export const metricLadder = {
   },
 
   /**
-   * Measurement only. The oracle spread (bid/ask, ~1bp measured — see index.ts's module doc) is
-   * already folded into the baked scale, not a separate fee this ladder charges on top — so gamma
-   * is the identity and mu is full retention, the same convention obric-v2/zerofi use when their
-   * own venue fee is priced INTO the quote rather than deducted afterward.
+   * Measurement only. The oracle spread and the measured ~3-4 ppm over-quote correction
+   * (`METRIC_QUOTE_HAIRCUT_PPM`, see index.ts) are already folded INTO the baked scale, not a
+   * separate fee this ladder charges on top — so gamma is the identity and mu is full retention, the
+   * same convention obric-v2/zerofi use when their own venue fee is priced into the quote rather than
+   * deducted afterward.
    */
   continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
     return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };

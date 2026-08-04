@@ -9,8 +9,10 @@
  */
 import { resolve } from 'path';
 import { compile } from '@eco-incorp/sauce-compiler';
-import { metric } from '../../../src/svm/venues/metric/index.js';
+import { metric, METRIC_QUOTE_HAIRCUT_PPM } from '../../../src/svm/venues/metric/index.js';
 import type { MetricPoolConfig } from '../../../src/svm/venues/metric/index.js';
+
+const HAIRCUT_PPM = METRIC_QUOTE_HAIRCUT_PPM;
 import { metricLadder } from '../../../src/svm/venues/metric/ladder.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 import { address } from '@solana/kit';
@@ -48,10 +50,18 @@ describe('metric.fetchPoolConfig', () => {
     expect(cfg.askQ64).toBe(REAL_ASK);
     expect(cfg.bakedPrice).toBe(REAL_BID); // direction 0 bakes bid
 
-    // Independently derived (not via metricScaleParams): equal decimals -> scale == bid/2^64, gcd-reduced.
-    const g = gcd(REAL_BID, 1n << 64n);
-    expect(cfg.scaleNum).toBe(REAL_BID / g);
-    expect(cfg.scaleDen).toBe((1n << 64n) / g);
+    // Independently derived (not via metricScaleParams): equal decimals -> scale == bid/2^64, with
+    // the measured conservative haircut folded in (num *= 1e6 - HAIRCUT, den *= 1e6), gcd-reduced.
+    const num = REAL_BID * (1_000_000n - HAIRCUT_PPM);
+    const den = (1n << 64n) * 1_000_000n;
+    const g = gcd(num, den);
+    expect(cfg.scaleNum).toBe(num / g);
+    expect(cfg.scaleDen).toBe(den / g);
+
+    // The haircut is a genuine, measured lower-bound correction: the scaled price is strictly below
+    // the raw oracle price, and by the expected ~50 ppm.
+    const rawG = gcd(REAL_BID, 1n << 64n);
+    expect(cfg.scaleNum * ((1n << 64n) / rawG)).toBeLessThan(cfg.scaleDen * (REAL_BID / rawG));
   });
 
   it('direction 1 bakes the ask and the exact reciprocal scale', async () => {
@@ -59,9 +69,12 @@ describe('metric.fetchPoolConfig', () => {
     const load = fixtureLoader(fixtures);
     const cfg = await metric.fetchPoolConfig(load, POOL, 1, async () => realOracleQuoteBytes());
     expect(cfg.bakedPrice).toBe(REAL_ASK);
-    const g = gcd(1n << 64n, REAL_ASK);
-    expect(cfg.scaleNum).toBe((1n << 64n) / g);
-    expect(cfg.scaleDen).toBe(REAL_ASK / g);
+    // Reciprocal direction: num = 2^64, den = ask, same haircut folded in.
+    const num = (1n << 64n) * (1_000_000n - HAIRCUT_PPM);
+    const den = REAL_ASK * 1_000_000n;
+    const g = gcd(num, den);
+    expect(cfg.scaleNum).toBe(num / g);
+    expect(cfg.scaleDen).toBe(den / g);
   });
 
   it('throws (refuse, do not guess) when fetchOracleQuote is not supplied', async () => {
@@ -78,6 +91,33 @@ describe('metric.fetchPoolConfig', () => {
     await expect(
       metric.fetchPoolConfig(load, POOL, 0, async () => new Uint8Array(16)),
     ).rejects.toThrow(/expected 32/);
+  });
+});
+
+describe('the baked scale is a conservative lower bound (measured over-quote correction)', () => {
+  // A paired-differential simulation of the REAL swap on real pools (funded recent trader, sizes
+  // spanning 667x pinned to one slot) found the RAW oracle-price prediction over-quotes the realized
+  // fill by a size-INDEPENDENT ~3-4 ppm (confirming a flat, no-slippage PMM fill — a bin-walk would
+  // address slippage that does not exist). The haircut folds that offset out so predicted <= realized.
+  it('predicts strictly LESS than the raw oracle price would, by ~HAIRCUT_PPM, for both directions', async () => {
+    const fixtures = loadFixtures(FIXTURES);
+    const load = fixtureLoader(fixtures);
+    const x = 2_000_000_000n; // 2000 USDC/USDT atoms — the top of the measured size range
+    for (const dir of [0, 1] as const) {
+      const cfg = await metric.fetchPoolConfig(load, POOL, dir, async () => realOracleQuoteBytes());
+      const priced = (x * cfg.scaleNum) / cfg.scaleDen;
+      // Raw (un-haircut) prediction from the same baked price and equal decimals.
+      const raw = dir === 0 ? (x * REAL_BID) / (1n << 64n) : (x * (1n << 64n)) / REAL_ASK;
+      expect(priced).toBeLessThan(raw);
+      // The gap is the haircut (~50 ppm), i.e. within a few ppm of raw * HAIRCUT_PPM / 1e6.
+      const cut = (raw * HAIRCUT_PPM) / 1_000_000n;
+      const gap = raw - priced;
+      expect(gap).toBeGreaterThan((cut * 90n) / 100n);
+      expect(gap).toBeLessThan((cut * 110n) / 100n);
+      // And comfortably above the measured raw over-quote (~4 ppm), so predicted <= realized holds.
+      const measuredOverQuotePpm = 4n;
+      expect(gap).toBeGreaterThan((raw * measuredOverQuotePpm) / 1_000_000n);
+    }
   });
 });
 
