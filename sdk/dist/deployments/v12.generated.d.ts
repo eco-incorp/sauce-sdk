@@ -74,7 +74,7 @@ export declare const V12_EVM_CHAINS: {
 };
 /** The SVM engine program (non-upgradeable when `upgradeable` is false). */
 export declare const V12_SVM: {
-    readonly programId: "FxMxSuHfxMWGRGL2SV63CDnkKX3XthE4Ti7U5NPmWng";
+    readonly programId: "CuHCniNMWLSkZWBQKon9tudGujZeXJRUwG2PCLDq4ipJ";
     readonly upgradeable: false;
     readonly clusters: {
         readonly devnet: {
