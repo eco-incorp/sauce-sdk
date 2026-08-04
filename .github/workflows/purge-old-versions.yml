@@ -57,22 +57,22 @@ jobs:
       - name: Deprecate 0.1.0
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm deprecate "$PKG@0.1.0" "$DEPRECATE_MSG"
+        run: npm deprecate "$PKG@0.1.0" "$DEPRECATE_MSG" || echo "::warning::deprecate 0.1.0 was a no-op (already deprecated) or failed — see the status step below"
 
       - name: Deprecate 0.2.0
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm deprecate "$PKG@0.2.0" "$DEPRECATE_MSG"
+        run: npm deprecate "$PKG@0.2.0" "$DEPRECATE_MSG" || echo "::warning::deprecate 0.2.0 was a no-op (already deprecated) or failed — see the status step below"
 
       - name: Deprecate 0.3.0
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm deprecate "$PKG@0.3.0" "$DEPRECATE_MSG"
+        run: npm deprecate "$PKG@0.3.0" "$DEPRECATE_MSG" || echo "::warning::deprecate 0.3.0 was a no-op (already deprecated) or failed — see the status step below"
 
       - name: Deprecate 0.4.0
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm deprecate "$PKG@0.4.0" "$DEPRECATE_MSG"
+        run: npm deprecate "$PKG@0.4.0" "$DEPRECATE_MSG" || echo "::warning::deprecate 0.4.0 was a no-op (already deprecated) or failed — see the status step below"
 
       - name: Show deprecation status AFTER
         env:
