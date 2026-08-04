@@ -111,13 +111,9 @@
  * unbounded linear quote.
  */
 import { address, getAddressCodec } from '@solana/kit';
-import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
-
 const SLUG = 'bisonfi';
 export const BISONFI_PROGRAM_ID = address('BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi');
 export const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-
 export const POOL_ACCOUNT_SIZE = 2048;
 export const OFF_VAULT_A = 120;
 export const OFF_VAULT_B = 152;
@@ -133,9 +129,7 @@ export const FEE_BPS_OFF_A = 852;
 export const FEE_BPS_OFF_B = 860;
 /** SPL token account `amount` field offset (standard layout). */
 export const AMOUNT_OFF = 64;
-
 export const PRICE_SCALE = 1n << 40n;
-
 /**
  * Freshness bound, seconds — see module doc "Freshness gate": the live
  * population never exceeded 1s of age in a full 18-pool sweep; the stale
@@ -143,90 +137,68 @@ export const PRICE_SCALE = 1n << 40n;
  * gap while tolerating ordinary keeper-push/RPC jitter.
  */
 export const STALE_SECONDS = 60n;
-
 /** Conservative quotable-capacity divisor — see module doc "Capacity". */
 export const CAP_DIVISOR = 20n;
-
 /** disc(1) ++ amountIn u64 LE (patched) ++ minOut u64 LE(=1) ++ direction(1) ++ flag(1) = 19 bytes. */
 export const SWAP_DISCRIMINATOR = 0x07;
 /** Byte 18 — see module doc "Swap instruction": every real sample carries 0x04. */
 export const TAIL_FLAG = 0x04;
-
 const codec = getAddressCodec();
-const pubkeyAt = (data: Uint8Array, offset: number): Address => codec.decode(data.subarray(offset, offset + 32));
-
-export interface BisonfiPoolConfig extends PoolConfig {
-  venue: typeof SLUG;
-  /** 0 = mintA in / mintB out, 1 = mintB in / mintA out. */
-  direction: 0 | 1;
-  mintA: Address;
-  mintB: Address;
-  vaultA: Address;
-  vaultB: Address;
-  /**
-   * Decimals-adjustment rational baked at fetch time, direction-neutral
-   * (see ladder.ts): out = mulDiv(x, livePrice*scaleNum, PRICE_SCALE*scaleDen)
-   * for direction 0, and the exact reciprocal for direction 1.
-   */
-  scaleNum: bigint;
-  scaleDen: bigint;
+const pubkeyAt = (data, offset) => codec.decode(data.subarray(offset, offset + 32));
+export function bisonfiConfig(cfg) {
+    if (cfg.venue !== SLUG)
+        throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
+    return cfg;
 }
-
-export function bisonfiConfig(cfg: PoolConfig): BisonfiPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
-  return cfg as BisonfiPoolConfig;
-}
-
 /** SPL Mint `decimals` byte offset. */
 const MINT_DECIMALS_OFFSET = 44;
-
-async function fetchPoolConfig(load: AccountLoader, pool: Address, direction: 0 | 1 = 0): Promise<BisonfiPoolConfig> {
-  const data = await load(pool);
-  if (data === null) throw new Error(`${SLUG} pool ${pool} account not found`);
-  if (data.length !== POOL_ACCOUNT_SIZE) {
-    throw new Error(`${SLUG} pool ${pool} account data is ${data.length} bytes, expected ${POOL_ACCOUNT_SIZE}`);
-  }
-  const mintA = pubkeyAt(data, OFF_MINT_A);
-  const mintB = pubkeyAt(data, OFF_MINT_B);
-  const [mintAData, mintBData] = await Promise.all([load(mintA), load(mintB)]);
-  if (mintAData === null || mintBData === null) {
-    throw new Error(`${SLUG} pool ${pool} mint account(s) not found`);
-  }
-  if (mintAData.length < MINT_DECIMALS_OFFSET + 1 || mintBData.length < MINT_DECIMALS_OFFSET + 1) {
-    throw new Error(`${SLUG} pool ${pool} mint account(s) too short to be an SPL mint`);
-  }
-  const decimalsA = mintAData[MINT_DECIMALS_OFFSET];
-  const decimalsB = mintBData[MINT_DECIMALS_OFFSET];
-  const d = decimalsB - decimalsA;
-  const scaleNum = d >= 0 ? 10n ** BigInt(d) : 1n;
-  const scaleDen = d >= 0 ? 1n : 10n ** BigInt(-d);
-  return {
-    venue: SLUG,
-    pool,
-    direction,
-    vaultA: pubkeyAt(data, OFF_VAULT_A),
-    vaultB: pubkeyAt(data, OFF_VAULT_B),
-    mintA,
-    mintB,
-    scaleNum,
-    scaleDen,
-  };
+async function fetchPoolConfig(load, pool, direction = 0) {
+    const data = await load(pool);
+    if (data === null)
+        throw new Error(`${SLUG} pool ${pool} account not found`);
+    if (data.length !== POOL_ACCOUNT_SIZE) {
+        throw new Error(`${SLUG} pool ${pool} account data is ${data.length} bytes, expected ${POOL_ACCOUNT_SIZE}`);
+    }
+    const mintA = pubkeyAt(data, OFF_MINT_A);
+    const mintB = pubkeyAt(data, OFF_MINT_B);
+    const [mintAData, mintBData] = await Promise.all([load(mintA), load(mintB)]);
+    if (mintAData === null || mintBData === null) {
+        throw new Error(`${SLUG} pool ${pool} mint account(s) not found`);
+    }
+    if (mintAData.length < MINT_DECIMALS_OFFSET + 1 || mintBData.length < MINT_DECIMALS_OFFSET + 1) {
+        throw new Error(`${SLUG} pool ${pool} mint account(s) too short to be an SPL mint`);
+    }
+    const decimalsA = mintAData[MINT_DECIMALS_OFFSET];
+    const decimalsB = mintBData[MINT_DECIMALS_OFFSET];
+    const d = decimalsB - decimalsA;
+    const scaleNum = d >= 0 ? 10n ** BigInt(d) : 1n;
+    const scaleDen = d >= 0 ? 1n : 10n ** BigInt(-d);
+    return {
+        venue: SLUG,
+        pool,
+        direction,
+        vaultA: pubkeyAt(data, OFF_VAULT_A),
+        vaultB: pubkeyAt(data, OFF_VAULT_B),
+        mintA,
+        mintB,
+        scaleNum,
+        scaleDen,
+    };
 }
-
-function quoteAccounts(base: PoolConfig): VenueAccount[] {
-  const cfg = bisonfiConfig(base);
-  const vaultOut = cfg.direction === 0 ? cfg.vaultB : cfg.vaultA;
-  return [
-    { ref: cfg.pool, address: cfg.pool },
-    { ref: vaultOut, address: vaultOut },
-  ];
+function quoteAccounts(base) {
+    const cfg = bisonfiConfig(base);
+    const vaultOut = cfg.direction === 0 ? cfg.vaultB : cfg.vaultA;
+    return [
+        { ref: cfg.pool, address: cfg.pool },
+        { ref: vaultOut, address: vaultOut },
+    ];
 }
-
 /** Family facade for the consuming app's orchestrator. */
 export const bisonfi = {
-  slug: SLUG,
-  kind: 'constant-product' as const,
-  programId: BISONFI_PROGRAM_ID,
-  fetchPoolConfig,
-  quoteAccounts,
+    slug: SLUG,
+    kind: 'constant-product',
+    programId: BISONFI_PROGRAM_ID,
+    fetchPoolConfig,
+    quoteAccounts,
 };
+//# sourceMappingURL=index.js.map
