@@ -25,11 +25,11 @@
       "types": "./dist/chains/index.d.ts",
       "default": "./dist/chains/index.js"
     },
-    "./programs": {
-      "types": "./dist/programs/index.d.ts",
-      "default": "./dist/programs/index.js"
+    "./recipes": {
+      "types": "./dist/recipes/index.d.ts",
+      "default": "./dist/recipes/index.js"
     },
-    "./programs/token-sweep.sauce.ts": "./dist/programs/token-sweep.sauce.ts",
+    "./recipes/settle.sauce.ts": "./dist/recipes/settle.sauce.ts",
     "./skills": {
       "types": "./dist/skills/loader.d.ts",
       "default": "./dist/skills/loader.js"
@@ -38,6 +38,7 @@
       "types": "./dist/svm/index.d.ts",
       "default": "./dist/svm/index.js"
     },
+    "./svm/recipes/settle.sauce.ts": "./dist/svm/recipes/settle.sauce.ts",
     "./verify": {
       "types": "./dist/verify/index.d.ts",
       "default": "./dist/verify/index.js"

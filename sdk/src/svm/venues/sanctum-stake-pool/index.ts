@@ -72,7 +72,7 @@
  * pools sampled during validation hit exactly this revert; the three
  * majors (BNSOL/JitoSOL/jupSOL/dSOL) were current. Because a launched CPI
  * failure aborts the whole cook on SVM (no execution-time catch — see
- * ecoswap/svm/README.md's parity verdicts), this MUST be a prepare-time
+ * the consuming app SVM README's parity verdicts), this MUST be a prepare-time
  * self-drop, not an on-chain guard: `fetchPoolConfig` reads the Clock
  * sysvar via the SAME `load` (a second, ordinary account read — the same
  * multi-read pattern obric-v2's fetch already uses for its price feeds) and
@@ -107,7 +107,7 @@
  * vocabulary for "the user is trading SOL"), so the caveat that follows is
  * real and worth stating plainly rather than glossing over: in the
  * `amountIn=0` balance-input sentinel specifically, "amountIn" is derived
- * on-chain from `inAta`'s LIVE balance alone (see ecoswap/svm/README.md),
+ * on-chain from `inAta`'s LIVE balance alone (see the consuming app SVM README),
  * so this family's owner-wallet-sourced contribution is NOT reflected in
  * that derivation — a sized (`amountIn>0`) request has no such gap (the
  * merge never assigns any slot more than the trade's own declared budget,
@@ -144,7 +144,7 @@
 import { address, getAddressDecoder, getAddressEncoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { createHash } from 'node:crypto';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 export const SANCTUM_STAKE_POOL_PROGRAM_ID = address('SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy');
 export const SANCTUM_STAKE_POOL_2_PROGRAM_ID = address('SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhY');
@@ -152,18 +152,12 @@ export const SANCTUM_STAKE_POOL_3_PROGRAM_ID = address('SPMBzsVUuoHA4Jm6Kunbsota
 export const SANCTUM_STAKE_POOL_4_PROGRAM_ID = address('stkitrT1Uoy18Dk1fTrgPw8W6MVzoCfYoAFT4MLsmhq');
 
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
 const CLOCK_SYSVAR = address('SysvarC1ock11111111111111111111111111111111');
 /** The recipe-wide vocabulary for "the user is trading SOL" — see module header's ACCOUNTS caveat. */
 export const WSOL_MINT = address('So11111111111111111111111111111111111111112');
 
 const ACCOUNT_TYPE_STAKE_POOL = 1;
-/** `DepositSol(u64)` — `StakePoolInstruction`'s 15th variant (index 14). */
-const DEPOSIT_SOL_TAG = 14;
-
 const OFF_TOTAL_LAMPORTS = 258;
-const OFF_POOL_TOKEN_SUPPLY = 266;
-
 class Cursor {
   private o = 0;
   constructor(private readonly buf: Uint8Array) {}
@@ -354,156 +348,3 @@ export const sanctumStakePool2 = makeSanctumStakePool('sanctum-stake-pool-2', SA
 export const sanctumStakePool3 = makeSanctumStakePool('sanctum-stake-pool-3', SANCTUM_STAKE_POOL_3_PROGRAM_ID);
 export const sanctumStakePool4 = makeSanctumStakePool('sanctum-stake-pool-4', SANCTUM_STAKE_POOL_4_PROGRAM_ID);
 
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror) — identical across all four
-// program deploys; only the programId (and hence CPI target) differs.
-// ---------------------------------------------------------------------------
-
-function sanctumConfig(slug: string, base: PoolConfig): SanctumStakePoolConfig {
-  if (base.venue !== slug) throw new Error(`${slug} ladder adapter got a '${base.venue}' pool config`);
-  return base as SanctumStakePoolConfig;
-}
-
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-function makeSanctumStakePoolLadder(slug: SanctumStakePoolConfig['venue'], programId: Address): SvmVenueLadderV2 {
-  const helperName = 'qSanctumStake';
-
-  return {
-    slug,
-    // The quote is exactly affine in x (see module header) — a straight
-    // line loses NOTHING to a coarser grid, so this pins the framework
-    // floor (MIN_RUNGS = 2) instead of the CP default of 4; cheaper CU for
-    // zero accuracy cost.
-    defaultRungs: 2,
-    // No conditional geometry at all (single direction, fixed universal
-    // offsets, fee rides as a param) — every pool of this family compiles
-    // to the exact same fragment shape.
-    shapeKey() {
-      return slug;
-    },
-    // minted = floor(x * supply / total) (or x when either is 0 — the
-    // bootstrap case calc_pool_tokens_for_deposit also takes); fee =
-    // ceil(minted * fn / fd), computed conservatively as floor+1 whenever
-    // nonzero (never re-deriving the exact remainder — see module header).
-    // A dust input or a fee that swallows the mint returns 0, matching
-    // every other family's dust convention.
-    helpers() {
-      return [
-        {
-          name: helperName,
-          source: [
-            `function ${helperName}(x, supply, total, fn, fd) {`,
-            '  if (x === 0) { return 0 }',
-            '  let minted = x;',
-            '  if (total > 0 && supply > 0) { minted = Math.mulDiv(x, supply, total) }',
-            '  if (minted === 0) { return 0 }',
-            '  let fee = 0;',
-            '  if (fd > 0 && fn > 0) {',
-            '    fee = Math.mulDiv(minted, fn, fd);',
-            '    fee = fee + 1;',
-            '  }',
-            '  if (fee >= minted) { return 0 }',
-            '  return minted - fee;',
-            '}',
-          ].join('\n'),
-        },
-      ];
-    },
-    /** Two params: sol_deposit_fee numerator, denominator (fetch-time snapshot; re-staged on a manager fee change like any other family's param). */
-    paramCount: 2,
-    paramsFor(base) {
-      const cfg = sanctumConfig(slug, base);
-      return [cfg.solDepositFeeNumerator, cfg.solDepositFeeDenominator];
-    },
-    quoteRefs(base, slot) {
-      const cfg = sanctumConfig(slug, base);
-      return [{ ref: ref(slot, 'pool'), address: cfg.pool }];
-    },
-    emitSetup(_base, slot, params) {
-      return [
-        `  const s${slot}supply = accountUint(${JSON.stringify(ref(slot, 'pool'))}, ${OFF_POOL_TOKEN_SUPPLY}, 8);`,
-        `  const s${slot}total = accountUint(${JSON.stringify(ref(slot, 'pool'))}, ${OFF_TOTAL_LAMPORTS}, 8);`,
-        `  const s${slot}fn = ${params[0]};`,
-        `  const s${slot}fd = ${params[1]};`,
-      ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-      return `${helperName}(${x}, s${slot}supply, s${slot}total, s${slot}fn, s${slot}fd)`;
-    },
-    buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-      const cfg = sanctumConfig(slug, base);
-      const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-        writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-      const accounts: VenueAccount[] = [
-        roled('pool', cfg.pool, true),
-        roled('withdrawAuthority', cfg.withdrawAuthority),
-        roled('reserveStake', cfg.reserveStake, true),
-        // Native-lamport source: `user.owner`, NOT `user.inAta` — see module header.
-        { ref: user.owner, signer: true, writable: true },
-        // Destination pool-token account: `user.outAta` (the LST the user receives).
-        { ref: user.outAta, writable: true },
-        roled('managerFeeAccount', cfg.managerFeeAccount, true),
-        // Referrer reuses the pool's own manager fee account (a standard
-        // no-referral-program default — see module header).
-        roled('referrerFeeAccount', cfg.managerFeeAccount, true),
-        roled('poolMint', cfg.poolMint, true),
-        roled('systemProgram', SYSTEM_PROGRAM),
-        roled('tokenProgram', TOKEN_PROGRAM),
-      ];
-      return {
-        programId,
-        prefix: Uint8Array.from([DEPOSIT_SOL_TAG]),
-        // No trailing bytes: DepositSol(u64) has no on-chain min-out param.
-        suffix: Uint8Array.from([]),
-        patch: 'in',
-        accounts,
-      };
-    },
-    referenceQuote(base, state: AccountBytesMap, params) {
-      const cfg = sanctumConfig(slug, base);
-      const data = state[cfg.pool];
-      if (data === undefined) throw new Error(`${slug} ladder reference is missing account ${cfg.pool}`);
-      const supply = readU64(data, OFF_POOL_TOKEN_SUPPLY);
-      const total = readU64(data, OFF_TOTAL_LAMPORTS);
-      const [fn, fd] = params;
-      return (x: bigint): bigint => {
-        if (x === 0n) return 0n;
-        let minted = x;
-        if (total > 0n && supply > 0n) minted = (x * supply) / total;
-        if (minted === 0n) return 0n;
-        let fee = 0n;
-        if (fd! > 0n && fn! > 0n) {
-          fee = (minted * fn!) / fd!;
-          fee = fee + 1n;
-        }
-        if (fee >= minted) return 0n;
-        return minted - fee;
-      };
-    },
-    depthReserves(base, state: AccountBytesMap) {
-      const cfg = sanctumConfig(slug, base);
-      const data = state[cfg.pool];
-      if (data === undefined) throw new Error(`${slug} ladder depth is missing account ${cfg.pool}`);
-      // Deposit capacity is genuinely unbounded pool-side (any input mints
-      // proportional tokens) — these are a SIZE PROXY for relative-depth
-      // ranking, not a hard cap; a bigger, more established pool ranks
-      // ahead of a dust one, which is the correct ordering.
-      return {
-        reserveIn: readU64(data, OFF_TOTAL_LAMPORTS),
-        reserveOut: readU64(data, OFF_POOL_TOKEN_SUPPLY),
-      };
-    },
-    continuousFees(_base, _state, params) {
-      const [fn, fd] = params;
-      let gamma = 1_000_000n;
-      if (fn! > 0n && fd! > 0n) gamma -= (fn! * 1_000_000n) / fd!;
-      return { gammaPpm: gamma, muPpm: 1_000_000n };
-    },
-  };
-}
-
-export const sanctumStakePoolLadder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool', SANCTUM_STAKE_POOL_PROGRAM_ID);
-export const sanctumStakePool2Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-2', SANCTUM_STAKE_POOL_2_PROGRAM_ID);
-export const sanctumStakePool3Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-3', SANCTUM_STAKE_POOL_3_PROGRAM_ID);
-export const sanctumStakePool4Ladder: SvmVenueLadderV2 = makeSanctumStakePoolLadder('sanctum-stake-pool-4', SANCTUM_STAKE_POOL_4_PROGRAM_ID);

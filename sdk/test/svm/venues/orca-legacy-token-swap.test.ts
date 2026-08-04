@@ -10,7 +10,6 @@ import { address } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import { orcaLegacyTokenSwap } from '../../../src/svm/venues/orca-legacy-token-swap/index.js';
 import type { OrcaLegacyPoolConfig } from '../../../src/svm/venues/orca-legacy-token-swap/index.js';
-import { orcaLegacyTokenSwapLadder } from '../../../src/svm/venues/orca-legacy-token-swap/ladder.js';
 import { readUintLE } from '../../../src/svm/index.js';
 import type { AccountBytesMap, AccountLoader } from '../../../src/svm/index.js';
 import { fixtureBytesMap, fixtureData, fixtureLoader, loadFixtures } from '../fixtures.js';
@@ -261,73 +260,5 @@ describe('buildSwap', () => {
     expect(() => orcaLegacyTokenSwap.buildSwap(cfg, user, 1n << 64n)).toThrow(
       `orca-legacy-token-swap amountIn must be a positive u64, got ${1n << 64n}`,
     );
-  });
-});
-
-describe('MONOTONICITY under REAL fees is bounded, not strict — a false invariant this file must not assert', () => {
-  // The ladder-clamp fix (see ladder.ts's header) removed the COLLAPSE bug: an
-  // early return that dropped the quote back to 0 past a reachable x for a
-  // thin pool, manufacturing an EVER-GROWING negative ladder-rung dOut. It did
-  // NOT — and cannot — make the curve STRICTLY nondecreasing under REAL fees:
-  // orca-legacy computes TWO INDEPENDENT floor-rounded fee legs (tradeFee,
-  // ownerTradeFee), and whenever raising x by 1 raw unit pushes BOTH legs'
-  // floor up by 1 in the same step, the net input (and so the post-trade
-  // invariant reserve) can DECREASE even though x increased — a real,
-  // BOUNDED, harmless fee-rounding artifact, categorically different from the
-  // fixed collapse (which dropped an ever-growing amount to EXACTLY 0 and
-  // never recovered). A test that zeroes tradeFee/ownerTradeFee to get a
-  // clean "always nondecreasing" pass is asserting an invariant that is FALSE
-  // for this pool's real, documented fee rates (25/10000 trade + 5/10000
-  // owner — see the fetchPoolConfig gate above).
-  const REAL_TN = 25n;
-  const REAL_ON = 5n;
-
-  function quoteAt(rin: bigint, rout: bigint, tn: bigint, on: bigint): (x: bigint) => bigint {
-    const doctored = withVaultAmount(withVaultAmount(state, VAULT_A, rin), VAULT_B, rout);
-    const c: OrcaLegacyPoolConfig = { ...cfg, tradeFeeNumerator: tn, ownerTradeFeeNumerator: on };
-    const params = orcaLegacyTokenSwapLadder.paramsFor(c);
-    return orcaLegacyTokenSwapLadder.referenceQuote(c, doctored, params);
-  }
-
-  it('REGRESSION PIN (real fees, rin=rout=1_000_000): q(4000) < q(3999) by exactly 1 unit — a real, bounded dip, not the fixed collapse', () => {
-    const quote = quoteAt(1_000_000n, 1_000_000n, REAL_TN, REAL_ON);
-    expect(quote(3999n)).toBe(3973n);
-    expect(quote(4000n)).toBe(3972n);
-    expect(quote(3999n) - quote(4000n)).toBe(1n);
-  });
-
-  it('the SAME reserves are STRICTLY nondecreasing at ZERO fees — the dip is a real-fee-rounding artifact, not the fixed bug', () => {
-    const quote = quoteAt(1_000_000n, 1_000_000n, 0n, 0n);
-    let prev = -1n;
-    for (let x = 0n; x <= 5000n; x++) {
-      const out = quote(x);
-      expect(out >= prev).toBe(true);
-      prev = out;
-    }
-  });
-
-  it('the dip stays BOUNDED and never reappears as the fixed COLLAPSE (an unbounded drop to 0), across a wide reserve sweep', () => {
-    // A canary against the FIXED bug reappearing disguised as "just more
-    // fee-rounding": the collapse dropped an ever-growing x to EXACTLY 0 and
-    // never recovered; a fee-rounding dip is always a SMALL, bounded decrease
-    // between adjacent points that stays well above 0.
-    let violations = 0;
-    for (let r = 100_000n; r <= 2_000_000n; r += 300_000n) {
-      const quote = quoteAt(r, r, REAL_TN, REAL_ON);
-      let prev = -1n;
-      for (let x = 0n; x <= 6000n; x++) {
-        const out = quote(x);
-        if (out < prev) {
-          violations++;
-          expect(prev - out).toBeLessThan(50n); // bounded — never the collapse's unbounded drop
-          expect(out).toBeGreaterThan(0n); // never drops to 0 (the fixed bug's signature)
-        }
-        prev = out;
-      }
-    }
-    // The dip mechanism must actually be EXERCISED by this sweep — if this
-    // ever hits 0, either the fee math changed or the sweep needs re-tuning,
-    // not a silent pass that quietly stops proving anything.
-    expect(violations).toBeGreaterThan(0);
   });
 });

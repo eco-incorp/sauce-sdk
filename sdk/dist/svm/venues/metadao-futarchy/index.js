@@ -1,5 +1,5 @@
 /**
- * MetaDAO Futarchy AMM — spot leg (EcoSwapSVM ladder fragment).
+ * MetaDAO Futarchy AMM — spot leg (SvmRoute ladder fragment).
  *
  * MetaDAO's `futarchy` program (fully open source,
  * github.com/metaDAOproject/programs, `programs/futarchy/src/`) embeds a
@@ -65,7 +65,7 @@
  * ("Program FUTARELB...consumed 40708 of..." on the flagship META/USDC dao,
  * "...consumed 39309 of..." on the SoLo/USDC dao — both PoolState::Spot,
  * both already including the nested `emit_cpi` self-log's own ~3634 CU) —
- * see `ecoswap/svm/budget.ts`'s `CU_FAMILIES.metadao-futarchy` for how that
+ * see `the consuming app SVM CU-budget module`'s `CU_FAMILIES.metadao-futarchy` for how that
  * folds into the pin.
  */
 import { address, getAddressCodec } from '@solana/kit';
@@ -83,8 +83,6 @@ const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 export const METADAO_FUTARCHY_EVENT_AUTHORITY = address('DGEympSS4qLvdr9r3uGHTfACdN8snShk4iGdJtZPxuBC');
 /** sha256("account:Dao")[0:8] (Anchor account discriminator). */
 const DAO_DISCRIMINATOR = [0xa3, 0x09, 0x2f, 0x1f, 0x34, 0x55, 0xc5, 0x31];
-/** sha256("global:spot_swap")[0:8] (Anchor instruction discriminator). */
-const SPOT_SWAP_DISCRIMINATOR = [0xa7, 0x61, 0x0c, 0xe7, 0xed, 0x4e, 0xa6, 0xfb];
 /**
  * Fixed Dao account size REGARDLESS of PoolState variant (verified against
  * 82 real mainnet dao accounts, 80 Spot-state + 2 Futarchy-state, all
@@ -112,14 +110,8 @@ const AMM_QUOTE_VAULT_OFFSET = AMM_BASE_VAULT_OFFSET + 32; // 253
 const MAX_BPS = 10000n;
 const PROTOCOL_TAKER_FEE_BPS = 50n;
 const NET_FEE_NUM = MAX_BPS - PROTOCOL_TAKER_FEE_BPS; // 9_950n
-function metadaoConfig(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
-    return cfg;
-}
 const codec = getAddressCodec();
 const pubkeyAt = (data, offset) => codec.decode(data.subarray(offset, offset + 32));
-const ref = (slot, role) => `s${slot}:${role}`;
 /**
  * Off-chain gate + decode: rejects the wrong account shape (size/discriminator),
  * an active-proposal dao (PoolState::Futarchy — see the file header), and a
@@ -140,7 +132,7 @@ export async function fetchMetaDaoFutarchySpotConfig(load, pool) {
     const stateTag = data[STATE_TAG_OFFSET];
     if (stateTag !== STATE_SPOT) {
         throw new Error(`${SLUG} dao ${pool} has an active proposal (PoolState::Futarchy, tag ${stateTag}) — conditional markets are ` +
-            'not yet served by this adapter, only PoolState::Spot (see ecoswap/svm/venues/metadao-futarchy.ts)');
+            'not yet served by this adapter, only PoolState::Spot (see the consuming app metadao-futarchy venue module)');
     }
     const quoteReserves = readUintLE(data, QUOTE_RESERVES_OFFSET, 8);
     const baseReserves = readUintLE(data, BASE_RESERVES_OFFSET, 8);
@@ -158,28 +150,6 @@ export async function fetchMetaDaoFutarchySpotConfig(load, pool) {
         tokenProgram: TOKEN_PROGRAM,
     };
 }
-/**
- * Live reserves, oriented (reserveIn, reserveOut) for `direction` — read from
- * the DAO ACCOUNT'S OWN quote_reserves/base_reserves ledger fields (offsets
- * QUOTE_RESERVES_OFFSET/BASE_RESERVES_OFFSET), NOT the vault's raw SPL
- * `amount`. These differ: `vault.amount == dao.reserves +
- * dao.protocol_fee_balance` (measured live on the flagship META/USDC dao —
- * the vault carries an extra 211,846,701/871,687,994 base/quote raw units of
- * accrued, not-yet-swept protocol fee on top of the tradeable reserve).
- * `Pool::swap` (`state/futarchy_amm.rs:495-546`) reads `self.base_reserves`/
- * `self.quote_reserves` exclusively — using the vault balance instead would
- * over-quote by exactly the retained fee, which is precisely what the first
- * cut of this adapter did wrong (caught by the real-CPI lamport-exact gate:
- * `ecoswap-svm.realcpi.e2e.test.ts`'s metadao-futarchy quadrilateral).
- */
-function liveReserves(cfg, state) {
-    const data = state[cfg.pool];
-    if (data === undefined)
-        throw new Error(`${SLUG} reference is missing the dao account ${cfg.pool}`);
-    const rQuote = readUintLE(data, QUOTE_RESERVES_OFFSET, 8);
-    const rBase = readUintLE(data, BASE_RESERVES_OFFSET, 8);
-    return cfg.direction === 'sell' ? { rin: rBase, rout: rQuote } : { rin: rQuote, rout: rBase };
-}
 /** The COLD, venue-exact quote (see the file header's derivation). */
 export function metadaoFutarchySpotQuote(x, rin, rout) {
     if (x === 0n)
@@ -189,91 +159,4 @@ export function metadaoFutarchySpotQuote(x, rin, rout) {
         return 0n;
     return (netIn * rout) / (rin + netIn);
 }
-export const metadaoFutarchySpotLadder = {
-    slug: SLUG,
-    /** CP-class: a closed-form quote (one multiply-divide per rung), 4 rungs. */
-    defaultRungs: 4,
-    shapeKey(base) {
-        return `${SLUG}:${metadaoConfig(base).direction}`;
-    },
-    helpers() {
-        return [
-            {
-                name: 'qMetaDaoFutarchySpot',
-                source: [
-                    'function qMetaDaoFutarchySpot(x, rin, rout) {',
-                    '  if (x === 0) { return 0 }',
-                    `  const netIn = Math.mulDiv(x, ${NET_FEE_NUM}, ${MAX_BPS});`,
-                    '  if (netIn === 0) { return 0 }',
-                    '  return Math.mulDiv(netIn, rout, rin + netIn);',
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    paramCount: 0,
-    paramsFor() {
-        return [];
-    },
-    quoteRefs(base, slot) {
-        const c = metadaoConfig(base);
-        // The dao account IS the reserve source (see liveReserves' doc comment) —
-        // the vaults are swap-CPI-only (buildSwapV2), never read for quoting.
-        return [{ ref: ref(slot, 'dao'), address: c.pool }];
-    },
-    emitSetup(base, slot) {
-        const c = metadaoConfig(base);
-        const daoRef = JSON.stringify(ref(slot, 'dao'));
-        const [quoteOff, baseOff] = [QUOTE_RESERVES_OFFSET, BASE_RESERVES_OFFSET];
-        const [rinOff, routOff] = c.direction === 'sell' ? [baseOff, quoteOff] : [quoteOff, baseOff];
-        return [
-            `  const s${slot}rin = accountUint(${daoRef}, ${rinOff}, 8);`,
-            `  const s${slot}rout = accountUint(${daoRef}, ${routOff}, 8);`,
-        ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-        return `qMetaDaoFutarchySpot(${x}, s${slot}rin, s${slot}rout)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const c = metadaoConfig(base);
-        const swapType = c.direction === 'sell' ? 1 : 0; // SwapType::Buy=0, Sell=1
-        const make = (r, addr, writable) => writable ? { ref: r, address: addr, writable: true } : { ref: r, address: addr };
-        const userBaseRef = c.direction === 'sell' ? user.inAta : user.outAta;
-        const userQuoteRef = c.direction === 'sell' ? user.outAta : user.inAta;
-        return {
-            programId: METADAO_FUTARCHY_PROGRAM_ID,
-            prefix: Uint8Array.from(SPOT_SWAP_DISCRIMINATOR),
-            // SpotSwapParams field order: inputAmount(patched u64 LE) ++ swapType(u8) ++ minOutputAmount(u64 LE)=1.
-            suffix: Uint8Array.from([swapType, 1, 0, 0, 0, 0, 0, 0, 0]),
-            patch: 'in',
-            accounts: [
-                make(ref(slot, 'dao'), c.pool, true),
-                { ref: userBaseRef, writable: true },
-                { ref: userQuoteRef, writable: true },
-                make(ref(slot, 'basevault'), c.ammBaseVault, true),
-                make(ref(slot, 'quotevault'), c.ammQuoteVault, true),
-                { ref: user.owner, signer: true },
-                make(ref(slot, 'tp'), c.tokenProgram),
-                make(ref(slot, 'ea'), METADAO_FUTARCHY_EVENT_AUTHORITY),
-                make(ref(slot, 'prog'), METADAO_FUTARCHY_PROGRAM_ID),
-            ],
-        };
-    },
-    referenceQuote(base, state) {
-        const c = metadaoConfig(base);
-        const { rin, rout } = liveReserves(c, state);
-        return (x) => metadaoFutarchySpotQuote(x, rin, rout);
-    },
-    depthReserves(base, state) {
-        const c = metadaoConfig(base);
-        const { rin, rout } = liveReserves(c, state);
-        return { reserveIn: rin, reserveOut: rout };
-    },
-    continuousFees() {
-        // out(x) == gamma*x*rOut/(rIn + gamma*x) EXACTLY at gamma = NET_FEE_NUM/MAX_BPS
-        // (see the file header derivation) — mu = 1 (no separate multiplicative
-        // reduction; LP_TAKER_FEE_BPS is 0 today).
-        return { gammaPpm: (NET_FEE_NUM * 1000000n) / MAX_BPS, muPpm: 1000000n };
-    },
-};
 //# sourceMappingURL=index.js.map

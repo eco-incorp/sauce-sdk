@@ -1,6 +1,6 @@
 /**
  * PancakeSwap (Solana CLMM) venue — pool decoding, scope gates and the
- * prepare-declared tick-boundary WINDOW for the EcoSwapSVM ladder fragment
+ * prepare-declared tick-boundary WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts).
  *
  * It is, byte-for-byte, the same PoolState/AmmConfig/
@@ -38,24 +38,33 @@
  *
  * Given the confirmed byte-identical layout, this module reuses raydium-clmm's
  * PURE math and PDA-independent helpers straight from the `@eco-incorp/sauce-sdk/svm`
- * barrel (raydiumSqrtPriceAtTick / raydiumDelta0 / raydiumDelta1 /
- * raydiumNextSqrt0, the tick-math constants, RAYDIUM_CLMM_MAX_BOUNDARIES, the
- * account discriminators, and the PROGRAM-INDEPENDENT arrayStartIndex /
- * windowStartTicks) — nothing here reinvents that arithmetic. Only the parts
- * that are genuinely PROGRAM-BOUND (the PDA derivations and the CPI target in
- * ./ladder.ts) are reimplemented, against this venue's own program id.
+ * barrel (raydiumSqrtPriceAtTick, the tick-math constants,
+ * RAYDIUM_CLMM_MAX_BOUNDARIES, the account discriminators, and the
+ * PROGRAM-INDEPENDENT arrayStartIndex / windowStartTicks) — nothing here
+ * reinvents that arithmetic. Only the parts that are genuinely PROGRAM-BOUND
+ * (the PDA derivations and the CPI target) are reimplemented, against this
+ * venue's own program id.
  *
  * Gates mirror raydium-clmm's exactly (see that adapter's header for the full
  * rationale): account size/discriminator, `fee_on != 0`, a nonzero
  * `dynamic_fee_info`, active limit orders on any scanned window tick, the
  * swap-disabled status bit, non-classic-SPL mints, and a direction with no
  * shipped boundaries/edge (gated by the orchestrator via windowFor).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import { AMM_CONFIG_DISCRIMINATOR as RAYDIUM_CLMM_AMM_CONFIG_DISCRIMINATOR, POOL_DISCRIMINATOR as RAYDIUM_CLMM_POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR as RAYDIUM_CLMM_TICK_ARRAY_DISCRIMINATOR, arrayStartIndex as raydiumClmmArrayStartIndex, windowStartTicks as raydiumClmmWindowStartTicks } from '../raydium-clmm/index.js';
+import { AMM_CONFIG_DISCRIMINATOR as RAYDIUM_CLMM_AMM_CONFIG_DISCRIMINATOR, POOL_DISCRIMINATOR as RAYDIUM_CLMM_POOL_DISCRIMINATOR, TICK_ARRAY_DISCRIMINATOR as RAYDIUM_CLMM_TICK_ARRAY_DISCRIMINATOR, windowStartTicks as raydiumClmmWindowStartTicks } from '../raydium-clmm/index.js';
 import { MAX_TICK as RAYDIUM_MAX_TICK, MIN_TICK as RAYDIUM_MIN_TICK } from '../raydium-clmm/tick-math.js';
-import { raydiumSqrtPriceAtTick } from '../raydium-clmm/ladder.js';
+import { raydiumSqrtPriceAtTick } from '../raydium-clmm/tick-math.js';
 import { readUintLE } from '../math.js';
 import type { AccountLoader, PoolConfig } from '../types.js';
 
@@ -144,11 +153,6 @@ export interface PancakeswapClmmPoolConfig extends PoolConfig {
     '0to1': PancakeswapClmmWindow;
     '1to0': PancakeswapClmmWindow;
   };
-}
-
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function windowFor(cfg: PancakeswapClmmPoolConfig): PancakeswapClmmWindow {
-  return cfg.direction === '0to1' ? cfg.windows['0to1'] : cfg.windows['1to0'];
 }
 
 const readI32 = (data: Uint8Array, offset: number): number => {

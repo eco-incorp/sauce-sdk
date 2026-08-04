@@ -41,7 +41,7 @@
  * writable account per ACTIVE fee_beneficiary, ata(mint_a) of that beneficiary's wallet.
  * A first pass at this file (going only off a live transaction's account COUNT) concluded
  * VMM carries none; that was wrong, and the real-CPI lane
- * (ecoswap-svm.scale.realcpi.e2e.test.ts) caught it immediately: omitting the remaining
+ * (the consuming app scale real-CPI e2e test) caught it immediately: omitting the remaining
  * account reverts on-chain with AnchorError MissingBeneficiaryAccount (6013). The
  * confusion: that reference transaction's beneficiary wallet happened to be the SAME
  * wallet as the trader (its 19th account, the beneficiary's mint_a ATA, is therefore
@@ -50,31 +50,8 @@
  * every address is what it claims to be.
  */
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SwapUser, VenueAccount, LadderSwapTemplate, AccountBytesMap, SvmVenueLadderV2 } from '../types.js';
-import {
-  ata,
-  BUY_DISCRIMINATOR,
-  computeScaleQuote,
-  CONFIG_SEED,
-  CURVE_CONSTANT_PRODUCT,
-  detectTokenProgram,
-  pda,
-  POOL_SEED,
-  pubkeyAt,
-  readFeeBeneficiaries,
-  readUintLE,
-  SCALE_AMM_PROGRAM_ID,
-  SCALE_VMM_PROGRAM_ID,
-  scaleContinuousFees,
-  scaleDepthReserves,
-  SCALE_CURVE_HELPER_NAME,
-  SCALE_CURVE_HELPER_SOURCE,
-  SELL_DISCRIMINATOR,
-  SYSTEM_PROGRAM,
-  type FeeBeneficiary,
-  type ScaleCurveState,
-  type ScaleDirection,
-} from '../scale-common.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
+import { ata, CONFIG_SEED, CURVE_CONSTANT_PRODUCT, detectTokenProgram, pda, POOL_SEED, pubkeyAt, readFeeBeneficiaries, readUintLE, SCALE_AMM_PROGRAM_ID, SCALE_VMM_PROGRAM_ID, type FeeBeneficiary, type ScaleDirection } from '../scale-common.js';
 
 const SLUG = 'scale-vmm';
 const PAIR_SIZE = 327;
@@ -130,11 +107,6 @@ async function loadRequired(load: AccountLoader, addr: Address, label: string): 
   const data = await load(addr);
   if (data === null) throw new Error(`${SLUG}: ${label} ${addr} not found`);
   return data;
-}
-
-function vmm(cfg: PoolConfig): ScaleVmmPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} adapter got a '${cfg.venue}' pool config`);
-  return cfg as ScaleVmmPoolConfig;
 }
 
 export const scaleVmm = {
@@ -222,142 +194,3 @@ export const scaleVmm = {
   },
 };
 
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-function directionOfParam(dirParam: bigint): ScaleDirection {
-  return dirParam === 0n ? 'aToB' : 'bToA';
-}
-
-export const scaleVmmLadder: SvmVenueLadderV2 = {
-  slug: SLUG,
-
-  shapeKey(base: PoolConfig): string {
-    const cfg = vmm(base);
-    return `${SLUG}:${cfg.direction}:${cfg.feeBeneficiaryCount}`;
-  },
-
-  helpers() {
-    return [{ name: SCALE_CURVE_HELPER_NAME, source: SCALE_CURVE_HELPER_SOURCE }];
-  },
-
-  paramCount: 1,
-  paramsFor(base: PoolConfig): bigint[] {
-    const cfg = vmm(base);
-    return [cfg.direction === 'bToA' ? 1n : 0n];
-  },
-
-  quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = vmm(base);
-    return [
-      { ref: ref(slot, 'pair'), address: cfg.pool },
-      { ref: ref(slot, 'cfg'), address: cfg.platformConfig },
-    ];
-  },
-
-  emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string {
-    const cfg = vmm(base);
-    const pair = JSON.stringify(ref(slot, 'pair'));
-    const config = JSON.stringify(ref(slot, 'cfg'));
-    return [
-      `  const s${slot}rA = accountUint(${pair}, ${OFFSETS.reservesA}, 16);`,
-      `  const s${slot}rB = accountUint(${pair}, ${OFFSETS.reservesB}, 16);`,
-      `  const s${slot}shift = accountUint(${pair}, ${OFFSETS.shift}, 16);`,
-      `  const s${slot}pbps = accountUint(${config}, ${CONFIG_OFFSETS.platformFeeBps}, 2);`,
-      ...cfg.feeBeneficiaries.map(
-        (_, i) => `  const s${slot}s${i} = accountUint(${pair}, ${OFFSETS.feeBeneficiaries + i * 34 + 32}, 2);`,
-      ),
-      `  const s${slot}dir = ${params[0]};`,
-    ].join('\n');
-  },
-
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    return `${SCALE_CURVE_HELPER_NAME}(${x}, s${slot}rA, s${slot}rB, s${slot}shift, s${slot}pbps, s${slot}s0, s${slot}s1, s${slot}s2, s${slot}s3, s${slot}s4, s${slot}dir)`;
-  },
-
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    const cfg = vmm(base);
-    const sell = cfg.direction === 'bToA';
-    const [userTaA, userTaB] = sell ? [user.outAta, user.inAta] : [user.inAta, user.outAta];
-    const fixed = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-    const accounts: VenueAccount[] = [
-      fixed('pair', cfg.pool, true),
-      { ref: user.owner, signer: true, writable: true },
-      fixed('mintA', cfg.mintA),
-      fixed('mintB', cfg.mintB),
-      { ref: userTaA, writable: true },
-      { ref: userTaB, writable: true },
-      fixed('vaultA', cfg.vaultA, true),
-      fixed('vaultB', cfg.vaultB, true),
-      fixed('feeTaA', cfg.platformFeeTaA, true),
-      fixed('tpA', cfg.tokenProgramA),
-      fixed('tpB', cfg.tokenProgramB),
-      fixed('sys', SYSTEM_PROGRAM),
-      fixed('cfg', cfg.platformConfig),
-      fixed('ammProgram', SCALE_AMM_PROGRAM_ID),
-      fixed('ammPool', cfg.ammPool, true),
-      fixed('ammVaultA', cfg.ammVaultA, true),
-      fixed('ammVaultB', cfg.ammVaultB, true),
-      fixed('ammConfig', cfg.ammConfig),
-      ...cfg.beneficiaryAtas.map((addr, i) => fixed(`ben${i}`, addr, true)),
-    ];
-    return {
-      programId: SCALE_VMM_PROGRAM_ID,
-      prefix: sell ? SELL_DISCRIMINATOR : BUY_DISCRIMINATOR,
-      suffix: Uint8Array.of(1, 0, 0, 0, 0, 0, 0, 0), // limit = 1 (venue min_out convention)
-      patch: 'in',
-      accounts,
-    };
-  },
-
-  referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint {
-    const cfg = vmm(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const pair = bytes(cfg.pool);
-    const config = bytes(cfg.platformConfig);
-    const curveState: ScaleCurveState = {
-      reservesA: readUintLE(pair, OFFSETS.reservesA, 16),
-      reservesB: readUintLE(pair, OFFSETS.reservesB, 16),
-      shift: readUintLE(pair, OFFSETS.shift, 16),
-      platformFeeBps: readUintLE(config, CONFIG_OFFSETS.platformFeeBps, 2),
-      shareBps: cfg.feeBeneficiaries.map((_, i) => readUintLE(pair, OFFSETS.feeBeneficiaries + i * 34 + 32, 2)),
-    };
-    const direction = directionOfParam(params[0]!);
-    return (x) => computeScaleQuote(curveState, x, direction);
-  },
-
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const cfg = vmm(base);
-    const pair = state[cfg.pool];
-    if (pair === undefined) throw new Error(`${SLUG} ladder depth is missing account ${cfg.pool}`);
-    const curveState: ScaleCurveState = {
-      reservesA: readUintLE(pair, OFFSETS.reservesA, 16),
-      reservesB: readUintLE(pair, OFFSETS.reservesB, 16),
-      shift: readUintLE(pair, OFFSETS.shift, 16),
-      platformFeeBps: 0n,
-      shareBps: [],
-    };
-    return scaleDepthReserves(curveState, cfg.direction);
-  },
-
-  continuousFees(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): { gammaPpm: bigint; muPpm: bigint } {
-    const cfg = vmm(base);
-    const pair = state[cfg.pool];
-    const config = state[cfg.platformConfig];
-    if (pair === undefined || config === undefined) {
-      throw new Error(`${SLUG} ladder fees are missing account state`);
-    }
-    const curveState: ScaleCurveState = {
-      reservesA: 0n,
-      reservesB: 0n,
-      shift: 0n,
-      platformFeeBps: readUintLE(config, CONFIG_OFFSETS.platformFeeBps, 2),
-      shareBps: cfg.feeBeneficiaries.map((_, i) => readUintLE(pair, OFFSETS.feeBeneficiaries + i * 34 + 32, 2)),
-    };
-    return scaleContinuousFees(curveState, directionOfParam(params[0]!));
-  },
-};

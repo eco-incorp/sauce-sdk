@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 export declare const HEAVEN_PROGRAM_ID: Address<"HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o">;
 /** One resolved (buyBps, sellBps) fee-type pair — see module header's FEE MODEL note. */
 interface HeavenFeeRates {
@@ -31,7 +31,6 @@ export declare const heaven: {
     programId: Address<"HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o">;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<HeavenPoolConfig>;
 };
-export declare const heavenLadder: SvmVenueLadderV2;
 export declare function heavenMints(base: PoolConfig): {
     inMint: Address;
     outMint: Address;

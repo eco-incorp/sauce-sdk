@@ -1,6 +1,6 @@
 /**
  * Cropper (Solana CLMM) venue — pool decoding, scope gates and the
- * prepare-declared tick-boundary WINDOW for the EcoSwapSVM ladder fragment
+ * prepare-declared tick-boundary WINDOW for the SvmRoute ladder fragment
  * (./ladder.ts).
  *
  * It is, byte-for-byte, the same Whirlpool/TickArray
@@ -42,13 +42,12 @@
  *
  * Given the confirmed byte-identical layout, this module reuses
  * orca-whirlpool's PURE math and PDA-independent helpers straight from the
- * `@eco-incorp/sauce-sdk/svm` barrel (whirlpoolSqrtPriceAtTick /
- * whirlpoolDeltaA / whirlpoolDeltaB / whirlpoolNextSqrtA, the account
+ * `@eco-incorp/sauce-sdk/svm` barrel (whirlpoolSqrtPriceAtTick, the account
  * discriminators, MIN_TICK_INDEX / MAX_TICK_INDEX, the OFF_* offsets,
  * TICK_ARRAY_SIZE / TICK_LEN, and the PROGRAM-INDEPENDENT windowStartTicks)
  * — nothing here reinvents that arithmetic. Only the parts that are
- * genuinely PROGRAM-BOUND (the PDA derivations and the CPI target in
- * ./ladder.ts) are reimplemented, against this venue's own program id. The
+ * genuinely PROGRAM-BOUND (the PDA derivations and the CPI target) are
+ * reimplemented, against this venue's own program id. The
  * MIN/MAX sqrt-price sentinels are not exported by the SDK barrel (they are
  * an orca-whirlpool-internal constant), so they are redeclared locally —
  * see CROPPER_MIN_SQRT_PRICE/CROPPER_MAX_SQRT_PRICE below; CROPPER_MAX_BOUNDARIES
@@ -63,7 +62,16 @@
  * Oracle volatility state the fragment does not read), non-Tokenkeg mints
  * (the swap ix is classic-SPL only), and a direction with no shipped
  * boundaries/edge (gated by the orchestrator via windowFor).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getProgramDerivedAddress } from '@solana/kit';
 import { MAX_TICK_INDEX, MIN_TICK_INDEX, whirlpoolSqrtPriceAtTick } from '../orca-whirlpool/tick-math.js';
 import { OFF_FEE_RATE, OFF_FEE_TIER_INDEX, OFF_LIQUIDITY, OFF_SQRT_PRICE, OFF_TA_START, OFF_TA_TICKS, OFF_TICK_CURRENT, OFF_TICK_SPACING, TICK_ARRAY_ACCOUNT_SIZE, TICK_ARRAY_DISCRIMINATOR, TICK_ARRAY_SIZE, TICK_LEN, WHIRLPOOL_ACCOUNT_SIZE, WHIRLPOOL_DISCRIMINATOR, windowStartTicks } from '../orca-whirlpool/index.js';
@@ -90,10 +98,6 @@ export const CROPPER_MAX_SQRT_PRICE = 79226673515401279992447579055n;
  * own budget.ts commentary).
  */
 export const CROPPER_MAX_BOUNDARIES = 4;
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function windowFor(cfg) {
-    return cfg.direction === 'aToB' ? cfg.windows.aToB : cfg.windows.bToA;
-}
 const readI32 = (data, offset) => {
     const u = Number(readUintLE(data, offset, 4));
     return u >= 0x8000_0000 ? u - 0x1_0000_0000 : u;

@@ -10,7 +10,7 @@
  * names and BYTE-IDENTICAL source as raydium-clmm's — the codegen dedupes
  * helper functions by (name, source) across every family in a shape, so a
  * cook mixing this venue with raydium-clmm shares one copy of each instead
- * of paying for two (SvmVenueLadderV2.helpers' contract: same name requires
+ * of paying for two (SvmVenueLadder.helpers' contract: same name requires
  * byte-identical source, enforced by the codegen).
  */
 import { address } from '@solana/kit';

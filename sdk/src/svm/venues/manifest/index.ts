@@ -1,6 +1,6 @@
 /**
  * Manifest CLOB venue — market decoding, scope gates and the prepare-declared
- * TOP-OF-BOOK ORDER WINDOW for the EcoSwapSVM ladder fragment (./ladder.ts).
+ * TOP-OF-BOOK ORDER WINDOW for the SvmRoute ladder fragment (./ladder.ts).
  * Like orca-whirlpool this family is LADDER-ONLY (adapter contract v2): a CLOB
  * quote is a best-first walk over a red-black tree of resting orders that lives
  * inside ONE market account, which does not fit the one-adapter-one-pool v1
@@ -60,7 +60,16 @@
  * != 0) are also a stop: the in-VM model carries no clock, so the walk ships
  * only the non-expiring (last_valid_slot == 0) prefix; the venue may match an
  * expiring order beyond it (favorable) — minOut enforced.
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
@@ -141,11 +150,6 @@ export interface ManifestPoolConfig extends PoolConfig {
   quoteDecimals: number;
   /** Direction-keyed prepare-declared order windows (see the header). */
   windows: { baseIn: ManifestWindow; quoteIn: ManifestWindow };
-}
-
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function manifestWindowFor(cfg: ManifestPoolConfig): ManifestWindow {
-  return cfg.direction === 'baseIn' ? cfg.windows.baseIn : cfg.windows.quoteIn;
 }
 
 // --- off-chain red-black-tree helpers over the raw market bytes ---

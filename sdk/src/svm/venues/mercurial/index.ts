@@ -88,7 +88,7 @@
  *    1/10/30 stSOL, bit-exact at all three.
  * See `test/svm/venues/mercurial.test.ts` for the pinned worked examples.
  *
- * NO `ecoswap-svm.realcpi.e2e.test.ts` CELL (unlike every other SAUCE_VENUE_PROGRAMS-gated
+ * NO `the consuming app realcpi e2e test` CELL (unlike every other SAUCE_VENUE_PROGRAMS-gated
  * venue): driving the real dumped `mercurial.so` through a raw single Exchange
  * CPI in LiteSVM (same pool/accounts/encoding the real-network probe above
  * validates) reproducibly fails a RUNTIME-LEVEL "sum of account balances
@@ -117,8 +117,7 @@ import { createHash } from 'node:crypto';
 import { address, getAddressDecoder, getAddressEncoder, isOffCurveAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import { STABLE_D_HELPER, STABLE_YW_HELPER, stableComputeD, stableComputeYWarm } from '../stable-helpers.js';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'mercurial';
 
@@ -130,22 +129,11 @@ const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const SWAP_STATE_LEN = 265;
 /** Classic (non-Token-2022) SPL Token Account encoding length. */
 const SPL_TOKEN_ACCOUNT_LEN = 165;
-const OFF_SPL_AMOUNT = 64;
-
 // SwapV2 offsets (absolute, i.e. including the leading version-tag byte — see module header).
 const OFF_NONCE = 2;
-const OFF_AMP = 3;
-const OFF_FEE_NUM = 11;
 const OFF_TOKENS_LEN = 27;
-const OFF_MULT_A = 39;
-const OFF_MULT_B = 47;
 const OFF_VAULT_A = 71;
 const OFF_VAULT_B = 103;
-const OFF_SWAP_ENABLED = 263;
-
-/** Fixed protocol constant (mercurial-js `FEE_DENOMINATOR = Math.pow(10, 10)`) — not a per-pool field. */
-const FEE_DENOMINATOR = 10_000_000_000n;
-
 export interface MercurialPoolConfig extends PoolConfig {
   venue: typeof SLUG;
   direction: 'aToB' | 'bToA';
@@ -156,13 +144,6 @@ export interface MercurialPoolConfig extends PoolConfig {
   mintA: Address;
   mintB: Address;
 }
-
-function mercurialConfig(cfg: PoolConfig): MercurialPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-  return cfg as MercurialPoolConfig;
-}
-
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
 /**
  * create_program_address([pool (32B), [nonce]], programId) — identical
@@ -249,218 +230,3 @@ export const mercurial = {
   fetchPoolConfig: fetchMercurialPoolConfig,
 };
 
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror). Newton math shared verbatim
-// with saber-stableswap / meteora-damm-v1-stable via the SDK barrel's
-// stable-helpers (dedupe-safe: the codegen merges helpers by {name, source}).
-
-interface MercurialLive {
-  enabled: boolean;
-  src: bigint;
-  dst: bigint;
-  smu: bigint;
-  dmu: bigint;
-  amp: bigint;
-  fn: bigint;
-  vsrc: bigint;
-  vdst: bigint;
-  /** 0 when the slot is unquotable (disabled / empty reserve) — the master validity flag. */
-  d: bigint;
-}
-
-function liveState(cfg: MercurialPoolConfig, state: AccountBytesMap): MercurialLive {
-  const bytes = (addr: Address): Uint8Array => {
-    const data = state[addr];
-    if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-    return data;
-  };
-  const pool = bytes(cfg.pool);
-  const enabled = pool[OFF_SWAP_ENABLED] !== 0;
-  const aToB = cfg.direction === 'aToB';
-  const srcVault = aToB ? cfg.vaultA : cfg.vaultB;
-  const dstVault = aToB ? cfg.vaultB : cfg.vaultA;
-  const srcMultOff = aToB ? OFF_MULT_A : OFF_MULT_B;
-  const dstMultOff = aToB ? OFF_MULT_B : OFF_MULT_A;
-  const src = readUintLE(bytes(srcVault), OFF_SPL_AMOUNT, 8);
-  const dst = readUintLE(bytes(dstVault), OFF_SPL_AMOUNT, 8);
-  const smu = readUintLE(pool, srcMultOff, 8);
-  const dmu = readUintLE(pool, dstMultOff, 8);
-  const amp = readUintLE(pool, OFF_AMP, 8);
-  const fn = readUintLE(pool, OFF_FEE_NUM, 8);
-  const vsrc = src * smu;
-  const vdst = dst * dmu;
-  const d = enabled && vsrc > 0n && vdst > 0n ? stableComputeD(amp, vsrc, vdst) : 0n;
-  return { enabled, src, dst, smu, dmu, amp, fn, vsrc, vdst, d };
-}
-
-/**
- * dyVirtual = vdst - y - 1 (the -1 rounding buffer, in VIRTUAL units), fee
- * taken IN VIRTUAL SPACE, THEN de-normalized (floor) to raw dst units — see
- * the module header for the empirical validation that fixed the rounding
- * order (fee-after-de-normalize is off by up to 1 raw unit on a non-unit
- * multiplier pool).
- */
-function outFromVirtualY(live: MercurialLive, y: bigint): bigint {
-  if (live.vdst <= y) return 0n;
-  const dyVirtual = live.vdst - y - 1n;
-  const feeVirtual = (dyVirtual * live.fn) / FEE_DENOMINATOR;
-  return (dyVirtual - feeVirtual) / live.dmu;
-}
-
-export const mercurialLadder = {
-  slug: SLUG,
-
-  /** Stable slots default to 2 rungs (cap 4) — a Newton quote is ~2 orders costlier than a CP one. */
-  defaultRungs: 2,
-
-  shapeKey(base: PoolConfig): string {
-    const cfg = mercurialConfig(base);
-    return `${SLUG}:${cfg.direction}`;
-  },
-
-  helpers(): { name: string; source: string }[] {
-    return [STABLE_D_HELPER, STABLE_YW_HELPER];
-  },
-
-  /** Everything is a live read — no per-trade params. */
-  paramCount: 0,
-
-  paramsFor(_base: PoolConfig): bigint[] {
-    return [];
-  },
-
-  quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = mercurialConfig(base);
-    return [
-      { ref: ref(slot, 'pool'), address: cfg.pool },
-      { ref: ref(slot, 'va'), address: cfg.vaultA },
-      { ref: ref(slot, 'vb'), address: cfg.vaultB },
-    ];
-  },
-
-  emitSetup(base: PoolConfig, slot: number, _params: readonly string[], enableVar?: string): string {
-    const cfg = mercurialConfig(base);
-    const pool = JSON.stringify(ref(slot, 'pool'));
-    const aToB = cfg.direction === 'aToB';
-    const srcVaultRef = JSON.stringify(ref(slot, aToB ? 'va' : 'vb'));
-    const dstVaultRef = JSON.stringify(ref(slot, aToB ? 'vb' : 'va'));
-    const srcMultOff = aToB ? OFF_MULT_A : OFF_MULT_B;
-    const dstMultOff = aToB ? OFF_MULT_B : OFF_MULT_A;
-    const enabled = enableVar ?? `s${slot}en`;
-    return [
-      `  const s${slot}en2 = accountUint(${pool}, ${OFF_SWAP_ENABLED}, 1);`,
-      `  const s${slot}src = accountUint(${srcVaultRef}, ${OFF_SPL_AMOUNT}, 8);`,
-      `  const s${slot}dst = accountUint(${dstVaultRef}, ${OFF_SPL_AMOUNT}, 8);`,
-      `  const s${slot}smu = accountUint(${pool}, ${srcMultOff}, 8);`,
-      `  const s${slot}dmu = accountUint(${pool}, ${dstMultOff}, 8);`,
-      `  const s${slot}amp = accountUint(${pool}, ${OFF_AMP}, 8);`,
-      `  const s${slot}fn = accountUint(${pool}, ${OFF_FEE_NUM}, 8);`,
-      `  const s${slot}vsrc = s${slot}src * s${slot}smu;`,
-      `  const s${slot}vdst = s${slot}dst * s${slot}dmu;`,
-      // Newton D — ONCE per trade, only for an enabled, funded slot. d == 0
-      // is the master validity flag every quote checks (mirrors saber).
-      `  let s${slot}d = 0;`,
-      `  if (${enabled} !== 0 && s${slot}en2 !== 0 && s${slot}vsrc > 0 && s${slot}vdst > 0) { s${slot}d = stableD(s${slot}amp, s${slot}vsrc, s${slot}vdst) }`,
-    ].join('\n');
-  },
-
-  emitLadderQuote(_base: PoolConfig, slot: number, rung: number, x: string, outVar: string): string {
-    const lines: string[] = [];
-    // The warm cursor: rung 0 seeds from D (the venue's own cold start).
-    if (rung === 0) lines.push(`    let s${slot}wy = s${slot}d;`);
-    lines.push(
-      `    let ${outVar} = 0;`,
-      `    if (s${slot}d > 0 && ${x} > 0) {`,
-      `      s${slot}wy = stableYW(s${slot}amp, s${slot}vsrc + ${x} * s${slot}smu, s${slot}d, s${slot}wy);`,
-      `      if (s${slot}vdst > s${slot}wy) {`,
-      `        const s${slot}dv${rung} = s${slot}vdst - s${slot}wy - 1;`,
-      `        const s${slot}fv${rung} = Math.mulDiv(s${slot}dv${rung}, s${slot}fn, ${FEE_DENOMINATOR});`,
-      `        ${outVar} = (s${slot}dv${rung} - s${slot}fv${rung}) / s${slot}dmu;`,
-      '      }',
-      '    }',
-    );
-    return lines.join('\n');
-  },
-
-  emitFinalQuote(_base: PoolConfig, slot: number, x: string, outVar: string): string {
-    // COLD: y0 = D — byte-identical to the venue's own from-scratch compute_y.
-    return [
-      `  let ${outVar} = 0;`,
-      `  if (s${slot}d > 0 && ${x} > 0) {`,
-      `    const s${slot}fy = stableYW(s${slot}amp, s${slot}vsrc + ${x} * s${slot}smu, s${slot}d, s${slot}d);`,
-      `    if (s${slot}vdst > s${slot}fy) {`,
-      `      const s${slot}fdv = s${slot}vdst - s${slot}fy - 1;`,
-      `      const s${slot}ffv = Math.mulDiv(s${slot}fdv, s${slot}fn, ${FEE_DENOMINATOR});`,
-      `      ${outVar} = (s${slot}fdv - s${slot}ffv) / s${slot}dmu;`,
-      '    }',
-      '  }',
-    ].join('\n');
-  },
-
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser) {
-    const cfg = mercurialConfig(base);
-    // tag 0x04 (Exchange) ++ in_amount u64 LE (runtime-patched) ++
-    // minimum_out_amount u64 LE = 1 (the recipe's terminal delta check
-    // enforces the real bound). Accounts per mercurial-finance's own
-    // stable-swap-n-pool-js `SwapInstruction.exchange` (validated against the
-    // real program, see module header): swapInfo(w), TOKEN_PROGRAM, authority,
-    // userTransferAuthority(signer), BOTH vaults in STORED order (symmetric —
-    // direction never changes this list), userSource(w), userDest(w).
-    const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-    return {
-      programId: MERCURIAL_PROGRAM_ID,
-      prefix: Uint8Array.from([0x04]),
-      suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]),
-      patch: 'in' as const,
-      accounts: [
-        roled('pool', cfg.pool, true),
-        roled('tp', TOKEN_PROGRAM),
-        roled('auth', cfg.authority),
-        { ref: user.owner, signer: true },
-        roled('va', cfg.vaultA, true),
-        roled('vb', cfg.vaultB, true),
-        { ref: user.inAta, writable: true },
-        { ref: user.outAta, writable: true },
-      ],
-    };
-  },
-
-  referenceQuote(base: PoolConfig, state: AccountBytesMap, _params: readonly bigint[], _now?: bigint): (x: bigint) => bigint {
-    const live = liveState(mercurialConfig(base), state);
-    return (x: bigint): bigint => {
-      if (live.d === 0n || x === 0n) return 0n;
-      const y = stableComputeYWarm(live.amp, live.vsrc + x * live.smu, live.d, live.d); // COLD
-      return outFromVirtualY(live, y);
-    };
-  },
-
-  referenceLadderQuotes(
-    base: PoolConfig,
-    state: AccountBytesMap,
-    _params: readonly bigint[],
-    _now?: bigint,
-  ): (grid: readonly bigint[]) => bigint[] {
-    const live = liveState(mercurialConfig(base), state);
-    return (grid: readonly bigint[]): bigint[] => {
-      let wy = live.d;
-      return grid.map((g) => {
-        if (live.d === 0n || g === 0n) return 0n; // wy unchanged, exactly like the fragment
-        wy = stableComputeYWarm(live.amp, live.vsrc + g * live.smu, live.d, wy);
-        return outFromVirtualY(live, wy);
-      });
-    };
-  },
-
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const live = liveState(mercurialConfig(base), state);
-    return { reserveIn: live.src, reserveOut: live.dst };
-  },
-
-  continuousFees(base: PoolConfig, state: AccountBytesMap): { gammaPpm: bigint; muPpm: bigint } {
-    const live = liveState(mercurialConfig(base), state);
-    // Output-side fee retention; the CP form badly understates a stable
-    // curve's depth — measurement oracle only, never a gate (like saber).
-    return { gammaPpm: 1_000_000n, muPpm: 1_000_000n - (live.fn * 1_000_000n) / FEE_DENOMINATOR };
-  },
-} satisfies SvmVenueLadderV2;

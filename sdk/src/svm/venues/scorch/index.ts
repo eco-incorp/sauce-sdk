@@ -1,5 +1,5 @@
 /**
- * Scorch (EcoSwapSVM venue, closed-source-binary reverse-engineering — no on-chain IDL; the same
+ * Scorch (SvmRoute venue, closed-source-binary reverse-engineering — no on-chain IDL; the same
  * RE method used for the WITHDRAWN BisonFi integration attempt, see docs/bisonfi-evidence.md —
  * this file does not import from it, the shared lineage is methodology only).
  *
@@ -76,7 +76,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 import { SCORCH_ASSET_CONFIGS } from './asset-configs.js';
 
 const SLUG = 'scorch';
@@ -85,14 +85,6 @@ const SLUG = 'scorch';
 export const SCORCH_CORE_PROGRAM_ID = address('ojh19ojaKduoJZuaJADhcVGp4xt1TcdAvZmpVsCorch');
 /** ROUTER — the real custodian; the swap CPI's actual CALL target. */
 export const SCORCH_ROUTER_PROGRAM_ID = address('SCoRcH8c2dpjvcJD6FiPbCSQyQgu3PcUAWj2Xxx3mqn');
-/** Single global vault-authority PDA (owned by ROUTER), shared by every pair — NOT per-pool. */
-const VAULT_AUTHORITY = address('EHcege7dok1iYs7SxL2XzDPvhg6XzMVcx2V5SkMUurJP');
-/** Single global oracle account, shared by every pair (confirmed across two unrelated pairs). */
-const ORACLE = address('HLixVmXdBqzP1sXT9au4BHcvUjDgx5ev16cEJdd9tUSM');
-const MEMO_PROGRAM = address('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
-const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const SYSVAR_INSTRUCTIONS = address('Sysvar1nstructions1111111111111111111111111');
-
 // PairConfig (658 bytes, owned by CORE): tag(1)=0x02, flag(1), reserved(12)=0xff*12,
 // idxA(u16 LE)@14, mintA(32)@16, vaultA(32)@48, idxB(u16 LE)@80, mintB(32)@82,
 // vaultB(32)@114, an 8-byte tail @146 of unrecovered semantics, zero-padded to 658.
@@ -104,13 +96,6 @@ const OFF_VAULT_A = 48;
 const OFF_MINT_B = 82;
 const OFF_VAULT_B = 114;
 
-// AssetConfig (592 bytes, owned by CORE): tag(1)=0x01, flag(1), a u16 @2, reserved(2)@4,
-// an i32 @6, a u32 @10, idx(u16 LE)@14, mint(32)@16, vault(32)@48. Validated against
-// all 19 real mainnet AssetConfig accounts.
-const ASSET_CONFIG_SIZE = 592;
-
-/** A standard (Tokenkeg) SPL token account's `amount` field offset. */
-const VAULT_AMOUNT_OFFSET = 64;
 const SPL_TOKEN_ACCOUNT_SIZE = 165;
 
 /**
@@ -120,8 +105,6 @@ const SPL_TOKEN_ACCOUNT_SIZE = 165;
  * CP output.
  */
 export const SCORCH_HAIRCUT_PPM = 300_000n;
-const PPM_DENOM = 1_000_000n;
-
 export interface ScorchPoolConfig extends PoolConfig {
   venue: typeof SLUG;
   /** 'AtoB' (default, mintA in / mintB out) | 'BtoA'. */
@@ -132,12 +115,6 @@ export interface ScorchPoolConfig extends PoolConfig {
   mintB: Address;
   vaultB: Address;
   assetConfigB: Address;
-}
-
-function readUintLE(bytes: Uint8Array, offset: number, len: number): bigint {
-  let v = 0n;
-  for (let i = len - 1; i >= 0; i--) v = (v << 8n) | BigInt(bytes[offset + i]);
-  return v;
 }
 
 function b58Address(bytes: Uint8Array, offset: number): Address {
@@ -201,12 +178,12 @@ export const scorch = {
     const assetConfigBStr = SCORCH_ASSET_CONFIGS[mintB];
     if (assetConfigAStr === undefined) {
       throw new Error(
-        `scorch pool ${pool}: no known AssetConfig for mint ${mintA} — refresh ecoswap/svm/venues/scorch-asset-configs.ts`,
+        `scorch pool ${pool}: no known AssetConfig for mint ${mintA} — refresh the consuming app scorch-asset-configs venue module`,
       );
     }
     if (assetConfigBStr === undefined) {
       throw new Error(
-        `scorch pool ${pool}: no known AssetConfig for mint ${mintB} — refresh ecoswap/svm/venues/scorch-asset-configs.ts`,
+        `scorch pool ${pool}: no known AssetConfig for mint ${mintB} — refresh the consuming app scorch-asset-configs venue module`,
       );
     }
 
@@ -245,131 +222,3 @@ export const scorch = {
   },
 };
 
-export const scorchLadder = {
-  slug: SLUG,
-
-  shapeKey(base: PoolConfig): string {
-    const cfg = scorchConfig(base);
-    return `${SLUG}:${cfg.direction}`;
-  },
-
-  helpers() {
-    return [
-      {
-        name: 'qScorch',
-        source: [
-          'function qScorch(x, rin, rout, feePpm) {',
-          '  if (x === 0) { return 0 }',
-          `  const fee = (x * feePpm + ${PPM_DENOM - 1n}) / ${PPM_DENOM};`,
-          '  const net = x - fee;',
-          '  return Math.mulDiv(net, rout, rin + net);',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-
-  /** One param: the conservative haircut-as-fee (ppm), constant today (see file header). */
-  paramCount: 1,
-  paramsFor(_base: PoolConfig): bigint[] {
-    return [SCORCH_HAIRCUT_PPM];
-  },
-
-  quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = scorchConfig(base);
-    const [vin, vout] = cfg.direction === 'BtoA' ? [cfg.vaultB, cfg.vaultA] : [cfg.vaultA, cfg.vaultB];
-    return [
-      { ref: ref(slot, 'vin'), address: vin },
-      { ref: ref(slot, 'vout'), address: vout },
-    ];
-  },
-
-  emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string {
-    scorchConfig(base);
-    const vin = JSON.stringify(ref(slot, 'vin'));
-    const vout = JSON.stringify(ref(slot, 'vout'));
-    return [
-      `  const s${slot}rin = accountUint(${vin}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-      `  const s${slot}rout = accountUint(${vout}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-      `  const s${slot}fee = ${params[0]};`,
-    ].join('\n');
-  },
-
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    return `qScorch(${x}, s${slot}rin, s${slot}rout, s${slot}fee)`;
-  },
-
-  /**
-   * ROUTER's real swap ix, ground-truthed live (see file header): disc(1)=0x02
-   * ++ subtag(1)=0x80 ++ commitment(16)=0 ++ amountIn(8, patched) ++
-   * minOut(8)=0 — the proven no-commitment encoding. Account order/roles
-   * match six real historical transactions plus six fresh simulate probes.
-   */
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    const cfg = scorchConfig(base);
-    const [mintIn, mintOut, vaultIn, vaultOut] =
-      cfg.direction === 'BtoA' ? [cfg.mintB, cfg.mintA, cfg.vaultB, cfg.vaultA] : [cfg.mintA, cfg.mintB, cfg.vaultA, cfg.vaultB];
-
-    return {
-      programId: SCORCH_ROUTER_PROGRAM_ID,
-      prefix: Uint8Array.from([0x02, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-      suffix: Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0]),
-      patch: 'in',
-      accounts: [
-        { ref: ref(slot, 'vaultAuth'), address: VAULT_AUTHORITY, writable: true },
-        { ref: user.owner, signer: true },
-        { ref: user.inAta, writable: true },
-        { ref: user.outAta, writable: true },
-        { ref: ref(slot, 'vin'), address: vaultIn, writable: true },
-        { ref: ref(slot, 'vout'), address: vaultOut, writable: true },
-        { ref: ref(slot, 'mintIn'), address: mintIn },
-        { ref: ref(slot, 'mintOut'), address: mintOut },
-        { ref: ref(slot, 'tpIn'), address: TOKEN_PROGRAM },
-        { ref: ref(slot, 'tpOut'), address: TOKEN_PROGRAM },
-        { ref: ref(slot, 'memo'), address: MEMO_PROGRAM },
-        { ref: ref(slot, 'core'), address: SCORCH_CORE_PROGRAM_ID },
-        { ref: ref(slot, 'oracle'), address: ORACLE },
-        { ref: ref(slot, 'acfgA'), address: cfg.assetConfigA, writable: true },
-        { ref: ref(slot, 'acfgB'), address: cfg.assetConfigB, writable: true },
-        { ref: ref(slot, 'pair'), address: cfg.pool, writable: true },
-        { ref: ref(slot, 'sysvarIx'), address: SYSVAR_INSTRUCTIONS },
-      ],
-    };
-  },
-
-  referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint {
-    const cfg = scorchConfig(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const [vin, vout] = cfg.direction === 'BtoA' ? [cfg.vaultB, cfg.vaultA] : [cfg.vaultA, cfg.vaultB];
-    const rin = readUintLE(bytes(vin), VAULT_AMOUNT_OFFSET, 8);
-    const rout = readUintLE(bytes(vout), VAULT_AMOUNT_OFFSET, 8);
-    const feePpm = params[0];
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      const fee = (x * feePpm + (PPM_DENOM - 1n)) / PPM_DENOM;
-      const net = x - fee;
-      const denom = rin + net;
-      if (denom === 0n) return 0n;
-      return (net * rout) / denom;
-    };
-  },
-
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const cfg = scorchConfig(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr];
-      if (data === undefined) throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-      return data;
-    };
-    const [vin, vout] = cfg.direction === 'BtoA' ? [cfg.vaultB, cfg.vaultA] : [cfg.vaultA, cfg.vaultB];
-    return { reserveIn: readUintLE(bytes(vin), VAULT_AMOUNT_OFFSET, 8), reserveOut: readUintLE(bytes(vout), VAULT_AMOUNT_OFFSET, 8) };
-  },
-
-  continuousFees(_base: PoolConfig, _state: AccountBytesMap, params: readonly bigint[]): { gammaPpm: bigint; muPpm: bigint } {
-    return { gammaPpm: PPM_DENOM - params[0], muPpm: PPM_DENOM };
-  },
-};

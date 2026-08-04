@@ -84,7 +84,7 @@
  *
  * KNOWN, MEASURED, SAFE-DIRECTION QUIRK — the real program does not always
  * debit EXACTLY `tokens` from the user: a raw hand-built instruction (no
- * ecoswap-svm engine involved) against the SAME V1 pool this file validates,
+ * the consuming app engine involved) against the SAME V1 pool this file validates,
  * at seven sizes from 10M to 1B raw units, measured the ACTUAL debit
  * (verified equal to the vault's own credit — both sides agree) falling 0
  * to 12 raw units SHORT of the requested `tokens`, NEVER over, and
@@ -95,26 +95,21 @@
  * multi-billion-unit reserves cannot move the floored CP quote — confirmed:
  * the realized output matched the prediction exactly at every size tested)
  * and is economically identical to the ordinary "partial fill" case
- * EcoSwapSvm already handles structurally on SVM (the un-entered input
+ * SvmRoute already handles structurally on SVM (the un-entered input
  * simply never leaves the user's own `inAta` — there is no pot to
- * reconcile). `test/svm/ecoswap-svm.realcpi.e2e.test.ts`'s `aldrin`/
+ * reconcile). `the consuming app realcpi e2e test`'s `aldrin`/
  * `aldrin-v2` cells assert this bound explicitly (`runQuad`'s `inputSlack`
  * parameter) rather than exact-debit equality, unlike every other family.
  */
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import { readUintLE } from '../math.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 export const ALDRIN_V1_PROGRAM_ID = address('AMM55ShdkoGRB5jVYPjWziwk8m5MpwyDgsMWHaMSQWH6');
 export const ALDRIN_V2_PROGRAM_ID = address('CURVGoZn8zycx6FXwwevgBTB2gVvdbGTEpvMJDbgs2t4');
-const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-
 /** sha256("account:Pool")[0..8] — shared with this repo's pumpswap adapter; see module header. */
 const POOL_DISCRIMINATOR = [0xf1, 0x9a, 0x6d, 0x04, 0x11, 0xb1, 0x6d, 0xbc];
-/** sha256("global:swap")[0..8]. */
-const SWAP_DISCRIMINATOR = Uint8Array.from([0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]);
-
 const POOL_V1_SIZE = 441;
 const POOL_V2_SIZE = 474;
 // Offsets into POOL_FIELDS_COMMON (identical prefix on both versions).
@@ -228,179 +223,3 @@ export const aldrinV2 = {
   fetchPoolConfig: (load: AccountLoader, pool: Address): Promise<AldrinPoolConfig> => fetchAldrinPoolConfig(load, pool, 2),
 };
 
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror) — shared between V1/V2; the
-// two exported ladders differ only in `version` (account count / program id).
-// ---------------------------------------------------------------------------
-
-function aldrinConfig(slug: string, base: PoolConfig): AldrinPoolConfig {
-  if (base.venue !== slug) throw new Error(`${slug} ladder adapter got a '${base.venue}' pool config`);
-  return base as AldrinPoolConfig;
-}
-
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-/** (rin, rout) vault addresses for the cfg's current direction. */
-function reserveVaults(cfg: AldrinPoolConfig): { vin: Address; vout: Address } {
-  return cfg.direction === 'quoteToBase'
-    ? { vin: cfg.quoteTokenVault, vout: cfg.baseTokenVault }
-    : { vin: cfg.baseTokenVault, vout: cfg.quoteTokenVault };
-}
-
-function makeAldrinLadder(slug: 'aldrin' | 'aldrin-v2', version: 1 | 2, programId: Address): SvmVenueLadderV2 {
-  const helperName = version === 1 ? 'qAldrinCp' : 'qAldrinV2Cp';
-
-  return {
-    slug,
-    shapeKey(base) {
-      const cfg = aldrinConfig(slug, base);
-      return `${slug}:${cfg.direction}`;
-    },
-    // Standard spl-token-swap-lineage CP quote: floor-fee (min 1 raw unit
-    // when the numerator is nonzero) on both the trade and owner fee legs,
-    // then a ceiling-divided constant product — byte-identical to this
-    // repo's orca-legacy-token-swap `qOrca` (see module header for the
-    // real-transaction validation). A venue-rejected input (fees swallow x,
-    // a drained pool) returns 0 instead of throwing, matching every other
-    // ladder's dust convention.
-    helpers() {
-      return [
-        {
-          name: helperName,
-          source: [
-            `function ${helperName}(x, rin, rout, tn, td, on, od) {`,
-            '  if (x === 0) { return 0 }',
-            '  if (rin === 0 || rout === 0) { return 0 }',
-            '  let tf = 0;',
-            '  if (tn > 0) { tf = x * tn / td; if (tf === 0) { tf = 1 } }',
-            '  let of = 0;',
-            '  if (on > 0) { of = x * on / od; if (of === 0) { of = 1 } }',
-            '  if (tf + of >= x) { return 0 }',
-            '  const net = x - tf - of;',
-            '  const ni = rin + net;',
-            '  const no = (rin * rout + ni - 1) / ni;',
-            '  if (no >= rout) { return 0 }',
-            '  return rout - no;',
-            '}',
-          ].join('\n'),
-        },
-      ];
-    },
-    /** Four params: trade fee numerator/denominator, owner fee numerator/denominator. */
-    paramCount: 4,
-    paramsFor(base) {
-      const cfg = aldrinConfig(slug, base);
-      return [cfg.tradeFeeNumerator, cfg.tradeFeeDenominator, cfg.ownerTradeFeeNumerator, cfg.ownerTradeFeeDenominator];
-    },
-    quoteRefs(base, slot) {
-      const cfg = aldrinConfig(slug, base);
-      const { vin, vout } = reserveVaults(cfg);
-      return [
-        { ref: ref(slot, 'vin'), address: vin },
-        { ref: ref(slot, 'vout'), address: vout },
-      ];
-    },
-    emitSetup(_base, slot, params) {
-      return [
-        `  const s${slot}rin = accountUint(${JSON.stringify(ref(slot, 'vin'))}, 64, 8);`,
-        `  const s${slot}rout = accountUint(${JSON.stringify(ref(slot, 'vout'))}, 64, 8);`,
-        `  const s${slot}tn = ${params[0]};`,
-        `  const s${slot}td = ${params[1]};`,
-        `  const s${slot}on = ${params[2]};`,
-        `  const s${slot}od = ${params[3]};`,
-      ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-      return `${helperName}(${x}, s${slot}rin, s${slot}rout, s${slot}tn, s${slot}td, s${slot}on, s${slot}od)`;
-    },
-    buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-      const cfg = aldrinConfig(slug, base);
-      const isQuoteToBase = cfg.direction === 'quoteToBase';
-      // side: Ask(1) = base in / quote out (the six validated real txs), Bid(0)
-      // = quote in / base out — see module header. userBaseTokenAccount /
-      // userQuoteTokenAccount stay in this FIXED order regardless of side.
-      const side = isQuoteToBase ? 0 : 1;
-      const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-        writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-      const userBaseAccount: VenueAccount = isQuoteToBase ? { ref: user.outAta, writable: true } : { ref: user.inAta, writable: true };
-      const userQuoteAccount: VenueAccount = isQuoteToBase ? { ref: user.inAta, writable: true } : { ref: user.outAta, writable: true };
-      const accounts: VenueAccount[] = [
-        roled('pool', cfg.pool),
-        roled('signer', cfg.poolSigner),
-        roled('poolMint', cfg.poolMint, true),
-        roled('baseVault', cfg.baseTokenVault, true),
-        roled('quoteVault', cfg.quoteTokenVault, true),
-        roled('feeAcct', cfg.feePoolTokenAccount, true),
-        { ref: user.owner, signer: true },
-        userBaseAccount,
-        userQuoteAccount,
-        ...(version === 2 ? [roled('curve', cfg.curve!)] : []),
-        roled('tokenProgram', TOKEN_PROGRAM),
-      ];
-      return {
-        programId,
-        prefix: SWAP_DISCRIMINATOR,
-        // minTokens u64 LE = 1 (the recipe's own outAta delta check is the
-        // real bound) ++ side u8.
-        suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, side]),
-        patch: 'in',
-        accounts,
-      };
-    },
-    referenceQuote(base, state: AccountBytesMap, params) {
-      const cfg = aldrinConfig(slug, base);
-      const bytes = (addr: Address): Uint8Array => {
-        const data = state[addr];
-        if (data === undefined) throw new Error(`${slug} ladder reference is missing account ${addr}`);
-        return data;
-      };
-      const { vin, vout } = reserveVaults(cfg);
-      const rin = readUintLE(bytes(vin), 64, 8);
-      const rout = readUintLE(bytes(vout), 64, 8);
-      const [tn, td, on, od] = params;
-      return (x: bigint): bigint => {
-        if (x === 0n) return 0n;
-        if (rin === 0n || rout === 0n) return 0n;
-        let tf = 0n;
-        if (tn! > 0n) {
-          tf = (x * tn!) / td!;
-          if (tf === 0n) tf = 1n;
-        }
-        let of = 0n;
-        if (on! > 0n) {
-          of = (x * on!) / od!;
-          if (of === 0n) of = 1n;
-        }
-        if (tf + of >= x) return 0n;
-        const net = x - tf - of;
-        const ni = rin + net;
-        const no = ceilDiv(rin * rout, ni);
-        if (no >= rout) return 0n;
-        return rout - no;
-      };
-    },
-    depthReserves(base, state: AccountBytesMap) {
-      const cfg = aldrinConfig(slug, base);
-      const bytes = (addr: Address): Uint8Array => {
-        const data = state[addr];
-        if (data === undefined) throw new Error(`${slug} ladder depth is missing account ${addr}`);
-        return data;
-      };
-      const { vin, vout } = reserveVaults(cfg);
-      return {
-        reserveIn: readUintLE(bytes(vin), 64, 8),
-        reserveOut: readUintLE(bytes(vout), 64, 8),
-      };
-    },
-    continuousFees(_base, _state, params) {
-      const [tn, td, on, od] = params;
-      let gamma = 1_000_000n;
-      if (tn! > 0n) gamma -= (tn! * 1_000_000n) / td!;
-      if (on! > 0n) gamma -= (on! * 1_000_000n) / od!;
-      return { gammaPpm: gamma, muPpm: 1_000_000n };
-    },
-  };
-}
-
-export const aldrinLadder: SvmVenueLadderV2 = makeAldrinLadder('aldrin', 1, ALDRIN_V1_PROGRAM_ID);
-export const aldrinV2Ladder: SvmVenueLadderV2 = makeAldrinLadder('aldrin-v2', 2, ALDRIN_V2_PROGRAM_ID);

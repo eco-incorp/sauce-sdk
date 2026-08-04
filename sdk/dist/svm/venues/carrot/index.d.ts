@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadderV2 } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 export declare const CARROT_PROGRAM_ID: Address<"CarrotwivhMpDnm27EHmRLeQ683Z1PufuqEmBZvD282s">;
 export declare const CRT_MINT: Address<"CRTx1JouZhzSU6XytsE42UQraoGqiHgxabocVfARTy2s">;
 /** The one deployed vault — a PDA of `["vault", CRT_MINT]`, singleton today. */
@@ -48,14 +48,13 @@ export interface CarrotDirection {
     assetId: number;
 }
 export declare function parseCarrotDirection(direction: string): CarrotDirection;
-/** Every `issue:<id>` / `redeem:<id>` direction the fetched vault currently offers, in asset order — the multi-direction dispatch `resolveSvmPoolSpec` tries (see `ecoswap/svm/index.ts`). */
+/** Every `issue:<id>` / `redeem:<id>` direction the fetched vault currently offers, in asset order — the multi-direction dispatch `resolveSvmPoolSpec` tries (see `the consuming app SVM solver entry`). */
 export declare function carrotAllDirections(cfg: PoolConfig): string[];
 export declare const carrot: {
     slug: "carrot";
     programId: Address<"CarrotwivhMpDnm27EHmRLeQ683Z1PufuqEmBZvD282s">;
     fetchPoolConfig: (load: AccountLoader, pool: Address) => Promise<CarrotPoolConfig>;
 };
-export declare const carrotLadder: SvmVenueLadderV2;
 /** Prepare-time direction gate: self-drops the SPECIFIC direction (not the whole vault) if its asset's oracle reading is stale. */
 export declare function carrotGate(base: PoolConfig, now: bigint): void;
 export declare function carrotMints(base: PoolConfig): {

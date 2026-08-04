@@ -62,8 +62,6 @@ export interface ManifestPoolConfig extends PoolConfig {
         quoteIn: ManifestWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function manifestWindowFor(cfg: ManifestPoolConfig): ManifestWindow;
 /**
  * Fetch + gate one Manifest market (see the header for the gate list) and
  * freeze both directions' top-of-book order windows. Read-only against the

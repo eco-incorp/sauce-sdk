@@ -140,7 +140,7 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueAdapter, SvmVenueLadderV2, SwapUser, VenueAccount, VenueSwap } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueAdapter, SwapUser, VenueAccount, VenueSwap } from '../types.js';
 
 const SLUG = 'perena';
 export const PERENA_PROGRAM_ID = address('NUMERUNsFCP3kuNmWZuXtm1AaQCPj9uw6Guv2Ekoi5P');
@@ -557,77 +557,7 @@ export const perena: SvmVenueAdapter = {
   referenceQuote,
 };
 
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const perenaLadder: SvmVenueLadderV2 = {
-  slug: SLUG,
-  defaultRungs: 2,
-  shapeKey(cfg) {
-    const c = asPerenaConfig(cfg);
-    return `${SLUG}:${c.direction}`;
-  },
-  helpers() {
-    return [];
-  },
-  paramCount: 0,
-  paramsFor() {
-    return [];
-  },
-  quoteRefs(cfg, slot) {
-    const c = asPerenaConfig(cfg);
-    return [{ ref: ref(slot, 'pool'), address: c.pool }];
-  },
-  emitSetup(cfg, slot) {
-    // The 6 reserve/scale reads + 2 fee reads, ONCE per trade — D itself is
-    // a COMPILE-TIME constant (no on-chain Newton solve), so nothing else
-    // needs setup-phase precompute. Every rung (and the final quote) reuses
-    // these `s{slot}`-named locals via arithmeticLines instead of re-reading.
-    const c = asPerenaConfig(cfg);
-    return readLines(c, JSON.stringify(ref(slot, 'pool')), `s${slot}`).join('\n');
-  },
-  emitLadderQuote(cfg, slot, rung, x, outVar) {
-    const c = asPerenaConfig(cfg);
-    return arithmeticLines(c, `s${slot}`, `s${slot}r${rung}`, x, outVar).join('\n');
-  },
-  emitFinalQuote(cfg, slot, x, outVar) {
-    const c = asPerenaConfig(cfg);
-    return arithmeticLines(c, `s${slot}`, `s${slot}f`, x, outVar).join('\n');
-  },
-  buildSwapV2(cfg, slot, user) {
-    const c = asPerenaConfig(cfg);
-    const inIndex = c.direction === 'aToB' ? 0 : 1;
-    const outIndex = c.direction === 'aToB' ? 1 : 0;
-    const template: LadderSwapTemplate = {
-      programId: PERENA_PROGRAM_ID,
-      prefix: Uint8Array.from([...SWAP_EXACT_IN_DISCRIMINATOR, inIndex, outIndex]),
-      suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]), // min_amount_out = 1
-      patch: 'in',
-      accounts: perenaAccounts(c, user, (role) => ref(slot, role)),
-    };
-    return template;
-  },
-  referenceQuote(cfg, state, _params, now) {
-    const c = asPerenaConfig(cfg);
-    const pool = state[c.pool];
-    if (pool === undefined) throw new Error(`${SLUG} ladder reference is missing account ${c.pool}`);
-    const live = liveStateFrom(c, pool);
-    return (x: bigint) => perenaSwapOut(live, x);
-  },
-  depthReserves(cfg, state) {
-    const c = asPerenaConfig(cfg);
-    const pool = state[c.pool];
-    if (pool === undefined) throw new Error(`${SLUG} ladder depth is missing account ${c.pool}`);
-    const live = liveStateFrom(c, pool);
-    return { reserveIn: live.xIn, reserveOut: live.xOut };
-  },
-  continuousFees(cfg, state) {
-    const c = asPerenaConfig(cfg);
-    const pool = state[c.pool];
-    if (pool === undefined) throw new Error(`${SLUG} ladder fees are missing account ${c.pool}`);
-    const fn = readUintLE(pool, OFF_FEE_NUM, 4);
-    const fd = readUintLE(pool, OFF_FEE_DENOM, 4);
-    return { gammaPpm: 1_000_000n, muPpm: fd === 0n ? 1_000_000n : 1_000_000n - (fn * 1_000_000n) / fd };
-  },
-};

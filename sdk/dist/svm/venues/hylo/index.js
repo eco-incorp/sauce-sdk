@@ -193,8 +193,6 @@ const TOKEN_ACCOUNT_AMOUNT_OFFSET = 64; // u64, no discriminator prefix (native 
 const N4_ONE = 10000n;
 const N9_ONE = 1000000000n;
 const N6_TO_N9 = 1000n;
-/** Uncapped sentinel — mint direction's clamp is always a no-op (see module header GATES). */
-const UNCAPPED = (1n << 64n) - 1n;
 /** floor(a*b/c), 0 on a non-positive denominator (mirrors the engine's Math.mulDiv/DIV rule). */
 function mulDivFloor(a, b, c) {
     return c <= 0n ? 0n : (a * b) / c;
@@ -316,9 +314,9 @@ export function hyloGate(cfg, now) {
 }
 /**
  * Recoverable live-state drift (pause / stale-or-low-confidence oracle) between discovery and
- * prepare — the SAME class `ecoswap/svm/index.ts`'s own `SvmWindowDriftError` names (that class
+ * prepare — the SAME class `the consuming app SVM solver entry`'s own `SvmWindowDriftError` names (that class
  * is private to index.ts, so this venue module carries an identically-treated local marker;
- * `ecoswap/svm/index.ts`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
+ * `the consuming app SVM solver entry`'s FAMILIES wiring re-throws this as its own `SvmWindowDriftError` so the
  * self-drop classification stays centralized there).
  */
 export class SvmHyloDriftError extends Error {
@@ -530,101 +528,6 @@ export const hylo = {
     buildSwap,
     referenceQuote,
 };
-// ---- SvmVenueLadderV2 (the EcoSwapSVM production ladder) ----
+// ---- SvmVenueLadder (the SvmRoute production ladder) ----
 const ref = (slot, role) => `s${slot}:${role}`;
-export const hyloLadder = {
-    slug: SLUG,
-    defaultRungs: 4,
-    shapeKey(cfg) {
-        const c = asHyloConfig(cfg);
-        return `${SLUG}:${c.direction}`;
-    },
-    helpers() {
-        return [];
-    },
-    paramCount: 0,
-    paramsFor() {
-        return [];
-    },
-    quoteRefs(cfg, slot) {
-        // The vault ref is fetched UNCONDITIONALLY (both directions) — see quoteAccounts' identical
-        // comment (the plain adapter's twin): depthReserves/continuousFees need it either way, even
-        // though the mint direction's own on-chain fragment (emitSetup) never reads it.
-        void cfg;
-        return [
-            { ref: ref(slot, 'pair'), address: USDC_PAIR_ACCOUNT },
-            { ref: ref(slot, 'pyth'), address: USDC_USD_PYTH_FEED },
-            { ref: ref(slot, 'vault'), address: USDC_COLLATERAL_VAULT },
-        ];
-    },
-    emitSetup(cfg, slot) {
-        const c = asHyloConfig(cfg);
-        const p = `s${slot}`;
-        const pair = JSON.stringify(ref(slot, 'pair'));
-        const pyth = JSON.stringify(ref(slot, 'pyth'));
-        const lines = [
-            `  const ${p}fee = accountUint(${pair}, ${OFF_SWAP_FEE_BITS}, 8);`,
-            `  const ${p}price = accountUint(${pyth}, ${OFF_PYTH_PRICE}, 8);`,
-            `  const ${p}conf = accountUint(${pyth}, ${OFF_PYTH_CONF}, 8);`,
-        ];
-        if (c.direction === 'aToB') {
-            // Mint has no practical cap (see module header GATES) — icap stays the uncapped sentinel.
-            lines.push(`  let ${p}icap = ${UNCAPPED};`, `  let ${p}cx = 0;`);
-            return lines.join('\n');
-        }
-        const vault = JSON.stringify(ref(slot, 'vault'));
-        lines.push(`  const ${p}vsupply = accountUint(${pair}, ${OFF_VIRTUAL_STABLECOIN_SUPPLY_BITS}, 8);`, `  const ${p}vaultbal = accountUint(${vault}, ${TOKEN_ACCOUNT_AMOUNT_OFFSET}, 8);`, `  let ${p}icap = ${UNCAPPED};`, `  if (${p}fee < 10000 && ${p}price > ${p}conf) {`, `    const ${p}upperN9 = (${p}price + ${p}conf) * ${c.priceScale.toString()};`, `    const ${p}cap1 = ((${p}vsupply + 1) * 10000 - 1) / (10000 - ${p}fee);`, `    const ${p}rmax = ((${p}vaultbal + 1) * ${p}upperN9 - 1) / 1000000000;`, `    const ${p}cap2 = ((${p}rmax + 1) * 10000 - 1) / (10000 - ${p}fee);`, `    ${p}icap = ${p}cap1 < ${p}cap2 ? ${p}cap1 : ${p}cap2;`, '  }', `  let ${p}cx = 0;`);
-        return lines.join('\n');
-    },
-    emitLadderQuote(cfg, slot, rung, x, outVar) {
-        const c = asHyloConfig(cfg);
-        const p = `s${slot}`;
-        const tmp = `${p}r${rung}`;
-        return [`  ${p}cx = ${x};`, `  if (${p}cx > ${p}icap) { ${p}cx = ${p}icap }`, ...arithmeticLines(c, p, tmp, `${p}cx`, outVar)].join('\n');
-    },
-    emitFinalQuote(cfg, slot, x, outVar) {
-        const c = asHyloConfig(cfg);
-        const p = `s${slot}`;
-        const tmp = `${p}f`;
-        return [`  ${p}fcx = ${x};`, `  if (${p}fcx > ${p}icap) { ${p}fcx = ${p}icap }`, ...arithmeticLines(c, p, tmp, `${p}fcx`, outVar)].join('\n');
-    },
-    capacityInputVar(slot) {
-        return `s${slot}cx`;
-    },
-    buildSwapV2(cfg, slot, user) {
-        const c = asHyloConfig(cfg);
-        const disc = c.direction === 'aToB' ? MINT_STABLECOIN_USDC_DISCRIMINATOR : REDEEM_STABLECOIN_USDC_DISCRIMINATOR;
-        const template = {
-            programId: HYLO_PROGRAM_ID,
-            prefix: Uint8Array.from(disc),
-            suffix: SLIPPAGE_CONFIG_NONE,
-            patch: 'in',
-            accounts: swapAccounts(c, user, (role) => ref(slot, role)),
-        };
-        return template;
-    },
-    referenceQuote(cfg, state) {
-        const c = asHyloConfig(cfg);
-        const live = liveStateFrom(state);
-        if (c.direction === 'aToB') {
-            return (x) => hyloMintOut(live, c.priceScale, x);
-        }
-        const cap = hyloRedeemCapacity(live, c.priceScale);
-        return (x) => hyloRedeemOut(live, c.priceScale, x > cap ? cap : x);
-    },
-    depthReserves(cfg, state) {
-        const c = asHyloConfig(cfg);
-        const live = liveStateFrom(state);
-        // Relative-depth / continuous-oracle input only (never a hard gate — see types.d.ts) — a
-        // rough "pool size" proxy: the pair's own tracked liability vs. its real USDC backing.
-        return c.direction === 'aToB'
-            ? { reserveIn: live.vaultBalance, reserveOut: live.vsupply }
-            : { reserveIn: live.vsupply, reserveOut: live.vaultBalance };
-    },
-    continuousFees(cfg, state) {
-        const live = liveStateFrom(state);
-        const feePpm = live.feeBits * 100n; // N4 (1e-4) -> ppm (1e-6): x * 1e4/1e6 = x*100
-        return { gammaPpm: 1000000n, muPpm: 1000000n - (feePpm > 1000000n ? 1000000n : feePpm) };
-    },
-};
 //# sourceMappingURL=index.js.map

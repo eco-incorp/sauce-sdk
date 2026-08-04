@@ -13,7 +13,7 @@ export declare const manifestLadder: {
      * 2 rungs by default: the setup (MANIFEST_MAX_ORDERS unrolled live reads over
      * the whole book account) is a heavy fixed cost, so a manifest slot is a
      * degrade-first 'stable'-class family like whirlpool (see
-     * recipes/ecoswap/svm/budget.ts). The cold walk is exact at any point, so a
+     * the consuming app SVM CU-budget module). The cold walk is exact at any point, so a
      * coarser rung grid only affects the split quantization, not correctness.
      */
     defaultRungs: number;

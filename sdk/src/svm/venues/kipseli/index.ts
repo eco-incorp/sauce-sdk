@@ -168,7 +168,7 @@ import type {
   AccountLoader,
   LadderSwapTemplate,
   PoolConfig,
-  SvmVenueLadderV2,
+  SvmVenueLadder,
   SwapUser,
   VenueAccount,
 } from '../types.js';
@@ -351,7 +351,7 @@ export const kipseli = {
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
 
-export const kipseliLadder: SvmVenueLadderV2 = {
+export const kipseliLadder: SvmVenueLadder = {
   slug: SLUG,
 
   shapeKey(base: PoolConfig): string {

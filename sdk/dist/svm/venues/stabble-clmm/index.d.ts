@@ -75,8 +75,6 @@ export interface StabbleClmmPoolConfig extends PoolConfig {
         '1to0': StabbleClmmWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: StabbleClmmPoolConfig): StabbleClmmWindow;
 /**
  * Fetch + gate one Stabble CLMM pool (see the header for the gate list) and
  * freeze both directions' boundary windows. Read-only against the loader.

@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountBytesMap, AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "phoenix";
 export declare const PHOENIX_PROGRAM_ID: Address<"PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY">;
 /** u64 LE @0 — accounts.rs `check_discriminants` asserts this exact value for MarketHeader. */
@@ -12,7 +12,7 @@ export declare const BIDS_NODES_BASE: number;
  * heavier per-level walk: two budget checks plus the fee-adjusted-budget
  * setup) — MEASURED (not guessed): 588,522 CU @2 rungs / 831,135 CU @4
  * rungs on the real engine against the checked-in real SOL/USDC fixture
- * (`ecoswap-svm.cu.e2e.test.ts`, `CU_FAMILIES.phoenix` in budget.ts), both
+ * (`the consuming app cu e2e test`, `CU_FAMILIES.phoenix` in budget.ts), both
  * comfortably under the ~1.19M admission budget with room for a companion
  * slot. At this depth the shipped bid window alone absorbs ~713 SOL before
  * exhausting (see `docs/phoenix-evidence.md`) — far beyond a typical trade
@@ -86,39 +86,5 @@ export declare function depthReserves(base: PoolConfig, state: AccountBytesMap):
     reserveIn: bigint;
     reserveOut: bigint;
 };
-export declare const phoenixLadder: {
-    slug: string;
-    /**
-     * 2 rungs by default: the setup (PHOENIX_MAX_ORDERS unrolled live reads) is
-     * a heavy fixed cost — a 'stable'-class family like manifest/whirlpool (see
-     * budget.ts). The cold walk is exact at any point, so a coarser rung grid
-     * only affects split quantization, not correctness.
-     */
-    defaultRungs: number;
-    shapeKey(base: PoolConfig): string;
-    helpers(): {
-        name: string;
-        source: string;
-    }[];
-    /** [nb, (nodeIndex, orderSequenceNumber) x PHOENIX_MAX_ORDERS]. */
-    paramCount: number;
-    paramsFor(base: PoolConfig): bigint[];
-    quoteRefs(base: PoolConfig, slot: number): VenueAccount[];
-    emitSetup(base: PoolConfig, slot: number, params: readonly string[], enableVar?: string): string;
-    emitLadderQuote(base: PoolConfig, slot: number, rung: number, x: string, outVar: string): string;
-    capacityInputVar(slot: number): string;
-    emitFinalQuote(base: PoolConfig, slot: number, x: string, outVar: string): string;
-    buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
-    depthReserves: typeof depthReserves;
-    referenceQuote: typeof referenceQuote;
-    referenceCapacities: typeof referenceCapacities;
-    /** Zero-fee unit multiplier — the venue's own taker_fee_bps is baked into the quote directly. */
-    continuousFees(): {
-        gammaPpm: bigint;
-        muPpm: bigint;
-    };
-};
-/** The lot-size divisor `codegen.ts`'s `patchDivisorIn` hook needs for this pool's direction. */
-export declare function phoenixPatchDivisor(base: PoolConfig): bigint;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -70,7 +70,16 @@
  * `28hFhD21Nka3stL27a8zZ4nRLgaDVxRYwJgeEVgeakzS`, two independent fetches
  * five minutes apart cross-checked field-for-field against an
  * Anchor-BorshAccountsCoder decode of the same IDL).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getAddressEncoder, getProgramDerivedAddress, getUtf8Encoder, } from '@solana/kit';
 import { readUintLE } from '../math.js';
 const SLUG = 'huma';
@@ -96,7 +105,7 @@ const U64_MAX = (1n << 64n) - 1n;
 // mainnet (there is no single on-chain account carrying both the underlying
 // mint AND a mode's share mint together, so this venue cannot be discovered
 // via a generic getProgramAccounts memcmp scan — see
-// ecoswap/svm/discovery.ts's SVM_FAMILY_FILTERS doc for why it is deliberately
+// the consuming app SVM discovery module's SVM_FAMILY_FILTERS doc for why it is deliberately
 // NOT in that table). Keyed by ModeConfig account address (base58) -> the
 // pool's PoolConfig account; everything else (PoolState, ModeMint,
 // PoolAuthority, PoolUnderlyingToken, ...) is PDA-derived or read live off

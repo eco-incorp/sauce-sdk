@@ -87,7 +87,7 @@
  *
  * TRADE ARGS — `TradeParams{token_amount, collateral_amount, fixed_side:u8
  * (IN=0/OUT=1), slippage_bps}`: this module ALWAYS uses `fixed_side=IN` (the
- * side matching the ecoswap ladder's own exact-input contract) and floors the
+ * side matching the the consuming app ladder's own exact-input contract) and floors the
  * OTHER (estimated) side at 1 with `slippage_bps=0` — the recipe's own
  * terminal outAta delta / minOut check is the real floor, mirroring every
  * other wired venue's "venue-level min_out is always 1" convention.
@@ -116,25 +116,20 @@
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadderV2, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'moonit' as const;
 
 export const MOONIT_PROGRAM_ID = address_('MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG');
 const TOKEN_PROGRAM = address_('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const ASSOCIATED_TOKEN_PROGRAM = address_('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
-const SYSTEM_PROGRAM = address_('11111111111111111111111111111111');
 /** PDA(["config_account"], MOONIT_PROGRAM_ID) — a singleton, verified live 2026-07-31. */
 const CONFIG_ACCOUNT = address_('36Eru7v11oU5Pfrojyn5oY3nETA1a1iqsw2WUu6afkM9');
 
 const CURVE_DISCRIMINATOR = [8, 91, 83, 28, 132, 216, 248, 22];
 const CONFIG_DISCRIMINATOR = [189, 255, 97, 70, 186, 189, 24, 102];
-const BUY_DISCRIMINATOR = [102, 6, 61, 18, 1, 218, 235, 234];
-const SELL_DISCRIMINATOR = [51, 230, 133, 164, 1, 127, 131, 173];
 const CURVE_TYPE_LINEAR_V1 = 0;
 const CURRENCY_SOL = 0;
-const FIXED_SIDE_IN = 0;
-
 /** coefA fixed-point scale — see the module header. Split hi/lo (see below) since coefA*SCALE_A can exceed u64. */
 const SCALE_A = 10n ** 30n;
 /** coefB fixed-point scale — coefB is a u32, so coefB*SCALE_B/1e9 always fits u64 (max ~4.29e18). */
@@ -199,11 +194,6 @@ export interface MoonitPoolConfig extends PoolConfig {
   /** 10^decimals. */
   tdScale: bigint;
   feeBps: bigint;
-}
-
-function asCfg(cfg: PoolConfig): MoonitPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config for pool ${cfg.pool}`);
-  return cfg as MoonitPoolConfig;
 }
 
 /** Derive coefA/coefB's fixed-point bakes from the CurveAccount's static fields (exact bigint, no rounding until the single final step). */
@@ -285,17 +275,6 @@ export const moonit = {
   },
 };
 
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-/** The reference twin of emitSetup's live reads: (totalSupply, curveAmount) from the pool account. */
-function livePosition(cfg: MoonitPoolConfig, state: AccountBytesMap): { m: bigint; curveAmount: bigint } {
-  const bytes = state[String(cfg.pool)];
-  if (bytes === undefined) throw new Error(`${SLUG} reference is missing pool ${cfg.pool}`);
-  const totalSupply = readUintLE(bytes, 8, 8);
-  const curveAmount = readUintLE(bytes, 16, 8);
-  return { m: totalSupply - curveAmount, curveAmount };
-}
-
 /** BUY: exact gross collateral `y` in (fee taken off the input) -> tokens out, capped at the curve's live inventory. */
 function referenceBuy(y: bigint, m: bigint, aw: bigint, bw: bigint, td: bigint, feeBps: bigint, curveAmount: bigint): bigint {
   if (y === 0n) return 0n;
@@ -330,176 +309,5 @@ function referenceSell(x: bigint, m: bigint, aw: bigint, bw: bigint, td: bigint,
   const fee = mulDiv(gross, feeBps, 10000n);
   return gross - fee;
 }
-
-export const moonitLadder: SvmVenueLadderV2 = {
-  slug: SLUG,
-  /** CP-class: a closed-form quote (a quadratic + isqrt for buy, a polynomial for sell), 4 rungs. */
-  defaultRungs: 4,
-  shapeKey(base) {
-    return `${SLUG}:${asCfg(base).direction}`;
-  },
-  helpers(base) {
-    const cfg = asCfg(base);
-    // scaleA reconstructed from two u64 halves — the SAME (hi << 64) | lo technique
-    // obric-v2 uses for its 128-bit bigK; coefA's own bake (awHi/awLo, per-pool
-    // params) uses the identical pattern in emitSetup below.
-    const scaleAExpr = '(54210108624 << 64) | 5076944270305263616';
-    if (cfg.direction === 'quoteToBase') {
-      return [
-        {
-          name: 'qMoonitBuy',
-          source: [
-            'function qMoonitBuy(y, m, aw, bw, td, fee, ca) {',
-            '  if (y === 0) { return 0 }',
-            '  const feeAmt = Math.mulDiv(y, fee, 10000);',
-            '  const net = y - feeAmt;',
-            '  if (net === 0) { return 0 }',
-            `  const scaleA = ${scaleAExpr};`,
-            '  const bwScaled = Math.mulDiv(scaleA, bw, 1000000000000000000);',
-            '  const bp = 2 * (aw * m + bwScaled * td);',
-            '  const cScaled = Math.mulDiv(scaleA, net, 1000000000);',
-            '  const cp = 2 * cScaled * td * td;',
-            '  const disc = bp * bp + 4 * aw * cp;',
-            '  const sq = Math.sqrt(disc);',
-            '  const numerator = sq - bp;',
-            '  if (numerator <= 0) { return 0 }',
-            '  let out = numerator / 2 / aw;',
-            '  if (out > ca) { out = ca }',
-            '  return out;',
-            '}',
-          ].join('\n'),
-        },
-      ];
-    }
-    return [
-      {
-        name: 'qMoonitSell',
-        source: [
-          'function qMoonitSell(x, m, aw, bw, td, fee) {',
-          '  if (x === 0) { return 0 }',
-          '  let xx = x;',
-          '  if (xx > m) { xx = m }',
-          `  const scaleA = ${scaleAExpr};`,
-          '  const twoMN = 2 * m - xx;',
-          '  const step1 = Math.mulDiv(aw, twoMN, 2);',
-          '  const step2 = Math.mulDiv(step1, xx, td);',
-          '  const step3 = step2 / td;',
-          '  const term1 = Math.mulDiv(step3, 1000000000, scaleA);',
-          '  const stepB = Math.mulDiv(bw, xx, td);',
-          '  const term2 = Math.mulDiv(stepB, 1000000000, 1000000000000000000);',
-          '  const gross = term1 + term2;',
-          '  const feeAmt = Math.mulDiv(gross, fee, 10000);',
-          '  return gross - feeAmt;',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  /** Five params: awHi, awLo, bwFixed, tdScale, feeBps. */
-  paramCount: 5,
-  paramsFor(base) {
-    const c = asCfg(base);
-    return [c.awHi, c.awLo, c.bwFixed, c.tdScale, c.feeBps];
-  },
-  quoteRefs(base, slot) {
-    const c = asCfg(base);
-    return [{ ref: ref(slot, 'pool'), address: c.pool }];
-  },
-  emitSetup(base, slot, params) {
-    const p = `s${slot}`;
-    const poolRef = JSON.stringify(ref(slot, 'pool'));
-    const [awHi, awLo, bwFixed, tdScale, feeBps] = params;
-    return [
-      `  const ${p}ts = accountUint(${poolRef}, 8, 8);`,
-      `  const ${p}ca = accountUint(${poolRef}, 16, 8);`,
-      `  const ${p}m = ${p}ts - ${p}ca;`,
-      `  const ${p}aw = (${awHi} << 64) | ${awLo};`,
-      `  const ${p}bw = ${bwFixed};`,
-      `  const ${p}td = ${tdScale};`,
-      `  const ${p}fee = ${feeBps};`,
-    ].join('\n');
-  },
-  emitQuoteCall(base, slot, x) {
-    const cfg = asCfg(base);
-    const p = `s${slot}`;
-    return cfg.direction === 'quoteToBase' ? `qMoonitBuy(${x}, ${p}m, ${p}aw, ${p}bw, ${p}td, ${p}fee, ${p}ca)` : `qMoonitSell(${x}, ${p}m, ${p}aw, ${p}bw, ${p}td, ${p}fee)`;
-  },
-  buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-    const cfg = asCfg(base);
-    const sell = cfg.direction === 'baseToQuote';
-    const senderTokenRef = sell ? user.inAta : user.outAta;
-    const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-
-    const accounts: VenueAccount[] = [
-      { ref: user.owner, writable: true, signer: true }, // sender — NATIVE lamports move here, see the module header
-      { ref: senderTokenRef, writable: true }, // sender_token_account (base mint)
-      roled('curveAccount', cfg.pool, true),
-      roled('curveTokenAccount', cfg.curveTokenAccount, true),
-      roled('dexFee', cfg.dexFee, true),
-      roled('helioFee', cfg.helioFee, true),
-      roled('mint', cfg.mint),
-      roled('configAccount', CONFIG_ACCOUNT),
-      roled('tokenProgram', TOKEN_PROGRAM),
-      roled('associatedTokenProgram', ASSOCIATED_TOKEN_PROGRAM),
-      roled('systemProgram', SYSTEM_PROGRAM),
-    ];
-
-    // TradeParams { token_amount: u64, collateral_amount: u64, fixed_side: u8, slippage_bps: u64 }.
-    // fixed_side is ALWAYS IN(0) — the exact-input contract every ladder rung assumes; the
-    // non-exact side floors at 1 with slippage_bps=0 (venue-level min_out convention, the
-    // recipe's own terminal delta/minOut check is the real floor).
-    if (!sell) {
-      // buy: disc(8) ++ token_amount=1(8, floor) ++ collateral_amount(8, PATCHED) ++ fixed_side=0(1) ++ slippage_bps=0(8).
-      const prefix = new Uint8Array(16);
-      Uint8Array.from(BUY_DISCRIMINATOR).forEach((b, i) => (prefix[i] = b));
-      prefix[8] = 1; // token_amount floor = 1
-      const suffix = Uint8Array.from([FIXED_SIDE_IN, 0, 0, 0, 0, 0, 0, 0, 0]);
-      return { programId: MOONIT_PROGRAM_ID, prefix, suffix, patch: 'in', accounts };
-    }
-    // sell: disc(8) ++ token_amount(8, PATCHED) ++ collateral_amount=1(8, floor) ++ fixed_side=0(1) ++ slippage_bps=0(8).
-    const prefix = Uint8Array.from(SELL_DISCRIMINATOR);
-    const suffix = new Uint8Array(17);
-    suffix[0] = 1; // collateral_amount floor = 1
-    suffix[8] = FIXED_SIDE_IN;
-    return { programId: MOONIT_PROGRAM_ID, prefix, suffix, patch: 'in', accounts };
-  },
-  referenceQuote(base, state: AccountBytesMap, params: readonly bigint[]) {
-    const cfg = asCfg(base);
-    const { m, curveAmount } = livePosition(cfg, state);
-    const [awHi, awLo, bwFixed, tdScale, feeBps] = params as [bigint, bigint, bigint, bigint, bigint];
-    const aw = (awHi << 64n) | awLo;
-    if (cfg.direction === 'quoteToBase') {
-      return (y: bigint) => referenceBuy(y, m, aw, bwFixed, tdScale, feeBps, curveAmount);
-    }
-    return (x: bigint) => referenceSell(x, m, aw, bwFixed, tdScale, feeBps);
-  },
-  depthReserves(base, state: AccountBytesMap) {
-    const cfg = asCfg(base);
-    const { m, curveAmount } = livePosition(cfg, state);
-    const [awHi, awLo, bwFixed, tdScale] = moonitLadder.paramsFor(cfg) as [bigint, bigint, bigint, bigint, bigint];
-    const aw = (awHi << 64n) | awLo;
-    // Both directions size depth off the SAME closed form, fee-free (fee only trims yield, not
-    // capacity): `referenceSell(k, k, ...)` is the trapezoid cost to sell k tokens starting at
-    // position k (i.e. the cost integral over [0,k]) — used here as "total collateral this many
-    // tokens represent", not a live sell (the position argument IS the trade size by construction).
-    if (cfg.direction === 'quoteToBase') {
-      // reserveOut = the curve's remaining token inventory (a real hard cap on how many tokens a
-      // buy can ever receive); reserveIn = the collateral it would cost to buy that whole
-      // remaining inventory (the curve's own remaining capacity in collateral terms).
-      const reserveIn = referenceSell(m + curveAmount, m + curveAmount, aw, bwFixed, tdScale, 0n) - referenceSell(m, m, aw, bwFixed, tdScale, 0n);
-      return { reserveIn, reserveOut: curveAmount };
-    }
-    // reserveIn = tokens in circulation (sellable back); reserveOut = total collateral raised so far.
-    const reserveOut = referenceSell(m, m, aw, bwFixed, tdScale, 0n);
-    return { reserveIn: m, reserveOut };
-  },
-  continuousFees(base, _state, params) {
-    const cfg = asCfg(base);
-    const feeBps = params[4]!;
-    const kept = (10000n - feeBps) * 100n; // ppm kept after fee (feeBps is out of 10000)
-    return cfg.direction === 'quoteToBase' ? { gammaPpm: kept, muPpm: 1_000_000n } : { gammaPpm: 1_000_000n, muPpm: kept };
-  },
-};
 
 export { referenceBuy as _referenceBuyForTest, referenceSell as _referenceSellForTest, bakeCoefficients as _bakeCoefficientsForTest, isqrt as _isqrtForTest };

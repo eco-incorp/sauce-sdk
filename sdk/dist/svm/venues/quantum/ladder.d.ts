@@ -1,5 +1,5 @@
 /**
- * Quantum adapter v2 (EcoSwapSVM ladder fragment) — the discrete-level PMM
+ * Quantum adapter v2 (SvmRoute ladder fragment) — the discrete-level PMM
  * walk. See ./index.ts for the layout, the reversed closed form and the
  * shipped-prefix rule; this file is the fragment + its lamport-exact mirror.
  *
@@ -35,12 +35,12 @@
  * level ramps steeply (dP >> pp). The descent is shape-independent.
  */
 import type { Address } from '@solana/kit';
-import type { SvmVenueLadderV2 } from '../types.js';
+import type { SvmVenueLadder } from '../types.js';
 /** The program's single global config account (one for every pool). */
 export declare const QUANTUM_GLOBAL: Address;
 /** TS mirror of qtCost. */
 export declare function quantumCost(m: bigint, pp: bigint, pc: bigint, c: bigint, s2: bigint): bigint;
 /** TS mirror of qtFill (the exact 64-step binary-digit descent). */
 export declare function quantumFill(rem: bigint, pp: bigint, pc: bigint, c: bigint, s2: bigint): bigint;
-export declare const quantumLadder: SvmVenueLadderV2;
+export declare const quantumLadder: SvmVenueLadder;
 //# sourceMappingURL=ladder.d.ts.map
