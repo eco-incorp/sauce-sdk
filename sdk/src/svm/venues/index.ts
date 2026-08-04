@@ -99,6 +99,8 @@ export {
   __alphaqDecodeSymbolForTest,
 } from './alphaq/index.js';
 export type { AlphaqStatsRpc, AlphaqPoolConfig } from './alphaq/index.js';
+export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi, binaryfiLadder } from './binaryfi/index.js';
+export type { BinaryFiPoolConfig } from './binaryfi/index.js';
 export { BOOP_FUN_PROGRAM_ID, boopFun, boopFunLadder } from './boop-fun/index.js';
 export type { BoopFunPoolConfig } from './boop-fun/index.js';
 // bisonfi: explicit re-export — some names collide with an existing venue's
