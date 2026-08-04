@@ -48,7 +48,8 @@ export interface ExecuteOpts extends SimulateOpts {
 /** A buffer staged by this client — carries the SDK-computed content hash (the execute pin). */
 export interface StagedBuffer {
   address: Address;
-  index: number;
+  /** The 32-byte PDA seed the buffer was derived + init'd under. */
+  seed: Uint8Array;
   /** sha256 of the staged bytecode, computed SDK-side and verified on-chain at finalize. */
   sha256: Uint8Array;
   /** Staging transaction signatures in send order: init, writes…, finalize. */
@@ -106,14 +107,15 @@ export interface SauceSvmClient {
   simulate(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateOpts): Promise<SimulateExecuteResult>;
   execute(bytecode: Uint8Array, plan: AccountPlan, resolution: AccountResolution, opts?: ExecuteOpts): Promise<SendExecuteResult>;
   /**
-   * Stages bytecode into buffer `index` (init → chunked writes → a dedicated
-   * finalize sent only after every write confirmed, each tx on a fresh
-   * blockhash). The buffer at the index must not be finalized — close it first
-   * (closeBuffer) to recompile at the same address.
+   * Stages bytecode into the buffer at 32-byte `seed` (init → chunked writes → a
+   * dedicated finalize sent only after every write confirmed, each tx on a fresh
+   * blockhash). The buffer at that seed must not be finalized — close it first
+   * (closeBuffer) to recompile at the same address. The same seed is resumable:
+   * it always derives the same address.
    */
-  stageBuffer(index: number, bytecode: Uint8Array): Promise<StagedBuffer>;
-  /** Closes buffer `index`, refunding its rent to the payer (the recompile path). */
-  closeBuffer(index: number): Promise<SendExecuteResult>;
+  stageBuffer(seed: Uint8Array, bytecode: Uint8Array): Promise<StagedBuffer>;
+  /** Closes the buffer at 32-byte `seed`, refunding its rent to the payer (the recompile path). */
+  closeBuffer(seed: Uint8Array): Promise<SendExecuteResult>;
   simulateStaged(buffer: Address | StagedBuffer, plan: AccountPlan, resolution: AccountResolution, opts?: SimulateStagedOpts): Promise<SimulateExecuteResult>;
   /**
    * Executes a finalized buffer, hash-pinned, in ONE instruction. With `args`,
@@ -317,9 +319,9 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }: 
       return sendExecute({ rpc, rpcSubscriptions, transaction });
     },
 
-    async stageBuffer(index: number, bytecode: Uint8Array): Promise<StagedBuffer> {
+    async stageBuffer(seed: Uint8Array, bytecode: Uint8Array): Promise<StagedBuffer> {
       const plan = buildStagingPlan(bytecode.length);
-      const { address } = await deriveBufferPda(programId, payer.address, index);
+      const { address } = await deriveBufferPda(programId, payer.address, seed);
       // Copy into a fresh ArrayBuffer-backed view (subtle.digest rejects
       // SharedArrayBuffer-backed views at the type level).
       const sha256 = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytecode)));
@@ -334,7 +336,7 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }: 
         programId,
         payer: payer.address,
         buffer: address,
-        index,
+        seed,
         capacity: bytecode.length,
         currentBytes,
       });
@@ -365,11 +367,11 @@ export async function createSauceSvmClient({ rpcUrl, wsUrl, programId, payer }: 
 
       stagedHashes.set(address, sha256);
 
-      return { address, index, sha256, signatures };
+      return { address, seed, sha256, signatures };
     },
 
-    async closeBuffer(index: number): Promise<SendExecuteResult> {
-      const { address } = await deriveBufferPda(programId, payer.address, index);
+    async closeBuffer(seed: Uint8Array): Promise<SendExecuteResult> {
+      const { address } = await deriveBufferPda(programId, payer.address, seed);
       stagedHashes.delete(address);
 
       return sendInstructions([buildCloseBufferInstruction({ programId, authority: payer.address, buffer: address })]);

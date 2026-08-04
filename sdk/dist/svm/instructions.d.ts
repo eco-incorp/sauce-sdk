@@ -15,54 +15,101 @@ export interface ExecuteInstructionInput {
  * buildHeapFramePrepend.
  */
 export declare function buildExecuteInstruction({ programId, bytecode, accounts }: ExecuteInstructionInput): Instruction;
+/**
+ * Explicit bytecode extent within a FOREIGN account: run `data[offset..offset+len]`.
+ * Only meaningful on the foreign path (an account the engine does not own / cannot
+ * parse as a buffer header) — it lets a consumer hold bytecode in its own program's
+ * accounts without a storage program. For a MANAGED buffer the engine derives the
+ * extent from the header, and accepts an explicit slice ONLY if it equals
+ * `(BUFFER_HEADER_BYTES, header.len)`; omit it for managed buffers.
+ */
+export interface ExecuteBytecodeSlice {
+    offset: number;
+    len: number;
+}
 export interface ExecuteFromAccountInstructionInput {
     programId: Address;
-    /** The finalized bytecode buffer — listed FIRST and read-only (mandated by the engine). */
+    /** The bytecode account — listed FIRST and read-only. A finalized engine buffer (managed) or any other account (foreign). */
     buffer: Address;
     accounts: readonly ResolvedAccountMeta[];
     /**
-     * Optional 32-byte content-hash pin: must equal the buffer's stored
-     * content_sha256 or the engine rejects (BufferHashMismatch). The only
-     * cross-lifecycle trust anchor — always pass it for buffers this process
-     * did not stage itself (close→re-init legitimately reuses the address).
+     * Optional 32-byte content-hash pin (managed path): must equal the buffer's
+     * stored content_sha256 or the engine rejects (BufferHashMismatch). The only
+     * cross-lifecycle trust anchor — always pass it for buffers this process did
+     * not stage itself. On the FOREIGN path a pin is InvalidInstruction (no stored
+     * hash to compare), so pass a slice instead, not a pin.
      */
     expectedSha256?: Uint8Array;
     /**
+     * Optional explicit bytecode extent for the FOREIGN path (see ExecuteBytecodeSlice).
+     * Omit for a managed engine buffer.
+     */
+    slice?: ExecuteBytecodeSlice;
+    /**
      * Per-execution payload args (already encoded — encodePayloadArgs), appended
-     * after the flags byte and optional pin. Surfaces to the bytecode through
-     * CALLDATA as the composite `buffer bytecode ++ args`.
+     * after the flags byte, optional pin, and optional slice. Surfaces to the
+     * bytecode through CALLDATA as the composite `buffer bytecode ++ args`.
      */
     args?: Uint8Array;
 }
 /**
- * Builds the staged execute instruction. Account order is
- * [buffer (read-only), ...user] — the buffer rides FIRST so the user tail (and
- * every account index baked into compiled bytecode) is byte-identical to
- * inline execute's list. Data is the v2 payload grammar
- * [discriminator][flags: u8][pin: 32B iff flags & 0x01][args…] — the flags
- * byte is REQUIRED (an empty payload is InvalidInstruction), so the minimal
- * pinless, argless payload is [0x00].
+ * Builds the staged/foreign execute instruction. Account order is
+ * [code (read-only), ...user] — the code account rides FIRST so the user tail
+ * (and every account index baked into compiled bytecode) is byte-identical to
+ * inline execute's list. The engine dispatches on the ACCOUNT (engine-owned +
+ * header-parseable ⇒ managed; anything else ⇒ foreign), never on a payload flag.
  */
-export declare function buildExecuteFromAccountInstruction({ programId, buffer, accounts, expectedSha256, args, }: ExecuteFromAccountInstructionInput): Instruction;
+export declare function buildExecuteFromAccountInstruction({ programId, buffer, accounts, expectedSha256, slice, args, }: ExecuteFromAccountInstructionInput): Instruction;
+export interface ExecuteAndCloseInstructionInput {
+    programId: Address;
+    /** The managed engine buffer to run then reap — listed FIRST and WRITABLE (it gets resized to 0). */
+    buffer: Address;
+    /**
+     * The user account tail. It MUST include the buffer's authority as a
+     * signer+writable account (it receives the rent refund); the engine finds it
+     * by key match, not by position. Managed-only — a foreign account rejects.
+     */
+    accounts: readonly ResolvedAccountMeta[];
+    /** Optional 32-byte content-hash pin — gates the execute AND the close together (TOCTOU-free). */
+    expectedSha256?: Uint8Array;
+    args?: Uint8Array;
+}
+/**
+ * Builds execute_and_close: run a managed buffer and reap it (drain rent to the
+ * authority, resize to 0, reassign to system) in ONE atomic instruction. Use this
+ * instead of an execute_from_account + close_buffer pair: the execute needs the
+ * buffer read-only and the close needs it writable, and account writability is a
+ * transaction-level property — so the pair can never share a transaction. The
+ * fixed prefix stays ONE account (buffer), so baked account indices agree with
+ * execute_from_account. No slice: managed only.
+ */
+export declare function buildExecuteAndCloseInstruction({ programId, buffer, accounts, expectedSha256, args, }: ExecuteAndCloseInstructionInput): Instruction;
 export interface InitBufferInstructionsInput {
     programId: Address;
     /** Pays rent and becomes the buffer AUTHORITY (only key allowed to write/finalize/grow/close). */
     payer: Address;
     buffer: Address;
-    /** The u8 seed discriminant (up to 256 buffers per authority). */
-    index: number;
-    /** Bytecode capacity in bytes (≤ 65,535); account size = 80 + capacity. */
+    /**
+     * The 32-byte PDA seed (must match the one `deriveBufferPda` derived `buffer`
+     * from). Stored in the header, so the address stays re-derivable from the
+     * account alone. A caller with a natural 32-byte id (e.g. an intent hash) uses
+     * it directly; a shorter id is the caller's to hash.
+     */
+    seed: Uint8Array;
+    /** Bytecode capacity in bytes (≤ 65,535); account size = BUFFER_HEADER_BYTES + capacity. */
     capacity: number;
     /** Current account data length (0 = not created); emits only the missing growth steps. */
     currentBytes?: number;
 }
 /**
  * Builds the create-then-grow init sequence for a bytecode buffer. Capacity
- * ≤ 10,160 is one instruction; a 16 KB buffer is 2 — all packable into one
- * transaction. Payload is index u8 + capacity u32 LE on every step (the engine
- * grows toward 80 + capacity per invocation; at/above target is a no-op).
+ * ≤ ~10,128 is one instruction; a 16 KB buffer is 2 — all packable into one
+ * transaction. Payload is `seed[32] ++ capacity u32 LE` (exactly 36 bytes) on
+ * every step (the engine grows toward BUFFER_HEADER_BYTES + capacity per
+ * invocation; at/above target is a no-op). The seed is fixed across steps — the
+ * engine records it once at create and rejects a mismatch thereafter.
  */
-export declare function buildInitBufferInstructions({ programId, payer, buffer, index, capacity, currentBytes, }: InitBufferInstructionsInput): Instruction[];
+export declare function buildInitBufferInstructions({ programId, payer, buffer, seed, capacity, currentBytes, }: InitBufferInstructionsInput): Instruction[];
 export interface WriteBufferInstructionInput {
     programId: Address;
     authority: Address;
@@ -89,6 +136,20 @@ export interface CloseBufferInstructionInput {
     buffer: Address;
 }
 export declare function buildCloseBufferInstruction({ programId, authority, buffer }: CloseBufferInstructionInput): Instruction;
+export interface CloseBufferCheckedInstructionInput {
+    programId: Address;
+    /** Receives the drained rent; must sign. */
+    authority: Address;
+    buffer: Address;
+    /**
+     * 32-byte content-hash pin — the close proceeds only if it equals the buffer's
+     * stored content_sha256. TOCTOU-free: guards against closing a buffer that was
+     * closed and re-init'd to different bytecode at the same address since you read it.
+     */
+    expectedSha256: Uint8Array;
+}
+/** Builds close_buffer_checked — close only if the content hash still matches. */
+export declare function buildCloseBufferCheckedInstruction({ programId, authority, buffer, expectedSha256, }: CloseBufferCheckedInstructionInput): Instruction;
 export interface StagingChunk {
     offset: number;
     length: number;

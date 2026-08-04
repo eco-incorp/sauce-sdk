@@ -34,7 +34,7 @@ export const V12_EVM_CHAINS = {
 };
 /** The SVM engine program (non-upgradeable when `upgradeable` is false). */
 export const V12_SVM = {
-    programId: 'FxMxSuHfxMWGRGL2SV63CDnkKX3XthE4Ti7U5NPmWng',
+    programId: 'CuHCniNMWLSkZWBQKon9tudGujZeXJRUwG2PCLDq4ipJ',
     upgradeable: false,
     clusters: {
         'devnet': { cluster: 'devnet', status: 'already-deployed' },

@@ -1,24 +1,48 @@
 /**
- * Constants mirrored from the SVM engine crate (sauce repo, svm/programs/engine).
- * That crate is the single source of truth — any change there must be reflected
- * here, byte for byte.
+ * SVM engine wire constants.
  *
- * Discriminators are Anchor-style: sha256("global:<instruction_name>")[..8].
+ * The wire-contract values (discriminators, header offsets/sizes, payload flags,
+ * seed scheme) are NOT hand-copied here anymore — they are re-exported from
+ * `engine-abi.generated.ts`, which `sdk/scripts/gen-engine-abi.mjs` derives from
+ * the pinned `sauce` dep's `svm/abi/engine-abi.json`. That artifact is generated
+ * from the engine's live Rust constants and CI-asserted byte-equal to them
+ * (engine `tests/abi_artifact.rs`). CI regenerates the module and `git diff`s it,
+ * and `engine-abi-drift.test.ts` asserts every artifact key is mapped — so a repin
+ * that changes the wire can't silently leave this file stale.
+ *
+ * This closes the drift that motivated the whole exercise: the SDK once carried
+ * `BYTECODE_FORMAT_EPOCH = 2` while the engine's value was 4, then the field was
+ * deleted entirely — two repos, one constant, three values, and no test could see
+ * it. That constant (and `BUFFER_VERSION`, and the index/epoch header fields) are
+ * gone from the engine, not merely renumbered: the engine deploys **non-upgradeable**
+ * (`--final`), so one program id has exactly one ISA and one header layout forever.
+ * A format change ships as a NEW program id, and buffer PDAs are derived under a
+ * program id — a buffer written under the old format isn't even addressable from
+ * the new program. So a client-side version/epoch check compared a constant
+ * against itself; there was never a value a reader could act on. `kind` (byte 0)
+ * is now the whole account discriminant. Do NOT reintroduce a version/epoch field
+ * "for safety" — it would be a fabricated guarantee against a value the engine no
+ * longer publishes.
+ *
+ * Only the constants NOT expressible in the ABI live here directly: BPF heap-frame
+ * sizing, packet budgets, the staging chunk, CU limits, and the synthetic chain
+ * ids — all SDK/transaction-shape concerns, not engine wire values.
  */
-// ── instruction discriminators (all 6) ──
-export const EXECUTE_DISCRIMINATOR = new Uint8Array([0x82, 0xdd, 0xf2, 0x9a, 0x0d, 0xc1, 0xbd, 0x1d]);
-export const EXECUTE_FROM_ACCOUNT_DISCRIMINATOR = new Uint8Array([0x71, 0x2c, 0xd5, 0x72, 0x82, 0x95, 0x58, 0xc3]);
-export const INIT_BUFFER_DISCRIMINATOR = new Uint8Array([0x7b, 0xd3, 0xe9, 0xd2, 0xa6, 0x8b, 0xda, 0x3c]);
-export const WRITE_BUFFER_DISCRIMINATOR = new Uint8Array([0xa4, 0xc2, 0x45, 0x9a, 0x4b, 0xa9, 0xe4, 0x55]);
-export const FINALIZE_BUFFER_DISCRIMINATOR = new Uint8Array([0x21, 0x9c, 0x88, 0xb1, 0x14, 0xc3, 0x7a, 0x43]);
-export const CLOSE_BUFFER_DISCRIMINATOR = new Uint8Array([0x2e, 0x72, 0xb3, 0x3a, 0x39, 0x2d, 0xc2, 0xac]);
-/**
- * execute_from_account payload flag bit 0: a 32-byte content-hash pin follows
- * the flags byte. Bits 1-7 are reserved and must be zero. The flags byte is
- * REQUIRED — an empty payload is InvalidInstruction (one canonical encoding
- * per meaning): the minimal pinless, argless payload is [0x00].
- */
-export const EXECUTE_FLAG_HAS_PIN = 0x01;
+// ── wire contract (generated from svm/abi/engine-abi.json — see the header) ──
+export { 
+// sizes / discriminants
+BUFFER_HEADER_BYTES, BUFFER_SEED_BYTES, BUFFER_SEED, KIND_BUFFER, MAX_BUFFER_CAPACITY, 
+// header flags
+FLAG_FINALIZED, 
+// execute_from_account / execute_and_close payload flags
+EXECUTE_FLAG_HAS_PIN, EXECUTE_FLAG_HAS_SLICE, 
+// header offsets (`len`@40 and `contentSha256`@48 kept their offsets across the
+// 80→112 growth on purpose, so code reading either did not move; `seed`@80 is new)
+BUFFER_OFFSET_KIND, BUFFER_OFFSET_BUMP, BUFFER_OFFSET_FLAGS, BUFFER_OFFSET_AUTHORITY, BUFFER_OFFSET_LEN, BUFFER_OFFSET_CONTENT_SHA256, BUFFER_OFFSET_CONTENT_SHA256 as BUFFER_OFFSET_HASH, BUFFER_OFFSET_SEED, 
+// instruction discriminators (all 8)
+EXECUTE_DISCRIMINATOR, EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, EXECUTE_AND_CLOSE_DISCRIMINATOR, INIT_BUFFER_DISCRIMINATOR, WRITE_BUFFER_DISCRIMINATOR, FINALIZE_BUFFER_DISCRIMINATOR, CLOSE_BUFFER_DISCRIMINATOR, CLOSE_BUFFER_CHECKED_DISCRIMINATOR, 
+// the whole structural mirror, for the drift test
+ENGINE_ABI, } from './engine-abi.generated.js';
 // ── interpreter memory (BPF heap frame) ──
 /**
  * The 256 KiB BPF heap frame every execute transaction MUST request:
@@ -39,54 +63,7 @@ export const HEAP_FRAME_CU_PER_INVOCATION = 56;
  * 9 standalone. Measured — engine tests/cu_budget.rs.
  */
 export const REQUEST_HEAP_FRAME_WIRE_BYTES = 9;
-// ── PDA seeds ──
-/** Bytecode buffer seed: ["buffer", authority_pubkey, [index: u8]]. */
-export const BUFFER_SEED = 'buffer';
-/** Buffer header byte 0 (the engine's account-kind discriminant). */
-export const KIND_BUFFER = 5;
-// ── bytecode buffer layout (staged execution) ──
-/**
- * Buffer account: an 80-byte header, then the bytecode region
- * (capacity = data_len − 80, never persisted).
- *
- *   offset  size  field
- *   0       1     kind            KIND_BUFFER
- *   1       1     bump            PDA bump seed
- *   2       1     version         BUFFER_VERSION
- *   3       1     flags           bit0 = finalized; bits 1-7 reserved (zero)
- *   4       1     index           the u8 seed discriminant
- *   5       3     reserved        zeroed
- *   8       32    authority       controls write/finalize/grow/close
- *   40      4     len             u32 LE — finalized bytecode length
- *   44      4     bytecode_epoch  u32 LE — BYTECODE_FORMAT_EPOCH at finalize
- *   48      32    content_sha256  sha256 of data[80..80+len]
- *   80      cap   bytecode
- */
-export const BUFFER_HEADER_BYTES = 80;
-export const BUFFER_VERSION = 1;
-export const FLAG_FINALIZED = 0x01;
-export const BUFFER_OFFSET_VERSION = 2;
-export const BUFFER_OFFSET_FLAGS = 3;
-export const BUFFER_OFFSET_INDEX = 4;
-export const BUFFER_OFFSET_AUTHORITY = 8;
-export const BUFFER_OFFSET_LEN = 40;
-export const BUFFER_OFFSET_EPOCH = 44;
-export const BUFFER_OFFSET_HASH = 48;
-/**
- * u16::MAX — the last pc a 16-bit CALL_FUNCTION return address / JUMP_2 /
- * CALLDATA length can reach; a larger program could never execute. Also the
- * ceiling of the CALLDATA composite `buffer bytecode ++ payload args`.
- */
-export const MAX_BUFFER_CAPACITY = 65535;
-/**
- * Version of the bytecode format the engine executes; finalize stamps it into
- * the buffer and execute_from_account asserts it (BufferEpochMismatch means:
- * recompile + re-stage). Epoch 2 = Wave D (heap-frame memory — the memory-PDA
- * account prefix is gone, so every account index baked into older bytecode
- * resolves differently; all epoch-1 buffers are dead).
- */
-export const BYTECODE_FORMAT_EPOCH = 2;
-/** MAX_PERMITTED_DATA_INCREASE — max account growth per init_buffer invocation. */
+/** MAX_PERMITTED_DATA_INCREASE — a Solana runtime limit (not an engine constant): max account growth per init_buffer invocation. */
 export const PDA_GROWTH_STEP = 10240;
 /**
  * The SDK's staging write chunk. The hard packet ceiling for a minimal
@@ -95,20 +72,28 @@ export const PDA_GROWTH_STEP = 10240;
  * program stages-and-executes in 8/12/20 transactions.
  */
 export const BUFFER_WRITE_CHUNK_BYTES = 1000;
-// ── packet budgets (measured, engine tests/payload_args.rs) ──
+// ── packet budgets (measured — engine tests/payload_args.rs; re-measured by test/svm/packet-budget.test.ts) ──
 /**
- * Fixed wire cost of the staged execute transaction (legacy shape): signature,
- * message overhead, both ComputeBudget instructions, the pinned
+ * Fixed wire cost of the staged execute transaction (managed, pinned shape):
+ * signature, message overhead, both ComputeBudget instructions, the pinned
  * execute_from_account instruction, buffer + payer accounts — 293 bytes plus
- * 33 per extra user account (32-byte key + 1-byte index).
+ * 33 per extra user account (32-byte key + 1-byte index). The engine's
+ * `payload_args.rs` pins the packet against PACKET_DATA_SIZE = 1232; this SDK
+ * mirrors that measurement in `test/svm/packet-budget.test.ts` rather than
+ * trusting the number across a repin.
+ *
+ * NOTE the shipped shape: pin present (bit 0x01), NO slice (bit 0x02). The new
+ * slice field costs 8 bytes when present (→ budget − 8); omitting the pin frees
+ * 32. The SDK's managed staged-execute path always pins and never slices, so
+ * `939 − 33·N` is the correct budget for it — but it is a *measured* size, not a
+ * formula to rescale by editing one term. See the re-measurement test.
  */
 export const STAGED_PACKET_FIXED_BYTES = 293;
 export const STAGED_PACKET_BYTES_PER_ACCOUNT = 33;
 /**
- * Payload-args budget of a pinned staged execute in the 1,232-byte packet with
- * `extraAccounts` user accounts beyond the payer: 939 − 33·N (+32 unpinned).
- * Bigger args belong in a second buffer used as a data account, read on-chain
- * with accountData.
+ * Payload-args budget of a pinned, sliceless staged execute in the 1,232-byte
+ * packet with `extraAccounts` user accounts beyond the payer: 939 − 33·N.
+ * Bigger args belong in a second buffer used as a data account, read on-chain.
  */
 export function stagedArgsBudget(extraAccounts) {
     return 1232 - STAGED_PACKET_FIXED_BYTES - STAGED_PACKET_BYTES_PER_ACCOUNT * extraAccounts;
@@ -121,8 +106,7 @@ export const ENGINE_GAS_LIMIT_CU = 1_400_000;
  * Measured staged-minus-inline CU premium on identical bytecode (buffer
  * validation: one create_program_address, the header parse, the hash-pin
  * compare, the payload-args parse, the buffer's loaded-accounts contribution).
- * Informational — the engine's cu_budget suite pins it under a 5,000 CU
- * ceiling; a staged 16 KB (or max-capacity) program executes in ~194,978 CU.
+ * Informational — the engine's cu_budget suite pins it under a 5,000 CU ceiling.
  */
 export const STAGED_EXECUTE_CU_PREMIUM = 2216;
 /**
