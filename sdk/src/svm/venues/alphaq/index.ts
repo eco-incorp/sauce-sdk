@@ -150,13 +150,10 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'alphaq';
 export const ALPHAQ_PROGRAM_ID = address('ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA');
-const TOKEN_PROGRAM_ID = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const SYSVAR_INSTRUCTIONS_ID = address('Sysvar1nstructions1111111111111111111111111');
-
 const MARKET_SIZE = 672;
 const OFF_DECIMALS_A = 106;
 const OFF_DECIMALS_B = 107;
@@ -164,9 +161,6 @@ const OFF_VAULT_A = 112;
 const OFF_VAULT_B = 144;
 const OFF_MINT_A = 240;
 const OFF_MINT_B = 272;
-/** SPL Token account `amount` field offset (Tokenkeg layout: mint(32) + owner(32) + amount(u64 LE)). */
-const SPL_TOKEN_AMOUNT_OFFSET = 64;
-
 /**
  * Flat conservative haircut applied on the INPUT side of the constant-product
  * model, in bps of 10,000 — see the module doc's "QUOTE MODEL" section for
@@ -339,12 +333,6 @@ function bs58EncodeUnchecked(bytes: Uint8Array): string {
   return out || '1';
 }
 
-function readUintLE(data: Uint8Array, offset: number, width: number): bigint {
-  let value = 0n;
-  for (let i = width - 1; i >= 0; i--) value = (value << 8n) | BigInt(data[offset + i]);
-  return value;
-}
-
 export interface AlphaqPoolConfig extends PoolConfig {
   venue: typeof SLUG;
   /** 'AtoB' (default, mintA -> mintB) | 'BtoA'. */
@@ -358,11 +346,6 @@ export interface AlphaqPoolConfig extends PoolConfig {
   decimalsB: number;
   /** The market's 336-byte hot-state companion account — WRITABLE in the swap CPI. */
   statsAccount: Address;
-}
-
-function alphaqConfig(cfg: PoolConfig): AlphaqPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-  return cfg as AlphaqPoolConfig;
 }
 
 /**
@@ -423,16 +406,6 @@ export async function fetchAlphaqPoolConfig(load: AccountLoader, pool: Address):
   };
 }
 
-function ref(slot: number, role: string): string {
-  return `s${slot}:${role}`;
-}
-
-function vaultAmount(state: AccountBytesMap, vault: Address): bigint {
-  const data = state[vault as string];
-  if (data === undefined) throw new Error(`alphaq ladder reference is missing vault account ${vault}`);
-  return readUintLE(data, SPL_TOKEN_AMOUNT_OFFSET, 8);
-}
-
 /**
  * The symmetric constant-product model — see the module doc's "THE ACTUAL
  * MODEL". `D = min(rawA, rawB)` (raw units; safe because
@@ -450,114 +423,5 @@ function cpQuote(x: bigint, rawA: bigint, rawB: bigint): bigint {
   if (net <= 0n) return 0n;
   return (net * depth) / (depth + net); // floor
 }
-
-/**
- * AlphaQ ladder (adapter contract v2). CP-kind, 4-rung default (no
- * window/capacity walk — the model is a symmetric reserve-based
- * constant-product curve, see the module doc's "QUOTE MODEL"). Reads BOTH
- * vaults every slot (the depth is `min(vaultA, vaultB)`, not a directed
- * reserveIn/reserveOut pair) — no per-trade params, the haircut is a
- * compiled constant, not pool state.
- */
-export const alphaqLadder: SvmVenueLadder = {
-  slug: SLUG,
-  shapeKey(base) {
-    const cfg = alphaqConfig(base);
-    return `${SLUG}:${cfg.direction}`;
-  },
-  helpers() {
-    return [
-      {
-        name: 'qAlphaQ',
-        source: [
-          'function qAlphaQ(x, rawA, rawB) {',
-          '  if (x === 0) { return 0 }',
-          '  const depth = rawA < rawB ? rawA : rawB;',
-          `  const fee = (x * ${HAIRCUT_BPS} + ${HAIRCUT_DENOM - 1n}) / ${HAIRCUT_DENOM};`,
-          '  const net = x - fee;',
-          '  if (net <= 0) { return 0 }',
-          '  return Math.mulDiv(net, depth, depth + net);',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  paramCount: 0,
-  paramsFor() {
-    return [];
-  },
-  quoteRefs(base, slot) {
-    const cfg = alphaqConfig(base);
-    return [
-      { ref: ref(slot, 'vaultA'), address: cfg.vaultA },
-      { ref: ref(slot, 'vaultB'), address: cfg.vaultB },
-    ];
-  },
-  emitSetup(_base, slot) {
-    const vaultA = JSON.stringify(ref(slot, 'vaultA'));
-    const vaultB = JSON.stringify(ref(slot, 'vaultB'));
-    return [
-      `  const s${slot}rawA = accountUint(${vaultA}, ${SPL_TOKEN_AMOUNT_OFFSET}, 8);`,
-      `  const s${slot}rawB = accountUint(${vaultB}, ${SPL_TOKEN_AMOUNT_OFFSET}, 8);`,
-    ].join('\n');
-  },
-  emitQuoteCall(_base, slot, x) {
-    return `qAlphaQ(${x}, s${slot}rawA, s${slot}rawB)`;
-  },
-  buildSwapV2(base, slot, user: SwapUser) {
-    const cfg = alphaqConfig(base);
-    const dirByte = cfg.direction === 'BtoA' ? 0 : 1;
-    const roled = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-    return {
-      programId: ALPHAQ_PROGRAM_ID,
-      prefix: Uint8Array.from([0x0c, dirByte]),
-      suffix: new Uint8Array(8),
-      patch: 'in',
-      accounts: [
-        { ref: user.owner, signer: true },
-        roled('market', cfg.pool),
-        roled('stats', cfg.statsAccount, true),
-        { ref: user.inAta, writable: true },
-        { ref: user.outAta, writable: true },
-        roled('vaultA1', cfg.vaultA, true),
-        roled('vaultB1', cfg.vaultB, true),
-        roled('vaultA2', cfg.vaultA),
-        roled('vaultB2', cfg.vaultB),
-        roled('vaultB3', cfg.vaultB, true),
-        roled('tokenProgram', TOKEN_PROGRAM_ID),
-        roled('ixSysvar', SYSVAR_INSTRUCTIONS_ID),
-      ],
-    };
-  },
-  referenceQuote(base, state) {
-    const cfg = alphaqConfig(base);
-    const rawA = vaultAmount(state, cfg.vaultA);
-    const rawB = vaultAmount(state, cfg.vaultB);
-    return (x: bigint) => cpQuote(x, rawA, rawB);
-  },
-  depthReserves(base, state) {
-    // The relative-depth filter's (reserveIn, reserveOut) — the REAL directed
-    // vault balances (not this model's conservative `min(A,B)` depth): a
-    // skewed-but-real pool should still be visible to the liquidity filter,
-    // even though this ladder's OWN quote curve will naturally self-limit its
-    // election on the thin side (a near-zero quote just doesn't win a merge
-    // slot) — see the module doc's "THE ACTUAL MODEL".
-    const cfg = alphaqConfig(base);
-    const [vin, vout] = cfg.direction === 'BtoA' ? [cfg.vaultB, cfg.vaultA] : [cfg.vaultA, cfg.vaultB];
-    return { reserveIn: vaultAmount(state, vin), reserveOut: vaultAmount(state, vout) };
-  },
-  continuousFees() {
-    // out(x) ~= mu * (gamma*x*rOut) / (rIn + gamma*x): gamma folds the flat
-    // input-side haircut, mu = 1. This ladder's real curve is symmetric
-    // (rIn = rOut = min(vaultA, vaultB), see "THE ACTUAL MODEL") rather than
-    // the directed (reserveIn, reserveOut) `depthReserves` reports, but the
-    // gamma/mu SLOPE is the same either way — only the depth term differs,
-    // and this oracle is measurement-only (never a gate, see
-    // SvmVenueLadder's doc), so the approximation is acceptable here.
-    const gammaPpm = ((HAIRCUT_DENOM - HAIRCUT_BPS) * 1_000_000n) / HAIRCUT_DENOM;
-    return { gammaPpm, muPpm: 1_000_000n };
-  },
-};
 
 export { cpQuote as __alphaqCpQuoteForTest, decodeSymbol as __alphaqDecodeSymbolForTest };

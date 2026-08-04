@@ -123,7 +123,7 @@
  * offset) lives in `withPumpfunBondingCurveDiscovery` (the consuming app SVM discovery module).
  */
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
-import { ceilDiv, readUintLE } from '../math.js';
+import { readUintLE } from '../math.js';
 const SLUG = 'pumpfun-bonding-curve';
 export const PUMPFUN_BONDING_CURVE_PROGRAM_ID = address_('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const FEE_PROGRAM = address_('pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ');
@@ -137,8 +137,6 @@ const DEFAULT_PUBKEY = SYSTEM_PROGRAM;
 /** Fixed program PDAs (hardcoded like pumpswap's GLOBAL_CONFIG/FEE_CONFIG — computed once, verified
  *  against real mainnet state; see the module header). */
 const GLOBAL = address_('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
-const EVENT_AUTHORITY = address_('Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1');
-const GLOBAL_VOLUME_ACCUMULATOR = address_('Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y');
 /** PDA(["fee_config", PUMPFUN_BONDING_CURVE_PROGRAM_ID], FEE_PROGRAM) — the bonding-curve-specific
  *  FeeConfig (a DIFFERENT address than pumpswap's own `5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx`,
  *  even though both are namespaced under the same fee program). */
@@ -146,9 +144,6 @@ const FEE_CONFIG = address_('8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt');
 const BONDING_CURVE_DISCRIMINATOR = [23, 183, 248, 55, 96, 216, 172, 96];
 const GLOBAL_DISCRIMINATOR = [167, 232, 232, 177, 200, 108, 114, 127];
 const FEE_CONFIG_DISCRIMINATOR = [143, 52, 146, 187, 219, 123, 76, 155];
-const BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR = [194, 171, 28, 70, 104, 77, 91, 47];
-const SELL_V2_DISCRIMINATOR = [93, 246, 130, 60, 231, 233, 64, 178];
-const BPS = 10000n;
 function address_(s) {
     return s;
 }
@@ -232,11 +227,6 @@ async function loadAccount(load, addr, what) {
     if (data === null)
         throw new Error(`pumpfun-bonding-curve ${what} ${addr} not found`);
     return data;
-}
-function asCfg(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config for pool ${cfg.pool}`);
-    return cfg;
 }
 /**
  * The user-scoped remaining PDAs the CLASSIC v1 adapter shape does not (and cannot,
@@ -368,194 +358,6 @@ export const pumpfunBondingCurve = {
             associatedCreatorVault,
             sharingConfig,
         };
-    },
-};
-const ref = (slot, role) => `s${slot}:${role}`;
-export const pumpfunBondingCurveLadder = {
-    slug: SLUG,
-    shapeKey(base) {
-        const cfg = asCfg(base);
-        return `${SLUG}:${cfg.direction}`;
-    },
-    helpers(base) {
-        const cfg = asCfg(base);
-        if (cfg.direction === 'quoteToBase') {
-            // buy_exact_quote_in_v2: strip the (protocol+creator) fee off the spendable
-            // budget, ceil-rounding each component separately, over-budget corrected —
-            // then the invariant swap runs on net − 1. net < 2 returns 0 (the venue-side
-            // throw guard, kept out of the ladder so a dust rung just never wins). No
-            // LP term: a bonding curve has no LP (lp_fee_bps is always 0, unread).
-            return [
-                {
-                    name: 'qPumpfunBuy',
-                    source: [
-                        'function qPumpfunBuy(x, rBase, rQuote, prot, cr) {',
-                        '  if (x === 0) { return 0 }',
-                        '  let net = (x * 10000) / (10000 + prot + cr);',
-                        '  const fees = (net * prot + 9999) / 10000 + (net * cr + 9999) / 10000;',
-                        '  if (net + fees > x) { net = net - (net + fees - x) }',
-                        '  if (net < 2) { return 0 }',
-                        '  const ia = net - 1;',
-                        '  return Math.mulDiv(rBase, ia, rQuote + ia);',
-                        '}',
-                    ].join('\n'),
-                },
-            ];
-        }
-        // sell_v2: fees are per-component ceilDiv on the GROSS output; clamp net at 0
-        // (never underflow-wrap) on a dust trade whose ceil'd fee sum exceeds gross.
-        return [
-            {
-                name: 'qPumpfunSell',
-                source: [
-                    'function qPumpfunSell(x, rBase, rQuote, prot, cr) {',
-                    '  if (x === 0) { return 0 }',
-                    '  const gross = Math.mulDiv(rQuote, x, rBase + x);',
-                    '  const fee = (gross * prot + 9999) / 10000 + (gross * cr + 9999) / 10000;',
-                    '  if (fee > gross) { return 0 }',
-                    '  return gross - fee;',
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    /** Two params: protocolFeeBps, creatorFeeBps (lp is always 0 and never read). */
-    paramCount: 2,
-    paramsFor(base) {
-        const cfg = asCfg(base);
-        return [cfg.protocolFeeBps, cfg.creatorFeeBps];
-    },
-    quoteRefs(base, slot) {
-        const cfg = asCfg(base);
-        // BOTH virtual reserves live in the bonding-curve account itself — one read,
-        // unlike pumpswap's two separate vault accounts.
-        return [{ ref: ref(slot, 'bc'), address: cfg.pool }];
-    },
-    emitSetup(base, slot, params) {
-        return [
-            `  const s${slot}rbase = accountUint(${JSON.stringify(ref(slot, 'bc'))}, 8, 8);`,
-            `  const s${slot}rquote = accountUint(${JSON.stringify(ref(slot, 'bc'))}, 16, 8);`,
-            `  const s${slot}prot = ${params[0]};`,
-            `  const s${slot}cr = ${params[1]};`,
-        ].join('\n');
-    },
-    emitQuoteCall(base, slot, x) {
-        const cfg = asCfg(base);
-        const helper = cfg.direction === 'quoteToBase' ? 'qPumpfunBuy' : 'qPumpfunSell';
-        return `${helper}(${x}, s${slot}rbase, s${slot}rquote, s${slot}prot, s${slot}cr)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const cfg = asCfg(base);
-        const sell = cfg.direction === 'baseToQuote';
-        const userVolumeAccumulatorRef = `s${slot}:${PUMPFUN_BONDING_CURVE_USER_VOLUME_ACCUMULATOR_REF}`;
-        const associatedUvaRef = `s${slot}:${PUMPFUN_BONDING_CURVE_ASSOCIATED_USER_VOLUME_ACCUMULATOR_REF}`;
-        const associatedBaseUser = sell ? user.inAta : user.outAta;
-        const associatedQuoteUser = sell ? user.outAta : user.inAta;
-        const roled = (role, addr, writable) => writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-        // Every account rides a SLOT-SCOPED ref (matching raydium-cp-swap/obric-v2's
-        // convention, not pumpswap's ref=address one) — safe even for accounts shared
-        // across every pool (GLOBAL, the token programs, FEE_PROGRAM, ...): duplicate
-        // addresses across refs resolve fine (Solana dedupes at message compile, per
-        // resolveAccounts' own doc comment).
-        const common = [
-            roled('global', GLOBAL),
-            roled('baseMint', cfg.baseMint),
-            roled('quoteMint', WSOL),
-            roled('baseTokenProgram', cfg.baseTokenProgram),
-            roled('quoteTokenProgram', TOKEN_PROGRAM),
-            roled('ata', ASSOCIATED_TOKEN_PROGRAM),
-            roled('feeRecipient', cfg.feeRecipient, true),
-            roled('assocQuoteFeeRecipient', cfg.associatedQuoteFeeRecipient, true),
-            roled('buybackFeeRecipient', cfg.buybackFeeRecipient, true),
-            roled('assocQuoteBuybackFeeRecipient', cfg.associatedQuoteBuybackFeeRecipient, true),
-            roled('bondingCurve', cfg.pool, true),
-            roled('assocBaseBondingCurve', cfg.associatedBaseBondingCurve, true),
-            roled('assocQuoteBondingCurve', cfg.associatedQuoteBondingCurve, true),
-            { ref: user.owner, writable: true, signer: true },
-            { ref: associatedBaseUser, writable: true },
-            { ref: associatedQuoteUser, writable: true },
-            roled('creatorVault', cfg.creatorVault, true),
-            roled('assocCreatorVault', cfg.associatedCreatorVault, true),
-            roled('sharingConfig', cfg.sharingConfig),
-        ];
-        if (!sell) {
-            // buy_exact_quote_in_v2: disc ++ spendable_quote_in u64 (patched) ++ min_tokens_out u64 = 1.
-            const prefix = Uint8Array.from(BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR);
-            const suffix = Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]);
-            const accounts = [
-                ...common,
-                roled('globalVolumeAccumulator', GLOBAL_VOLUME_ACCUMULATOR),
-                { ref: userVolumeAccumulatorRef, writable: true },
-                { ref: associatedUvaRef, writable: true },
-                roled('feeConfig', FEE_CONFIG),
-                roled('feeProgram', FEE_PROGRAM),
-                roled('systemProgram', SYSTEM_PROGRAM),
-                roled('eventAuthority', EVENT_AUTHORITY),
-                roled('program', PUMPFUN_BONDING_CURVE_PROGRAM_ID),
-            ];
-            return { programId: PUMPFUN_BONDING_CURVE_PROGRAM_ID, prefix, suffix, patch: 'in', accounts };
-        }
-        // sell_v2: disc ++ base_amount_in u64 (patched) ++ min_quote_amount_out u64 = 1.
-        const prefix = Uint8Array.from(SELL_V2_DISCRIMINATOR);
-        const suffix = Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]);
-        const accounts = [
-            ...common,
-            { ref: userVolumeAccumulatorRef, writable: true },
-            { ref: associatedUvaRef, writable: true },
-            roled('feeConfig', FEE_CONFIG),
-            roled('feeProgram', FEE_PROGRAM),
-            roled('systemProgram', SYSTEM_PROGRAM),
-            roled('eventAuthority', EVENT_AUTHORITY),
-            roled('program', PUMPFUN_BONDING_CURVE_PROGRAM_ID),
-        ];
-        return { programId: PUMPFUN_BONDING_CURVE_PROGRAM_ID, prefix, suffix, patch: 'in', accounts };
-    },
-    referenceQuote(base, state, params) {
-        const cfg = asCfg(base);
-        const bytes = state[String(cfg.pool)];
-        if (bytes === undefined)
-            throw new Error(`${SLUG} ladder reference is missing account ${cfg.pool}`);
-        const rBase = readUintLE(bytes, 8, 8);
-        const rQuote = readUintLE(bytes, 16, 8);
-        const [prot, cr] = params;
-        if (cfg.direction === 'quoteToBase') {
-            return (x) => {
-                if (x === 0n)
-                    return 0n;
-                let net = (x * BPS) / (BPS + prot + cr);
-                const fees = ceilDiv(net * prot, BPS) + ceilDiv(net * cr, BPS);
-                if (net + fees > x)
-                    net -= net + fees - x;
-                if (net < 2n)
-                    return 0n;
-                const ia = net - 1n;
-                return (rBase * ia) / (rQuote + ia);
-            };
-        }
-        return (x) => {
-            if (x === 0n)
-                return 0n;
-            const gross = (rQuote * x) / (rBase + x);
-            const fee = ceilDiv(gross * prot, BPS) + ceilDiv(gross * cr, BPS);
-            return fee > gross ? 0n : gross - fee;
-        };
-    },
-    depthReserves(base, state) {
-        const cfg = asCfg(base);
-        const bytes = state[String(cfg.pool)];
-        if (bytes === undefined)
-            throw new Error(`${SLUG} ladder depth is missing account ${cfg.pool}`);
-        const rBase = readUintLE(bytes, 8, 8);
-        const rQuote = readUintLE(bytes, 16, 8);
-        return cfg.direction === 'quoteToBase' ? { reserveIn: rQuote, reserveOut: rBase } : { reserveIn: rBase, reserveOut: rQuote };
-    },
-    continuousFees(base, _state, params) {
-        const cfg = asCfg(base);
-        const [prot, cr] = params;
-        if (cfg.direction === 'quoteToBase') {
-            return { gammaPpm: (BPS * 1000000n) / (BPS + prot + cr), muPpm: 1000000n };
-        }
-        return { gammaPpm: 1000000n, muPpm: ((BPS - prot - cr) * 1000000n) / BPS };
     },
 };
 //# sourceMappingURL=index.js.map

@@ -58,8 +58,6 @@ export interface CropperPoolConfig extends PoolConfig {
         bToA: CropperWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: CropperPoolConfig): CropperWindow;
 /**
  * Fetch + gate one Cropper pool (see the header for the gate list) and
  * freeze both directions' boundary windows. Read-only against the loader.

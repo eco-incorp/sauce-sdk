@@ -63,8 +63,9 @@
  * itself a floor: `floor(x*m/D) <= T  <=>  x <= floor(((T+1)*D-1)/m)` with
  * `m = D-feeBps` (verified against hand-checked boundary cases — x=xCap
  * satisfies the bound, x=xCap+1 does not, for several (T, feeBps) pairs).
- * `capacityInputVar`/`referenceCapacities` fold this into the ladder exactly
- * like obric-v2's `icap`/`obricCapacity`.
+ * A merge-decomposition ladder folds this into its rung capacities; the
+ * ladders themselves now live in the consuming recipes package, so only the
+ * decode/derivation above is this module's concern.
  *
  * REDUCE_ONLY: `Pair.reduce_only` ("blocks borrowing and adding liquidity for
  * this pair", per its own doc comment) and `FutarchyAuthority.global_reduce_only`
@@ -108,12 +109,9 @@ import { readUintLE } from '../math.js';
 const SLUG = 'omnipair';
 export const OMNIPAIR_PROGRAM_ID = address('omnixgS8fnqHfCcTGKWj6JtKjzpJZ1Y5y9pyFkQDkYE');
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const TOKEN_2022_PROGRAM = address('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 export const PAIR_ACCOUNT_SIZE = 350;
 /** sha256('account:Pair')[0..8]. */
 export const PAIR_DISCRIMINATOR = [0x55, 0x48, 0x31, 0xb0, 0xb6, 0xe4, 0x8d, 0x52];
-/** sha256('global:swap')[0..8] — same ix name as Whirlpool's v1 swap / meteora's unified swap. */
-const SWAP_DISCRIMINATOR = [248, 198, 158, 145, 225, 117, 135, 200];
 const OFF_TOKEN0 = 8;
 const OFF_TOKEN1 = 40;
 const OFF_RATE_MODEL = 104;
@@ -122,12 +120,6 @@ const OFF_SWAP_FEE_BPS = 136;
 const OFF_OPTION_TAG = 146;
 const FEE_D = 10000n;
 const U64_MAX = (1n << 64n) - 1n;
-function omnipairConfig(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-    return cfg;
-}
-const ref = (slot, role) => `s${slot}:${role}`;
 function hasDiscriminator(data, discriminator) {
     return discriminator.every((byte, i) => data[i] === byte);
 }
@@ -199,11 +191,6 @@ export const omnipair = {
     tokenProgram: TOKEN_PROGRAM,
     fetchPoolConfig: fetchOmnipairPoolConfig,
 };
-/** reserveIn/reserveOut/cashOut offsets within the Pair account for `direction`. */
-function directedOffsets(cfg) {
-    const rb = cfg.reserveBase;
-    return cfg.direction === 'aToB' ? { offRin: rb, offRout: rb + 8, offCout: rb + 24 } : { offRin: rb + 8, offRout: rb, offCout: rb + 16 };
-}
 /**
  * Closed-form capacity: the largest gross input `x` for which
  * `amountOut(x) <= cashOut` holds (see the module header derivation).
@@ -222,18 +209,6 @@ export function omnipairCapacity(reserveIn, reserveOut, cashOut, feeBps) {
     const m = FEE_D - feeBps;
     return ((netInMax + 1n) * FEE_D - 1n) / m;
 }
-function liveState(cfg, state) {
-    const pool = state[cfg.pool];
-    if (pool === undefined)
-        throw new Error(`${SLUG} reference is missing account ${cfg.pool}`);
-    const { offRin, offRout, offCout } = directedOffsets(cfg);
-    const ri = readUintLE(pool, offRin, 8);
-    const ro = readUintLE(pool, offRout, 8);
-    const co = readUintLE(pool, offCout, 8);
-    const fb = readUintLE(pool, OFF_SWAP_FEE_BPS, 2);
-    const icap = omnipairCapacity(ri, ro, co, fb);
-    return { ri, ro, co, fb, icap };
-}
 /** The COLD (venue-exact) quote for gross input x, saturating at the capacity clamp. */
 export function omnipairQuote(x, ri, ro, fb, icap) {
     const cx = x > icap ? icap : x;
@@ -242,173 +217,4 @@ export function omnipairQuote(x, ri, ro, fb, icap) {
     const ni = (cx * (FEE_D - fb)) / FEE_D;
     return (ni * ro) / (ri + ni);
 }
-export const omnipairLadder = {
-    slug: SLUG,
-    /** CP-class: one mul + one div per rung (plus the capacity clamp), 4 rungs. */
-    defaultRungs: 4,
-    shapeKey(base) {
-        const c = omnipairConfig(base);
-        return `${SLUG}:${c.direction}:${c.reserveBase}`;
-    },
-    /** Everything is inline statement-form (capacity-aware, like obric-v2) — no shared helper. */
-    helpers(_base) {
-        return [];
-    },
-    paramCount: 0,
-    paramsFor(_base) {
-        return [];
-    },
-    quoteRefs(base, slot) {
-        const c = omnipairConfig(base);
-        // Everything the quote needs (reserves, cash reserves, swap_fee_bps) lives
-        // in the ONE Pair account — no separate config/vault reads at quote time.
-        return [{ ref: ref(slot, 'pair'), address: c.pool }];
-    },
-    emitSetup(base, slot, _params, enableVar) {
-        const c = omnipairConfig(base);
-        const { offRin, offRout, offCout } = directedOffsets(c);
-        const p = `s${slot}`;
-        const en = enableVar ?? `${p}en`;
-        const pairRef = JSON.stringify(ref(slot, 'pair'));
-        return [
-            // LIVE unconditional reads — a disabled slot still needs its account read.
-            `  const ${p}ri = accountUint(${pairRef}, ${offRin}, 8);`,
-            `  const ${p}ro = accountUint(${pairRef}, ${offRout}, 8);`,
-            `  const ${p}co = accountUint(${pairRef}, ${offCout}, 8);`,
-            `  const ${p}fb = accountUint(${pairRef}, ${OFF_SWAP_FEE_BPS}, 2);`,
-            // Capacity clamp — cheap (one mul + one div), but gated on enable anyway
-            // (a disabled slot's icap defaults to the uncapped sentinel: a no-op
-            // clamp, since the outer ladder block never runs for it regardless).
-            `  let ${p}icap = ${U64_MAX};`,
-            `  let ${p}cx = 0; let ${p}ni = 0;`,
-            `  if (${en} !== 0) {`,
-            `    if (${p}ro > ${p}co) {`,
-            `      const ${p}kq = ${p}ri * ${p}ro;`,
-            `      const ${p}tgt = ${p}ro - ${p}co;`,
-            `      let ${p}nim = ${p}kq / ${p}tgt - ${p}ri;`,
-            `      if (${p}nim < 0) { ${p}nim = 0 }`,
-            `      const ${p}fd = ${FEE_D} - ${p}fb;`,
-            `      ${p}icap = (((${p}nim + 1) * ${FEE_D}) - 1) / ${p}fd;`,
-            `    }`,
-            `  }`,
-        ].join('\n');
-    },
-    capacityInputVar(slot) {
-        return `s${slot}cx`;
-    },
-    /**
-     * Ladder rung at cumulative grid point `x`: `qOmnipair(min(x, icap))` —
-     * SATURATING (never collapses past the live cash-reserve capacity). Stateless
-     * (every rung is an independent closed-form evaluation) — `rung` is unused.
-     */
-    emitLadderQuote(base, slot, _rung, x, outVar) {
-        omnipairConfig(base);
-        const p = `s${slot}`;
-        return [
-            `    ${p}cx = ${x};`,
-            `    if (${p}cx > ${p}icap) { ${p}cx = ${p}icap }`,
-            `    let ${outVar} = 0;`,
-            `    if (${p}cx > 0) {`,
-            `      ${p}ni = (${p}cx * (${FEE_D} - ${p}fb)) / ${FEE_D};`,
-            `      ${outVar} = (${p}ni * ${p}ro) / (${p}ri + ${p}ni);`,
-            `    }`,
-        ].join('\n');
-    },
-    /** Cold final quote — same capacity clamp, fresh locals (no rung state to reuse). */
-    emitFinalQuote(base, slot, x, outVar) {
-        omnipairConfig(base);
-        const p = `s${slot}`;
-        return [
-            `  let ${p}fcx = ${x};`,
-            `  if (${p}fcx > ${p}icap) { ${p}fcx = ${p}icap }`,
-            `  let ${outVar} = 0;`,
-            `  if (${p}fcx > 0) {`,
-            `    const ${p}fni = (${p}fcx * (${FEE_D} - ${p}fb)) / ${FEE_D};`,
-            `    ${outVar} = (${p}fni * ${p}ro) / (${p}ri + ${p}fni);`,
-            `  }`,
-        ].join('\n');
-    },
-    buildSwapV2(base, slot, user) {
-        const c = omnipairConfig(base);
-        const aToB = c.direction === 'aToB';
-        const [inMint, outMint] = aToB ? [c.token0Mint, c.token1Mint] : [c.token1Mint, c.token0Mint];
-        const [inVault, outVault] = aToB ? [c.reserveVault0, c.reserveVault1] : [c.reserveVault1, c.reserveVault0];
-        const make = (r, addr, writable) => writable ? { ref: r, address: addr, writable: true } : { ref: r, address: addr };
-        // swap: disc(8) ++ amount_in u64 LE (runtime-patched) ++ min_amount_out u64 LE = 1
-        // (the recipe's terminal outAta delta check enforces the real bound).
-        // Account order is EXACT per the on-chain IDL (fetched live, not guessed):
-        // pair, rate_model, futarchy_authority, token_in_vault, token_out_vault,
-        // user_token_in_account, user_token_out_account, token_in_mint,
-        // token_out_mint, user, token_program, token_2022_program,
-        // event_authority (#[event_cpi]), program.
-        return {
-            programId: OMNIPAIR_PROGRAM_ID,
-            prefix: Uint8Array.from(SWAP_DISCRIMINATOR),
-            suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]),
-            patch: 'in',
-            accounts: [
-                make(ref(slot, 'pair'), c.pool, true),
-                make(ref(slot, 'ratemodel'), c.rateModel, true),
-                make(ref(slot, 'futarchy'), c.futarchyAuthority),
-                make(ref(slot, 'vin'), inVault, true),
-                make(ref(slot, 'vout'), outVault, true),
-                { ref: user.inAta, writable: true },
-                { ref: user.outAta, writable: true },
-                make(ref(slot, 'min'), inMint),
-                make(ref(slot, 'mout'), outMint),
-                { ref: user.owner, signer: true },
-                make(ref(slot, 'tp'), TOKEN_PROGRAM),
-                make(ref(slot, 'tp22'), TOKEN_2022_PROGRAM),
-                make(ref(slot, 'ea'), c.eventAuthority),
-                make(ref(slot, 'prog'), OMNIPAIR_PROGRAM_ID),
-            ],
-        };
-    },
-    /** The COLD final quote (0 past capacity) — the lamport-exact target for emitFinalQuote. No per-trade params (paramCount 0); `now` is unused (no time-dependent state). */
-    referenceQuote(base, state, _params, _now) {
-        const cfg = omnipairConfig(base);
-        const { ri, ro, fb, icap } = liveState(cfg, state);
-        return (x) => omnipairQuote(x, ri, ro, fb, icap);
-    },
-    /** Stateless (every grid point is its own closed-form evaluation) — mirrors emitLadderQuote's `min(x, icap)` clamp. */
-    referenceLadderQuotes(base, state, _params, _now) {
-        const cfg = omnipairConfig(base);
-        const { ri, ro, fb, icap } = liveState(cfg, state);
-        return (grid) => grid.map((x) => omnipairQuote(x, ri, ro, fb, icap));
-    },
-    /**
-     * Cumulative productive input per ORDERED grid point — `min(g, icap)`.
-     * Mirrors `capacityInputVar` lamport-for-lamport (see the module header).
-     */
-    referenceCapacities(base, state, _params, _now) {
-        const cfg = omnipairConfig(base);
-        const { icap } = liveState(cfg, state);
-        return (grid) => grid.map((g) => (g > icap ? icap : g));
-    },
-    /**
-     * Depth = the CASH reserves (the real swappable liquidity), not the virtual
-     * curve reserves — a heavily-borrowed-against pair reads thinner depth than
-     * its notional reserve suggests, matching the relative-depth filter's
-     * intent (mirrors obric-v2's "actual vault balance, not notional" choice).
-     */
-    depthReserves(base, state, _now) {
-        const cfg = omnipairConfig(base);
-        const pool = state[cfg.pool];
-        if (pool === undefined)
-            throw new Error(`${SLUG} depth is missing account ${cfg.pool}`);
-        const rb = cfg.reserveBase;
-        const cash0 = readUintLE(pool, rb + 16, 8);
-        const cash1 = readUintLE(pool, rb + 24, 8);
-        return cfg.direction === 'aToB' ? { reserveIn: cash0, reserveOut: cash1 } : { reserveIn: cash1, reserveOut: cash0 };
-    },
-    continuousFees(base, state, _params) {
-        const cfg = omnipairConfig(base);
-        const pool = state[cfg.pool];
-        if (pool === undefined)
-            throw new Error(`${SLUG} fees are missing account ${cfg.pool}`);
-        const fb = readUintLE(pool, OFF_SWAP_FEE_BPS, 2);
-        // fee is entirely on INPUT (no output-side fee for this venue) — bps -> ppm (x100).
-        return { gammaPpm: 1000000n - fb * 100n, muPpm: 1000000n };
-    },
-};
 //# sourceMappingURL=index.js.map

@@ -88,7 +88,16 @@
  * a real mainnet dump of the JLP pool + 6 custodies (SOL/ETH/BTC/USDC/USDT +
  * a 6th newer stable asset) — every custody's byte range past offset 1117 is
  * all-zero padding, confirming the field table below is the complete struct.
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec, getProgramDerivedAddress, getUtf8Encoder, getAddressEncoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';

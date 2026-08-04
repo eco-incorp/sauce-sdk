@@ -40,14 +40,13 @@
  *      on the output leg, capped at the pool's LIVE `outPoolReserves` SPL
  *      balance (`core/src/quote/swap/exact_in.rs` — a straight capacity
  *      check, `NotEnoughLiquidity` if exceeded; this adapter SATURATES
- *      instead of reverting, same convention as obric-v2's `obricColdQuote`).
+ *      instead of reverting rather than collapsing to zero).
  *
  * Because the fee is a FLAT proportional rate (no curve), the quote is
  * PIECEWISE LINEAR (linear up to the output-reserve cap, flat after) —
  * trivially monotone and concave, and cheaper to model than any curved
  * family: no ladder-rung path-dependence exists (rung count is a codegen
- * convenience, not an accuracy requirement — see `sanctumInfinityLadder`'s
- * doc).
+ * convenience, not an accuracy requirement).
  *
  * CALCULATORS SUPPORTED (of `WHITELISTED_SVC_PROGS`, the 6 whitelisted
  * SOL-value-calculator programs, `controller/core/src/keys.rs`): `spl`,
@@ -113,8 +112,8 @@
 import { createHash } from 'node:crypto';
 import { address, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import { ceilDiv, readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import { readUintLE } from '../math.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 import {
   SANCTUM_INFINITY_REGISTRY,
   WSOL_MINT,
@@ -181,12 +180,6 @@ const OFF_SOL_VALUE_CALCULATOR = 48;
 // resolved by an explicit off-chain walk (`readStakeWithdrawalFee`), NOT a
 // fixed offset. ──
 const SPL_ACCOUNT_TYPE_STAKE_POOL = 1;
-const OFF_SPL_TOTAL_LAMPORTS = 258;
-const OFF_SPL_POOL_TOKEN_SUPPLY = 266;
-
-// ── SPL token account amount field. ──
-const TOKEN_AMOUNT_OFFSET = 64;
-
 /** Reads a Borsh `Fee { denominator: u64, numerator: u64 }` at `off`. */
 function readFee(data: Uint8Array, off: number): { numerator: bigint; denominator: bigint } {
   const denominator = readUintLE(data, off, 8);
@@ -201,9 +194,9 @@ function readFee(data: Uint8Array, off: number): { numerator: bigint; denominato
  * to `stake_withdrawal_fee` — see the module doc for the full field list.
  * `stake_withdrawal_fee` (the withdrawal fee levied on `lst_to_sol`/
  * `sol_to_lst`) changes rarely (an admin-set config value, not a
- * per-trade-drifting reserve), so it is baked as a compile-time PARAM —
- * `total_lamports`/`pool_token_supply` stay LIVE on-chain reads (see
- * `sanctumInfinityLadder`).
+ * per-trade-drifting reserve), so it is a natural compile-time PARAM for a
+ * consumer's fragment, while `total_lamports`/`pool_token_supply` must stay
+ * LIVE on-chain reads.
  */
 function readStakeWithdrawalFee(data: Uint8Array): { numerator: bigint; denominator: bigint } {
   let off = 274 + 8 + 48 + 16; // last_update_epoch(8) + lockup(48) + epoch_fee(16)
@@ -470,269 +463,6 @@ export const sanctumInfinity = {
 // ── ladder ────────────────────────────────────────────────────────────────
 
 const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-/** Params baked at compile time (in order): inFeeNum, inFeeDenom, outFeeNum, outFeeDenom, feeNanosSum, inLstIndex, outLstIndex. */
-const PARAM_COUNT = 7;
-
-export const sanctumInfinityLadder = {
-  slug: SLUG,
-
-  /**
-   * Shape varies by which side (if either) is wSOL — a wsol leg attaches no
-   * stake-pool account and its setup emits a literal `1`/`1` sentinel pair
-   * instead of an `accountUint` read (see `emitSetup`); the shared helper
-   * (`qSanctumInfinity`) computes the plain identity from those sentinels
-   * with NO runtime branch (totalLamports==poolTokenSupply==1, feeNum==0 ⇒
-   * the general ratio math reduces to `x` exactly — see the helper source).
-   */
-  shapeKey(base: PoolConfig): string {
-    const cfg = infinityConfig(base);
-    return `${SLUG}:in=${cfg.in.isWsol ? 'w' : 's'}:out=${cfg.out.isWsol ? 'w' : 's'}`;
-  },
-
-  helpers(_base: PoolConfig): { name: string; source: string }[] {
-    return [
-      {
-        name: 'qSanctumInfinity',
-        source: [
-          'function qSanctumInfinity(x, inTL, inPTS, inFeeNum, inFeeDenom, outTL, outPTS, outFeeNum, outFeeDenom, feeNanosSum, outCap) {',
-          '  if (x === 0) { return 0 }',
-          '  const inFeeQ = Math.mulDiv(x, inFeeNum, inFeeDenom);',
-          '  const inFeeR = x * inFeeNum - inFeeQ * inFeeDenom;',
-          '  let inFee = inFeeQ;',
-          '  if (inFeeR !== 0) { inFee = inFeeQ + 1 }',
-          '  const burnt = x - inFee;',
-          '  const inSolValue = Math.mulDiv(burnt, inTL, inPTS);',
-          '  if (inSolValue === 0) { return 0 }',
-          '  const postFeeNanos = 1000000000 - feeNanosSum;',
-          '  if (postFeeNanos < 0) { return 0 }',
-          '  const outSolValue = Math.mulDiv(inSolValue, postFeeNanos, 1000000000);',
-          '  if (outSolValue === 0) { return 0 }',
-          // sol_to_lst's MIN (the value the engine actually delivers, .start()) is a PLAIN
-          // floor-floor chain — NOT a ceil-based reversal (see the module doc's
-          // real-mainnet-proof note: this file originally shipped a ceildiv-based guess here
-          // that was numerically close but 2 units off the real chain's exact minimum on a
-          // live jitoSOL->JupSOL simulate; sanctum_token_ratio_compat's floor_ratio_u64_u64_reverse
-          // takes MIN = floor(d*y/n), not ceil).
-          '  const burntMin = Math.mulDiv(outPTS, outSolValue, outTL);',
-          '  let out = burntMin;',
-          '  if (outFeeNum !== 0) { out = Math.mulDiv(outFeeDenom, burntMin, outFeeDenom - outFeeNum) }',
-          '  if (out > outCap) { return outCap }',
-          '  return out;',
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-
-  paramCount: PARAM_COUNT,
-  paramsFor(base: PoolConfig): bigint[] {
-    const cfg = infinityConfig(base);
-    const feeNanosSum = cfg.in.inpFeeNanos + cfg.out.outFeeNanos;
-    return [
-      cfg.in.feeNum,
-      cfg.in.feeDenom,
-      cfg.out.feeNum,
-      cfg.out.feeDenom,
-      feeNanosSum,
-      BigInt(cfg.in.lstIndex),
-      BigInt(cfg.out.lstIndex),
-    ];
-  },
-
-  quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = infinityConfig(base);
-    const accs: VenueAccount[] = [{ ref: ref(slot, 'outPoolReserves'), address: cfg.out.poolReserves }];
-    // Attached for depthReserves' off-chain relative-depth read only — the on-chain fragment
-    // never accountUint()s the input side's own reserve balance (the quote formula doesn't need it).
-    accs.push({ ref: ref(slot, 'inPoolReserves'), address: cfg.in.poolReserves });
-    if (cfg.in.stakePool !== undefined) accs.push({ ref: ref(slot, 'inStakePool'), address: cfg.in.stakePool });
-    if (cfg.out.stakePool !== undefined) accs.push({ ref: ref(slot, 'outStakePool'), address: cfg.out.stakePool });
-    return accs;
-  },
-
-  emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string {
-    const cfg = infinityConfig(base);
-    const lines: string[] = [];
-    const outCapRef = JSON.stringify(ref(slot, 'outPoolReserves'));
-    lines.push(`  const s${slot}outCap = accountUint(${outCapRef}, ${TOKEN_AMOUNT_OFFSET}, 8);`);
-    if (cfg.in.isWsol) {
-      lines.push(`  const s${slot}inTL = 1;`);
-      lines.push(`  const s${slot}inPTS = 1;`);
-    } else {
-      const inRef = JSON.stringify(ref(slot, 'inStakePool'));
-      lines.push(`  const s${slot}inTL = accountUint(${inRef}, ${OFF_SPL_TOTAL_LAMPORTS}, 8);`);
-      lines.push(`  const s${slot}inPTS = accountUint(${inRef}, ${OFF_SPL_POOL_TOKEN_SUPPLY}, 8);`);
-    }
-    if (cfg.out.isWsol) {
-      lines.push(`  const s${slot}outTL = 1;`);
-      lines.push(`  const s${slot}outPTS = 1;`);
-    } else {
-      const outRef = JSON.stringify(ref(slot, 'outStakePool'));
-      lines.push(`  const s${slot}outTL = accountUint(${outRef}, ${OFF_SPL_TOTAL_LAMPORTS}, 8);`);
-      lines.push(`  const s${slot}outPTS = accountUint(${outRef}, ${OFF_SPL_POOL_TOKEN_SUPPLY}, 8);`);
-    }
-    lines.push(`  const s${slot}inFeeNum = ${params[0]};`);
-    lines.push(`  const s${slot}inFeeDenom = ${params[1]};`);
-    lines.push(`  const s${slot}outFeeNum = ${params[2]};`);
-    lines.push(`  const s${slot}outFeeDenom = ${params[3]};`);
-    lines.push(`  const s${slot}feeNanosSum = ${params[4]};`);
-    return lines.join('\n');
-  },
-
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    return `qSanctumInfinity(${x}, s${slot}inTL, s${slot}inPTS, s${slot}inFeeNum, s${slot}inFeeDenom, s${slot}outTL, s${slot}outPTS, s${slot}outFeeNum, s${slot}outFeeDenom, s${slot}feeNanosSum, s${slot}outCap)`;
-  },
-
-  /**
-   * `swapExactInV2` (disc 23) — see the module doc for the full account-
-   * order citation trail. `limit` (min_amount_out) is 1, matching every
-   * other adapter — the recipe's own outAta delta check is the real floor.
-   */
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    const cfg = infinityConfig(base);
-    const inCalcAccs = cfg.in.isWsol ? 1 : 5;
-    const outCalcAccs = cfg.out.isWsol ? 1 : 5;
-
-    const prefix = new Uint8Array(1 + 1 + 1 + 4 + 4 + 8);
-    let o = 0;
-    prefix[o++] = 23; // SwapExactInV2 discriminator
-    prefix[o++] = inCalcAccs;
-    prefix[o++] = outCalcAccs;
-    new DataView(prefix.buffer).setUint32(o, cfg.in.lstIndex, true);
-    o += 4;
-    new DataView(prefix.buffer).setUint32(o, cfg.out.lstIndex, true);
-    o += 4;
-    new DataView(prefix.buffer).setBigUint64(o, 1n, true); // limit = 1
-
-    const accounts: VenueAccount[] = [
-      { ref: user.owner, signer: true },
-      { ref: ref(slot, 'inMint'), address: cfg.in.mint },
-      { ref: ref(slot, 'outMint'), address: cfg.out.mint },
-      { ref: user.inAta, writable: true },
-      { ref: user.outAta, writable: true },
-      { ref: ref(slot, 'inTokenProgram'), address: TOKEN_PROGRAM },
-      { ref: ref(slot, 'outTokenProgram'), address: TOKEN_PROGRAM },
-      { ref: ref(slot, 'poolState'), address: POOL_STATE_ID, writable: true },
-      { ref: ref(slot, 'lstStateList'), address: LST_STATE_LIST_ID, writable: true },
-      { ref: ref(slot, 'inPoolReserves'), address: cfg.in.poolReserves, writable: true },
-      { ref: ref(slot, 'outPoolReserves'), address: cfg.out.poolReserves, writable: true },
-    ];
-
-    if (cfg.in.isWsol) {
-      accounts.push({ ref: ref(slot, 'inCalcProgram'), address: WSOL_CALC_PROGRAM_ID });
-    } else {
-      const family = registryFamilyFor(cfg.in);
-      const c = CALC_CONSTANTS[family];
-      // suf order is [state, pool_state, pool_prog, pool_progdata] — confirmed against
-      // sol-val-calc/generic/core/src/instructions/interface/mod.rs's IxSufAccs struct
-      // field order (NOT the [state, pool_prog, pool_progdata, pool_state] order this
-      // file originally shipped with, which fails on-chain with WrongPoolProgram (1003) —
-      // see the module doc's real-mainnet quote-proof note).
-      accounts.push(
-        { ref: ref(slot, 'inCalcProgram'), address: c.calcProgram },
-        { ref: ref(slot, 'inCalcState'), address: c.calcState },
-        { ref: ref(slot, 'inStakePool'), address: cfg.in.stakePool as Address },
-        { ref: ref(slot, 'inCalcPoolProgram'), address: c.poolProgram },
-        { ref: ref(slot, 'inCalcPoolProgramData'), address: c.poolProgramData },
-      );
-    }
-    if (cfg.out.isWsol) {
-      accounts.push({ ref: ref(slot, 'outCalcProgram'), address: WSOL_CALC_PROGRAM_ID });
-    } else {
-      const family = registryFamilyFor(cfg.out);
-      const c = CALC_CONSTANTS[family];
-      accounts.push(
-        { ref: ref(slot, 'outCalcProgram'), address: c.calcProgram },
-        { ref: ref(slot, 'outCalcState'), address: c.calcState },
-        { ref: ref(slot, 'outStakePool'), address: cfg.out.stakePool as Address },
-        { ref: ref(slot, 'outCalcPoolProgram'), address: c.poolProgram },
-        { ref: ref(slot, 'outCalcPoolProgramData'), address: c.poolProgramData },
-      );
-    }
-    accounts.push(
-      { ref: ref(slot, 'pricingProgram'), address: FLAT_SLAB_PROGRAM_ID },
-      { ref: ref(slot, 'slab'), address: SLAB_ID },
-    );
-
-    return {
-      programId: SANCTUM_INFINITY_PROGRAM_ID,
-      prefix,
-      suffix: new Uint8Array(0),
-      patch: 'in',
-      accounts,
-    };
-  },
-
-  /** TS mirror of `qSanctumInfinity` — see that helper for the line-for-line derivation. */
-  referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint {
-    const cfg = infinityConfig(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const outCap = readUintLE(bytes(cfg.out.poolReserves), TOKEN_AMOUNT_OFFSET, 8);
-    const inTL = cfg.in.isWsol ? 1n : readUintLE(bytes(cfg.in.stakePool as Address), OFF_SPL_TOTAL_LAMPORTS, 8);
-    const inPTS = cfg.in.isWsol ? 1n : readUintLE(bytes(cfg.in.stakePool as Address), OFF_SPL_POOL_TOKEN_SUPPLY, 8);
-    const outTL = cfg.out.isWsol ? 1n : readUintLE(bytes(cfg.out.stakePool as Address), OFF_SPL_TOTAL_LAMPORTS, 8);
-    const outPTS = cfg.out.isWsol ? 1n : readUintLE(bytes(cfg.out.stakePool as Address), OFF_SPL_POOL_TOKEN_SUPPLY, 8);
-    const [inFeeNum, inFeeDenom, outFeeNum, outFeeDenom, feeNanosSum] = params;
-
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      const inFee = inFeeNum === 0n ? 0n : ceilDiv(x * inFeeNum, inFeeDenom);
-      const burnt = x - inFee;
-      const inSolValue = (burnt * inTL) / inPTS;
-      if (inSolValue === 0n) return 0n;
-      const postFeeNanos = 1_000_000_000n - feeNanosSum;
-      if (postFeeNanos < 0n) return 0n;
-      const outSolValue = (inSolValue * postFeeNanos) / 1_000_000_000n;
-      if (outSolValue === 0n) return 0n;
-      // PLAIN floor-floor chain (matches sanctum_token_ratio_compat's floor_ratio_u64_u64_reverse
-      // MIN — see the module doc's real-mainnet-proof note; NOT a ceil-based reversal).
-      const burntMin = (outPTS * outSolValue) / outTL;
-      let out = burntMin;
-      if (outFeeNum !== 0n) {
-        out = (outFeeDenom * burntMin) / (outFeeDenom - outFeeNum);
-      }
-      return out > outCap ? outCap : out;
-    };
-  },
-
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const cfg = infinityConfig(base);
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-      return data;
-    };
-    return {
-      reserveIn: readUintLE(bytes(cfg.in.poolReserves), TOKEN_AMOUNT_OFFSET, 8),
-      reserveOut: readUintLE(bytes(cfg.out.poolReserves), TOKEN_AMOUNT_OFFSET, 8),
-    };
-  },
-
-  /**
-   * Measurement-only approximation: `gammaPpm` folds the flat FlatSlab fee
-   * (nanos -> ppm) — there is no curve, so this is exact for THIS venue
-   * (unlike CP families, where the continuous-fee oracle is an
-   * approximation of a real curve).
-   */
-  continuousFees(_base: PoolConfig, _state: AccountBytesMap, params: readonly bigint[]): { gammaPpm: bigint; muPpm: bigint } {
-    const feeNanosSum = params[4];
-    const feePpm = feeNanosSum / 1_000n;
-    let gammaPpm = 1_000_000n - feePpm;
-    if (gammaPpm < 0n) gammaPpm = 0n;
-    return { gammaPpm, muPpm: 1_000_000n };
-  },
-};
-
-function registryFamilyFor(leg: SanctumInfinityLegConfig): SanctumInfinityCalcFamily {
-  const reg = SANCTUM_INFINITY_REGISTRY.get(leg.mint as unknown as string);
-  if (reg === undefined) throw new Error(`${SLUG}: mint ${leg.mint} has no registry entry (buildSwapV2)`);
-  return reg.family;
-}
 
 /** Test/tooling seam: clear the discovery-key registry between fixtures. */
 export function __resetSanctumInfinityKeysForTest(): void {

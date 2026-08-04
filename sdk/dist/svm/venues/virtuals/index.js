@@ -114,7 +114,7 @@
  * state-gated SVM family already carries.
  */
 import { getAddressDecoder, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
-import { ceilDiv, readUintLE } from '../math.js';
+import { readUintLE } from '../math.js';
 const SLUG = 'virtuals';
 export const VIRTUALS_PROGRAM_ID = address_('5U3EU2ubXtK84QcRjWVmYt9RaDyA8gKxdUrPFXmZyaki');
 const TOKEN_PROGRAM = address_('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -125,14 +125,7 @@ export const VIRTUALS_MINT = address_('3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfy
 const PLATFORM_PROTOTYPE = address_('933jV351WDG23QTcHPqLFJxyYRrEPWRTR3qoPWi3jwEL');
 /** sha256("account:VirtualsPool")[0..8]. */
 const VIRTUALS_POOL_DISCRIMINATOR = [71, 118, 5, 203, 5, 98, 135, 116];
-const BUY_DISCRIMINATOR = [102, 6, 61, 18, 1, 218, 235, 234];
-const SELL_DISCRIMINATOR = [51, 230, 133, 164, 1, 127, 131, 173];
 export const POOL_ACCOUNT_SIZE = 90;
-/** Flat protocol fee, ppm-of-10000 (1%) — a compiled-in program constant, never chain-read (see header). */
-const FEE_BPS = 100n;
-const BPS_DENOM = 10000n;
-/** SPL token account `amount` field offset (post-mint(32)+owner(32)). */
-const VAULT_AMOUNT_OFFSET = 64;
 function address_(s) {
     return s;
 }
@@ -155,11 +148,6 @@ async function loadAccount(load, addr, what) {
     if (data === null)
         throw new Error(`virtuals ${what} ${addr} not found`);
     return data;
-}
-function asCfg(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config for pool ${cfg.pool}`);
-    return cfg;
 }
 export const virtuals = {
     slug: SLUG,
@@ -194,190 +182,6 @@ export const virtuals = {
             vpoolVirtualsAta,
             platformPrototypeVirtualsAta,
         };
-    },
-};
-const ref = (slot, role) => `s${slot}:${role}`;
-export const virtualsLadder = {
-    slug: SLUG,
-    shapeKey(base) {
-        const cfg = asCfg(base);
-        return `${SLUG}:${cfg.direction}`;
-    },
-    helpers(base) {
-        const cfg = asCfg(base);
-        if (cfg.direction === 'quoteToBase') {
-            // BUY is exact-OUTPUT (see header): given a VIRTUAL budget x, find the largest dx
-            // (base tokens) the venue's own exact-output formula would deliver for <= x total cost.
-            // Closed-form inverse, no search loop; the final `if` is a belt-and-suspenders forward
-            // re-check (see header — proven never to trigger over 200k randomized trials, kept
-            // because it makes "never overspend x" true by construction, not by trusting the closed
-            // form alone).
-            return [
-                {
-                    name: 'qVirtualsBuy',
-                    source: [
-                        'function qVirtualsBuy(x, rbase, effy) {',
-                        '  if (x === 0) { return 0 }',
-                        '  const q = x / 101;',
-                        '  const rem = x - q * 101;',
-                        '  const r = rem < 99 ? rem : 99;',
-                        '  const dy = q * 100 + r;',
-                        '  let dx = Math.mulDiv(rbase, dy + 1, effy + dy + 1);',
-                        '  if (dx >= rbase) { dx = rbase - 1 }',
-                        '  if (dx > 0) {',
-                        '    const dyFwd = Math.mulDiv(effy, dx, rbase - dx);',
-                        '    const feeFwd = dyFwd / 100;',
-                        '    if (dyFwd + feeFwd > x) { dx = dx - 1 }',
-                        '  }',
-                        '  return dx;',
-                        '}',
-                    ].join('\n'),
-                },
-            ];
-        }
-        // SELL is exact-input: gross = ceil(effy*x/(rbase+x)) [the vault's virtuals balance
-        // decreases by exactly this], fee = floor(gross/100) taken from the ceil'd gross, net = the
-        // rest (see header for the boundary test that pins ceil-then-floor over floor-then-floor).
-        return [
-            {
-                name: 'qVirtualsSell',
-                source: [
-                    'function qVirtualsSell(x, rbase, effy) {',
-                    '  if (x === 0) { return 0 }',
-                    '  const grossFloor = Math.mulDiv(effy, x, rbase + x);',
-                    '  const gross = (effy * x > grossFloor * (rbase + x)) ? grossFloor + 1 : grossFloor;',
-                    '  const fee = gross / 100;',
-                    '  return gross - fee;',
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    /** One param: virtualY (read live off the pool account — see header). */
-    paramCount: 1,
-    paramsFor(base) {
-        const cfg = asCfg(base);
-        return [cfg.virtualY];
-    },
-    quoteRefs(base, slot) {
-        const cfg = asCfg(base);
-        return [
-            { ref: ref(slot, 'vpoolToken'), address: cfg.vpoolTokenAta },
-            { ref: ref(slot, 'vpoolVirtuals'), address: cfg.vpoolVirtualsAta },
-        ];
-    },
-    emitSetup(base, slot, params) {
-        return [
-            `  const s${slot}rbase = accountUint(${JSON.stringify(ref(slot, 'vpoolToken'))}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-            `  const s${slot}rvirt = accountUint(${JSON.stringify(ref(slot, 'vpoolVirtuals'))}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-            `  const s${slot}effy = s${slot}rvirt + ${params[0]};`,
-        ].join('\n');
-    },
-    emitQuoteCall(base, slot, x) {
-        const cfg = asCfg(base);
-        const helper = cfg.direction === 'quoteToBase' ? 'qVirtualsBuy' : 'qVirtualsSell';
-        return `${helper}(${x}, s${slot}rbase, s${slot}effy)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const cfg = asCfg(base);
-        const buy = cfg.direction === 'quoteToBase';
-        const roled = (role, addr, writable) => writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-        // buy: VIRTUAL is the trade's inAta, the launched token is outAta. sell: the mirror.
-        const userVirtualsRef = buy ? user.inAta : user.outAta;
-        const userTokenRef = buy ? user.outAta : user.inAta;
-        const accounts = [
-            { ref: user.owner, writable: false, signer: true },
-            roled('vpool', cfg.pool, true),
-            roled('mint', cfg.baseMint),
-            { ref: userVirtualsRef, writable: true },
-            { ref: userTokenRef, writable: true },
-            roled('vpoolToken', cfg.vpoolTokenAta, true),
-            roled('platform', PLATFORM_PROTOTYPE, true),
-            roled('platformVirtuals', cfg.platformPrototypeVirtualsAta, true),
-            roled('vpoolVirtuals', cfg.vpoolVirtualsAta, true),
-            roled('tokenProgram', TOKEN_PROGRAM),
-        ];
-        if (buy) {
-            // buy: disc ++ amount u64 (patched — the PREDICTED token output, patch:'out') ++
-            // max_amount_out u64 = u64::MAX (a max-COST cap despite the name; our own forward
-            // re-check inside qVirtualsBuy already guarantees cost <= the merge's allocated share,
-            // so this suffix is a pure decorative safety ceiling, never actually binding).
-            const prefix = Uint8Array.from(BUY_DISCRIMINATOR);
-            const suffix = Uint8Array.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-            return { programId: VIRTUALS_PROGRAM_ID, prefix, suffix, patch: 'out', accounts };
-        }
-        // sell: disc ++ amount u64 (patched — the merge-elected input, patch:'in') ++
-        // min_amount_out u64 = 1 (the recipe's terminal outAta delta check enforces the real bound).
-        const prefix = Uint8Array.from(SELL_DISCRIMINATOR);
-        const suffix = Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]);
-        return { programId: VIRTUALS_PROGRAM_ID, prefix, suffix, patch: 'in', accounts };
-    },
-    referenceQuote(base, state, params) {
-        const cfg = asCfg(base);
-        const tokenBytes = state[String(cfg.vpoolTokenAta)];
-        const virtualsBytes = state[String(cfg.vpoolVirtualsAta)];
-        if (tokenBytes === undefined)
-            throw new Error(`${SLUG} ladder reference is missing account ${cfg.vpoolTokenAta}`);
-        if (virtualsBytes === undefined)
-            throw new Error(`${SLUG} ladder reference is missing account ${cfg.vpoolVirtualsAta}`);
-        const rbase = readUintLE(tokenBytes, VAULT_AMOUNT_OFFSET, 8);
-        const rvirt = readUintLE(virtualsBytes, VAULT_AMOUNT_OFFSET, 8);
-        const [virtualY] = params;
-        const effy = rvirt + virtualY;
-        if (cfg.direction === 'quoteToBase') {
-            return (x) => {
-                if (x === 0n)
-                    return 0n;
-                const q = x / 101n;
-                const rem = x - q * 101n;
-                const r = rem < 99n ? rem : 99n;
-                const dy = q * 100n + r;
-                let dx = (rbase * (dy + 1n)) / (effy + dy + 1n);
-                if (dx >= rbase)
-                    dx = rbase - 1n;
-                if (dx > 0n) {
-                    const dyFwd = (effy * dx) / (rbase - dx);
-                    const feeFwd = dyFwd / 100n;
-                    if (dyFwd + feeFwd > x)
-                        dx -= 1n;
-                }
-                return dx;
-            };
-        }
-        return (x) => {
-            if (x === 0n)
-                return 0n;
-            const gross = ceilDiv(effy * x, rbase + x);
-            const fee = gross / 100n;
-            return gross - fee;
-        };
-    },
-    depthReserves(base, state) {
-        const cfg = asCfg(base);
-        const tokenBytes = state[String(cfg.vpoolTokenAta)];
-        const virtualsBytes = state[String(cfg.vpoolVirtualsAta)];
-        if (tokenBytes === undefined)
-            throw new Error(`${SLUG} ladder depth is missing account ${cfg.vpoolTokenAta}`);
-        if (virtualsBytes === undefined)
-            throw new Error(`${SLUG} ladder depth is missing account ${cfg.vpoolVirtualsAta}`);
-        const rbase = readUintLE(tokenBytes, VAULT_AMOUNT_OFFSET, 8);
-        const rvirt = readUintLE(virtualsBytes, VAULT_AMOUNT_OFFSET, 8);
-        // virtualY isn't threaded here (depthReserves carries no `params`); rvirt (the REAL vault
-        // balance) is a conservative under-estimate of the true effective quote depth (missing the
-        // virtual_y seed), which only makes the relative-depth filter MORE conservative, never lets
-        // an under-depth pool in.
-        return cfg.direction === 'quoteToBase' ? { reserveIn: rvirt, reserveOut: rbase } : { reserveIn: rbase, reserveOut: rvirt };
-    },
-    continuousFees(base, _state, params) {
-        const cfg = asCfg(base);
-        void params;
-        if (cfg.direction === 'quoteToBase') {
-            // BUY: the fee is a surcharge ADDED on top of the cost (cost = dy*(1+FEE_BPS/BPS_DENOM)),
-            // i.e. only a BPS_DENOM/(BPS_DENOM+FEE_BPS) fraction of the input budget is "productive".
-            return { gammaPpm: (BPS_DENOM * 1000000n) / (BPS_DENOM + FEE_BPS), muPpm: 1000000n };
-        }
-        // SELL: the fee is deducted from the gross OUTPUT.
-        return { gammaPpm: 1000000n, muPpm: ((BPS_DENOM - FEE_BPS) * 1000000n) / BPS_DENOM };
     },
 };
 //# sourceMappingURL=index.js.map

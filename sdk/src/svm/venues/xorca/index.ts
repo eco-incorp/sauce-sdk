@@ -18,7 +18,7 @@
  * `Unstake` therefore CANNOT be a Sauce venue leg: it does not deliver its
  * output atomically, only a claim redeemable in a separate transaction days
  * later. This is a STRUCTURAL fact about the program, not a permission or
- * whitelist gap — `xorcaLadder` only ever implements the `Stake` direction
+ * whitelist gap — this venue only ever supports the `Stake` direction
  * (ORCA -> xORCA); there is no `direction` field to flip (unlike every other
  * family in `FAMILIES`, which is why `the consuming app SVM solver entry`'s `xorca` entry
  * carries no `REVERSE_DIRECTION` entry, the same shape as `saber-stableswap`
@@ -149,7 +149,7 @@
  */
 import { address } from '@solana/kit';
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'xorca';
 
@@ -163,10 +163,6 @@ export const ORCA_MINT_ID: Address<'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE'
 export const XORCA_MINT_ID: Address<'xorcaYqbXUNz3474ubUMJAdu2xgPsew3rUCe5ughT3N'> = address(
   'xorcaYqbXUNz3474ubUMJAdu2xgPsew3rUCe5ughT3N',
 );
-const SPL_TOKEN_PROGRAM_ID: Address<'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'> = address(
-  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-);
-
 /**
  * The single global State PDA — seed `["state"]` under `XORCA_PROGRAM_ID`,
  * bump 250. The single vault ATA — seed `[statePda, tokenProgram, orcaMint]`
@@ -193,19 +189,10 @@ export const VAULT_AMOUNT_OFFSET = 64;
 /** SPL `Mint.supply`, u64 LE (4-byte COption tag + 32-byte pubkey precede it). */
 export const MINT_SUPPLY_OFFSET = 36;
 
-/** `util/math.rs`'s `VIRTUAL_XORCA_SUPPLY` / `VIRTUAL_NON_ESCROWED_ORCA_AMOUNT` — ported verbatim. */
-const VIRTUAL_XORCA_SUPPLY = 100n;
-const VIRTUAL_NON_ESCROWED_ORCA = 100n;
-
 export interface XorcaPoolConfig extends PoolConfig {
   venue: typeof SLUG;
   /** The only tradable direction — see file header for why Unstake/Withdraw cannot be one. */
   direction: 'orcaToXorca';
-}
-
-function xorcaConfig(cfg: PoolConfig): XorcaPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-  return cfg as XorcaPoolConfig;
 }
 
 /**
@@ -229,109 +216,3 @@ export async function fetchXorcaConfig(load: AccountLoader, pool: Address): Prom
   return { venue: SLUG, pool, direction: 'orcaToXorca' };
 }
 
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-function readU64LE(data: Uint8Array, offset: number): bigint {
-  let v = 0n;
-  for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(data[offset + i]!);
-  return v;
-}
-
-export const xorcaLadder: SvmVenueLadder = {
-  slug: SLUG,
-  defaultRungs: 4,
-  shapeKey(base: PoolConfig): string {
-    xorcaConfig(base); // validates venue; nothing else varies — one shape total
-    return SLUG;
-  },
-  helpers() {
-    return [
-      {
-        name: 'qXorca',
-        source: [
-          'function qXorca(x, nonEscrowed, xorcaSupply) {',
-          '  if (x === 0) { return 0 }',
-          `  return Math.mulDiv(x, xorcaSupply + ${VIRTUAL_XORCA_SUPPLY}, nonEscrowed + ${VIRTUAL_NON_ESCROWED_ORCA});`,
-          '}',
-        ].join('\n'),
-      },
-    ];
-  },
-  paramCount: 0,
-  paramsFor(): bigint[] {
-    return [];
-  },
-  quoteRefs(_base: PoolConfig, slot: number): VenueAccount[] {
-    return [
-      { ref: ref(slot, 'vault'), address: XORCA_VAULT_ATA },
-      { ref: ref(slot, 'xorcaMint'), address: XORCA_MINT_ID },
-      { ref: ref(slot, 'state'), address: XORCA_STATE_PDA },
-    ];
-  },
-  emitSetup(_base: PoolConfig, slot: number): string {
-    return [
-      `  const s${slot}vault = accountUint(${JSON.stringify(ref(slot, 'vault'))}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-      `  const s${slot}escrowed = accountUint(${JSON.stringify(ref(slot, 'state'))}, ${STATE_ESCROWED_OFFSET}, 8);`,
-      `  const s${slot}supply = accountUint(${JSON.stringify(ref(slot, 'xorcaMint'))}, ${MINT_SUPPLY_OFFSET}, 8);`,
-      `  const s${slot}rin = s${slot}vault - s${slot}escrowed;`,
-    ].join('\n');
-  },
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    return `qXorca(${x}, s${slot}rin, s${slot}supply)`;
-  },
-  buildSwapV2(_base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    return {
-      programId: XORCA_PROGRAM_ID,
-      prefix: Uint8Array.from([0]), // Instruction::Stake discriminator (Borsh enum tag, declaration order)
-      suffix: new Uint8Array(0), // Stake{orca_stake_amount:u64} carries nothing after the amount
-      patch: 'in',
-      accounts: [
-        { ref: user.owner, signer: true, writable: true }, // 0 staker_account
-        { ref: ref(slot, 'vault'), address: XORCA_VAULT_ATA, writable: true }, // 1 vault_account
-        { ref: user.inAta, writable: true }, // 2 staker_orca_ata
-        { ref: user.outAta, writable: true }, // 3 staker_xorca_ata
-        { ref: ref(slot, 'xorcaMint'), address: XORCA_MINT_ID, writable: true }, // 4 xorca_mint_account
-        { ref: ref(slot, 'state'), address: XORCA_STATE_PDA }, // 5 state_account (read-only)
-        { ref: ref(slot, 'orcaMint'), address: ORCA_MINT_ID }, // 6 orca_mint_account (read-only)
-        { ref: ref(slot, 'tokenProgram'), address: SPL_TOKEN_PROGRAM_ID }, // 7 token_program_account
-      ],
-    };
-  },
-  referenceQuote(_base: PoolConfig, state: AccountBytesMap): (x: bigint) => bigint {
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder reference is missing account ${addr}`);
-      return data;
-    };
-    const vaultAmount = readU64LE(bytes(XORCA_VAULT_ATA), VAULT_AMOUNT_OFFSET);
-    const escrowed = readU64LE(bytes(XORCA_STATE_PDA), STATE_ESCROWED_OFFSET);
-    const supply = readU64LE(bytes(XORCA_MINT_ID), MINT_SUPPLY_OFFSET);
-    const nonEscrowed = vaultAmount - escrowed;
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      if (nonEscrowed === 0n || supply === 0n) return x; // convert_orca_to_xorca's 1:1 bootstrap case
-      return (x * (supply + VIRTUAL_XORCA_SUPPLY)) / (nonEscrowed + VIRTUAL_NON_ESCROWED_ORCA);
-    };
-  },
-  depthReserves(_base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const bytes = (addr: Address): Uint8Array => {
-      const data = state[addr as unknown as string];
-      if (data === undefined) throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-      return data;
-    };
-    const vaultAmount = readU64LE(bytes(XORCA_VAULT_ATA), VAULT_AMOUNT_OFFSET);
-    const escrowed = readU64LE(bytes(XORCA_STATE_PDA), STATE_ESCROWED_OFFSET);
-    const supply = readU64LE(bytes(XORCA_MINT_ID), MINT_SUPPLY_OFFSET);
-    return { reserveIn: vaultAmount - escrowed, reserveOut: supply };
-  },
-  continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
-    // Measurement-only oracle input (never a gate — see the SvmVenueLadder
-    // doc). The real curve is exactly LINEAR (no price impact at all — see
-    // file header), strictly MORE depth than any CP curve models; reporting
-    // a plain no-fee CP shape (gamma=mu=1) over the real reserves is a
-    // CONSERVATIVE stand-in (the CP form under-states this venue's depth,
-    // same documented caveat as every stable/oracle-anchored family's
-    // continuousFees), never an over-promise.
-    return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };
-  },
-};

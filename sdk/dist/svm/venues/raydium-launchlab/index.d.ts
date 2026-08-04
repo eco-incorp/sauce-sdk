@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG: "raydium-launchlab";
 export declare const RAYDIUM_LAUNCHLAB_PROGRAM_ID: Address;
 export interface RaydiumLaunchlabPoolConfig extends PoolConfig {
@@ -22,6 +22,5 @@ export declare const raydiumLaunchlab: {
     programId: Address;
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<RaydiumLaunchlabPoolConfig>;
 };
-export declare const raydiumLaunchlabLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

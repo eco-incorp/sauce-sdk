@@ -1,6 +1,6 @@
 import type { Address } from '@solana/kit';
 import { MAX_TICK_INDEX, MIN_TICK_INDEX } from '../orca-whirlpool/tick-math.js';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "crema";
 export declare const CREMA_PROGRAM_ID: Address<"CLMM9tUoggJu2wagPkkqs9eFG4BWhVBZWkP1qv3Sp7tR">;
 export declare const CLMMPOOL_ACCOUNT_SIZE = 748;
@@ -64,8 +64,6 @@ export interface CremaPoolConfig extends PoolConfig {
         bToA: CremaWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function cremaWindowFor(cfg: CremaPoolConfig): CremaWindow;
 /** Fetch + decode one Clmmpool and freeze both directions' boundary windows. Read-only against the loader. */
 export declare function fetchCremaPoolConfig(load: AccountLoader, pool: Address): Promise<CremaPoolConfig>;
 /** Family facade for the recipe orchestrator (ladder-only, like orca-whirlpool/raydium-clmm). */
@@ -75,5 +73,4 @@ export declare const crema: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchCremaPoolConfig;
 };
-export declare const cremaLadder: SvmVenueLadder;
 //# sourceMappingURL=index.d.ts.map

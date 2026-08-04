@@ -199,7 +199,7 @@ import { createHash } from 'node:crypto';
 import { address, getAddressCodec, getBase58Decoder, getProgramDerivedAddress } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 const SLUG = 'mswap';
 
@@ -211,8 +211,6 @@ export const SWAP_GLOBAL_ID = address('6U4ZZZkftbuHxjRDHUfh83M9zG66aAAXDV3xTRX7y
 export const M_MINT = address('mzerojk9tg56ebsrEAhfkyc9VgKjTW2zDqp6C5mhjzH');
 /** `$M` is always Token2022 (`m_ext`'s `Wrap`/`Unwrap` hard-type `m_token_program: Program<Token2022>`). */
 export const M_TOKEN_PROGRAM = address('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
-const TOKEN2022 = M_TOKEN_PROGRAM;
-const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
 /** `SwapGlobal`'s own ATA of `$M` (owner = `SWAP_GLOBAL_ID`) — the transient per-trade holding account (see module doc). */
 export const SWAP_M_ACCOUNT = address('7dM9YCAbN9XGixnaP7wnyQDVZH6BVy6HPFeZr1SWVNka');
 
@@ -323,11 +321,6 @@ export interface MSwapPoolConfig extends PoolConfig {
   toMVault: Address;
 }
 
-function asConfig(cfg: PoolConfig): MSwapPoolConfig {
-  if (cfg.venue !== SLUG) throw new Error(`${SLUG} adapter got a config for venue '${cfg.venue}'`);
-  return cfg as MSwapPoolConfig;
-}
-
 async function derivePdas(extProgramId: Address, mMint: Address, mTokenProgram: Address) {
   const [global] = await getProgramDerivedAddress({ programAddress: extProgramId, seeds: [M_EXT_GLOBAL_SEED] });
   const [mVaultAuth] = await getProgramDerivedAddress({ programAddress: extProgramId, seeds: [M_VAULT_SEED] });
@@ -414,106 +407,3 @@ export const mswap = {
   fetchPoolConfig: fetchMSwapPoolConfig,
 };
 
-// ---------------------------------------------------------------------------
-// Ladder (fragment emission + reference mirror). CP-kind — `min(x, cap)`
-// over the FROM leg's live `$M` vault balance is a single breakpoint, no
-// path-dependence between rungs (identical shape to `solayer`'s ladder).
-// ---------------------------------------------------------------------------
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-/** SPL/Token2022 token account `amount` (u64 LE) — standard program-pack layout, offset 64. */
-const OFF_TOKEN_AMOUNT = 64;
-
-export const mswapLadder = {
-  slug: SLUG,
-  shapeKey(_base: PoolConfig): string {
-    // One fixed 24-account shape regardless of which whitelisted pair —
-    // token-program/mint choice only changes resolved ADDRESSES, never the
-    // account role layout.
-    return SLUG;
-  },
-  helpers(_base: PoolConfig): { name: string; source: string }[] {
-    return [
-      {
-        name: 'qMswap',
-        source: ['function qMswap(x, cap) {', '  if (x <= 0) { return 0 }', '  if (x < cap) { return x }', '  return cap;', '}'].join('\n'),
-      },
-    ];
-  },
-  paramCount: 0,
-  paramsFor(_base: PoolConfig): bigint[] {
-    return [];
-  },
-  quoteRefs(_base: PoolConfig, slot: number): VenueAccount[] {
-    const cfg = asConfig(_base);
-    return [{ ref: ref(slot, 'mvault'), address: cfg.fromMVault }];
-  },
-  emitSetup(_base: PoolConfig, slot: number): string {
-    return `  const s${slot}cap = accountUint(${JSON.stringify(ref(slot, 'mvault'))}, ${OFF_TOKEN_AMOUNT}, 8);`;
-  },
-  emitQuoteCall(_base: PoolConfig, slot: number, x: string): string {
-    // Exact 1:1 for the servable subset (both legs' m_ext index permanently
-    // 1e12 — see module doc), capped at the from-leg vault's live balance.
-    return `qMswap(${x}, s${slot}cap)`;
-  },
-  buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate {
-    const cfg = asConfig(base);
-    const disc = createHash('sha256').update('global:swap').digest().subarray(0, 8);
-    const acct = (role: string, addr: Address, writable?: boolean): VenueAccount =>
-      writable ? { ref: ref(slot, role), address: addr, writable: true } : { ref: ref(slot, role), address: addr };
-    return {
-      programId: MSWAP_PROGRAM_ID,
-      prefix: Uint8Array.from(disc),
-      // remaining_accounts_split_idx = 0 (no TransferHook on any servable mint — see module doc)
-      suffix: Uint8Array.from([0]),
-      patch: 'in',
-      accounts: [
-        { ref: user.owner, signer: true },
-        acct('wrapAuthoritySentinel', MSWAP_PROGRAM_ID),
-        acct('unwrapAuthoritySentinel', MSWAP_PROGRAM_ID),
-        acct('swapGlobal', SWAP_GLOBAL_ID),
-        acct('fromGlobal', cfg.fromGlobal, true),
-        acct('toGlobal', cfg.toGlobal, true),
-        acct('fromMint', cfg.fromMint, true),
-        acct('toMint', cfg.toMint, true),
-        acct('mMint', M_MINT),
-        { ref: user.inAta, writable: true },
-        { ref: user.outAta, writable: true },
-        acct('swapMAccount', SWAP_M_ACCOUNT, true),
-        acct('fromMVaultAuth', cfg.fromMVaultAuth),
-        acct('toMVaultAuth', cfg.toMVaultAuth),
-        acct('fromMintAuthority', cfg.fromMintAuthority),
-        acct('toMintAuthority', cfg.toMintAuthority),
-        acct('fromMVault', cfg.fromMVault, true),
-        acct('toMVault', cfg.toMVault, true),
-        acct('fromTokenProgram', cfg.fromTokenProgram),
-        acct('toTokenProgram', cfg.toTokenProgram),
-        acct('mTokenProgram', M_TOKEN_PROGRAM),
-        acct('fromExtProgram', cfg.fromProgramId),
-        acct('toExtProgram', cfg.toProgramId),
-        acct('systemProgram', SYSTEM_PROGRAM),
-      ],
-    };
-  },
-  referenceQuote(base: PoolConfig, state: AccountBytesMap): (x: bigint) => bigint {
-    const cfg = asConfig(base);
-    const vaultData = state[cfg.fromMVault];
-    if (vaultData === undefined) throw new Error(`${SLUG} ladder reference is missing account ${cfg.fromMVault}`);
-    const cap = readUintLE(vaultData, OFF_TOKEN_AMOUNT, 8);
-    return (x: bigint) => {
-      if (x <= 0n) return 0n;
-      return x < cap ? x : cap;
-    };
-  },
-  depthReserves(base: PoolConfig, state: AccountBytesMap): { reserveIn: bigint; reserveOut: bigint } {
-    const cfg = asConfig(base);
-    const vaultData = state[cfg.fromMVault];
-    if (vaultData === undefined) throw new Error(`${SLUG} ladder depth is missing vault account ${cfg.fromMVault}`);
-    const balance = readUintLE(vaultData, OFF_TOKEN_AMOUNT, 8);
-    return { reserveIn: balance, reserveOut: balance };
-  },
-  continuousFees(): { gammaPpm: bigint; muPpm: bigint } {
-    // No fee anywhere in the servable subset (see module doc) — full pass-through.
-    return { gammaPpm: 1_000_000n, muPpm: 1_000_000n };
-  },
-};

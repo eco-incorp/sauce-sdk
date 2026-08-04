@@ -98,8 +98,6 @@ export interface MeteoraDlmmPoolConfig extends PoolConfig {
         yToX: DlmmWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: MeteoraDlmmPoolConfig): DlmmWindow;
 /** The three bin-array indexes the walk touches: the active array then two more in the walk direction. */
 export declare function windowArrayIndexes(activeId: number, swapForY: boolean): [number, number, number];
 /**

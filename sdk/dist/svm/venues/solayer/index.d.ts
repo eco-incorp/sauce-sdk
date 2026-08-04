@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "solayer";
 export declare const SOLAYER_PROGRAM_ID: Address<"endoLNCKTqDn8gSVnN2hDdpgACUPWHZTwoYnnMybpAT">;
 export declare const SOLAYER_SSOL_MINT: Address<"sSo14endRuUbvQaJS3dq36Q829a3A6BEfoeeRGJywEh">;
@@ -29,6 +29,5 @@ export declare const solayer: {
     tokenProgram: Address<"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA">;
     fetchPoolConfig: typeof fetchSolayerPoolConfig;
 };
-export declare const solayerLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

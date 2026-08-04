@@ -96,15 +96,12 @@
 import { address, getAddressCodec } from '@solana/kit';
 const SLUG = 'solfi-v1';
 export const SOLFI_V1_PROGRAM_ID = address('SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe');
-const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const INSTRUCTIONS_SYSVAR = address('Sysvar1nstructions1111111111111111111111111');
 export const POOL_ACCOUNT_SIZE = 2800;
 // Verified across all 40 discovered pools (docs/solfi-v1-evidence.md) — plaintext, no XOR.
 export const OFF_MINT_A = 2664;
 export const OFF_MINT_B = 2696;
 export const OFF_VAULT_A = 2736;
 export const OFF_VAULT_B = 2768;
-const VAULT_AMOUNT_OFFSET = 64;
 /**
  * Per-pool, per-direction verified floor rates. A pool absent here THROWS at
  * `fetchPoolConfig` (see `fetchSolfiV1Config`) — never borrowed from another
@@ -125,11 +122,6 @@ export const SOLFI_V1_POOL_RATES = {
         1: { num: 1679058126523n, den: 200000000000n }, // B -> A floor (measured 8395290632615 out / 1e12 in)
     },
 };
-function solfiV1Config(cfg) {
-    if (cfg.venue !== SLUG)
-        throw new Error(`${SLUG} ladder adapter got a '${cfg.venue}' pool config`);
-    return cfg;
-}
 const ADDRESS_CODEC = getAddressCodec();
 /**
  * Off-chain gate + decode: pool size, mint/vault pubkeys (plaintext, fixed
@@ -162,116 +154,4 @@ export async function fetchSolfiV1Config(load, pool, direction = 0) {
         rate1: rates[1],
     };
 }
-const ref = (slot, role) => `s${slot}:${role}`;
-export const solfiV1Ladder = {
-    slug: SLUG,
-    defaultRungs: 4,
-    shapeKey(base) {
-        const cfg = solfiV1Config(base);
-        return `${SLUG}:${cfg.direction}`;
-    },
-    helpers() {
-        return [
-            {
-                name: 'qSolfiV1',
-                source: [
-                    'function qSolfiV1(x, rateNum, rateDen, outBal) {',
-                    '  if (x === 0) { return 0 }',
-                    '  const raw = Math.mulDiv(x, rateNum, rateDen);',
-                    '  let out = raw;',
-                    '  if (raw > outBal) { out = outBal }',
-                    '  return out;',
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    paramCount: 2,
-    paramsFor(base) {
-        const cfg = solfiV1Config(base);
-        const rate = cfg.direction === 0 ? cfg.rate0 : cfg.rate1;
-        return [rate.num, rate.den];
-    },
-    quoteRefs(base, slot) {
-        const cfg = solfiV1Config(base);
-        const voutRef = cfg.direction === 0 ? ref(slot, 'vaultB') : ref(slot, 'vaultA');
-        const voutAddr = cfg.direction === 0 ? cfg.vaultB : cfg.vaultA;
-        return [{ ref: voutRef, address: voutAddr }];
-    },
-    emitSetup(base, slot, params) {
-        const cfg = solfiV1Config(base);
-        const voutRef = cfg.direction === 0 ? ref(slot, 'vaultB') : ref(slot, 'vaultA');
-        return [
-            `  const s${slot}rateNum = ${params[0]};`,
-            `  const s${slot}rateDen = ${params[1]};`,
-            `  const s${slot}outBal = accountUint(${JSON.stringify(voutRef)}, ${VAULT_AMOUNT_OFFSET}, 8);`,
-        ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-        return `qSolfiV1(${x}, s${slot}rateNum, s${slot}rateDen, s${slot}outBal)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const cfg = solfiV1Config(base);
-        const aIsIn = cfg.direction === 0;
-        const userA = aIsIn ? user.inAta : user.outAta;
-        const userB = aIsIn ? user.outAta : user.inAta;
-        return {
-            programId: SOLFI_V1_PROGRAM_ID,
-            prefix: Uint8Array.from([0x07]),
-            // minOut u64 LE = 1 (dead weight — the recipe's terminal outAta delta
-            // owns the real bound, same convention as solfi-v2), then direction u8.
-            suffix: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, cfg.direction]),
-            patch: 'in',
-            accounts: [
-                { ref: user.owner, signer: true },
-                { ref: ref(slot, 'pool'), address: cfg.pool, writable: true },
-                { ref: ref(slot, 'vaultA'), address: cfg.vaultA, writable: true },
-                { ref: ref(slot, 'vaultB'), address: cfg.vaultB, writable: true },
-                { ref: userA, writable: true },
-                { ref: userB, writable: true },
-                { ref: ref(slot, 'tokenProgram'), address: TOKEN_PROGRAM },
-                { ref: ref(slot, 'sysvarIx'), address: INSTRUCTIONS_SYSVAR },
-            ],
-        };
-    },
-    referenceQuote(base, state) {
-        const cfg = solfiV1Config(base);
-        const rate = cfg.direction === 0 ? cfg.rate0 : cfg.rate1;
-        const voutAddr = cfg.direction === 0 ? cfg.vaultB : cfg.vaultA;
-        const voutData = state[voutAddr];
-        if (voutData === undefined)
-            throw new Error(`${SLUG} ladder reference is missing account ${voutAddr}`);
-        let outBal = 0n;
-        for (let i = 7; i >= 0; i--)
-            outBal = (outBal << 8n) | BigInt(voutData[VAULT_AMOUNT_OFFSET + i]);
-        return (x) => {
-            if (x === 0n)
-                return 0n;
-            const raw = (x * rate.num) / rate.den;
-            return raw > outBal ? outBal : raw;
-        };
-    },
-    depthReserves(base, state) {
-        const cfg = solfiV1Config(base);
-        const readAmount = (addr) => {
-            const data = state[addr];
-            if (data === undefined)
-                throw new Error(`${SLUG} ladder depth is missing account ${addr}`);
-            let v = 0n;
-            for (let i = 7; i >= 0; i--)
-                v = (v << 8n) | BigInt(data[VAULT_AMOUNT_OFFSET + i]);
-            return v;
-        };
-        const rA = readAmount(cfg.vaultA);
-        const rB = readAmount(cfg.vaultB);
-        return cfg.direction === 0 ? { reserveIn: rA, reserveOut: rB } : { reserveIn: rB, reserveOut: rA };
-    },
-    continuousFees() {
-        // Measurement-only oracle input (never a gate, see the barrel's doc on
-        // this field) — the model is intentionally linear (no reserve-ratio
-        // curvature), so this degenerates to "no impact term"; not meaningful for
-        // this non-CP-class venue (same disclosure as humidifi's).
-        return { gammaPpm: 0n, muPpm: 1000000n };
-    },
-};
 //# sourceMappingURL=index.js.map

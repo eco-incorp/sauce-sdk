@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "alphaq";
 export declare const ALPHAQ_PROGRAM_ID: Address<"ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA">;
 /** Minimal getProgramAccounts transport for the stats-account join (data included, unlike the
@@ -75,14 +75,5 @@ export declare function fetchAlphaqPoolConfig(load: AccountLoader, pool: Address
  * doc's "REJECTED FIRST ATTEMPT").
  */
 declare function cpQuote(x: bigint, rawA: bigint, rawB: bigint): bigint;
-/**
- * AlphaQ ladder (adapter contract v2). CP-kind, 4-rung default (no
- * window/capacity walk — the model is a symmetric reserve-based
- * constant-product curve, see the module doc's "QUOTE MODEL"). Reads BOTH
- * vaults every slot (the depth is `min(vaultA, vaultB)`, not a directed
- * reserveIn/reserveOut pair) — no per-trade params, the haircut is a
- * compiled constant, not pool state.
- */
-export declare const alphaqLadder: SvmVenueLadder;
 export { cpQuote as __alphaqCpQuoteForTest, decodeSymbol as __alphaqDecodeSymbolForTest };
 //# sourceMappingURL=index.d.ts.map

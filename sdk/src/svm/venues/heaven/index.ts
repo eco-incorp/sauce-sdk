@@ -89,23 +89,15 @@
 import { address, getAddressDecoder } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SvmVenueLadder, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 
 export const HEAVEN_PROGRAM_ID = address('HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o');
 
-const ASSOCIATED_TOKEN_PROGRAM = address('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
-const SYSTEM_PROGRAM = address('11111111111111111111111111111111');
-const SYSVAR_INSTRUCTIONS = address('Sysvar1nstructions1111111111111111111111111');
 const CLOCK_SYSVAR = address('SysvarC1ock11111111111111111111111111111111');
 const TOKEN_2022_PROGRAM = address('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const WSOL_MINT = address('So11111111111111111111111111111111111111112');
-/** Universal across every Heaven pool (see module header) — never per-pool. */
-const CHAINLINK_PROGRAM_ID = address('HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny');
 const CHAINLINK_SOL_USD_FEED = address('CH31Xns5z3M1cTAbKW34jcxPPciazARpijcHj9rxtemt');
 
-/** `sha256("global:buy")[..8]` / `sha256("global:sell")[..8]` — confirmed live (module header). */
-const BUY_DISCRIMINATOR = Uint8Array.from([102, 6, 61, 18, 1, 218, 235, 234]);
-const SELL_DISCRIMINATOR = Uint8Array.from([51, 230, 133, 164, 1, 127, 131, 173]);
 const POOL_DISCRIMINATOR = [190, 158, 220, 130, 15, 162, 132, 252];
 
 const MINT_SUPPLY_OFFSET = 36;
@@ -405,145 +397,6 @@ export const heaven = {
   slug: 'heaven' as const,
   programId: HEAVEN_PROGRAM_ID,
   fetchPoolConfig: (load: AccountLoader, pool: Address): Promise<HeavenPoolConfig> => fetchHeavenPoolConfig(load, pool),
-};
-
-const ref = (slot: number, role: string): string => `s${slot}:${role}`;
-
-const HELPER_BUY = 'qHeavenBuy';
-const HELPER_SELL = 'qHeavenSell';
-
-export const heavenLadder: SvmVenueLadder = {
-  slug: 'heaven',
-  shapeKey(base) {
-    return `heaven:${heavenConfig(base).direction}`;
-  },
-  // Both helpers share the same fee-subtraction shape (module header: 5 independently-floored
-  // components summed off the gross CP output) — the ONLY difference is which side of the
-  // reserves feeds the numerator. Dust/degenerate inputs return 0, matching every other family's
-  // convention.
-  helpers() {
-    const feeSubtract = [
-      '  const fee = (gross * p) / 10000 + (gross * lp) / 10000 + (gross * c) / 10000 + (gross * cpf) / 10000 + (gross * rf) / 10000;',
-      '  if (fee >= gross) { return 0 }',
-      '  return gross - fee;',
-    ].join('\n');
-    return [
-      {
-        name: HELPER_BUY,
-        source: ['function qHeavenBuy(x, ra, rb, p, lp, c, cpf, rf) {', '  if (x === 0) { return 0 }', '  const gross = Math.mulDiv(ra, x, rb + x);', '  if (gross === 0) { return 0 }', feeSubtract, '}'].join('\n'),
-      },
-      {
-        name: HELPER_SELL,
-        source: ['function qHeavenSell(x, ra, rb, p, lp, c, cpf, rf) {', '  if (x === 0) { return 0 }', '  const gross = Math.mulDiv(rb, x, ra + x);', '  if (gross === 0) { return 0 }', feeSubtract, '}'].join('\n'),
-      },
-    ];
-  },
-  /** 5 params: protocolBps, lpBps, creatorBps, creatorProtocolBps, reflectionBps — for the resolved direction. */
-  paramCount: 5,
-  paramsFor(base) {
-    const c = heavenConfig(base);
-    const f = c.fees;
-    return c.direction === 'buy'
-      ? [f.protocolBuyBps, f.lpBuyBps, f.creatorBuyBps, f.creatorProtocolBuyBps, f.reflectionBuyBps]
-      : [f.protocolSellBps, f.lpSellBps, f.creatorSellBps, f.creatorProtocolSellBps, f.reflectionSellBps];
-  },
-  quoteRefs(base, slot) {
-    const c = heavenConfig(base);
-    return [{ ref: ref(slot, 'pool'), address: c.pool }];
-  },
-  emitSetup(base, slot, params) {
-    const p = `s${slot}`;
-    const poolRef = JSON.stringify(ref(slot, 'pool'));
-    return [
-      `  const ${p}ra = accountUint(${poolRef}, ${OFF_RESERVE_A}, 8);`,
-      `  const ${p}rb = accountUint(${poolRef}, ${OFF_RESERVE_B}, 8);`,
-      `  const ${p}p = ${params[0]};`,
-      `  const ${p}lp = ${params[1]};`,
-      `  const ${p}c = ${params[2]};`,
-      `  const ${p}cpf = ${params[3]};`,
-      `  const ${p}rf = ${params[4]};`,
-    ].join('\n');
-  },
-  emitQuoteCall(base, slot, x) {
-    const c = heavenConfig(base);
-    const helper = c.direction === 'buy' ? HELPER_BUY : HELPER_SELL;
-    const p = `s${slot}`;
-    return `${helper}(${x}, ${p}ra, ${p}rb, ${p}p, ${p}lp, ${p}c, ${p}cpf, ${p}rf)`;
-  },
-  buildSwapV2(base, slot, user: SwapUser): LadderSwapTemplate {
-    const c = heavenConfig(base);
-    const sell = c.direction === 'sell';
-    // buy: BuyParams{max_sol_spend: u64 (patched), minimum_amount_out: u64 = 1, event: "" (u32 len = 0)}.
-    // sell: SellParams{amount_in: u64 (patched), minimum_amount_out: u64 = 1, event: "" (u32 len = 0)}.
-    // Venue-level min_out is always 1 — the recipe's terminal outAta delta check enforces the real bound.
-    const suffix = Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    const userTokenAAta = sell ? user.inAta : user.outAta;
-    const userTokenBAta = sell ? user.outAta : user.inAta;
-    const readonly = (addr: Address): VenueAccount => ({ ref: `heaven:${addr}`, address: addr });
-    const accounts: VenueAccount[] = [
-      readonly(c.tokenAProgram),
-      readonly(c.tokenBProgram),
-      readonly(ASSOCIATED_TOKEN_PROGRAM),
-      readonly(SYSTEM_PROGRAM),
-      { ref: ref(slot, 'pool'), address: c.pool, writable: true },
-      { ref: user.owner, writable: true, signer: true },
-      readonly(c.tokenAMint),
-      readonly(c.tokenBMint),
-      { ref: userTokenAAta, writable: true },
-      { ref: userTokenBAta, writable: true },
-      { ref: ref(slot, 'vaultA'), address: c.tokenAVault, writable: true },
-      { ref: ref(slot, 'vaultB'), address: c.tokenBVault, writable: true },
-      { ref: ref(slot, 'protocolConfig'), address: c.protocolConfig, writable: true },
-      readonly(SYSVAR_INSTRUCTIONS),
-      readonly(CHAINLINK_PROGRAM_ID),
-      readonly(CHAINLINK_SOL_USD_FEED),
-    ];
-    return {
-      programId: HEAVEN_PROGRAM_ID,
-      prefix: sell ? SELL_DISCRIMINATOR : BUY_DISCRIMINATOR,
-      suffix,
-      patch: 'in',
-      accounts,
-    };
-  },
-  referenceQuote(base, state: AccountBytesMap, params: readonly bigint[]) {
-    const c = heavenConfig(base);
-    const data = state[c.pool];
-    if (data === undefined) throw new Error(`heaven ladder reference is missing pool ${c.pool}`);
-    const ra = readUintLE(data, OFF_RESERVE_A, 8);
-    const rb = readUintLE(data, OFF_RESERVE_B, 8);
-    const [p, lp, cr, cpf, rf] = params;
-    const feeOf = (gross: bigint): bigint => (gross * p!) / 10000n + (gross * lp!) / 10000n + (gross * cr!) / 10000n + (gross * cpf!) / 10000n + (gross * rf!) / 10000n;
-    if (c.direction === 'buy') {
-      return (x: bigint): bigint => {
-        if (x === 0n) return 0n;
-        const gross = (ra * x) / (rb + x);
-        if (gross === 0n) return 0n;
-        const fee = feeOf(gross);
-        return fee >= gross ? 0n : gross - fee;
-      };
-    }
-    return (x: bigint): bigint => {
-      if (x === 0n) return 0n;
-      const gross = (rb * x) / (ra + x);
-      if (gross === 0n) return 0n;
-      const fee = feeOf(gross);
-      return fee >= gross ? 0n : gross - fee;
-    };
-  },
-  depthReserves(base, state: AccountBytesMap) {
-    const c = heavenConfig(base);
-    const data = state[c.pool];
-    if (data === undefined) throw new Error(`heaven ladder depth is missing pool ${c.pool}`);
-    const ra = readUintLE(data, OFF_RESERVE_A, 8);
-    const rb = readUintLE(data, OFF_RESERVE_B, 8);
-    return c.direction === 'buy' ? { reserveIn: rb, reserveOut: ra } : { reserveIn: ra, reserveOut: rb };
-  },
-  continuousFees(base, _state, params: readonly bigint[]) {
-    const totalBps = params.reduce((sum, bps) => sum + bps, 0n);
-    const muPpm = totalBps >= 10_000n ? 0n : 1_000_000n - totalBps * 100n;
-    return { gammaPpm: 1_000_000n, muPpm };
-  },
 };
 
 export function heavenMints(base: PoolConfig): { inMint: Address; outMint: Address } {

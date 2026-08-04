@@ -99,8 +99,6 @@ export interface RaydiumClmmPoolConfig extends PoolConfig {
         '1to0': RaydiumClmmWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: RaydiumClmmPoolConfig): RaydiumClmmWindow;
 /** floor division toward negative infinity (TickArrayState::get_array_start_index). */
 export declare function arrayStartIndex(tickIndex: number, tickSpacing: number): number;
 /**

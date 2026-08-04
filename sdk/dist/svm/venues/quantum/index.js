@@ -79,11 +79,26 @@
  * - account size / program owner;
  * - non-classic-SPL mints (the swap is Tokenkeg-only here);
  * - a direction with no walkable level prefix (empty/parked ladder side).
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { address, getAddressCodec } from '@solana/kit';
 import { readUintLE } from '../math.js';
 const SLUG = 'quantum';
 export const QUANTUM_PROGRAM_ID = address('QuaNtZsgYRe5Z9Bk4LZ4cTD9tbkVoyCNf1R2BN9bBDv');
+/**
+ * The program's single global config account (one for every pool). Lived in
+ * this venue's ladder module until the merge-decomposition ladders moved out;
+ * it is a program address, not decomposition state, so it stays here.
+ */
+export const QUANTUM_GLOBAL = address('3JumrbigQRj9TqEuy5fKGPHsQ6zCTwqqfVGhFhyoEMqH');
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 /** Exact pool account size (all 27 live mainnet pools). */
 export const QUANTUM_POOL_SIZE = 2280;
@@ -135,10 +150,6 @@ export function quantumInVault(cfg) {
 /** Cached out-reserve offset for the direction (the second half of the out cap). */
 export function quantumOutReserveOffset(cfg) {
     return cfg.direction === 'zeroIn' ? OFF_RESERVE1 : OFF_RESERVE0;
-}
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export function quantumWindowFor(cfg) {
-    return cfg.direction === 'zeroIn' ? cfg.windows.zeroIn : cfg.windows.oneIn;
 }
 const levelPrice = (data, side, i) => readUintLE(data, side + SIDE_LEVELS + i * SIDE_LEVEL_STRIDE, 8);
 const levelCum = (data, side, i) => readUintLE(data, side + SIDE_LEVELS + i * SIDE_LEVEL_STRIDE + 8, 8);

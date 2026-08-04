@@ -67,8 +67,6 @@ export interface SarosDlmmPoolConfig extends PoolConfig {
         yToX: SarosDlmmWindow;
     };
 }
-/** The direction's window (the ladder adapter and the orchestrator gate read through this). */
-export declare function windowFor(cfg: SarosDlmmPoolConfig): SarosDlmmWindow;
 /**
  * The two bracketing bin-array indices for `activeId` — matching the real
  * program's own swap-account convention (cross-validated: the pair chosen

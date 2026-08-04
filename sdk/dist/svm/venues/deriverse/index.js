@@ -57,7 +57,16 @@
  * obric-v2's own "Tokenkeg-only, no Token-2022" scope note; a Token-2022
  * transfer-fee mint would desync the wire amount from the curve and is out
  * of scope for this first integration.
- */
+ *
+ * NOTE — RELOCATED LADDER. This venue's merge-decomposition ladder used to sit
+ * next to this file as `./ladder.ts`; it now lives in the consuming recipes
+ * package, which defines every `*Ladder`, window selector and rung-feeding
+ * decomposition helper itself. The SDK keeps only the generic venue
+ * integration below (pool-account decode, program ids, pool-config types, and
+ * the AMM/tick math the decode needs). Every `ladder.ts` reference in the text
+ * above therefore points at that relocated module, not at a file in this
+ * directory.
+  */
 import { getAddressCodec, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 const SLUG = 'deriverse';
 export const DERIVERSE_PROGRAM_ID = 'DRVSpZ2YUYYKgZP8XtLhAGtT1zYSCKzeHfb4DgRnrgqD';

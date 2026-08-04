@@ -50,7 +50,7 @@
  * every address is what it claims to be.
  */
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 import { type FeeBeneficiary, type ScaleDirection } from '../scale-common.js';
 declare const SLUG = "scale-vmm";
 export interface ScaleVmmPoolConfig extends PoolConfig {
@@ -84,6 +84,5 @@ export declare const scaleVmm: {
     programId: Address<"SCALEWoRSpVZpMRqHEcDfNvBh3nUSe34jDr9r689gLa">;
     fetchPoolConfig(load: AccountLoader, pair: Address): Promise<ScaleVmmPoolConfig>;
 };
-export declare const scaleVmmLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map
