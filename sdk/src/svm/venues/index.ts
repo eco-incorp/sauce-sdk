@@ -321,3 +321,23 @@ export * from './one-intro-swap/index.js';
 export * from './one-intro-swap/ladder.js';
 export { WHALESTREET_PROGRAM_ID, WHALESTREET_OFF_MINT_A, WHALESTREET_OFF_VAULT_A, WHALESTREET_OFF_MINT_B, WHALESTREET_OFF_VAULT_B, WHALESTREET_IX_PREFIX, whalestreet, whalestreetLadder, fetchWhalestreetPoolConfig } from './whalestreet/index.js';
 export type { WhalestreetPoolConfig } from './whalestreet/index.js';
+// metric: explicit re-export — some names collide with an existing venue's
+// generic constants/helpers; aliased with a `METRIC_` prefix.
+export {
+  METRIC_PROGRAM_ID,
+  METRIC_ORACLE_PROGRAM_ID,
+  OFF_MINT_A as METRIC_OFF_MINT_A,
+  OFF_VAULT_A as METRIC_OFF_VAULT_A,
+  OFF_MINT_B as METRIC_OFF_MINT_B,
+  OFF_VAULT_B as METRIC_OFF_VAULT_B,
+  OFF_ORACLE_CONFIG as METRIC_OFF_ORACLE_CONFIG,
+  PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG as METRIC_PRICE_ACCOUNT_OFFSET_IN_ORACLE_CONFIG,
+  METRIC_SWAP_DISCRIMINATOR,
+  CAP_DIVISOR as METRIC_CAP_DIVISOR,
+  METRIC_DRIFT_TOLERANCE_BPS,
+  metricScaleParams,
+  metric,
+  metricSwapAccounts,
+} from './metric/index.js';
+export type { MetricPoolConfig } from './metric/index.js';
+export { metricLadder } from './metric/ladder.js';
