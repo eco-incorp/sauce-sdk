@@ -123,10 +123,10 @@ describe('the emitted fragment compiles as valid SauceScript (svm target)', () =
     const { bytecode, accountPlan } = compile(source, { target: 'svm' });
     expect(bytecode[0].length).toBeGreaterThan(0);
     const refs = accountPlan?.metas.map((m) => m.ref).sort() ?? [];
-    expect(refs).toEqual(['s0:oracleConfig', 's0:oracleProg', 's0:price', 's0:vout'].sort());
+    expect(refs).toEqual(['s0:vout']);
   });
 
-  it('a disabled slot (enable=0) skips the CPI account plan entries at runtime but still compiles', async () => {
+  it('a disabled slot (enable=0) keeps the zero-output scale and still compiles', async () => {
     const fixtures = loadFixtures(FIXTURES);
     const load = fixtureLoader(fixtures);
     const cfg: MetricPoolConfig = await metric.fetchPoolConfig(load, POOL, 0, async () => realOracleQuoteBytes());
@@ -143,6 +143,30 @@ describe('the emitted fragment compiles as valid SauceScript (svm target)', () =
     const { bytecode } = compile(source, { target: 'svm' });
     expect(bytecode[0].length).toBeGreaterThan(0);
   });
+});
+
+describe('the emitted quote fragment issues NO oracle CPI (whole-cook-abort safety)', () => {
+  // A launched CPI that reverts (this oracle reverts Custom:20 when stale) aborts the ENTIRE cook —
+  // every co-merged venue's fill, not just Metric's — because the engine's CATCH is pre-flight-only.
+  // The quote is baked off-chain at fetch time; minOut is the sole atomic backstop. So the emitted
+  // quote program must contain zero contract.call and attach only the vault it reads for its cap.
+  for (const dir of [0, 1] as const) {
+    it(`direction ${dir}: emitSetup/emitQuoteCall contain no contract.call, and the account plan is just the vault`, async () => {
+      const fixtures = loadFixtures(FIXTURES);
+      const load = fixtureLoader(fixtures);
+      const cfg: MetricPoolConfig = await metric.fetchPoolConfig(load, POOL, dir, async () => realOracleQuoteBytes());
+      const params = metricLadder.paramsFor(cfg).map((v) => v.toString());
+      const setup = metricLadder.emitSetup(cfg, 0, params, 's0en');
+      const quote = metricLadder.emitQuoteCall(cfg, 0, '100000');
+      expect(setup).not.toMatch(/contract\.call/);
+      expect(quote).not.toMatch(/contract\.call/);
+      const helpers = metricLadder.helpers().map((h) => h.source).join('\n');
+      const source = [helpers, 'function main() {', '  let s0en = 1;', setup, `  return ${quote};`, '}'].join('\n');
+      const { accountPlan } = compile(source, { target: 'svm' });
+      const refs = accountPlan?.metas.map((m) => m.ref).sort() ?? [];
+      expect(refs).toEqual(['s0:vout']);
+    });
+  }
 });
 
 function gcd(a: bigint, b: bigint): bigint {

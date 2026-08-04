@@ -1,71 +1,42 @@
 /**
- * Metric adapter v2 (SvmRoute ladder fragment) — the amount-parametric sibling of ./index.ts's
- * buildSwap. See index.ts's module doc for the account/instruction layout and the full oracle-CPI
- * price mechanism; this file is the emitted-fragment side of that mechanism.
+ * Metric adapter — the amount-parametric quote-ladder fragment, sibling of ./index.ts's buildSwap.
+ * See index.ts's module doc for the account/instruction layout and the off-chain price mechanism;
+ * this file is the emitted-fragment side of the quote.
  *
- * THE ONE THING THIS FRAGMENT DOES THAT NO OTHER LADDER IN THIS TREE DOES: it issues a REAL CPI
- * (`contract.call`) inside `emitSetup`, not just an `accountUint` byte read. Every other oracle-
- * priced ladder (zerofi, obric-v2) decodes its price from plain account BYTES; Metric's oracle
- * exposes its price only through CALL return data (its own internal transform is closed and
- * unrecovered — see index.ts's module doc), so the fragment must actually invoke the oracle
- * program the same way `ecoswap/svm/codegen.ts`'s native-merge emission already does (intern the
- * target program's account with a zero-length `accountData` read so it rides the transaction's
- * account list, then `contract.call(targetPubkeyLiteral, calldata, accounts[])`, then decode the
- * returned `Bytes` descriptor with `.slice()` + `uint()` — the SVM engine's `CALL`/`Static` opcodes
- * push the callee's return data as exactly that descriptor, see
- * `../sauce/svm/programs/engine/src/opcode.rs` (0xA2/0xA3) + `ops/call.rs`'s `get_return_data()`).
+ * BAKED PRICE, NO IN-VM ORACLE CPI. Metric's oracle exposes its price only through CALL return data
+ * (its internal byte->price transform is closed and unrecovered — see index.ts's module doc), so
+ * `fetchPoolConfig` reads it ONCE off-chain at quote time (via the caller-supplied `fetchOracleQuote`
+ * callback) and BAKES the resulting scale into `params`. The emitted fragment then just multiplies
+ * by that baked scale — exactly like every other read-off-chain-and-bake venue in this tree (zerofi,
+ * WOOFi, BisonFi). It issues ZERO `contract.call`: it reads only the output vault's balance
+ * (`accountUint`) to size a reserve-fraction cap.
  *
- * LIVE-GATES, BAKED-QUOTES: the live CPI result is used ONLY to gate the slot (self-drop on drift
- * beyond `METRIC_DRIFT_TOLERANCE_BPS` from the baked price) — the ACTUAL quote multiply always uses
- * the BAKED (params-carried) scale, never the freshly-read live value. This is what keeps
- * `referenceQuote` a pure function of `params` (state bytes cannot reproduce the oracle's closed
- * transform — see index.ts's module doc) while the on-chain fragment still pays for a live
- * freshness check. `referenceQuote` therefore assumes the gate passes (baked-at-fetch and
- * live-at-cook coincide, true within one fixture/test snapshot); it cannot reproduce a genuine
- * PRODUCTION drift self-drop, an honest, disclosed limitation of the same shape as
- * `continuousFees`'s "measurement only" caveat elsewhere in this framework — the drift check is a
- * pure availability/staleness safety net, never a fill-quality gate, and `minOut` remains the sole
- * atomic backstop regardless.
+ * WHY NO CPI (this was the production blocker, now removed): an in-VM `contract.call` to the oracle
+ * can REVERT — this oracle returns program error Custom:20 when its price account is stale (measured
+ * live: some calls return a clean 32-byte quote, others revert once the price account's bytes move).
+ * The engine's CATCH is PRE-FLIGHT-ONLY (`resolveRawCallCatch`: once `invoke()` launches, a failing
+ * callee aborts the WHOLE transaction), so an in-quote oracle revert would abort the ENTIRE cook —
+ * every co-merged venue's fill, not just Metric's own slot. A prior revision emitted such a CPI as a
+ * freshness gate; it is deleted. Applying a baked scale can never revert, so Metric's quote fragment
+ * can never take down a cook, and `minOut` remains the sole atomic backstop — the same posture as
+ * every other read-off-chain venue here. The venue's OWN swap instruction still prices via the
+ * oracle (its business, and only when Metric is actually elected), a normal per-slot swap failure,
+ * not a quote-time whole-cook abort.
  *
- * CAPACITY: flat price, reserve-fraction capped (`liveReserveOut / CAP_DIVISOR`, see index.ts's
- * module doc) — stateless, closed-form; every rung (and the cold final quote) is an INDEPENDENT
- * evaluation via `emitQuoteCall`, mirroring zerofi's own "no warm-start chain needed" shape.
+ * CAPACITY: flat price, reserve-fraction capped (`liveReserveOut / CAP_DIVISOR`, see index.ts) —
+ * stateless, closed-form; every rung (and the cold final quote) is an INDEPENDENT evaluation via
+ * `emitQuoteCall`, mirroring zerofi's own "no warm-start chain needed" shape. The pool carries an
+ * undecoded variable-length tail that may encode a real depth model, so the flat rung is held to the
+ * conservative `CAP_DIVISOR` bound (output can never exceed reserveOut / CAP_DIVISOR) rather than
+ * quoting an unmeasured curve — zerofi's own CAP_DIVISOR rationale, for the identical reason.
  *
- * ⚠ MEASURED RISK, NOT A HYPOTHETICAL — read before enabling this slot in production: this
- * fragment's CPI is a REAL invoke() of a program this adapter does not control, and unlike every
- * other read in this framework (`accountUint`, a plain byte fetch that cannot fail once the account
- * exists) an invoked callee CAN REVERT. A live standalone probe of this exact instruction
- * (`[0x02, feedByte]` against the ground-truth oracleConfig/priceAccount pair) reproduced BOTH
- * outcomes on the SAME feed within one working session: a clean 32-byte return (3,398 CU, matching
- * this adapter's baked measurement) on one call, and a custom program error `0x14` (2,092 CU — the
- * program was genuinely INVOKED, not rejected pre-flight) on a later call after the price account's
- * own bytes had visibly changed. `contract.call(...).catch()` CANNOT rescue this on the SVM target
- * — the compiler's own `resolveRawCallCatch` documents the engine's CATCH as PRE-FLIGHT-ONLY
- * (unresolvable target/calldata/accounts); "once invoke() launches, a failing callee aborts the
- * whole transaction" (`compiler/src/processor/expression.ts`'s `resolveRawCallCatch` doc, verbatim).
- * CONSEQUENCE: unlike a normal venue-CPI failure (contained to that one slot dropping its
- * contribution — the "one venue's live failure must never kill a cook" invariant this framework
- * otherwise upholds throughout), a Metric oracle revert aborts the ENTIRE transaction — every other
- * engaged venue's fill in the SAME cook, not just Metric's own slot. This is a genuine, wider blast
- * radius than any other family in this tree carries, and it is a PLATFORM property (SVM CPI
- * semantics), not a bug in this adapter — there is no in-VM mitigation available. It does not
- * threaten fund safety (an abort moves nothing; `minOut` still backstops any transaction that DOES
- * land), but it is a real liveness/robustness regression worth a maintainer decision before this
- * family serves alongside other venues in shared production traffic, not something to route around
- * silently in this file.
+ * `referenceQuote` is a pure, lamport-exact function of state + the baked `params` (state bytes
+ * cannot reproduce the oracle's closed transform, so the price must ride in `params`).
  */
-import { getAddressCodec } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { readUintLE } from '../math.js';
 import type { AccountBytesMap, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
-import {
-  CAP_DIVISOR,
-  METRIC_DRIFT_TOLERANCE_BPS,
-  METRIC_ORACLE_PROGRAM_ID,
-  METRIC_PROGRAM_ID,
-  METRIC_SWAP_DISCRIMINATOR,
-  metricSwapAccounts,
-} from './index.js';
+import { CAP_DIVISOR, METRIC_PROGRAM_ID, METRIC_SWAP_DISCRIMINATOR, metricSwapAccounts } from './index.js';
 import type { MetricPoolConfig } from './index.js';
 
 const SLUG = 'metric';
@@ -78,16 +49,6 @@ function metricConfig(cfg: PoolConfig): MetricPoolConfig {
 }
 
 const ref = (slot: number, role: string) => `s${slot}:${role}`;
-
-const addressCodec = getAddressCodec();
-
-/** 32-byte pubkey -> a big hex integer literal, the SauceScript-literal encoding for a fixed CALL target. */
-function pubkeyHexLiteral(addr: Address): string {
-  const bytes = addressCodec.encode(addr);
-  let hex = '0x';
-  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
-  return hex;
-}
 
 export const metricLadder = {
   slug: SLUG,
@@ -109,64 +70,45 @@ export const metricLadder = {
     ];
   },
 
-  /** [scaleNum, scaleDen, bakedPrice] — baked in fetchPoolConfig (index.ts) from the oracle CPI. */
-  paramCount: 3,
+  /** [scaleNum, scaleDen] — this direction's baked scale, read off-chain in fetchPoolConfig (index.ts). */
+  paramCount: 2,
 
   paramsFor(base: PoolConfig): bigint[] {
     const c = metricConfig(base);
-    return [c.scaleNum, c.scaleDen, c.bakedPrice];
+    return [c.scaleNum, c.scaleDen];
   },
 
   quoteRefs(base: PoolConfig, slot: number): VenueAccount[] {
     const c = metricConfig(base);
     const vaultOut = c.direction === 0 ? c.vaultB : c.vaultA;
-    return [
-      { ref: ref(slot, 'oracleProg'), address: METRIC_ORACLE_PROGRAM_ID },
-      { ref: ref(slot, 'oracleConfig'), address: c.oracleConfig },
-      { ref: ref(slot, 'price'), address: c.priceAccount },
-      { ref: ref(slot, 'vout'), address: vaultOut },
-    ];
+    // Only the output vault is read (for the reserve-fraction cap). The price is baked off-chain in
+    // fetchPoolConfig, so the emitted quote issues NO oracle CPI — see emitSetup.
+    return [{ ref: ref(slot, 'vout'), address: vaultOut }];
   },
 
-  emitSetup(base: PoolConfig, slot: number, params: readonly string[], enableVar?: string): string {
-    const c = metricConfig(base);
+  emitSetup(_base: PoolConfig, slot: number, params: readonly string[], enableVar?: string): string {
     const p = `s${slot}`;
-    const oracleProg = JSON.stringify(ref(slot, 'oracleProg'));
-    const oracleConfig = JSON.stringify(ref(slot, 'oracleConfig'));
-    const priceAcc = JSON.stringify(ref(slot, 'price'));
     const vout = JSON.stringify(ref(slot, 'vout'));
-    const [scaleNum, scaleDen, bakedPrice] = params;
-    // bid halves the return data [0,16); ask halves [16,32) — direction 0 (mintA->mintB) gates on
-    // the bid it was baked from, direction 1 (mintB->mintA) gates on the ask (see index.ts's
-    // fetchPoolConfig: bakedPrice IS whichever half this direction baked its scale from).
-    const liveOffset = c.direction === 0 ? 0 : 16;
-    const target = pubkeyHexLiteral(METRIC_ORACLE_PROGRAM_ID);
-    const gateBlock = [
-      `    accountData(${oracleProg}, 0, 0);`,
-      `    const ${p}calldata = Uint8Array.from([2, 0]);`,
-      `    const ${p}or = contract.call(${target}, ${p}calldata, [${oracleConfig}, ${priceAcc}]);`,
-      `    const ${p}live = uint(${p}or.slice(${liveOffset}, ${liveOffset + 16}));`,
-      `    const ${p}diff = ${p}live > ${bakedPrice} ? ${p}live - ${bakedPrice} : ${bakedPrice} - ${p}live;`,
-      `    if (${p}diff * 10000 <= ${bakedPrice} * ${METRIC_DRIFT_TOLERANCE_BPS}) {`,
-      `      ${p}sn = ${scaleNum};`,
-      `      ${p}sd = ${scaleDen};`,
-      `    }`,
-    ].join('\n');
+    const [scaleNum, scaleDen] = params;
+    // NO oracle CPI. The price is read off-chain at fetch time and baked into the scale params
+    // (see index.ts's module doc) — identical to how zerofi/BisonFi read-off-chain-and-bake. A
+    // launched CPI can revert (this oracle reverts Custom:20 when stale), and the engine's CATCH is
+    // pre-flight-only, so an in-quote CPI revert would abort the ENTIRE cook — every co-merged
+    // venue's fill, not just Metric's. Applying a baked scale can never revert; minOut is the sole
+    // atomic backstop, exactly as for every read-off-chain venue in this tree.
+    const scaleBlock = [`    ${p}sn = ${scaleNum};`, `    ${p}sd = ${scaleDen};`].join('\n');
     const lines = [
-      // Unconditional, cheap: the vault read always happens (the account must be
-      // readable regardless of enable), sizing the reserve-fraction cap.
+      // The output vault read always happens (must be readable regardless of enable), sizing the cap.
       `  const ${p}rout = accountUint(${vout}, ${AMOUNT_OFFSET}, 8);`,
       `  const ${p}cap = ${p}rout / ${CAP_DIVISOR};`,
-      // Default a disabled/dropped slot to a zero-output scale (0/1) — no
-      // separate "ok" flag needed, unlike zerofi: sn === 0 already forces
-      // qMetric(x, 0, 1, cap) === 0 for every x.
+      // A disabled/dropped slot keeps the zero-output scale (0/1): qMetric(x, 0, 1, cap) === 0.
       `  let ${p}sn = 0;`,
       `  let ${p}sd = 1;`,
     ];
     if (enableVar !== undefined) {
-      lines.push(`  if (${enableVar} !== 0) {`, gateBlock, `  }`);
+      lines.push(`  if (${enableVar} !== 0) {`, scaleBlock, `  }`);
     } else {
-      lines.push(gateBlock);
+      lines.push(scaleBlock);
     }
     return lines.join('\n');
   },

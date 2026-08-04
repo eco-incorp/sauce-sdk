@@ -34,19 +34,17 @@
  * "refuse, don't guess" posture zerofi's fee catalog and authority table already use.
  *
  * The baked (bid, ask) become part of `MetricPoolConfig` (`paramsFor`-visible, per the
- * `SvmVenueLadder` contract) and are what the emitted fragment's ACTUAL QUOTE MATH uses — the
- * fragment ALSO re-runs the identical oracle CPI on-chain (this the VM genuinely can do — `CALL`
- * pushes the callee's return data as a `Bytes` descriptor the fragment slices/decodes with pure
- * integer ops) and compares the live value against the baked one, self-dropping the slot (zeroing
- * its enable local) on drift beyond `METRIC_DRIFT_TOLERANCE_BPS` — the same "live-gates, baked-
- * quotes" posture zerofi's `scaleBakedTop` comparison already establishes, generalized here to a
- * full price rather than a coarse exponent class. See ladder.ts's module doc for the emitted
- * fragment. If a later pass recovers the oracle's own byte transform, the CPI becomes provably
- * redundant and this collapses to a byte-only adapter — a strict simplification, not a redesign.
- *
- * ⚠ See ladder.ts's module doc for a MEASURED, real risk this CPI mechanism carries: the oracle
- * program CAN revert post-invoke() (reproduced live, not hypothetical), and SVM's CATCH cannot
- * rescue a launched CPI failure — a revert here aborts the WHOLE transaction, not just this slot.
+ * `SvmVenueLadder` contract) and are what the emitted fragment's quote math uses. The emitted
+ * fragment issues NO on-chain oracle CPI — it multiplies by the baked scale and caps at a reserve
+ * fraction (see ladder.ts). That is deliberate and load-bearing: the oracle program CAN revert
+ * post-invoke() (measured live, not hypothetical — program error Custom:20 when its price account
+ * is stale), and SVM's CATCH is PRE-FLIGHT-ONLY, so an in-quote CPI revert would abort the WHOLE
+ * cook — every co-merged venue's fill, not just this slot. A baked scale can never revert, so this
+ * quote can never take down a cook; `minOut` is the sole atomic backstop, the same read-off-chain-
+ * and-bake posture zerofi/WOOFi/BisonFi already use. If a later pass recovers the oracle's byte
+ * transform, the off-chain read collapses to a plain account decode — a simplification, not a
+ * redesign. (The venue's OWN swap instruction still prices via the oracle — its business, only when
+ * Metric is elected — a normal per-slot swap failure, never a quote-time whole-cook abort.)
  *
  * POOL ACCOUNT LAYOUT (variable length — 8 distinct sizes observed across a live sweep, 780 through
  * 1932 bytes, gcd of the size deltas 36 — a variable-length tail this adapter does not decode; see
@@ -115,15 +113,6 @@ export const METRIC_SWAP_DISCRIMINATOR = 0x01;
  */
 export const CAP_DIVISOR = 20n;
 
-/**
- * On-chain drift tolerance (bps) between the BAKED oracle price (from `fetchPoolConfig`'s
- * `fetchOracleQuote`) and the LIVE price the emitted fragment re-reads via its own CPI at cook
- * time — beyond this, the slot self-drops (zeroes its enable local) rather than quoting a stale
- * price. 50 bps is a deliberately conservative choice (the measured live spread itself is ~1bp);
- * this bounds staleness, not fill quality.
- */
-export const METRIC_DRIFT_TOLERANCE_BPS = 50n;
-
 /** SPL Mint `decimals` byte offset. */
 const MINT_DECIMALS_OFFSET = 44;
 
@@ -144,13 +133,13 @@ export interface MetricPoolConfig extends PoolConfig {
   tokenProgramB: Address;
   decimalsA: number;
   decimalsB: number;
-  /** Baked oracle read (32-byte CPI return data, u128 LE halves) — see module doc. */
+  /** Baked oracle read (32-byte off-chain oracle-read return data, u128 LE halves) — see module doc. */
   bidQ64: bigint;
   askQ64: bigint;
   /** This direction's baked scale, already decimals-adjusted and gcd-reduced: out = in * scaleNum / scaleDen. */
   scaleNum: bigint;
   scaleDen: bigint;
-  /** The baked price THIS direction's on-chain drift check compares the live re-read against (bidQ64 or askQ64). */
+  /** This direction's baked price (bidQ64 for dir 0, askQ64 for dir 1) — informational; the quote uses scaleNum/scaleDen. */
   bakedPrice: bigint;
 }
 
