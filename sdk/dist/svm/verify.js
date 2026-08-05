@@ -26,8 +26,10 @@
 //
 // Unlike `@eco-incorp/sauce-sdk/verify` (viem-only, browser-safe), `verifySvmSettleProgram` pulls the
 // compiler in to recompile — a node-side check. `decodeSvmSettleArgs` is light (only @solana/kit).
+import { createHash } from 'node:crypto';
 import { getAddressDecoder } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
+import { EXECUTE_AND_CLOSE_DISCRIMINATOR, EXECUTE_DISCRIMINATOR, EXECUTE_FLAG_HAS_PIN, EXECUTE_FLAG_HAS_SLICE, EXECUTE_FROM_ACCOUNT_DISCRIMINATOR, } from './engine.js';
 import { SVM_MAX_ESCROWS, svmSettleRefs, svmSettleSource } from './recipes/index.js';
 /** Byte length of the settle args tail: 4 scalar slots × 32 bytes. */
 export const SVM_SETTLE_ARGS_BYTES = 4 * 32;
@@ -125,5 +127,142 @@ export function verifySvmSettleProgram(bytecode, accountPlan) {
         return { genuine: false, escrowCount, refs, mismatch: `bytecode does not byte-match svmSettleSource(${escrowCount})` };
     }
     return { genuine: true, escrowCount, refs };
+}
+/**
+ * Parses the shared `execute_from_account` / `execute_and_close` instruction data into its
+ * `[disc][flags][pin?][slice?][args]` parts. Throws on a non-staged-execute discriminator (an inline
+ * `execute` payload carries BYTECODE, not an args tail — a different grammar), a missing flags byte, or
+ * a header that runs past the end of the buffer. The exact inverse of `encodeExecutePayload`
+ * (instructions.ts).
+ */
+export function parseExecutePayload(instructionData) {
+    if (!(instructionData instanceof Uint8Array))
+        throw new Error('instructionData must be a Uint8Array');
+    if (instructionData.length < 8)
+        throw new Error(`instructionData is ${instructionData.length} bytes — too short for an 8-byte discriminator`);
+    const disc = instructionData.subarray(0, 8);
+    let instruction;
+    if (bytesEqual(disc, EXECUTE_FROM_ACCOUNT_DISCRIMINATOR))
+        instruction = 'execute_from_account';
+    else if (bytesEqual(disc, EXECUTE_AND_CLOSE_DISCRIMINATOR))
+        instruction = 'execute_and_close';
+    else if (bytesEqual(disc, EXECUTE_DISCRIMINATOR)) {
+        throw new Error('this is an inline `execute` instruction — its payload is bytecode, not a staged args tail; pass the execute_from_account / execute_and_close data');
+    }
+    else {
+        throw new Error('instructionData does not begin with a Sauce staged-execute discriminator');
+    }
+    if (instructionData.length < 9)
+        throw new Error('instructionData is missing the required flags byte');
+    const flags = instructionData[8];
+    let offset = 9;
+    let pin;
+    if (flags & EXECUTE_FLAG_HAS_PIN) {
+        if (instructionData.length < offset + 32)
+            throw new Error('HAS_PIN flag set but the 32-byte pin runs past the end of instructionData');
+        pin = instructionData.subarray(offset, offset + 32);
+        offset += 32;
+    }
+    let slice;
+    if (flags & EXECUTE_FLAG_HAS_SLICE) {
+        if (instructionData.length < offset + 8)
+            throw new Error('HAS_SLICE flag set but the 8-byte slice runs past the end of instructionData');
+        const view = new DataView(instructionData.buffer, instructionData.byteOffset + offset, 8);
+        slice = { offset: view.getUint32(0, true), len: view.getUint32(4, true) };
+        offset += 8;
+    }
+    return { instruction, pin, slice, args: instructionData.subarray(offset) };
+}
+function accountAddress(a, i) {
+    const raw = typeof a === 'string' ? a : (a.address ?? a.pubkey);
+    if (typeof raw !== 'string' || raw.length === 0) {
+        throw new Error(`account ${i} is not an address (expected a base58 string, or an object with .address/.pubkey)`);
+    }
+    return raw;
+}
+/** Classifies an account-list length as a settle shape: `3N+3` is the user tail alone, `3N+4` is that
+ *  tail with the leading bytecode-buffer account. Returns null for any other length (the two never
+ *  collide — `3N+3 = 3M+4` has no integer solution). */
+function classifyAccountList(length) {
+    for (const hasBuffer of [false, true]) {
+        const userCount = hasBuffer ? length - 1 : length;
+        if ((userCount - 3) % 3 !== 0)
+            continue;
+        const escrowCount = (userCount - 3) / 3;
+        if (Number.isInteger(escrowCount) && escrowCount >= 1 && escrowCount <= SVM_MAX_ESCROWS) {
+            return { escrowCount, hasBuffer };
+        }
+    }
+    return null;
+}
+/**
+ * Decodes a full settle execution — the calldata AND the account list — into its params and resolved
+ * account identities in one call. It parses the execute payload grammar off `instructionData`, decodes
+ * the four settle args from the tail, infers the escrow count from the account-list length, and resolves
+ * each `svmSettleRefs(N)` slot to the attached pubkey. Consumes the sauce-recipes `split=1` settle sauce
+ * (`execution.instructionData` + `execution.accounts[]`) directly, and equally an executed engine
+ * instruction (full data + `[buffer, …user]` account list).
+ *
+ * Nothing is trusted: the args are re-derived from the raw calldata (not read from a receipt), the
+ * account identities are resolved positionally against the canonical refs (not from caller-supplied
+ * labels), and `tokenProgramsConsistent` cross-checks the two independent bindings of each token program
+ * — exactly the "decode from the bytes, then compare against expectation" contract of the EVM decoder.
+ */
+export function decodeSvmSettleExecution(input) {
+    const { instruction, pin, slice, args } = parseExecutePayload(input.instructionData);
+    const shape = classifyAccountList(input.accounts.length);
+    if (shape === null) {
+        throw new Error(`account list has ${input.accounts.length} accounts, which is neither 3N+3 (user tail) nor 3N+4 (with buffer) for any settle escrow count 1..${SVM_MAX_ESCROWS}`);
+    }
+    const { escrowCount, hasBuffer } = shape;
+    const decodedArgs = decodeSvmSettleArgs(args);
+    const refs = svmSettleRefs(escrowCount);
+    const userAccounts = hasBuffer ? input.accounts.slice(1) : input.accounts;
+    const accounts = {};
+    let labeledRefsConsistent = true;
+    refs.forEach((ref, i) => {
+        accounts[ref] = accountAddress(userAccounts[i], i);
+        const entry = userAccounts[i];
+        if (typeof entry === 'object' && entry !== null && typeof entry.ref === 'string') {
+            if (entry.ref !== ref)
+                labeledRefsConsistent = false;
+        }
+        else if (labeledRefsConsistent !== false) {
+            labeledRefsConsistent = null; // at least one entry carried no label → can't confirm
+        }
+    });
+    const tokenProgramsConsistent = decodedArgs.tokenProgram0 === accounts.tokenProgram0 && decodedArgs.tokenProgram1 === accounts.tokenProgram1;
+    return {
+        instruction,
+        pin,
+        slice,
+        args: decodedArgs,
+        escrowCount,
+        refs,
+        accounts,
+        hadBufferAccount: hasBuffer,
+        tokenProgramsConsistent,
+        labeledRefsConsistent,
+    };
+}
+/**
+ * The fullest settle check: `decodeSvmSettleExecution` PLUS the bytecode genuineness proof
+ * (`verifySvmSettleProgram` — recompile `svmSettleSource(escrowCount)` and byte-compare) PLUS the
+ * pin↔bytecode tie (`sha256(bytecode) === pin`, so the calldata provably targets THIS blob). A
+ * `genuine`, `pinMatchesBytecode`, `tokenProgramsConsistent` result means: the logic is the real settle
+ * logic, the calldata commits to exactly that logic, and its two token-program bindings agree — leaving
+ * only `(minOut, splCount, tokenPrograms)` and the resolved account identities to check against
+ * expectation. Never throws for a mismatch beyond the shared decode step; reports it in `mismatch`.
+ */
+export function verifySvmSettleExecution(input) {
+    const decoded = decodeSvmSettleExecution(input);
+    const program = verifySvmSettleProgram(input.bytecode, { metas: decoded.refs.map((ref) => ({ ref })) });
+    const pinMatchesBytecode = decoded.pin === undefined ? null : bytesEqual(new Uint8Array(createHash('sha256').update(input.bytecode).digest()), decoded.pin);
+    const mismatch = !program.genuine
+        ? program.mismatch
+        : pinMatchesBytecode === false
+            ? 'calldata pin does not equal sha256(bytecode) — the calldata targets different bytecode'
+            : undefined;
+    return { ...decoded, genuine: program.genuine && pinMatchesBytecode !== false, pinMatchesBytecode, mismatch };
 }
 //# sourceMappingURL=verify.js.map
