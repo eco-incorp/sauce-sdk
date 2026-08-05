@@ -144,6 +144,18 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+function sha256(bytes: Uint8Array): Uint8Array {
+  return new Uint8Array(createHash('sha256').update(bytes).digest());
+}
+
+/** The canonical settle bytecode for `escrowCount`, recompiled from the shipped source with the shipped
+ *  options. A pure function of the escrow count (staged args never affect the blob), and cached by the
+ *  compiler — so it is the SDK's own ground truth for "what the genuine settle program's bytes are",
+ *  derivable WITHOUT any partner-supplied bytecode. */
+function compileCanonicalSettle(escrowCount: number): Uint8Array {
+  return compile(svmSettleSource(escrowCount), { target: 'svm', staged: true, treeshake: true, args: [0n, 0n, 0n, 0n] }).bytecode[0]!;
+}
+
 /**
  * Verifies a compiled SVM settle program is genuine — the SVM analogue of the EVM decoder's body-hash
  * check, done by recompile rather than prologue-decode (the staged blob has no prologue). It:
@@ -340,6 +352,14 @@ export interface DecodedSvmSettleExecution {
  * account identities are resolved positionally against the canonical refs (not from caller-supplied
  * labels), and `tokenProgramsConsistent` cross-checks the two independent bindings of each token program
  * — exactly the "decode from the bytes, then compare against expectation" contract of the EVM decoder.
+ *
+ * IMPORTANT — this is a STRUCTURAL decode, NOT a genuineness proof. Unlike the EVM `decodeSettleProgram`
+ * (whose prologue grammar is a settle-specific signature), a STAGED settle's args carry no structural
+ * signature: any staged Sauce execute with a 128-byte args tail and a `3N+3`/`3N+4` account count has
+ * this exact shape. So a non-settle execution (or an adversarial decoy) decodes here without error into
+ * arbitrary `(minOut, splCount, …)`. To prove the execution actually runs the genuine settle program,
+ * use `verifySvmSettleExecution` (or `extractSvmSettleFromIntent`), which ties the calldata to the SDK's
+ * own recompiled canonical settle bytecode.
  */
 export function decodeSvmSettleExecution(input: SvmSettleExecutionInput): DecodedSvmSettleExecution {
   const { instruction, pin, slice, args } = parseExecutePayload(input.instructionData);
@@ -387,45 +407,90 @@ export function decodeSvmSettleExecution(input: SvmSettleExecutionInput): Decode
 
 export interface SvmSettleExecutionVerifyInput extends SvmSettleExecutionInput {
   /**
-   * The compiled settle bytecode this execution runs (from the recipes split response this is
+   * OPTIONAL. The compiled settle bytecode this execution runs (from the recipes split response this is
    * base64-decode(`sauces[settleIdx].program.bytecode`); from an eco-solver intent it is
-   * base64-decode(`fulfillmentMetadata.svm.sauceStage.buffers[settleIdx].bytecode`)). Recompiled and
-   * byte-compared against `svmSettleSource(escrowCount)`, and its sha256 checked against the calldata pin.
+   * base64-decode(`fulfillmentMetadata.svm.sauceStage.buffers[settleIdx].bytecode`)). When supplied, the
+   * actual staged bytes are byte-compared to the canonical settle and tied to the pin.
+   *
+   * A partner usually does NOT have this (only the on-chain `route.calls`), and does not need it: the SDK
+   * recompiles the canonical settle itself and proves genuineness via the calldata pin (see below).
    */
-  bytecode: Uint8Array;
+  bytecode?: Uint8Array;
 }
 
+/** How genuineness was established. `bytecode`: the supplied bytes byte-match the canonical settle (and
+ *  tie to the pin). `pin`: no bytecode, but the calldata pin equals `sha256(canonical settle)` — proof
+ *  that the program committed by this calldata IS the genuine settle (or the on-chain execution reverts
+ *  on the pin gate; it can never run a different program). `none`: no pin and no bytecode — genuineness
+ *  cannot be established from structure alone, so `genuine` is false. */
+export type SvmSettleVerifiedBy = 'bytecode' | 'pin' | 'none';
+
 export interface SvmSettleExecutionVerification extends DecodedSvmSettleExecution {
-  /** True iff the bytecode byte-matches `svmSettleSource(escrowCount)` AND the refs match. */
+  /** True iff the execution provably runs the genuine `svmSettleSource(escrowCount)` program. */
   genuine: boolean;
-  /** True iff `sha256(bytecode)` equals the calldata pin, or null if the calldata carried no pin. */
+  /** How `genuine` was established (or why it could not be). */
+  verifiedBy: SvmSettleVerifiedBy;
+  /** `sha256(canonical recompiled settle)` === the calldata pin. null iff the calldata carried no pin. */
+  pinMatchesCanonical: boolean | null;
+  /** Only when `bytecode` was supplied: `sha256(bytecode)` === the calldata pin. null otherwise. */
   pinMatchesBytecode: boolean | null;
+  /** Only when `bytecode` was supplied: the bytes byte-match the canonical settle. null otherwise. */
+  bytecodeMatchesCanonical: boolean | null;
   /** Present iff not genuine: what failed. */
   mismatch?: string;
 }
 
 /**
- * The fullest settle check: `decodeSvmSettleExecution` PLUS the bytecode genuineness proof
- * (`verifySvmSettleProgram` — recompile `svmSettleSource(escrowCount)` and byte-compare) PLUS the
- * pin↔bytecode tie (`sha256(bytecode) === pin`, so the calldata provably targets THIS blob). A
- * `genuine`, `pinMatchesBytecode`, `tokenProgramsConsistent` result means: the logic is the real settle
- * logic, the calldata commits to exactly that logic, and its two token-program bindings agree — leaving
- * only `(minOut, splCount, tokenPrograms)` and the resolved account identities to check against
- * expectation. Never throws for a mismatch beyond the shared decode step; reports it in `mismatch`.
+ * The genuineness check for a settle execution — the crucial companion to `decodeSvmSettleExecution`,
+ * whose structural decode alone CANNOT tell a settle from any other staged Sauce execute (staged args
+ * carry no signature). This ties the calldata to the SDK's own recompiled canonical settle bytecode, in
+ * one of two ways, no partner bytecode required for either verdict:
+ *
+ *   - `bytecode` supplied → byte-compare it to `compileCanonicalSettle(escrowCount)` AND check the pin
+ *     ties to it (`sha256(bytecode) === pin`). Proves the exact staged bytes ARE the settle and WILL run.
+ *   - no bytecode, but the calldata carries a pin → check `pin === sha256(canonical settle)`. The pin is
+ *     the buffer's content hash the engine enforces on-chain, so a match proves the committed program is
+ *     the genuine settle (or the execution reverts on the pin gate) — a decoy's pin cannot match.
+ *   - neither → `genuine: false`, `verifiedBy: 'none'` (structure alone is not proof).
+ *
+ * A `genuine` result leaves only `(minOut, splCount, tokenPrograms)` + the resolved account identities to
+ * check against expectation. Never throws beyond the shared structural decode; reports failures in
+ * `mismatch`.
  */
 export function verifySvmSettleExecution(input: SvmSettleExecutionVerifyInput): SvmSettleExecutionVerification {
   const decoded = decodeSvmSettleExecution(input);
+  const canonical = compileCanonicalSettle(decoded.escrowCount);
+  const pin = decoded.pin;
 
-  const program = verifySvmSettleProgram(input.bytecode, { metas: decoded.refs.map((ref) => ({ ref })) });
-
+  const pinMatchesCanonical = pin === undefined ? null : bytesEqual(sha256(canonical), pin);
+  const bytecodeMatchesCanonical = input.bytecode === undefined ? null : bytesEqual(input.bytecode, canonical);
   const pinMatchesBytecode =
-    decoded.pin === undefined ? null : bytesEqual(new Uint8Array(createHash('sha256').update(input.bytecode).digest()), decoded.pin);
+    input.bytecode === undefined || pin === undefined ? null : bytesEqual(sha256(input.bytecode), pin);
 
-  const mismatch = !program.genuine
-    ? program.mismatch
-    : pinMatchesBytecode === false
-      ? 'calldata pin does not equal sha256(bytecode) — the calldata targets different bytecode'
-      : undefined;
+  let genuine: boolean;
+  let verifiedBy: SvmSettleVerifiedBy;
+  let mismatch: string | undefined;
 
-  return { ...decoded, genuine: program.genuine && pinMatchesBytecode !== false, pinMatchesBytecode, mismatch };
+  if (input.bytecode !== undefined) {
+    verifiedBy = 'bytecode';
+    genuine = bytecodeMatchesCanonical === true && pinMatchesBytecode !== false;
+    mismatch =
+      bytecodeMatchesCanonical !== true
+        ? `bytecode does not byte-match svmSettleSource(${decoded.escrowCount})`
+        : pinMatchesBytecode === false
+          ? 'calldata pin does not equal sha256(bytecode) — the calldata targets different bytecode'
+          : undefined;
+  } else if (pin !== undefined) {
+    verifiedBy = 'pin';
+    genuine = pinMatchesCanonical === true;
+    mismatch = genuine
+      ? undefined
+      : `calldata pin does not match sha256(svmSettleSource(${decoded.escrowCount})) — not a genuine settle execution`;
+  } else {
+    verifiedBy = 'none';
+    genuine = false;
+    mismatch = 'no calldata pin and no bytecode supplied — a staged settle has no structural signature, so genuineness cannot be proven';
+  }
+
+  return { ...decoded, genuine, verifiedBy, pinMatchesCanonical, pinMatchesBytecode, bytecodeMatchesCanonical, mismatch };
 }

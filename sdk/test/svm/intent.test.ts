@@ -24,6 +24,7 @@ import {
 } from '@solana/kit';
 import { compile } from '@eco-incorp/sauce-compiler';
 import { encodePayloadArgs } from '../../src/svm/args.js';
+import { EXECUTE_FROM_ACCOUNT_DISCRIMINATOR } from '../../src/svm/engine.js';
 import { buildExecuteFromAccountInstruction } from '../../src/svm/instructions.js';
 import { svmSettleRefs, svmSettleSource } from '../../src/svm/recipes/index.js';
 import {
@@ -122,8 +123,22 @@ describe('decodePortalCalldataWithAccounts', () => {
   });
 });
 
+/** A settle-SHAPED decoy: a real execute_from_account instruction (valid discriminator, a 128-byte args
+ *  tail, a 3N+3 account list) but NOT the genuine settle — either pinless, or pinned to a non-canonical
+ *  hash. This is the adversarial input a shape-only detector would have misread. */
+function decoyEnvelope(n: number, opts: { pin?: Uint8Array } = {}): Uint8Array {
+  const refs = svmSettleRefs(n);
+  const disc = EXECUTE_FROM_ACCOUNT_DISCRIMINATOR;
+  const flags = opts.pin ? [0x01] : [0x00];
+  const pin = opts.pin ? Array.from(opts.pin) : [];
+  const argsTail = Array.from({ length: 128 }, (_, i) => (i * 7) & 0xff); // arbitrary 128 bytes
+  const instructionData = new Uint8Array([...disc, ...flags, ...pin, ...argsTail]);
+  const accounts = refs.map((_, i) => ({ address: makeAddr(200 + i), role: AccountRole.READONLY }));
+  return encodeEnvelope(instructionData, accounts);
+}
+
 describe('extractSvmSettleFromIntent / extractSvmSettleFromCalls', () => {
-  it('extracts args + resolved accounts from an intent (no bytecode → decode only)', () => {
+  it('extracts + VERIFIES a genuine settle from an intent with no partner bytecode (pin proof)', () => {
     const fx = buildIntentFixture(2, { minOut: 4242n });
     const intent = { route: { calls: [{ data: fx.envelope }] } };
     const found = extractSvmSettleFromIntent(intent);
@@ -135,28 +150,52 @@ describe('extractSvmSettleFromIntent / extractSvmSettleFromCalls', () => {
     expect(found!.args.tokenProgram0).toBe(TOKENKEG);
     expect(found!.accounts.owner).toBe(fx.addrByRef.owner);
     expect(found!.tokenProgramsConsistent).toBe(true);
-    expect('genuine' in found!).toBe(false); // no verify without bytecode
+    expect(found!.genuine).toBe(true); // verified via the calldata pin vs the SDK's recompiled canonical
+    expect(found!.verifiedBy).toBe('pin');
   });
 
-  it('verifies genuineness when the staged bytecode is supplied', () => {
+  it('additionally byte-matches when the staged bytecode is supplied', () => {
     const fx = buildIntentFixture(2);
     const found = extractSvmSettleFromIntent({ route: { calls: [{ data: fx.envelope }] } }, { bytecode: fx.bytecode });
     expect(found).not.toBeNull();
-    expect((found as { genuine: boolean }).genuine).toBe(true);
-    expect((found as { pinMatchesBytecode: boolean }).pinMatchesBytecode).toBe(true);
+    expect(found!.genuine).toBe(true);
+    expect(found!.verifiedBy).toBe('bytecode');
+    expect(found!.bytecodeMatchesCanonical).toBe(true);
+    expect(found!.pinMatchesBytecode).toBe(true);
   });
 
-  it('finds the settle call by content within a mixed batch', () => {
+  it('finds the genuine settle call within a mixed batch', () => {
     const settle = buildIntentFixture(1);
-    // A non-settle call: a Portal envelope wrapping an unrelated 5-byte instruction + 2 accounts.
     const junk = encodeEnvelope(new Uint8Array([1, 2, 3, 4, 5]), [
       { address: makeAddr(9), role: AccountRole.READONLY },
       { address: makeAddr(10), role: AccountRole.READONLY },
     ]);
-    const calls = [{ data: junk }, { data: settle.envelope }];
-    const found = extractSvmSettleFromCalls(calls);
+    const found = extractSvmSettleFromCalls([{ data: junk }, { data: settle.envelope }]);
     expect(found!.callIndex).toBe(1);
     expect(found!.escrowCount).toBe(1);
+    expect(found!.genuine).toBe(true);
+  });
+
+  // ── adversarial: a shape-only decoy must NOT be reported as a settle ──
+
+  it('REJECTS a settle-shaped decoy (does not misread it as a genuine settle)', () => {
+    // Pinless decoy: right shape, arbitrary 128-byte args — the exact input the shape-only path returned
+    // junk params for. Must now yield null, not attacker-chosen (minOut, splCount, …).
+    expect(extractSvmSettleFromCalls([{ data: decoyEnvelope(1) }])).toBeNull();
+    // Pinned decoy whose pin is NOT the canonical settle hash — also rejected.
+    expect(extractSvmSettleFromCalls([{ data: decoyEnvelope(1, { pin: new Uint8Array(32).fill(0xcd) }) }])).toBeNull();
+  });
+
+  it('does not let a decoy earlier in the batch mask a genuine settle later (no masking)', () => {
+    const settle = buildIntentFixture(1);
+    const calls = [
+      { data: decoyEnvelope(1, { pin: new Uint8Array(32).fill(0x11) }) }, // shape-match, wrong pin
+      { data: settle.envelope }, // the real settle
+    ];
+    const found = extractSvmSettleFromCalls(calls);
+    expect(found).not.toBeNull();
+    expect(found!.callIndex).toBe(1); // scanned past the decoy to the genuine settle
+    expect(found!.genuine).toBe(true);
   });
 
   it('returns null when no call carries a settle execution', () => {

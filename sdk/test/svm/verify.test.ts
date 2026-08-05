@@ -261,4 +261,38 @@ describe('verifySvmSettleExecution', () => {
     expect(result.pinMatchesBytecode).toBe(false);
     expect(result.mismatch).toMatch(/pin does not equal sha256/);
   });
+
+  it('proves genuineness via the calldata PIN alone, with NO partner bytecode', () => {
+    // fx.ix was pinned to sha256(the real settle bytecode) == sha256(canonical) — the SDK recompiles the
+    // canonical settle itself and matches the pin, so a partner needs no bytecode.
+    const fx = buildFixture(2, { minOut: 321n });
+    const result = verifySvmSettleExecution({ instructionData: fx.ix.data as Uint8Array, accounts: fx.ix.accounts.map((a) => ({ address: a.address as string })) });
+    expect(result.genuine).toBe(true);
+    expect(result.verifiedBy).toBe('pin');
+    expect(result.pinMatchesCanonical).toBe(true);
+    expect(result.bytecodeMatchesCanonical).toBeNull();
+    expect(result.args.minOut).toBe(321n);
+  });
+
+  it('rejects a settle-SHAPED decoy whose pin does not match the canonical settle (no bytecode)', () => {
+    // Same shape as a real settle (128-byte args tail, 3·1+3 accounts) but a pin that is NOT the canonical
+    // settle hash — exactly the adversarial decoy the shape-only path would have misread.
+    const fx = buildFixture(1);
+    const ix = buildExecuteFromAccountInstruction({ programId: PROGRAM as never, buffer: BUFFER as never, accounts: fx.userMetas, expectedSha256: new Uint8Array(32).fill(0xab), args: fx.args });
+    const result = verifySvmSettleExecution({ instructionData: ix.data as Uint8Array, accounts: ix.accounts.map((a) => ({ address: a.address as string })) });
+    expect(result.genuine).toBe(false);
+    expect(result.verifiedBy).toBe('pin');
+    expect(result.pinMatchesCanonical).toBe(false);
+    expect(result.mismatch).toMatch(/pin does not match sha256/);
+  });
+
+  it('is NOT genuine when the calldata carries no pin and no bytecode is supplied', () => {
+    const fx = buildFixture(1);
+    const ix = buildExecuteFromAccountInstruction({ programId: PROGRAM as never, buffer: BUFFER as never, accounts: fx.userMetas, args: fx.args }); // no expectedSha256 → no pin
+    const result = verifySvmSettleExecution({ instructionData: ix.data as Uint8Array, accounts: ix.accounts.map((a) => ({ address: a.address as string })) });
+    expect(result.genuine).toBe(false);
+    expect(result.verifiedBy).toBe('none');
+    expect(result.pin).toBeUndefined();
+    expect(result.mismatch).toMatch(/no calldata pin and no bytecode/);
+  });
 });
