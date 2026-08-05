@@ -68,10 +68,8 @@ export {
   obsidian,
 } from './obsidian/index.js';
 export type { ObsidianPoolConfig } from './obsidian/index.js';
-export { obsidianLadder } from './obsidian/ladder.js';
 export * from './woofi/index.js';
 export * from './hadron/index.js';
-export * from './hadron/ladder.js';
 export * from './deriverse/index.js';
 export * from './tesserav/index.js';
 export * from './perps-jlp/index.js';
@@ -99,9 +97,9 @@ export {
   __alphaqDecodeSymbolForTest,
 } from './alphaq/index.js';
 export type { AlphaqStatsRpc, AlphaqPoolConfig } from './alphaq/index.js';
-export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi, binaryfiLadder } from './binaryfi/index.js';
+export { BINARYFI_PROGRAM_ID, BINARYFI_CONFIG, binaryfi } from './binaryfi/index.js';
 export type { BinaryFiPoolConfig } from './binaryfi/index.js';
-export { BOOP_FUN_PROGRAM_ID, boopFun, boopFunLadder } from './boop-fun/index.js';
+export { BOOP_FUN_PROGRAM_ID, boopFun } from './boop-fun/index.js';
 export type { BoopFunPoolConfig } from './boop-fun/index.js';
 // bisonfi: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `BISONFI_` prefix.
@@ -123,7 +121,6 @@ export {
   bisonfiConfig,
 } from './bisonfi/index.js';
 export type { BisonfiPoolConfig } from './bisonfi/index.js';
-export { bisonfiLadder } from './bisonfi/ladder.js';
 export { BYREAL_PROGRAM_ID, byreal, fetchByrealPoolConfig } from './byreal/index.js';
 export type { ByrealPoolConfig } from './byreal/index.js';
 export {
@@ -183,7 +180,7 @@ export {
   fetchDefiTunaPoolConfig,
 } from './defituna/index.js';
 export type { DefiTunaBoundary, DefiTunaWindow, DefiTunaPoolConfig } from './defituna/index.js';
-export { DENALI_PROGRAM_ID, DENALI_ORACLE_PROGRAM_ID, DENALI_GLOBAL_CONFIG, OFF_MINT_A as DENALI_OFF_MINT_A, OFF_MINT_B as DENALI_OFF_MINT_B, OFF_VAULT_A as DENALI_OFF_VAULT_A, OFF_VAULT_B as DENALI_OFF_VAULT_B, denali, denaliLadder, fetchDenaliPoolConfig } from './denali/index.js';
+export { DENALI_PROGRAM_ID, DENALI_ORACLE_PROGRAM_ID, DENALI_GLOBAL_CONFIG, OFF_MINT_A as DENALI_OFF_MINT_A, OFF_MINT_B as DENALI_OFF_MINT_B, OFF_VAULT_A as DENALI_OFF_VAULT_A, OFF_VAULT_B as DENALI_OFF_VAULT_B, denali, fetchDenaliPoolConfig } from './denali/index.js';
 export type { DenaliPoolConfig } from './denali/index.js';
 export {
   FLINT_PROGRAM_ID,
@@ -192,7 +189,6 @@ export {
   FLINT_HAIRCUT_PUMPCMXQ_TO_USDT_PPM,
   FLINT_HAIRCUT_USDT_TO_PUMPCMXQ_PPM,
   flint,
-  flintLadder,
 } from './flint/index.js';
 export type { FlintPairEntry, FlintPoolConfig } from './flint/index.js';
 export { FLUXBEAM_PROGRAM_ID, FLUXBEAM_POOL_SIZE, fluxbeam, fetchFluxBeamPoolConfig } from './fluxbeam/index.js';
@@ -208,7 +204,6 @@ export {
   HELIUM_CIRCUIT_BREAKER_PROGRAM_ID,
   U64_MAX as HELIUM_TREASURY_U64_MAX,
   heliumTreasury,
-  heliumTreasuryLadder,
   fetchHeliumTreasuryPoolConfig,
 } from './helium-treasury/index.js';
 export type { HeliumTreasuryPoolConfig } from './helium-treasury/index.js';
@@ -271,9 +266,9 @@ export {
 export type { InvariantSwapStep, InvariantBoundary, InvariantWindow, InvariantPoolConfig } from './invariant/index.js';
 export { JUPITER_LEND_EARN_PROGRAM_ID, JUPITER_LEND_LIQUIDITY_PROGRAM_ID, LENDING_ACCOUNT_SIZE, jupiterLendEarn } from './jupiter-lend-earn/index.js';
 export type { JupiterLendEarnPoolConfig } from './jupiter-lend-earn/index.js';
-export { KIPSELI_PROGRAM_ID, kipseli, kipseliLadder, KIPSELI_BAN_ENTRY_REF, deriveKipseliBanEntry } from './kipseli/index.js';
+export { KIPSELI_PROGRAM_ID, kipseli, KIPSELI_BAN_ENTRY_REF, deriveKipseliBanEntry } from './kipseli/index.js';
 export type { KipseliPoolConfig } from './kipseli/index.js';
-export { LEMMINGSFI_PROGRAM_ID, LEMMINGSFI_CONFIG, STALE_AFTER_SECONDS as LEMMINGSFI_STALE_AFTER_SECONDS, lemmingsfi, lemmingsfiLadder, fetchLemmingsFiPoolConfig } from './lemmingsfi/index.js';
+export { LEMMINGSFI_PROGRAM_ID, LEMMINGSFI_CONFIG, STALE_AFTER_SECONDS as LEMMINGSFI_STALE_AFTER_SECONDS, lemmingsfi, fetchLemmingsFiPoolConfig } from './lemmingsfi/index.js';
 export type { LemmingsFiPoolConfig } from './lemmingsfi/index.js';
 export { MERCURIAL_PROGRAM_ID, mercurial, fetchMercurialPoolConfig } from './mercurial/index.js';
 export type { MercurialPoolConfig } from './mercurial/index.js';
@@ -353,7 +348,7 @@ export {
 export type { PumpfunBondingCurvePoolConfig } from './pumpfun-bonding-curve/index.js';
 export { RAYDIUM_LAUNCHLAB_PROGRAM_ID, raydiumLaunchlab } from './raydium-launchlab/index.js';
 export type { RaydiumLaunchlabPoolConfig } from './raydium-launchlab/index.js';
-export { RUNNER_RODEO_PROGRAM_ID, runnerRodeo, runnerRodeoLadder } from './runner-rodeo/index.js';
+export { RUNNER_RODEO_PROGRAM_ID, runnerRodeo } from './runner-rodeo/index.js';
 export type { RunnerRodeoPoolConfig } from './runner-rodeo/index.js';
 export {
   SANCTUM_INFINITY_PROGRAM_ID,
@@ -410,7 +405,7 @@ export {
   fetchSolfiV1Config,
 } from './solfi-v1/index.js';
 export type { SolfiV1FloorRate, SolfiV1PoolConfig } from './solfi-v1/index.js';
-export { TAURUSFI_PROGRAM_ID, TAURUSFI_PRICE_SCALE, TAURUSFI_POOL_REGISTRY, taurusfi, taurusFiLadder, decodeTaurusFiPriceScaled, fetchTaurusFiConfig } from './taurusfi/index.js';
+export { TAURUSFI_PROGRAM_ID, TAURUSFI_PRICE_SCALE, TAURUSFI_POOL_REGISTRY, taurusfi, decodeTaurusFiPriceScaled, fetchTaurusFiConfig } from './taurusfi/index.js';
 export type { TaurusFiRegistryEntry, TaurusFiPoolConfig } from './taurusfi/index.js';
 // trends: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `trends`/`TRENDS` prefix.
@@ -565,7 +560,7 @@ export {
   fetchStabbleClmmConfig,
 } from './stabble-clmm/index.js';
 export type { StabbleClmmBoundary, StabbleClmmWindow, StabbleClmmPoolConfig } from './stabble-clmm/index.js';
-export { GATORSWAP_PROGRAM_ID, gatorswap, gatorswapLadder, deriveGatorswapPool } from './gatorswap/index.js';
+export { GATORSWAP_PROGRAM_ID, gatorswap, deriveGatorswapPool } from './gatorswap/index.js';
 export type { GatorswapPoolConfig } from './gatorswap/index.js';
 // riptide: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `riptide`/`RIPTIDE` prefix.
@@ -587,7 +582,6 @@ export {
   riptide,
 } from './riptide/index.js';
 export type { RiptidePoolConfig } from './riptide/index.js';
-export { riptideLadder } from './riptide/ladder.js';
 // zerofi: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `ZEROFI_` prefix.
 export {
@@ -610,11 +604,9 @@ export {
   zerofiSwapAccounts,
 } from './zerofi/index.js';
 export type { ZeroFiPoolConfig } from './zerofi/index.js';
-export { zerofiLadder } from './zerofi/ladder.js';
 export { ieee754ScaleParams as zerofiIeee754ScaleParams } from './zerofi/ieee754.js';
 export * from './one-intro-swap/index.js';
-export * from './one-intro-swap/ladder.js';
-export { WHALESTREET_PROGRAM_ID, WHALESTREET_OFF_MINT_A, WHALESTREET_OFF_VAULT_A, WHALESTREET_OFF_MINT_B, WHALESTREET_OFF_VAULT_B, WHALESTREET_IX_PREFIX, whalestreet, whalestreetLadder, fetchWhalestreetPoolConfig } from './whalestreet/index.js';
+export { WHALESTREET_PROGRAM_ID, WHALESTREET_OFF_MINT_A, WHALESTREET_OFF_VAULT_A, WHALESTREET_OFF_MINT_B, WHALESTREET_OFF_VAULT_B, WHALESTREET_IX_PREFIX, whalestreet, fetchWhalestreetPoolConfig } from './whalestreet/index.js';
 export type { WhalestreetPoolConfig } from './whalestreet/index.js';
 // metric: explicit re-export — some names collide with an existing venue's
 // generic constants/helpers; aliased with a `METRIC_` prefix.
@@ -634,4 +626,3 @@ export {
   metricSwapAccounts,
 } from './metric/index.js';
 export type { MetricPoolConfig } from './metric/index.js';
-export { metricLadder } from './metric/ladder.js';

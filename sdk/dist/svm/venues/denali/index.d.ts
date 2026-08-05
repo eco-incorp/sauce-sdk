@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "denali";
 export declare const DENALI_PROGRAM_ID: Address<"DNL1tgEj3nJovHw9jtyCCQD3arssCJzkmpDizknwzey4">;
 /** Owner of every pool's per-pool oracle PDA — see the file header. */
@@ -35,6 +35,5 @@ export declare const denali: {
     fetchPoolConfig: typeof fetchDenaliPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const denaliLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -137,7 +137,6 @@
  * only, not this ladder's own setup-read + interpreter overhead.
  */
 import { address, getAddressCodec, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
-import { readUintLE } from '../math.js';
 const SLUG = 'denali';
 export const DENALI_PROGRAM_ID = address('DNL1tgEj3nJovHw9jtyCCQD3arssCJzkmpDizknwzey4');
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -206,119 +205,5 @@ export const denali = {
     programId: DENALI_PROGRAM_ID,
     fetchPoolConfig: fetchDenaliPoolConfig,
     quoteAccounts,
-};
-export const denaliLadder = {
-    slug: SLUG,
-    /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
-    defaultRungs: 4,
-    shapeKey(base) {
-        return `${SLUG}:${denaliConfig(base).direction}`;
-    },
-    helpers() {
-        return [
-            {
-                name: 'qDenali',
-                source: [
-                    'function qDenali(x, rin, rout) {',
-                    '  if (x === 0) { return 0 }',
-                    '  return Math.mulDiv(x, rout, rin + x);',
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    paramCount: 0,
-    paramsFor() {
-        return [];
-    },
-    quoteRefs(base, slot) {
-        const cfg = denaliConfig(base);
-        const [vin, vout] = cfg.direction === 0 ? [cfg.vaultA, cfg.vaultB] : [cfg.vaultB, cfg.vaultA];
-        return [
-            { ref: ref(slot, 'vin'), address: vin },
-            { ref: ref(slot, 'vout'), address: vout },
-        ];
-    },
-    emitSetup(base, slot) {
-        denaliConfig(base);
-        const vin = JSON.stringify(ref(slot, 'vin'));
-        const vout = JSON.stringify(ref(slot, 'vout'));
-        return [
-            `  const s${slot}rin = accountUint(${vin}, ${AMOUNT_OFF}, 8);`,
-            `  const s${slot}rout = (accountUint(${vout}, ${AMOUNT_OFF}, 8) * ${OUT_DISCOUNT_NUM}) / ${OUT_DISCOUNT_DEN};`,
-        ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-        return `qDenali(${x}, s${slot}rin, s${slot}rout)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const cfg = denaliConfig(base);
-        const [userAtaA, userAtaB] = cfg.direction === 0 ? [user.inAta, user.outAta] : [user.outAta, user.inAta];
-        const roled = (roleRef, addr, writable) => writable ? { ref: ref(slot, roleRef), address: addr, writable: true } : { ref: ref(slot, roleRef), address: addr };
-        return {
-            programId: DENALI_PROGRAM_ID,
-            // disc(8) ++ direction(1) — the patched amountIn u64 LE follows immediately.
-            prefix: (() => {
-                const p = new Uint8Array(9);
-                p.set(SWAP_DISCRIMINATOR, 0);
-                p[8] = cfg.direction;
-                return p;
-            })(),
-            // minAmountOut u64 LE = 0 (Sauce's own minOut/avgPriceLimit is the real floor).
-            suffix: new Uint8Array(8),
-            patch: 'in',
-            accounts: [
-                { ref: user.owner, signer: true },
-                roled('pool', cfg.pool, true),
-                roled('mintA', cfg.mintA),
-                roled('mintB', cfg.mintB),
-                roled('vaultA', cfg.vaultA, true),
-                roled('vaultB', cfg.vaultB, true),
-                roled('tp1', TOKEN_PROGRAM),
-                roled('tp2', TOKEN_PROGRAM),
-                roled('oracle', cfg.oracle),
-                roled('global', DENALI_GLOBAL_CONFIG),
-                { ref: userAtaA, writable: true },
-                { ref: userAtaB, writable: true },
-            ],
-        };
-    },
-    referenceQuote(base, state) {
-        const cfg = denaliConfig(base);
-        const [vin, vout] = cfg.direction === 0 ? [cfg.vaultA, cfg.vaultB] : [cfg.vaultB, cfg.vaultA];
-        const vinData = state[vin];
-        const voutData = state[vout];
-        if (vinData === undefined)
-            throw new Error(`${SLUG} reference is missing vault ${vin}`);
-        if (voutData === undefined)
-            throw new Error(`${SLUG} reference is missing vault ${vout}`);
-        const rin = readUintLE(vinData, AMOUNT_OFF, 8);
-        const rout = (readUintLE(voutData, AMOUNT_OFF, 8) * OUT_DISCOUNT_NUM) / OUT_DISCOUNT_DEN;
-        return (x) => {
-            if (x === 0n)
-                return 0n;
-            return (x * rout) / (rin + x);
-        };
-    },
-    depthReserves(base, state) {
-        const cfg = denaliConfig(base);
-        const vaData = state[cfg.vaultA];
-        const vbData = state[cfg.vaultB];
-        if (vaData === undefined || vbData === undefined)
-            throw new Error(`${SLUG} depth is missing a vault`);
-        // Real (undiscounted) vault balances — the true liquidity depth for the
-        // relative-depth filter; the conservative haircut above is a QUOTE-only
-        // safety margin, not a claim about real depth.
-        const ra = readUintLE(vaData, AMOUNT_OFF, 8);
-        const rb = readUintLE(vbData, AMOUNT_OFF, 8);
-        return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
-    },
-    continuousFees() {
-        // Measurement-only oracle (see the SvmVenueLadder doc comment) — no
-        // additional denominator decay (gammaPpm at par), muPpm folds the
-        // OUT_DISCOUNT_NUM/DEN conservative haircut so the efficiency oracle
-        // reads the same conservative curve the ladder actually quotes.
-        return { gammaPpm: 1000000n, muPpm: (1000000n * OUT_DISCOUNT_NUM) / OUT_DISCOUNT_DEN };
-    },
 };
 //# sourceMappingURL=index.js.map

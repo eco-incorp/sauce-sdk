@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "gatorswap";
 export declare const GATORSWAP_PROGRAM_ID: Address<"gatorLx9aC1e5ZWAXscv5QRKiLXnLPLXjftVc81h1Hr">;
 /** `PDA(gatorLx9a, ["pool", mintA, mintB])` — documentation/testing only; discovery supplies `pool` directly. */
@@ -28,6 +28,5 @@ export declare const gatorswap: {
     fetchPoolConfig: typeof fetchPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const gatorswapLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

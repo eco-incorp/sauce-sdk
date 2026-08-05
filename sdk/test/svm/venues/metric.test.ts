@@ -13,7 +13,6 @@ import { metric, METRIC_QUOTE_HAIRCUT_PPM } from '../../../src/svm/venues/metric
 import type { MetricPoolConfig } from '../../../src/svm/venues/metric/index.js';
 
 const HAIRCUT_PPM = METRIC_QUOTE_HAIRCUT_PPM;
-import { metricLadder } from '../../../src/svm/venues/metric/ladder.js';
 import { fixtureBytesMap, fixtureLoader, loadFixtures } from '../fixtures.js';
 import { address } from '@solana/kit';
 
@@ -121,103 +120,9 @@ describe('the baked scale is a conservative lower bound (measured over-quote cor
   });
 });
 
-describe('metricLadder.referenceQuote', () => {
-  it('quotes proportional to the baked scale, capped at reserveOut / CAP_DIVISOR', async () => {
-    const fixtures = loadFixtures(FIXTURES);
-    const load = fixtureLoader(fixtures);
-    const state = fixtureBytesMap(fixtures);
-    const cfg: MetricPoolConfig = await metric.fetchPoolConfig(load, POOL, 0, async () => realOracleQuoteBytes());
-    const params = metricLadder.paramsFor(cfg);
-    const quote = metricLadder.referenceQuote(cfg, state, params);
-
-    expect(quote(0n)).toBe(0n);
-    const small = 1_000_000n; // 1 USDC (6dp)
-    expect(quote(small)).toBe((small * cfg.scaleNum) / cfg.scaleDen);
-
-    // Cap: reserveOut (vaultB) from the real fixture / CAP_DIVISOR.
-    const vaultB = fixtureBytesMap(fixtures)[cfg.vaultB];
-    const reserveOut = readU64LE(vaultB, 64);
-    const cap = reserveOut / 20n;
-    const huge = 10n ** 15n;
-    expect(quote(huge)).toBe(cap);
-  });
-});
-
-describe('the emitted fragment compiles as valid SauceScript (svm target)', () => {
-  it('emitSetup + one rung + a second (disabled) slot compiles, with the expected account plan', async () => {
-    const fixtures = loadFixtures(FIXTURES);
-    const load = fixtureLoader(fixtures);
-    const cfg: MetricPoolConfig = await metric.fetchPoolConfig(load, POOL, 0, async () => realOracleQuoteBytes());
-    const params = metricLadder.paramsFor(cfg).map((v) => v.toString());
-    const helpers = metricLadder.helpers().map((h) => h.source).join('\n');
-    const source = [
-      helpers,
-      'function main() {',
-      '  let s0en = 1;',
-      metricLadder.emitSetup(cfg, 0, params, 's0en'),
-      `  const q1 = ${metricLadder.emitQuoteCall(cfg, 0, '100000')};`,
-      `  const q2 = ${metricLadder.emitQuoteCall(cfg, 0, '5000000')};`,
-      '  return q1 + q2;',
-      '}',
-    ].join('\n');
-    const { bytecode, accountPlan } = compile(source, { target: 'svm' });
-    expect(bytecode[0].length).toBeGreaterThan(0);
-    const refs = accountPlan?.metas.map((m) => m.ref).sort() ?? [];
-    expect(refs).toEqual(['s0:vout']);
-  });
-
-  it('a disabled slot (enable=0) keeps the zero-output scale and still compiles', async () => {
-    const fixtures = loadFixtures(FIXTURES);
-    const load = fixtureLoader(fixtures);
-    const cfg: MetricPoolConfig = await metric.fetchPoolConfig(load, POOL, 0, async () => realOracleQuoteBytes());
-    const params = metricLadder.paramsFor(cfg).map((v) => v.toString());
-    const helpers = metricLadder.helpers().map((h) => h.source).join('\n');
-    const source = [
-      helpers,
-      'function main() {',
-      '  let s0en = 0;',
-      metricLadder.emitSetup(cfg, 0, params, 's0en'),
-      `  return ${metricLadder.emitQuoteCall(cfg, 0, '100000')};`,
-      '}',
-    ].join('\n');
-    const { bytecode } = compile(source, { target: 'svm' });
-    expect(bytecode[0].length).toBeGreaterThan(0);
-  });
-});
-
-describe('the emitted quote fragment issues NO oracle CPI (whole-cook-abort safety)', () => {
-  // A launched CPI that reverts (this oracle reverts Custom:20 when stale) aborts the ENTIRE cook —
-  // every co-merged venue's fill, not just Metric's — because the engine's CATCH is pre-flight-only.
-  // The quote is baked off-chain at fetch time; minOut is the sole atomic backstop. So the emitted
-  // quote program must contain zero contract.call and attach only the vault it reads for its cap.
-  for (const dir of [0, 1] as const) {
-    it(`direction ${dir}: emitSetup/emitQuoteCall contain no contract.call, and the account plan is just the vault`, async () => {
-      const fixtures = loadFixtures(FIXTURES);
-      const load = fixtureLoader(fixtures);
-      const cfg: MetricPoolConfig = await metric.fetchPoolConfig(load, POOL, dir, async () => realOracleQuoteBytes());
-      const params = metricLadder.paramsFor(cfg).map((v) => v.toString());
-      const setup = metricLadder.emitSetup(cfg, 0, params, 's0en');
-      const quote = metricLadder.emitQuoteCall(cfg, 0, '100000');
-      expect(setup).not.toMatch(/contract\.call/);
-      expect(quote).not.toMatch(/contract\.call/);
-      const helpers = metricLadder.helpers().map((h) => h.source).join('\n');
-      const source = [helpers, 'function main() {', '  let s0en = 1;', setup, `  return ${quote};`, '}'].join('\n');
-      const { accountPlan } = compile(source, { target: 'svm' });
-      const refs = accountPlan?.metas.map((m) => m.ref).sort() ?? [];
-      expect(refs).toEqual(['s0:vout']);
-    });
-  }
-});
-
 function gcd(a: bigint, b: bigint): bigint {
   let x = a < 0n ? -a : a;
   let y = b < 0n ? -b : b;
   while (y !== 0n) [x, y] = [y, x % y];
   return x === 0n ? 1n : x;
-}
-
-function readU64LE(data: Uint8Array, offset: number): bigint {
-  let v = 0n;
-  for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(data[offset + i]);
-  return v;
 }

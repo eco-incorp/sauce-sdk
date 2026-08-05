@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "helium-treasury";
 /** `TreasuryManagementV0`'s own program — recipe-side `SVM_VENUE_PROGRAM_IDS['helium-treasury']`. */
 export declare const HELIUM_TREASURY_PROGRAM_ID: Address<"treaf4wWBBty3fHdyBpo35Mz84M8k3heKXmjmi9vFt5">;
@@ -25,6 +25,5 @@ export declare const heliumTreasury: {
     programId: Address<"treaf4wWBBty3fHdyBpo35Mz84M8k3heKXmjmi9vFt5">;
     fetchPoolConfig: typeof fetchHeliumTreasuryPoolConfig;
 };
-export declare const heliumTreasuryLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

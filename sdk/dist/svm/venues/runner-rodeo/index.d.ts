@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG: "runner-rodeo";
 export declare const RUNNER_RODEO_PROGRAM_ID: Address;
 export interface RunnerRodeoPoolConfig extends PoolConfig {
@@ -23,6 +23,5 @@ export declare const runnerRodeo: {
     programId: Address;
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<RunnerRodeoPoolConfig>;
 };
-export declare const runnerRodeoLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map
