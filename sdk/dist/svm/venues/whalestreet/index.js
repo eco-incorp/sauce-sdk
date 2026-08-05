@@ -143,7 +143,6 @@
  * accuracy — this curve only shapes off-chain election/sizing.
  */
 import { address, getAddressCodec } from '@solana/kit';
-import { readUintLE } from '../math.js';
 const SLUG = 'whalestreet';
 export const WHALESTREET_PROGRAM_ID = address('FW6zUqn4iKRaeopwwhwsquTY6ABWLLgjxtrC3VPnaWBf');
 const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -204,119 +203,5 @@ export const whalestreet = {
     programId: WHALESTREET_PROGRAM_ID,
     fetchPoolConfig: fetchWhalestreetPoolConfig,
     quoteAccounts,
-};
-export const whalestreetLadder = {
-    slug: SLUG,
-    /** Simple CP-style curve (no window walk / Newton iteration), 4 rungs. */
-    defaultRungs: 4,
-    shapeKey(base) {
-        return `${SLUG}:${whalestreetConfig(base).direction}`;
-    },
-    helpers() {
-        return [
-            {
-                name: 'qWhaleStreet',
-                source: [
-                    'function qWhaleStreet(x, rin, rout) {',
-                    '  if (x === 0) { return 0 }',
-                    '  if (rin === 0) { return 0 }',
-                    '  return Math.mulDiv(x, rout, rin + x);',
-                    '}',
-                ].join('\n'),
-            },
-        ];
-    },
-    paramCount: 0,
-    paramsFor() {
-        return [];
-    },
-    quoteRefs(base, slot) {
-        const cfg = whalestreetConfig(base);
-        const [vin, vout] = cfg.direction === 0 ? [cfg.vaultA, cfg.vaultB] : [cfg.vaultB, cfg.vaultA];
-        return [
-            { ref: ref(slot, 'vin'), address: vin },
-            { ref: ref(slot, 'vout'), address: vout },
-        ];
-    },
-    emitSetup(base, slot) {
-        whalestreetConfig(base);
-        const vin = JSON.stringify(ref(slot, 'vin'));
-        const vout = JSON.stringify(ref(slot, 'vout'));
-        return [
-            `  const s${slot}rin = accountUint(${vin}, ${AMOUNT_OFF}, 8);`,
-            `  const s${slot}rout = (accountUint(${vout}, ${AMOUNT_OFF}, 8) * ${OUT_HAIRCUT_NUM}) / ${OUT_HAIRCUT_DEN};`,
-        ].join('\n');
-    },
-    emitQuoteCall(_base, slot, x) {
-        return `qWhaleStreet(${x}, s${slot}rin, s${slot}rout)`;
-    },
-    buildSwapV2(base, slot, user) {
-        const cfg = whalestreetConfig(base);
-        const [userAtaA, userAtaB] = cfg.direction === 0 ? [user.inAta, user.outAta] : [user.outAta, user.inAta];
-        const roled = (roleRef, addr, writable) => writable ? { ref: ref(slot, roleRef), address: addr, writable: true } : { ref: ref(slot, roleRef), address: addr };
-        return {
-            programId: WHALESTREET_PROGRAM_ID,
-            // REAL, validated prefix (see the module doc's "INSTRUCTION DATA") — the trailing
-            // ~33-byte amount/nonce encoding was NOT recovered, so `suffix` is deliberately empty
-            // (incomplete, not a guess) and this template does not compile into a working real
-            // trade today. The recipe-side gate on this family self-drops every candidate before
-            // this is ever reached from a real compile.
-            prefix: WHALESTREET_IX_PREFIX,
-            suffix: new Uint8Array(0),
-            patch: 'in',
-            accounts: [
-                roled('pool', cfg.pool, true),
-                { ref: userAtaA, writable: true },
-                { ref: userAtaB, writable: true },
-                roled('vaultA', cfg.vaultA, true),
-                roled('vaultB', cfg.vaultB, true),
-                { ref: user.owner, signer: true, writable: true },
-                roled('tokenProgram', TOKEN_PROGRAM),
-                roled('ixSysvar', SYSVAR_INSTRUCTIONS),
-            ],
-        };
-    },
-    referenceQuote(base, state) {
-        const cfg = whalestreetConfig(base);
-        const [vin, vout] = cfg.direction === 0 ? [cfg.vaultA, cfg.vaultB] : [cfg.vaultB, cfg.vaultA];
-        const vinData = state[vin];
-        const voutData = state[vout];
-        if (vinData === undefined)
-            throw new Error(`${SLUG} reference is missing vault ${vin}`);
-        if (voutData === undefined)
-            throw new Error(`${SLUG} reference is missing vault ${vout}`);
-        const rin = readUintLE(vinData, AMOUNT_OFF, 8);
-        const rout = (readUintLE(voutData, AMOUNT_OFF, 8) * OUT_HAIRCUT_NUM) / OUT_HAIRCUT_DEN;
-        return (x) => {
-            if (x === 0n)
-                return 0n;
-            // A drained "in" vault (rin === 0) would otherwise divide down to a constant `rout` for
-            // ANY x — a favourable-error hazard on an empty pool (see the module doc's "QUOTE MODEL").
-            // The upstream relative-depth filter (depthReserves) already excludes a fully-drained pool
-            // in practice; this guard is defense in depth, not the only backstop.
-            if (rin === 0n)
-                return 0n;
-            return (x * rout) / (rin + x);
-        };
-    },
-    depthReserves(base, state) {
-        const cfg = whalestreetConfig(base);
-        const vaData = state[cfg.vaultA];
-        const vbData = state[cfg.vaultB];
-        if (vaData === undefined || vbData === undefined)
-            throw new Error(`${SLUG} depth is missing a vault`);
-        // Real (un-haircut) vault balances — the true liquidity depth for the relative-depth
-        // filter; the conservative haircut above is a QUOTE-only safety margin, not a claim
-        // about real depth.
-        const ra = readUintLE(vaData, AMOUNT_OFF, 8);
-        const rb = readUintLE(vbData, AMOUNT_OFF, 8);
-        return cfg.direction === 0 ? { reserveIn: ra, reserveOut: rb } : { reserveIn: rb, reserveOut: ra };
-    },
-    continuousFees() {
-        // Measurement-only oracle (see the SvmVenueLadder doc comment) — no additional
-        // denominator decay (gammaPpm at par), muPpm folds the OUT_HAIRCUT_NUM/DEN conservative
-        // haircut so the efficiency oracle reads the same conservative curve the ladder quotes.
-        return { gammaPpm: 1000000n, muPpm: (1000000n * OUT_HAIRCUT_NUM) / OUT_HAIRCUT_DEN };
-    },
 };
 //# sourceMappingURL=index.js.map

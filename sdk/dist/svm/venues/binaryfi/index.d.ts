@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountBytesMap, AccountLoader, LadderSwapTemplate, PoolConfig, SwapUser, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "binaryfi";
 export declare const BINARYFI_PROGRAM_ID: Address<"B72M6nyCLFgWiJtAN4naUTminMiTmyGcEqQHXwVeRdht">;
 /** Single global config account, shared by every market (see file header). */
@@ -30,35 +30,6 @@ export declare const binaryfi: {
      */
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<BinaryFiPoolConfig>;
     quoteAccounts(base: PoolConfig): VenueAccount[];
-};
-export declare const binaryfiLadder: {
-    slug: string;
-    shapeKey(base: PoolConfig): string;
-    helpers(): {
-        name: string;
-        source: string;
-    }[];
-    /** Two params: the per-asset conservative floor rate (num, den). */
-    paramCount: number;
-    paramsFor(base: PoolConfig): bigint[];
-    quoteRefs(base: PoolConfig, slot: number): VenueAccount[];
-    emitSetup(base: PoolConfig, slot: number, params: readonly string[]): string;
-    emitQuoteCall(_base: PoolConfig, slot: number, x: string): string;
-    /**
-     * The real, ground-truthed swap ix (see file header): disc(1)=0x08 ++
-     * amountIn(8, patched) ++ minOut(8)=0. Account order/roles match 24 real
-     * historical fills on the `GWqUcqoZtjq8...` market.
-     */
-    buildSwapV2(base: PoolConfig, slot: number, user: SwapUser): LadderSwapTemplate;
-    referenceQuote(base: PoolConfig, state: AccountBytesMap, params: readonly bigint[]): (x: bigint) => bigint;
-    depthReserves(base: PoolConfig, state: AccountBytesMap): {
-        reserveIn: bigint;
-        reserveOut: bigint;
-    };
-    continuousFees(): {
-        gammaPpm: bigint;
-        muPpm: bigint;
-    };
 };
 export {};
 //# sourceMappingURL=index.d.ts.map

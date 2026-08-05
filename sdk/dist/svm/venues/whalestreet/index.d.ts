@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "whalestreet";
 export declare const WHALESTREET_PROGRAM_ID: Address<"FW6zUqn4iKRaeopwwhwsquTY6ABWLLgjxtrC3VPnaWBf">;
 export declare const WHALESTREET_OFF_MINT_A = 22;
@@ -32,6 +32,5 @@ export declare const whalestreet: {
     fetchPoolConfig: typeof fetchWhalestreetPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const whalestreetLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

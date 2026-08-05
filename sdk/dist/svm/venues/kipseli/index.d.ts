@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "kipseli";
 export declare const KIPSELI_PROGRAM_ID: Address<"3TK9D8aoBFYjYZtKCjciPrVrRStsnvo7KmpcJqDavpaU">;
 /**
@@ -36,6 +36,5 @@ export declare const kipseli: {
     fetchPoolConfig: typeof fetchPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const kipseliLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

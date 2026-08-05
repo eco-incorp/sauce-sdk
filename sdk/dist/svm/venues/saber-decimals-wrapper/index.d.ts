@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "saber-decimals-wrapper";
 export declare const SABER_DECIMALS_WRAPPER_PROGRAM_ID: Address<"DecZY86MU5Gj7kppfUCEmd4LbXXuyZH1yHaP2NTqdiZB">;
 export declare const OFF_DECIMALS = 8;
@@ -26,6 +26,5 @@ export declare const saberDecimalsWrapper: {
     fetchPoolConfig: typeof fetchPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const saberDecimalsWrapperLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG: "boop-fun";
 export declare const BOOP_FUN_PROGRAM_ID: Address;
 export interface BoopFunPoolConfig extends PoolConfig {
@@ -20,6 +20,5 @@ export declare const boopFun: {
     programId: Address;
     fetchPoolConfig(load: AccountLoader, pool: Address): Promise<BoopFunPoolConfig>;
 };
-export declare const boopFunLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

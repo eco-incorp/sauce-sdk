@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder } from '../types.js';
+import type { AccountLoader, PoolConfig } from '../types.js';
 declare const SLUG = "taurusfi";
 export declare const TAURUSFI_PROGRAM_ID: Address<'9VX8EKBg6vM6tA68xaDsPkbrx26XConZjkQmhVApUptc'>;
 /** Fixed-point scale for the decoded price (10^9 — ~9-10 significant decimal digits of headroom). */
@@ -73,6 +73,5 @@ export declare const taurusfi: {
     programId: Address<"9VX8EKBg6vM6tA68xaDsPkbrx26XConZjkQmhVApUptc">;
     fetchPoolConfig: typeof fetchTaurusFiConfig;
 };
-export declare const taurusFiLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map

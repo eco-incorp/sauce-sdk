@@ -1,6 +1,6 @@
 {
   "name": "@eco-incorp/sauce-sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Sauce protocol tooling: compiler, SDK, action primitives, and a local dev environment.",
   "type": "module",
   "repository": {
@@ -51,6 +51,10 @@
     "./svm": {
       "types": "./sdk/dist/svm/index.d.ts",
       "default": "./sdk/dist/svm/index.js"
+    },
+    "./svm/engine": {
+      "types": "./sdk/dist/svm/engine-public.d.ts",
+      "default": "./sdk/dist/svm/engine-public.js"
     },
     "./svm/recipes/settle.sauce.ts": "./sdk/dist/svm/recipes/settle.sauce.ts",
     "./verify": {

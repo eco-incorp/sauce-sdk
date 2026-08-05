@@ -1,5 +1,5 @@
 import type { Address } from '@solana/kit';
-import type { AccountLoader, PoolConfig, SvmVenueLadder, VenueAccount } from '../types.js';
+import type { AccountLoader, PoolConfig, VenueAccount } from '../types.js';
 declare const SLUG = "lemmingsfi";
 export declare const LEMMINGSFI_PROGRAM_ID: Address<'BQEJZUB4CzoT6UhRffoCkqCyqQNrCPCSGHcPEmsdbEsX'>;
 /**
@@ -42,6 +42,5 @@ export declare const lemmingsfi: {
     fetchPoolConfig: typeof fetchLemmingsFiPoolConfig;
     quoteAccounts: typeof quoteAccounts;
 };
-export declare const lemmingsfiLadder: SvmVenueLadder;
 export {};
 //# sourceMappingURL=index.d.ts.map
