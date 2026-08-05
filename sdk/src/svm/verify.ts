@@ -40,6 +40,22 @@ import {
 } from './engine.js';
 import { SVM_MAX_ESCROWS, svmSettleRefs, svmSettleSource } from './recipes/index.js';
 
+// The intent-level surface (unwrap the Portal envelope + extract from an intent) is re-exported here so
+// the whole partner-facing decode/verify story lives under `@eco-incorp/sauce-sdk/svm/verify`, symmetric
+// with the EVM `/verify` barrel re-exporting its own `intent.ts`.
+export {
+  decodePortalCalldataWithAccounts,
+  extractSvmSettleFromCalls,
+  extractSvmSettleFromIntent,
+  type PortalAccountMeta,
+  type PortalCalldataWithAccounts,
+  type BytesInput,
+  type SvmIntentCallLike,
+  type SvmIntentLike,
+  type ExtractSvmSettleOptions,
+  type ExtractedSvmSettle,
+} from './intent.js';
+
 // ── args (from the execute payload's calldata tail) ──
 
 export interface DecodedSvmSettleArgs {

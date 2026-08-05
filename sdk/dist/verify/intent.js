@@ -13,11 +13,10 @@
 // program is decoded from its own bytes with the strict decoder — a cook call whose ingredient is not a
 // valid settle program yields `null`, never a guess.
 //
-// SVM has no analogue here: an SVM intent wraps its settle CPI in eco-solver's Portal
-// `CalldataWithAccounts` (a Borsh envelope that is the SOLVER's encoding, not Sauce's), and the compiled
-// bytecode lives out-of-band in `fulfillmentMetadata.svm.sauceStage`. The caller decodes that envelope
-// itself and passes the `{ instructionData, accounts }` (and staged bytecode) to
-// `@eco-incorp/sauce-sdk/svm/verify`'s `decodeSvmSettleExecution` / `verifySvmSettleExecution`.
+// The SVM analogue is `extractSvmSettleFromIntent` in `@eco-incorp/sauce-sdk/svm/verify`: an SVM intent
+// wraps its settle CPI one layer deeper (the Eco Portal `CalldataWithAccounts` Borsh envelope), so that
+// module decodes the envelope itself before handing the halves to `decodeSvmSettleExecution` /
+// `verifySvmSettleExecution` — same "one call from intent to params" story, on the SVM side.
 import { decodeFunctionData, parseAbi } from "viem";
 import { decodeSettleProgram } from "./decode.js";
 /** `Pot.cook` / `SauceRouter.cook` — identical input signature on both (`sdk/src/artifacts/*.json`), so
