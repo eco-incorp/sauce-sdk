@@ -17,6 +17,15 @@
 // wraps its settle CPI one layer deeper (the Eco Portal `CalldataWithAccounts` Borsh envelope), so that
 // module decodes the envelope itself before handing the halves to `decodeSvmSettleExecution` /
 // `verifySvmSettleExecution` — same "one call from intent to params" story, on the SVM side.
+//
+// ONE DELIBERATE ASYMMETRY vs the SVM twin: the SVM extractor returns a `genuine` verdict because a
+// staged settle can ONLY be identified by recompiling it, so that module is node-side and verifies by
+// default. This EVM path stays viem-only/browser-safe and therefore stops at a STRICT prologue decode:
+// it cannot return a non-settle program (the prologue grammar is a real signature), and it reports
+// `bodyHash` — but proving the trailing BODY is the genuine settle logic (not just prologue-shaped) is
+// the caller's step: compile `@eco-incorp/sauce-sdk/recipes`'s settle source and compare `bodyHash`
+// (the body is byte-identical across all params). That is the established EVM `/verify` contract; these
+// helpers inherit it, they do not weaken it.
 import { decodeFunctionData, parseAbi, type Hex } from "viem";
 import { decodeSettleProgram, type DecodedSettleProgram } from "./decode.js";
 
