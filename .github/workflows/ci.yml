@@ -43,6 +43,18 @@ jobs:
         with:
           version: v1.5.1
 
+      # The huff-neo compiler (hnc) — sync-engine-artifacts compiles engine-v12/v12/Runtime.huff with
+      # it to GENERATE V12RuntimeBytecode.json (nothing is committed). PINNED: the produced creation
+      # bytecode is a pure function of the hnc version + the source, and there is no committed golden
+      # to byte-check against, so the version is the reproducibility anchor.
+      - name: Install huff-neo compiler (hnc)
+        run: |
+          curl -L https://raw.githubusercontent.com/cakevm/huff-neo/main/hnc-up/install | bash
+          "$HOME/.huff-neo/bin/hnc-up" --install 1.5.13
+          echo "$HOME/.huff-neo/bin" >> "$GITHUB_PATH"
+      - name: Verify hnc is the pinned version
+        run: hnc --version | grep -q '1\.5\.13' || { echo "::error::hnc is not the pinned 1.5.13"; hnc --version; exit 1; }
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10.28.2
@@ -80,23 +92,22 @@ jobs:
       # generated from the pinned dep's deployments/v12.json (the deployed
       # router/kitchen/runtime addresses + SVM program id that the package now
       # exports), so a repin that moves the deploy record must be committed too.
-      - name: Verify engine artifacts are in sync with the pinned engine
+      - name: Verify engine artifacts generate cleanly from the pinned engine
         run: |
           pnpm --filter './sdk' sync-engine-artifacts
-          if [ -n "$(git status --porcelain -- sdk/dist/artifacts sdk/src/deployments)" ]; then
-            echo "::error::sdk/dist/artifacts or sdk/src/deployments is stale vs the pinned sauce engine. Run 'pnpm --filter ./sdk sync-engine-artifacts' and commit the result.";
-            git --no-pager diff --stat -- sdk/dist/artifacts sdk/src/deployments;
+          # sdk/src/deployments/v12.generated.ts is COMMITTED (src, generated from the pin's deploy
+          # record) — it must match a fresh sync, else a repin that moved the record wasn't committed.
+          if [ -n "$(git status --porcelain -- sdk/src/deployments)" ]; then
+            echo "::error::sdk/src/deployments is stale vs the pinned engine. Run 'pnpm --filter ./sdk sync-engine-artifacts' and commit the result.";
+            git --no-pager diff -- sdk/src/deployments;
             exit 1;
           fi
-          # sdk/dist is gitignored (force-added), so a DELETED artifact is invisible to the check
-          # above — a resync recreates it untracked+ignored, which `git status --porcelain` hides.
-          # These ship to consumers, so assert each expected artifact is actually committed. (This is
-          # exactly the gap that let 0.7.0 publish with an empty dist/artifacts.)
+          # dist/artifacts is a BUILD OUTPUT (git-ignored, generated — nothing committed): the 8 forge
+          # JSONs are synced from the engine build, V12RuntimeBytecode is compiled with hnc. Assert the
+          # sync produced all 9, so a broken generation (missing hnc/Foundry, submodule-fetch failure)
+          # fails CI here instead of shipping an empty dir — the exact regression that broke 0.7.0.
           for a in IERC20 ISauceRouter IStateView IUniswapV3Pool Router SauceRouter V12Kitchen V12Pot V12RuntimeBytecode; do
-            if [ -z "$(git ls-files "sdk/dist/artifacts/$a.json")" ]; then
-              echo "::error::sdk/dist/artifacts/$a.json is not committed — it would ship missing. Force-add it (git add -f).";
-              exit 1;
-            fi
+            test -s "sdk/dist/artifacts/$a.json" || { echo "::error::sync did not produce sdk/dist/artifacts/$a.json (is hnc/Foundry set up?)"; exit 1; }
           done
       # -----------------------------------------------------------------------
 

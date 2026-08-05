@@ -47,6 +47,7 @@
 // NOTE: a `rm -rf sdk/dist` clean build drops these (tsc emits no JSON) — re-run
 // this after such a build. The normal `tsc` build leaves them in place.
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { generateEngineAbi } from './gen-engine-abi.mjs';
@@ -109,19 +110,78 @@ for (const [name, rel] of Object.entries(SOURCES)) {
 }
 
 if (missing.length) {
-  console.error(
+  const message =
     `[sync-engine-artifacts] missing from the pinned engine build: ${missing.join(', ')}. ` +
-      'Ensure Foundry is installed and `pnpm install` ran the engine forge build.',
-  );
-  process.exit(1);
+    'Ensure Foundry is installed and `pnpm install` ran the engine forge build.';
+  // Wired into the sdk build, so a local build without Foundry must not hard-fail: SYNC_OPTIONAL_FORGE=1
+  // downgrades to a warning (dist/artifacts is then incomplete locally). CI/publish install Foundry, so
+  // they still produce every artifact; the drift check fails there on any gap.
+  if (process.env.SYNC_OPTIONAL_FORGE === '1') {
+    console.warn(`${message} (SYNC_OPTIONAL_FORGE=1 → continuing; dist/artifacts will be incomplete)`);
+  } else {
+    console.error(message);
+    process.exit(1);
+  }
 }
 
-// Optional artifacts: copy when the pin ships them, otherwise keep the committed
-// copy and say so. Never fatal — a pin that compiles its Huff runtime at deploy
-// time legitimately has no snapshot to copy.
+// Generate V12RuntimeBytecode from the pinned engine-v12 by compiling v12/Runtime.huff with hnc via
+// the engine's own forge generator. Requires hnc + forge on PATH; fetches the (harness-only)
+// submodules the script imports. Returns the produced snapshot path, or null when the toolchain is
+// unavailable (local dev without hnc) — the caller then simply skips this one artifact.
+function generateV12Runtime(sauceRoot) {
+  const engineV12 = resolve(sauceRoot, 'engine-v12');
+  const generator = resolve(engineV12, 'script', 'V12RuntimeBytecode.s.sol');
+  if (!existsSync(generator)) return null; // this pin ships no generator
+
+  const onPath = (bin) => {
+    try { execSync(`command -v ${bin}`, { stdio: 'ignore' }); return true; } catch { return false; }
+  };
+  if (!onPath('hnc') || !onPath('forge')) {
+    console.warn('[sync-engine-artifacts] V12RuntimeBytecode: hnc and/or forge not on PATH — skipping generation (install the huff-neo compiler + Foundry to generate it locally).');
+    return null;
+  }
+
+  // The forge script imports forge-std (Script) + foundry-huff-neo (the hnc deployer). Their versions
+  // do NOT affect the hnc-produced bytecode — they are the Script harness only, not the compiler.
+  const SUBMODULES = {
+    'forge-std': 'https://github.com/foundry-rs/forge-std',
+    'foundry-huff-neo': 'https://github.com/cakevm/foundry-huff-neo',
+    'openzeppelin-contracts': 'https://github.com/OpenZeppelin/openzeppelin-contracts',
+  };
+  for (const [name, url] of Object.entries(SUBMODULES)) {
+    const dir = resolve(engineV12, 'lib', name);
+    if (existsSync(dir)) continue;
+    console.log(`[sync-engine-artifacts] fetching engine-v12 harness lib: ${name}`);
+    execSync(`git clone --depth 1 -q ${url} ${JSON.stringify(dir)}`, { stdio: 'inherit' });
+  }
+
+  console.log('[sync-engine-artifacts] generating V12RuntimeBytecode (hnc compiles v12/Runtime.huff) …');
+  try {
+    execSync('forge script script/V12RuntimeBytecode.s.sol --sig "run()" --ffi', { cwd: engineV12, stdio: 'inherit' });
+  } catch (e) {
+    console.warn(`[sync-engine-artifacts] V12RuntimeBytecode generation failed: ${e.message} — skipping.`);
+    return null;
+  }
+  const snap = resolve(engineV12, 'snapshots', 'V12RuntimeBytecode.json');
+  return existsSync(snap) ? snap : null;
+}
+
+// Optional artifacts: copy when the pin ships them; otherwise GENERATE (V12RuntimeBytecode) or skip.
+// Never fatal — a pin that compiles its Huff runtime at deploy time ships no snapshot, and a build
+// host without the huff toolchain still produces every other artifact.
 const skipped = [];
 for (const [name, rel] of Object.entries(OPTIONAL_SOURCES)) {
-  const src = resolve(sauce, rel);
+  let src = resolve(sauce, rel);
+
+  // A pin that compiles its Huff runtime at deploy time ships no snapshot to copy — so GENERATE it
+  // (commit-nothing, generate-everything). This is the ONLY byte-faithful method: the engine's own
+  // forge generator has foundry-huff-neo invoke `hnc <Runtime.huff> -b -e <evmVersion>` with the evm
+  // version from foundry.toml (matching those flags by hand risks byte drift). Non-fatal if the
+  // toolchain is absent (local dev without hnc/forge) — that one artifact is simply skipped there.
+  if (!existsSync(src) && name === 'V12RuntimeBytecode') {
+    const generated = generateV12Runtime(sauce);
+    if (generated) src = generated;
+  }
 
   if (!existsSync(src)) {
     skipped.push(name);

@@ -14,7 +14,11 @@
 // holding only `.sauce.ts` files gets no `tsc` output at all (all excluded), so
 // there may be no dist dir for the copy to land in.
 //
-// Run as part of `sdk`'s build: `tsc && node scripts/copy-verify-assets.mjs`.
+// The engine ABI artifacts the EVM `settle.sauce.ts` imports (`./artifacts/*.json`) are handled
+// separately by `sync-engine-artifacts` (which writes them into dist/artifacts as a build output),
+// not here — this script only copies the `.sauce.ts` program templates `tsc` leaves behind.
+//
+// Run as part of `sdk`'s build: `tsc && sync-engine-artifacts && node scripts/copy-verify-assets.mjs`.
 import { existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";

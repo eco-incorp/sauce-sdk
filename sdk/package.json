@@ -57,7 +57,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc && node scripts/copy-verify-assets.mjs",
+    "build": "tsc && SYNC_OPTIONAL_FORGE=1 node scripts/sync-engine-artifacts.mjs && node scripts/copy-verify-assets.mjs",
     "typecheck": "tsc --noEmit",
     "sync-engine-artifacts": "node scripts/sync-engine-artifacts.mjs",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.config.cjs"

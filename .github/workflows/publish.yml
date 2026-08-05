@@ -74,6 +74,14 @@ jobs:
         with:
           version: v1.5.1
 
+      # hnc (huff-neo) — the sdk build compiles engine-v12/v12/Runtime.huff with it to GENERATE
+      # dist/artifacts/V12RuntimeBytecode.json (nothing committed). Pinned for reproducible bytes.
+      - name: Install huff-neo compiler (hnc)
+        run: |
+          curl -L https://raw.githubusercontent.com/cakevm/huff-neo/main/hnc-up/install | bash
+          "$HOME/.huff-neo/bin/hnc-up" --install 1.5.13
+          echo "$HOME/.huff-neo/bin" >> "$GITHUB_PATH"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10.28.2
@@ -90,6 +98,18 @@ jobs:
 
       - name: Build all areas (compiler first, then sdk/actions in parallel)
         run: pnpm build
+
+      # The sdk build runs sync with SYNC_OPTIONAL_FORGE=1 (tolerant, for local dev), so a broken
+      # generation would NOT fail the build — it would ship an empty dist/artifacts (exactly how 0.7.0
+      # broke). Hard-gate publish on the artifacts + templates actually being present in the tarball dir.
+      - name: Verify the tarball will ship the engine artifacts + templates
+        run: |
+          for a in IERC20 ISauceRouter IStateView IUniswapV3Pool Router SauceRouter V12Kitchen V12Pot V12RuntimeBytecode; do
+            test -s "sdk/dist/artifacts/$a.json" || { echo "::error::build did not produce sdk/dist/artifacts/$a.json — refusing to publish (would ship broken)"; exit 1; }
+          done
+          test -s sdk/dist/recipes/settle.sauce.ts || { echo "::error::missing sdk/dist/recipes/settle.sauce.ts"; exit 1; }
+          test -s sdk/dist/svm/recipes/settle.sauce.ts || { echo "::error::missing sdk/dist/svm/recipes/settle.sauce.ts"; exit 1; }
+          echo "verified: 9 engine artifacts + both settle templates present"
 
       - name: Resolve version
         id: version
