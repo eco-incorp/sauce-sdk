@@ -12,7 +12,13 @@
 // prologue-shaped program can carry anything after it. If you need that guarantee, compile the
 // program from source yourself and byte-compare (see `@eco-incorp/sauce-sdk/recipes`), which is a
 // direct check against source you can read rather than a hash pinned in a table.
+//
+// The `intent.js` exports (`decodeSettleCall`, `extractEvmSettleFromIntent`) go one wrapper further:
+// a producer hands you an intent whose `route.calls[]` ends in a `Pot.cook(bytes[])` call, not a bare
+// program, so these unwrap the cook calldata and hand the settle ingredient to the decoder above — same
+// viem-only dependency closure, same strict decode.
 export { SETTLE_WIRE, scanMinimalPush, encodeMinimalPush } from "./wire.js";
 export { decodeSettleProgram, encodeSettleProgram, parseSettleProgram, bestEffortDecode, SettleDecodeError, } from "./decode.js";
 export { SETTLE_VECTORS } from "./vectors.js";
+export { decodeSettleCall, extractEvmSettleFromCalls, extractEvmSettleFromIntent, } from "./intent.js";
 //# sourceMappingURL=index.js.map
