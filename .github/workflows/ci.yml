@@ -88,6 +88,16 @@ jobs:
             git --no-pager diff --stat -- sdk/dist/artifacts sdk/src/deployments;
             exit 1;
           fi
+          # sdk/dist is gitignored (force-added), so a DELETED artifact is invisible to the check
+          # above — a resync recreates it untracked+ignored, which `git status --porcelain` hides.
+          # These ship to consumers, so assert each expected artifact is actually committed. (This is
+          # exactly the gap that let 0.7.0 publish with an empty dist/artifacts.)
+          for a in IERC20 ISauceRouter IStateView IUniswapV3Pool Router SauceRouter V12Kitchen V12Pot V12RuntimeBytecode; do
+            if [ -z "$(git ls-files "sdk/dist/artifacts/$a.json")" ]; then
+              echo "::error::sdk/dist/artifacts/$a.json is not committed — it would ship missing. Force-add it (git add -f).";
+              exit 1;
+            fi
+          done
       # -----------------------------------------------------------------------
 
       - name: Build compiler
