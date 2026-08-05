@@ -78,9 +78,10 @@ jobs:
       # dist/artifacts/V12RuntimeBytecode.json (nothing committed). Pinned for reproducible bytes.
       - name: Install huff-neo compiler (hnc)
         run: |
+          export HUFF_NEO_DIR="$HOME/.huff-neo"   # pin the install dir (runner sets XDG_CONFIG_HOME, which the installer would otherwise use)
           curl -L https://raw.githubusercontent.com/cakevm/huff-neo/main/hnc-up/install | bash
-          "$HOME/.huff-neo/bin/hnc-up" --install 1.5.13
-          echo "$HOME/.huff-neo/bin" >> "$GITHUB_PATH"
+          "$HUFF_NEO_DIR/bin/hnc-up" --install 1.5.13
+          echo "$HUFF_NEO_DIR/bin" >> "$GITHUB_PATH"
 
       - uses: pnpm/action-setup@v4
         with:
