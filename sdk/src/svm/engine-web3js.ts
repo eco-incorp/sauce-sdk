@@ -12,10 +12,13 @@
 // fs-free invariant is preserved. This module is itself CJS-require-safe (no `import.meta` /
 // `__dirname`), so it loads under ts-jest / babel-jest CommonJS transforms.
 
+import { createHash } from 'node:crypto';
+
 import { AccountRole, isSignerRole, isWritableRole } from '@solana/kit';
 import type { Address, Instruction } from '@solana/kit';
 import { PublicKey, TransactionInstruction } from '@solana/web3.js';
 
+import { BUFFER_SEED, BUFFER_SEED_BYTES } from './engine.js';
 import {
   buildCloseBufferCheckedInstruction as kitBuildCloseBufferChecked,
   buildCloseBufferInstruction as kitBuildCloseBuffer,
@@ -203,4 +206,36 @@ export function buildExecuteAndCloseInstruction(params: {
       args: params.args,
     }),
   );
+}
+
+/**
+ * Derive a bytecode buffer PDA — the sync web3.js twin of the SDK's async kit `deriveBufferPda`
+ * (`./pda.ts`). Same seed scheme `["buffer", authority, seed[32]]`, so it yields the identical
+ * address; provided here because web3.js consumers stage synchronously.
+ */
+export function deriveBufferPda(
+  programId: PublicKey,
+  authority: PublicKey,
+  seed: Uint8Array,
+): PublicKey {
+  if (!(seed instanceof Uint8Array) || seed.length !== BUFFER_SEED_BYTES) {
+    const got = seed instanceof Uint8Array ? `${seed.length} bytes` : 'a non-Uint8Array';
+    throw new Error(`buffer seed must be exactly ${BUFFER_SEED_BYTES} bytes, got ${got}`);
+  }
+
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from(BUFFER_SEED, 'utf8'), authority.toBuffer(), Buffer.from(seed)],
+    programId,
+  );
+
+  return pda;
+}
+
+/**
+ * sha256 of the bytecode — the content hash `finalize_buffer` pins and `execute` may verify. Sync
+ * (node:crypto) so web3.js consumers compute the `sha256` argument for
+ * `buildFinalizeBufferInstruction` inline; the kit client hashes the same bytes via async WebCrypto.
+ */
+export function bytecodeSha256(bytecode: Uint8Array): Uint8Array {
+  return createHash('sha256').update(bytecode).digest();
 }
