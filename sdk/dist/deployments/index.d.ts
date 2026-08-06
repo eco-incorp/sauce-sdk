@@ -54,6 +54,26 @@ export declare function isV12Live(chainId: number): boolean;
 /** The raw per-chain record (including a failed chain's `error`), or undefined if unknown. */
 export declare function v12ChainDeployment(chainId: number): V12ChainDeployment | undefined;
 /**
+ * The Sauce Recipes API chain slug (its `chain=` query param, e.g. `'base'`) for
+ * `chainId`, or undefined when the v12 stack is not live there.
+ *
+ * The slug IS the engine-side chain name from the pinned deploy record, which by
+ * construction equals the API's pool-config key — both derive from the same
+ * `deployments/v12.json` `evm.chains` id map — so a consumer can gate provider
+ * capability AND build the API URL from ONE source, with no hand-maintained
+ * chainId→slug table to drift (and go stale the next time a chain is added).
+ * Gated on `live` for the same reason as {@link v12Deployment}: a chain with no
+ * Kitchen has no Pot to cook on, so emitting a slug there would misreport a
+ * permanent deployment gap as a servable route.
+ */
+export declare function v12ChainSlug(chainId: number): string | undefined;
+/**
+ * Every live v12 chain as a `chainId → slug` map, ascending — the direct
+ * replacement for a hand-maintained slug constant. Excludes chains whose deploy
+ * did not land (see {@link v12FailedChainIds}).
+ */
+export declare function v12LiveChainSlugs(): Record<number, string>;
+/**
  * Addresses for `chainId`, or undefined when the stack is not live there.
  *
  * Returns undefined rather than the addresses for a non-live chain on purpose:
