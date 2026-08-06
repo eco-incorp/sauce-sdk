@@ -1,6 +1,6 @@
 {
   "name": "@eco-incorp/sauce-sdk",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "Sauce protocol tooling: compiler, SDK, action primitives, and a local dev environment.",
   "type": "module",
   "repository": {
@@ -56,6 +56,14 @@
       "types": "./sdk/dist/svm/engine-public.d.ts",
       "default": "./sdk/dist/svm/engine-public.js"
     },
+    "./svm/engine/web3js": {
+      "types": "./sdk/dist/svm/engine-web3js.d.ts",
+      "default": "./sdk/dist/svm/engine-web3js.js"
+    },
+    "./evm/engine": {
+      "types": "./sdk/dist/evm/engine.d.ts",
+      "default": "./sdk/dist/evm/engine.js"
+    },
     "./svm/recipes/settle.sauce.ts": "./sdk/dist/svm/recipes/settle.sauce.ts",
     "./verify": {
       "types": "./sdk/dist/verify/index.d.ts",
@@ -97,6 +105,14 @@
     "ts-evaluator": "^2.0.0",
     "typescript": "^5.7.0",
     "viem": "^2.45.3"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.98.0"
+  },
+  "peerDependenciesMeta": {
+    "@solana/web3.js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@uniswap/v3-core": "^1.0.1",
