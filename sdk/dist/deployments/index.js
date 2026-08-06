@@ -43,6 +43,34 @@ export function v12ChainDeployment(chainId) {
     return c === undefined ? undefined : { chainId, ...c };
 }
 /**
+ * The Sauce Recipes API chain slug (its `chain=` query param, e.g. `'base'`) for
+ * `chainId`, or undefined when the v12 stack is not live there.
+ *
+ * The slug IS the engine-side chain name from the pinned deploy record, which by
+ * construction equals the API's pool-config key — both derive from the same
+ * `deployments/v12.json` `evm.chains` id map — so a consumer can gate provider
+ * capability AND build the API URL from ONE source, with no hand-maintained
+ * chainId→slug table to drift (and go stale the next time a chain is added).
+ * Gated on `live` for the same reason as {@link v12Deployment}: a chain with no
+ * Kitchen has no Pot to cook on, so emitting a slug there would misreport a
+ * permanent deployment gap as a servable route.
+ */
+export function v12ChainSlug(chainId) {
+    const c = CHAINS[chainId];
+    return c === undefined || !c.live ? undefined : c.name;
+}
+/**
+ * Every live v12 chain as a `chainId → slug` map, ascending — the direct
+ * replacement for a hand-maintained slug constant. Excludes chains whose deploy
+ * did not land (see {@link v12FailedChainIds}).
+ */
+export function v12LiveChainSlugs() {
+    const out = {};
+    for (const id of v12LiveChainIds())
+        out[id] = CHAINS[id].name;
+    return out;
+}
+/**
  * Addresses for `chainId`, or undefined when the stack is not live there.
  *
  * Returns undefined rather than the addresses for a non-live chain on purpose:
