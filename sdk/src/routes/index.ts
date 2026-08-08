@@ -72,3 +72,27 @@ export type {
   TokenAmountInput,
   UniversalAddress,
 } from "./types.js";
+
+export {
+  assertSauceEvmLive,
+  buildSauceCall,
+  buildSauceCalls,
+  buildSauceEvmCall,
+  buildSauceEvmCalls,
+  buildSauceSvmCall,
+  buildSauceSvmCalls,
+  mergeSvmAccountFlags,
+  sauceEvmDeployPotCall,
+  sauceSvmStagingPlan,
+} from "./sauce-calls.js";
+export type {
+  SauceEvmCallParams,
+  SauceEvmCallsParams,
+  SauceEvmDeployPotCallParams,
+  SauceSvmAccountMeta,
+  SauceSvmCallParams,
+  SauceSvmCallsParams,
+  SauceSvmExecution,
+  StagedBufferRef,
+  SvmAddressInput,
+} from "./sauce-calls.js";

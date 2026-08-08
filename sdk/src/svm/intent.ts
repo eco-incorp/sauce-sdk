@@ -24,13 +24,21 @@
 // byte-match). A partner needs no bytecode to get a genuine verdict; a decoy is REJECTED, not returned.
 import {
   addDecoderSizePrefix,
+  addEncoderSizePrefix,
   getArrayDecoder,
+  getArrayEncoder,
   getAddressDecoder,
+  getAddressEncoder,
   getBooleanDecoder,
+  getBooleanEncoder,
   getBytesDecoder,
+  getBytesEncoder,
   getStructDecoder,
+  getStructEncoder,
   getU8Decoder,
+  getU8Encoder,
   getU32Decoder,
+  getU32Encoder,
 } from '@solana/kit';
 import type { Address } from '@solana/kit';
 import { verifySvmSettleExecution, type SvmSettleExecutionVerification } from './verify.js';
@@ -108,6 +116,50 @@ export function decodePortalCalldataWithAccounts(data: BytesInput): PortalCallda
     accountCount: decoded.calldata.accountCount,
     accounts: decoded.accounts.map((a) => ({ pubkey: a.pubkey, isSigner: a.isSigner, isWritable: a.isWritable })),
   };
+}
+
+// Encoder side of the exact same envelope — kept beside the decoder above so the Portal
+// `CalldataWithAccounts` Borsh layout has exactly one source of truth (field order, u32-length
+// prefixes, u8 account_count, u32-length-prefixed accounts vec).
+const calldataEncoder = getStructEncoder([
+  ['data', addEncoderSizePrefix(getBytesEncoder(), getU32Encoder())],
+  ['accountCount', getU8Encoder()],
+]);
+const accountMetaEncoder = getStructEncoder([
+  ['pubkey', getAddressEncoder()],
+  ['isSigner', getBooleanEncoder()],
+  ['isWritable', getBooleanEncoder()],
+]);
+const calldataWithAccountsEncoder = getStructEncoder([
+  ['calldata', calldataEncoder],
+  ['accounts', getArrayEncoder(accountMetaEncoder, { size: getU32Encoder() })],
+]);
+
+/** Input to {@link encodePortalCalldataWithAccounts} — the mirror of {@link PortalCalldataWithAccounts}. */
+export interface PortalCalldataWithAccountsInput {
+  /** The wrapped instruction data — for a Sauce call, the `execute_from_account` payload. */
+  instructionData: Uint8Array;
+  /** The attached account metas, in order. */
+  accounts: readonly PortalAccountMeta[];
+  /** The envelope's own `account_count` field. Defaults to `accounts.length` — see the decoder's own
+   *  comment on why this is not asserted equal to `accounts.length` here either; a caller with a
+   *  different convention (e.g. excluding a leading buffer account) can override it explicitly. */
+  accountCount?: number;
+}
+
+/**
+ * Encodes a Portal `CalldataWithAccounts` envelope — the exact inverse of
+ * {@link decodePortalCalldataWithAccounts}, sharing its codec byte-for-byte (both are built from the
+ * same field list above), so encoder and decoder cannot drift apart. This is what a route `Call.data`
+ * for a staged SVM Sauce execution looks like on the wire.
+ */
+export function encodePortalCalldataWithAccounts(input: PortalCalldataWithAccountsInput): `0x${string}` {
+  const accountCount = input.accountCount ?? input.accounts.length;
+  const encoded = calldataWithAccountsEncoder.encode({
+    calldata: { data: input.instructionData, accountCount },
+    accounts: input.accounts.map((a) => ({ pubkey: a.pubkey, isSigner: a.isSigner, isWritable: a.isWritable })),
+  });
+  return `0x${Buffer.from(Uint8Array.from(encoded as ArrayLike<number>)).toString('hex')}`;
 }
 
 // ── intent extraction ──
