@@ -197,6 +197,11 @@ export class CompilerContext {
   /** Module-level state, shared across a v12 module's per-function contexts. */
   private readonly module: SharedModule;
   private baseDirs: string[];
+  // Absolute roots an import is allowed to resolve INSIDE — the caller-granted `baseDirs`, plus
+  // a node_modules package directory once `resolvePackage` has located one (a package's own
+  // internal relative imports live inside the package, which the walk-up may find ABOVE every
+  // baseDir). Used only by the `..`-escape check (`assertDoesNotEscapeRoots`).
+  private allowedRoots: string[];
   private pendingContractBinding?: { contractName: string; callTypeOverride?: 'static' | 'delegate' };
   private boundContracts: Map<string, { contract: ContractInfo; callTypeOverride?: 'static' | 'delegate' }> = new Map();
 
@@ -313,6 +318,7 @@ export class CompilerContext {
   ) {
     this.scopes.push({ variables: new Map() });
     this.baseDirs = baseDirs;
+    this.allowedRoots = baseDirs.map((dir) => path.resolve(dir));
     this.target = target;
     this.module = shared ?? {
       functions: [],
@@ -615,8 +621,10 @@ export class CompilerContext {
   // shipped alongside an imported SauceScript module (or inside a resolved node_modules
   // package) resolves relative to that module, not just the entry program's own baseDirs.
   // Omitted, this is byte-identical to before this parameter existed.
-  resolveImport(source: string, importerDir?: string): Record<string, unknown> {
+  resolveImport(source: string, importerDir?: string): unknown {
     const roots = importerDir ? [importerDir, ...this.baseDirs] : this.baseDirs;
+
+    this.assertDoesNotEscapeRoots(source, roots);
 
     for (const root of roots) {
       const filePath = path.resolve(root, source);
@@ -672,6 +680,8 @@ export class CompilerContext {
 
     const roots = importerDir ? [importerDir, ...this.baseDirs] : this.baseDirs;
 
+    this.assertDoesNotEscapeRoots(source, roots);
+
     const hit = this.resolveInRoots(source, roots);
 
     if (hit) return hit;
@@ -681,6 +691,27 @@ export class CompilerContext {
     }
 
     return undefined;
+  }
+
+  // compiler-rs's `ImportEscapesRoot` (`path::normalize` -> `None`): a specifier whose own ".."
+  // segments climb ABOVE every root it is resolved against is rejected outright — a real-but-
+  // unintended file next to the project ("../secret.json", "abi/../../secret.json") is never
+  // read, on the module path and the `.json` contract path alike. A ".." that stays INSIDE a
+  // root is untouched: a module in a subdirectory importing "../shared.js" still resolves,
+  // because containment is judged against the granted roots (`allowedRoots`), not against the
+  // importing module's own directory. A specifier with no ".." at all short-circuits, so every
+  // ordinary import keeps its exact previous behavior — including the "no baseDirs at all" case,
+  // which has no root to escape and still reports plain unresolvability.
+  private assertDoesNotEscapeRoots(source: string, roots: string[]): void {
+    if (this.allowedRoots.length === 0 || !source.split('/').includes('..')) return;
+
+    const staysInside = roots.some((root) => {
+      const target = path.resolve(root, source);
+
+      return this.allowedRoots.some((allowed) => target === allowed || target.startsWith(allowed + path.sep));
+    });
+
+    if (!staysInside) throw new Error(`import "${source}" escapes the project root`);
   }
 
   // The original resolveModuleSource loop body, unchanged, now parameterized over an
@@ -789,6 +820,12 @@ export class CompilerContext {
     if (subpath !== '') {
       throw new Error(`subpath import "${spec}" is not supported; import the package root "${pkg}"`);
     }
+
+    // The package itself becomes a root: the walk-up may find it ABOVE every baseDir, and its
+    // own internal relative imports (and in-package `.json` ABIs) must keep resolving inside it.
+    const pkgRoot = path.resolve(pkgDir);
+
+    if (!this.allowedRoots.includes(pkgRoot)) this.allowedRoots.push(pkgRoot);
 
     const entry = this.packageEntry(pkgDir) ?? 'index.js';
     const normalized = normalizeEntry(entry);
