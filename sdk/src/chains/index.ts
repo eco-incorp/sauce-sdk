@@ -47,3 +47,5 @@ export function getChain(chainId: number): Chain | undefined {
 export function getAllChainIds(): number[] {
   return Object.keys(chains).map(Number);
 }
+
+export * from "./canonical.js";
