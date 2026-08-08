@@ -15,6 +15,62 @@ export type CompileTarget = 'v1' | 'v12' | 'svm';
 // ".<target>" token that immediately precedes the file's own module extension, e.g.
 // "/dir/token.svm.js" -> "/dir/token.js" and "/dir/token.svm.sauce.ts" -> "/dir/token.sauce.ts".
 // Path-only string manipulation, arm-agnostic by construction — never reads the filesystem.
+// True for a specifier the compiler must reject outright as a module import: a bare
+// filesystem-root path, or (on Windows) a drive-letter path. A relative ("./x", "../x") or
+// bare package specifier ("pkg", "@scope/pkg") is never absolute by this check.
+function isAbsoluteSpecifier(source: string): boolean {
+  return path.isAbsolute(source);
+}
+
+// Structural normalization of a package.json "exports"/"module"/"main" entry, mirroring
+// compiler-rs's `path::normalize`: folds "." segments away, resolves ".." against what's
+// already been folded, and fails (undefined) the moment a ".." would climb above the
+// package root — the exact "did this entry escape the package" check, computed on the
+// entry string ALONE (never by resolving-then-comparing), so an escaping path is never
+// handed to the filesystem. An absolute entry also fails closed here.
+function normalizeEntry(entry: string): string | undefined {
+  if (path.isAbsolute(entry)) return undefined;
+
+  const out: string[] = [];
+
+  for (const seg of entry.split('/')) {
+    if (seg === '' || seg === '.') continue;
+
+    if (seg === '..') {
+      if (out.length === 0) return undefined; // climbed above the package root
+
+      out.pop();
+      continue;
+    }
+
+    out.push(seg);
+  }
+
+  return out.join('/');
+}
+
+// Picks the "." subpath of a package.json `exports` field, then the first present of the
+// import/node/default conditions (recursing through nested condition objects) — a small,
+// deliberately non-exhaustive subset of Node's real exports resolution. An unmodeled shape
+// (an array, a non-"." top-level subpath only, null, a number, ...) returns undefined so the
+// caller degrades to `module`/`main` rather than failing the whole resolution.
+function exportsEntry(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    const dot = obj['.'];
+
+    if (dot !== undefined) return exportsEntry(dot);
+
+    for (const cond of ['import', 'node', 'default']) {
+      if (obj[cond] !== undefined) return exportsEntry(obj[cond]);
+    }
+  }
+
+  return undefined;
+}
+
 function stripArmToken(filePath: string, target: CompileTarget): string {
   const armToken = `.${target}.`;
   const idx = filePath.lastIndexOf(armToken);
@@ -555,9 +611,15 @@ export class CompilerContext {
     this.warnings.push(message);
   }
 
-  resolveImport(source: string): Record<string, unknown> {
-    for (const baseDir of this.baseDirs) {
-      const filePath = path.resolve(baseDir, source);
+  // `importerDir`, when provided, is tried BEFORE `baseDirs` — so a `.json` contract ABI
+  // shipped alongside an imported SauceScript module (or inside a resolved node_modules
+  // package) resolves relative to that module, not just the entry program's own baseDirs.
+  // Omitted, this is byte-identical to before this parameter existed.
+  resolveImport(source: string, importerDir?: string): Record<string, unknown> {
+    const roots = importerDir ? [importerDir, ...this.baseDirs] : this.baseDirs;
+
+    for (const root of roots) {
+      const filePath = path.resolve(root, source);
 
       try {
         return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -585,9 +647,49 @@ export class CompilerContext {
    * common, backward-compatible case), so `filePath` alone is the correct key there, exactly as
    * before this feature existed.
    */
-  resolveModuleSource(source: string): { code: string; filePath: string; dedupKey?: string } | undefined {
+  // `importerDir`, when provided, is tried BEFORE `baseDirs` for both (a) resolving a
+  // relative specifier next to the importing module (compiler-rs's #274 fix — today this is
+  // simply unreachable: a transitive relative import can only ever find something under a
+  // baseDir) and (b) as the walk-up start for a bare package specifier. Omitted, every code
+  // path below is byte-identical to before this parameter existed — `roots === this.baseDirs`.
+  //
+  // A BARE specifier (no leading "./" "../" "/", not ending ".json") that the path-based probe
+  // below can't resolve is additionally tried as a node_modules package specifier
+  // (`resolvePackage`) — see that method's own doc comment for the full algorithm. A specifier
+  // resolving as an ordinary path (relative OR bare-as-a-baseDir-file, the latter a pre-existing,
+  // deliberately preserved behavior) always wins over the package interpretation.
+  resolveModuleSource(
+    source: string,
+    importerDir?: string,
+  ): { code: string; filePath: string; dedupKey?: string } | undefined {
     if (source.endsWith('.json')) return undefined; // a .json import is a contract ABI, not a module
 
+    if (isAbsoluteSpecifier(source)) {
+      throw new Error(
+        `absolute module import "${source}" is not supported; use a relative ("./x.js") or package specifier`,
+      );
+    }
+
+    const roots = importerDir ? [importerDir, ...this.baseDirs] : this.baseDirs;
+
+    const hit = this.resolveInRoots(source, roots);
+
+    if (hit) return hit;
+
+    if (!source.startsWith('./') && !source.startsWith('../')) {
+      return this.resolvePackage(source, roots);
+    }
+
+    return undefined;
+  }
+
+  // The original resolveModuleSource loop body, unchanged, now parameterized over an
+  // arbitrary root list (a plain baseDir list for the top-level/backward-compatible case, or
+  // `[importerDir, ...baseDirs]`, or `[packageDir]` when resolving a package's own entry).
+  private resolveInRoots(
+    source: string,
+    roots: string[],
+  ): { code: string; filePath: string; dedupKey?: string } | undefined {
     const MODULE_EXTS = ['.ts', '.sauce.ts', '.js', '.sauce', '.mjs'];
     // Strip the longest matching module extension so an explicit-extension specifier
     // (e.g. "./token.js") probes its own extension's arm first (`./token.svm.js`).
@@ -606,13 +708,13 @@ export class CompilerContext {
     const armExts = matchedExt ? [matchedExt, ...MODULE_EXTS.filter((e) => e !== matchedExt)] : MODULE_EXTS;
     const armCandidates = armExts.map((ext) => `${base}.${this.target}${ext}`);
 
-    for (const baseDir of this.baseDirs) {
+    for (const root of roots) {
       for (const cand of armCandidates) {
-        const filePath = path.resolve(baseDir, cand);
+        const filePath = path.resolve(root, cand);
 
         try {
           const code = fs.readFileSync(filePath, 'utf-8');
-          const dedupKey = this.findNeutralPathForKey(neutralCandidates) ?? stripArmToken(filePath, this.target);
+          const dedupKey = this.findNeutralPathForKey(neutralCandidates, roots) ?? stripArmToken(filePath, this.target);
 
           return { code, filePath, dedupKey };
         } catch {
@@ -621,7 +723,7 @@ export class CompilerContext {
       }
 
       for (const cand of neutralCandidates) {
-        const filePath = path.resolve(baseDir, cand);
+        const filePath = path.resolve(root, cand);
 
         try {
           return { code: fs.readFileSync(filePath, 'utf-8'), filePath };
@@ -635,13 +737,13 @@ export class CompilerContext {
   }
 
   // Path-only probe (never reads/parses) for the NEUTRAL identity of an already-arm-selected
-  // module, scanned in the SAME baseDir+candidate order `resolveModuleSource` itself uses — so
-  // when an arm wins in baseDir X, this can only find a neutral file in X or a LATER baseDir
-  // (an earlier baseDir contained neither, or the arm probe there would have already won).
-  private findNeutralPathForKey(neutralCandidates: string[]): string | undefined {
-    for (const baseDir of this.baseDirs) {
+  // module, scanned in the SAME root+candidate order `resolveInRoots` itself uses — so
+  // when an arm wins in root X, this can only find a neutral file in X or a LATER root
+  // (an earlier root contained neither, or the arm probe there would have already won).
+  private findNeutralPathForKey(neutralCandidates: string[], roots: string[]): string | undefined {
+    for (const root of roots) {
       for (const cand of neutralCandidates) {
-        const filePath = path.resolve(baseDir, cand);
+        const filePath = path.resolve(root, cand);
 
         try {
           if (fs.statSync(filePath).isFile()) return filePath;
@@ -652,6 +754,113 @@ export class CompilerContext {
     }
 
     return undefined;
+  }
+
+  // Resolves a BARE specifier (`spec`) as a node_modules package, mirroring compiler-rs's
+  // `FsResolver::resolve_package`/`package_entry`/`exports_entry`. Only reached once the
+  // ordinary path-based probe in `resolveModuleSource` has already failed, so this can never
+  // shadow an existing relative-or-baseDir-file import (a bare specifier that resolves as a
+  // plain path today keeps resolving that way, unchanged).
+  //
+  // Returns undefined (never throws) when the package simply isn't installed — the caller
+  // falls through to the pre-existing ".json contract ABI" path and its existing error, so an
+  // uninstalled bare specifier fails exactly as it always has. Every OTHER rejection (a
+  // subpath, a bare "@scope", an escaping package-entry) throws, since those can only be
+  // reached once the package DOES exist on disk, at which point silently falling through to
+  // "unresolvable" would misreport a real, actionable configuration error as a missing file.
+  private resolvePackage(
+    spec: string,
+    roots: string[],
+  ): { code: string; filePath: string; dedupKey?: string } | undefined {
+    const pkgSegments = spec.startsWith('@') ? 2 : 1;
+    const parts = spec.split('/');
+
+    if (spec.startsWith('@') && parts.length < 2) {
+      throw new Error(`invalid package specifier "${spec}"; a scoped package is "@scope/name"`);
+    }
+
+    const pkg = parts.slice(0, pkgSegments).join('/');
+    const subpath = parts.slice(pkgSegments).join('/');
+
+    const pkgDir = this.findPackageDir(pkg, roots);
+
+    if (!pkgDir) return undefined; // not installed: fall through to the existing ".json" error
+
+    if (subpath !== '') {
+      throw new Error(`subpath import "${spec}" is not supported; import the package root "${pkg}"`);
+    }
+
+    const entry = this.packageEntry(pkgDir) ?? 'index.js';
+    const normalized = normalizeEntry(entry);
+
+    if (normalized === undefined) {
+      throw new Error(`package "${pkg}" entry "${entry}" escapes the package root`);
+    }
+
+    const resolved = this.resolveInRoots(`./${normalized}`, [pkgDir]);
+
+    if (!resolved) {
+      throw new Error(`package "${pkg}" entry "${entry}" did not resolve`);
+    }
+
+    return resolved;
+  }
+
+  // Walks UP from each root's directory looking for `<dir>/node_modules/<pkg>`, mirroring
+  // Node's own module resolution walk-up (so a package-local `node_modules/dep` correctly
+  // shadows a top-level one when `roots[0]` is inside a package already reached this way).
+  // `fs.statSync` follows symlinks, so a pnpm `node_modules/<pkg> -> ../.pnpm/...` link
+  // resolves as a directory; the returned path keeps the symlinked spelling.
+  private findPackageDir(pkg: string, roots: string[]): string | undefined {
+    const visited = new Set<string>();
+
+    for (const root of roots) {
+      let dir = path.resolve(root);
+
+      for (;;) {
+        if (visited.has(dir)) break;
+
+        visited.add(dir);
+
+        const candidate = path.join(dir, 'node_modules', pkg);
+
+        try {
+          if (fs.statSync(candidate).isDirectory()) return candidate;
+        } catch {
+          // not here, keep climbing
+        }
+
+        const parent = path.dirname(dir);
+
+        if (parent === dir) break; // filesystem root
+
+        dir = parent;
+      }
+    }
+
+    return undefined;
+  }
+
+  // Reads `<pkgDir>/package.json` and picks its module entry: the "." export condition
+  // first, then "module", then "main" — a small, deliberately non-exhaustive subset of real
+  // Node resolution. Returns undefined on any parse/read failure or when none of the three
+  // fields yields a usable string, so the caller falls back to "index.js".
+  private packageEntry(pkgDir: string): string | undefined {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8')) as Record<string, unknown>;
+
+      const fromExports = exportsEntry(pkg.exports);
+
+      if (fromExports) return fromExports;
+
+      if (typeof pkg.module === 'string') return pkg.module;
+
+      if (typeof pkg.main === 'string') return pkg.main;
+
+      return undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   registerContract(name: string, abi: Abi): void {

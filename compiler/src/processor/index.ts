@@ -1,3 +1,4 @@
+import * as path from 'path';
 import * as acorn from 'acorn';
 import type {
   Node,
@@ -56,9 +57,9 @@ export function processNode(node: Node, ctx: CompilerContext): SaucerLike[] {
   }
 }
 
-function processImportDeclaration(stmt: ImportDeclaration, ctx: CompilerContext): void {
+function processImportDeclaration(stmt: ImportDeclaration, ctx: CompilerContext, importerDir?: string): void {
   const source = (stmt.source as { value: string }).value;
-  const artifact = ctx.resolveImport(source);
+  const artifact = ctx.resolveImport(source, importerDir);
   const abi = artifact.abi;
 
   if (!abi) {
@@ -135,6 +136,7 @@ function collectImportedFunctions(
   seen: Map<string, string>,
   visited: Set<string>,
   inlineOut: Map<string, InlineFnEntry>,
+  importerDir?: string,
 ): FunctionDeclaration[] {
   const out: FunctionDeclaration[] = [];
 
@@ -142,11 +144,11 @@ function collectImportedFunctions(
     if (stmt.type !== 'ImportDeclaration') continue;
 
     const source = (stmt.source as { value: string }).value;
-    const mod = ctx.resolveModuleSource(source);
+    const mod = ctx.resolveModuleSource(source, importerDir);
 
     if (!mod) {
       // No source file resolves → a `.json` contract ABI import.
-      processImportDeclaration(stmt as ImportDeclaration, ctx);
+      processImportDeclaration(stmt as ImportDeclaration, ctx, importerDir);
       continue;
     }
 
@@ -185,7 +187,7 @@ function collectImportedFunctions(
 
     // Recurse into the imported module's own imports FIRST so transitive functions
     // (and contracts) are registered before this module's.
-    out.push(...collectImportedFunctions(modAst, ctx, seen, visited, inlineOut));
+    out.push(...collectImportedFunctions(modAst, ctx, seen, visited, inlineOut, path.dirname(mod.filePath)));
 
     for (const fn of extractFunctionDeclarations(modAst)) {
       const name = fn.id?.name;
