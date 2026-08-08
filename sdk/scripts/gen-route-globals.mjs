@@ -85,7 +85,7 @@ function render(chains) {
     }
     seen.set(name, c.slug);
     lines.push(`  /** eco-routes origin accessor for ${c.name} (chain id ${c.id}). */`);
-    lines.push(`  const ${name}: Accessors["${name}"];`);
+    lines.push(`  const ${name}: Accessors["${name}"] & ChainContracts;`);
   }
 
   return `// GENERATED FILE — do not edit by hand.
@@ -102,6 +102,7 @@ function render(chains) {
 // exists in the registry fails \`tsc\` here before the drift test even runs.
 import type { ChainAccessors } from "./builder.js";
 import type { RewardInput, RouteInput } from "./types.js";
+import type { ChainContracts } from "../descriptors/accessors.js";
 
 type Accessors = ChainAccessors<RouteInput, RewardInput>;
 

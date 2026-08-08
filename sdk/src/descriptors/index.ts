@@ -28,3 +28,8 @@ export {
   selectorOf,
 } from "./query.js";
 export { buildDescriptor, buildMethods, buildPerChainAddress, deriveChainSlugs, deriveContractName } from "./derive.js";
+
+// E2.3: the native accessor tree (`Base.Uniswap.UniversalRouter.method(...)`).
+export { chainContracts, on, type ChainContracts, type ContractAccessor } from "./accessors.js";
+export { makeContractCall, CONTRACT_BASE_DIRS, type ContractCall, type EncodeOptions, type SauceScriptOptions } from "./call.js";
+export type { ContractNameOf, FamilyContracts, FamilyKey, FamilyOf, ProtocolNamespaceKey, ProtocolSlug } from "./names.js";

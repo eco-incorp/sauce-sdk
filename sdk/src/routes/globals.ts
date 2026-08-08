@@ -25,6 +25,7 @@
  * Never clobbers a name already present on the target -- see
  * `installRouteGlobals` below.
  */
+import type { CanonicalChain } from "../chains/canonical.js";
 import { chain, chainAccessors } from "./accessors.js";
 // Load-bearing for TYPES, not runtime: this bare side-effect import is what
 // tsc preserves into dist/routes/globals.d.ts, which is how the ambient
@@ -32,6 +33,10 @@ import { chain, chainAccessors } from "./accessors.js";
 // "clean up" this import -- see globals.generated.ts and this file's own
 // header comment above.
 import "./globals.generated.js";
+// E2.3: composes each chain global with its native contract accessor tree
+// (`Base.Uniswap.UniversalRouter.method(...)`) alongside the existing
+// eco-routes DSL (`Base.route(...)`) -- see chainContractsFor below.
+import { chainContracts } from "../descriptors/accessors.js";
 
 export interface RouteGlobalsReport {
   /** Names this call actually defined. */
@@ -64,9 +69,34 @@ const owned = new Set<string>();
  * `Object.keys(globalThis)`/`for...in`) and `configurable: true` (so
  * `uninstallRouteGlobals` can genuinely remove it).
  */
+/**
+ * Composes one chain global: the existing `ChainOrigin` (`chain`/`route`)
+ * plus its lazy contract-namespace tree (`Uniswap`, `UniswapV4`, ...),
+ * copied via `Object.getOwnPropertyDescriptors` (NOT spread) so the contract
+ * namespaces' memoising GETTERS stay lazy — spread would invoke every one of
+ * them eagerly at install time. `origin` itself is never mutated: this
+ * returns a fresh object. Throws on a name collision (e.g. a future protocol
+ * slug literally named "route" or "chain"), mirroring
+ * `createChainAccessors`'s own duplicate-key throw.
+ */
+function composeChainGlobal(name: string, origin: Record<string, unknown> & { chain: CanonicalChain }): object {
+  const contracts = chainContracts(origin.chain) as unknown as Record<string, unknown>;
+  const originDescriptors = Object.getOwnPropertyDescriptors(origin);
+  const contractDescriptors = Object.getOwnPropertyDescriptors(contracts);
+  for (const key of Object.keys(contractDescriptors)) {
+    if (key in originDescriptors) {
+      throw new Error(`routes/globals: contract namespace '${key}' collides with the eco-routes accessor on '${name}'`);
+    }
+  }
+  return Object.defineProperties({}, { ...originDescriptors, ...contractDescriptors });
+}
+
 export function installRouteGlobals(opts: InstallRouteGlobalsOptions = {}): RouteGlobalsReport {
   const target = (opts.target ?? globalThis) as Record<string, unknown>;
-  const entries: [string, unknown][] = Object.entries(chainAccessors);
+  const entries: [string, unknown][] = Object.entries(chainAccessors).map(([name, origin]) => [
+    name,
+    composeChainGlobal(name, origin as unknown as Record<string, unknown> & { chain: CanonicalChain }),
+  ]);
   if (opts.includeChain !== false) entries.push(["chain", chain]);
 
   const installed: string[] = [];

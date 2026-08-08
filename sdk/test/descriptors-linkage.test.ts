@@ -4,15 +4,27 @@
  * drift alarm: a future edit to addresses.ts/abis.ts, or to links.ts itself,
  * that breaks one of these should fail the suite, not ship a silent hole.
  */
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isAddress, getAddress } from "viem";
 import { CONTRACT_LINKS, type ContractLink } from "../src/descriptors/links.js";
 
 const LINKS: readonly ContractLink[] = CONTRACT_LINKS;
 import { ABI_EXPORTS } from "../src/descriptors/registry.js";
 import { DESCRIPTORS } from "../src/descriptors/index.js";
+import { deriveContractName } from "../src/descriptors/derive.js";
 import { getProtocol } from "../src/protocols/index.js";
 import { requireChain, chainByAlias } from "../src/chains/canonical.js";
 import { protocols } from "../src/protocols/index.js";
+
+/** Links whose `contract` is a deliberate OVERRIDE of what deriveContractName would compute from
+ *  `abiExport` alone (see links.ts's module comment) -- these are EXPECTED to diverge, since
+ *  deriveContractName has no notion of roleKey and would otherwise collapse e.g. all three
+ *  compound-v3 Comet markets to the same name "Comet". */
+const DELIBERATE_OVERRIDES = new Set(["uniswap-v3::swapRouter02", "compound-v3::cUSDCv3", "compound-v3::cWETHv3", "compound-v3::cUSDTv3", "erc4626::"]);
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 describe("descriptor linkage: every link resolves against the live vendored data", () => {
   it("every link's protocol exists in the registry", () => {
@@ -103,6 +115,29 @@ describe("descriptor linkage: (protocol, contract) uniqueness (E2.3's key space)
   it("no two descriptors share a (protocol, contract) pair", () => {
     const keys = DESCRIPTORS.map((d) => `${d.protocol}::${d.contract}`);
     expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("every link has an explicit `contract` (required for E2.3's literal accessor-tree types)", () => {
+    for (const link of LINKS) {
+      expect(typeof link.contract).toBe("string");
+    }
+  });
+
+  it("every non-override explicit `contract` equals what deriveContractName computes — the literal type can never drift from the derivation", () => {
+    for (const link of LINKS) {
+      if (link.abiExport === undefined) continue;
+      if (DELIBERATE_OVERRIDES.has(`${link.protocol}::${link.roleKey ?? ""}`)) continue;
+      const info = getProtocol(link.protocol)!;
+      expect(link.contract).toBe(deriveContractName(info.name, link.abiExport));
+    }
+  });
+
+  it("every linked abiExport has a sibling protocols/<slug>/<Export>.json on disk (needed by toSauceScript's import line)", () => {
+    for (const link of LINKS) {
+      if (link.abiExport === undefined) continue;
+      const jsonPath = join(__dirname, "..", "src", "protocols", link.protocol, `${link.abiExport}.json`);
+      expect(existsSync(jsonPath)).toBe(true);
+    }
   });
 });
 

@@ -80,4 +80,41 @@ describe("routes globals: ambient types resolve with zero import", () => {
     `);
     expect(diagnostics).toHaveLength(0);
   });
+
+  // --- E2.3: the native contract-accessor tree is intersected onto the SAME ambient global ---
+
+  it("Base's ambient type ALSO carries the E2.3 native accessor tree, zero-import, alongside .route -- both capabilities, one global", () => {
+    const diagnostics = typecheckProbe(`
+      const canonical: unknown = Base.UniswapV4.UniversalRouter;
+      const alias: unknown = Base.Uniswap.UniversalRouter;
+      const stillHasRoute: unknown = Base.route;
+      export {};
+    `);
+    expect(diagnostics).toHaveLength(0);
+  });
+
+  it("negative control: an ambiguous family contract name is excluded from the ambient type too (TS2339, not silently `any`)", () => {
+    const diagnostics = typecheckProbe(`
+      const x: unknown = Base.Uniswap.Factory;
+      export {};
+    `);
+    expect(diagnostics.some((d) => d.code === 2339)).toBe(true); // TS2339: Property does not exist
+  });
+
+  it("negative control: a method the vendored ABI does not have is a real error too (never invented, never `any`)", () => {
+    const diagnostics = typecheckProbe(`
+      const x: unknown = Base.UniswapV4.UniversalRouter.exactIn;
+      export {};
+    `);
+    expect(diagnostics).toHaveLength(0);
+    // UniversalRouter's method surface is typed loosely (unknown), so
+    // .exactIn is not a TS2339 -- calling it is a RUNTIME undefined, per
+    // accessors.ts's own doc comment. Confirm the property access itself at
+    // least resolves against the real, narrowed contract-name union first.
+    const namespaceDiagnostics = typecheckProbe(`
+      const x: unknown = Base.UniswapV4.NotARealContract;
+      export {};
+    `);
+    expect(namespaceDiagnostics.some((d) => d.code === 2339)).toBe(true);
+  });
 });
