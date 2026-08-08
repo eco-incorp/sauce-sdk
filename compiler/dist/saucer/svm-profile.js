@@ -1,3 +1,4 @@
+import { assertCapability, SVM_GATED_HINTS } from '../capabilities.js';
 /**
  * SVM target profile — the single reference for how the 'svm' target differs
  * from the EVM v12 dialect. The SVM engine executes the SAME v12 postfix opcode
@@ -40,22 +41,13 @@ export const SVM_UNSUPPORTED = {
     create3Address: 0x87,
     delegatecall: 0xa4,
 };
-/** Surface names whose emission is rejected under 'svm', → the replacement to suggest (if any). */
-export const SVM_GATED = {
-    create: undefined,
-    create2: undefined,
-    create3: undefined,
-    createAddress: undefined,
-    create2Address: undefined,
-    create3Address: undefined,
-    delegatecall: undefined,
-    'storage.read': 'accountData(ref, offset, len)',
-    'storage.write': 'writeAccountData(ref, offset, value)',
-};
-/** Throw when a gated construct is emitted under target 'svm'; no-op otherwise. */
+/** Surface names whose emission is rejected under 'svm', → the replacement to suggest (if any).
+ *  Re-derived from `capabilities.ts`'s `TARGET_CAPABILITIES` (the single source of truth) —
+ *  kept as its own export only so nothing outside this file needs to change shape. */
+export const SVM_GATED = SVM_GATED_HINTS;
+/** Throw when a gated construct is emitted under target 'svm'; no-op otherwise. A one-line
+ *  delegate to the centralized, bidirectional gate (`capabilities.ts`) — kept so the nine
+ *  builder call sites below (which have no AST node in scope) don't need to change at all. */
 export function assertSvmSupported(ctx, construct) {
-    if (!ctx.isSvm)
-        return;
-    const hint = SVM_GATED[construct];
-    throw new Error(`${construct} is not supported on target 'svm'${hint ? `; use ${hint}` : ''}`);
+    assertCapability(ctx, construct);
 }

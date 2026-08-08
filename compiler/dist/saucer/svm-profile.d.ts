@@ -41,8 +41,12 @@ export declare const SVM_UNSUPPORTED: {
     readonly create3Address: 135;
     readonly delegatecall: 164;
 };
-/** Surface names whose emission is rejected under 'svm', → the replacement to suggest (if any). */
+/** Surface names whose emission is rejected under 'svm', → the replacement to suggest (if any).
+ *  Re-derived from `capabilities.ts`'s `TARGET_CAPABILITIES` (the single source of truth) —
+ *  kept as its own export only so nothing outside this file needs to change shape. */
 export declare const SVM_GATED: Record<string, string | undefined>;
-/** Throw when a gated construct is emitted under target 'svm'; no-op otherwise. */
+/** Throw when a gated construct is emitted under target 'svm'; no-op otherwise. A one-line
+ *  delegate to the centralized, bidirectional gate (`capabilities.ts`) — kept so the nine
+ *  builder call sites below (which have no AST node in scope) don't need to change at all. */
 export declare function assertSvmSupported(ctx: CompilerContext, construct: string): void;
 //# sourceMappingURL=svm-profile.d.ts.map

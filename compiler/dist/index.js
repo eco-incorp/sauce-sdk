@@ -16,6 +16,7 @@ export { CompilerContext } from './context.js';
 export { OPS } from './saucer/ops.js';
 export { OPS_V12 } from './saucer/ops-v12.js';
 export { SVM_UNSUPPORTED } from './saucer/svm-profile.js';
+export { UnsupportedTargetError, TARGET_CAPABILITIES } from './capabilities.js';
 export { estimatePacket, stagingTransactionCount, PAYER_REF } from './planner/index.js';
 /** A plain struct object (excludes bigint, string, and arrays — all also `object`-ish). */
 function isArgObject(v) {

@@ -34,6 +34,7 @@ import {
 import { processUint8Array } from './collection.js';
 import { GLOBALS, GLOBAL_FUNCTIONS } from '../globals.js';
 import { compile } from '../index.js';
+import { assertCapability } from '../capabilities.js';
 
 export function processLiteral(literal: Literal, saucer: SaucerLike): SaucerLike {
   switch (typeof literal.value) {
@@ -422,11 +423,7 @@ function processContractCall(
   // svm has no ABI-typed binding lowering yet (a binding would need per-method
   // account lists); every typed-binding shape (inline chain, .view()/.lib(),
   // variable-bound, standalone) funnels through here, so one guard covers them.
-  if (ctx.isSvm) {
-    throw new Error(
-      `contract bindings are not supported on target 'svm'; use contract.call(target, calldata, accounts)`,
-    );
-  }
+  assertCapability(ctx, 'contract bindings');
 
   const method = contract.methods.get(methodName);
 
