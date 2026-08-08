@@ -97,6 +97,21 @@ export interface SwapSourceOptions {
 }
 
 /**
+ * The import lines a `swapSource(specs)` program needs — `ISauceRouter` always, plus `IERC20` iff
+ * any spec uses `amountIn: "balance"`. Extracted so `swapThenDepositSource` (E4.2's composition
+ * seam) can union these with the deposit side's own import lines instead of duplicating this rule;
+ * `swapSource` itself just calls this, so its own output is unaffected byte-for-byte.
+ */
+export function swapImportLines(specs: SwapSourceSpec | readonly SwapSourceSpec[]): readonly string[] {
+  const list = Array.isArray(specs) ? specs : [specs as SwapSourceSpec];
+  const needsBalanceImport = list.some((s) => s.amountIn === "balance");
+  return [
+    `import { ISauceRouter } from "./artifacts/ISauceRouter.json";`,
+    ...(needsBalanceImport ? [`import { IERC20 } from "./artifacts/IERC20.json";`] : []),
+  ];
+}
+
+/**
  * A complete, compilable `function main() { ... }` program: one `ISauceRouter.swap(...)` statement
  * per spec, in the given order, inside ONE function — because `V12Pot.cook` executes only
  * `ingredients[0]` (its own doc), a multi-hop route is ONE program with N swap statements, not N
@@ -110,12 +125,7 @@ export function swapSource(
   const specs = Array.isArray(spec) ? spec : [spec as SwapSourceSpec];
   if (specs.length === 0) throw new Error("swapSource: at least one swap spec is required");
 
-  const needsBalanceImport = specs.some((s) => s.amountIn === "balance");
-  const importLines = [
-    `import { ISauceRouter } from "./artifacts/ISauceRouter.json";`,
-    ...(needsBalanceImport ? [`import { IERC20 } from "./artifacts/IERC20.json";`] : []),
-    ...(opts.imports ?? []),
-  ];
+  const importLines = [...swapImportLines(specs), ...(opts.imports ?? [])];
 
   const fnName = opts.functionName ?? "main";
   const body = specs

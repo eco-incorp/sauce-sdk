@@ -90,5 +90,5 @@ export type {
 
 export { toSwapParams, amountSpecifiedFor } from "./params.js";
 
-export { swapCallStatement, swapSource, SWAP_BASE_DIRS } from "./source.js";
+export { swapCallStatement, swapSource, swapImportLines, SWAP_BASE_DIRS } from "./source.js";
 export type { SwapSourceOptions } from "./source.js";
