@@ -30,6 +30,34 @@ export { assembleIntent } from "./intent.js";
 
 export { emptyRoute, toBigInt, toUniversalAddress } from "./normalize.js";
 
+export {
+  denormalizeToEvm,
+  encodeIntent,
+  encodeReward,
+  encodeRewardEvm,
+  encodeRewardSvm,
+  encodeRoute,
+  encodeRouteEvm,
+  encodeRouteSvm,
+  decodeReward,
+  decodeRewardEvm,
+  decodeRewardSvm,
+  decodeRoute,
+  decodeRouteEvm,
+  decodeRouteSvm,
+  hashIntent,
+  kindOf,
+  rewardHash,
+  routeHash,
+  EVM_ROUTE_PARAM,
+  EVM_REWARD_PARAM,
+  svmCallCodec,
+  svmRewardCodec,
+  svmRouteCodec,
+  svmTokenAmountCodec,
+} from "./encode.js";
+export type { ChainKindRef, IntentHashes } from "./encode.js";
+
 export type {
   AddressInput,
   Call,
