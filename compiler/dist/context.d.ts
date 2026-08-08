@@ -282,11 +282,23 @@ export declare class CompilerContext {
      * + absolute path, or undefined if no source file resolves (the caller then treats the
      * import as a `.json` contract). Tries the literal path, then the common SauceScript source
      * extensions, across every baseDir. A `.json` source is never a module (returns undefined).
+     *
+     * Per-target arm selection: for each baseDir, a target-arm sibling (`<base>.<target>.<ext>`,
+     * e.g. `./token.svm.js` when `this.target === 'svm'`) is probed BEFORE the neutral candidate
+     * list, so a module can ship a target-specific implementation alongside a neutral fallback.
+     * The unselected arm (a different target's arm file) is never read. `dedupKey`, when present,
+     * is the NEUTRAL specifier's own resolved path — the identity `collectImportedFunctions` should
+     * dedup/graph-key on, so cross-module dedup stays arm-agnostic regardless of which arm a given
+     * import happened to select. It is omitted whenever the neutral candidate itself won (the
+     * common, backward-compatible case), so `filePath` alone is the correct key there, exactly as
+     * before this feature existed.
      */
     resolveModuleSource(source: string): {
         code: string;
         filePath: string;
+        dedupKey?: string;
     } | undefined;
+    private findNeutralPathForKey;
     registerContract(name: string, abi: Abi): void;
     lookupContract(name: string): ContractInfo | undefined;
     setPendingContractBinding(contractName: string, callTypeOverride?: 'static' | 'delegate'): void;

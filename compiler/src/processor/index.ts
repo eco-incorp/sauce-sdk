@@ -150,9 +150,14 @@ function collectImportedFunctions(
       continue;
     }
 
-    if (visited.has(mod.filePath)) continue; // shared module already pulled
+    // Dedup on the NEUTRAL identity (`mod.dedupKey`, when an arm won) rather than the file
+    // actually read, so cross-module dedup stays arm-agnostic — a shared module imported by
+    // two parents is pulled once regardless of which arm each import resolved to.
+    const dedupKey = mod.dedupKey ?? mod.filePath;
 
-    visited.add(mod.filePath);
+    if (visited.has(dedupKey)) continue; // shared module already pulled
+
+    visited.add(dedupKey);
 
     // A caller-supplied transformModule always wins; absent one, a `.ts`/`.sauce.ts`
     // module gets the built-in fold+strip front-end automatically — `.js`/`.sauce`/`.mjs`
