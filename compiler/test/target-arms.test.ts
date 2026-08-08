@@ -138,8 +138,12 @@ describe('per-target arm import resolution', () => {
   it('F: a .json ABI import is NOT arm-selected', () => {
     // (svm rejects ABI-typed contract bindings outright regardless of arm-selection, so this
     // is exercised on v12 — the arm-selection question is orthogonal to that unrelated guard.)
-    const fooAbi = [{ type: 'function' as const, name: 'foo', inputs: [], outputs: [], stateMutability: 'view' as const }];
-    const barAbi = [{ type: 'function' as const, name: 'bar', inputs: [], outputs: [], stateMutability: 'view' as const }];
+    const fooAbi = [
+      { type: 'function' as const, name: 'foo', inputs: [], outputs: [], stateMutability: 'view' as const },
+    ];
+    const barAbi = [
+      { type: 'function' as const, name: 'bar', inputs: [], outputs: [], stateMutability: 'view' as const },
+    ];
     fs.writeFileSync(path.join(tmpDir, 'TaAbi.json'), JSON.stringify({ abi: fooAbi }));
     fs.writeFileSync(path.join(tmpDir, 'TaAbi.v12.json'), JSON.stringify({ abi: barAbi }));
 
