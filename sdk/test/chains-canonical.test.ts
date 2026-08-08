@@ -200,3 +200,34 @@ describe("canonical chain registry: non-regression of existing exports", () => {
     expect(getChain(8453)!.name).toBe("Base");
   });
 });
+
+describe("canonical chain registry: bigint chain-ref resolution (regression)", () => {
+  // eco-routes chain ids are native bigint. Before the fix, resolveChain fell
+  // through to `return ref` for a bigint, so an svm id silently resolved to
+  // undefined-kind and downstream encoders defaulted to EVM. These pin that a
+  // bigint resolves identically to its numeric id.
+  it("resolves an EVM bigint id to its evm record", () => {
+    expect(resolveChain(8453n)?.slug).toBe("base");
+    expect(isEvm(8453n)).toBe(true);
+    expect(isSvm(8453n)).toBe(false);
+  });
+
+  it("resolves the Solana bigint id to its SVM record (not a silent evm default)", () => {
+    const solana = chainBySlug("solana");
+    expect(solana).toBeDefined();
+    expect(resolveChain(BigInt(solana!.id))?.slug).toBe("solana");
+    expect(isSvm(BigInt(solana!.id))).toBe(true);
+    expect(isEvm(BigInt(solana!.id))).toBe(false);
+  });
+
+  it("agrees with the numeric-id resolution for every canonical chain", () => {
+    for (const c of canonicalChains) {
+      expect(resolveChain(BigInt(c.id))).toBe(chainById(c.id));
+    }
+  });
+
+  it("returns undefined for a negative or out-of-safe-range bigint (never throws here)", () => {
+    expect(resolveChain(-1n)).toBeUndefined();
+    expect(resolveChain(BigInt(Number.MAX_SAFE_INTEGER) + 1n)).toBeUndefined();
+  });
+});

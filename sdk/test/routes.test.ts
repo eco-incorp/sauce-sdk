@@ -46,7 +46,9 @@ describe("routes: single leg", () => {
   });
 
   it("copies caller arrays -- mutating the input afterward does not change the intent", () => {
-    const calls = [{ target: "0x4444444444444444444444444444444444444444", data: "0xaa", value: 1n }];
+    const calls: Array<NonNullable<RouteInput["calls"]>[number]> = [
+      { target: "0x4444444444444444444444444444444444444444", data: "0xaa", value: 1n },
+    ];
     const rt = route({ calls });
     const intents = chain("base").route(reward()).Solana(rt).build();
     calls.push({ target: "0x6666666666666666666666666666666666666666", data: "0xbb", value: 2n });
@@ -222,7 +224,7 @@ describe("routes: normalization", () => {
   });
 
   it("passes an already-32-byte value through unchanged", () => {
-    const value = "0x" + "ab".repeat(32);
+    const value = `0x${"ab".repeat(32)}` as const;
     expect(toUniversalAddress(value)).toBe(value);
   });
 

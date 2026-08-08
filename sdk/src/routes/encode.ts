@@ -59,8 +59,10 @@ import type { Call, Intent, Reward, Route, TokenAmount, UniversalAddress } from 
 // Chain-kind resolution
 // ---------------------------------------------------------------------------
 
-/** Anything that can select which encoding fork to use: an explicit kind, or anything `resolveChain` accepts. */
-export type ChainKindRef = ChainKind | number | string | CanonicalChain;
+/** Anything that can select which encoding fork to use: an explicit kind, or anything `resolveChain` accepts
+ *  — including a native `bigint` chain id (eco-routes `Intent.destination`/`sourceChainId` are bigint), so a
+ *  caller can pass those straight through without a silent evm mis-classification. */
+export type ChainKindRef = ChainKind | number | bigint | string | CanonicalChain;
 
 const CHAIN_KINDS = new Set<string>(["evm", "svm"]);
 
