@@ -59,10 +59,25 @@ export function processNode(node: Node, ctx: CompilerContext): SaucerLike[] {
 
 function processImportDeclaration(stmt: ImportDeclaration, ctx: CompilerContext, importerDir?: string): void {
   const source = (stmt.source as { value: string }).value;
-  const artifact = ctx.resolveImport(source, importerDir);
-  const abi = artifact.abi;
 
-  if (!abi) {
+  // One ABI is one contract, so a `.json` import binds exactly one name. Binding several
+  // (`import { A, B } from "./Erc20.json"`) used to silently register EVERY name against the
+  // SAME ABI — `B.at(addr).transfer(...)` would compile against A's selectors — so it is a
+  // clear error instead, checked before the file is even read (mirroring compiler-rs's
+  // `MultiBindingContractImport`). A SOURCE module import is unaffected: it binds N names.
+  if (stmt.specifiers.length > 1) {
+    throw new Error(
+      `contract import "${source}" binds ${stmt.specifiers.length} names; a .json ABI import binds exactly one`,
+    );
+  }
+
+  const artifact = ctx.resolveImport(source, importerDir);
+  // Both shipped shapes of an ABI `.json`: the bare top-level entry ARRAY, and a build-tool
+  // artifact OBJECT (`{ "abi": [...], "bytecode": ... }`, as forge/hardhat/OpenZeppelin emit)
+  // whose `abi` field holds it. Anything else is not an ABI.
+  const abi = Array.isArray(artifact) ? artifact : (artifact as Record<string, unknown> | null)?.abi;
+
+  if (!Array.isArray(abi)) {
     throw new Error(`import "${source}" does not contain an ABI.`);
   }
 

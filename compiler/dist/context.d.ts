@@ -106,6 +106,7 @@ export declare class CompilerContext {
     /** Module-level state, shared across a v12 module's per-function contexts. */
     private readonly module;
     private baseDirs;
+    private allowedRoots;
     private pendingContractBinding?;
     private boundContracts;
     private stackDepth;
@@ -275,7 +276,7 @@ export declare class CompilerContext {
     popLoop(): void;
     assertInLoop(keyword: string): void;
     warn(message: string): void;
-    resolveImport(source: string, importerDir?: string): Record<string, unknown>;
+    resolveImport(source: string, importerDir?: string): unknown;
     /**
      * Resolve a SOURCE-FILE import (a SauceScript module that exports functions) — distinct
      * from `resolveImport`, which loads a `.json` contract ABI. Returns the module's raw text
@@ -298,6 +299,7 @@ export declare class CompilerContext {
         filePath: string;
         dedupKey?: string;
     } | undefined;
+    private assertDoesNotEscapeRoots;
     private resolveInRoots;
     private findNeutralPathForKey;
     private resolvePackage;
