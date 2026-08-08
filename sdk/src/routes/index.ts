@@ -1,0 +1,46 @@
+/**
+ * eco-routes fluent builder — top-level chain accessors generated from
+ * `../chains/canonical.js`.
+ *
+ * ```ts
+ * import { chainAccessors } from "@eco-incorp/sauce-sdk/routes"; // or routes namespace, see sdk/src/index.ts
+ * const { Base, Solana, Ethereum } = chainAccessors;
+ * const intents = Base.route(rewardA).Solana(routeA).route(rewardB).Ethereum();
+ * ```
+ */
+export { chain, chainAccessors, pascalOfSlug } from "./accessors.js";
+export type { PascalOf } from "./accessors.js";
+
+export {
+  createChainAccessors,
+  makeChainOrigin,
+} from "./builder.js";
+export type {
+  Assembler,
+  ChainAccessors,
+  ChainOrigin,
+  ChainRef,
+  ChainStage,
+  DestinationMethod,
+  DestinationSelectors,
+  PendingLeg,
+} from "./builder.js";
+
+export { assembleIntent } from "./intent.js";
+
+export { emptyRoute, toBigInt, toUniversalAddress } from "./normalize.js";
+
+export type {
+  AddressInput,
+  Call,
+  CallInput,
+  Hex,
+  Intent,
+  Reward,
+  RewardInput,
+  Route,
+  RouteInput,
+  TokenAmount,
+  TokenAmountInput,
+  UniversalAddress,
+} from "./types.js";

@@ -15,3 +15,4 @@ export {
   listSkillSlugs,
   SKILLS_DIR,
 } from "./skills/loader.js";
+export * as routes from "./routes/index.js";
