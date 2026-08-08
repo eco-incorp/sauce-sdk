@@ -5,6 +5,17 @@ import { RESERVED_NAMES } from './globals.js';
 import { Saucer } from './saucer/saucer.js';
 import { V12Saucer } from './saucer/saucer-v12.js';
 import { AccountRegistry } from './planner/registry.js';
+// Fallback dedup key for an arm-only module (no neutral sibling on disk at all): strip the
+// ".<target>" token that immediately precedes the file's own module extension, e.g.
+// "/dir/token.svm.js" -> "/dir/token.js" and "/dir/token.svm.sauce.ts" -> "/dir/token.sauce.ts".
+// Path-only string manipulation, arm-agnostic by construction — never reads the filesystem.
+function stripArmToken(filePath, target) {
+    const armToken = `.${target}.`;
+    const idx = filePath.lastIndexOf(armToken);
+    if (idx === -1)
+        return filePath;
+    return filePath.slice(0, idx) + '.' + filePath.slice(idx + armToken.length);
+}
 export class CompilerContext {
     warnings = [];
     target;
@@ -385,11 +396,26 @@ export class CompilerContext {
      * + absolute path, or undefined if no source file resolves (the caller then treats the
      * import as a `.json` contract). Tries the literal path, then the common SauceScript source
      * extensions, across every baseDir. A `.json` source is never a module (returns undefined).
+     *
+     * Per-target arm selection: for each baseDir, a target-arm sibling (`<base>.<target>.<ext>`,
+     * e.g. `./token.svm.js` when `this.target === 'svm'`) is probed BEFORE the neutral candidate
+     * list, so a module can ship a target-specific implementation alongside a neutral fallback.
+     * The unselected arm (a different target's arm file) is never read. `dedupKey`, when present,
+     * is the NEUTRAL specifier's own resolved path — the identity `collectImportedFunctions` should
+     * dedup/graph-key on, so cross-module dedup stays arm-agnostic regardless of which arm a given
+     * import happened to select. It is omitted whenever the neutral candidate itself won (the
+     * common, backward-compatible case), so `filePath` alone is the correct key there, exactly as
+     * before this feature existed.
      */
     resolveModuleSource(source) {
         if (source.endsWith('.json'))
             return undefined; // a .json import is a contract ABI, not a module
-        const candidates = [
+        const MODULE_EXTS = ['.ts', '.sauce.ts', '.js', '.sauce', '.mjs'];
+        // Strip the longest matching module extension so an explicit-extension specifier
+        // (e.g. "./token.js") probes its own extension's arm first (`./token.svm.js`).
+        const matchedExt = [...MODULE_EXTS].sort((a, b) => b.length - a.length).find((ext) => source.endsWith(ext));
+        const base = matchedExt ? source.slice(0, -matchedExt.length) : source;
+        const neutralCandidates = [
             source,
             `${source}.ts`,
             `${source}.sauce.ts`,
@@ -397,11 +423,43 @@ export class CompilerContext {
             `${source}.sauce`,
             `${source}.mjs`,
         ];
+        const armExts = matchedExt ? [matchedExt, ...MODULE_EXTS.filter((e) => e !== matchedExt)] : MODULE_EXTS;
+        const armCandidates = armExts.map((ext) => `${base}.${this.target}${ext}`);
         for (const baseDir of this.baseDirs) {
-            for (const cand of candidates) {
+            for (const cand of armCandidates) {
+                const filePath = path.resolve(baseDir, cand);
+                try {
+                    const code = fs.readFileSync(filePath, 'utf-8');
+                    const dedupKey = this.findNeutralPathForKey(neutralCandidates) ?? stripArmToken(filePath, this.target);
+                    return { code, filePath, dedupKey };
+                }
+                catch {
+                    continue;
+                }
+            }
+            for (const cand of neutralCandidates) {
                 const filePath = path.resolve(baseDir, cand);
                 try {
                     return { code: fs.readFileSync(filePath, 'utf-8'), filePath };
+                }
+                catch {
+                    continue;
+                }
+            }
+        }
+        return undefined;
+    }
+    // Path-only probe (never reads/parses) for the NEUTRAL identity of an already-arm-selected
+    // module, scanned in the SAME baseDir+candidate order `resolveModuleSource` itself uses — so
+    // when an arm wins in baseDir X, this can only find a neutral file in X or a LATER baseDir
+    // (an earlier baseDir contained neither, or the arm probe there would have already won).
+    findNeutralPathForKey(neutralCandidates) {
+        for (const baseDir of this.baseDirs) {
+            for (const cand of neutralCandidates) {
+                const filePath = path.resolve(baseDir, cand);
+                try {
+                    if (fs.statSync(filePath).isFile())
+                        return filePath;
                 }
                 catch {
                     continue;
