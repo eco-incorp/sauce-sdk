@@ -16,6 +16,7 @@ export {
   SKILLS_DIR,
 } from "./skills/loader.js";
 export * as routes from "./routes/index.js";
+export * as swap from "./swap/index.js";
 
 // eco-routes chain accessors as default globals: `Base.route(reward).Solana(route)`
 // with no import. The bare import both installs at runtime and -- load-bearing --
