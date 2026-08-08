@@ -136,15 +136,25 @@ export function chainByAlias(nameOrAlias: string): CanonicalChain | undefined {
   return byAlias.get(normalizeChainKey(nameOrAlias));
 }
 
-/** Unified front door: number -> chainById, string -> chainBySlug then chainByAlias, CanonicalChain -> identity. */
-export function resolveChain(ref: number | string | CanonicalChain): CanonicalChain | undefined {
+/** Anything resolvable to a chain: a numeric id, a native-`bigint` id (eco-routes uses these), a
+ *  slug/name/alias string, or an already-resolved `CanonicalChain`. */
+export type ChainRef = number | bigint | string | CanonicalChain;
+
+/** Unified front door: number/bigint -> chainById, string -> chainBySlug then chainByAlias, CanonicalChain -> identity. */
+export function resolveChain(ref: ChainRef): CanonicalChain | undefined {
   if (typeof ref === "number") return chainById(ref);
+  // eco-routes chain ids are natively bigint (e.g. Solana 1399811149n); accept
+  // them here so an svm id resolves to its svm record instead of falling
+  // through to the object case and silently mis-classifying as evm downstream.
+  if (typeof ref === "bigint") {
+    return ref >= 0n && ref <= BigInt(Number.MAX_SAFE_INTEGER) ? chainById(Number(ref)) : undefined;
+  }
   if (typeof ref === "string") return chainBySlug(ref) ?? chainByAlias(ref);
-  return ref;
+  return typeof ref === "object" && ref !== null ? ref : undefined;
 }
 
 /** `resolveChain` or throw, mirroring `requireV12Deployment`'s existing throw-with-the-known-set style. */
-export function requireChain(ref: number | string | CanonicalChain): CanonicalChain {
+export function requireChain(ref: ChainRef): CanonicalChain {
   const found = resolveChain(ref);
   if (found === undefined) {
     const known = canonicalChains.map((c) => c.slug).join(", ");
@@ -154,12 +164,12 @@ export function requireChain(ref: number | string | CanonicalChain): CanonicalCh
 }
 
 /** Resolves `ref` then tests `kind === 'evm'`. False for an unresolvable ref. */
-export function isEvm(ref: number | string | CanonicalChain): boolean {
+export function isEvm(ref: ChainRef): boolean {
   return resolveChain(ref)?.kind === "evm";
 }
 
 /** Resolves `ref` then tests `kind === 'svm'`. False for an unresolvable ref. */
-export function isSvm(ref: number | string | CanonicalChain): boolean {
+export function isSvm(ref: ChainRef): boolean {
   return resolveChain(ref)?.kind === "svm";
 }
 
