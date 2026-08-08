@@ -44,11 +44,36 @@ describe("routes globals: installed by default on import", () => {
     expect(routeGlobals.installed).toHaveLength(canonicalChains.length + 1);
   });
 
-  it("every canonical chain's PascalCase name resolves on globalThis to the SAME accessor object", () => {
+  it("every canonical chain's PascalCase name resolves on globalThis to a composed origin over the SAME CanonicalChain", () => {
+    // Composed, not identical: E2.3 wraps each origin with its native
+    // contract-accessor tree, so this is no longer the SAME object as
+    // `chainAccessors[key]` -- only the same underlying chain/route.
     for (const c of canonicalChains) {
       const key = pascalOfSlug(c.slug);
-      expect(g[key]).toBe(chainAccessors[key as keyof typeof chainAccessors]);
+      const composed = g[key] as { chain: unknown; route: unknown };
+      const origin = chainAccessors[key as keyof typeof chainAccessors];
+      expect(composed.chain).toEqual(origin.chain);
+      expect(typeof composed.route).toBe("function");
     }
+  });
+
+  it("E2.3: the installed global carries BOTH the eco-routes DSL and the native contract accessor tree", () => {
+    const base = g.Base as { route: unknown; UniswapV4: { UniversalRouter: unknown }; Uniswap: { UniversalRouter: unknown } };
+    expect(typeof base.route).toBe("function");
+    expect(base.UniswapV4.UniversalRouter).toBeDefined();
+    // Family alias forwards to the SAME underlying accessor as the canonical namespace.
+    expect(base.Uniswap.UniversalRouter).toBe(base.UniswapV4.UniversalRouter);
+  });
+
+  it("composition never mutates the imported chainAccessors.Base object", () => {
+    expect(Object.keys(chainAccessors.Base).sort()).toEqual(["chain", "route"]);
+  });
+
+  it("contract namespaces install as lazy, memoising getters (not eagerly constructed)", () => {
+    const desc = Object.getOwnPropertyDescriptor(g.Base, "UniswapV4");
+    expect(typeof desc?.get).toBe("function");
+    const base = g.Base as { UniswapV4: unknown };
+    expect(base.UniswapV4).toBe(base.UniswapV4);
   });
 
   it("`chain` the front door is also a global and behaves identically to the named import", () => {
@@ -149,9 +174,9 @@ describe("routes globals: installRouteGlobals / uninstallRouteGlobals", () => {
     const target: Record<string, unknown> = {};
     const report = installRouteGlobals({ target });
     expect(report.skipped).toEqual([]);
-    expect(target.Base).toBe(chainAccessors.Base);
+    expect((target.Base as { chain: unknown }).chain).toEqual(chainAccessors.Base.chain);
     // globalThis's own Base is untouched by this call (still whatever the
     // top-level install-on-import set it to).
-    expect(g.Base).toBe(chainAccessors.Base);
+    expect((g.Base as { chain: unknown }).chain).toEqual(chainAccessors.Base.chain);
   });
 });

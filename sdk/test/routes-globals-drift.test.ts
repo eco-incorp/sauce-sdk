@@ -54,4 +54,12 @@ describe("routes globals ambient .d.ts drift guard", () => {
       execFileSync(process.execPath, [SCRIPT_PATH, "--check"], { cwd: SDK_DIR, encoding: "utf8" }),
     ).not.toThrow();
   });
+
+  it("every chain declaration also carries the E2.3 `& ChainContracts` intersection (a generator that dropped it can't pass vacuously)", () => {
+    for (const c of canonicalChains) {
+      const name = pascalOfSlug(c.slug);
+      const matches = committed.match(new RegExp(`\\bconst ${name}: Accessors\\["${name}"\\] & ChainContracts;`, "g")) ?? [];
+      expect(matches).toHaveLength(1);
+    }
+  });
 });
