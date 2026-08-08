@@ -1,3 +1,4 @@
+import * as path from 'path';
 import * as acorn from 'acorn';
 import { CompilerContext } from '../context.js';
 import { processLiteral, processUnaryExpression, processBinaryExpression, processLogicalExpression, processCallExpression, processMemberExpression, processNewExpression, processTaggedTemplateExpression, literalToInt, } from './expression.js';
@@ -15,9 +16,9 @@ export function processNode(node, ctx) {
             throw new Error(`not implemented: ${node.type}`);
     }
 }
-function processImportDeclaration(stmt, ctx) {
+function processImportDeclaration(stmt, ctx, importerDir) {
     const source = stmt.source.value;
-    const artifact = ctx.resolveImport(source);
+    const artifact = ctx.resolveImport(source, importerDir);
     const abi = artifact.abi;
     if (!abi) {
         throw new Error(`import "${source}" does not contain an ABI.`);
@@ -76,16 +77,16 @@ function extractFunctionDeclarations(program) {
 // detection across modules); `visited` is the set of already-pulled module paths
 // (a shared module imported by two parents is pulled once). Imports recurse FIRST
 // so a transitively-imported function is registered before the importing module's.
-function collectImportedFunctions(program, ctx, seen, visited, inlineOut) {
+function collectImportedFunctions(program, ctx, seen, visited, inlineOut, importerDir) {
     const out = [];
     for (const stmt of program.body) {
         if (stmt.type !== 'ImportDeclaration')
             continue;
         const source = stmt.source.value;
-        const mod = ctx.resolveModuleSource(source);
+        const mod = ctx.resolveModuleSource(source, importerDir);
         if (!mod) {
             // No source file resolves → a `.json` contract ABI import.
-            processImportDeclaration(stmt, ctx);
+            processImportDeclaration(stmt, ctx, importerDir);
             continue;
         }
         // Dedup on the NEUTRAL identity (`mod.dedupKey`, when an arm won) rather than the file
@@ -119,7 +120,7 @@ function collectImportedFunctions(program, ctx, seen, visited, inlineOut) {
         }
         // Recurse into the imported module's own imports FIRST so transitive functions
         // (and contracts) are registered before this module's.
-        out.push(...collectImportedFunctions(modAst, ctx, seen, visited, inlineOut));
+        out.push(...collectImportedFunctions(modAst, ctx, seen, visited, inlineOut, path.dirname(mod.filePath)));
         for (const fn of extractFunctionDeclarations(modAst)) {
             const name = fn.id?.name;
             if (!name)

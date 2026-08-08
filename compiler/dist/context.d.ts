@@ -275,7 +275,7 @@ export declare class CompilerContext {
     popLoop(): void;
     assertInLoop(keyword: string): void;
     warn(message: string): void;
-    resolveImport(source: string): Record<string, unknown>;
+    resolveImport(source: string, importerDir?: string): Record<string, unknown>;
     /**
      * Resolve a SOURCE-FILE import (a SauceScript module that exports functions) — distinct
      * from `resolveImport`, which loads a `.json` contract ABI. Returns the module's raw text
@@ -293,12 +293,16 @@ export declare class CompilerContext {
      * common, backward-compatible case), so `filePath` alone is the correct key there, exactly as
      * before this feature existed.
      */
-    resolveModuleSource(source: string): {
+    resolveModuleSource(source: string, importerDir?: string): {
         code: string;
         filePath: string;
         dedupKey?: string;
     } | undefined;
+    private resolveInRoots;
     private findNeutralPathForKey;
+    private resolvePackage;
+    private findPackageDir;
+    private packageEntry;
     registerContract(name: string, abi: Abi): void;
     lookupContract(name: string): ContractInfo | undefined;
     setPendingContractBinding(contractName: string, callTypeOverride?: 'static' | 'delegate'): void;
