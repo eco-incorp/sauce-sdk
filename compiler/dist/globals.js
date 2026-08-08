@@ -1,6 +1,7 @@
 import { keccak256, toBytes } from 'viem';
 import { OPS } from './saucer/index.js';
 import { compile } from './index.js';
+import { assertCapability } from './capabilities.js';
 const ABI_TYPE_SPECS = {
     bool: OPS.BYTE_1,
     address: OPS.BYTE_20,
@@ -118,6 +119,33 @@ const svmAccountsArray = (name, arg, ctx) => {
     }
     const indices = elements.map((el) => svmAccountEntry(name, el, ctx));
     return ctx.newSaucer().array(indices.map((i) => ctx.newSaucer().int(BigInt(i))));
+};
+/**
+ * Closes a confirmed silent-miscompile hole: on an EVM target, `contract.call`'s 3rd
+ * operand is plain calldata bytes (or, for `contract.static`, an outright arity error) —
+ * NOT an accounts list. Passing the svm accounts-list SHAPE there anyway (a string ref, or
+ * an `{ref, writable?, signer?}` object, inside an array literal) used to compile cleanly
+ * and silently encode the "accounts" as an array-of-UTF8-bytes descriptor passed as calldata,
+ * corrupting the actual call. A purely numeric array (`[3, 5]`, the raw-index escape hatch)
+ * is syntactically indistinguishable from an ordinary literal array and is deliberately left
+ * to the existing arity/type errors — see capabilities.ts's 'accounts list' row.
+ */
+const isAccountRefShaped = (el) => {
+    if (el?.type === 'Literal')
+        return typeof el.value === 'string';
+    if (el?.type === 'ObjectExpression') {
+        return el.properties.some((prop) => prop.type === 'Property' && !prop.computed && getPropertyKeyName(prop) === 'ref');
+    }
+    return false;
+};
+const getPropertyKeyName = (p) => p.key.type === 'Identifier' ? p.key.name : String(p.key.value);
+const assertAccountsListNotOnEvm = (name, arg, ctx) => {
+    if (!arg || arg.type !== 'ArrayExpression')
+        return;
+    const elements = arg.elements;
+    if (elements.length > 0 && elements.every((el) => isAccountRefShaped(el))) {
+        assertCapability(ctx, 'accounts list', arg);
+    }
 };
 /** Resolve an accountData/writeAccountData ref argument to an account-index saucer. */
 const svmAccountRef = (name, arg, ctx, flags = {}) => {
@@ -441,6 +469,7 @@ export const GLOBALS = {
                     const calldata = process(args[1]);
                     return s.svmCall(target, calldata, svmAccountsArray('contract.call', args[2], s.ctx));
                 }
+                assertAccountsListNotOnEvm('contract.call', args[2], s.ctx);
                 return s.externalCall(process(args[0]), process(args[1]), process(args[2]));
             },
         },
@@ -453,6 +482,10 @@ export const GLOBALS = {
                     const calldata = process(args[1]);
                     return s.svmStaticCall(target, calldata, svmAccountsArray('contract.static', args[2], s.ctx));
                 }
+                // Check the accounts-list shape BEFORE the arity check below: a 3rd argument
+                // shaped like an svm accounts list should get the target-named capability
+                // error, not the generic "expects 2 argument(s), got 3".
+                assertAccountsListNotOnEvm('contract.static', args[2], s.ctx);
                 expectArity('contract.static', 2, args);
                 return s.staticCall(process(args[0]), process(args[1]));
             },
@@ -460,8 +493,7 @@ export const GLOBALS = {
         delegate: {
             kind: 'dynamic',
             compile: (s, args, process) => {
-                if (s.ctx.isSvm)
-                    throw new Error(`delegatecall is not supported on target 'svm'`);
+                assertCapability(s.ctx, 'delegatecall');
                 expectArity('contract.delegate', 2, args);
                 return s.delegateCall(process(args[0]), process(args[1]));
             },
@@ -595,8 +627,7 @@ export const GLOBAL_FUNCTIONS = {
     uint: {
         kind: 'scalar',
         compile: (s, args, process) => {
-            if (!s.ctx.isV12)
-                throw new Error(`uint is only available on targets 'v12' and 'svm'`);
+            assertCapability(s.ctx, 'uint', args[0]);
             expectArity('uint', 1, args);
             const data = process(args[0]);
             return s.ctx.isSvm ? s.castLe(data) : s.castBe(data);
@@ -612,8 +643,7 @@ export const GLOBAL_FUNCTIONS = {
     accountData: {
         kind: 'dynamic',
         compile: (s, args, process) => {
-            if (!s.ctx.isSvm)
-                throw new Error(`accountData is only available on target 'svm'`);
+            assertCapability(s.ctx, 'accountData', args[0]);
             expectArity('accountData', 3, args);
             const index = svmAccountRef('accountData', args[0], s.ctx);
             return s.svmAccountData(index, process(args[1]), process(args[2]));
@@ -622,8 +652,7 @@ export const GLOBAL_FUNCTIONS = {
     writeAccountData: {
         kind: 'scalar',
         compile: (s, args, process) => {
-            if (!s.ctx.isSvm)
-                throw new Error(`writeAccountData is only available on target 'svm'`);
+            assertCapability(s.ctx, 'writeAccountData', args[0]);
             expectArity('writeAccountData', 3, args);
             const index = svmAccountRef('writeAccountData', args[0], s.ctx, { writable: true });
             return s.svmWriteAccountData(index, process(args[1]), process(args[2]));
@@ -637,8 +666,7 @@ export const GLOBAL_FUNCTIONS = {
     accountUint: {
         kind: 'scalar',
         compile: (s, args, process) => {
-            if (!s.ctx.isSvm)
-                throw new Error(`accountUint is only available on target 'svm'`);
+            assertCapability(s.ctx, 'accountUint', args[0]);
             return s.castLe(svmAccountUintData('accountUint', s, args, process));
         },
     },

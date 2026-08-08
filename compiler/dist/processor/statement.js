@@ -2,6 +2,7 @@ import { isImmutablePackedArray, OPS } from '../saucer/index.js';
 import { processExpression, processStatement } from './index.js';
 import { applyBinaryOp, resolveContractCallTarget, emitRawContractCall, resolveCatchChain, abiDecodeTypeSpecs, } from './expression.js';
 import { evalConstBool } from './const-eval.js';
+import { assertCapability } from '../capabilities.js';
 import { inferKindWithContext, inferElementTypeWithContext, inferStructTypeWithContext, getPropertyName, lookupStructType, getFieldIndex, abiOutputKind, } from './inference.js';
 export function processVariableDeclaration(decl, ctx, saucer) {
     if (decl.kind === 'var') {
@@ -37,10 +38,7 @@ export function processVariableDeclaration(decl, ctx, saucer) {
 function processDestructuringDeclaration(pattern, init, ctx, saucer) {
     // Fail with a destructuring-specific message on svm: the generic binding
     // error suggests contract.call(...), which cannot be destructured either.
-    if (ctx.isSvm) {
-        throw new Error(`array destructuring is not supported on target 'svm' — contract bindings are not available there; ` +
-            `read fields from the contract.call(...) returndata with slice()/uint()`);
-    }
+    assertCapability(ctx, 'array destructuring', pattern);
     if (init.type === 'CallExpression' && resolveCatchChain(init)) {
         throw new Error('cannot destructure a .catch() chain — a catch handler cannot capture call outputs; destructure the bare call instead');
     }

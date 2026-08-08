@@ -4,6 +4,7 @@ import { OPS } from './saucer/index.js';
 import type { SaucerLike, V12Saucer } from './saucer/index.js';
 import type { VariableKind, CompilerContext } from './context.js';
 import { compile } from './index.js';
+import { assertCapability } from './capabilities.js';
 
 type PropertyCompile = (saucer: SaucerLike) => SaucerLike;
 type MethodCompile = (saucer: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => SaucerLike;
@@ -162,6 +163,42 @@ const svmAccountsArray = (name: string, arg: Expression, ctx: CompilerContext): 
   const indices = elements.map((el) => svmAccountEntry(name, el, ctx));
 
   return ctx.newSaucer().array(indices.map((i) => ctx.newSaucer().int(BigInt(i))));
+};
+
+/**
+ * Closes a confirmed silent-miscompile hole: on an EVM target, `contract.call`'s 3rd
+ * operand is plain calldata bytes (or, for `contract.static`, an outright arity error) —
+ * NOT an accounts list. Passing the svm accounts-list SHAPE there anyway (a string ref, or
+ * an `{ref, writable?, signer?}` object, inside an array literal) used to compile cleanly
+ * and silently encode the "accounts" as an array-of-UTF8-bytes descriptor passed as calldata,
+ * corrupting the actual call. A purely numeric array (`[3, 5]`, the raw-index escape hatch)
+ * is syntactically indistinguishable from an ordinary literal array and is deliberately left
+ * to the existing arity/type errors — see capabilities.ts's 'accounts list' row.
+ */
+const isAccountRefShaped = (el: ArrayExpression['elements'][number]): boolean => {
+  if (el?.type === 'Literal') return typeof (el as Literal).value === 'string';
+
+  if (el?.type === 'ObjectExpression') {
+    return (el as ObjectExpression).properties.some(
+      (prop) =>
+        prop.type === 'Property' && !(prop as Property).computed && getPropertyKeyName(prop as Property) === 'ref',
+    );
+  }
+
+  return false;
+};
+
+const getPropertyKeyName = (p: Property): string =>
+  p.key.type === 'Identifier' ? (p.key as { name: string }).name : String((p.key as Literal).value);
+
+const assertAccountsListNotOnEvm = (name: string, arg: Expression | undefined, ctx: CompilerContext): void => {
+  if (!arg || arg.type !== 'ArrayExpression') return;
+
+  const elements = (arg as ArrayExpression).elements;
+
+  if (elements.length > 0 && elements.every((el) => isAccountRefShaped(el))) {
+    assertCapability(ctx, 'accounts list', arg);
+  }
 };
 
 /** Resolve an accountData/writeAccountData ref argument to an account-index saucer. */
@@ -566,6 +603,8 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
           return (s as V12Saucer).svmCall(target, calldata, svmAccountsArray('contract.call', args[2], s.ctx));
         }
 
+        assertAccountsListNotOnEvm('contract.call', args[2], s.ctx);
+
         return s.externalCall(process(args[0]), process(args[1]), process(args[2]));
       },
     },
@@ -580,6 +619,11 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
           return (s as V12Saucer).svmStaticCall(target, calldata, svmAccountsArray('contract.static', args[2], s.ctx));
         }
 
+        // Check the accounts-list shape BEFORE the arity check below: a 3rd argument
+        // shaped like an svm accounts list should get the target-named capability
+        // error, not the generic "expects 2 argument(s), got 3".
+        assertAccountsListNotOnEvm('contract.static', args[2], s.ctx);
+
         expectArity('contract.static', 2, args);
 
         return s.staticCall(process(args[0]), process(args[1]));
@@ -588,7 +632,7 @@ export const GLOBALS: Record<string, Record<string, GlobalDef>> = {
     delegate: {
       kind: 'dynamic',
       compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
-        if (s.ctx.isSvm) throw new Error(`delegatecall is not supported on target 'svm'`);
+        assertCapability(s.ctx, 'delegatecall');
 
         expectArity('contract.delegate', 2, args);
 
@@ -739,7 +783,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   uint: {
     kind: 'scalar',
     compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
-      if (!s.ctx.isV12) throw new Error(`uint is only available on targets 'v12' and 'svm'`);
+      assertCapability(s.ctx, 'uint', args[0]);
 
       expectArity('uint', 1, args);
 
@@ -758,7 +802,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   accountData: {
     kind: 'dynamic',
     compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
-      if (!s.ctx.isSvm) throw new Error(`accountData is only available on target 'svm'`);
+      assertCapability(s.ctx, 'accountData', args[0]);
 
       expectArity('accountData', 3, args);
 
@@ -770,7 +814,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   writeAccountData: {
     kind: 'scalar',
     compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
-      if (!s.ctx.isSvm) throw new Error(`writeAccountData is only available on target 'svm'`);
+      assertCapability(s.ctx, 'writeAccountData', args[0]);
 
       expectArity('writeAccountData', 3, args);
 
@@ -787,7 +831,7 @@ export const GLOBAL_FUNCTIONS: Record<string, GlobalDef> = {
   accountUint: {
     kind: 'scalar',
     compile: (s: SaucerLike, args: Expression[], process: (e: Expression) => SaucerLike) => {
-      if (!s.ctx.isSvm) throw new Error(`accountUint is only available on target 'svm'`);
+      assertCapability(s.ctx, 'accountUint', args[0]);
 
       return (s as V12Saucer).castLe(svmAccountUintData('accountUint', s, args, process));
     },

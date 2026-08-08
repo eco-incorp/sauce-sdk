@@ -12,6 +12,7 @@ export type { CompileTarget } from './context.js';
 export { OPS } from './saucer/ops.js';
 export { OPS_V12 } from './saucer/ops-v12.js';
 export { SVM_UNSUPPORTED } from './saucer/svm-profile.js';
+export { UnsupportedTargetError, TARGET_CAPABILITIES } from './capabilities.js';
 export { estimatePacket, stagingTransactionCount, PAYER_REF } from './planner/index.js';
 export type { AccountMeta, AccountPlan, PacketBudget, PacketBudgetOptions, PacketMode } from './planner/index.js';
 export type { AbiParameter, AbiFunction, AbiItem, Abi, ContractConfig, ContractsConfig, ContractInfo, } from './contracts.js';

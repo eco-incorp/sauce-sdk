@@ -26,6 +26,7 @@ import {
   abiDecodeTypeSpecs,
 } from './expression.js';
 import { evalConstBool } from './const-eval.js';
+import { assertCapability } from '../capabilities.js';
 import {
   inferKindWithContext,
   inferElementTypeWithContext,
@@ -84,12 +85,7 @@ function processDestructuringDeclaration(
 ): SaucerLike {
   // Fail with a destructuring-specific message on svm: the generic binding
   // error suggests contract.call(...), which cannot be destructured either.
-  if (ctx.isSvm) {
-    throw new Error(
-      `array destructuring is not supported on target 'svm' — contract bindings are not available there; ` +
-        `read fields from the contract.call(...) returndata with slice()/uint()`,
-    );
-  }
+  assertCapability(ctx, 'array destructuring', pattern);
 
   if (init.type === 'CallExpression' && resolveCatchChain(init as CallExpression)) {
     throw new Error(
