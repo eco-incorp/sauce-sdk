@@ -45,10 +45,12 @@ import { SVM_MAX_ESCROWS, svmSettleRefs, svmSettleSource } from './recipes/index
 // with the EVM `/verify` barrel re-exporting its own `intent.ts`.
 export {
   decodePortalCalldataWithAccounts,
+  encodePortalCalldataWithAccounts,
   extractSvmSettleFromCalls,
   extractSvmSettleFromIntent,
   type PortalAccountMeta,
   type PortalCalldataWithAccounts,
+  type PortalCalldataWithAccountsInput,
   type BytesInput,
   type SvmIntentCallLike,
   type SvmIntentLike,
